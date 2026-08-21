@@ -110,9 +110,11 @@ fn sql_bind_col_safe(
         return SQL_ERROR;
     }
 
-    // Both null unbinds the column; a null data pointer with a live indicator
-    // stays bound, so the application can collect lengths without the values.
-    if target_value_ptr.is_null() && strlen_or_ind_ptr.is_null() {
+    // A null TargetValuePtr unbinds the column whatever the indicator says.
+    // msodbcsql never inspects the indicator here (`sqlcdesc.cpp` UnbindParam)
+    // and has no indicator-only binding, so keeping one bound would both consume
+    // the column from the row cursor and run validation msodbcsql never reaches.
+    if target_value_ptr.is_null() {
         stmt_state.clear_binding(column_number);
         debug!(column_number, "SQLBindCol: column unbound");
         return SQL_SUCCESS;
@@ -124,9 +126,10 @@ fn sql_bind_col_safe(
         return SQL_ERROR;
     }
 
-    // SQL_C_DEFAULT would have to be resolved against the column's SQL type,
-    // and ODBC allows binding before execution, so there may be no metadata to
-    // resolve it against yet.
+    // Divergence: msodbcsql accepts SQL_C_DEFAULT here and resolves it at fetch
+    // time from the IRD (`sqlcfunc.cpp` BindOffset -> Sql2CDefault). Deferring
+    // needs the column's SQL type threaded into the fill loop, which the binding
+    // does not carry today, so this is refused for now and tracked separately.
     if target_type == SQL_C_DEFAULT {
         error!("SQLBindCol: SQL_C_DEFAULT is not supported as a bound target");
         post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
@@ -300,16 +303,54 @@ mod tests {
         assert_eq!(bindings_len(&h), 0);
     }
 
-    /// A null data pointer with a live indicator is not an unbind: the
-    /// application is asking for lengths without the values.
+    /// A null data pointer unbinds whatever the indicator says. Keeping such a
+    /// binding alive would consume the column from the row cursor and subject it
+    /// to validation msodbcsql never reaches, since it unbinds first.
     #[test]
-    fn a_null_data_pointer_with_an_indicator_stays_bound() {
+    fn a_null_data_pointer_unbinds_whatever_the_indicator_says() {
         let h = TestHandles::with_env_dbc_stmt();
+        let mut buf = [0i32; 1];
         let mut ind = [0 as SqlLen; 1];
+        let rc = unsafe {
+            sql_bind_col(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                buf.as_mut_ptr() as SqlPointer,
+                4,
+                ind.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(bindings_len(&h), 1);
+
         let rc =
             unsafe { sql_bind_col(h.stmt, 1, SQL_C_SLONG, ptr::null_mut(), 0, ind.as_mut_ptr()) };
         assert_eq!(rc, SQL_SUCCESS);
-        assert_eq!(bindings_len(&h), 1);
+        assert_eq!(
+            bindings_len(&h),
+            0,
+            "the live indicator must not keep it bound"
+        );
+    }
+
+    /// Unbinding happens before any argument validation, so a combination that
+    /// would otherwise be rejected still unbinds rather than erroring.
+    #[test]
+    fn unbinding_skips_the_argument_validation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind = [0 as SqlLen; 1];
+        let rc = unsafe {
+            sql_bind_col(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                ptr::null_mut(),
+                -1,
+                ind.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
     }
 
     /// Column 0 is the bookmark column, which a forward-only cursor does not

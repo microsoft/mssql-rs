@@ -450,8 +450,15 @@ fn fill_rowset(
     // Report why the rowset was imperfect with the SQLSTATE that value would
     // have produced through SQLGetData, rather than a blanket truncation
     // warning. Per-row detail lives in the row status array.
+    // msodbcsql keys the return code on the rowset size, not on how many rows
+    // failed: a block fetch demotes a row error to SQL_SUCCESS_WITH_INFO and
+    // leaves the detail in the row status array, while a single-row fetch lets
+    // the error stand (`sqlccurs.cpp`, gated on dwRowSize > 1).
     if let Some(issue) = worst.issue() {
         issue.post(&mut stmt_state);
+        if row_array_size == 1 && matches!(worst, RowOutcome::Error(_)) {
+            return SQL_ERROR;
+        }
         return SQL_SUCCESS_WITH_INFO;
     }
     if has_server_info {
@@ -476,7 +483,7 @@ unsafe fn write_row_status(row_status_ptr: *mut SqlUSmallInt, row: SqlULen, stat
     if row_status_ptr.is_null() {
         return;
     }
-    unsafe { row_status_ptr.add(row).write(status) };
+    unsafe { row_status_ptr.add(row).write_unaligned(status) };
 }
 
 /// Byte stride between consecutive elements of a column-wise bound array.
@@ -502,9 +509,9 @@ fn element_stride(target_type: SqlSmallInt, buffer_length: SqlLen) -> usize {
 
 /// Current value of `SQL_ATTR_ROW_BIND_OFFSET_PTR`, in bytes.
 ///
-/// ODBC adds this to the data and length/indicator base addresses alike, so an
-/// application is expected to use a whole-rowset displacement that keeps both
-/// naturally aligned; a ragged offset would misalign the indicator write.
+/// Read unaligned: the offset displaces application pointers by an arbitrary
+/// byte count, so nothing guarantees the result is aligned for `SqlULen`, and a
+/// misaligned `read` is UB in Rust on every target rather than merely slow.
 ///
 /// # Safety
 /// `ptr` must be null or point to a readable `SqlULen`.
@@ -512,7 +519,7 @@ unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
     if ptr.is_null() {
         return 0;
     }
-    unsafe { ptr.read() }
+    unsafe { ptr.read_unaligned() }
 }
 
 /// Writes one column value into its bound buffer slot for row `row_index`.
@@ -552,12 +559,6 @@ unsafe fn deliver_bound(
         return RowOutcome::Error(RowIssue::IndicatorRequired);
     }
 
-    if binding.target_value_ptr.is_null() {
-        // msodbcsql delivers nothing here, neither a length for a value nor
-        // SQL_NULL_DATA for a NULL: a null TargetValuePtr is also how a column
-        // is unbound, and it resolves that ambiguity by treating this as one.
-        return RowOutcome::Success;
-    }
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
@@ -804,21 +805,6 @@ mod tests {
         assert_eq!(ind[0], 10);
         assert_eq!(&buf[..7], b"1234567");
         assert_eq!(buf[7], 0, "the buffer stays NUL-terminated");
-    }
-
-    /// A binding with no data pointer delivers nothing at all, as msodbcsql does.
-    #[test]
-    fn indicator_only_binding_delivers_nothing() {
-        let mut ind = [-999 as SqlLen; 1];
-        let b = binding(1, SQL_C_SLONG, ptr::null_mut(), 0, ind.as_mut_ptr());
-
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Null) };
-        assert!(matches!(outcome, RowOutcome::Success));
-        assert_eq!(ind[0], -999, "NULL must not write the indicator");
-
-        let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Int(7)) };
-        assert!(matches!(outcome, RowOutcome::Success));
-        assert_eq!(ind[0], -999, "a value must not write the indicator either");
     }
 
     /// A zero-length character binding is a length probe, as it is for

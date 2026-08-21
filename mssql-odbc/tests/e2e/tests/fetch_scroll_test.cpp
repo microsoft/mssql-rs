@@ -482,42 +482,60 @@ TEST_F(FetchScrollLiveTest, GetDataAfterABlockFetchFailsCleanly) {
     SQLCloseCursor(stmt_);
 }
 
-// An application may bind only the length/indicator buffer, with no data
-// buffer. msodbcsql writes nothing at all in that case -- neither a length for
-// a value nor SQL_NULL_DATA for a NULL -- which settles the ambiguity in the
-// spec, where a null TargetValuePtr is also how a column is unbound. This
-// driver has to leave the indicator alone for the same reason.
-TEST_F(FetchScrollLiveTest, IndicatorOnlyBindingDeliversNothing) {
-    ExecDirect("SELECT CAST(42 AS INT) AS n, CAST(NULL AS INT) AS z");
-    SQLLEN nInd = -999;
-    SQLLEN zInd = -999;
-    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, nullptr, 0, &nInd),
+// A null TargetValuePtr unbinds the column outright; the indicator is never
+// consulted. The column must therefore stay available to SQLGetData, which is
+// what distinguishes an unbind from a binding that delivers nothing.
+TEST_F(FetchScrollLiveTest, ANullTargetPointerUnbindsAndLeavesTheColumnReadable) {
+    ExecDirect("SELECT CAST(42 AS INT) AS n, CAST('hi' AS VARCHAR(10)) AS s");
+    SQLINTEGER v = -1;
+    SQLLEN ind = -999;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &v, sizeof(v), &ind),
                   SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, nullptr, 0, &zInd),
+    // Rebinding with a null data pointer unbinds, even though the indicator is live.
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, nullptr, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
-    SQLRETURN rc = SQLFetch(stmt_);
-    ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) << "rc=" << rc;
-    EXPECT_EQ(static_cast<SQLLEN>(-999), nInd) << "value indicator untouched";
-    EXPECT_EQ(static_cast<SQLLEN>(-999), zInd) << "NULL indicator untouched";
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, v) << "an unbound column is not delivered";
+    EXPECT_EQ(static_cast<SQLLEN>(-999), ind);
+
+    // Column 1 must not have been consumed by a lingering binding.
+    SQLINTEGER viaGetData = -1;
+    SQLLEN gdInd = 0;
+    EXPECT_TRUE(SQL_SUCCEEDED(
+        SQLGetData(stmt_, 1, SQL_C_SLONG, &viaGetData, sizeof(viaGetData), &gdInd)));
+    EXPECT_EQ(42, viaGetData);
     SQLCloseCursor(stmt_);
 }
 
-// Review question: is a zero-length character binding a legal "length probe"
-// for SQLBindCol, the way it is for SQLGetData? Settled against msodbcsql
-// rather than argued from the spec.
-TEST_F(FetchScrollLiveTest, ZeroLengthCharacterBindingIsALengthProbe) {
-    ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS s");
-    char buf[8];
-    std::memset(buf, '#', sizeof(buf));
-    SQLLEN ind = -999;
-    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, 0, &ind), SQL_HANDLE_STMT, stmt_);
+// msodbcsql keys the fetch return code on the rowset size: a single-row fetch
+// lets a row error stand as SQL_ERROR, while a block fetch demotes it to
+// SQL_SUCCESS_WITH_INFO and leaves the detail in the row status array.
+TEST_F(FetchScrollLiveTest, ARowErrorIsSQL_ERRORAtRowsetSizeOne) {
+    ExecDirect("SELECT CAST(NULL AS INT) AS z");
+    SQLINTEGER v = -1;
+    // NULL with no indicator to report it through is a row error.
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &v, sizeof(v), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
 
-    SQLRETURN rc = SQLFetch(stmt_);
-    // A probe reports the available length and flags truncation; it must not
-    // come back as an unsupported binding.
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
-    EXPECT_EQ(static_cast<SQLLEN>(5), ind) << "available length";
-    EXPECT_EQ('#', buf[0]) << "a zero-length buffer must not be written";
+// The same row error inside a rowset is demoted, so the application reads the
+// per-row detail from the status array instead.
+TEST_F(FetchScrollLiveTest, TheSameRowErrorIsDemotedInABlockFetch) {
+    ExecDirect("SELECT CAST(NULL AS INT) AS z");
+    SQLINTEGER v[2] = {-1, -1};
+    SQLUSMALLINT status[2] = {0, 0};
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, v, sizeof(SQLINTEGER), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_EQ(SQL_ROW_ERROR, status[0]);
     SQLCloseCursor(stmt_);
 }
 
