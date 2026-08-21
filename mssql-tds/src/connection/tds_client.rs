@@ -6074,6 +6074,7 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         );
         (client, fail)
     }
