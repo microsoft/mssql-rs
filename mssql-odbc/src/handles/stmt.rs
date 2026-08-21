@@ -11,7 +11,9 @@ use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClien
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
-use crate::api::odbc_types::{SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt};
+use crate::api::odbc_types::{
+    self, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
+};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -193,6 +195,106 @@ pub(crate) struct StmtState {
     /// tracked separately (AB#46385), so a non-zero value does not yet cancel
     /// anything. msodbcsql does enforce it and answers `HYT00` on expiry.
     pub(crate) query_timeout: u32,
+    /// `SQL_ATTR_MAX_ROWS`: cap on the number of rows returned from each result
+    /// set; `0` (the ODBC default) means no cap.
+    ///
+    /// Unlike the rest of the S4 attributes this one is genuinely enforced.
+    /// msodbcsql stops the cursor at the cap — a `SELECT TOP 10` under
+    /// `MAX_ROWS = 3` yields exactly three rows — so merely storing the value
+    /// would quietly hand the application seven rows it asked not to receive.
+    pub(crate) max_rows: SqlULen,
+    /// Rows already handed to the application from the current result set.
+    /// Counted solely to enforce [`Self::max_rows`], and restarted by
+    /// [`Self::begin_result_set`] because the cap is per result set.
+    pub(crate) rows_returned: SqlULen,
+    /// Statement attributes msodbcsql accepts and round-trips but that have no
+    /// effect on this driver's forward-only, read-only cursor.
+    pub(crate) inert_attrs: InertStmtAttrs,
+}
+
+/// Statement attributes msodbcsql stores and round-trips without acting on,
+/// paired with the default it reports before any set.
+///
+/// Every entry was measured against msodbcsql 18 rather than taken from the
+/// ODBC headers, because several defaults are driver choices rather than
+/// specification values: `SQL_ATTR_SIMULATE_CURSOR` reports `SQL_SC_UNIQUE`,
+/// `SQL_ROWSET_SIZE` reports 1, and `SQL_ATTR_CURSOR_SENSITIVITY` reports
+/// `SQL_INSENSITIVE` even though the header default is `SQL_UNSPECIFIED`.
+/// See `docs/attributes_plan.md` §8.
+const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
+    (
+        odbc_types::SQL_ATTR_CURSOR_SENSITIVITY,
+        odbc_types::SQL_INSENSITIVE,
+    ),
+    (odbc_types::SQL_ATTR_NOSCAN, 0),
+    (odbc_types::SQL_ATTR_MAX_LENGTH, 0),
+    (odbc_types::SQL_ATTR_ASYNC_ENABLE, 0),
+    (odbc_types::SQL_ATTR_KEYSET_SIZE, 0),
+    (odbc_types::SQL_ROWSET_SIZE, 1),
+    (
+        odbc_types::SQL_ATTR_SIMULATE_CURSOR,
+        odbc_types::SQL_SC_UNIQUE,
+    ),
+    (odbc_types::SQL_ATTR_RETRIEVE_DATA, odbc_types::SQL_RD_ON),
+    (odbc_types::SQL_ATTR_USE_BOOKMARKS, 0),
+    (odbc_types::SQL_ATTR_ENABLE_AUTO_IPD, 0),
+    (odbc_types::SQL_ATTR_FETCH_BOOKMARK_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAM_BIND_TYPE, 0),
+    (odbc_types::SQL_ATTR_PARAM_OPERATION_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAM_STATUS_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR, 0),
+    (odbc_types::SQL_ATTR_ROW_OPERATION_PTR, 0),
+    (odbc_types::SQL_ATTR_METADATA_ID, 0),
+];
+
+/// Values for the [`INERT_STMT_ATTRS`] identifiers, positionally aligned with
+/// that table.
+///
+/// A flat array keyed by a linear scan is deliberate: the set is small and
+/// fixed, and holding the identifiers and their defaults in one auditable
+/// table keeps a measured default from drifting away from the attribute it
+/// belongs to, which nineteen separate struct fields would invite.
+#[derive(Debug, Clone)]
+pub(crate) struct InertStmtAttrs([SqlULen; INERT_STMT_ATTRS.len()]);
+
+impl Default for InertStmtAttrs {
+    fn default() -> Self {
+        let mut values = [0; INERT_STMT_ATTRS.len()];
+        for (slot, (_, default)) in values.iter_mut().zip(INERT_STMT_ATTRS) {
+            *slot = *default;
+        }
+        Self(values)
+    }
+}
+
+impl InertStmtAttrs {
+    /// The identifiers this store covers, in table order. Test-only: it exists
+    /// so a new entry cannot be added without an asserted msodbcsql default.
+    #[cfg(test)]
+    pub(crate) fn identifiers() -> impl Iterator<Item = SqlInteger> {
+        INERT_STMT_ATTRS.iter().map(|(id, _)| *id)
+    }
+
+    fn index_of(attribute: SqlInteger) -> Option<usize> {
+        INERT_STMT_ATTRS.iter().position(|(id, _)| *id == attribute)
+    }
+    /// Returns the stored value, or `None` when `attribute` is not one of the
+    /// inert identifiers.
+    pub(crate) fn get(&self, attribute: SqlInteger) -> Option<SqlULen> {
+        Self::index_of(attribute).map(|i| self.0[i])
+    }
+
+    /// Stores `value`, returning whether `attribute` is an inert identifier.
+    pub(crate) fn set(&mut self, attribute: SqlInteger, value: SqlULen) -> bool {
+        match Self::index_of(attribute) {
+            Some(i) => {
+                self.0[i] = value;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// One data-at-execution parameter: which binding it refers to and how many
@@ -391,6 +493,24 @@ impl StmtState {
         self.bindings.clear();
     }
 
+    /// Makes `metadata` the current result set, restarting the
+    /// `SQL_ATTR_MAX_ROWS` budget.
+    ///
+    /// The cap is per result set, so every path that advances onto a new one
+    /// must come through here; assigning `column_metadata` directly would leave
+    /// a spent budget in place and truncate the next result set.
+    pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
+        self.column_metadata = metadata;
+        self.rows_returned = 0;
+    }
+
+    /// Whether `SQL_ATTR_MAX_ROWS` has already been satisfied for the current
+    /// result set, meaning the cursor must report end-of-data without pulling
+    /// another row.
+    pub(crate) fn max_rows_reached(&self) -> bool {
+        self.max_rows != 0 && self.rows_returned >= self.max_rows
+    }
+
     /// Clears all row-stream state (cursor invalidated, no PLP in progress).
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
@@ -536,6 +656,9 @@ impl StmtHandle {
                 state_flags: 0,
                 dae: None,
                 query_timeout,
+                max_rows: 0,
+                rows_returned: 0,
+                inert_attrs: InertStmtAttrs::default(),
             }),
         }
     }

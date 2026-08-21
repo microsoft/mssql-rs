@@ -491,18 +491,41 @@ pub const SQL_ATTR_READONLY: SqlLen = 0;
 pub const SQL_ATTR_READWRITE_UNKNOWN: SqlLen = 2;
 
 // ---- Statement attribute identifiers (SQLSetStmtAttr / SQLGetStmtAttr) ------
+pub const SQL_ATTR_CURSOR_SCROLLABLE: SqlInteger = -1;
+pub const SQL_ATTR_CURSOR_SENSITIVITY: SqlInteger = -2;
 pub const SQL_ATTR_QUERY_TIMEOUT: SqlInteger = 0;
+pub const SQL_ATTR_MAX_ROWS: SqlInteger = 1;
+pub const SQL_ATTR_NOSCAN: SqlInteger = 2;
+pub const SQL_ATTR_MAX_LENGTH: SqlInteger = 3;
+pub const SQL_ATTR_ASYNC_ENABLE: SqlInteger = 4;
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;
 pub const SQL_ATTR_CURSOR_TYPE: SqlInteger = 6;
 pub const SQL_ATTR_CONCURRENCY: SqlInteger = 7;
+pub const SQL_ATTR_KEYSET_SIZE: SqlInteger = 8;
+/// ODBC 2.x `SQL_ROWSET_SIZE`. Despite the name overlap it is *not* an alias of
+/// [`SQL_ATTR_ROW_ARRAY_SIZE`]: msodbcsql keeps the two in separate slots, so
+/// setting one leaves the other untouched.
+pub const SQL_ROWSET_SIZE: SqlInteger = 9;
+pub const SQL_ATTR_SIMULATE_CURSOR: SqlInteger = 10;
+pub const SQL_ATTR_RETRIEVE_DATA: SqlInteger = 11;
+pub const SQL_ATTR_USE_BOOKMARKS: SqlInteger = 12;
+pub const SQL_ATTR_ROW_NUMBER: SqlInteger = 14;
+pub const SQL_ATTR_ENABLE_AUTO_IPD: SqlInteger = 15;
+pub const SQL_ATTR_FETCH_BOOKMARK_PTR: SqlInteger = 16;
+pub const SQL_ATTR_PARAM_BIND_OFFSET_PTR: SqlInteger = 17;
 pub const SQL_ATTR_PARAM_BIND_TYPE: SqlInteger = 18;
+pub const SQL_ATTR_PARAM_OPERATION_PTR: SqlInteger = 19;
 pub const SQL_ATTR_PARAM_STATUS_PTR: SqlInteger = 20;
 pub const SQL_ATTR_PARAMS_PROCESSED_PTR: SqlInteger = 21;
 pub const SQL_ATTR_PARAMSET_SIZE: SqlInteger = 22;
 pub const SQL_ATTR_ROW_BIND_OFFSET_PTR: SqlInteger = 23;
+pub const SQL_ATTR_ROW_OPERATION_PTR: SqlInteger = 24;
 pub const SQL_ATTR_ROW_STATUS_PTR: SqlInteger = 25;
 pub const SQL_ATTR_ROWS_FETCHED_PTR: SqlInteger = 26;
 pub const SQL_ATTR_ROW_ARRAY_SIZE: SqlInteger = 27;
+/// Shared between the connection and statement scopes; only the statement form
+/// is recognized here.
+pub const SQL_ATTR_METADATA_ID: SqlInteger = 10014;
 
 /// `SQL_ATTR_ROW_BIND_TYPE` value selecting column-wise (array-of-columns)
 /// binding — the mode mssql-python uses.
@@ -515,6 +538,23 @@ pub const SQL_ROWSET_SIZE_DEFAULT: SqlULen = 1;
 pub const SQL_CURSOR_FORWARD_ONLY: SqlULen = 0;
 /// `SQL_ATTR_CONCURRENCY` value: read-only.
 pub const SQL_CONCUR_READ_ONLY: SqlULen = 1;
+/// `SQL_ATTR_CURSOR_SCROLLABLE` value: the cursor cannot scroll. Implied by
+/// [`SQL_CURSOR_FORWARD_ONLY`] — msodbcsql keeps the two in step, flipping the
+/// cursor type when scrollability is requested and vice versa.
+pub const SQL_NONSCROLLABLE: SqlULen = 0;
+/// `SQL_ATTR_CURSOR_SENSITIVITY` value reported for this driver's cursor.
+/// A request for `SQL_UNSPECIFIED` (0) resolves to this, matching msodbcsql,
+/// which answers `1` after a caller sets `0`.
+pub const SQL_INSENSITIVE: SqlULen = 1;
+/// `SQL_ATTR_SIMULATE_CURSOR` value msodbcsql reports and accepts; any other
+/// request is substituted for it and reported with `01S02`.
+pub const SQL_SC_UNIQUE: SqlULen = 2;
+/// `SQL_ATTR_RETRIEVE_DATA` default: data is retrieved on fetch.
+pub const SQL_RD_ON: SqlULen = 1;
+/// Value msodbcsql substitutes for any non-zero `SQL_ATTR_MAX_LENGTH` request,
+/// reporting `01S02`. The cap is cosmetic on both drivers: a value longer than
+/// this is still returned whole.
+pub const MSODBCSQL_MAX_LENGTH: SqlULen = 8000;
 /// Largest `SQL_ATTR_QUERY_TIMEOUT` msodbcsql accepts; larger requests are
 /// clamped to it and reported with `01S02` (`MAX_QUERY_TIMEOUT`,
 /// msodbcsql `sqlcmisc.cpp:3988`).

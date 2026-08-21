@@ -202,6 +202,8 @@ static DBC_ATTRS: &[AttrRow] = &[
 /// attribute, and the sweep confirmed msodbcsql answers `HY092` for it on a
 /// statement handle even though the identifier sits in the shared vendor range.
 static STMT_ATTRS: &[AttrRow] = &[
+    (-2, "SQL_ATTR_CURSOR_SENSITIVITY", OP_SET | OP_GET),
+    (-1, "SQL_ATTR_CURSOR_SCROLLABLE", OP_SET | OP_GET),
     (0, "SQL_ATTR_QUERY_TIMEOUT", OP_SET | OP_GET),
     (1, "SQL_ATTR_MAX_ROWS", OP_SET | OP_GET),
     (2, "SQL_ATTR_NOSCAN", OP_SET | OP_GET),
@@ -211,6 +213,7 @@ static STMT_ATTRS: &[AttrRow] = &[
     (6, "SQL_ATTR_CURSOR_TYPE", OP_SET | OP_GET),
     (7, "SQL_ATTR_CONCURRENCY", OP_SET | OP_GET),
     (8, "SQL_ATTR_KEYSET_SIZE", OP_SET | OP_GET),
+    (9, "SQL_ROWSET_SIZE", OP_SET | OP_GET),
     (10, "SQL_ATTR_SIMULATE_CURSOR", OP_SET | OP_GET),
     (11, "SQL_ATTR_RETRIEVE_DATA", OP_SET | OP_GET),
     (12, "SQL_ATTR_USE_BOOKMARKS", OP_SET | OP_GET),
@@ -534,14 +537,28 @@ mod tests {
     }
 
     /// Negative identifiers are reachable from Python, whose `attrs_before`
-    /// keys are unbounded ints, and must never be treated as recognized.
+    /// keys are unbounded ints. Only the two ODBC 3.x cursor attributes are
+    /// genuinely negative; every other negative value must stay unknown so it
+    /// is rejected rather than silently accepted.
     #[test]
-    fn negative_identifiers_are_unknown() {
-        for id in [-1, -1000, SqlInteger::MIN] {
+    fn only_the_cursor_attributes_are_negative() {
+        for id in [-3, -1000, SqlInteger::MIN] {
             for scope in SCOPES {
                 for op in OPS {
                     assert!(native_attr_name(scope, op, id).is_none(), "id {id}");
                 }
+            }
+        }
+        for id in [-1, -2] {
+            for op in OPS {
+                assert!(
+                    native_attr_name(AttrScope::Stmt, op, id).is_some(),
+                    "stmt id {id}"
+                );
+                assert!(
+                    native_attr_name(AttrScope::Dbc, op, id).is_none(),
+                    "dbc id {id}"
+                );
             }
         }
     }

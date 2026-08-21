@@ -9,11 +9,17 @@
 //! fetch path. `SQL_ATTR_CURSOR_TYPE` and `SQL_ATTR_CONCURRENCY` accept only the
 //! supported forward-only / read-only values; any other request is substituted
 //! and reported with `01S02` (option value changed) rather than silently
-//! succeeding. `SQL_ATTR_QUERY_TIMEOUT` is stored and clamped to
-//! [`MAX_QUERY_TIMEOUT`], matching msodbcsql, which reports `01S02` rather than
-//! rejecting an over-large request; enforcing the stored timeout against a
-//! running statement is tracked separately. Other recognized statement
-//! attributes (param / descriptor controls) are accepted without effect.
+//! succeeding; `SQL_ATTR_CURSOR_SCROLLABLE` is the same setting seen from the
+//! other side and behaves identically. `SQL_ATTR_QUERY_TIMEOUT` is stored and
+//! clamped to [`MAX_QUERY_TIMEOUT`], matching msodbcsql, which reports `01S02`
+//! rather than rejecting an over-large request; enforcing the stored timeout
+//! against a running statement is tracked separately. `SQL_ATTR_MAX_ROWS` is
+//! stored and genuinely enforced by the fetch path. Other recognized statement
+//! attributes (param / cursor / descriptor controls) are stored and
+//! round-tripped without effect, because msodbcsql reports back whatever was
+//! written; the handful whose reported value msodbcsql pins regardless of the
+//! request (`SQL_ATTR_MAX_LENGTH`, `SQL_ATTR_KEYSET_SIZE`,
+//! `SQL_ATTR_SIMULATE_CURSOR`) substitute and warn with `01S02`.
 //! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger
 //! batches, since parameter arrays are not yet consumed and a silent success
 //! would execute only the first row. Unrecognized attribute identifiers fail
@@ -26,16 +32,19 @@ use tracing::{debug, error};
 
 use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
-    MAX_QUERY_TIMEOUT, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_CONCURRENCY,
-    SQL_ATTR_CURSOR_TYPE, SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_PARAM_BIND_TYPE,
-    SQL_ATTR_PARAM_STATUS_PTR, SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_PARAMSET_SIZE,
-    SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR,
-    SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
-    SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    MAX_QUERY_TIMEOUT, MSODBCSQL_MAX_LENGTH, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC,
+    SQL_ATTR_CONCURRENCY, SQL_ATTR_CURSOR_SCROLLABLE, SQL_ATTR_CURSOR_SENSITIVITY,
+    SQL_ATTR_CURSOR_TYPE, SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_KEYSET_SIZE,
+    SQL_ATTR_MAX_LENGTH, SQL_ATTR_MAX_ROWS, SQL_ATTR_PARAMSET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
+    SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR, SQL_ATTR_ROW_BIND_TYPE,
+    SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
+    SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR,
+    SQL_INSENSITIVE, SQL_INVALID_HANDLE, SQL_NONSCROLLABLE, SQL_SC_UNIQUE, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CURSOR_STATE, SQLSTATE_01S02,
+    SQLSTATE_HYC00,
     WARN_OPTION_VALUE_CHANGED, post_diag,
 };
 use crate::api::util::write_if_some;
@@ -243,14 +252,104 @@ fn sql_set_stmt_attr_w_safe(
             }
             SQL_SUCCESS
         }
-        // Recognized attributes accepted without tracking: these param /
-        // descriptor controls have no effect on the implemented forward-only,
-        // read-only behavior.
-        SQL_ATTR_PARAM_BIND_TYPE
-        | SQL_ATTR_PARAM_STATUS_PTR
-        | SQL_ATTR_PARAMS_PROCESSED_PTR
-        | SQL_ATTR_APP_ROW_DESC
-        | SQL_ATTR_APP_PARAM_DESC => {
+        SQL_ATTR_MAX_ROWS => {
+            // Enforced, not merely stored: `fetch_rows_next` stops the cursor
+            // once this many rows have been returned from the current result
+            // set, matching msodbcsql.
+            state.max_rows = value_ptr as SqlULen;
+            debug!(
+                max_rows = state.max_rows,
+                "SQLSetStmtAttrW: SQL_ATTR_MAX_ROWS set"
+            );
+            SQL_SUCCESS
+        }
+        SQL_ATTR_MAX_LENGTH => {
+            // msodbcsql substitutes MSODBCSQL_MAX_LENGTH for any non-zero
+            // request and reports 01S02; the cap is then never applied, and a
+            // longer value still comes back whole. Mirror the reported value
+            // and the warning so an application that inspects either sees the
+            // same thing from both drivers.
+            let requested = value_ptr as SqlULen;
+            let effective = if requested == 0 {
+                0
+            } else {
+                MSODBCSQL_MAX_LENGTH
+            };
+            state.inert_attrs.set(SQL_ATTR_MAX_LENGTH, effective);
+            if requested == effective {
+                SQL_SUCCESS
+            } else {
+                post_diag(&mut state, WARN_OPTION_VALUE_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            }
+        }
+        SQL_ATTR_KEYSET_SIZE => {
+            // Keyset-driven cursors are not implemented, so any non-zero keyset
+            // is refused the same way msodbcsql refuses it: the stored value
+            // stays 0 and the caller is told with 01S02.
+            if value_ptr as SqlULen == 0 {
+                SQL_SUCCESS
+            } else {
+                post_diag(&mut state, WARN_OPTION_VALUE_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            }
+        }
+        SQL_ATTR_SIMULATE_CURSOR => {
+            // msodbcsql reports SQL_SC_UNIQUE and accepts only that value.
+            if value_ptr as SqlULen == SQL_SC_UNIQUE {
+                SQL_SUCCESS
+            } else {
+                post_diag(&mut state, WARN_OPTION_VALUE_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            }
+        }
+        SQL_ATTR_CURSOR_SCROLLABLE => {
+            // Scrollability is the cursor type seen from the other side:
+            // msodbcsql moves SQL_ATTR_CURSOR_TYPE off forward-only when a
+            // caller asks for a scrollable cursor. This driver has no scrollable
+            // cursor, so a request is substituted and reported exactly as
+            // SQL_ATTR_CURSOR_TYPE already does.
+            if value_ptr as SqlULen == SQL_NONSCROLLABLE {
+                SQL_SUCCESS
+            } else {
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_01S02,
+                    0,
+                    "Scrollable cursors not supported; substituted SQL_NONSCROLLABLE",
+                );
+                SQL_SUCCESS_WITH_INFO
+            }
+        }
+        SQL_ATTR_CURSOR_SENSITIVITY => {
+            // SQL_UNSPECIFIED (0) means "whatever the driver does", so the get
+            // path must answer with the driver's actual sensitivity rather than
+            // the request. msodbcsql resolves it to SQL_INSENSITIVE silently —
+            // no 01S02 — and stores any other value verbatim.
+            let requested = value_ptr as SqlULen;
+            let effective = if requested == 0 {
+                SQL_INSENSITIVE
+            } else {
+                requested
+            };
+            state
+                .inert_attrs
+                .set(SQL_ATTR_CURSOR_SENSITIVITY, effective);
+            SQL_SUCCESS
+        }
+        // Recognized attributes stored and round-tripped without effect: these
+        // param / cursor / descriptor controls do not change the implemented
+        // forward-only, read-only behavior, but msodbcsql reports back whatever
+        // was written, so silently discarding the value would diverge on the
+        // very next get.
+        attribute if state.inert_attrs.set(attribute, value_ptr as SqlULen) => {
+            debug!(
+                attribute,
+                "SQLSetStmtAttrW: attribute stored without effect"
+            );
+            SQL_SUCCESS
+        }
+        SQL_ATTR_APP_ROW_DESC | SQL_ATTR_APP_PARAM_DESC => {
             debug!(attribute, "SQLSetStmtAttrW: attribute accepted as no-op");
             SQL_SUCCESS
         }
@@ -341,6 +440,29 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_QUERY_TIMEOUT => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.query_timeout as SqlULen);
         },
+        SQL_ATTR_MAX_ROWS => unsafe {
+            write_if_some(value_ptr as *mut SqlULen, state.max_rows);
+        },
+        SQL_ATTR_ROW_NUMBER => {
+            // Get-only, and only answerable while the cursor sits on a row:
+            // msodbcsql returns 24000 on a statement with no cursor, on an
+            // executed-but-not-yet-fetched cursor, and again once the rowset is
+            // exhausted or closed. Positioned, it answers 0 rather than an
+            // ordinal, because a forward-only cursor keeps no rowset origin to
+            // number rows against.
+            if !state.row_positioned {
+                post_diag(&mut state, ERR_INVALID_CURSOR_STATE);
+                return SQL_ERROR;
+            }
+            unsafe {
+                write_if_some(value_ptr as *mut SqlULen, 0);
+            }
+        }
+        SQL_ATTR_CURSOR_SCROLLABLE => unsafe {
+            // Derived from the cursor type rather than stored, so the pair can
+            // never disagree.
+            write_if_some(value_ptr as *mut SqlULen, SQL_NONSCROLLABLE);
+        },
         // Recognized attributes we don't store: report their effective ODBC
         // defaults for this forward-only, read-only, single-paramset driver.
         SQL_ATTR_CURSOR_TYPE => unsafe {
@@ -370,13 +492,21 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_IMP_PARAM_DESC => unsafe {
             write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
         },
-        _ => {
-            post_diag(
-                &mut state,
-                unimplemented_attr_diag(AttrScope::Stmt, AttrOp::Get, attribute),
-            );
-            return SQL_ERROR;
-        }
+        // Attributes the set path stores without effect share the table that
+        // holds their measured defaults, so a get before any set answers what
+        // msodbcsql answers. Anything not in it is genuinely unhandled.
+        _ => match state.inert_attrs.get(attribute) {
+            Some(value) => unsafe {
+                write_if_some(value_ptr as *mut SqlULen, value);
+            },
+            None => {
+                post_diag(
+                    &mut state,
+                    unimplemented_attr_diag(AttrScope::Stmt, AttrOp::Get, attribute),
+                );
+                return SQL_ERROR;
+            }
+        },
     }
 
     SQL_SUCCESS
@@ -385,9 +515,17 @@ fn sql_get_stmt_attr_w_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_BIND_BY_COLUMN, SQL_NULL_HANDLE};
-    use crate::api::sqlstate::SQLSTATE_HY092;
+    use crate::api::odbc_types::{
+        SQL_ATTR_ASYNC_ENABLE, SQL_ATTR_ENABLE_AUTO_IPD, SQL_ATTR_FETCH_BOOKMARK_PTR,
+        SQL_ATTR_METADATA_ID, SQL_ATTR_NOSCAN, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+        SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
+        SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_RETRIEVE_DATA, SQL_ATTR_ROW_BIND_OFFSET_PTR,
+        SQL_ATTR_ROW_OPERATION_PTR, SQL_ATTR_USE_BOOKMARKS, SQL_BIND_BY_COLUMN, SQL_NULL_HANDLE,
+        SQL_RD_ON, SQL_ROWSET_SIZE,
+    };
+    use crate::api::sqlstate::{SQLSTATE_24000, SQLSTATE_HY092};
     use crate::handles::handle_from_raw;
+    use crate::handles::stmt::InertStmtAttrs;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -575,6 +713,58 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().row_status_ptr, ptr);
+    }
+
+    /// The rowset pointers are the only statement attributes whose value *is* a
+    /// pointer, so the get path has to write a pointer-width slot rather than
+    /// the `SqlULen` every other attribute uses. Round-tripped through the
+    /// public entry points because an application that sets a rowset pointer
+    /// and reads it back must get the same address, not a truncated one.
+    #[test]
+    fn rowset_pointers_round_trip_through_the_get_path() {
+        let h = TestHandles::with_env_dbc_stmt();
+
+        let mut rows_fetched: SqlULen = 0;
+        let fetched_ptr = &mut rows_fetched as *mut SqlULen;
+        let mut status: SqlUSmallInt = 0;
+        let status_ptr = &mut status as *mut SqlUSmallInt;
+
+        unsafe {
+            assert_eq!(
+                sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROWS_FETCHED_PTR, fetched_ptr.cast(), 0),
+                SQL_SUCCESS
+            );
+            assert_eq!(
+                sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_STATUS_PTR, status_ptr.cast(), 0),
+                SQL_SUCCESS
+            );
+
+            let mut out_fetched: *mut SqlULen = std::ptr::null_mut();
+            assert_eq!(
+                sql_get_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_ROWS_FETCHED_PTR,
+                    (&raw mut out_fetched).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                SQL_SUCCESS
+            );
+            assert_eq!(out_fetched, fetched_ptr);
+
+            let mut out_status: *mut SqlUSmallInt = std::ptr::null_mut();
+            assert_eq!(
+                sql_get_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_ROW_STATUS_PTR,
+                    (&raw mut out_status).cast(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                SQL_SUCCESS
+            );
+            assert_eq!(out_status, status_ptr);
+        }
     }
 
     #[test]
@@ -937,5 +1127,326 @@ mod tests {
             stmt.inner.lock().unwrap().diag_records.is_empty(),
             "stale diagnostic from the prior failure was not cleared"
         );
+    }
+
+    // ---- S4: remaining statement attributes -------------------------------
+    //
+    // Every expectation below was measured against msodbcsql 18 rather than
+    // read out of the ODBC headers; see `docs/attributes_plan.md` §8.
+
+    /// Sets an attribute and returns the return code.
+    fn set_attr(stmt: SqlHandle, attribute: SqlInteger, value: SqlULen) -> SqlReturn {
+        unsafe { sql_set_stmt_attr_w(stmt, attribute, value as SqlPointer, 0) }
+    }
+
+    /// Reads an attribute back, asserting the get itself succeeded.
+    fn get_attr(stmt: SqlHandle, attribute: SqlInteger) -> SqlULen {
+        let mut out: SqlULen = 0;
+        let rc = unsafe {
+            sql_get_stmt_attr_w(
+                stmt,
+                attribute,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS, "get of attribute {attribute} failed");
+        out
+    }
+
+    /// The msodbcsql defaults, restated independently of the table the driver
+    /// reads them from so the two can be compared rather than agreeing by
+    /// construction.
+    const MEASURED_DEFAULTS: &[(SqlInteger, SqlULen)] = &[
+        (SQL_ATTR_NOSCAN, 0),
+        (SQL_ATTR_MAX_LENGTH, 0),
+        (SQL_ATTR_ASYNC_ENABLE, 0),
+        (SQL_ATTR_KEYSET_SIZE, 0),
+        (SQL_ROWSET_SIZE, 1),
+        (SQL_ATTR_SIMULATE_CURSOR, SQL_SC_UNIQUE),
+        (SQL_ATTR_RETRIEVE_DATA, SQL_RD_ON),
+        (SQL_ATTR_USE_BOOKMARKS, 0),
+        (SQL_ATTR_ENABLE_AUTO_IPD, 0),
+        (SQL_ATTR_FETCH_BOOKMARK_PTR, 0),
+        (SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0),
+        (SQL_ATTR_PARAM_BIND_TYPE, 0),
+        (SQL_ATTR_PARAM_OPERATION_PTR, 0),
+        (SQL_ATTR_PARAM_STATUS_PTR, 0),
+        (SQL_ATTR_PARAMS_PROCESSED_PTR, 0),
+        (SQL_ATTR_ROW_BIND_OFFSET_PTR, 0),
+        (SQL_ATTR_ROW_OPERATION_PTR, 0),
+        (SQL_ATTR_METADATA_ID, 0),
+        (SQL_ATTR_CURSOR_SENSITIVITY, SQL_INSENSITIVE),
+    ];
+
+    /// A get before any set must answer the measured default, because an
+    /// application that reads an attribute to decide whether to change it would
+    /// otherwise take a different branch on each driver.
+    #[test]
+    fn inert_attribute_defaults_match_msodbcsql() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for &(attribute, expected) in MEASURED_DEFAULTS {
+            assert_eq!(get_attr(h.stmt, attribute), expected, "attr {attribute}");
+        }
+    }
+
+    /// Guards [`MEASURED_DEFAULTS`] against drift: adding an identifier to the
+    /// store without measuring its msodbcsql default would otherwise ship an
+    /// invented value that no test ever looks at.
+    #[test]
+    fn every_inert_identifier_has_a_measured_default() {
+        for attribute in InertStmtAttrs::identifiers() {
+            assert!(
+                MEASURED_DEFAULTS.iter().any(|&(id, _)| id == attribute),
+                "attribute {attribute} is stored but has no asserted default"
+            );
+        }
+    }
+
+    /// The set/get asymmetry this slice closes: these were previously accepted
+    /// and discarded, so a read-back reported a stale default.
+    #[test]
+    fn inert_attributes_round_trip_the_written_value() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for (attribute, value) in [
+            (SQL_ATTR_NOSCAN, 1),
+            (SQL_ATTR_ASYNC_ENABLE, 1),
+            (SQL_ROWSET_SIZE, 10),
+            (SQL_ATTR_RETRIEVE_DATA, 0),
+            (SQL_ATTR_USE_BOOKMARKS, 2),
+            (SQL_ATTR_ENABLE_AUTO_IPD, 1),
+            (SQL_ATTR_FETCH_BOOKMARK_PTR, 0x1234),
+            (SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0x2345),
+            (SQL_ATTR_PARAM_BIND_TYPE, 16),
+            (SQL_ATTR_PARAM_OPERATION_PTR, 0x3456),
+            (SQL_ATTR_PARAM_STATUS_PTR, 0x4567),
+            (SQL_ATTR_PARAMS_PROCESSED_PTR, 0x5678),
+            (SQL_ATTR_ROW_BIND_OFFSET_PTR, 0x6789),
+            (SQL_ATTR_ROW_OPERATION_PTR, 0x789a),
+            (SQL_ATTR_METADATA_ID, 1),
+        ] {
+            assert_eq!(
+                set_attr(h.stmt, attribute, value),
+                SQL_SUCCESS,
+                "set {attribute}"
+            );
+            assert_eq!(get_attr(h.stmt, attribute), value, "readback {attribute}");
+        }
+    }
+
+    /// `SQL_ROWSET_SIZE` shares a name with `SQL_ATTR_ROW_ARRAY_SIZE` but not a
+    /// slot: msodbcsql keeps them independent, so treating one as an alias of
+    /// the other would silently resize an application's rowset.
+    #[test]
+    fn rowset_size_is_independent_of_row_array_size() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(set_attr(h.stmt, SQL_ROWSET_SIZE, 7), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ROWSET_SIZE), 7);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE), 1);
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE, 5), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_ARRAY_SIZE), 5);
+        assert_eq!(get_attr(h.stmt, SQL_ROWSET_SIZE), 7);
+    }
+
+    /// A non-zero `SQL_ATTR_MAX_LENGTH` is substituted rather than honored, and
+    /// the substitution is announced. The cap is cosmetic on msodbcsql too — a
+    /// longer value still comes back whole — so only the reported state matters.
+    #[test]
+    fn max_length_substitutes_and_warns() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_MAX_LENGTH, 10),
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_LENGTH), MSODBCSQL_MAX_LENGTH);
+    }
+
+    #[test]
+    fn max_length_zero_is_accepted_silently() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_MAX_LENGTH, 0), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_LENGTH), 0);
+    }
+
+    /// Setting the already-substituted value is not itself a change, so it must
+    /// not warn a second time.
+    #[test]
+    fn max_length_at_the_substituted_value_is_accepted_silently() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let rc = set_attr(h.stmt, SQL_ATTR_MAX_LENGTH, MSODBCSQL_MAX_LENGTH);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_LENGTH), MSODBCSQL_MAX_LENGTH);
+    }
+
+    #[test]
+    fn keyset_size_zero_accepted_nonzero_warns_and_stays_zero() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_KEYSET_SIZE, 0), SQL_SUCCESS);
+
+        let rc = set_attr(h.stmt, SQL_ATTR_KEYSET_SIZE, 100);
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_KEYSET_SIZE), 0);
+    }
+
+    #[test]
+    fn simulate_cursor_accepts_only_unique() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_SIMULATE_CURSOR, SQL_SC_UNIQUE),
+            SQL_SUCCESS
+        );
+
+        let rc = set_attr(h.stmt, SQL_ATTR_SIMULATE_CURSOR, 0);
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_SIMULATE_CURSOR), SQL_SC_UNIQUE);
+    }
+
+    /// `SQL_UNSPECIFIED` means "whatever the driver does", so the get must
+    /// resolve it to the driver's actual sensitivity instead of echoing the
+    /// request. msodbcsql resolves it silently, with no `01S02`.
+    #[test]
+    fn cursor_sensitivity_unspecified_resolves_to_insensitive() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_CURSOR_SENSITIVITY, 0),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            get_attr(h.stmt, SQL_ATTR_CURSOR_SENSITIVITY),
+            SQL_INSENSITIVE
+        );
+    }
+
+    #[test]
+    fn cursor_sensitivity_explicit_values_round_trip() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for value in [1, 2] {
+            assert_eq!(
+                set_attr(h.stmt, SQL_ATTR_CURSOR_SENSITIVITY, value),
+                SQL_SUCCESS
+            );
+            assert_eq!(get_attr(h.stmt, SQL_ATTR_CURSOR_SENSITIVITY), value);
+        }
+    }
+
+    #[test]
+    fn cursor_scrollable_nonscrollable_accepted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let rc = set_attr(h.stmt, SQL_ATTR_CURSOR_SCROLLABLE, SQL_NONSCROLLABLE);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            get_attr(h.stmt, SQL_ATTR_CURSOR_SCROLLABLE),
+            SQL_NONSCROLLABLE
+        );
+    }
+
+    /// Scrollability is the cursor type seen from the other side, so a request
+    /// for a scrollable cursor is refused exactly as `SQL_ATTR_CURSOR_TYPE`
+    /// refuses a non-forward-only type: substituted, and announced.
+    #[test]
+    fn cursor_scrollable_request_is_substituted_like_cursor_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_CURSOR_SCROLLABLE, 1),
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01S02);
+        assert_eq!(
+            get_attr(h.stmt, SQL_ATTR_CURSOR_SCROLLABLE),
+            SQL_NONSCROLLABLE
+        );
+        assert_eq!(
+            get_attr(h.stmt, SQL_ATTR_CURSOR_TYPE),
+            SQL_CURSOR_FORWARD_ONLY
+        );
+    }
+
+    /// The pair can never disagree, because scrollability is derived from the
+    /// cursor type rather than stored alongside it.
+    #[test]
+    fn cursor_scrollable_stays_consistent_with_cursor_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_attr(h.stmt, SQL_ATTR_CURSOR_TYPE, 2),
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(
+            get_attr(h.stmt, SQL_ATTR_CURSOR_SCROLLABLE),
+            SQL_NONSCROLLABLE
+        );
+    }
+
+    #[test]
+    fn max_rows_defaults_to_unlimited_and_round_trips() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_ROWS), 0);
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_MAX_ROWS, 3), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_ROWS), 3);
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_MAX_ROWS, 0), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_MAX_ROWS), 0);
+    }
+
+    /// `SQL_ATTR_ROW_NUMBER` is get-only; the set falls through to the
+    /// recognition table, which knows msodbcsql rejects it.
+    #[test]
+    fn row_number_cannot_be_set() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_ROW_NUMBER, 1), SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY092);
+    }
+
+    /// Answerable only while the cursor sits on a row. A fresh statement has no
+    /// cursor, so msodbcsql reports `24000` rather than a position.
+    #[test]
+    fn row_number_without_a_cursor_is_invalid_cursor_state() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut out: SqlULen = 0;
+        let rc = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_ROW_NUMBER,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_24000);
+    }
+
+    /// Positioned, msodbcsql answers 0 rather than an ordinal: a forward-only
+    /// cursor keeps no rowset origin to number rows against.
+    #[test]
+    fn row_number_on_a_positioned_cursor_is_zero() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().row_positioned = true;
+        }
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_ROW_NUMBER), 0);
+    }
+
+    /// The inert table is a linear scan over identifiers, so a duplicate would
+    /// make the second entry unreachable and pin its attribute to the first
+    /// one's value.
+    #[test]
+    fn inert_attribute_identifiers_are_unique() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        let ids: Vec<SqlInteger> = InertStmtAttrs::identifiers().collect();
+        assert!(!ids.is_empty());
+        for (i, attribute) in ids.iter().enumerate() {
+            assert!(
+                !ids[..i].contains(attribute),
+                "duplicate inert attribute {attribute}"
+            );
+            assert!(state.inert_attrs.get(*attribute).is_some());
+        }
     }
 }

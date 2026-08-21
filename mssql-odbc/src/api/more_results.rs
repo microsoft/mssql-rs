@@ -111,7 +111,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
                 return SQL_ERROR;
             };
-            stmt_state.column_metadata = metadata;
+            stmt_state.begin_result_set(metadata);
             stmt_state.reset_row_stream();
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();

@@ -348,11 +348,11 @@ rejection and the `HY024`/native-911 mapping for a nonexistent database.
 
 ---
 
-### S4 — Remaining ODBC-standard statement attributes
+### S4 — Remaining ODBC-standard statement attributes — **shipped**
 
-> `mssql-odbc | Remaining ODBC statement attributes`
+> `mssql-odbc | Remaining ODBC statement attributes` (AB#47456)
 
-**Scope** — for each, either honor it or reject with msodbcsql's exact SQLSTATE;
+**Scope** — for each, either honor it or answer with msodbcsql's exact SQLSTATE;
 no silent success. Derived from `sqlcmisc.cpp:3508` case labels minus what already
 works and minus S2:
 
@@ -367,11 +367,66 @@ works and minus S2:
 
 Also closes the asymmetry where four attributes accept a set but reject the get
 (`PARAM_BIND_TYPE`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`,
-`ROW_BIND_OFFSET_PTR`) — an app that writes then reads currently gets `HY092`.
+`ROW_BIND_OFFSET_PTR`) — an app that writes then reads previously got `HY092`.
 
-**Cross-story notes:** `SQL_ATTR_NOSCAN` must be readable by AB#46384;
-`SQL_ATTR_METADATA_ID` contradicts `catalog.rs:767`, which hardcodes "never TRUE"
-— either wire it through or document the divergence there.
+#### Measured contract
+
+Every row was measured against msodbcsql 18 with the §8 sweep plus targeted
+value probes; none of it was read out of `sqlext.h`, which documents the ODBC
+ideal rather than what this driver does.
+
+| id | attribute | default | behavior |
+|---|---|---|---|
+| 1 | `MAX_ROWS` | 0 | **enforced**: bounds each result set; 0 is unlimited |
+| 2 | `NOSCAN` | 0 | stored, round-trips |
+| 3 | `MAX_LENGTH` | 0 | 0 → success; non-zero → `01S02`, stored value becomes 8000 |
+| 4 | `ASYNC_ENABLE` | 0 | stored |
+| 8 | `KEYSET_SIZE` | 0 | 0 → success; non-zero → `01S02`, stays 0 |
+| 9 | `SQL_ROWSET_SIZE` | 1 | stored, **independent of `ROW_ARRAY_SIZE`** |
+| 10 | `SIMULATE_CURSOR` | `SQL_SC_UNIQUE` | only unique; otherwise `01S02`, unchanged |
+| 11 | `RETRIEVE_DATA` | `SQL_RD_ON` | stored |
+| 12 | `USE_BOOKMARKS` | 0 | stored |
+| 14 | `ROW_NUMBER` | — | get-only; `24000` unless positioned on a row, else 0 |
+| 15 | `ENABLE_AUTO_IPD` | 0 | stored |
+| 16–24 | bind/offset/status pointers | 0 | stored |
+| 10014 | `METADATA_ID` | 0 | stored |
+| -1 | `CURSOR_SCROLLABLE` | `SQL_NONSCROLLABLE` | the boolean face of `CURSOR_TYPE` |
+| -2 | `CURSOR_SENSITIVITY` | `SQL_INSENSITIVE` | `SQL_UNSPECIFIED` normalises to insensitive, silently |
+
+Four findings changed the implementation:
+
+- **The `MAX_ROWS` cutoff has to invalidate the row stream, not just return
+  `SQL_NO_DATA`.** Measured on msodbcsql, stopping at the cap leaves the cursor
+  in exactly the state it reaches at the natural end of a result set:
+  `SQL_ATTR_ROW_NUMBER` and `SQLGetData` both answer `24000`. Short-circuiting
+  the fetch before the row stream is reset would keep the previous row readable
+  past `SQL_NO_DATA`, so an application that loops on `SQLFetch` and then reads
+  columns would see one phantom row here and none on msodbcsql.
+- **`SQL_ATTR_ROW_NUMBER` is not unconditionally 0.** An earlier probe only read
+  it mid-fetch and saw 0. A full cursor-lifecycle probe showed `24000` with no
+  cursor, `24000` after execute but before the first fetch, 0 while positioned,
+  and `24000` again once the cursor is exhausted or closed. Returning a flat 0
+  would make "no cursor" indistinguishable from a real position.
+- **Four defaults are not 0** (`SQL_ROWSET_SIZE`, `SIMULATE_CURSOR`,
+  `RETRIEVE_DATA`, `CURSOR_SENSITIVITY`). An application that reads an attribute
+  to decide whether to change it takes a different branch on a driver that
+  answers a blanket 0.
+- **`HY024` on out-of-range values comes from the Driver Manager, not the
+  driver.** The DM range-checks the documented booleans and enums before
+  dispatch, so a driver-side rejection for those values is unreachable. Range
+  validation is therefore deliberately absent; the identifiers themselves do
+  reach the driver, which is also how `CURSOR_SCROLLABLE` is shown to alias
+  `CURSOR_TYPE` driver-side.
+
+**Known divergence:** `SQL_ATTR_CURSOR_SCROLLABLE = SQL_SCROLLABLE` succeeds on
+msodbcsql and reports `01S02` here, because scrollable cursors are a deferred
+feature. It is the same single divergence already recorded for
+`SQL_ATTR_CURSOR_TYPE`, since the two are one setting. Variation 40 asserts the
+shared invariant on both drivers and the per-driver state separately.
+
+**Cross-story notes:** `SQL_ATTR_NOSCAN` is now readable for AB#46384;
+`SQL_ATTR_METADATA_ID` is stored and round-trips, but `catalog.rs:767` still
+hardcodes "never TRUE" — wiring it into catalog-function matching is S5 work.
 
 **Size:** M. **Depends on:** S1.
 
