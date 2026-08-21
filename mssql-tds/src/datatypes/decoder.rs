@@ -2419,6 +2419,10 @@ impl DecimalParts {
         if self.is_positive { d_ret } else { -d_ret }
     }
 
+    fn clamped_scale(&self) -> usize {
+        (self.scale as usize).min(DECIMAL_STR_LEN - 3)
+    }
+
     /// The `index`-th little-endian 32-bit word of the magnitude, counting from
     /// the least significant. Words past the fourth are always zero.
     ///
@@ -2435,7 +2439,8 @@ impl DecimalParts {
     /// least one so that zero still has a word.
     ///
     /// This is the minimal count, not the width the value was decoded from:
-    /// trailing zero words are not reported.
+    /// trailing zero words are not reported. Consumers must accumulate the
+    /// returned words rather than assuming a fixed width.
     pub fn word_count(&self) -> usize {
         (128 - self.magnitude().leading_zeros() as usize)
             .div_ceil(32)
@@ -2444,8 +2449,9 @@ impl DecimalParts {
 
     /// Builds a value from little-endian 32-bit words, least significant first.
     ///
-    /// Words past the fourth are ignored: a `decimal`/`numeric` with precision
-    /// <= 38 never sets them, and every encoder here already emits at most four.
+    /// Zero words past the fourth are ignored. Non-zero words cannot fit in the
+    /// representation and trigger a debug assertion; callers at trust boundaries
+    /// should use [`Self::try_from_words`] to reject them in every build.
     pub fn from_words(is_positive: bool, precision: u8, scale: u8, words: &[i32]) -> Self {
         debug_assert!(
             words

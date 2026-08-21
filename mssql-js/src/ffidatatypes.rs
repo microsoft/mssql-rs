@@ -666,3 +666,20 @@ pub fn transform_col(col: ColumnValues) -> RowDataType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_decimal_magnitude_is_rejected() {
+        let decimal = NapiDecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![1, 0, 0, 0, 1],
+        };
+
+        assert!(DecimalParts::try_from(decimal).is_err());
+    }
+}
