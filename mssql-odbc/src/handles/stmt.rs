@@ -545,8 +545,10 @@ const VENDOR_STMT_ATTRS: &[(SqlInteger, SqlULen, ValueRule)] = &[
     (
         odbc_types::SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT,
         odbc_types::SQL_QN_TIMEOUT_DEFAULT,
-        // Zero is rejected, unlike most ODBC timeouts where it means "no limit".
-        ValueRule::Range(1, u32::MAX as SqlULen),
+        // Zero is rejected, unlike most ODBC timeouts where it means "no limit",
+        // and the ceiling is i32::MAX rather than the full SQLULEN width:
+        // msodbcsql answers HY024 from 2^31 upwards on 64-bit.
+        ValueRule::Range(1, i32::MAX as SqlULen),
     ),
     (odbc_types::SQL_SOPT_SS_PARAM_FOCUS, 0, ValueRule::Rejected),
     (

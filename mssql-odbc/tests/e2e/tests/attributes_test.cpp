@@ -75,6 +75,9 @@
 //   53. CurrentCommandTracksTheResultSetOrdinal        - per execute, not a flag
 //   54. QueryNotificationStringsFollowTheByteLengthContract - bytes, not chars
 //   55. IntegerGetsReportTheValueWidth                 - StringLength on success
+//   56. CurrentCommandAdvancesThroughNonRowResults     - DML counts too
+//   57. QueryNotificationStringsRejectBadNegativeLengths - only SQL_NTS
+//   58. QueryNotificationTimeoutCeilingIsIntMax        - INT_MAX, not SQLULEN
 
 #include "odbc_test_fixture.h"
 
@@ -1519,7 +1522,111 @@ TEST_F(AttributesTest, IntegerGetsReportTheValueWidth) {
 }
 
 // -------------------------------------------------------------------
-// 56. MAX_ROWS truncates a rowset rather than rounding it.
+// Variation 56 - CURRENT_COMMAND counts every statement in the batch,
+// not just the row-returning ones. A batch that mixes SELECTs, DML and
+// PRINT still reports 1, 2, 3. Advancing the ordinal only where a
+// cursor opens agrees on an all-SELECT batch and stalls on every other
+// shape, which is exactly the batch a stored procedure produces.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, CurrentCommandAdvancesThroughNonRowResults) {
+    struct Batch {
+        const char* label;
+        const char* sql;
+    };
+    const Batch batches[] = {
+        {"select-dml-select",
+         "SELECT 1; DECLARE @t TABLE(i INT); INSERT INTO @t VALUES(1); SELECT 2"},
+        {"pure-dml",
+         "DECLARE @t TABLE(i INT); INSERT INTO @t VALUES(1); "
+         "INSERT INTO @t VALUES(2); INSERT INTO @t VALUES(3)"},
+        {"print-select-print", "PRINT 'a'; SELECT 1; PRINT 'b'"},
+    };
+
+    for (const Batch& batch : batches) {
+        SCOPED_TRACE(batch.label);
+        SqlTString sql = ODBCTestUtils::ToSqlTStr(batch.sql);
+        SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()),
+                                     SQL_NTS);
+        ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+        for (SQLULEN expected = 1; expected <= 3; ++expected) {
+            EXPECT_EQ(expected, GetStmtULen(kSsCurrentCommand))
+                << "result " << expected;
+            if (expected < 3) {
+                ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        EXPECT_EQ(SQLULEN{3}, GetStmtULen(kSsCurrentCommand));
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 57 - SQL_NTS is the only negative StringLength a character
+// attribute accepts. Any other negative value is HY024 and leaves the
+// stored string untouched; reading it as a terminated string instead
+// would silently clear an attribute the caller never meant to write.
+// Note the SQLSTATE differs from SQL_ATTR_CURRENT_CATALOG's HY090 -
+// these are vendor attributes the driver validates itself.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, QueryNotificationStringsRejectBadNegativeLengths) {
+    const SQLINTEGER attributes[] = {kSsQnMsgtext, kSsQnOptions};
+    SqlTString seed = ODBCTestUtils::ToSqlTStr("SEED");
+    SqlTString other = ODBCTestUtils::ToSqlTStr("REPLACED");
+
+    for (SQLINTEGER attribute : attributes) {
+        SCOPED_TRACE(attribute);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute,
+                                     const_cast<SQLTCHAR*>(seed.c_str()),
+                                     SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+
+        for (SQLINTEGER length : {-2, -5, -100}) {
+            SCOPED_TRACE(length);
+            EXPECT_EQ(SQL_ERROR,
+                      SQLSetStmtAttr(stmt_, attribute,
+                                     const_cast<SQLTCHAR*>(other.c_str()),
+                                     length));
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+
+            SQLTCHAR buffer[32] = {};
+            SQLINTEGER written = -1;
+            EXPECT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer,
+                                         sizeof(buffer), &written),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ("SEED", ODBCTestUtils::ToNarrow(SqlTString(buffer)));
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 58 - the query-notification timeout tops out at INT_MAX,
+// not at the full SQLULEN width the pointer slot can carry. Values
+// above it are HY024 and leave the previous timeout in place.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, QueryNotificationTimeoutCeilingIsIntMax) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, kSsQnTimeout,
+                                 reinterpret_cast<SQLPOINTER>(
+                                     static_cast<SQLULEN>(2147483647)),
+                                 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQLULEN{2147483647}, GetStmtULen(kSsQnTimeout));
+
+    const SQLULEN rejected[] = {2147483648ULL, 3000000000ULL, 4294967295ULL};
+    for (SQLULEN value : rejected) {
+        SCOPED_TRACE(value);
+        EXPECT_EQ(SQL_ERROR,
+                  SQLSetStmtAttr(stmt_, kSsQnTimeout,
+                                 reinterpret_cast<SQLPOINTER>(value), 0));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+        EXPECT_EQ(SQLULEN{2147483647}, GetStmtULen(kSsQnTimeout))
+            << "a rejected set must leave the previous value in place";
+    }
+}
+
+// -------------------------------------------------------------------
+// 59. MAX_ROWS truncates a rowset rather than rounding it.
 //
 // SQL_ATTR_MAX_ROWS was measured against single-row fetches, which leaves
 // open whether the cap is a row budget or a rowset boundary. Measured on
