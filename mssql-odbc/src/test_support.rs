@@ -124,6 +124,31 @@ impl TestHandles {
         };
         state.connection_state = ConnectionState::Connected;
     }
+
+    /// The implicit application row descriptor (ARD) owned by `self.stmt`.
+    pub(crate) fn ard(&self) -> SqlHandle {
+        self.stmt_ref().ard
+    }
+
+    /// The implicit application parameter descriptor (APD) owned by `self.stmt`.
+    pub(crate) fn apd(&self) -> SqlHandle {
+        self.stmt_ref().apd
+    }
+
+    /// The implicit implementation row descriptor (IRD) owned by `self.stmt`.
+    pub(crate) fn ird(&self) -> SqlHandle {
+        self.stmt_ref().ird
+    }
+
+    /// The implicit implementation parameter descriptor (IPD) owned by `self.stmt`.
+    pub(crate) fn ipd(&self) -> SqlHandle {
+        self.stmt_ref().ipd
+    }
+
+    fn stmt_ref(&self) -> &crate::handles::StmtHandle {
+        assert!(!self.stmt.is_null(), "descriptor accessors require a STMT");
+        unsafe { handle_from_raw::<crate::handles::StmtHandle>(self.stmt) }
+    }
 }
 
 impl Drop for TestHandles {
