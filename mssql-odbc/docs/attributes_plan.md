@@ -143,15 +143,15 @@ completeness.
 
 ---
 
-### S1 — Attribute dispatch spine, string I/O, and defensive rejection
+### S1 — Attribute dispatch spine, string I/O, and defensive rejection — **delivered**
 
-> `mssql-odbc | Attribute dispatch & pass-through hardening`
+> `mssql-odbc | Attribute dispatch & pass-through hardening` (AB#47453)
 
 **Why first:** every other slice needs the table, the string plumbing, and the
 rejection policy. Alone it discharges the §4.10 "never crash on unexpected input"
 requirement.
 
-**Already landed with S2/S3** (the parts those two could not proceed without):
+**Landed with S2/S3** (the parts those two could not proceed without):
 
 - Character-attribute I/O in `util.rs`: `read_utf16_attr` (byte-count input,
   `SQL_NTS` passthrough) and `write_wide_attr` (honors `buffer_length`, writes
@@ -163,27 +163,75 @@ requirement.
 - `post_tds_error_as` in `sqlstate.rs`, for paths where msodbcsql forces a
   SQLSTATE over the error-number map.
 
-**Still open**
+**Landed here**
 
-- Single source-of-truth attribute table: `id → { scope, value kind (int / pointer /
-  wide string), settable phase (pre-connect / post-connect / either), disposition
-  (honored / accepted-no-op / not-implemented / invalid) }`. Replaces four
-  hand-rolled `match` arms.
-- Build the **msodbcsql truth table** systematically: table-driven e2e sweep over
-  the attribute id space against the real driver, recording
-  `(attr, phase, value) → (SQLRETURN, SQLSTATE)`. Everything downstream
-  implements against measured behavior, not a guess. `attributes_test.cpp` is the
-  hand-written seed of this.
-- Finish reconciling rejection SQLSTATEs with msodbcsql: `HY092` invalid
-  identifier, `HYC00` recognized-but-not-implemented, `HY024` invalid value,
-  `HY011` wrong phase, `HY010` function sequence. Promote to `ERR_*` `DiagMsg`
-  constants in `sqlstate.rs` per repo convention.
-- Property/fuzz test sweeping the full `i32` identifier space × representative
-  values, asserting no panic and a diagnostic record on every failure path.
+- **The msodbcsql truth table, measured rather than guessed.** A ctypes sweep
+  drove 135 attribute identifiers through `SQLSetConnectAttrW` /
+  `SQLGetConnectAttrW` / `SQLSetStmtAttrW` / `SQLGetStmtAttrW` on a live
+  msodbcsql 18, pre- and post-connect, recording
+  `(scope, phase, op, id) → (SQLRETURN, SQLSTATE)`. 321 units, 513 rows. See §8
+  for how to reproduce it.
+- `src/api/attributes.rs`, generated from that CSV: `DBC_ATTRS` (90 ids) and
+  `STMT_ATTRS` (46 ids), each row carrying an `OP_SET` / `OP_GET` flag mask.
+  `native_attr_name(scope, op, id)` answers "does msodbcsql know this
+  identifier, in this scope, on this operation?"; `unimplemented_attr_diag`
+  turns that into the right `DiagMsg`.
+- All four attribute catch-alls now consult it: **recognized → `HYC00`**
+  (not implemented), **unrecognized → `HY092`** (not an attribute). A caller
+  probing for, say, MARS can now tell "unavailable" from "no such thing"
+  instead of getting one undifferentiated error.
+- Property test sweeping the identifier space (boundaries plus stride 7 across
+  0–12000, both scopes, both operations) asserting classification never panics.
+- e2e Variations 23–30 in `attributes_test.cpp`. 23–27 are pure parity and pass
+  unmodified on both drivers; 28–30 assert behavior that is deliberately ours.
 
-**Acceptance:** no input to `SQLSet/GetConnectAttrW` or `SQLSet/GetStmtAttrW`
-panics or returns `SQL_ERROR` without a retrievable `SQLGetDiagRec`; parity sweep
-green; string round-trip covered by unit + e2e tests.
+**Two findings that shaped the design** — both measured, neither obvious:
+
+1. **Recognition is scope-keyed.** The vendor ranges collide.
+   `SQL_COPT_SS_*` and `SQL_SOPT_SS_*` both occupy 1225–1238, so
+   `SQL_COPT_SS_FAILOVER_PARTNER` and `SQL_SOPT_SS_TEXTPTR_LOGGING` are both
+   1225; `SQL_ATTR_OUTPUT_NTS` (env) and `SQL_ATTR_AUTO_IPD` (dbc) are both
+   10001. A flat id → name map answers for the wrong scope.
+2. **Recognition is *also* operation-keyed.** msodbcsql accepts the ODBC 2.x
+   statement options (ids 0–12, 29) on a **connection** handle and fans them out
+   to every statement (`sqlcmisc.cpp:2879`), but `SQLGetConnectAttrW` returns
+   `HY092` for those same ids:
+
+   ```
+   post_connect set SQL_ATTR_QUERY_TIMEOUT -> SUCCESS_WITH_INFO 01S02
+   post_connect get SQL_ATTR_QUERY_TIMEOUT -> SQL_ERROR         HY092
+   ```
+
+   A scope-only table would have softened
+   `SQLGetConnectAttrW(SQL_ATTR_QUERY_TIMEOUT)` from `HY092` to `HYC00` and
+   broken the contract S2 already shipped. Hence the per-operation flag column.
+
+**Three further measured facts, recorded so nobody re-derives them:**
+
+- **Pre-connect `SQLSetConnectAttrW` returns `SUCCESS` for every identifier**,
+  including garbage — the Driver Manager buffers the call and replays it after
+  connect, so the driver never sees it. Pre-connect rows prove nothing about the
+  driver and are excluded from the table.
+- **Environment attributes (200–202) answer `HY092` on both dbc and stmt.** The
+  DM handles them; they are absent from both tables by construction.
+- **Three identifiers hard-fault msodbcsql** when handed a plain 256-byte
+  buffer on the connection set path: `SQL_ATTR_ENLIST_IN_DTC` (1207),
+  `SQL_COPT_SS_ENLIST_IN_DTC` (1207) and `SQL_COPT_SS_CEKEYSTOREDATA` (1252).
+  They dereference the pointer as a struct with no validation. Routing
+  unimplemented identifiers through a table lookup rather than a pointer read
+  is what makes this driver immune; Variation 30 pins that down.
+
+**Deferred to the slice that implements each attribute:** the value-kind and
+phase columns (`int` / `pointer` / `wide string`; pre-connect / post-connect /
+either). Recognition is the part every other slice needs, and the hand-written
+`match` arms remain the place a *supported* attribute is defined — the table
+sits behind the catch-all, so S4–S6 shrink it as they land rather than rewriting
+it.
+
+**Acceptance:** met. No input to `SQLSet/GetConnectAttrW` or
+`SQLSet/GetStmtAttrW` panics or returns `SQL_ERROR` without a retrievable
+`SQLGetDiagRec`; parity sweep green on both drivers; string round-trip covered
+by unit + e2e tests.
 
 **Size:** M–L. **Depends on:** nothing.
 
@@ -461,12 +509,19 @@ $env:ODBC_TEST_TRUST_CERT = 'Yes'
 
 # baseline
 $env:ODBC_TEST_DRIVER = 'ODBC Driver 18 for SQL Server'
+$env:ODBC_TEST_TARGET = 'msodbcsql'
 .\build\attributes_test.exe
 
 # this driver
 $env:ODBC_TEST_DRIVER = 'mssql-odbc dev'
+$env:ODBC_TEST_TARGET = 'rust'
 .\build\attributes_test.exe
 ```
+
+`ODBC_TEST_TARGET` drives `SKIP_IF_COMPARING_MSODBCSQL()`. Use it only where the
+two drivers diverge *by design* — an attribute msodbcsql implements and we do
+not, or input that faults it. Everything else must pass on both legs unchanged;
+that is what makes the file a parity contract rather than a regression suite.
 
 Two constraints worth knowing before adding cases:
 
@@ -476,3 +531,36 @@ Two constraints worth knowing before adding cases:
 - A fixture helper that runs its own query fails with a Driver-Manager `24000`
   if a cursor is already open on the shared statement. Resolve every value the
   assertion needs *before* opening the cursor under test.
+
+### 8.1 Re-measuring the msodbcsql recognition table
+
+`src/api/attributes.rs` is generated, not authored. Its rows come from a ctypes
+sweep that calls the four attribute entry points directly against msodbcsql for
+every known identifier and records what comes back. Regenerate it when the
+identifier list grows or a new msodbcsql version ships:
+
+1. **Collect identifiers.** Grep `#define SQL_(ATTR|COPT_SS|SOPT_SS)_\w+` out of
+   the Windows SDK `sqlext.h` / `sql.h` and msodbcsql's `msodbcsql.h`, resolving
+   each to its numeric value. Keep the aliases — `SQL_COPT_SS_ENLIST_IN_DTC` and
+   `SQL_ATTR_ENLIST_IN_DTC` share id 1207, and confirming both behave alike is
+   the point.
+2. **Sweep.** For each `(scope, phase, op, id)` issue the call with a **zeroed
+   256-byte buffer**, not a small integer: several attributes are read as
+   structs and a short buffer turns a recognition probe into a heap overrun.
+   Record `SQLRETURN` plus the SQLSTATE from `SQLGetDiagRec`.
+3. **Isolate.** Use a fresh connection per post-connect probe — a probe that
+   leaves the connection in a bad state otherwise contaminates its successors —
+   and flush results to CSV incrementally, keyed by unit index, so a hard fault
+   can be resumed rather than restarted.
+4. **Expect faults.** Three identifiers take the process down (§S1). Drive the
+   sweep from a wrapper that restarts it at `index + 1` after a crash and logs
+   which unit died; a fault *is* a measurement — it proves msodbcsql recognized
+   the identifier in that scope and operation.
+5. **Classify.** Drop `phase == "pre_connect"` rows: the Driver Manager buffers
+   those and returns `SUCCESS` for anything, so they say nothing about the
+   driver. Treat `HY092` as "not an attribute here" and everything else —
+   success, `HYC00`, `HY011`, `HY024`, a fault — as "recognized".
+6. **Emit and verify.** Generate the two tables sorted by id with the
+   `OP_SET` / `OP_GET` mask per row. `tables_are_sorted_unique_and_flagged`
+   enforces the invariant the binary search depends on, so a bad generation
+   fails the build rather than silently mis-answering.

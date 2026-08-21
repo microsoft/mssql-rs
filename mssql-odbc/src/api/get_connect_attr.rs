@@ -15,6 +15,7 @@ use tracing::{debug, error};
 
 use super::current_catalog::get_current_catalog;
 use super::sqlstate::*;
+use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
@@ -194,18 +195,19 @@ fn sql_get_connect_attr_w_safe(
             debug!(value, "SQLGetConnectAttrW: connection-dead returned");
             SQL_SUCCESS
         }
-        // Any other attribute identifier is not one this driver knows: surface
-        // HY092 instead of claiming success while leaving the caller's buffer
-        // untouched. `SQL_ATTR_ANSI_APP` lands here deliberately — the Driver
-        // Manager sets it and ODBC defines no way to read it back, and so does
+        // Any other identifier is not one this driver reports: surface a
+        // diagnostic rather than claiming success while leaving the caller's
+        // buffer untouched. Which diagnostic depends on whether msodbcsql
+        // recognizes the identifier *on the get path* — recognition is not
+        // symmetric. `SQL_ATTR_ANSI_APP` lands here deliberately (the Driver
+        // Manager sets it and ODBC defines no way to read it back), and so does
         // `SQL_ATTR_QUERY_TIMEOUT`, which msodbcsql accepts on a connection but
-        // refuses to report back.
+        // refuses to report back; both stay `HY092`. See `attributes.rs`.
         _ => {
-            error!(
-                attribute,
-                "SQLGetConnectAttrW: unsupported connection attribute"
+            post_diag(
+                &mut state,
+                unimplemented_attr_diag(AttrScope::Dbc, AttrOp::Get, attribute),
             );
-            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
             SQL_ERROR
         }
     }
@@ -397,6 +399,30 @@ mod tests {
             )
         };
         assert_eq!(get, SQL_ERROR);
+    }
+
+    /// `SQL_COPT_SS_MARS_ENABLED` (1224) is readable from msodbcsql, so a
+    /// caller probing for MARS must get `HYC00` here rather than `HY092`.
+    /// Contrast `query_timeout_is_write_only_on_a_connection`: msodbcsql's
+    /// recognized set is not the same for the set and get paths, so the lookup
+    /// is keyed by operation as well as scope.
+    #[test]
+    fn attribute_known_to_msodbcsql_reports_not_implemented() {
+        let h = TestHandles::with_env_dbc();
+        let mut out: u32 = 0;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                1224,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]
