@@ -186,7 +186,13 @@ impl EntraIdTokenFactory for EntraTokenFactory {
 /// cache ([`CREDENTIAL_CACHE`]). Two factories that produce equal keys are
 /// guaranteed to represent the same tenant/client/secret (or the same managed
 /// identity) and may safely share one credential instance.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+///
+/// `Debug` is gated to `cfg(test)` rather than derived unconditionally: the
+/// module never logs a cache key's contents (tenant, client id, secret
+/// digest), and gating this makes a future `debug!(?key, ...)` a compile
+/// error in production code instead of a convention someone has to remember.
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(test, derive(Debug))]
 enum CredentialCacheKey {
     ServicePrincipal {
         authority_host: String,
@@ -228,22 +234,15 @@ fn digest(secret: &str) -> [u8; 32] {
 /// own per-scope, expiry-aware token cache internally, so sharing the
 /// credential *instance* is enough to share tokens too — this map never
 /// stores raw tokens itself, which keeps expiry/refresh entirely in the
-/// already-tested Azure SDK code path.
+/// already-tested Azure SDK code path. Exceeds msodbcsql parity rather than
+/// closing a gap — see the PR description and AB#46409 for the C++ driver
+/// comparison.
 ///
-/// This is a deliberate improvement beyond msodbcsql parity, not a gap versus
-/// it: the classic C++ driver's `AzureADAuth` has no equivalent cache either —
-/// `Parse.cpp:3655` constructs a stack-local `AzureADAuth auth;` and
-/// re-authenticates on every connection for service principal and managed
-/// identity. Only its interactive/WAM path caches (`MSQAAuthContextCache`),
-/// mirrored here by the interactive path's own process-wide cache in
-/// `msqa.rs`.
-///
-/// Unbounded like that interactive cache: entries are never evicted, so a
-/// process that cycles through many distinct identities (e.g. a multi-tenant
-/// service impersonating many different service principals) or rotates a
-/// secret repeatedly retains one entry per identity/secret it has ever seen
-/// for the life of the process. Acceptable for the same reason as the
-/// interactive cache — realistic deployments use a small, stable set of
+/// Unbounded like the interactive path's cache in `msqa.rs`: entries are
+/// never evicted, so a process that cycles through many distinct identities
+/// or rotates a secret repeatedly retains one entry per identity/secret it
+/// has ever seen for the life of the process. Acceptable for the same reason
+/// as that cache — realistic deployments use a small, stable set of
 /// identities — but a candidate for follow-up if that stops holding.
 static CREDENTIAL_CACHE: OnceLock<Mutex<HashMap<CredentialCacheKey, Arc<dyn TokenCredential>>>> =
     OnceLock::new();
@@ -258,18 +257,11 @@ static CREDENTIAL_CACHE: OnceLock<Mutex<HashMap<CredentialCacheKey, Arc<dyn Toke
 /// id, or secret digest) so a connection storm's throttling behavior can be
 /// correlated against actual cache effectiveness in production traces.
 ///
-/// Recovers from a poisoned lock rather than propagating an error, unlike an
-/// ODBC handle's `*.inner` mutex. That rule exists because a poisoned handle
-/// mutex might guard a torn domain object, and erroring out affects only the
-/// one handle that panicked — the application frees it and gets a fresh,
-/// unpoisoned mutex on its next allocation. `CREDENTIAL_CACHE` is a `static`:
-/// once poisoned it never recovers on its own, so treating poison as fatal
-/// here would permanently fail every future connection's Entra auth for the
-/// rest of the process from a single transient panic, instead of just the one
-/// call in flight when it happened. The recovered map cannot be torn in a way
-/// that matters either — the lock is never held across `build()`'s fallible
-/// work in a way that leaves a partial insert (see above), so the worst case
-/// is a missing entry, which is exactly a cache miss.
+/// Recovers from a poisoned lock rather than propagating an error: unlike an
+/// ODBC handle's `*.inner` mutex, `CREDENTIAL_CACHE` is a `static` that never
+/// un-poisons itself, so treating poison as fatal here would fail Entra auth
+/// for the rest of the process instead of just the one call in flight (see
+/// `cached_credential_recovers_from_a_poisoned_lock` for the full case).
 fn cached_credential(
     key: CredentialCacheKey,
     build: impl FnOnce() -> TdsResult<Arc<dyn TokenCredential>>,
