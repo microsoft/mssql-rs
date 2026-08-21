@@ -11,7 +11,7 @@ use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
-use crate::api::odbc_types::{SqlSmallInt, SqlULen, SqlUSmallInt};
+use crate::api::odbc_types::{SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -34,10 +34,36 @@ pub(crate) struct ActivePlpStream {
     pub(crate) pending_high_surrogate: Option<u16>,
 }
 
+/// An application buffer bound to a result-set column by `SQLBindCol`.
+///
+/// The pointers belong to the application, which must keep them valid until it
+/// unbinds the column, rebinds it, or frees the statement. They are written
+/// only during a bound fetch, never at bind time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ColumnBinding {
+    /// 1-based column number, as passed to `SQLBindCol`.
+    pub(crate) column_number: SqlUSmallInt,
+    /// The requested `SQL_C_*` target type.
+    pub(crate) target_type: SqlSmallInt,
+    /// Start of the application's buffer, or of its array when the rowset holds
+    /// more than one row.
+    pub(crate) target_value_ptr: SqlPointer,
+    /// Capacity of one element of `target_value_ptr`, in bytes.
+    pub(crate) buffer_length: SqlLen,
+    /// Receives the length/indicator for each row, or null if the application
+    /// does not want one.
+    pub(crate) strlen_or_ind_ptr: *mut SqlLen,
+}
+
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
 pub(crate) const STMT_STATE_PREPARED: u32 = 0x0000_0200;
 pub(crate) const STMT_STATE_CURSOR_OPEN: u32 = 0x0000_0800;
 pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
+/// A block fetch is between taking its snapshot of the bindings and finishing
+/// its writes. The fetch cannot hold the statement mutex across network I/O, so
+/// this is what stops a concurrent rebind from freeing a buffer the fill loop is
+/// still writing through: the mutating entry points refuse while it is set.
+pub(crate) const STMT_STATE_FETCH_IN_PROGRESS: u32 = 0x0000_2000;
 
 /// Statement handle
 ///
@@ -141,6 +167,19 @@ pub(crate) struct StmtState {
     /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
     /// (0) for column-wise arrays, otherwise a row-struct byte size.
     pub(crate) row_bind_type: SqlULen,
+    /// Application-supplied byte offset added to every bound column's data and
+    /// indicator pointer at fetch time (`SQL_ATTR_ROW_BIND_OFFSET_PTR`); null
+    /// when unset. Read at fetch rather than at bind, so the application can
+    /// move the whole rowset by updating the pointed-to value.
+    pub(crate) row_bind_offset_ptr: *mut SqlULen,
+    /// Columns bound by `SQLBindCol`, in binding order. A column appears at
+    /// most once: rebinding replaces its entry, unbinding removes it. Bindings
+    /// outlive a result set, so they are cleared by `SQLFreeStmt(SQL_UNBIND)`
+    /// rather than by closing the cursor.
+    ///
+    /// Staying empty is a legal state: an unbound `SQLFetchScroll` still
+    /// advances the rowset and reports counts, it just delivers no data.
+    pub(crate) bindings: Vec<ColumnBinding>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
 }
@@ -175,6 +214,32 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Binds, or rebinds, one column. A column can only be bound once, so an
+    /// existing entry for the same column is replaced in place rather than
+    /// shadowed.
+    pub(crate) fn set_binding(&mut self, binding: ColumnBinding) {
+        // Kept ordered by column number: the fill loop walks a forward-only row
+        // cursor, so it can only visit bound columns in ascending order.
+        match self
+            .bindings
+            .binary_search_by_key(&binding.column_number, |b| b.column_number)
+        {
+            Ok(existing) => self.bindings[existing] = binding,
+            Err(insert_at) => self.bindings.insert(insert_at, binding),
+        }
+    }
+
+    /// Removes one column's binding, which is what `SQLBindCol` does when the
+    /// application passes a null `TargetValuePtr`.
+    pub(crate) fn clear_binding(&mut self, column_number: SqlUSmallInt) {
+        self.bindings.retain(|b| b.column_number != column_number);
+    }
+
+    /// Drops every column binding — `SQLFreeStmt(SQL_UNBIND)`.
+    pub(crate) fn clear_bindings(&mut self) {
+        self.bindings.clear();
     }
 
     /// Clears all row-stream state (cursor invalidated, no PLP in progress).
@@ -271,6 +336,8 @@ impl StmtHandle {
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+                row_bind_offset_ptr: std::ptr::null_mut(),
+                bindings: Vec::new(),
                 state_flags: 0,
             }),
         }
@@ -306,5 +373,101 @@ impl Drop for StmtHandle {
         for raw in [self.ard, self.apd, self.ird, self.ipd] {
             unsafe { free_handle::<DescHandle>(raw) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
+
+    fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
+        ColumnBinding {
+            column_number,
+            target_type,
+            target_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+        }
+    }
+
+    /// Runs `f` against a fresh statement's state. The handle owns descriptor
+    /// allocations it frees on drop, so it has to outlive the borrow.
+    fn with_state(f: impl FnOnce(&mut StmtState)) {
+        let handle = StmtHandle::new(std::ptr::null_mut());
+        let mut state = handle.inner.lock().unwrap();
+        f(&mut state);
+    }
+
+    /// A column can only be bound once, so rebinding replaces the entry rather
+    /// than shadowing it — otherwise the fetch loop would write the column
+    /// twice, once through a stale pointer.
+    #[test]
+    fn rebinding_a_column_replaces_its_entry() {
+        with_state(|s| {
+            s.set_binding(binding(1, SQL_C_SLONG));
+            s.set_binding(binding(2, SQL_C_SLONG));
+            s.set_binding(binding(1, SQL_C_CHAR));
+
+            assert_eq!(s.bindings.len(), 2);
+            let first = s.bindings.iter().find(|b| b.column_number == 1).unwrap();
+            assert_eq!(first.target_type, SQL_C_CHAR);
+        });
+    }
+
+    /// Unbinding one column leaves the others in place; this is what SQLBindCol
+    /// does with a null TargetValuePtr.
+    #[test]
+    fn clearing_one_binding_leaves_the_others() {
+        with_state(|s| {
+            s.set_binding(binding(1, SQL_C_SLONG));
+            s.set_binding(binding(2, SQL_C_SLONG));
+            s.clear_binding(1);
+
+            assert_eq!(s.bindings.len(), 1);
+            assert_eq!(s.bindings[0].column_number, 2);
+            // Unbinding a column that was never bound is a no-op, not a panic.
+            s.clear_binding(99);
+            assert_eq!(s.bindings.len(), 1);
+        });
+    }
+
+    /// SQLFreeStmt(SQL_UNBIND) drops the whole table.
+    #[test]
+    fn clearing_all_bindings_empties_the_table() {
+        with_state(|s| {
+            s.set_binding(binding(1, SQL_C_SLONG));
+            s.set_binding(binding(2, SQL_C_SLONG));
+            s.clear_bindings();
+            assert!(s.bindings.is_empty());
+        });
+    }
+
+    /// The fill loop reads a forward-only cursor, so it depends on this order
+    /// rather than re-establishing it; an application may bind in any order.
+    #[test]
+    fn bindings_stay_ordered_by_column_however_they_were_bound() {
+        with_state(|s| {
+            for col in [5, 1, 3, 2, 4] {
+                s.set_binding(binding(col, SQL_C_SLONG));
+            }
+            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            assert_eq!(cols, vec![1, 2, 3, 4, 5]);
+
+            // A rebind replaces in place and keeps the order.
+            s.set_binding(binding(3, SQL_C_CHAR));
+            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            assert_eq!(cols, vec![1, 2, 3, 4, 5]);
+            assert_eq!(s.bindings[2].target_type, SQL_C_CHAR);
+        });
+    }
+
+    /// Bindings start empty, which is what makes an unbound fetch legal.
+    #[test]
+    fn a_fresh_statement_has_no_bindings() {
+        with_state(|s| {
+            assert!(s.bindings.is_empty());
+            assert!(s.row_bind_offset_ptr.is_null());
+        });
     }
 }

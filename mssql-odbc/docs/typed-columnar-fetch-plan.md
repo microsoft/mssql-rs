@@ -134,7 +134,27 @@ The underlying type is a property of the **value**, not the column — a variant
 - `SQLBindCol`: store per-column binding (col, target C type, buffer ptr, buffer len, indicator ptr); support unbind (null ptr) and `SQLFreeStmt(SQL_UNBIND)`.
 - `SQLFetchScroll(SQL_FETCH_NEXT)`: fetch up to `row_array_size` rows into a rowset; fill each bound-column array + indicator array (default column-wise); set `*rows_fetched_ptr`; return `SQL_NO_DATA` at end with partial-rowset handling. Forward-only.
 - Reuse the P1 conversion core. Ensure `SQLGetData` still works after a bound fetch (mixed access).
-- Export `SQLBindCol` and `SQLFetchScroll`.
+- Export `SQLBindCol` and `SQLFetchScroll`, and advertise both in `SQLGetFunctions` — the Windows DM returns `IM001` for an entry point it has not been told about even when the export exists, which cost P2 a CI cycle.
+
+`SQLFreeStmt(SQL_UNBIND)` is part of this, not an extra: `mssql-python` calls it before every fetch, so the columnar path does not work without it.
+
+#### Deliberate limits
+
+Each of these is an error rather than a guess, because a wrong value delivered silently into an application buffer is worse than a reported failure.
+
+| Case | Behaviour | Why |
+| --- | --- | --- |
+| A scrolling `FetchOrientation` | `HY106` | The cursor is forward-only; treating `SQL_FETCH_PRIOR` as `NEXT` would return the wrong rows |
+| Row-wise binding (`SQL_ATTR_ROW_BIND_TYPE` ≠ `SQL_BIND_BY_COLUMN`) | `HYC00` | Filling a struct array as if it were column-wise would corrupt application memory |
+| A bound PLP / LOB column | `SQL_ROW_ERROR` | Draining a LOB into a fixed buffer needs machinery `SQLGetData` owns — Task [47361](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47361) |
+| NULL at a column bound with no indicator | `22002`, `SQL_ROW_ERROR` | There is nowhere to report the NULL, and the slot would read back as the previous row's value |
+| `SQLGetData` after a rowset wider than one row | cursor left unpositioned | ODBC expects `SQLSetPos` to nominate the current row, and that is not implemented; mixed access still works at `row_array_size` 1 |
+| `SQL_C_DEFAULT` at bind time | `HY003` | **Divergence from msodbcsql**, which accepts it and resolves it at fetch time from the IRD (`sqlcfunc.cpp` `BindOffset` → `Sql2CDefault`). Deferring needs the column's SQL type threaded into the fill loop, which `ColumnBinding` does not carry. No known consumer binds `SQL_C_DEFAULT` on the fetch path — mssql-python uses it only for parameters — so this is deferred rather than blocking |
+
+Two details worth keeping in mind when extending this:
+
+- **`BufferLength` is ignored for fixed-width C targets.** The stride comes from the C type; only the character and binary targets are sized by the application. Honouring a caller's `sizeof(array)` would place later rows outside it.
+- **`SQL_ATTR_ROW_BIND_OFFSET_PTR` is read per fetch, not per bind,** and displaces the data *and* indicator bases by the same byte count — so the offset has to keep both naturally aligned.
 
 ### P4 — Exports & driver-load compatibility — Task [46581](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46581)
 
@@ -169,6 +189,6 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/wchar rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `SQL_C_BINARY` and binary→char hex are **not** implemented (see the P1 section); `sql_variant` underlying-type resolution deferred to P2. |
 | P1a — Mandatory source-type conversions | 47107 | Implemented (decimal, money and character sources into the numeric and date/time C targets; `01S07` on lossy numeric conversion, `22018` on an invalid character literal). |
 | P2 — SQLColAttributeW | 46579 | Implemented (common descriptor fields + `SQL_CA_SS_VARIANT_TYPE`, plus the `SQL_SS_VARIANT` type mapping and the zero-length `SQL_C_BINARY` probe the variant path depends on). Binary *delivery* remains unimplemented (Task 47239). |
-| P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
-| P4 — Exports & driver-load compat | 46581 | Not started |
+| P3 — SQLBindCol + SQLFetchScroll | 46580, 47359 | Implemented ([#322](https://github.com/microsoft/mssql-rs/pull/322)). Column-wise binding and forward-only block fetch, sharing P1's conversion core. 47359 was briefly split out to be worked in parallel and folded back in, since the fill loop cannot be exercised end to end without `SQLBindCol`. Bound PLP columns remain unimplemented (Task 47361). |
+| P4 — Exports & driver-load compat | 46581 | Partly done — `SQLColAttributeW` exported and advertised in P2; `SQLBindCol` and `SQLFetchScroll` in P3. Remaining: confirm the full symbol set loads under `mssql-python`. |
 | P5 — Testing & end-to-end | 46582 | Not started |
