@@ -208,7 +208,10 @@ enum ResetAckState {
     /// No reset armed or outstanding.
     Idle,
     /// Armed on the writer; no request has carried the bit to the server yet.
-    Armed,
+    /// Carries the mode so a request boundary can re-arm it: `PacketWriter::new`
+    /// consumes the arm before any bytes are written, so a message abandoned
+    /// mid-serialization takes the arm with it.
+    Armed(ResetConnectionMode),
     /// A request carried the bit; its response must contain the
     /// `ResetConnection` ENVCHANGE.
     AwaitingAck,
@@ -689,7 +692,7 @@ impl TdsClient {
     /// server diagnostic reaches the caller instead of being masked by this
     /// one; a reset still unacknowledged after it is caught on the next token.
     fn observe_response_token(&mut self, token: &Tokens) -> TdsResult<()> {
-        if self.reset_state == ResetAckState::Armed
+        if matches!(self.reset_state, ResetAckState::Armed(_))
             && self.transport.as_writer().take_reset_dispatched()
         {
             self.reset_state = ResetAckState::AwaitingAck;
@@ -715,6 +718,13 @@ impl TdsClient {
     /// the tokens that reach the failure log are typically ROW or RETURNVALUE,
     /// whose Debug output is customer row and output-parameter data. The kind is
     /// the whole diagnostic value here; the payload is not ours to log.
+    ///
+    /// Kept as an explicit match rather than `?token.token_type()` because that
+    /// collapses `Done` / `DoneInProc` / `DoneProc` into a single
+    /// `TokenType::Done`, and which of the three ended the carrying request is
+    /// exactly the detail worth having when diagnosing an unacknowledged reset.
+    /// The match is exhaustive, so a new variant is a build break, not a silent
+    /// gap.
     fn token_variant_name(token: &Tokens) -> &'static str {
         match token {
             Tokens::Done(_) => "Done",
@@ -780,13 +790,33 @@ impl TdsClient {
     /// arm time. No pool guarantee is weakened either — an abandoned carrier
     /// fails its own request, so the checkout that issued it reports failure and
     /// discards the connection.
+    ///
+    /// This is also where a *lost* arm is recovered. `PacketWriter::new`
+    /// consumes the armed mode before any bytes are written, so a message
+    /// abandoned during serialization (e.g. a parameter-encoding or Always
+    /// Encrypted failure, which propagates without condemning the transport)
+    /// takes the arm with it while leaving no dispatch record. Left alone the
+    /// connection would sit in `Armed` forever: no request would carry the bit,
+    /// so nothing could ever reach `AwaitingAck`, and the session would never be
+    /// reset with nothing to notice. Re-arming the carried mode restores the
+    /// invariant that `Armed` means "the next eligible request carries it".
     fn settle_abandoned_reset_verification(&mut self) {
         let carried = self.transport.as_writer().take_reset_dispatched();
         let abandoned = match self.reset_state {
             ResetAckState::Idle => false,
             // Still `Armed` with the bit already sent: an earlier request
             // carried it and its response was abandoned before the first token.
-            ResetAckState::Armed => carried,
+            ResetAckState::Armed(mode) => {
+                if !carried {
+                    // The arm may have been consumed by a message that never
+                    // reached the wire. Re-arming is safe either way: if the
+                    // writer still holds it, this overwrites it with the same
+                    // mode; if it was lost, this puts it back.
+                    self.transport.as_writer().set_reset_mode(mode);
+                    return;
+                }
+                true
+            }
             // The response ended without ever reaching a verdict token.
             ResetAckState::AwaitingAck => true,
         };
@@ -1140,7 +1170,7 @@ impl TdsClient {
             false => ResetConnectionMode::Reset,
         };
         self.transport.as_writer().set_reset_mode(mode);
-        self.reset_state = ResetAckState::Armed;
+        self.reset_state = ResetAckState::Armed(mode);
         // A full reset discards the server-side transaction, so mirror that here.
         // Leaving a stale descriptor would make `has_active_transaction()` report
         // a transaction the carrying request is itself about to destroy, and the
@@ -5748,7 +5778,6 @@ mod tests {
         /// Mirrors the production writer's dispatch record so client tests can
         /// drive acknowledgement verification without a real socket.
         reset_dispatched: bool,
-
         /// Every byte handed to `send` (request framing + payload), so tests can
         /// assert what was actually written to the wire.
         sent: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -10174,7 +10203,6 @@ mod tests {
     /// reset: starting a command while a reset is armed is the normal path, and
     /// that command is the one that carries the bit.
     #[tokio::test]
-
     async fn starting_a_command_leaves_an_unsent_armed_reset_alone() {
         let mut client = create_test_client_with_tokens(vec![
             Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
@@ -10273,6 +10301,97 @@ mod tests {
             !client.is_connection_dead(),
             "a cursor op must not be charged for a reset it never carried"
         );
+    }
+
+    /// Regression: the arm is consumed by `PacketWriter::new` *before* any bytes
+    /// are written, so a message abandoned during serialization takes it with it
+    /// while leaving no dispatch record — e.g. a parameter-encoding failure,
+    /// which propagates without condemning the transport. The connection would
+    /// then sit in `Armed` forever: nothing carries the bit, so nothing reaches
+    /// `AwaitingAck`, and the session is silently never reset. The request
+    /// boundary must put the arm back.
+    #[tokio::test]
+    async fn an_arm_lost_with_an_abandoned_message_is_restored_at_the_next_boundary() {
+        use crate::message::messages::ResetConnectionMode;
+
+        let mut client = create_test_client_with_tokens(vec![
+            Tokens::EnvChange(crate::token::tokens::EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: crate::token::tokens::EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        client.prepare_reset_connection(false);
+
+        // Simulate a message that consumed the arm and was then abandoned before
+        // anything reached the wire: the writer's mode is taken, and no dispatch
+        // was recorded.
+        let taken = client.transport.as_writer().take_reset_mode();
+        assert_eq!(
+            taken,
+            ResetConnectionMode::Reset,
+            "precondition: arm consumed"
+        );
+        assert!(
+            !client.transport.as_writer().take_reset_dispatched(),
+            "precondition: nothing reached the wire"
+        );
+
+        // The next request's boundary must put the arm back on the writer. This
+        // is asserted directly rather than via the scripted response: the mock
+        // replays its ResetConnection ENVCHANGE unconditionally, so collecting an
+        // acknowledgement proves nothing about whether the bit was actually sent.
+        client.settle_abandoned_reset_verification();
+        assert!(
+            client.reset_pending(),
+            "the reset is still owed; it must not be silently dropped"
+        );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the lost arm must be restored to the writer, or no request ever carries the bit"
+        );
+        // Put it back for the end-to-end leg (the assertion above consumed it).
+        client
+            .transport
+            .as_writer()
+            .set_reset_mode(ResetConnectionMode::Reset);
+
+        // ...so this request actually carries the bit and collects the ack.
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("the re-armed reset must ride this request");
+        assert!(
+            !client.reset_pending(),
+            "the restored arm must have been carried and acknowledged"
+        );
+        assert!(!client.is_connection_dead());
+    }
+
+    /// The fourth `receive_token` loop — `consume_done_token`, the INSERT BULK
+    /// preamble's response reader — must reach the same verdict as the other
+    /// three when the carrier's response lacks the acknowledgement.
+    #[tokio::test]
+    async fn unacknowledged_reset_is_caught_in_consume_done_token() {
+        let mut client = create_test_client_with_tokens(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+
+        client
+            .send_query_batch("SELECT 1".to_string(), ().into())
+            .await
+            .expect("the carrier is sent");
+
+        let err = client
+            .consume_done_token()
+            .await
+            .expect_err("an unacknowledged reset must fail here too");
+
+        assert!(
+            matches!(err, crate::error::Error::ConnectionResetNotAcknowledged),
+            "expected ConnectionResetNotAcknowledged, got {err:?}"
+        );
+        assert!(client.is_connection_dead());
     }
 
     /// D3: a server fatal-error token (severity/class ≥ 20) marks the transport

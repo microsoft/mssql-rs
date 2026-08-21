@@ -147,6 +147,44 @@ Three cases are deliberately not treated as failures:
 A message the server is told to ignore (the attention/cancel path) is likewise
 never recorded as having delivered the bit.
 
+### Protocol basis and validated scope
+
+MS-TDS defines ENVCHANGE **type 18** as
+"RESETCONNECTION/RESETCONNECTIONSKIPTRAN Completion Acknowledgement", so the
+acknowledgement is specified for *both* reset modes, not only the full reset.
+What the spec does **not** state is an unconditional "the server MUST emit type
+18 whenever the bit is honoured" — the ENVCHANGE section carries explicit
+emission rules for types 4, 13, 15, 16, 20, and 21, but none for 18. So the
+guarantee this driver relies on is documented-by-definition rather than
+mandated-by-clause.
+
+That matters because this driver **exceeds** both reference implementations
+here. SqlClient clears `_fResetConnection` on send (`TdsParser.cs:1930`) and only
+reconciles session data when the ENVCHANGE arrives; msodbcsql calls
+`ResetConnection(FALSE)` immediately after the send (`TdsSend.cpp:1213`). Neither
+can fail a request for a missing acknowledgement — for them it is advisory.
+Failing the carrying request is therefore a deliberate exceed-parity decision
+and, per the repo's parity rules, one that needs product-owner sign-off recorded
+against the tracking work item.
+
+Validated topologies:
+
+| Topology | Covered |
+|---|---|
+| SQL Server 2022 (CI container, Linux/Windows/macOS legs) | yes |
+| Azure SQL Database (via gateway) | **not covered** |
+| Azure SQL Managed Instance | **not covered** |
+| Down-level SQL Server (2016/2017/2019) | **not covered** |
+| MARS | n/a — this driver does not implement MARS |
+
+The residual risk is scoped, not eliminated: if any of the uncovered topologies
+honours the bit without emitting type 18, the failure surfaces on whichever
+request carried the bit rather than on a pool checkout the pool could retry.
+Should that need mitigating before the matrix is filled in, the smallest change
+is to gate the verdict — verify by default, and let a consumer downgrade it to
+advisory (log and clear, matching SqlClient/msodbcsql) — which keeps the
+fail-at-checkout guarantee for the topologies it is proven on.
+
 ### Abandoned carriers
 
 A verdict is only ever valid against the response of the request that carried
@@ -167,6 +205,15 @@ seen there necessarily belongs to an earlier request. The settle is idempotent,
 so a path that reaches both costs nothing. Without this the next, unrelated
 request would be condemned on its first token — marking a healthy connection
 dead, which is a worse outcome than the gap the verification closes.
+
+The same boundary recovers a *lost* arm. `PacketWriter::new` consumes the armed
+mode before any bytes are written, so a message abandoned during serialization —
+a parameter-encoding or Always Encrypted failure, which propagates without
+condemning the transport — takes the arm with it and leaves no dispatch record.
+Left alone the connection would sit in `Armed` forever: nothing would carry the
+bit, so nothing could reach `AwaitingAck`, and the session would silently never
+be reset. The `Armed` state therefore carries its mode, and the boundary re-arms
+it when no dispatch was recorded.
 
 The settlement treats the session as reset rather than failed. That is what the
 protocol supports: SQL Server resets before it processes the carrying request,

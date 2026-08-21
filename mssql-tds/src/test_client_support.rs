@@ -474,6 +474,11 @@ pub(crate) mod byte_stream {
         fn take_reset_mode(&mut self) -> ResetConnectionMode {
             ResetConnectionMode::None
         }
+        // This transport never carries a reset, so there is nothing to record.
+        fn note_reset_dispatched(&mut self) {}
+        fn take_reset_dispatched(&mut self) -> bool {
+            false
+        }
     }
 
     #[async_trait]
