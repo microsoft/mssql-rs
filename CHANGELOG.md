@@ -74,6 +74,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   server's `DONE_COUNT`. Fixes a doubled count on distributed engines that
   acknowledge one load with multiple `DONE_COUNT` tokens (issue #209).
 
+- `mssql-odbc`: Entra ID credentials for service-principal and managed-identity
+  authentication are now cached process-wide (keyed by tenant/authority,
+  client id, and a digest of the secret, or by client id alone for managed
+  identity) instead of being rebuilt for every connection. A burst of new
+  connections for the same identity now triggers a single token acquisition,
+  reused until near expiry, instead of one AAD/IMDS round-trip per connection —
+  avoiding Managed Identity (IMDS) throttling and added login latency during
+  connection-pool warm-up. A cached credential retains the secret it was built
+  from for the life of the process; a rotated secret creates a new cache entry
+  rather than replacing the old one.
+
 ### Removed
 
 - `mssql-tds`: the public `connection::odbc_authentication_transformer`,
