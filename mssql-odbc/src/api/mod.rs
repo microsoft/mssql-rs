@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 pub(crate) mod alloc_handle;
+mod attributes;
 mod bind_col;
 mod bind_param;
 mod catalog;

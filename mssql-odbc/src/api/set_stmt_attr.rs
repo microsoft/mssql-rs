@@ -24,6 +24,7 @@
 
 use tracing::{debug, error};
 
+use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
     MAX_QUERY_TIMEOUT, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_CONCURRENCY,
     SQL_ATTR_CURSOR_TYPE, SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_PARAM_BIND_TYPE,
@@ -34,8 +35,8 @@ use crate::api::odbc_types::{
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE,
-    SQLSTATE_01S02, SQLSTATE_HYC00, WARN_OPTION_VALUE_CHANGED, post_diag,
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
+    WARN_OPTION_VALUE_CHANGED, post_diag,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
@@ -254,11 +255,10 @@ fn sql_set_stmt_attr_w_safe(
             SQL_SUCCESS
         }
         _ => {
-            error!(
-                attribute,
-                "SQLSetStmtAttrW: unrecognized attribute identifier"
+            post_diag(
+                &mut state,
+                unimplemented_attr_diag(AttrScope::Stmt, AttrOp::Set, attribute),
             );
-            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
             SQL_ERROR
         }
     }
@@ -371,11 +371,10 @@ fn sql_get_stmt_attr_w_safe(
             write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
         },
         _ => {
-            error!(
-                attribute,
-                "SQLGetStmtAttrW: unrecognized attribute identifier"
+            post_diag(
+                &mut state,
+                unimplemented_attr_diag(AttrScope::Stmt, AttrOp::Get, attribute),
             );
-            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
             return SQL_ERROR;
         }
     }
@@ -387,6 +386,7 @@ fn sql_get_stmt_attr_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_BIND_BY_COLUMN, SQL_NULL_HANDLE};
+    use crate::api::sqlstate::SQLSTATE_HY092;
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
@@ -401,6 +401,15 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    /// Reads the SQLSTATE of the newest diagnostic on a statement. Must be
+    /// called before any `sql_get_stmt_attr_w` helper, which frees diagnostics
+    /// on entry.
+    fn stmt_sql_state(stmt: SqlHandle) -> [u8; 5] {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let state = stmt.inner.lock().unwrap();
+        state.diag_records[0].sql_state
     }
 
     /// Reads `SQL_ATTR_QUERY_TIMEOUT` back off a statement.
@@ -610,6 +619,47 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let ret = unsafe { sql_set_stmt_attr_w(h.stmt, 9999, 0 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY092);
+    }
+
+    /// An identifier msodbcsql implements but this driver does not must report
+    /// `HYC00`, not `HY092`: a caller probing for the feature has to be able to
+    /// tell "unavailable" from "not an attribute". `SQL_SOPT_SS_DEFER_PREPARE`
+    /// (1232) is a statement attribute msodbcsql honors.
+    #[test]
+    fn set_attribute_known_to_msodbcsql_reports_not_implemented() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe { sql_set_stmt_attr_w(h.stmt, 1232, 0 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HYC00);
+    }
+
+    #[test]
+    fn get_attribute_known_to_msodbcsql_reports_not_implemented() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut out: SqlULen = 7;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                1232,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HYC00);
+    }
+
+    /// A connection attribute aimed at a statement stays `HY092`; the tables are
+    /// scope-keyed precisely so this does not soften to `HYC00`.
+    /// `SQL_ATTR_CURRENT_CATALOG` (109) is connection-only.
+    #[test]
+    fn connection_attribute_on_a_statement_stays_invalid() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe { sql_set_stmt_attr_w(h.stmt, 109, 0 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY092);
     }
 
     #[test]
