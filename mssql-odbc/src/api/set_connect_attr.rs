@@ -16,6 +16,7 @@ use super::current_catalog::set_current_catalog;
 use super::set_stmt_attr::clamp_query_timeout;
 use super::sqlstate::*;
 use super::txn::{reset_connection, set_autocommit, set_txn_isolation};
+use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
     SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
@@ -224,17 +225,15 @@ unsafe fn sql_set_connect_attr_w_impl(
         // Set by the Driver Manager only, and not retrievable, so nothing to
         // store.
         SQL_ATTR_ANSI_APP => SQL_SUCCESS,
-        // Any other attribute identifier is not one this driver knows. msodbcsql
-        // answers HY092 ("invalid attribute/option identifier") here rather than
-        // HYC00, and the Driver Manager relies on that to tell "you named
-        // something that isn't an attribute" apart from "that attribute exists
-        // but I can't do it".
+        // Any other identifier is one this driver does not act on. Which
+        // diagnostic that earns depends on whether msodbcsql recognizes it:
+        // `HYC00` when it does, so a caller can tell "unavailable here" from
+        // "not an attribute", and `HY092` when it does not. See `attributes.rs`.
         _ => {
-            error!(
-                attribute,
-                "SQLSetConnectAttrW: unsupported connection attribute"
+            post_diag(
+                &mut state,
+                unimplemented_attr_diag(AttrScope::Dbc, AttrOp::Set, attribute),
             );
-            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
             SQL_ERROR
         }
     }
@@ -454,6 +453,46 @@ mod tests {
         // attribute/option identifier") here, not HYC00. (1234 would be a poor
         // choice: it is a real undocumented SQL_COPT_SS_* id msodbcsql accepts.)
         let ret = unsafe { sql_set_connect_attr_w(h.dbc, 99999, std::ptr::null_mut(), 0) };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
+    }
+
+    /// `SQL_COPT_SS_MARS_ENABLED` (1224) is a real msodbcsql connection
+    /// attribute this driver does not implement, so it must report `HYC00`.
+    /// `attrs_before` forwards identifiers unfiltered, and a caller probing for
+    /// MARS has to be able to tell "not available" from "not an attribute".
+    #[test]
+    fn attribute_known_to_msodbcsql_reports_not_implemented() {
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe { sql_set_connect_attr_w(h.dbc, 1224, std::ptr::null_mut(), 0) };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    /// A statement attribute aimed at a connection is `HYC00`, not `HY092`:
+    /// msodbcsql accepts the ODBC 2.x statement options here and fans them out
+    /// to every statement (`SQL_ATTR_MAX_ROWS` = 1). This driver implements the
+    /// fan-out only for `SQL_ATTR_QUERY_TIMEOUT`.
+    #[test]
+    fn statement_option_on_a_connection_reports_not_implemented() {
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe { sql_set_connect_attr_w(h.dbc, 1, 10 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    /// A statement-only identifier msodbcsql rejects on a connection stays
+    /// `HY092`. `SQL_ATTR_ROW_ARRAY_SIZE` (27) is outside the fan-out band.
+    #[test]
+    fn statement_only_attribute_on_a_connection_stays_invalid() {
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe { sql_set_connect_attr_w(h.dbc, 27, 10 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let state = dbc.inner.lock().unwrap();
