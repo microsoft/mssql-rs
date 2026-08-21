@@ -47,7 +47,7 @@ struct PreparedState {
     orphaned: Option<StatementId>,
 }
 
-fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &str) -> PyErr {
+fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static str) -> PyErr {
     match error {
         ClaimError::Closing => PyRuntimeError::new_err("Connection is closing"),
         ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
@@ -57,10 +57,7 @@ fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &str) -> P
 }
 
 fn map_claim_error(error: ClaimError) -> PyErr {
-    map_claim_error_with_busy_message(
-        error,
-        "Connection is busy with another cursor operation",
-    )
+    map_claim_error_with_busy_message(error, "Connection is busy with another cursor operation")
 }
 
 fn map_execute_error(error: impl std::fmt::Display) -> PyErr {
