@@ -143,6 +143,14 @@ pub(crate) struct StmtState {
     pub(crate) row_bind_type: SqlULen,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
+    /// `SQL_ATTR_QUERY_TIMEOUT` in seconds; `0` (the ODBC default) means no
+    /// timeout. Seeded at allocation from the parent connection's
+    /// [`DbcState::stmt_query_timeout`].
+    ///
+    /// Stored and reported only — enforcement against a running query is
+    /// tracked separately (AB#46385), so a non-zero value does not yet cancel
+    /// anything. msodbcsql does enforce it and answers `HYT00` on expiry.
+    pub(crate) query_timeout: u32,
 }
 
 /// A prepared statement bundled with the marker count of its rewritten SQL, so
@@ -243,7 +251,11 @@ unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
 impl StmtHandle {
-    pub(crate) fn new(parent_dbc: *mut c_void) -> Self {
+    /// `query_timeout` is the parent connection's current
+    /// [`DbcState::stmt_query_timeout`](crate::handles::dbc::DbcState); a
+    /// statement starts at the connection-level default rather than always at
+    /// zero (msodbcsql `sqlcfunc.cpp:173`).
+    pub(crate) fn new(parent_dbc: *mut c_void, query_timeout: u32) -> Self {
         Self {
             object_type: HandleType::Stmt,
             parent_dbc,
@@ -272,6 +284,7 @@ impl StmtHandle {
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 state_flags: 0,
+                query_timeout,
             }),
         }
     }

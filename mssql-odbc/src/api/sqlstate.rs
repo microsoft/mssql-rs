@@ -223,6 +223,46 @@ pub(crate) const WARN_CONNECTION_TIMEOUT_CHANGED: DiagMsg = DiagMsg {
     text: "Connection timeout changed",
 };
 
+/// The same clamp applied to `SQL_ATTR_QUERY_TIMEOUT`.
+///
+/// msodbcsql posts the generic `IDS_01_S02` here rather than one of the
+/// timeout-specific strings (`sqlcmisc.cpp:3993`), so the text matches it
+/// verbatim.
+pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Option value changed",
+};
+
+/// Post a server-originated error under a caller-chosen SQLSTATE, keeping the
+/// native error number and the engine's message text.
+///
+/// `SQL_ATTR_CURRENT_CATALOG` needs this: msodbcsql overwrites whatever state
+/// the failed `USE` produced with `IDS_HY_024` (`sqlcmisc.cpp:1873-1875`), so a
+/// missing database surfaces as `HY024` + native 911 rather than the `08004`
+/// the error-number map would otherwise give.
+pub(crate) fn post_tds_error_as(
+    state: &mut impl HasDiagnostics,
+    err: &TdsError,
+    forced_state: [u8; 5],
+) {
+    if let TdsError::SqlServerError { diagnostics } = err
+        && !diagnostics.errors.is_empty()
+    {
+        for e in &diagnostics.errors {
+            let native = i32::try_from(e.number).unwrap_or(i32::MAX);
+            post_sql_error(
+                state,
+                forced_state,
+                native,
+                format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
+            );
+        }
+        post_tds_info_messages(state, &diagnostics.info_messages);
+        return;
+    }
+    post_sql_error(state, forced_state, 0, err.to_string());
+}
+
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
 /// native error 0. For server-originated errors use [`post_tds_error`].
 pub(crate) fn post_diag(state: &mut impl HasDiagnostics, msg: DiagMsg) {
@@ -630,6 +670,84 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    /// Runs `post_tds_error_as` against a real [`DbcState`] — the only type the
+    /// driver instantiates it with — and returns what it posted.
+    fn post_as_on_dbc(err: &TdsError, forced: [u8; 5]) -> Vec<crate::error::DiagRecord> {
+        use crate::handles::dbc::DbcHandle;
+        use crate::handles::handle_from_raw;
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        post_tds_error_as(&mut *state, err, forced);
+        state.diag_records.clone()
+    }
+
+    #[test]
+    fn post_tds_error_as_overrides_the_error_number_mapping() {
+        // 911 maps to 08004 by error number, but the catalog path forces
+        // HY024 the way msodbcsql does (`sqlcmisc.cpp:1873-1875`). The native
+        // number and the engine's text must survive the override.
+        assert_eq!(sqlstate_for_sql_error(911), Some(*b"08004"));
+        let err = TdsError::from_sql_errors(vec![sql_error(
+            911,
+            "Database 'nope' does not exist. Make sure that the name is entered correctly.",
+        )]);
+        let records = post_as_on_dbc(&err, SQLSTATE_HY024);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[0].native_error, 911);
+        assert!(records[0].message.ends_with(
+            "Database 'nope' does not exist. Make sure that the name is entered correctly."
+        ));
+    }
+
+    #[test]
+    fn post_tds_error_as_forces_every_error_then_appends_info_messages() {
+        use mssql_tds::error::SqlServerDiagnostics;
+        let diagnostics = SqlServerDiagnostics::new(
+            vec![sql_error(911, "no such db"), sql_error(5701, "context")],
+            vec![SqlInfoMessage {
+                message: "Changed database context to 'master'.".into(),
+                state: 1,
+                class: 10,
+                number: 5701,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }],
+        );
+        let records = post_as_on_dbc(&TdsError::from_sql_diagnostics(diagnostics), SQLSTATE_HY024);
+        assert_eq!(records.len(), 3);
+        // Every server error takes the forced state, in order.
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[1].sql_state, SQLSTATE_HY024);
+        // Info messages keep their own 01000 state and are appended last.
+        assert_eq!(records[2].sql_state, *b"01000");
+        assert_eq!(records[2].native_error, 5701);
+    }
+
+    #[test]
+    fn post_tds_error_as_falls_back_for_non_server_errors() {
+        let records = post_as_on_dbc(
+            &TdsError::ProtocolError("bad packet".into()),
+            SQLSTATE_HY024,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[0].native_error, 0);
+        assert!(records[0].message.contains("bad packet"));
+    }
+
+    #[test]
+    fn post_tds_error_as_falls_back_when_the_error_list_is_empty() {
+        let records = post_as_on_dbc(&TdsError::from_sql_errors(vec![]), SQLSTATE_HY024);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[0].native_error, 0);
     }
 
     #[test]

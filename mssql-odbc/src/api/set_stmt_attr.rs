@@ -9,11 +9,15 @@
 //! fetch path. `SQL_ATTR_CURSOR_TYPE` and `SQL_ATTR_CONCURRENCY` accept only the
 //! supported forward-only / read-only values; any other request is substituted
 //! and reported with `01S02` (option value changed) rather than silently
-//! succeeding. Other recognized statement attributes (param / descriptor
-//! controls) are accepted without effect. `SQL_ATTR_PARAMSET_SIZE` accepts the
-//! ODBC default of 1 but rejects larger batches, since parameter arrays are not
-//! yet consumed and a silent success would execute only the first row.
-//! Unrecognized attribute identifiers fail with `HY092`.
+//! succeeding. `SQL_ATTR_QUERY_TIMEOUT` is stored and clamped to
+//! [`MAX_QUERY_TIMEOUT`], matching msodbcsql, which reports `01S02` rather than
+//! rejecting an over-large request; enforcing the stored timeout against a
+//! running statement is tracked separately. Other recognized statement
+//! attributes (param / descriptor controls) are accepted without effect.
+//! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger
+//! batches, since parameter arrays are not yet consumed and a silent success
+//! would execute only the first row. Unrecognized attribute identifiers fail
+//! with `HY092`.
 //!
 //! Each entry point follows the crate's mandatory layering: FFI panic boundary
 //! → `unsafe` raw-handle shim → safe core (`README.md`; `num_result_cols.rs`).
@@ -21,21 +25,37 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_CONCURRENCY, SQL_ATTR_CURSOR_TYPE,
-    SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_PARAM_BIND_TYPE,
+    MAX_QUERY_TIMEOUT, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_ATTR_CONCURRENCY,
+    SQL_ATTR_CURSOR_TYPE, SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_PARAM_BIND_TYPE,
     SQL_ATTR_PARAM_STATUS_PTR, SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_PARAMSET_SIZE,
-    SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR, SQL_ATTR_ROW_BIND_TYPE,
-    SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR, SQL_CONCUR_READ_ONLY,
-    SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR,
+    SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
+    SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
     ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
-    post_diag,
+    WARN_OPTION_VALUE_CHANGED, post_diag,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+
+/// Clamps a requested `SQL_ATTR_QUERY_TIMEOUT` to the largest value the driver
+/// accepts, reporting whether the request had to be reduced.
+///
+/// msodbcsql caps at `MAX_QUERY_TIMEOUT` and posts `01S02` instead of rejecting
+/// (`sqlcmisc.cpp:3988-3994`), so an over-large request still yields a usable
+/// statement. Shared with the `SQLSetConnectAttrW` route, which applies the same
+/// cap before fanning the value out.
+pub(super) fn clamp_query_timeout(requested: SqlULen) -> (u32, bool) {
+    let seconds = u32::try_from(requested).unwrap_or(u32::MAX);
+    if seconds > MAX_QUERY_TIMEOUT {
+        (MAX_QUERY_TIMEOUT, true)
+    } else {
+        (seconds, false)
+    }
+}
 
 /// Sets a statement attribute.
 ///
@@ -190,6 +210,16 @@ fn sql_set_stmt_attr_w_safe(
                 SQL_SUCCESS_WITH_INFO
             }
         }
+        SQL_ATTR_QUERY_TIMEOUT => {
+            let (seconds, clamped) = clamp_query_timeout(value_ptr as SqlULen);
+            state.query_timeout = seconds;
+            debug!(seconds, "SQLSetStmtAttrW: SQL_ATTR_QUERY_TIMEOUT set");
+            if clamped {
+                post_diag(&mut state, WARN_OPTION_VALUE_CHANGED);
+                return SQL_SUCCESS_WITH_INFO;
+            }
+            SQL_SUCCESS
+        }
         // Recognized attributes accepted without tracking: these param /
         // descriptor controls have no effect on the implemented forward-only,
         // read-only behavior.
@@ -284,6 +314,9 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_ROW_BIND_TYPE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.row_bind_type);
         },
+        SQL_ATTR_QUERY_TIMEOUT => unsafe {
+            write_if_some(value_ptr as *mut SqlULen, state.query_timeout as SqlULen);
+        },
         // Recognized attributes we don't store: report their effective ODBC
         // defaults for this forward-only, read-only, single-paramset driver.
         SQL_ATTR_CURSOR_TYPE => unsafe {
@@ -342,6 +375,85 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    /// Reads `SQL_ATTR_QUERY_TIMEOUT` back off a statement.
+    fn stmt_query_timeout(stmt: SqlHandle) -> SqlULen {
+        let mut out: SqlULen = 0;
+        let rc = unsafe {
+            sql_get_stmt_attr_w(
+                stmt,
+                SQL_ATTR_QUERY_TIMEOUT,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+        out
+    }
+
+    #[test]
+    fn query_timeout_defaults_to_no_limit() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(stmt_query_timeout(h.stmt), 0);
+    }
+
+    #[test]
+    fn query_timeout_round_trips() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_QUERY_TIMEOUT, 30 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(stmt_query_timeout(h.stmt), 30);
+    }
+
+    #[test]
+    fn query_timeout_at_the_cap_is_accepted_silently() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_QUERY_TIMEOUT,
+                MAX_QUERY_TIMEOUT as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(stmt_query_timeout(h.stmt), MAX_QUERY_TIMEOUT as SqlULen);
+    }
+
+    #[test]
+    fn query_timeout_past_the_cap_is_clamped_with_a_warning() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_stmt_attr_w(h.stmt, SQL_ATTR_QUERY_TIMEOUT, 0x10000 as SqlPointer, 0)
+        };
+        // Clamped rather than rejected, so the statement stays usable.
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S02);
+        }
+        assert_eq!(stmt_query_timeout(h.stmt), MAX_QUERY_TIMEOUT as SqlULen);
+    }
+
+    #[test]
+    fn clamp_reports_whether_it_reduced_the_request() {
+        assert_eq!(clamp_query_timeout(0), (0, false));
+        assert_eq!(clamp_query_timeout(30), (30, false));
+        assert_eq!(
+            clamp_query_timeout(MAX_QUERY_TIMEOUT as SqlULen),
+            (MAX_QUERY_TIMEOUT, false)
+        );
+        assert_eq!(
+            clamp_query_timeout(MAX_QUERY_TIMEOUT as SqlULen + 1),
+            (MAX_QUERY_TIMEOUT, true)
+        );
+        // A value past `u32` must clamp, not wrap to a small number (or to 0,
+        // which would silently mean "no timeout").
+        assert_eq!(clamp_query_timeout(SqlULen::MAX), (MAX_QUERY_TIMEOUT, true));
     }
 
     #[test]

@@ -4,24 +4,28 @@
 //! Implementation of SQLSetConnectAttrW.
 //!
 //! Handles the msodbcsql-specific `SQL_COPT_SS_ACCESS_TOKEN` attribute (a
-//! pre-acquired Entra access token) and `SQL_ATTR_LOGIN_TIMEOUT` (the login
-//! deadline applied at connect time). Other standard attributes are accepted as
-//! no-ops for now.
+//! pre-acquired Entra access token), `SQL_ATTR_LOGIN_TIMEOUT` (the login
+//! deadline applied at connect time), `SQL_ATTR_CURRENT_CATALOG` (the current
+//! database, which sends `USE` when connected), and `SQL_ATTR_QUERY_TIMEOUT`
+//! (the statement option in its connection-wide form). Other standard
+//! attributes are accepted as no-ops for now.
 
 use tracing::{debug, error};
 
+use super::current_catalog::set_current_catalog;
+use super::set_stmt_attr::clamp_query_timeout;
 use super::sqlstate::*;
 use super::txn::{reset_connection, set_autocommit, set_txn_isolation};
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
-    SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_RESET_CONNECTION,
-    SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN, SQL_COPT_SS_RESET_CONNECTION,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
+    SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
+    SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE,
+    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
-use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Largest login timeout the driver accepts, in seconds.
 ///
@@ -33,14 +37,17 @@ const MAX_LOGIN_TIMEOUT_SECS: u64 = 0xfffe;
 ///
 /// For `SQL_COPT_SS_ACCESS_TOKEN`, `string_length` is ignored: real ODBC callers
 /// pass `SQL_IS_POINTER` and the token length comes from the `ACCESSTOKEN`
-/// struct's own `dataSize` field (matching msodbcsql). Unrecognized attributes
-/// return `HYC00` rather than silently succeeding.
+/// struct's own `dataSize` field (matching msodbcsql). Unrecognized attribute
+/// identifiers return `HY092` rather than silently succeeding.
 ///
 /// # Safety
 /// - `connection_handle` must be a valid `DbcHandle` from `SQLAllocHandle`.
 /// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to an ACCESSTOKEN
 ///   struct: a 4-byte little-endian length prefix followed by that many bytes
 ///   of the UTF-16-LE-encoded access token.
+/// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must point to `string_length`
+///   `SQLWCHAR`s, or to a NUL-terminated wide string when `string_length` is
+///   `SQL_NTS`.
 pub(crate) unsafe fn sql_set_connect_attr_w(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
@@ -63,7 +70,7 @@ unsafe fn sql_set_connect_attr_w_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
-    _string_length: SqlInteger,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     if connection_handle.is_null() {
         error!("SQLSetConnectAttrW: connection_handle is null");
@@ -92,6 +99,13 @@ unsafe fn sql_set_connect_attr_w_impl(
         SQL_ATTR_RESET_CONNECTION | SQL_COPT_SS_RESET_CONNECTION => {
             return reset_connection(dbc, value_ptr as usize as u64);
         }
+        // Sends `USE` when connected — likewise not under the mutex.
+        SQL_ATTR_CURRENT_CATALOG => {
+            return unsafe { set_current_catalog(dbc, value_ptr, string_length) };
+        }
+        // Fans out to every statement on the connection, so it takes statement
+        // locks and must not hold the DBC mutex while doing so.
+        SQL_ATTR_QUERY_TIMEOUT => return set_query_timeout(dbc, value_ptr as usize as u64),
         _ => {}
     }
 
@@ -210,22 +224,70 @@ unsafe fn sql_set_connect_attr_w_impl(
         // Set by the Driver Manager only, and not retrievable, so nothing to
         // store.
         SQL_ATTR_ANSI_APP => SQL_SUCCESS,
-        // Any other attribute is genuinely unsupported: surface a clear error
-        // (HYC00) instead of silently pretending it took effect.
+        // Any other attribute identifier is not one this driver knows. msodbcsql
+        // answers HY092 ("invalid attribute/option identifier") here rather than
+        // HYC00, and the Driver Manager relies on that to tell "you named
+        // something that isn't an attribute" apart from "that attribute exists
+        // but I can't do it".
         _ => {
             error!(
                 attribute,
                 "SQLSetConnectAttrW: unsupported connection attribute"
             );
-            post_sql_error(
-                &mut state,
-                SQLSTATE_HYC00,
-                0,
-                "Connection attribute not supported",
-            );
+            post_diag(&mut state, ERR_INVALID_ATTRIBUTE_IDENTIFIER);
             SQL_ERROR
         }
     }
+}
+
+/// Applies `SQL_ATTR_QUERY_TIMEOUT` on a connection handle.
+///
+/// ODBC lets the statement options be set on the connection, where they mean
+/// "this is the default, and also apply it to what is already open". msodbcsql
+/// implements exactly that (`sqlcmisc.cpp:2879-2935`): it records the connection
+/// default and walks the statement list, and `SQLAllocHandle(SQL_HANDLE_STMT)`
+/// then seeds new statements from the stored default (`sqlcfunc.cpp:173`).
+///
+/// Unlike the statement-level set, this is write-only: msodbcsql answers
+/// `SQLGetConnectAttr(SQL_ATTR_QUERY_TIMEOUT)` with `HY092`, so there is
+/// deliberately no matching arm in `SQLGetConnectAttrW`.
+fn set_query_timeout(dbc: &DbcHandle, requested: u64) -> SqlReturn {
+    let (seconds, clamped) = clamp_query_timeout(requested as usize);
+
+    let statements = {
+        let Ok(mut state) = dbc.inner.lock() else {
+            error!("SQLSetConnectAttrW: dbc mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut state);
+        state.stmt_query_timeout = seconds;
+        // Clone so the statement locks below are taken with the DBC mutex
+        // released, matching `close_all_cursors`.
+        state.statements.clone()
+    };
+
+    for stmt_ptr in statements {
+        // SAFETY: every pointer in `statements` came from
+        // `handle_to_raw::<StmtHandle>` and is owned by this DBC.
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
+        match stmt.inner.lock() {
+            Ok(mut stmt_state) => stmt_state.query_timeout = seconds,
+            // One unusable statement must not abort the fan-out: the connection
+            // default is already stored and the other statements still need it.
+            Err(_) => error!(?stmt_ptr, "SQLSetConnectAttrW: stmt mutex poisoned"),
+        }
+    }
+    debug!(seconds, "SQLSetConnectAttrW: query timeout applied");
+
+    if clamped {
+        let Ok(mut state) = dbc.inner.lock() else {
+            error!("SQLSetConnectAttrW: dbc mutex poisoned");
+            return SQL_ERROR;
+        };
+        post_diag(&mut state, WARN_OPTION_VALUE_CHANGED);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+    SQL_SUCCESS
 }
 
 /// Decodes the msodbcsql `SQL_COPT_SS_ACCESS_TOKEN` structure into the raw JWT.
@@ -367,8 +429,107 @@ mod tests {
     #[test]
     fn unsupported_attribute_returns_error() {
         let h = TestHandles::with_env_dbc();
-        // 1234 is an arbitrary unhandled attribute id -> HYC00, not silent success.
-        let ret = unsafe { sql_set_connect_attr_w(h.dbc, 1234, std::ptr::null_mut(), 0) };
+        // 99999 is not an attribute identifier in any namespace, so it must fail
+        // rather than succeed silently. msodbcsql answers HY092 ("invalid
+        // attribute/option identifier") here, not HYC00. (1234 would be a poor
+        // choice: it is a real undocumented SQL_COPT_SS_* id msodbcsql accepts.)
+        let ret = unsafe { sql_set_connect_attr_w(h.dbc, 99999, std::ptr::null_mut(), 0) };
+        assert_eq!(ret, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` set on a connection is a bulk statement-option
+    /// set: it applies to statements that already exist and becomes the default
+    /// for ones allocated later.
+    #[test]
+    fn query_timeout_on_a_connection_fans_out_and_is_inherited() {
+        let mut h = TestHandles::with_env_dbc();
+        let existing = h.alloc_extra_stmt();
+
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 17usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        // Already open when the attribute was set.
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(existing) };
+        assert_eq!(stmt.inner.lock().unwrap().query_timeout, 17);
+
+        // Allocated afterwards: seeded from the connection default.
+        let later = h.alloc_extra_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(later) };
+        assert_eq!(stmt.inner.lock().unwrap().query_timeout, 17);
+    }
+
+    #[test]
+    fn query_timeout_on_a_connection_clamps_with_a_warning() {
+        let mut h = TestHandles::with_env_dbc();
+        let stmt_handle = h.alloc_extra_stmt();
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 0x10000usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records[0].sql_state,
+            *b"01S02"
+        );
+
+        // The clamped value, not the requested one, is what statements receive.
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_handle) };
+        assert_eq!(stmt.inner.lock().unwrap().query_timeout, 0xfffe);
+    }
+
+    #[test]
+    fn query_timeout_on_a_connection_with_no_statements_is_still_stored() {
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 42usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(dbc.inner.lock().unwrap().stmt_query_timeout, 42);
+    }
+
+    #[test]
+    fn query_timeout_fan_out_skips_a_poisoned_statement() {
+        // One unusable statement must not abort the fan-out: the connection
+        // default still lands, and the healthy statements still get the value.
+        let mut h = TestHandles::with_env_dbc();
+        let bad = h.alloc_extra_stmt();
+        let good = h.alloc_extra_stmt();
+
+        let bad_stmt = unsafe { handle_from_raw::<StmtHandle>(bad) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = bad_stmt.inner.lock().unwrap();
+            panic!("poison the stmt lock");
+        }));
+
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 19usize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(dbc.inner.lock().unwrap().stmt_query_timeout, 19);
+        let good_stmt = unsafe { handle_from_raw::<StmtHandle>(good) };
+        assert_eq!(good_stmt.inner.lock().unwrap().query_timeout, 19);
+    }
+
+    #[test]
+    fn query_timeout_fails_cleanly_on_a_poisoned_connection() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dbc.inner.lock().unwrap();
+            panic!("poison the dbc lock");
+        }));
+        let ret = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 7usize as SqlPointer, 0)
+        };
         assert_eq!(ret, SQL_ERROR);
     }
 
