@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mssql_tds::connection::tds_client::{
     ExecuteOptions, PreparedStatement, StatementId, StatementResult,
 };
+use mssql_tds::error::Error;
+use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -38,7 +40,9 @@ use tracing::instrument::WithSubscriber;
 use mssql_tds::connection::tds_client::TdsClient;
 
 use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
-use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
+use crate::async_session::{
+    AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, ExecuteClaim, OperationId,
+};
 
 /// Cursor-local state for prepared execution and deferred handle cleanup.
 #[derive(Default)]
@@ -49,6 +53,167 @@ struct PreparedState {
     parameter_signature: Vec<ParameterMetadata>,
     /// A superseded statement retained until its unprepare request is serialized.
     orphaned: Option<StatementId>,
+}
+
+/// Whether execute must replace the cursor's current prepared statement.
+fn should_replace_prepared_statement(
+    state: &PreparedState,
+    operation: &str,
+    parameter_signature: &[ParameterMetadata],
+    reset_cursor: bool,
+) -> bool {
+    reset_cursor
+        || state
+            .statement
+            .as_ref()
+            .is_none_or(|statement| statement.sql() != operation)
+        || state.parameter_signature != parameter_signature
+}
+
+/// Python-free inputs required to execute one command on the TDS session.
+struct ExecuteRequest {
+    operation: String,
+    rpc_parameters: Vec<RpcParameter>,
+    parameter_signature: Vec<ParameterMetadata>,
+    use_prepare: bool,
+    reset_cursor: bool,
+    timeout: u32,
+    autocommit: bool,
+}
+
+/// Cursor state captured under the GIL before constructing the execute future.
+struct ExecuteSnapshot {
+    request: ExecuteRequest,
+    client: Arc<Mutex<TdsClient>>,
+    dispatch: Option<tracing::Dispatch>,
+    prepared_state: Arc<Mutex<PreparedState>>,
+    session_state: Arc<AsyncConnectionState>,
+    cursor_id: CursorId,
+    input_sizes_generation: u64,
+    cleanup_required: Arc<AtomicBool>,
+}
+
+/// Ownership state left by a successful command dispatch.
+enum ExecuteOutcome {
+    Idle,
+    Fetching,
+}
+
+impl ExecuteOutcome {
+    fn has_open_batch(&self) -> bool {
+        matches!(self, Self::Fetching)
+    }
+}
+
+/// Protocol failure and whether ownership must poison the connection.
+struct ExecuteFailure {
+    error: Error,
+    break_connection: bool,
+}
+
+impl ExecuteFailure {
+    fn broken(error: Error) -> Self {
+        Self {
+            error,
+            break_connection: true,
+        }
+    }
+}
+
+impl From<Error> for ExecuteFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            break_connection: false,
+        }
+    }
+}
+
+/// Runs the protocol portion of execute without accessing Python objects.
+async fn execute_on_client(
+    client: &mut TdsClient,
+    prepared_state: &Mutex<PreparedState>,
+    claim: &ExecuteClaim,
+    request: ExecuteRequest,
+) -> Result<ExecuteOutcome, ExecuteFailure> {
+    let ExecuteRequest {
+        operation,
+        rpc_parameters,
+        parameter_signature,
+        use_prepare,
+        reset_cursor,
+        timeout,
+        autocommit,
+    } = request;
+
+    if claim.drain_previous {
+        client.close_query().await?;
+    }
+    let options = ExecuteOptions {
+        timeout: if timeout == 0 { None } else { Some(timeout) },
+        cancel: Some(&claim.cancel_handle),
+        ..Default::default()
+    };
+    if !autocommit && !client.has_active_transaction() {
+        // TODO(mssql-tds): Add an options-aware begin_transaction API that applies
+        // reconnect timeout accounting and cancellation, and records whether the
+        // transaction-manager request reached the wire. Until then, any BEGIN
+        // failure must conservatively poison the session.
+        client
+            .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+            .await
+            .map_err(ExecuteFailure::broken)?;
+    }
+
+    let first = if use_prepare {
+        // TODO(performance): Benchmark prepared-statement reuse independently
+        // from placeholder scanning and scalar conversion.
+        let mut state = prepared_state.lock().await;
+        let replace_statement = should_replace_prepared_statement(
+            &state,
+            &operation,
+            &parameter_signature,
+            reset_cursor,
+        );
+        if replace_statement {
+            if let Some(mut statement) = state.statement.take()
+                && let Some(statement_id) = statement.take_id()
+            {
+                state.orphaned = Some(statement_id);
+            }
+            state.statement = Some(PreparedStatement::new(operation));
+            state.parameter_signature = parameter_signature;
+        }
+        let PreparedState {
+            statement,
+            parameter_signature: _,
+            orphaned,
+        } = &mut *state;
+        client
+            .execute_prepared(
+                statement
+                    .as_mut()
+                    .expect("prepared statement was initialized"),
+                rpc_parameters,
+                orphaned,
+                options,
+            )
+            .await?
+    } else if rpc_parameters.is_empty() {
+        client.execute(operation, options).await?
+    } else {
+        client
+            .execute_sp_executesql(operation, rpc_parameters, options)
+            .await?
+    };
+    if !matches!(first, StatementResult::Rows) {
+        client.advance_to_rows().await?;
+    }
+    Ok(if client.has_open_batch() {
+        ExecuteOutcome::Fetching
+    } else {
+        ExecuteOutcome::Idle
+    })
 }
 
 /// Converts a failed session claim into a Python error with operation-specific busy text.
@@ -90,16 +255,32 @@ impl ExecuteGuard {
     }
 
     /// Completes execution and transitions ownership to fetching or idle.
-    fn complete(&mut self, has_open_batch: bool) {
+    fn complete(&mut self, outcome: &ExecuteOutcome) {
         self.session_state
-            .finish_execute(self.operation_id, has_open_batch);
+            .finish_execute(self.operation_id, outcome.has_open_batch());
         self.completed = true;
     }
 
-    /// Releases ownership after an outcome that was handled without interruption.
-    fn fail(&mut self) {
+    /// Releases ownership after an error that left the protocol reusable.
+    fn release(&mut self) {
         self.session_state.release_operation(self.operation_id);
         self.completed = true;
+    }
+
+    /// Marks the connection broken after an error left protocol work pending.
+    fn break_connection(&mut self) {
+        self.session_state.mark_broken();
+        self.session_state.release_operation(self.operation_id);
+        self.completed = true;
+    }
+
+    /// Completes a handled error according to the remaining protocol state.
+    fn fail(&mut self, has_open_batch: bool) {
+        if has_open_batch {
+            self.break_connection();
+        } else {
+            self.release();
+        }
     }
 }
 
@@ -109,6 +290,96 @@ impl Drop for ExecuteGuard {
         if !self.completed {
             self.session_state.mark_broken();
             self.session_state.release_operation(self.operation_id);
+        }
+    }
+}
+
+/// Python-independent resources required to drain and release a cursor.
+struct CursorCleanup {
+    client: Arc<Mutex<TdsClient>>,
+    prepared_state: Arc<Mutex<PreparedState>>,
+    session_state: Arc<AsyncConnectionState>,
+    cursor_id: CursorId,
+    timeout: u32,
+    closed: Arc<AtomicBool>,
+}
+
+impl CursorCleanup {
+    async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
+        let mut cleanup_guard = ExecuteGuard::new(self.session_state.clone(), claim.operation_id);
+        let (result, has_open_batch) = {
+            let mut client = self.client.lock().await;
+            let result = async {
+                if claim.drain_previous {
+                    client.close_query().await?;
+                }
+                let statement_ids = {
+                    let mut state = self.prepared_state.lock().await;
+                    let current = state
+                        .statement
+                        .as_mut()
+                        .and_then(PreparedStatement::take_id);
+                    let orphaned = state.orphaned.take();
+                    state.statement = None;
+                    state.parameter_signature.clear();
+                    [current, orphaned]
+                };
+                let mut released = None;
+                for statement_id in statement_ids.into_iter().flatten() {
+                    if released == Some(statement_id) {
+                        continue;
+                    }
+                    client
+                        .unprepare(
+                            statement_id,
+                            ExecuteOptions {
+                                timeout: Some(self.timeout),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    released = Some(statement_id);
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            let has_open_batch = client.has_open_batch();
+            (result, has_open_batch)
+        };
+
+        cleanup_guard.fail(has_open_batch);
+        result?;
+        self.closed.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Ensures abandoned finalizer tasks synchronously poison session ownership.
+struct FinalizerCleanup {
+    cleanup: Option<CursorCleanup>,
+    session_state: Arc<AsyncConnectionState>,
+    cursor_id: CursorId,
+    completed: bool,
+}
+
+impl FinalizerCleanup {
+    async fn run(mut self, claim: CursorCloseClaim) {
+        let cleanup = self.cleanup.take().expect("finalizer cleanup is available");
+        match cleanup.run(claim).await {
+            Ok(()) => self.completed = true,
+            Err(error) => {
+                tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
+                self.session_state.abandon_cursor(self.cursor_id);
+                self.completed = true;
+            }
+        }
+    }
+}
+
+impl Drop for FinalizerCleanup {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.session_state.abandon_cursor(self.cursor_id);
         }
     }
 }
@@ -142,6 +413,8 @@ pub struct PyAsyncCursor {
     default_query_timeout: u32,
     input_sizes: Option<Vec<crate::types::ParameterHint>>,
     input_sizes_generation: u64,
+    cleanup_required: Arc<AtomicBool>,
+    cleanup_started: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
 }
 
@@ -167,8 +440,138 @@ impl PyAsyncCursor {
             default_query_timeout,
             input_sizes: None,
             input_sizes_generation: 0,
+            cleanup_required: Arc::new(AtomicBool::new(false)),
+            cleanup_started: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn cleanup(&self) -> CursorCleanup {
+        CursorCleanup {
+            client: self.tds_client.clone(),
+            prepared_state: self.prepared_state.clone(),
+            session_state: self.session_state.clone(),
+            cursor_id: self.cursor_id,
+            timeout: self.default_query_timeout,
+            closed: self.closed.clone(),
+        }
+    }
+}
+
+impl Drop for PyAsyncCursor {
+    fn drop(&mut self) {
+        if !self.cleanup_required.load(Ordering::Acquire)
+            || self.closed.load(Ordering::Acquire)
+            || self
+                .cleanup_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+
+        let cleanup = self.cleanup();
+        let session_state = self.session_state.clone();
+        let claim = match session_state.claim_cursor_close(self.cursor_id) {
+            Ok(claim) => claim,
+            Err(error) => {
+                tracing::warn!("PyAsyncCursor finalizer could not claim cleanup: {error:?}");
+                session_state.abandon_cursor(self.cursor_id);
+                return;
+            }
+        };
+        let finalizer = FinalizerCleanup {
+            cleanup: Some(cleanup),
+            session_state,
+            cursor_id: self.cursor_id,
+            completed: false,
+        };
+        pyo3_async_runtimes::tokio::get_runtime().spawn(finalizer.run(claim));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::should_replace_prepared_statement;
+    use super::{ExecuteGuard, ParameterMetadata, PreparedState, PreparedStatement};
+    use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+
+    fn prepared_state(sql: &str, signature: Vec<ParameterMetadata>) -> PreparedState {
+        PreparedState {
+            statement: Some(PreparedStatement::new(sql.to_string())),
+            parameter_signature: signature,
+            orphaned: None,
+        }
+    }
+
+    #[test]
+    fn compatible_prepared_statement_is_reused_when_reset_is_false() {
+        let signature = vec![ParameterMetadata::Scalar("int")];
+        let state = prepared_state("SELECT @P1", signature.clone());
+
+        assert!(!should_replace_prepared_statement(
+            &state,
+            "SELECT @P1",
+            &signature,
+            false,
+        ));
+    }
+
+    #[test]
+    fn prepared_statement_is_replaced_for_each_incompatible_input() {
+        let signature = vec![ParameterMetadata::Scalar("int")];
+        let state = prepared_state("SELECT @P1", signature.clone());
+
+        assert!(should_replace_prepared_statement(
+            &state,
+            "SELECT @P1",
+            &signature,
+            true,
+        ));
+        assert!(should_replace_prepared_statement(
+            &state,
+            "SELECT @P1 + 1",
+            &signature,
+            false,
+        ));
+        assert!(should_replace_prepared_statement(
+            &state,
+            "SELECT @P1",
+            &[ParameterMetadata::Scalar("bigint")],
+            false,
+        ));
+        assert!(should_replace_prepared_statement(
+            &PreparedState::default(),
+            "SELECT @P1",
+            &signature,
+            false,
+        ));
+    }
+
+    #[test]
+    fn handled_error_releases_reusable_session() {
+        let state = Arc::new(AsyncConnectionState::new());
+        let claim = state.claim_execute(1).unwrap();
+        let mut guard = ExecuteGuard::new(Arc::clone(&state), claim.operation_id);
+
+        guard.fail(false);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn handled_error_breaks_session_with_open_batch() {
+        let state = Arc::new(AsyncConnectionState::new());
+        let claim = state.claim_execute(1).unwrap();
+        let mut guard = ExecuteGuard::new(Arc::clone(&state), claim.operation_id);
+
+        guard.fail(true);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Broken);
     }
 }
 
@@ -207,19 +610,7 @@ impl PyAsyncCursor {
         use_prepare: bool,
         reset_cursor: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (
-            operation,
-            rpc_parameters,
-            parameter_signature,
-            client,
-            dispatch,
-            prepared_state,
-            autocommit,
-            session_state,
-            cursor_id,
-            timeout,
-            input_sizes_generation,
-        ) = {
+        let snapshot = {
             let cursor = slf.borrow(py);
             if cursor.closed.load(Ordering::Acquire) {
                 return Err(PyRuntimeError::new_err("Cursor is closed"));
@@ -230,20 +621,35 @@ impl PyAsyncCursor {
             // block the caller's event-loop thread during preflight.
             let (operation, rpc_parameters, parameter_signature) =
                 bind_parameters(operation, parameters, cursor.input_sizes.as_deref())?;
-            (
-                operation,
-                rpc_parameters,
-                parameter_signature,
-                cursor.tds_client.clone(),
-                cursor.tracing_dispatch.clone(),
-                cursor.prepared_state.clone(),
-                cursor.autocommit.load(Ordering::Relaxed),
-                cursor.session_state.clone(),
-                cursor.cursor_id,
-                cursor.default_query_timeout,
-                cursor.input_sizes_generation,
-            )
+            ExecuteSnapshot {
+                request: ExecuteRequest {
+                    operation,
+                    rpc_parameters,
+                    parameter_signature,
+                    use_prepare,
+                    reset_cursor,
+                    timeout: cursor.default_query_timeout,
+                    autocommit: cursor.autocommit.load(Ordering::Relaxed),
+                },
+                client: cursor.tds_client.clone(),
+                dispatch: cursor.tracing_dispatch.clone(),
+                prepared_state: cursor.prepared_state.clone(),
+                session_state: cursor.session_state.clone(),
+                cursor_id: cursor.cursor_id,
+                input_sizes_generation: cursor.input_sizes_generation,
+                cleanup_required: cursor.cleanup_required.clone(),
+            }
         };
+        let ExecuteSnapshot {
+            request,
+            client,
+            dispatch,
+            prepared_state,
+            session_state,
+            cursor_id,
+            input_sizes_generation,
+            cleanup_required,
+        } = snapshot;
         let claim = session_state
             .claim_execute(cursor_id)
             .map_err(map_claim_error)?;
@@ -252,78 +658,24 @@ impl PyAsyncCursor {
 
         let future = async move {
             let mut execute_guard = ExecuteGuard::new(future_state, operation_id);
+            cleanup_required.store(true, Ordering::Release);
             tracing::info!(
                 "PyAsyncCursor::execute: executing query; parameter_count={}, use_prepare={}, reset_cursor={}",
-                rpc_parameters.len(),
-                use_prepare,
-                reset_cursor
+                request.rpc_parameters.len(),
+                request.use_prepare,
+                request.reset_cursor
             );
 
-            let result = async {
+            let (result, has_open_batch) = {
                 let mut client = client.lock().await;
-                if claim.drain_previous {
-                    client.close_query().await?;
-                }
-                if !autocommit && !client.has_active_transaction() {
-                    client
-                        .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
-                        .await?;
-                }
-
-                let options = ExecuteOptions {
-                    timeout: if timeout == 0 { None } else { Some(timeout) },
-                    cancel: Some(&claim.cancel_handle),
-                    ..Default::default()
-                };
-                let first = if use_prepare {
-                    let mut state = prepared_state.lock().await;
-                    let replace_statement = reset_cursor
-                        || state
-                            .statement
-                            .as_ref()
-                            .is_none_or(|statement| statement.sql() != operation)
-                        || state.parameter_signature != parameter_signature;
-                    if replace_statement {
-                        if let Some(mut statement) = state.statement.take()
-                            && let Some(statement_id) = statement.take_id()
-                        {
-                            state.orphaned = Some(statement_id);
-                        }
-                        state.statement = Some(PreparedStatement::new(operation));
-                        state.parameter_signature = parameter_signature;
-                    }
-                    let PreparedState {
-                        statement,
-                        parameter_signature: _,
-                        orphaned,
-                    } = &mut *state;
-                    client
-                        .execute_prepared(
-                            statement
-                                .as_mut()
-                                .expect("prepared statement was initialized"),
-                            rpc_parameters,
-                            orphaned,
-                            options,
-                        )
-                        .await?
-                } else if rpc_parameters.is_empty() {
-                    client.execute(operation, options).await?
-                } else {
-                    client
-                        .execute_sp_executesql(operation, rpc_parameters, options)
-                        .await?
-                };
-                if !matches!(first, StatementResult::Rows) {
-                    client.advance_to_rows().await?;
-                }
-                Ok::<bool, mssql_tds::error::Error>(client.has_open_batch())
-            }
-            .await;
+                let result = execute_on_client(&mut client, &prepared_state, &claim, request).await;
+                let has_open_batch = client.has_open_batch();
+                (result, has_open_batch)
+            };
 
             match result {
-                Ok(has_open_batch) => {
-                    execute_guard.complete(has_open_batch);
+                Ok(outcome) => {
+                    execute_guard.complete(&outcome);
                     Python::attach(|py| {
                         let mut cursor = slf.borrow_mut(py);
                         if cursor.input_sizes_generation == input_sizes_generation {
@@ -334,8 +686,8 @@ impl PyAsyncCursor {
                     Ok(slf)
                 }
                 Err(error) => {
-                    execute_guard.fail();
-                    Err(map_execute_error(error))
+                    execute_guard.fail(error.break_connection || has_open_batch);
+                    Err(map_execute_error(error.error))
                 }
             }
         };
@@ -360,72 +712,38 @@ impl PyAsyncCursor {
     /// Returns an awaitable resolving to `None`. Closing an already closed
     /// cursor is a no-op.
     fn close<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (client, dispatch, prepared_state, session_state, cursor_id, timeout, closed) = {
+        let (cleanup, cleanup_started, dispatch) = {
             let cursor = slf.borrow(py);
-            if cursor.closed.load(Ordering::Acquire) {
+            if cursor.closed.load(Ordering::Acquire)
+                || cursor
+                    .cleanup_started
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
                 return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                     Python::attach(|py| Ok(py.None()))
                 });
             }
             (
-                cursor.tds_client.clone(),
+                cursor.cleanup(),
+                cursor.cleanup_started.clone(),
                 cursor.tracing_dispatch.clone(),
-                cursor.prepared_state.clone(),
-                cursor.session_state.clone(),
-                cursor.cursor_id,
-                cursor.default_query_timeout,
-                cursor.closed.clone(),
             )
         };
-        let claim = session_state
-            .claim_cursor_close(cursor_id)
-            .map_err(map_claim_error)?;
-        let operation_id = claim.operation_id;
-        let future_state = session_state.clone();
-        let future = async move {
-            let mut close_guard = ExecuteGuard::new(future_state, operation_id);
-            let result = async {
-                let mut client = client.lock().await;
-                if claim.drain_previous {
-                    client.close_query().await?;
-                }
-                let statement_ids = {
-                    let mut state = prepared_state.lock().await;
-                    let current = state
-                        .statement
-                        .as_mut()
-                        .and_then(PreparedStatement::take_id);
-                    let orphaned = state.orphaned.take();
-                    state.statement = None;
-                    state.parameter_signature.clear();
-                    [current, orphaned]
-                };
-                let mut released = None;
-                for statement_id in statement_ids.into_iter().flatten() {
-                    if released == Some(statement_id) {
-                        continue;
-                    }
-                    client
-                        .unprepare(
-                            statement_id,
-                            ExecuteOptions {
-                                timeout: Some(timeout),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
-                    released = Some(statement_id);
-                }
-                Ok::<(), mssql_tds::error::Error>(())
+        let session_state = cleanup.session_state.clone();
+        let claim = match session_state.claim_cursor_close(cleanup.cursor_id) {
+            Ok(claim) => claim,
+            Err(error) => {
+                cleanup_started.store(false, Ordering::Release);
+                return Err(map_claim_error(error));
             }
-            .await;
-
-            close_guard.fail();
-            result.map_err(|error| {
+        };
+        let operation_id = claim.operation_id;
+        let future = async move {
+            cleanup.run(claim).await.map_err(|error| {
                 tracing::error!("PyAsyncCursor::close: failed: {error}");
                 PyRuntimeError::new_err(format!("Cursor close failed: {error}"))
             })?;
-            closed.store(true, Ordering::Release);
             Python::attach(|py| Ok(py.None()))
         };
         let future = async move {
@@ -438,54 +756,9 @@ impl PyAsyncCursor {
             Ok(awaitable) => Ok(awaitable),
             Err(error) => {
                 session_state.release_operation(operation_id);
+                cleanup_started.store(false, Ordering::Release);
                 Err(error)
             }
         }
     }
-
-    // TODO(mssql-tds blockers for async execute parity):
-    // - Add a public, general TdsClient parameter-description API backed by
-    //   sp_describe_undeclared_parameters. The existing describe path is
-    //   private and specific to Always Encrypted, so an unhinted Python None
-    //   still falls back to NVARCHAR(1).
-    // - Add declaration metadata to nullable Decimal/Numeric RPC parameters.
-    //   RpcParameter/SqlType cannot carry precision and scale separately from
-    //   a non-NULL DecimalParts value, and declaration generation hardcodes
-    //   SqlType::{Decimal, Numeric}(None) to (18,10).
-    // - Add a public SqlType::Udt input contract and RPC serializer carrying
-    //   database, schema, and server UDT type names. mssql-tds currently parses
-    //   UDT result metadata internally but cannot send a typed UDT parameter.
-    // TODO(remaining async transaction work):
-    // - Add an awaitable connection mode-change API rather than a synchronous
-    //   property setter: false -> true commits active work before changing
-    //   mode and leaves the mode unchanged if commit fails; true -> false
-    //   defers begin until the next execute.
-    // - Test lazy begin, restart after commit/rollback, both mode transitions,
-    //   context finalization, and cleanup-error precedence.
-    //
-    // TODO(remaining async fetch/close/cancel ownership work):
-    // - Release Fetching ownership when results are exhausted or the cursor is
-    //   closed.
-    // - Add cursor cancel(), triggering the root CancelHandle only when cursor
-    //   and operation IDs match; complete ATTENTION cleanup before deciding
-    //   whether the connection remains reusable or must be marked Broken.
-    // - Add a two-cursor acceptance test with a multi-packet result: reject
-    //   cursor B with a typed busy-state error while cursor A has unread rows,
-    //   verify A can drain its remaining rows, then verify B can execute after
-    //   A drains or closes.
-    //
-    // TODO(performance opportunities):
-    // - Move large parameter/TVP preflight off the Python event-loop thread by
-    //   introducing a chunked or pre-converted input contract; Python objects
-    //   still require the GIL, so spawn_blocking alone is insufficient.
-    // - Remove the per-execution TVP deep clone when mssql-tds supports shared
-    //   TvpTableData ownership.
-    // - Cache or compute datetime base ordinals in the bulk-copy conversion path.
-    // - Convert TVP row iterators directly instead of collecting Bound cells first.
-    // - Add Criterion benchmarks for placeholder scanning, scalar binding,
-    //   prepared reuse, and representative TVP row counts.
-    // - Placeholder rewriting still runs under the GIL before the awaitable is
-    //   returned. If benchmarks of the optimized scanner justify caching, share
-    //   rewritten SQL and marker metadata at connection scope, use borrowed raw
-    //   SQL plus parameter style for hit-path lookup, and bound retained bytes.
 }

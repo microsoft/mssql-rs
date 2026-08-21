@@ -5,6 +5,7 @@
 
 import asyncio
 import datetime
+import gc
 import uuid
 import warnings
 from decimal import Decimal
@@ -51,6 +52,9 @@ def test_execute_drains_same_cursor_previous_results(client_context):
 
 @pytest.mark.integration
 def test_execute_rejects_another_cursor_while_results_are_pending(client_context):
+    # TODO: Extend this to a multi-packet result, drain the first cursor to
+    # exhaustion, and verify the second cursor can then execute. Closing the
+    # first cursor is already covered by test_cursor_close_drains_results.
     async def run():
         conn = await connect(client_context)
         try:
@@ -212,6 +216,27 @@ def test_execute_rejects_parameter_style_and_arity_mismatches(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    [
+        ("SELECT ?", "1 parameter markers, but 0 parameters"),
+        ("SELECT %(value)s", "named placeholders"),
+    ],
+)
+def test_execute_rejects_markers_without_arguments(client_context, operation, message):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            with pytest.raises(TypeError, match=message):
+                cursor.execute(operation)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_execute_accepts_empty_mapping_without_markers(client_context):
     async def run():
         conn = await connect(client_context)
@@ -276,7 +301,10 @@ def test_execute_rejects_unsupported_parameter_value(client_context):
         ([(999999, 0, 0)], "Invalid SQL type"),
         ([(4, 0, 0, 0)], "must contain"),  # SQL_INTEGER
         ([(3, 39, 0)], "precision/scale"),  # SQL_DECIMAL
+        ([(3, 2, 3)], "precision/scale"),
+        ([(3, 38, 39)], "precision/scale"),
         ([(3, 10, 11)], "precision/scale"),
+        ([(93, 0, 8)], "Invalid temporal scale"),  # SQL_TYPE_TIMESTAMP
     ],
 )
 def test_setinputsizes_rejects_invalid_hints(client_context, sizes, message):
@@ -389,7 +417,17 @@ def test_execute_infers_parameter_sql_type(
 
 @pytest.mark.integration
 @pytest.mark.parametrize("use_prepare", [True, False])
-def test_execute_infers_decimal_precision_and_scale(client_context, use_prepare):
+@pytest.mark.parametrize(
+    ("value", "precision", "scale"),
+    [
+        (Decimal("123.4500"), 7, 4),
+        (Decimal("1E+3"), 4, 0),
+        (Decimal("1E-3"), 3, 3),
+    ],
+)
+def test_execute_infers_decimal_precision_and_scale(
+    client_context, use_prepare, value, precision, scale
+):
     async def run():
         conn = await connect(client_context)
         try:
@@ -398,11 +436,13 @@ def test_execute_infers_decimal_precision_and_scale(client_context, use_prepare)
                 """
                 DECLARE @value sql_variant = CAST(? AS sql_variant)
                 IF SQL_VARIANT_PROPERTY(@value, 'BaseType') <> 'numeric'
-                    OR SQL_VARIANT_PROPERTY(@value, 'Precision') <> 7
-                    OR SQL_VARIANT_PROPERTY(@value, 'Scale') <> 4
+                    OR SQL_VARIANT_PROPERTY(@value, 'Precision') <> ?
+                    OR SQL_VARIANT_PROPERTY(@value, 'Scale') <> ?
                     THROW 50000, 'Unexpected decimal parameter metadata', 1
                 """,
-                Decimal("123.4500"),
+                value,
+                precision,
+                scale,
                 use_prepare=use_prepare,
             )
         finally:
@@ -413,7 +453,17 @@ def test_execute_infers_decimal_precision_and_scale(client_context, use_prepare)
 
 @pytest.mark.integration
 @pytest.mark.parametrize("use_prepare", [True, False])
-def test_execute_preserves_datetimeoffset(client_context, use_prepare):
+@pytest.mark.parametrize(
+    ("offset", "expected_minutes"),
+    [
+        (datetime.timedelta(hours=-14), -840),
+        (datetime.timedelta(hours=5, minutes=30), 330),
+        (datetime.timedelta(hours=14), 840),
+    ],
+)
+def test_execute_preserves_datetimeoffset(
+    client_context, use_prepare, offset, expected_minutes
+):
     async def run():
         conn = await connect(client_context)
         try:
@@ -426,16 +476,81 @@ def test_execute_preserves_datetimeoffset(client_context, use_prepare):
                 34,
                 56,
                 123456,
-                tzinfo=datetime.timezone(datetime.timedelta(hours=5, minutes=30)),
+                tzinfo=datetime.timezone(offset),
             )
             await cursor.execute(
-                """
-                IF DATEPART(TZOFFSET, CAST(? AS datetimeoffset)) <> 330
+                f"""
+                IF DATEPART(TZOFFSET, CAST(? AS datetimeoffset)) <> {expected_minutes}
                     THROW 50000, 'Unexpected datetime offset', 1
                 """,
                 value,
                 use_prepare=use_prepare,
             )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+@pytest.mark.parametrize("scale", [0, 3, 7])
+@pytest.mark.parametrize(
+    ("hint", "value", "expected_type"),
+    [
+        ((92, 0), datetime.time(12, 34, 56), "time"),
+        ((93, 0), datetime.datetime(2026, 8, 20, 12, 34, 56), "datetime2"),
+        (
+            (-155, 0),
+            datetime.datetime(
+                2026, 8, 20, 12, 34, 56, tzinfo=datetime.timezone.utc
+            ),
+            "datetimeoffset",
+        ),
+    ],
+)
+def test_setinputsizes_preserves_temporal_scale(
+    client_context, use_prepare, scale, hint, value, expected_type
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([(hint[0], hint[1], scale)])
+            await cursor.execute(
+                f"""
+                DECLARE @value sql_variant = CAST(? AS sql_variant)
+                IF SQL_VARIANT_PROPERTY(@value, 'BaseType') <> '{expected_type}'
+                    OR SQL_VARIANT_PROPERTY(@value, 'Scale') <> {scale}
+                    THROW 50000, 'Unexpected temporal parameter metadata', 1
+                """,
+                value,
+                use_prepare=use_prepare,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+@pytest.mark.parametrize("offset_seconds", [30, -30])
+def test_execute_rejects_sub_minute_datetimeoffset(
+    client_context, use_prepare, offset_seconds
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            value = datetime.datetime(
+                2026,
+                8,
+                20,
+                tzinfo=datetime.timezone(datetime.timedelta(seconds=offset_seconds)),
+            )
+            with pytest.raises(RuntimeError, match="whole-minute UTC offset"):
+                await cursor.execute("SELECT ?", value, use_prepare=use_prepare)
         finally:
             await conn.close()
 
@@ -455,6 +570,83 @@ def test_setinputsizes_binds_typed_null(client_context, use_prepare):
                 None,
                 use_prepare=use_prepare,
             )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_setinputsizes_uses_default_numeric_precision(client_context, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([(3, 0, 2)])  # SQL_DECIMAL, default precision
+            await cursor.execute(
+                """
+                DECLARE @value sql_variant = CAST(? AS sql_variant)
+                IF SQL_VARIANT_PROPERTY(@value, 'BaseType') <> 'decimal'
+                    OR SQL_VARIANT_PROPERTY(@value, 'Precision') <> 18
+                    OR SQL_VARIANT_PROPERTY(@value, 'Scale') <> 2
+                    THROW 50000, 'Unexpected decimal parameter metadata', 1
+                """,
+                Decimal("1.23"),
+                use_prepare=use_prepare,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("hint", "message"),
+    [
+        ((3, 9, 2), "require precision 18 and scale 10"),
+        ((92, 0, 3), "require scale 7"),
+        ((93, 0, 3), "require scale 7"),
+        ((-155, 0, 3), "require scale 7"),
+    ],
+)
+def test_setinputsizes_rejects_unrepresentable_typed_null_metadata(
+    client_context, hint, message
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([hint])
+            with pytest.raises(TypeError, match=message):
+                cursor.execute("SELECT ?", None)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+@pytest.mark.parametrize(
+    "hint",
+    [
+        (3, 18, 10),
+        (92, 0, 7),
+        (93, 0, 7),
+        (-155, 0, 7),
+    ],
+)
+def test_setinputsizes_accepts_representable_typed_null_metadata(
+    client_context, use_prepare, hint
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([hint])
+            await cursor.execute("SELECT ?", None, use_prepare=use_prepare)
         finally:
             await conn.close()
 
@@ -651,6 +843,8 @@ def test_execute_binds_table_valued_parameter(client_context, use_prepare, rows)
 
 @pytest.mark.integration
 def test_execute_reuses_prepared_statement_when_reset_cursor_is_false(client_context):
+    # The py-core unit test pins the state-reuse decision; mssql-tds separately
+    # asserts that a retained live handle emits sp_execute rather than sp_prepexec.
     async def run():
         conn = await connect(client_context)
         try:
@@ -693,6 +887,37 @@ def test_cursor_close_drains_results_and_rejects_further_use(client_context):
                 await cursor.execute("SELECT 1")
             with pytest.raises(RuntimeError, match="Cursor is closed"):
                 cursor.setinputsizes([(4, 0, 0)])
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_dropped_cursor_with_unread_rows_does_not_leave_connection_busy(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT CAST(? AS int)", 1)
+            del cursor
+            gc.collect()
+
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                probe = conn.cursor()
+                try:
+                    await probe.execute("SET NOCOUNT ON", use_prepare=False)
+                except RuntimeError as error:
+                    if "busy" in str(error).lower():
+                        continue
+                    assert "broken" in str(error).lower()
+                    break
+                else:
+                    await probe.close()
+                    break
+            else:
+                pytest.fail("Dropped cursor left the connection permanently busy")
         finally:
             await conn.close()
 

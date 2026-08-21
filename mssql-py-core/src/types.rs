@@ -33,12 +33,90 @@ fn uuid_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     UUID_TYPE.import(py, "uuid", "UUID")
 }
 
+/// A supported ODBC `setinputsizes()` type after boundary validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputSqlType {
+    Bit,
+    TinyInt,
+    SmallInt,
+    Integer,
+    BigInt,
+    Real,
+    Float,
+    Numeric,
+    Decimal,
+    Char,
+    VarChar,
+    LongVarChar,
+    WChar,
+    WVarChar,
+    WLongVarChar,
+    Binary,
+    VarBinary,
+    LongVarBinary,
+    Date,
+    Time,
+    DateTime,
+    DateTimeOffset,
+    Guid,
+    Xml,
+    Json,
+    Vector,
+    Money,
+    SmallMoney,
+    Variant,
+    Udt,
+}
+
+impl TryFrom<i32> for InputSqlType {
+    type Error = Error;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        Ok(match value {
+            -7 => Self::Bit,
+            -6 => Self::TinyInt,
+            5 => Self::SmallInt,
+            4 => Self::Integer,
+            -5 => Self::BigInt,
+            7 => Self::Real,
+            6 | 8 => Self::Float,
+            2 => Self::Numeric,
+            3 => Self::Decimal,
+            1 => Self::Char,
+            12 => Self::VarChar,
+            -1 => Self::LongVarChar,
+            -8 => Self::WChar,
+            -9 => Self::WVarChar,
+            -10 => Self::WLongVarChar,
+            -2 => Self::Binary,
+            -3 => Self::VarBinary,
+            -4 => Self::LongVarBinary,
+            9 | 91 => Self::Date,
+            10 | 92 | -154 => Self::Time,
+            11 | 93 => Self::DateTime,
+            -155 => Self::DateTimeOffset,
+            -11 => Self::Guid,
+            -152 | 241 => Self::Xml,
+            244 => Self::Json,
+            245 => Self::Vector,
+            60 => Self::Money,
+            122 => Self::SmallMoney,
+            -150 => Self::Variant,
+            -151 => Self::Udt,
+            _ => {
+                return Err(Error::UsageError(format!(
+                    "Invalid SQL type: {value}. Must be a supported SQL type constant"
+                )));
+            }
+        })
+    }
+}
+
 /// A validated ODBC-compatible `setinputsizes()` entry lowered to [`SqlType`]
 /// before TDS serialization.
 #[derive(Clone, Copy)]
 pub(crate) struct ParameterHint {
-    /// A supported ODBC SQL type code.
-    sql_type: i32,
+    sql_type: InputSqlType,
     /// Precision, dimension count, or character/binary allocation size.
     size: u32,
     /// Numeric or temporal scale where the selected type supports one.
@@ -49,18 +127,22 @@ impl ParameterHint {
     /// Validates the type code and numeric bounds once so conversion matches
     /// can treat any remaining arm as unreachable.
     pub(crate) fn new(sql_type: i32, size: u32, scale: u8) -> TdsResult<Self> {
-        const VALID_TYPES: &[i32] = &[
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 91, 92, 93, -1, -2, -3, -4, -5, -6, -7, -8, -9,
-            -10, -11, -150, -151, -152, -154, -155, 60, 122, 241, 244, 245,
-        ];
-        if !VALID_TYPES.contains(&sql_type) {
-            return Err(Error::UsageError(format!(
-                "Invalid SQL type: {sql_type}. Must be a supported SQL type constant"
-            )));
+        let sql_type = InputSqlType::try_from(sql_type)?;
+        if matches!(sql_type, InputSqlType::Numeric | InputSqlType::Decimal) {
+            let precision = Self::effective_numeric_precision(size);
+            if precision > 38 || u32::from(scale) > precision {
+                return Err(Error::UsageError(format!(
+                    "Invalid numeric precision/scale: precision={precision}, scale={scale}"
+                )));
+            }
         }
-        if matches!(sql_type, 2 | 3) && (size > 38 || u32::from(scale) > size.max(1)) {
+        if matches!(
+            sql_type,
+            InputSqlType::Time | InputSqlType::DateTime | InputSqlType::DateTimeOffset
+        ) && scale > 7
+        {
             return Err(Error::UsageError(format!(
-                "Invalid numeric precision/scale: precision={size}, scale={scale}"
+                "Invalid temporal scale: {scale}. Expected a value from 0 to 7"
             )));
         }
         Ok(Self {
@@ -70,21 +152,35 @@ impl ParameterHint {
         })
     }
 
-    /// Returns the validated ODBC SQL type code for TVP compatibility checks.
-    pub(crate) fn sql_type(self) -> i32 {
-        self.sql_type
+    fn effective_numeric_precision(size: u32) -> u32 {
+        if size == 0 { 18 } else { size }
     }
 
-    /// Returns explicit decimal precision for TVP metadata, excluding zero as unspecified.
+    /// Whether SQL Server permits this type in TVP column metadata.
+    pub(crate) fn supports_tvp_column(self) -> bool {
+        !matches!(
+            self.sql_type,
+            InputSqlType::Udt | InputSqlType::LongVarChar | InputSqlType::WLongVarChar
+        )
+    }
+
+    /// Returns effective decimal precision for TVP metadata.
     pub(crate) fn precision(self) -> Option<u8> {
-        matches!(self.sql_type, 2 | 3)
-            .then(|| u8::try_from(self.size).unwrap_or(0))
-            .filter(|precision| *precision > 0)
+        matches!(self.sql_type, InputSqlType::Numeric | InputSqlType::Decimal)
+            .then(|| Self::effective_numeric_precision(self.size) as u8)
     }
 
     /// Returns scale only for numeric and scale-bearing temporal types.
     pub(crate) fn scale(self) -> Option<u8> {
-        matches!(self.sql_type, 2 | 3 | 10 | 11 | 92 | 93 | -154 | -155).then_some(self.scale)
+        matches!(
+            self.sql_type,
+            InputSqlType::Numeric
+                | InputSqlType::Decimal
+                | InputSqlType::Time
+                | InputSqlType::DateTime
+                | InputSqlType::DateTimeOffset
+        )
+        .then_some(self.scale)
     }
 }
 
@@ -206,7 +302,7 @@ pub(crate) fn py_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
     }
 
     if py_obj.is_instance_of::<PyDateTime>() {
-        return py_datetime_to_sql_type(py_obj);
+        return py_datetime_to_sql_type(py_obj, None);
     }
 
     if py_obj.is_instance_of::<PyTime>() {
@@ -274,113 +370,138 @@ pub(crate) fn py_to_sql_type_with_hint(
     }
 
     match hint.sql_type {
-        -7 => Ok(SqlType::Bit(Some(py_obj.extract::<bool>().map_err(|error| {
+        InputSqlType::Bit => Ok(SqlType::Bit(Some(py_obj.extract::<bool>().map_err(|error| {
             Error::UsageError(format!("Failed to convert parameter to BIT: {error}"))
         })?))),
-        -6 => Ok(SqlType::TinyInt(Some(py_obj.extract::<u8>().map_err(
+        InputSqlType::TinyInt => Ok(SqlType::TinyInt(Some(py_obj.extract::<u8>().map_err(
             |error| Error::UsageError(format!("Failed to convert parameter to TINYINT: {error}")),
         )?))),
-        5 => Ok(SqlType::SmallInt(Some(py_obj.extract::<i16>().map_err(
+        InputSqlType::SmallInt => Ok(SqlType::SmallInt(Some(py_obj.extract::<i16>().map_err(
             |error| Error::UsageError(format!("Failed to convert parameter to SMALLINT: {error}")),
         )?))),
-        4 => Ok(SqlType::Int(Some(py_obj.extract::<i32>().map_err(
+        InputSqlType::Integer => Ok(SqlType::Int(Some(py_obj.extract::<i32>().map_err(
             |error| Error::UsageError(format!("Failed to convert parameter to INT: {error}")),
         )?))),
-        -5 => Ok(SqlType::BigInt(Some(py_obj.extract::<i64>().map_err(
+        InputSqlType::BigInt => Ok(SqlType::BigInt(Some(py_obj.extract::<i64>().map_err(
             |error| Error::UsageError(format!("Failed to convert parameter to BIGINT: {error}")),
         )?))),
-        7 => Ok(SqlType::Real(Some(py_obj.extract::<f32>().map_err(
+        InputSqlType::Real => Ok(SqlType::Real(Some(py_obj.extract::<f32>().map_err(
             |error| Error::UsageError(format!("Failed to convert parameter to REAL: {error}")),
         )?))),
-        6 | 8 => Ok(SqlType::Float(Some(py_obj.extract::<f64>().map_err(
+        InputSqlType::Float => Ok(SqlType::Float(Some(py_obj.extract::<f64>().map_err(
             |error| Error::UsageError(format!("Failed to convert parameter to FLOAT: {error}")),
         )?))),
-        2 | 3 => hinted_decimal(py_obj, hint),
-        1 | 12 | -1 | -8 | -9 | -10 => hinted_string(py_obj, hint),
-        -4..=-2 => hinted_binary(py_obj, hint),
-        9 | 91 => match py_to_sql_type(py_obj)? {
+        InputSqlType::Numeric | InputSqlType::Decimal => hinted_decimal(py_obj, hint),
+        InputSqlType::Char
+        | InputSqlType::VarChar
+        | InputSqlType::LongVarChar
+        | InputSqlType::WChar
+        | InputSqlType::WVarChar
+        | InputSqlType::WLongVarChar => hinted_string(py_obj, hint),
+        InputSqlType::Binary | InputSqlType::VarBinary | InputSqlType::LongVarBinary => {
+            hinted_binary(py_obj, hint)
+        }
+        InputSqlType::Date => match py_to_sql_type(py_obj)? {
             SqlType::Date(value) => Ok(SqlType::Date(value)),
             _ => Err(Error::UsageError("Expected a date parameter".to_string())),
         },
-        10 | 92 | -154 => Ok(SqlType::Time(Some(py_time(py_obj, hint.scale.min(7))?))),
-        11 | 93 => match py_datetime_to_sql_type(py_obj)? {
+        InputSqlType::Time => Ok(SqlType::Time(Some(py_time(py_obj, hint.scale)?))),
+        InputSqlType::DateTime => match py_datetime_to_sql_type(py_obj, Some(hint.scale))? {
             SqlType::DateTime2(value) => Ok(SqlType::DateTime2(value)),
             SqlType::DateTimeOffset(value) => Ok(SqlType::DateTime2(
                 value.map(|value| value.datetime2),
             )),
             _ => unreachable!("datetime conversion returns a temporal SQL type"),
         },
-        -155 => match py_datetime_to_sql_type(py_obj)? {
+        InputSqlType::DateTimeOffset => match py_datetime_to_sql_type(py_obj, Some(hint.scale))? {
             SqlType::DateTimeOffset(value) => Ok(SqlType::DateTimeOffset(value)),
             _ => Err(Error::UsageError(
                 "DATETIMEOFFSET requires a timezone-aware datetime".to_string(),
             )),
         },
-        -11 => match py_to_sql_type(py_obj)? {
+        InputSqlType::Guid => match py_to_sql_type(py_obj)? {
             SqlType::Uuid(value) => Ok(SqlType::Uuid(value)),
             _ => Err(Error::UsageError("Expected a UUID parameter".to_string())),
         },
-        -152 => {
+        InputSqlType::Xml => {
             let value = py_obj.extract::<String>().map_err(|error| {
                 Error::UsageError(format!("Failed to convert parameter to XML: {error}"))
             })?;
             Ok(SqlType::Xml(Some(SqlXml::from(value))))
         }
-        241 => {
-            let value = py_obj.extract::<String>().map_err(|error| {
-                Error::UsageError(format!("Failed to convert parameter to XML: {error}"))
-            })?;
-            Ok(SqlType::Xml(Some(SqlXml::from(value))))
-        }
-        244 => hinted_json(py_obj),
-        245 => hinted_vector(py_obj, hint),
-        60 | 122 => hinted_money(py_obj, hint),
-        -150 => Ok(SqlType::Variant(Box::new(py_to_sql_type(py_obj)?))),
-        -151 => Err(Error::UsageError(
+        InputSqlType::Json => hinted_json(py_obj),
+        InputSqlType::Vector => hinted_vector(py_obj, hint),
+        InputSqlType::Money | InputSqlType::SmallMoney => hinted_money(py_obj, hint),
+        InputSqlType::Variant => Ok(SqlType::Variant(Box::new(py_to_sql_type(py_obj)?))),
+        // TODO(mssql-tds): Add a public SqlType::Udt input contract and RPC
+        // serializer carrying database, schema, and server UDT type names.
+        InputSqlType::Udt => Err(Error::UsageError(
             "SQL_SS_UDT parameters require a server UDT type name, which setinputsizes does not provide"
                 .to_string(),
         )),
-        _ => unreachable!("ParameterHint validates SQL type constants"),
     }
 }
 
 /// Constructs the typed NULL required when inference has no Python value.
 ///
 /// Variable-length types may promote to `MAX`; fixed-width types reject sizes
-/// beyond SQL Server limits. Nullable decimal precision and scale cannot yet be
-/// retained because their value-free [`SqlType`] variants do not carry them.
+/// beyond SQL Server limits. NULL numeric and temporal hints are accepted only
+/// when their metadata matches the value-free [`SqlType`] defaults.
 pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
     let size = hint.size.max(1);
     Ok(match hint.sql_type {
-        -7 => SqlType::Bit(None),
-        -6 => SqlType::TinyInt(None),
-        5 => SqlType::SmallInt(None),
-        4 => SqlType::Int(None),
-        -5 => SqlType::BigInt(None),
-        7 => SqlType::Real(None),
-        6 | 8 => SqlType::Float(None),
-        // TODO(mssql-tds): Nullable Decimal/Numeric variants must carry
-        // precision and scale independently of a value. SqlType currently
-        // falls back to (18,10), so py-core cannot preserve these hints here.
-        2 => SqlType::Numeric(None),
-        3 => SqlType::Decimal(None),
-        1 => SqlType::Char(None, checked_length(size, 8_000, "CHAR")?),
-        12 => sized_varchar(None, size),
-        -1 => SqlType::VarcharMax(None),
-        -8 => SqlType::NChar(None, checked_length(size, 4_000, "NCHAR")?),
-        -9 => sized_nvarchar(None, size),
-        -10 => SqlType::NText(None),
-        -2 => SqlType::Binary(None, checked_length(size, 8_000, "BINARY")?),
-        -3 => sized_varbinary(None, size),
-        -4 | -151 => SqlType::VarBinaryMax(None),
-        9 | 91 => SqlType::Date(None),
-        10 | 92 | -154 => SqlType::Time(None),
-        11 | 93 => SqlType::DateTime2(None),
-        -155 => SqlType::DateTimeOffset(None),
-        -11 => SqlType::Uuid(None),
-        -152 | 241 => SqlType::Xml(None),
-        244 => SqlType::Json(None),
-        245 => {
+        InputSqlType::Bit => SqlType::Bit(None),
+        InputSqlType::TinyInt => SqlType::TinyInt(None),
+        InputSqlType::SmallInt => SqlType::SmallInt(None),
+        InputSqlType::Integer => SqlType::Int(None),
+        InputSqlType::BigInt => SqlType::BigInt(None),
+        InputSqlType::Real => SqlType::Real(None),
+        InputSqlType::Float => SqlType::Float(None),
+        InputSqlType::Numeric | InputSqlType::Decimal => {
+            // TODO(mssql-tds): Carry NULL precision and scale independently of
+            // the optional value so py-core can preserve non-default metadata.
+            if hint.size != 18 || hint.scale != 10 {
+                return Err(Error::UsageError(format!(
+                    "NULL numeric parameters currently require precision 18 and scale 10; requested precision {} and scale {}",
+                    hint.size, hint.scale
+                )));
+            }
+            if hint.sql_type == InputSqlType::Numeric {
+                SqlType::Numeric(None)
+            } else {
+                SqlType::Decimal(None)
+            }
+        }
+        InputSqlType::Char => SqlType::Char(None, checked_length(size, 8_000, "CHAR")?),
+        InputSqlType::VarChar => sized_varchar(None, size),
+        InputSqlType::LongVarChar => SqlType::VarcharMax(None),
+        InputSqlType::WChar => SqlType::NChar(None, checked_length(size, 4_000, "NCHAR")?),
+        InputSqlType::WVarChar => sized_nvarchar(None, size),
+        InputSqlType::WLongVarChar => SqlType::NText(None),
+        InputSqlType::Binary => SqlType::Binary(None, checked_length(size, 8_000, "BINARY")?),
+        InputSqlType::VarBinary => sized_varbinary(None, size),
+        InputSqlType::LongVarBinary | InputSqlType::Udt => SqlType::VarBinaryMax(None),
+        InputSqlType::Date => SqlType::Date(None),
+        InputSqlType::Time | InputSqlType::DateTime | InputSqlType::DateTimeOffset => {
+            // TODO(mssql-tds): Carry NULL temporal scale independently of the
+            // optional value so py-core can preserve non-default metadata.
+            if hint.scale != 7 {
+                return Err(Error::UsageError(format!(
+                    "NULL temporal parameters currently require scale 7; requested scale {}",
+                    hint.scale
+                )));
+            }
+            match hint.sql_type {
+                InputSqlType::Time => SqlType::Time(None),
+                InputSqlType::DateTime => SqlType::DateTime2(None),
+                InputSqlType::DateTimeOffset => SqlType::DateTimeOffset(None),
+                _ => unreachable!("matched temporal input type"),
+            }
+        }
+        InputSqlType::Guid => SqlType::Uuid(None),
+        InputSqlType::Xml => SqlType::Xml(None),
+        InputSqlType::Json => SqlType::Json(None),
+        InputSqlType::Vector => {
             if hint.size == 0 {
                 return Err(Error::UsageError(
                     "A NULL VECTOR parameter requires its dimension count as the input size"
@@ -393,23 +514,22 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
                 mssql_tds::datatypes::sqldatatypes::VectorBaseType::Float32,
             )
         }
-        60 => SqlType::Money(None),
-        122 => SqlType::SmallMoney(None),
-        -150 => SqlType::Variant(Box::new(SqlType::NVarchar(None, 1))),
-        _ => unreachable!("ParameterHint validates SQL type constants"),
+        InputSqlType::Money => SqlType::Money(None),
+        InputSqlType::SmallMoney => SqlType::SmallMoney(None),
+        InputSqlType::Variant => SqlType::Variant(Box::new(SqlType::NVarchar(None, 1))),
     })
 }
 
 /// Applies caller-specified decimal precision and scale instead of inferring
 /// them from the Python value.
 fn hinted_decimal(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {
-    let precision = if hint.size == 0 { 18 } else { hint.size } as u8;
+    let precision = ParameterHint::effective_numeric_precision(hint.size) as u8;
     let value = py_obj
         .str()
         .and_then(|value| value.extract::<String>())
         .map_err(|error| Error::UsageError(format!("Failed to convert numeric value: {error}")))?;
     let parts = DecimalParts::from_string(&value, precision, hint.scale)?;
-    Ok(if hint.sql_type == 2 {
+    Ok(if hint.sql_type == InputSqlType::Numeric {
         SqlType::Numeric(Some(parts))
     } else {
         SqlType::Decimal(Some(parts))
@@ -422,7 +542,10 @@ fn hinted_string(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
     let value = py_obj.extract::<String>().map_err(|error| {
         Error::UsageError(format!("Failed to convert parameter to string: {error}"))
     })?;
-    let actual = if matches!(hint.sql_type, -10..=-8) {
+    let actual = if matches!(
+        hint.sql_type,
+        InputSqlType::WChar | InputSqlType::WVarChar | InputSqlType::WLongVarChar
+    ) {
         value.encode_utf16().count() as u32
     } else {
         value.len() as u32
@@ -431,12 +554,12 @@ fn hinted_string(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
     let size = hint.size.max(actual);
     let value = Some(SqlString::from_utf8_string(value));
     Ok(match hint.sql_type {
-        1 => SqlType::Char(value, checked_length(size, 8_000, "CHAR")?),
-        12 => sized_varchar(value, size),
-        -1 => SqlType::Text(value),
-        -8 => SqlType::NChar(value, checked_length(size, 4_000, "NCHAR")?),
-        -9 => sized_nvarchar(value, size),
-        -10 => SqlType::NText(value),
+        InputSqlType::Char => SqlType::Char(value, checked_length(size, 8_000, "CHAR")?),
+        InputSqlType::VarChar => sized_varchar(value, size),
+        InputSqlType::LongVarChar => SqlType::Text(value),
+        InputSqlType::WChar => SqlType::NChar(value, checked_length(size, 4_000, "NCHAR")?),
+        InputSqlType::WVarChar => sized_nvarchar(value, size),
+        InputSqlType::WLongVarChar => SqlType::NText(value),
         _ => unreachable!("hinted_string receives only string constants"),
     })
 }
@@ -448,9 +571,11 @@ fn hinted_binary(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
     })?;
     let size = hint.size.max(value.len() as u32).max(1);
     Ok(match hint.sql_type {
-        -2 => SqlType::Binary(Some(value), checked_length(size, 8_000, "BINARY")?),
-        -3 => sized_varbinary(Some(value), size),
-        -4 => SqlType::VarBinaryMax(Some(value)),
+        InputSqlType::Binary => {
+            SqlType::Binary(Some(value), checked_length(size, 8_000, "BINARY")?)
+        }
+        InputSqlType::VarBinary => sized_varbinary(Some(value), size),
+        InputSqlType::LongVarBinary => SqlType::VarBinaryMax(Some(value)),
         _ => unreachable!("hinted_binary receives only binary constants"),
     })
 }
@@ -515,7 +640,7 @@ fn hinted_money(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sql
         .and_then(|value| value.extract::<i64>())
         .map_err(|error| Error::UsageError(format!("Failed to scale money value: {error}")))?;
 
-    if hint.sql_type == 122 {
+    if hint.sql_type == InputSqlType::SmallMoney {
         let scaled = i32::try_from(scaled)
             .map_err(|_| Error::UsageError("Value is outside the SMALLMONEY range".to_string()))?;
         Ok(SqlType::SmallMoney(Some(SqlSmallMoney { int_val: scaled })))
@@ -561,7 +686,12 @@ fn sized_varbinary(value: Option<Vec<u8>>, size: u32) -> SqlType {
     }
 }
 
-fn py_datetime_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
+// TODO(performance): Cache or compute datetime base ordinals in the bulk-copy
+// conversion path instead of calling Python's toordinal for each value.
+fn py_datetime_to_sql_type(
+    py_obj: &Bound<'_, PyAny>,
+    hinted_scale: Option<u8>,
+) -> TdsResult<SqlType> {
     let ordinal = py_obj
         .call_method0("toordinal")
         .and_then(|value| value.extract::<u32>())
@@ -576,7 +706,7 @@ fn py_datetime_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
     if tzinfo.is_none() {
         return Ok(SqlType::DateTime2(Some(SqlDateTime2 {
             days,
-            time: py_time(py_obj, 6)?,
+            time: py_time(py_obj, hinted_scale.unwrap_or(6))?,
         })));
     }
 
@@ -594,20 +724,30 @@ fn py_datetime_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
         .map_err(|error| {
             Error::UsageError(format!("Failed to get timezone offset seconds: {error}"))
         })?;
-    let offset_minutes = (offset_seconds / 60.0).round() as i16;
-    if !(-840..=840).contains(&offset_minutes) {
-        return Err(Error::UsageError(format!(
-            "Timezone offset {offset_minutes} minutes is outside the DATETIMEOFFSET range"
-        )));
-    }
+    let offset_minutes = datetimeoffset_minutes(offset_seconds)?;
 
     Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
         datetime2: SqlDateTime2 {
             days,
-            time: py_time(py_obj, 7)?,
+            time: py_time(py_obj, hinted_scale.unwrap_or(7))?,
         },
         offset: offset_minutes,
     })))
+}
+
+fn datetimeoffset_minutes(offset_seconds: f64) -> TdsResult<i16> {
+    if !offset_seconds.is_finite() || offset_seconds % 60.0 != 0.0 {
+        return Err(Error::UsageError(
+            "DATETIMEOFFSET requires a whole-minute UTC offset".to_string(),
+        ));
+    }
+    let offset_minutes = offset_seconds / 60.0;
+    if !(-840.0..=840.0).contains(&offset_minutes) {
+        return Err(Error::UsageError(format!(
+            "Timezone offset {offset_minutes} minutes is outside the DATETIMEOFFSET range"
+        )));
+    }
+    Ok(offset_minutes as i16)
 }
 
 /// Converts Python time components to the 100-nanosecond units used by TDS,
@@ -638,6 +778,30 @@ fn is_decimal(py_obj: &Bound<'_, PyAny>) -> TdsResult<bool> {
         .map_err(|error| Error::UsageError(format!("Failed to inspect Decimal value: {error}")))
 }
 
+fn inferred_decimal_shape(digit_count: usize, exponent: i64) -> TdsResult<(u8, u8)> {
+    let precision = if exponent >= 0 {
+        digit_count.saturating_add(exponent as usize)
+    } else {
+        digit_count.max(exponent.unsigned_abs() as usize)
+    };
+    if precision == 0 || precision > 38 {
+        return Err(Error::UsageError(format!(
+            "Decimal precision {precision} is outside SQL Server's supported range of 1 to 38"
+        )));
+    }
+    let scale = if exponent < 0 {
+        exponent.unsigned_abs() as usize
+    } else {
+        0
+    };
+    if scale > 38 {
+        return Err(Error::UsageError(format!(
+            "Decimal scale {scale} exceeds SQL Server's maximum scale of 38"
+        )));
+    }
+    Ok((precision as u8, scale as u8))
+}
+
 fn py_decimal_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
     let decimal_tuple = py_obj
         .call_method0("as_tuple")
@@ -652,27 +816,12 @@ fn py_decimal_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
         .map_err(|_| {
             Error::UsageError("NaN and infinite Decimal values are unsupported".to_string())
         })?;
-    let precision = if exponent >= 0 {
-        digit_count.saturating_add(exponent as usize)
-    } else {
-        digit_count.max(exponent.unsigned_abs() as usize)
-    };
-    if precision == 0 || precision > 38 {
-        return Err(Error::UsageError(format!(
-            "Decimal precision {precision} is outside SQL Server's supported range of 1 to 38"
-        )));
-    }
-    let scale = exponent.saturating_neg() as usize;
-    if scale > 38 {
-        return Err(Error::UsageError(format!(
-            "Decimal scale {scale} exceeds SQL Server's maximum scale of 38"
-        )));
-    }
+    let (precision, scale) = inferred_decimal_shape(digit_count, exponent)?;
     let value = py_obj
         .call_method0("__str__")
         .and_then(|value| value.extract::<String>())
         .map_err(|error| Error::UsageError(format!("Failed to extract Decimal value: {error}")))?;
-    let value = DecimalParts::from_string(&value, precision as u8, scale as u8)?;
+    let value = DecimalParts::from_string(&value, precision, scale)?;
     Ok(SqlType::Numeric(Some(value)))
 }
 
@@ -886,21 +1035,13 @@ fn py_to_column_value_internal(
                                     e
                                 ))
                             })?;
-                        (offset_seconds / 60.0).round() as i16
+                        datetimeoffset_minutes(offset_seconds)?
                     }
                     _ => {
                         // No timezone info, default to UTC (0 offset)
                         0
                     }
                 };
-
-                // Validate offset range: -840 to +840 minutes (-14:00 to +14:00)
-                if !(-840..=840).contains(&offset_minutes) {
-                    return Err(Error::UsageError(format!(
-                        "Timezone offset {} minutes out of valid range for DATETIMEOFFSET (-840 to +840)",
-                        offset_minutes
-                    )));
-                }
 
                 return Ok(ColumnValues::DateTimeOffset(
                     mssql_tds::datatypes::column_values::SqlDateTimeOffset {
@@ -1323,6 +1464,126 @@ fn validate_type_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_hints_validate_effective_precision() {
+        for sql_type in [2, 3] {
+            assert!(ParameterHint::new(sql_type, 0, 0).is_ok());
+            assert!(ParameterHint::new(sql_type, 0, 2).is_ok());
+            assert!(ParameterHint::new(sql_type, 2, 3).is_err());
+            assert!(ParameterHint::new(sql_type, 39, 0).is_err());
+            assert!(ParameterHint::new(sql_type, 38, 39).is_err());
+            assert_eq!(
+                ParameterHint::new(sql_type, 0, 2).unwrap().precision(),
+                Some(18)
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_hints_accept_scales_zero_through_seven() {
+        for sql_type in [10, 11, 92, 93, -154, -155] {
+            for scale in [0, 3, 7] {
+                assert!(ParameterHint::new(sql_type, 0, scale).is_ok());
+            }
+            assert!(ParameterHint::new(sql_type, 0, 8).is_err());
+        }
+    }
+
+    #[test]
+    fn null_numeric_accepts_only_core_default_metadata() {
+        for sql_type in [2, 3] {
+            assert!(null_sql_type(ParameterHint::new(sql_type, 18, 10).unwrap()).is_ok());
+            assert!(null_sql_type(ParameterHint::new(sql_type, 9, 2).unwrap()).is_err());
+            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 0).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn null_temporal_accepts_only_core_default_scale() {
+        for sql_type in [92, 93, -155] {
+            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 7).unwrap()).is_ok());
+            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 3).unwrap()).is_err());
+            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 0).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn datetimeoffset_requires_whole_minute_offsets() {
+        assert!(datetimeoffset_minutes(30.0).is_err());
+        assert!(datetimeoffset_minutes(-30.0).is_err());
+        assert!(datetimeoffset_minutes(f64::NAN).is_err());
+        assert!(datetimeoffset_minutes(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn datetimeoffset_accepts_range_boundaries() {
+        assert_eq!(datetimeoffset_minutes(14.0 * 60.0 * 60.0).unwrap(), 840);
+        assert_eq!(datetimeoffset_minutes(-14.0 * 60.0 * 60.0).unwrap(), -840);
+        assert!(datetimeoffset_minutes(841.0 * 60.0).is_err());
+        assert!(datetimeoffset_minutes(-841.0 * 60.0).is_err());
+    }
+
+    #[test]
+    fn decimal_shape_handles_positive_and_negative_exponents() {
+        assert_eq!(inferred_decimal_shape(1, 3).unwrap(), (4, 0));
+        assert_eq!(inferred_decimal_shape(1, -3).unwrap(), (3, 3));
+    }
+
+    #[test]
+    fn decimal_shape_enforces_precision_38_boundaries() {
+        assert_eq!(inferred_decimal_shape(38, 0).unwrap(), (38, 0));
+        assert!(inferred_decimal_shape(39, 0).is_err());
+        assert_eq!(inferred_decimal_shape(1, 37).unwrap(), (38, 0));
+        assert!(inferred_decimal_shape(1, 38).is_err());
+        assert_eq!(inferred_decimal_shape(1, -38).unwrap(), (38, 38));
+        assert!(inferred_decimal_shape(1, -39).is_err());
+    }
+
+    #[test]
+    fn input_sql_type_accepts_every_supported_odbc_code() {
+        let supported = [
+            -155, -154, -152, -151, -150, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 1, 2, 3, 4,
+            5, 6, 7, 8, 9, 10, 11, 12, 60, 91, 92, 93, 122, 241, 244, 245,
+        ];
+
+        for code in supported {
+            assert!(InputSqlType::try_from(code).is_ok(), "ODBC code {code}");
+        }
+    }
+
+    #[test]
+    fn input_sql_type_normalizes_equivalent_odbc_aliases() {
+        assert_eq!(InputSqlType::try_from(6).unwrap(), InputSqlType::Float);
+        assert_eq!(InputSqlType::try_from(8).unwrap(), InputSqlType::Float);
+        assert_eq!(InputSqlType::try_from(9).unwrap(), InputSqlType::Date);
+        assert_eq!(InputSqlType::try_from(91).unwrap(), InputSqlType::Date);
+        assert_eq!(InputSqlType::try_from(10).unwrap(), InputSqlType::Time);
+        assert_eq!(InputSqlType::try_from(92).unwrap(), InputSqlType::Time);
+        assert_eq!(InputSqlType::try_from(-154).unwrap(), InputSqlType::Time);
+        assert_eq!(InputSqlType::try_from(11).unwrap(), InputSqlType::DateTime);
+        assert_eq!(InputSqlType::try_from(93).unwrap(), InputSqlType::DateTime);
+        assert_eq!(InputSqlType::try_from(-152).unwrap(), InputSqlType::Xml);
+        assert_eq!(InputSqlType::try_from(241).unwrap(), InputSqlType::Xml);
+    }
+
+    #[test]
+    fn input_sql_type_rejects_unknown_odbc_code() {
+        let error = InputSqlType::try_from(0).unwrap_err();
+        assert!(error.to_string().contains("Invalid SQL type: 0"));
+    }
+
+    #[test]
+    fn parameter_hint_reports_tvp_column_support_symbolically() {
+        for code in [-151, -1, -10] {
+            assert!(
+                !ParameterHint::new(code, 0, 0)
+                    .unwrap()
+                    .supports_tvp_column()
+            );
+        }
+        assert!(ParameterHint::new(-9, 20, 0).unwrap().supports_tvp_column());
+    }
 
     #[test]
     fn datetime_to_ticks_rounds_up() {

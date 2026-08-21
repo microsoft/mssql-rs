@@ -8,7 +8,6 @@ use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use std::fmt::Write as _;
 
 use crate::types::{ParameterHint, null_sql_type, py_to_sql_type, py_to_sql_type_with_hint};
 
@@ -259,11 +258,13 @@ fn parse_tvp_type_name(type_name: String, schema: Option<String>) -> PyResult<Tv
 
 /// Builds TVP column metadata and converts each row using its matching hint.
 fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyResult<TvpTableData> {
+    // TODO(performance): Convert TVP row iterators without first collecting
+    // Bound cells, and benchmark representative row counts.
     let hints = parse_input_sizes(columns)?
         .ok_or_else(|| PyValueError::new_err("A TVP must define at least one column"))?;
     let mut column_defs = Vec::with_capacity(hints.len());
     for hint in &hints {
-        if matches!(hint.sql_type(), -151 | -1 | -10) {
+        if !hint.supports_tvp_column() {
             return Err(PyValueError::new_err(
                 "TVP columns do not support UDT, TEXT, or NTEXT input types",
             ));
@@ -323,7 +324,7 @@ enum ScanState {
 
 /// A rewritten parameter marker in RPC wire order.
 struct Placeholder {
-    /// The generated `@Pn` name used in both the SQL text and RPC parameter.
+    /// The generated collision-free name used in both SQL text and RPC metadata.
     rpc_name: String,
     /// The dictionary key for `%(name)s`, or `None` for positional `?`.
     source_name: Option<String>,
@@ -337,6 +338,14 @@ fn parse_pyformat_marker(sql: &str, start: usize, close: Option<usize>) -> Optio
     Some((source_name, close + ")s".len() - start))
 }
 
+fn rpc_prefix(sql: &str) -> String {
+    let lowercase_sql = sql.to_ascii_lowercase();
+    (0_u32..)
+        .map(|suffix| format!("@__mssql_py_{suffix}_"))
+        .find(|candidate| !lowercase_sql.contains(candidate))
+        .expect("an unused generated RPC prefix exists")
+}
+
 /// Normalizes Python execute arguments and binds them as positional or named RPC parameters.
 ///
 /// A sole dictionary selects `%(name)s` binding. A sole tuple, list, or DB-API
@@ -347,10 +356,6 @@ pub(crate) fn bind_parameters(
     parameters: &Bound<'_, PyTuple>,
     hints: Option<&[ParameterHint]>,
 ) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
-    if parameters.is_empty() {
-        return Ok((operation, Vec::new(), Vec::new()));
-    }
-
     if parameters.len() == 1 {
         let parameter = parameters.get_item(0)?;
         if let Ok(values) = parameter.cast::<PyDict>() {
@@ -486,6 +491,10 @@ fn rpc_parameter(
     value: &Bound<'_, PyAny>,
     hint: Option<&ParameterHint>,
 ) -> PyResult<(RpcParameter, ParameterMetadata)> {
+    // TODO(mssql-tds): Expose general parameter description backed by
+    // sp_describe_undeclared_parameters. The existing private path is specific
+    // to Always Encrypted, so an unhinted Python None falls back to NVARCHAR(1).
+    // TODO(performance): Benchmark representative scalar binding conversions.
     let (value, status) = if let Ok(tvp) = value.extract::<PyRef<'_, PyTableValuedParameter>>() {
         if hint.is_some() {
             return Err(PyTypeError::new_err(
@@ -512,7 +521,7 @@ fn rpc_parameter(
     Ok((RpcParameter::new(Some(name), status, value), signature))
 }
 
-/// Rewrites DB-API parameter markers to SQL Server `@P1` through `@Pn` names.
+/// Rewrites DB-API parameter markers to collision-free SQL Server RPC names.
 ///
 /// Positional mode recognizes `?`; dictionary-backed named mode recognizes
 /// `%(name)s` and converts `%%` to `%`. A valid marker from the other mode is
@@ -521,8 +530,13 @@ fn rpc_parameter(
 /// Malformed pyformat candidates and unsupported `:name` markers are left
 /// unchanged for the caller's marker-count validation.
 fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeholder>)> {
+    // TODO(performance): Benchmark placeholder scanning. If results justify
+    // caching, share rewritten SQL and marker metadata at connection scope,
+    // use borrowed SQL plus parameter style for hit-path lookup, and bound the
+    // retained bytes.
     let mut output = String::with_capacity(sql.len() + sql.len() / 2);
     let mut names = Vec::new();
+    let rpc_prefix = rpc_prefix(sql);
     let mut state = ScanState::Normal;
     let mut block_comment_depth = 0usize;
     let mut chars = sql.char_indices().peekable();
@@ -556,10 +570,8 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                     chars.next();
                 }
                 ('?', _) if !named => {
-                    let start = output.len();
-                    write!(&mut output, "@P{}", names.len() + 1)
-                        .expect("writing to a String cannot fail");
-                    let rpc_name = output[start..].to_owned();
+                    let rpc_name = format!("{rpc_prefix}{}", names.len() + 1);
+                    output.push_str(&rpc_name);
                     names.push(Placeholder {
                         rpc_name,
                         source_name: None,
@@ -593,10 +605,8 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                         if source_name.is_empty() {
                             return Err(PyTypeError::new_err("Named parameter cannot be empty"));
                         }
-                        let start = output.len();
-                        write!(&mut output, "@P{}", names.len() + 1)
-                            .expect("writing to a String cannot fail");
-                        let rpc_name = output[start..].to_owned();
+                        let rpc_name = format!("{rpc_prefix}{}", names.len() + 1);
+                        output.push_str(&rpc_name);
                         names.push(Placeholder {
                             rpc_name,
                             source_name: Some(source_name.to_owned()),
@@ -680,13 +690,16 @@ mod tests {
     fn rewrites_only_executable_qmarks() {
         let sql = "SELECT ?, '?', [??] -- ?\n/* ? */ WHERE value = ?";
         let (sql, names) = rewrite_placeholders(sql, false).unwrap();
-        assert_eq!(sql, "SELECT @P1, '?', [??] -- ?\n/* ? */ WHERE value = @P2");
+        assert_eq!(
+            sql,
+            "SELECT @__mssql_py_0_1, '?', [??] -- ?\n/* ? */ WHERE value = @__mssql_py_0_2"
+        );
         assert_eq!(
             names
                 .into_iter()
                 .map(|placeholder| placeholder.rpc_name)
                 .collect::<Vec<_>>(),
-            vec!["@P1", "@P2"]
+            vec!["@__mssql_py_0_1", "@__mssql_py_0_2"]
         );
     }
 
@@ -694,7 +707,7 @@ mod tests {
     fn line_comment_ends_at_carriage_return() {
         let (sql, names) = rewrite_placeholders("SELECT 1 -- c\rWHERE a = ?", false).unwrap();
 
-        assert_eq!(sql, "SELECT 1 -- c\rWHERE a = @P1");
+        assert_eq!(sql, "SELECT 1 -- c\rWHERE a = @__mssql_py_0_1");
         assert_eq!(names.len(), 1);
     }
 
@@ -702,7 +715,7 @@ mod tests {
     fn line_comment_still_ends_at_crlf() {
         let (sql, names) = rewrite_placeholders("SELECT 1 -- c\r\nWHERE a = ?", false).unwrap();
 
-        assert_eq!(sql, "SELECT 1 -- c\r\nWHERE a = @P1");
+        assert_eq!(sql, "SELECT 1 -- c\r\nWHERE a = @__mssql_py_0_1");
         assert_eq!(names.len(), 1);
     }
 
@@ -710,7 +723,7 @@ mod tests {
     fn leading_line_comment_ends_at_carriage_return() {
         let (sql, names) = rewrite_placeholders("-- lead\rSELECT ?, ?", false).unwrap();
 
-        assert_eq!(sql, "-- lead\rSELECT @P1, @P2");
+        assert_eq!(sql, "-- lead\rSELECT @__mssql_py_0_1, @__mssql_py_0_2");
         assert_eq!(names.len(), 2);
     }
 
@@ -720,35 +733,64 @@ mod tests {
         let (sql, names) = rewrite_placeholders(&sql, false).unwrap();
 
         assert_eq!(names.len(), 2000);
-        assert_eq!(names.first().unwrap().rpc_name, "@P1");
-        assert_eq!(names.last().unwrap().rpc_name, "@P2000");
+        assert_eq!(names.first().unwrap().rpc_name, "@__mssql_py_0_1");
+        assert_eq!(names.last().unwrap().rpc_name, "@__mssql_py_0_2000");
         assert_eq!(sql.split(", ").count(), 2000);
-        assert!(sql.starts_with("@P1, @P2"));
-        assert!(sql.ends_with("@P1999, @P2000"));
+        assert!(sql.starts_with("@__mssql_py_0_1, @__mssql_py_0_2"));
+        assert!(sql.ends_with("@__mssql_py_0_1999, @__mssql_py_0_2000"));
     }
 
     #[test]
     fn rewrites_named_parameters_in_occurrence_order() {
         let (sql, names) = rewrite_placeholders("SELECT %(id)s, %(id)s, %(name)s", true).unwrap();
-        assert_eq!(sql, "SELECT @P1, @P2, @P3");
+        assert_eq!(
+            sql,
+            "SELECT @__mssql_py_0_1, @__mssql_py_0_2, @__mssql_py_0_3"
+        );
         assert_eq!(
             names
                 .into_iter()
                 .map(|placeholder| (placeholder.rpc_name, placeholder.source_name.unwrap()))
                 .collect::<Vec<_>>(),
             vec![
-                ("@P1".to_string(), "id".to_string()),
-                ("@P2".to_string(), "id".to_string()),
-                ("@P3".to_string(), "name".to_string()),
+                ("@__mssql_py_0_1".to_string(), "id".to_string()),
+                ("@__mssql_py_0_2".to_string(), "id".to_string()),
+                ("@__mssql_py_0_3".to_string(), "name".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn generated_names_do_not_collide_with_existing_parameter_names() {
+        let sql = "DECLARE @P1 int = 10; SELECT @P1, ?, ?";
+        let (sql, names) = rewrite_placeholders(sql, false).unwrap();
+
+        assert_eq!(
+            sql,
+            "DECLARE @P1 int = 10; SELECT @P1, @__mssql_py_0_1, @__mssql_py_0_2"
+        );
+        assert_eq!(names[0].rpc_name, "@__mssql_py_0_1");
+        assert_eq!(names[1].rpc_name, "@__mssql_py_0_2");
+    }
+
+    #[test]
+    fn generated_prefix_collision_check_is_case_insensitive() {
+        let sql = "DECLARE @__MsSqL_Py_0_1 int; SELECT %(first)s, %(second)s";
+        let (sql, names) = rewrite_placeholders(sql, true).unwrap();
+
+        assert_eq!(
+            sql,
+            "DECLARE @__MsSqL_Py_0_1 int; SELECT @__mssql_py_1_1, @__mssql_py_1_2"
+        );
+        assert_eq!(names[0].rpc_name, "@__mssql_py_1_1");
+        assert_eq!(names[1].rpc_name, "@__mssql_py_1_2");
     }
 
     #[test]
     fn rewrites_named_parameters_with_unicode() {
         let (sql, names) = rewrite_placeholders("SELECT N'東京', %(café)s", true).unwrap();
 
-        assert_eq!(sql, "SELECT N'東京', @P1");
+        assert_eq!(sql, "SELECT N'東京', @__mssql_py_0_1");
         assert_eq!(names[0].source_name.as_deref(), Some("café"));
     }
 
@@ -759,7 +801,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "SELECT 'it''s ?', \"col\"\"?\", [col]]?] WHERE value = @P1"
+            "SELECT 'it''s ?', \"col\"\"?\", [col]]?] WHERE value = @__mssql_py_0_1"
         );
         assert_eq!(names.len(), 1);
     }
@@ -783,7 +825,7 @@ mod tests {
         let (sql, names) =
             rewrite_placeholders("SELECT %(broken)x, %(value)s, %(unterminated", true).unwrap();
 
-        assert_eq!(sql, "SELECT %(broken)x, @P1, %(unterminated");
+        assert_eq!(sql, "SELECT %(broken)x, @__mssql_py_0_1, %(unterminated");
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].source_name.as_deref(), Some("value"));
     }
@@ -793,7 +835,10 @@ mod tests {
         let (sql, names) =
             rewrite_placeholders("SELECT a %(SELECT c FROM t WHERE id = ?) FROM u", false).unwrap();
 
-        assert_eq!(sql, "SELECT a %(SELECT c FROM t WHERE id = @P1) FROM u");
+        assert_eq!(
+            sql,
+            "SELECT a %(SELECT c FROM t WHERE id = @__mssql_py_0_1) FROM u"
+        );
         assert_eq!(names.len(), 1);
     }
 
@@ -801,7 +846,7 @@ mod tests {
     fn unterminated_percent_paren_does_not_swallow_later_markers() {
         let (sql, names) = rewrite_placeholders("SELECT a %(b FROM t WHERE c = ?", false).unwrap();
 
-        assert_eq!(sql, "SELECT a %(b FROM t WHERE c = @P1");
+        assert_eq!(sql, "SELECT a %(b FROM t WHERE c = @__mssql_py_0_1");
         assert_eq!(names.len(), 1);
     }
 
@@ -809,7 +854,7 @@ mod tests {
     fn quoting_is_tracked_after_a_bare_percent_paren() {
         let (sql, names) = rewrite_placeholders("SELECT a %(b, '?' , ? FROM t", false).unwrap();
 
-        assert_eq!(sql, "SELECT a %(b, '?' , @P1 FROM t");
+        assert_eq!(sql, "SELECT a %(b, '?' , @__mssql_py_0_1 FROM t");
         assert_eq!(names.len(), 1);
     }
 
@@ -818,7 +863,7 @@ mod tests {
         let sql = format!("SELECT {} ?", "%(".repeat(2000));
         let (rewritten, names) = rewrite_placeholders(&sql, false).unwrap();
 
-        assert!(rewritten.ends_with("@P1"));
+        assert!(rewritten.ends_with("@__mssql_py_0_1"));
         assert_eq!(names.len(), 1);
     }
 
@@ -827,7 +872,7 @@ mod tests {
         let (sql, names) =
             rewrite_placeholders("SELECT 100%%, %(value)s, '%%(ignored)s'", true).unwrap();
 
-        assert_eq!(sql, "SELECT 100%, @P1, '%%(ignored)s'");
+        assert_eq!(sql, "SELECT 100%, @__mssql_py_0_1, '%%(ignored)s'");
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].source_name.as_deref(), Some("value"));
     }
@@ -855,7 +900,10 @@ mod tests {
         let sql = "SELECT /* outer /* inner */ ? still outer */ ?";
         let (sql, names) = rewrite_placeholders(sql, false).unwrap();
 
-        assert_eq!(sql, "SELECT /* outer /* inner */ ? still outer */ @P1");
+        assert_eq!(
+            sql,
+            "SELECT /* outer /* inner */ ? still outer */ @__mssql_py_0_1"
+        );
         assert_eq!(names.len(), 1);
     }
 
@@ -864,7 +912,7 @@ mod tests {
     fn accepts_empty_named_parameter() {
         let (sql, names) = rewrite_placeholders("SELECT %()s", true).unwrap();
 
-        assert_eq!(sql, "SELECT @P1");
+        assert_eq!(sql, "SELECT @__mssql_py_0_1");
         assert_eq!(names[0].source_name.as_deref(), Some(""));
     }
 }

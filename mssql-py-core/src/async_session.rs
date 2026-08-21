@@ -43,6 +43,7 @@ pub(crate) enum ConnectionLifecycle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationPhase {
     Executing,
+    // TODO: Release Fetching ownership when async fetch exhausts the results.
     Fetching,
     Closing,
 }
@@ -53,6 +54,9 @@ pub(crate) struct ActiveOperation {
     pub(crate) cursor_id: Option<CursorId>,
     pub(crate) operation_id: OperationId,
     pub(crate) phase: OperationPhase,
+    // TODO: Add cursor cancellation that triggers this root handle only when
+    // cursor and operation IDs match. Complete ATTENTION cleanup before marking
+    // the connection reusable or broken.
     pub(crate) cancel_handle: Option<CancelHandle>,
 }
 
@@ -217,6 +221,18 @@ impl AsyncConnectionState {
         }
     }
 
+    pub(crate) fn abandon_cursor(&self, cursor_id: CursorId) {
+        let mut state = self.lock();
+        if state
+            .active_operation
+            .as_ref()
+            .is_some_and(|active| active.cursor_id == Some(cursor_id))
+        {
+            state.active_operation = None;
+        }
+        state.lifecycle = ConnectionLifecycle::Broken;
+    }
+
     pub(crate) fn begin_close(&self) {
         let mut state = self.lock();
         if state.lifecycle == ConnectionLifecycle::Open {
@@ -328,6 +344,22 @@ mod tests {
             OperationPhase::Closing
         );
         state.release_operation(close.operation_id);
+    }
+
+    #[test]
+    fn abandoning_cursor_breaks_session_and_only_releases_its_ownership() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+
+        state.abandon_cursor(2);
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        assert_eq!(
+            state.lock().active_operation.as_ref().unwrap().operation_id,
+            execute.operation_id
+        );
+
+        state.abandon_cursor(1);
+        assert!(state.lock().active_operation.is_none());
     }
 
     #[test]

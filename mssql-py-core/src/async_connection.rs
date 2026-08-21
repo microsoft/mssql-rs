@@ -266,6 +266,9 @@ impl PyAsyncConnection {
 
     /// Whether statements use SQL Server autocommit mode. The mode is fixed at
     /// connection time until async transition semantics are implemented.
+    // TODO: Add an awaitable mode-change API. Enabling autocommit must commit
+    // active work before changing mode and preserve the old mode on failure;
+    // disabling it must defer begin until the next execute.
     #[getter]
     fn autocommit(&self) -> bool {
         self.autocommit.load(Ordering::Relaxed)
