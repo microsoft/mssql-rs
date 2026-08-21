@@ -25,6 +25,17 @@
 //! would execute only the first row. Unrecognized attribute identifiers fail
 //! with `HY092`.
 //!
+//! The SQL Server vendor attributes (`SQL_SOPT_SS_*`, ids 1225-1238) differ from
+//! the rest in that the driver, not the Driver Manager, validates their values:
+//! the DM knows nothing about these identifiers and forwards whatever it is
+//! given, so each one carries the accept rule measured from msodbcsql and
+//! answers `HY024` outside it, leaving the previous value in place. Two are
+//! get-only and answer `HY092` on set (`SQL_SOPT_SS_CURRENT_COMMAND`, which
+//! reports the batch command ordinal, and `SQL_SOPT_SS_NOCOUNT_STATUS`), and two
+//! are string-valued (the query-notification message text and options) — the
+//! only statement attributes that use `buffer_length` / `string_length_ptr`
+//! rather than passing an integer in the pointer slot.
+//!
 //! Each entry point follows the crate's mandatory layering: FFI panic boundary
 //! → `unsafe` raw-handle shim → safe core (`README.md`; `num_result_cols.rs`).
 
@@ -39,15 +50,17 @@ use crate::api::odbc_types::{
     SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR,
     SQL_ATTR_ROWS_FETCHED_PTR, SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY,
     SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_INSENSITIVE, SQL_INVALID_HANDLE, SQL_NONSCROLLABLE,
-    SQL_SC_UNIQUE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer,
-    SqlReturn, SqlULen, SqlUSmallInt,
+    SQL_SC_UNIQUE, SQL_SOPT_SS_CURRENT_COMMAND, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+    SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
+    SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CURSOR_STATE, SQLSTATE_01S02, SQLSTATE_HYC00,
     WARN_OPTION_VALUE_CHANGED, post_diag,
 };
-use crate::api::util::write_if_some;
+use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::VendorStmtAttrs;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Clamps a requested `SQL_ATTR_QUERY_TIMEOUT` to the largest value the driver
@@ -86,7 +99,7 @@ pub(crate) unsafe fn sql_set_stmt_attr_w(
         "SQLSetStmtAttrW called",
     );
     crate::ffi_entry!("SQLSetStmtAttrW", unsafe {
-        sql_set_stmt_attr_w_impl(statement_handle, attribute, value_ptr)
+        sql_set_stmt_attr_w_impl(statement_handle, attribute, value_ptr, string_length)
     })
 }
 
@@ -94,6 +107,7 @@ unsafe fn sql_set_stmt_attr_w_impl(
     statement_handle: SqlHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLSetStmtAttrW: statement_handle is null");
@@ -106,13 +120,20 @@ unsafe fn sql_set_stmt_attr_w_impl(
         HandleType::Stmt,
         "SQLSetStmtAttrW: handle is not a STMT"
     );
-    sql_set_stmt_attr_w_safe(stmt, attribute, value_ptr)
+    unsafe { sql_set_stmt_attr_w_safe(stmt, attribute, value_ptr, string_length) }
 }
 
-fn sql_set_stmt_attr_w_safe(
+/// # Safety
+/// For the two string-valued attributes (`SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT`
+/// and `..._OPTIONS`) `value_ptr` must point to `string_length` readable bytes of
+/// UTF-16, or to a NUL-terminated string when `string_length` is `SQL_NTS`. For
+/// every other attribute `value_ptr` is an integer passed in the pointer slot and
+/// is never dereferenced.
+unsafe fn sql_set_stmt_attr_w_safe(
     stmt: &StmtHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
+    string_length: SqlInteger,
 ) -> SqlReturn {
     let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLSetStmtAttrW: stmt mutex poisoned");
@@ -314,6 +335,42 @@ fn sql_set_stmt_attr_w_safe(
                 .set(SQL_ATTR_CURSOR_SENSITIVITY, effective);
             SQL_SUCCESS
         }
+        SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT | SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS => {
+            // The only two string-valued statement attributes. `string_length`
+            // is a byte count (or SQL_NTS), which is why the set entry point
+            // has to forward it rather than treating the pointer slot as an
+            // integer like every other attribute here.
+            let value = unsafe { read_utf16_attr(value_ptr as *const SqlWChar, string_length) };
+            if attribute == SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT {
+                state.qn_msgtext = value;
+            } else {
+                state.qn_options = value;
+            }
+            SQL_SUCCESS
+        }
+        // SQL Server vendor attributes. Unlike the inert set these validate
+        // before storing: the Driver Manager has no knowledge of ids 1225-1238
+        // and passes any value straight through, so rejecting an out-of-range
+        // value is the driver's job. A rejected set leaves the previous value
+        // in place.
+        //
+        // The get-only ids are deliberately excluded by `is_settable` so they
+        // fall through to the identifier-rejection path below, which answers
+        // the `HY092` msodbcsql gives them rather than `HY024`.
+        attribute if VendorStmtAttrs::is_settable(attribute) => {
+            if state.vendor_attrs.set(attribute, value_ptr as SqlULen) {
+                debug!(attribute, "SQLSetStmtAttrW: vendor attribute stored");
+                SQL_SUCCESS
+            } else {
+                error!(
+                    attribute,
+                    value = value_ptr as SqlULen,
+                    "SQLSetStmtAttrW: value rejected for vendor attribute"
+                );
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                SQL_ERROR
+            }
+        }
         // Recognized attributes stored and round-tripped without effect: these
         // param / cursor / descriptor controls do not change the implemented
         // forward-only, read-only behavior, but msodbcsql reports back whatever
@@ -362,7 +419,13 @@ pub(crate) unsafe fn sql_get_stmt_attr_w(
         "SQLGetStmtAttrW called",
     );
     crate::ffi_entry!("SQLGetStmtAttrW", unsafe {
-        sql_get_stmt_attr_w_impl(statement_handle, attribute, value_ptr)
+        sql_get_stmt_attr_w_impl(
+            statement_handle,
+            attribute,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
     })
 }
 
@@ -370,6 +433,8 @@ unsafe fn sql_get_stmt_attr_w_impl(
     statement_handle: SqlHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLGetStmtAttrW: statement_handle is null");
@@ -382,13 +447,21 @@ unsafe fn sql_get_stmt_attr_w_impl(
         HandleType::Stmt,
         "SQLGetStmtAttrW: handle is not a STMT"
     );
-    sql_get_stmt_attr_w_safe(stmt, attribute, value_ptr)
+    unsafe {
+        sql_get_stmt_attr_w_safe(stmt, attribute, value_ptr, buffer_length, string_length_ptr)
+    }
 }
 
-fn sql_get_stmt_attr_w_safe(
+/// # Safety
+/// `value_ptr`, when non-null, must be writable for `buffer_length` bytes for
+/// the two string-valued attributes, and for one pointer-sized value otherwise.
+/// `string_length_ptr`, when non-null, must be writable for one `SQLINTEGER`.
+unsafe fn sql_get_stmt_attr_w_safe(
     stmt: &StmtHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLGetStmtAttrW: stmt mutex poisoned");
@@ -396,9 +469,27 @@ fn sql_get_stmt_attr_w_safe(
     };
     free_errors(&mut state);
 
-    // Every attribute reported here is a pointer-sized integer or pointer.
+    // Every attribute reported here is a pointer-sized integer or pointer,
+    // except the two query-notification strings, which return directly because
+    // they own `buffer_length` / `string_length_ptr` themselves.
     // `write_if_some` is a no-op when `value_ptr` is null.
     match attribute {
+        SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT | SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS => {
+            let value = if attribute == SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT {
+                state.qn_msgtext.clone()
+            } else {
+                state.qn_options.clone()
+            };
+            return unsafe {
+                write_wide_attr(
+                    &mut *state,
+                    value_ptr as *mut SqlWChar,
+                    buffer_length,
+                    string_length_ptr,
+                    &value,
+                )
+            };
+        }
         SQL_ATTR_ROW_ARRAY_SIZE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.row_array_size);
         },
@@ -464,10 +555,19 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_IMP_PARAM_DESC => unsafe {
             write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
         },
+        SQL_SOPT_SS_CURRENT_COMMAND => unsafe {
+            // Get-only: the ordinal of the command being processed within the
+            // current batch, maintained by the result-set advance hooks.
+            write_if_some(value_ptr as *mut SqlULen, state.current_command);
+        },
         // Attributes the set path stores without effect share the table that
         // holds their measured defaults, so a get before any set answers what
         // msodbcsql answers. Anything not in it is genuinely unhandled.
-        _ => match state.inert_attrs.get(attribute) {
+        _ => match state
+            .inert_attrs
+            .get(attribute)
+            .or_else(|| state.vendor_attrs.get(attribute))
+        {
             Some(value) => unsafe {
                 write_if_some(value_ptr as *mut SqlULen, value);
             },
@@ -481,6 +581,18 @@ fn sql_get_stmt_attr_w_safe(
         },
     }
 
+    // Integer gets report the value's width. msodbcsql writes this on every
+    // successful integer `SQLGetStmtAttrW`, so leaving the pointer untouched
+    // hands the caller whatever was already in that memory. Every failure path
+    // above returns early, and msodbcsql likewise leaves the pointer alone on
+    // error, so writing once here is correct for both outcomes.
+    unsafe {
+        write_if_some(
+            string_length_ptr,
+            SqlInteger::try_from(size_of::<SqlULen>()).unwrap_or(SqlInteger::MAX),
+        );
+    }
+
     SQL_SUCCESS
 }
 
@@ -492,10 +604,14 @@ mod tests {
         SQL_ATTR_METADATA_ID, SQL_ATTR_NOSCAN, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
         SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
         SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_RETRIEVE_DATA, SQL_ATTR_ROW_BIND_OFFSET_PTR,
-        SQL_ATTR_ROW_OPERATION_PTR, SQL_ATTR_USE_BOOKMARKS, SQL_BIND_BY_COLUMN, SQL_NULL_HANDLE,
-        SQL_RD_ON, SQL_ROWSET_SIZE, SqlLen,
+        SQL_ATTR_ROW_OPERATION_PTR, SQL_ATTR_USE_BOOKMARKS, SQL_BIND_BY_COLUMN, SQL_NTS,
+        SQL_NULL_HANDLE, SQL_RD_ON, SQL_ROWSET_SIZE, SQL_SOPT_SS_COLUMN_ENCRYPTION,
+        SQL_SOPT_SS_CURSOR_OPTIONS, SQL_SOPT_SS_DEFER_PREPARE, SQL_SOPT_SS_HIDDEN_COLUMNS,
+        SQL_SOPT_SS_NAME_SCOPE, SQL_SOPT_SS_NOBROWSETABLE, SQL_SOPT_SS_NOCOUNT_STATUS,
+        SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT, SQL_SOPT_SS_REGIONALIZE,
+        SQL_SOPT_SS_TEXTPTR_LOGGING, SqlLen,
     };
-    use crate::api::sqlstate::{SQLSTATE_24000, SQLSTATE_HY092};
+    use crate::api::sqlstate::{SQLSTATE_01004, SQLSTATE_24000, SQLSTATE_HY024, SQLSTATE_HY092};
     use crate::handles::handle_from_raw;
     use crate::handles::stmt::InertStmtAttrs;
     use crate::test_support::TestHandles;
@@ -757,31 +873,54 @@ mod tests {
 
     /// An identifier msodbcsql implements but this driver does not must report
     /// `HYC00`, not `HY092`: a caller probing for the feature has to be able to
-    /// tell "unavailable" from "not an attribute". `SQL_SOPT_SS_DEFER_PREPARE`
-    /// (1232) is a statement attribute msodbcsql honors.
+    /// tell "unavailable" from "not an attribute".
+    ///
+    /// `SQL_ATTR_ASYNC_STMT_EVENT` (29) is the last statement attribute
+    /// msodbcsql accepts that this driver does not implement, so it is the only
+    /// remaining witness for this class. If asynchronous execution is ever
+    /// implemented, this test needs a new subject — or deleting, if by then
+    /// nothing is left in that class.
     #[test]
     fn set_attribute_known_to_msodbcsql_reports_not_implemented() {
         let h = TestHandles::with_env_dbc_stmt();
-        let ret = unsafe { sql_set_stmt_attr_w(h.stmt, 1232, 0 as SqlPointer, 0) };
+        let ret = unsafe { sql_set_stmt_attr_w(h.stmt, 29, 0 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HYC00);
     }
 
+    /// Every statement attribute msodbcsql answers on a get, this driver also
+    /// answers. Asserted over the recognition table rather than a hand-picked
+    /// identifier so that adding a row without implementing it fails here
+    /// instead of reaching an application as `HYC00`.
+    ///
+    /// This replaced a test that used `SQL_SOPT_SS_DEFER_PREPARE` as its
+    /// unimplemented example; no gettable statement attribute is left in that
+    /// class, which is the point.
     #[test]
-    fn get_attribute_known_to_msodbcsql_reports_not_implemented() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let mut out: SqlULen = 7;
-        let ret = unsafe {
-            sql_get_stmt_attr_w(
-                h.stmt,
-                1232,
-                (&mut out as *mut SqlULen).cast(),
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(ret, SQL_ERROR);
-        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HYC00);
+    fn every_gettable_statement_attribute_is_implemented() {
+        for id in crate::api::attributes::stmt_attr_ids(AttrOp::Get) {
+            let h = TestHandles::with_env_dbc_stmt();
+            // SQL_ATTR_ROW_NUMBER is the one legitimate error: it is answerable
+            // only while the cursor sits on a row, and reports 24000 otherwise.
+            if id == SQL_ATTR_ROW_NUMBER {
+                continue;
+            }
+            let mut out: SqlULen = 0;
+            let mut written: SqlInteger = 0;
+            let ret = unsafe {
+                sql_get_stmt_attr_w(
+                    h.stmt,
+                    id,
+                    (&mut out as *mut SqlULen).cast(),
+                    size_of::<SqlULen>() as SqlInteger,
+                    &mut written,
+                )
+            };
+            assert_ne!(
+                ret, SQL_ERROR,
+                "attribute {id} is recognized by msodbcsql but not served by this driver",
+            );
+        }
     }
 
     /// A connection attribute aimed at a statement stays `HY092`; the tables are
@@ -1382,5 +1521,438 @@ mod tests {
             );
             assert!(state.inert_attrs.get(*attribute).is_some());
         }
+    }
+
+    // ---- SQL Server vendor statement attributes (SQL_SOPT_SS_*) ----
+    //
+    // Every expectation below is a measurement taken from msodbcsql 18 with
+    // `probe_vendor_stmt.py` / `probe_vendor_bounds.py`, not a reading of the
+    // ODBC headers: two of these attributes accept values the headers do not
+    // name, and two reject every value the headers do name.
+
+    /// The vendor table is scanned linearly like the inert one, so a duplicate
+    /// identifier would silently shadow the second entry's default and rule.
+    #[test]
+    fn vendor_attribute_identifiers_are_unique() {
+        let ids: Vec<SqlInteger> = VendorStmtAttrs::identifiers().collect();
+        assert!(!ids.is_empty());
+        for (i, attribute) in ids.iter().enumerate() {
+            assert!(
+                !ids[..i].contains(attribute),
+                "duplicate vendor attribute {attribute}"
+            );
+        }
+    }
+
+    /// `set` is documented to reject anything the table does not know rather
+    /// than silently accept it. Callers check `is_settable` first, so this
+    /// guard is defensive — but a future caller that forgets would otherwise
+    /// write past the table.
+    #[test]
+    fn vendor_set_rejects_an_identifier_outside_the_table() {
+        let mut attrs = VendorStmtAttrs::default();
+        assert!(!attrs.set(SQL_ATTR_QUERY_TIMEOUT, 0));
+        assert!(!attrs.set(9999, 1));
+        assert_eq!(attrs.get(9999), None);
+    }
+
+    /// Defaults msodbcsql reports before any set. Three are non-zero, which is
+    /// the whole reason the table stores a default per attribute rather than
+    /// zero-initialising.
+    #[test]
+    fn vendor_attribute_defaults_match_msodbcsql() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for (attribute, expected) in [
+            (SQL_SOPT_SS_TEXTPTR_LOGGING, 1),
+            (SQL_SOPT_SS_CURRENT_COMMAND, 0),
+            (SQL_SOPT_SS_HIDDEN_COLUMNS, 0),
+            (SQL_SOPT_SS_NOBROWSETABLE, 0),
+            (SQL_SOPT_SS_REGIONALIZE, 0),
+            (SQL_SOPT_SS_CURSOR_OPTIONS, 0),
+            (SQL_SOPT_SS_NOCOUNT_STATUS, 1),
+            (SQL_SOPT_SS_DEFER_PREPARE, 1),
+            (SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT, 432_000),
+            (SQL_SOPT_SS_PARAM_FOCUS, 0),
+            (SQL_SOPT_SS_NAME_SCOPE, 0),
+            (SQL_SOPT_SS_COLUMN_ENCRYPTION, 0),
+        ] {
+            assert_eq!(
+                get_attr(h.stmt, attribute),
+                expected,
+                "default for vendor attribute {attribute}"
+            );
+        }
+    }
+
+    /// The boolean-valued vendor attributes take 0 and 1 and nothing else.
+    #[test]
+    fn vendor_boolean_attributes_accept_only_zero_and_one() {
+        for attribute in [
+            SQL_SOPT_SS_TEXTPTR_LOGGING,
+            SQL_SOPT_SS_HIDDEN_COLUMNS,
+            SQL_SOPT_SS_NOBROWSETABLE,
+            SQL_SOPT_SS_REGIONALIZE,
+            SQL_SOPT_SS_DEFER_PREPARE,
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            for value in [0, 1] {
+                let ret = unsafe { sql_set_stmt_attr_w(h.stmt, attribute, value as SqlPointer, 0) };
+                assert_eq!(ret, SQL_SUCCESS, "set {attribute} = {value}");
+                assert_eq!(get_attr(h.stmt, attribute), value);
+            }
+            let ret = unsafe { sql_set_stmt_attr_w(h.stmt, attribute, 2 as SqlPointer, 0) };
+            assert_eq!(ret, SQL_ERROR, "set {attribute} = 2 should be rejected");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+        }
+    }
+
+    /// `SQL_SOPT_SS_CURSOR_OPTIONS` is a three-bit mask, so it accepts the whole
+    /// 0..=7 range rather than an enumerated set — a detail the headers do not
+    /// state and only the value sweep revealed.
+    #[test]
+    fn vendor_cursor_options_accepts_the_three_bit_range() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for value in 0..=7 {
+            let ret = unsafe {
+                sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_CURSOR_OPTIONS, value as SqlPointer, 0)
+            };
+            assert_eq!(ret, SQL_SUCCESS, "cursor options {value}");
+            assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURSOR_OPTIONS), value);
+        }
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_CURSOR_OPTIONS, 8 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+    }
+
+    /// `SQL_SOPT_SS_NAME_SCOPE` tops out at 3.
+    #[test]
+    fn vendor_name_scope_range_is_bounded() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for value in 0..=3 {
+            let ret = unsafe {
+                sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_NAME_SCOPE, value as SqlPointer, 0)
+            };
+            assert_eq!(ret, SQL_SUCCESS, "name scope {value}");
+        }
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_NAME_SCOPE, 4 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+    }
+
+    /// Zero is rejected for the query-notification timeout, unlike most ODBC
+    /// timeouts where zero means "no limit". Measured, not assumed.
+    #[test]
+    fn vendor_query_notification_timeout_rejects_zero() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret = unsafe {
+            sql_set_stmt_attr_w(
+                h.stmt,
+                SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT,
+                0 as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+        // The rejected set must not have disturbed the default.
+        assert_eq!(
+            get_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT),
+            432_000
+        );
+
+        for value in [1, 432_000, u32::MAX as SqlULen] {
+            let ret = unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT,
+                    value as SqlPointer,
+                    0,
+                )
+            };
+            assert_eq!(ret, SQL_SUCCESS, "qn timeout {value}");
+            assert_eq!(
+                get_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT),
+                value
+            );
+        }
+    }
+
+    /// `SQL_SOPT_SS_PARAM_FOCUS` and `SQL_SOPT_SS_COLUMN_ENCRYPTION` name
+    /// features neither driver offers here, and msodbcsql refuses every value
+    /// for them — including the "off" value its own headers define, and
+    /// including `COLUMN_ENCRYPTION` on a connection opened with
+    /// `ColumnEncryption=Enabled`. They are recognized, so the answer is
+    /// `HY024` (bad value) rather than `HY092` (bad identifier).
+    #[test]
+    fn vendor_unsupported_features_reject_every_value() {
+        for attribute in [SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_COLUMN_ENCRYPTION] {
+            for value in [0, 1, 2] {
+                let h = TestHandles::with_env_dbc_stmt();
+                let ret = unsafe { sql_set_stmt_attr_w(h.stmt, attribute, value as SqlPointer, 0) };
+                assert_eq!(ret, SQL_ERROR, "set {attribute} = {value}");
+                assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+            }
+        }
+    }
+
+    /// A rejected value leaves the previous one in place — a failed set is not
+    /// a reset.
+    #[test]
+    fn vendor_rejected_value_leaves_previous_in_place() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_CURSOR_OPTIONS, 5 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_CURSOR_OPTIONS, 99 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURSOR_OPTIONS), 5);
+    }
+
+    /// The two get-only vendor attributes answer `HY092` on a set, not `HY024`:
+    /// msodbcsql treats them as identifiers that are not settable at all rather
+    /// than settable ones given a bad value.
+    #[test]
+    fn vendor_get_only_attributes_reject_set_as_bad_identifier() {
+        for attribute in [SQL_SOPT_SS_CURRENT_COMMAND, SQL_SOPT_SS_NOCOUNT_STATUS] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let ret = unsafe { sql_set_stmt_attr_w(h.stmt, attribute, 0 as SqlPointer, 0) };
+            assert_eq!(ret, SQL_ERROR, "set {attribute}");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY092);
+        }
+    }
+
+    /// `SQL_SOPT_SS_CURRENT_COMMAND` is the ordinal of the command being
+    /// processed, not a flag: it starts at 0, becomes 1 on the first result
+    /// set, and advances with each further one.
+    #[test]
+    fn current_command_tracks_the_result_set_ordinal() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURRENT_COMMAND), 0);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().begin_batch(Vec::new());
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURRENT_COMMAND), 1);
+
+        stmt.inner.lock().unwrap().begin_result_set(Vec::new());
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURRENT_COMMAND), 2);
+
+        // A second execution restarts the count rather than continuing it.
+        stmt.inner.lock().unwrap().begin_batch(Vec::new());
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_CURRENT_COMMAND), 1);
+    }
+
+    /// Reads a string statement attribute into a fixed buffer, returning the
+    /// return code, the decoded value and the reported byte length.
+    fn get_str_attr(
+        stmt: SqlHandle,
+        attribute: SqlInteger,
+        buffer_bytes: usize,
+    ) -> (SqlReturn, String, SqlInteger) {
+        let mut buf = vec![0u16; buffer_bytes.div_ceil(2)];
+        let mut written: SqlInteger = -1;
+        let rc = unsafe {
+            sql_get_stmt_attr_w(
+                stmt,
+                attribute,
+                buf.as_mut_ptr().cast(),
+                buffer_bytes as SqlInteger,
+                &mut written,
+            )
+        };
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        (rc, String::from_utf16_lossy(&buf[..end]), written)
+    }
+
+    /// Sets a string statement attribute from a UTF-16 buffer.
+    fn set_str_attr(
+        stmt: SqlHandle,
+        attribute: SqlInteger,
+        value: &str,
+        byte_length: SqlInteger,
+    ) -> SqlReturn {
+        let utf16: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { sql_set_stmt_attr_w(stmt, attribute, utf16.as_ptr() as SqlPointer, byte_length) }
+    }
+
+    /// The two query-notification attributes are the only string-valued
+    /// statement attributes, and they default to empty.
+    #[test]
+    fn query_notification_strings_default_to_empty() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for attribute in [
+            SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+            SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS,
+        ] {
+            let (rc, value, written) = get_str_attr(h.stmt, attribute, 64);
+            assert_eq!(rc, SQL_SUCCESS);
+            assert_eq!(value, "");
+            assert_eq!(written, 0);
+        }
+    }
+
+    #[test]
+    fn query_notification_strings_round_trip_independently() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_str_attr(
+                h.stmt,
+                SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+                "msg",
+                SQL_NTS.into()
+            ),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            set_str_attr(
+                h.stmt,
+                SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS,
+                "service=x",
+                SQL_NTS.into()
+            ),
+            SQL_SUCCESS
+        );
+
+        let (rc, value, written) = get_str_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, 64);
+        assert_eq!((rc, value.as_str(), written), (SQL_SUCCESS, "msg", 6));
+        let (rc, value, written) = get_str_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, 64);
+        assert_eq!(
+            (rc, value.as_str(), written),
+            (SQL_SUCCESS, "service=x", 18)
+        );
+    }
+
+    /// `StringLength` on the set side is a **byte** count, so an explicit 6
+    /// stores three characters. Treating it as a character count would store
+    /// six and read past the caller's intent.
+    #[test]
+    fn query_notification_set_length_is_a_byte_count() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            set_str_attr(
+                h.stmt,
+                SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+                "abcdefghij",
+                6
+            ),
+            SQL_SUCCESS
+        );
+        let (_, value, written) = get_str_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, 64);
+        assert_eq!((value.as_str(), written), ("abc", 6));
+    }
+
+    /// A short buffer truncates with `01004` but still reports the full byte
+    /// length the value needs, so a caller can size a second call. A buffer
+    /// exactly the size of the value still truncates, because the NUL needs
+    /// room.
+    #[test]
+    fn query_notification_get_truncates_and_reports_full_length() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_str_attr(
+            h.stmt,
+            SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+            "abcdefghij",
+            SQL_NTS.into(),
+        );
+
+        for (buffer_bytes, expected) in [(4, "a"), (10, "abcd"), (20, "abcdefghi")] {
+            let (rc, value, written) =
+                get_str_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, buffer_bytes);
+            assert_eq!(rc, SQL_SUCCESS_WITH_INFO, "buffer of {buffer_bytes} bytes");
+            assert_eq!(value, expected);
+            assert_eq!(written, 20, "full length is always reported");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_01004);
+        }
+
+        // One more SQLWCHAR of room for the terminator and it fits.
+        let (rc, value, written) = get_str_attr(h.stmt, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, 22);
+        assert_eq!(
+            (rc, value.as_str(), written),
+            (SQL_SUCCESS, "abcdefghij", 20)
+        );
+    }
+
+    /// A null value pointer is the documented length-query form: it succeeds
+    /// and reports the length without writing.
+    #[test]
+    fn query_notification_null_pointer_is_a_length_query() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_str_attr(
+            h.stmt,
+            SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+            "abcdefghij",
+            SQL_NTS.into(),
+        );
+        let mut written: SqlInteger = -1;
+        let rc = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+                std::ptr::null_mut(),
+                0,
+                &mut written,
+            )
+        };
+        assert_eq!((rc, written), (SQL_SUCCESS, 20));
+    }
+
+    /// msodbcsql writes the value's width into `StringLength` on every
+    /// successful integer get. Leaving it untouched hands the caller whatever
+    /// happened to be in that memory, so this is a correctness fix and not
+    /// cosmetic.
+    #[test]
+    fn integer_gets_report_the_value_width() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for attribute in [
+            SQL_ATTR_QUERY_TIMEOUT,
+            SQL_ATTR_MAX_ROWS,
+            SQL_ATTR_NOSCAN,
+            SQL_ATTR_CURSOR_TYPE,
+            SQL_ATTR_CONCURRENCY,
+            SQL_ATTR_ROW_ARRAY_SIZE,
+            SQL_ATTR_METADATA_ID,
+            SQL_SOPT_SS_DEFER_PREPARE,
+        ] {
+            let mut out: SqlULen = 0;
+            let mut written: SqlInteger = -1;
+            let rc = unsafe {
+                sql_get_stmt_attr_w(
+                    h.stmt,
+                    attribute,
+                    (&mut out as *mut SqlULen).cast(),
+                    size_of::<SqlULen>() as SqlInteger,
+                    &mut written,
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS, "get {attribute}");
+            assert_eq!(
+                written,
+                size_of::<SqlULen>() as SqlInteger,
+                "StringLength for attribute {attribute}",
+            );
+        }
+    }
+
+    /// On a failed get msodbcsql leaves `StringLength` alone, so the success
+    /// write must not have been hoisted ahead of the error paths.
+    #[test]
+    fn failed_integer_get_leaves_string_length_untouched() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut out: SqlULen = 0;
+        let mut written: SqlInteger = -12345;
+        // SQL_ATTR_ROW_NUMBER with no open cursor is 24000.
+        let rc = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_ROW_NUMBER,
+                (&mut out as *mut SqlULen).cast(),
+                size_of::<SqlULen>() as SqlInteger,
+                &mut written,
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(written, -12345);
     }
 }
