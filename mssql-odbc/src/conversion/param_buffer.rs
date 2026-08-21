@@ -368,6 +368,44 @@ mod tests {
         );
     }
 
+    /// The application picks the indicator's address, so it is read with
+    /// `read_unaligned`; a plain dereference here would be UB.
+    #[test]
+    fn misaligned_indicator_pointer_is_read() {
+        #[repr(align(8))]
+        struct Backing([u8; 32]);
+        let mut backing = Backing([0u8; 32]);
+
+        let ind_ptr = unsafe { backing.0.as_mut_ptr().add(1) } as *mut SqlLen;
+        unsafe { ind_ptr.write_unaligned(SQL_NULL_DATA) };
+        let p = param(SQL_C_SLONG, std::ptr::null_mut(), ind_ptr);
+        assert_eq!(read(&p).unwrap(), None);
+
+        let mut value: i32 = 42;
+        unsafe { ind_ptr.write_unaligned(4) };
+        let p = param(SQL_C_SLONG, (&mut value as *mut i32).cast(), ind_ptr);
+        assert_eq!(read(&p).unwrap(), Some(AppValue::Integer(42)));
+    }
+
+    /// `SQL_C_WCHAR` is read unit by unit rather than through a slice, so an
+    /// odd-offset buffer must decode the same as an aligned one.
+    #[test]
+    fn misaligned_wchar_buffer_is_read() {
+        #[repr(align(8))]
+        struct Backing([u8; 16]);
+        let mut backing = Backing([0u8; 16]);
+        // "hi" as UTF-16LE, starting one byte in.
+        backing.0[1..5].copy_from_slice(&[b'h', 0, b'i', 0]);
+
+        let mut ind: SqlLen = 4;
+        let ptr = unsafe { backing.0.as_mut_ptr().add(1) } as *mut c_void;
+        let p = param(SQL_C_WCHAR, ptr, &mut ind);
+        assert_eq!(
+            read(&p).unwrap(),
+            Some(AppValue::WideText(vec![b'h', 0, b'i', 0]))
+        );
+    }
+
     #[test]
     fn null_indicator_pointer_means_null_terminated() {
         let mut buf: Vec<u8> = b"abc\0".to_vec();
