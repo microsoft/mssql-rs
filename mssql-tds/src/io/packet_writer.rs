@@ -111,6 +111,28 @@ pub struct PacketWriter<'a> {
     eom_pending: bool,
 }
 
+/// Owned, detached state of an in-progress outgoing message, produced by
+/// [`PacketWriter::suspend`] and consumed by [`PacketWriter::resume`]. Holds
+/// every field of [`PacketWriter`] except the borrowed network writer and
+/// `start_time`, allowing a partially-written message to be parked as owned
+/// state between calls. `start_time` is intentionally not preserved:
+/// [`resume`](PacketWriter::resume) always starts a fresh wall-clock write
+/// timeout budget rather than restoring the suspended one — see `resume`'s
+/// doc comment.
+#[derive(Debug)]
+pub(crate) struct SuspendedMessage {
+    packet_type: PacketType,
+    max_payload_size: usize,
+    packet_id: u8,
+    payload_cursor: Cursor<Vec<u8>>,
+    packet_size: usize,
+    is_first_packet: bool,
+    max_timeout_sec: Option<u32>,
+    cancel_handle: Option<CancelHandle>,
+    reset_mode: ResetConnectionMode,
+    eom_pending: bool,
+}
+
 impl<'a> PacketWriter<'a> {
     pub(crate) const PACKET_HEADER_SIZE: usize = 8;
 
@@ -155,6 +177,66 @@ impl<'a> PacketWriter<'a> {
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
             reset_mode,
             eom_pending: false,
+        }
+    }
+
+    /// Detaches this writer's in-progress message state from the borrowed
+    /// network writer so it can be parked as owned state (e.g. on the TDS
+    /// client) across `await` points and multiple public calls, then later
+    /// reattached with [`resume`](Self::resume).
+    ///
+    /// This is the enabling primitive for incremental (streamed) PLP parameter
+    /// writes: the RPC header and any fully-materialized parameters are written
+    /// eagerly, then the message is suspended while the caller streams parameter
+    /// chunks one call at a time, resuming for each chunk and the final
+    /// terminator + `finalize`.
+    ///
+    /// The timeout budget (`start_time`) and packet accounting (`packet_id`,
+    /// `is_first_packet`, `eom_pending`, buffered payload) are preserved so the
+    /// resumed message behaves as one continuous send, except `start_time`
+    /// itself: [`resume`](Self::resume) always takes a fresh timestamp instead
+    /// of restoring the suspended one (see its doc comment), so it is not
+    /// carried in [`SuspendedMessage`].
+    pub(crate) fn suspend(self) -> SuspendedMessage {
+        SuspendedMessage {
+            packet_type: self.packet_type,
+            max_payload_size: self.max_payload_size,
+            packet_id: self.packet_id,
+            payload_cursor: self.payload_cursor,
+            packet_size: self.packet_size,
+            is_first_packet: self.is_first_packet,
+            max_timeout_sec: self.max_timeout_sec,
+            cancel_handle: self.cancel_handle,
+            reset_mode: self.reset_mode,
+            eom_pending: self.eom_pending,
+        }
+    }
+
+    /// Reattaches a previously [`suspend`](Self::suspend)ed message to a network
+    /// writer, restoring all packet/timeout accounting so writing can continue
+    /// exactly where it left off. `start_time` is refreshed to the moment of
+    /// resumption (it is not part of [`SuspendedMessage`]): each call that
+    /// resumes a message is a fresh write operation with its own budget for the
+    /// hard wall-clock write timeout, mirroring msodbcsql's per-`SQLPutData`
+    /// timeout refresh — application think-time between chunks must not count
+    /// against a single deadline set when the message was first opened.
+    pub(crate) fn resume(
+        state: SuspendedMessage,
+        network_writer: &'a mut dyn NetworkWriter,
+    ) -> PacketWriter<'a> {
+        PacketWriter {
+            packet_type: state.packet_type,
+            network_writer,
+            max_payload_size: state.max_payload_size,
+            packet_id: state.packet_id,
+            payload_cursor: state.payload_cursor,
+            packet_size: state.packet_size,
+            is_first_packet: state.is_first_packet,
+            start_time: Instant::now(),
+            max_timeout_sec: state.max_timeout_sec,
+            cancel_handle: state.cancel_handle,
+            reset_mode: state.reset_mode,
+            eom_pending: state.eom_pending,
         }
     }
 
@@ -464,7 +546,7 @@ impl TdsPacketWriter for PacketWriter<'_> {
             let packet_space_left = self.max_payload_size - self.position() as usize;
 
             if packet_space_left < remaining.len() {
-                // Fill the current packet and flush
+                // Fill the current packet and flush.
                 let chunk = &remaining[..packet_space_left];
                 let _ = std::io::Write::write_all(&mut self.payload_cursor, chunk);
                 self.populate_header_and_send(false, false).await?;
@@ -1300,5 +1382,69 @@ pub(crate) mod tests {
         let mut mock = MockNetworkWriter::new(packet_size as u32);
         let writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         assert!(writer.max_timeout_sec.is_none());
+    }
+
+    /// Reassembles the TDS packet stream captured by the mock into the original
+    /// contiguous payload, stripping each 8-byte packet header.
+    fn reassemble_payload(sent: &[u8]) -> Vec<u8> {
+        let mut reconstructed: Vec<u8> = Vec::new();
+        let mut offset = 0;
+        while offset < sent.len() {
+            let packet_len = u16::from_be_bytes([sent[offset + 2], sent[offset + 3]]) as usize;
+            reconstructed.extend_from_slice(&sent[offset + 8..offset + packet_len]);
+            offset += packet_len;
+        }
+        reconstructed
+    }
+
+    /// A message written across a suspend/resume boundary produces the same
+    /// bytes as if written in one go: payload is preserved and the final packet
+    /// still terminates the message.
+    #[test]
+    fn suspend_resume_preserves_payload_within_single_packet() {
+        let packet_size = 4096u32;
+        let mut mock = MockNetworkWriter::new(packet_size);
+
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_async(&[0x01, 0x02, 0x03, 0x04])).unwrap();
+        let suspended = writer.suspend();
+
+        // Nothing should have been sent yet (payload fits one packet, unflushed).
+        assert!(mock.data.is_empty());
+
+        let mut writer = PacketWriter::resume(suspended, &mut mock);
+        block_on(writer.write_async(&[0x05, 0x06, 0x07, 0x08])).unwrap();
+        block_on(writer.finalize()).unwrap();
+
+        assert_eq!(
+            reassemble_payload(&mock.data),
+            vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+        // Single packet, EOM status bit set on the last (only) packet.
+        assert_eq!(mock.data[0], PacketType::RpcRequest as u8);
+        assert_eq!(mock.data[1] & 0x01, 0x01);
+    }
+
+    /// Suspending mid-message preserves packet accounting so a resumed write that
+    /// overflows the packet boundary frames continuous, correctly ordered
+    /// packets.
+    #[test]
+    fn suspend_resume_spans_packet_boundary() {
+        let packet_size = 16u32; // 8-byte payload per packet
+        let mut mock = MockNetworkWriter::new(packet_size);
+
+        let first: Vec<u8> = (0..8).collect();
+        let second: Vec<u8> = (8..16).collect();
+
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(writer.write_async(&first)).unwrap();
+        let suspended = writer.suspend();
+        let mut writer = PacketWriter::resume(suspended, &mut mock);
+        block_on(writer.write_async(&second)).unwrap();
+        block_on(writer.finalize()).unwrap();
+
+        // Two packets were needed; payload reassembles to the full 16 bytes.
+        assert!(mock.data.len() > packet_size as usize);
+        assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
     }
 }
