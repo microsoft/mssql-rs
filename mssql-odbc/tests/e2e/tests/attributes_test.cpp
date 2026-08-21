@@ -35,6 +35,17 @@
 //   22. SetCurrentCatalogQuotesIdentifier  - injection attempt stays one name
 //   23. PreConnectDefaultCatalogIsNotASentinel - "(Default)" only means
 //                                            "no change" once connected
+//
+// Attribute rejection policy:
+//   24. UnknownStatementAttributeIsInvalidIdentifier   - HY092
+//   25. UnknownConnectionAttributeIsInvalidIdentifier  - HY092
+//   26. StatementOnlyAttributeIsRejectedOnAConnection  - scope-keyed HY092
+//   27. ConnectionOnlyAttributeIsRejectedOnAStatement  - the mirror image
+//   28. RowNumberIsNotSettable                         - operation-keyed HY092
+//   29. UnimplementedStatementAttributeIsNotImplemented- HYC00, not HY092
+//   30. UnimplementedConnectionAttributeIsNotImplemented - HYC00 on the get path
+//   31. HostileAttributePayloadDoesNotFault            - HYC00, session survives
+//   32. KeystoreDataGetIsRecognizedNotUnknown          - recognized on both, never HY092
 
 #include "odbc_test_fixture.h"
 
@@ -52,6 +63,41 @@ constexpr SQLULEN kMaxQueryTimeout = 0xfffe;
 
 // SQL Server's sysname limit; longer catalog names are rejected outright.
 constexpr size_t kSysnameLen = 128;
+
+// -- attribute identifiers used only to exercise the rejection policy --------
+//
+// Values measured against msodbcsql 18 rather than assumed; see
+// `docs/attributes_plan.md` §8 for the sweep that produced them.
+
+// Not an attribute in any scope. Both drivers must answer HY092.
+constexpr SQLINTEGER kUnknownAttribute = 99999;
+
+// Statement-only. msodbcsql's connection switch has no arm for it, because it
+// falls outside the ODBC 2.x statement-option fan-out band (0-12, 29).
+constexpr SQLINTEGER kRowArraySizeAttr = 27;
+
+// Connection-only (SQL_ATTR_ENLIST_IN_DTC). Rejected on a statement handle.
+constexpr SQLINTEGER kEnlistInDtcAttr = 1207;
+
+// SQL_ATTR_NOSCAN - a real statement attribute msodbcsql implements and this
+// driver does not yet, so the two legs diverge by design.
+constexpr SQLINTEGER kNoScanAttr = 2;
+
+// SQL_ATTR_ROW_NUMBER - readable but not settable on msodbcsql, which makes it
+// the statement-side mirror of the connection-side SQL_ATTR_QUERY_TIMEOUT
+// asymmetry that Variation 13 pins down.
+constexpr SQLINTEGER kRowNumberAttr = 14;
+
+// SQL_COPT_SS_MARS_ENABLED - readable on msodbcsql. MARS is a deferred feature
+// here (plan §4.12), and "is MARS available?" is exactly the question a caller
+// needs a distinguishable answer to.
+constexpr SQLINTEGER kMarsEnabledAttr = 1224;
+
+// SQL_COPT_SS_CEKEYSTOREDATA - on the set path msodbcsql dereferences the
+// pointer as a struct without validating it, so a caller passing a plain buffer
+// faults the process. This driver must refuse it cleanly instead. The get path
+// is safe on both and answers HY010 there, so it is asserted on both drivers.
+constexpr SQLINTEGER kCekeystoreDataAttr = 1252;
 
 } // namespace
 
@@ -499,4 +545,166 @@ TEST_F(AttributesTest, PreConnectDefaultCatalogIsNotASentinel) {
         SQLDisconnect(dbc);
     }
     SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+}
+
+// ===========================================================================
+// Attribute rejection policy (§4.10 pass-through hardening)
+//
+// mssql-python forwards arbitrary identifiers through `attrs_before` and
+// `set_attr` without filtering, so the answer to "is this an attribute at all?"
+// is part of the contract. Variations 24-28 are pure parity: both drivers must
+// agree. Variations 29-31 assert behavior that is deliberately this driver's
+// own, because msodbcsql implements the attribute (or faults on it). Variation
+// 32 runs on both but expects a different SQLSTATE from each, asserting only
+// the shared half of the contract: a recognized id is never HY092.
+// ===========================================================================
+
+// -------------------------------------------------------------------
+// Variation 24 - an identifier that is not an attribute in any scope is
+// HY092 on a statement, on both drivers.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, UnknownStatementAttributeIsInvalidIdentifier) {
+    EXPECT_EQ(SQL_ERROR,
+              SQLSetStmtAttr(stmt_, kUnknownAttribute,
+                             reinterpret_cast<SQLPOINTER>(1), 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY092");
+
+    SQLULEN out = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetStmtAttr(stmt_, kUnknownAttribute, &out,
+                                        sizeof(out), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY092");
+}
+
+// -------------------------------------------------------------------
+// Variation 25 - the same identifier on a connection. Asserted after
+// connect: before connect the Driver Manager buffers the call and the
+// driver never sees it, so pre-connect proves nothing about either.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, UnknownConnectionAttributeIsInvalidIdentifier) {
+    EXPECT_EQ(SQL_ERROR,
+              SQLSetConnectAttr(dbc_, kUnknownAttribute,
+                                reinterpret_cast<SQLPOINTER>(1), 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY092");
+
+    SQLULEN out = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetConnectAttr(dbc_, kUnknownAttribute, &out,
+                                           sizeof(out), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY092");
+}
+
+// -------------------------------------------------------------------
+// Variation 26 - recognition is scoped. SQL_ATTR_ROW_ARRAY_SIZE is a real
+// statement attribute, but it sits outside the ODBC 2.x statement-option
+// band that msodbcsql fans out from a connection, so on a connection it is
+// as unknown as garbage.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, StatementOnlyAttributeIsRejectedOnAConnection) {
+    EXPECT_EQ(SQL_ERROR,
+              SQLSetConnectAttr(dbc_, kRowArraySizeAttr,
+                                reinterpret_cast<SQLPOINTER>(10), 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY092");
+}
+
+// -------------------------------------------------------------------
+// Variation 27 - the mirror image: a connection-only attribute on a
+// statement handle. Vendor ranges overlap between the two scopes, so this
+// is the case a flat identifier table would get wrong.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ConnectionOnlyAttributeIsRejectedOnAStatement) {
+    EXPECT_EQ(SQL_ERROR,
+              SQLSetStmtAttr(stmt_, kEnlistInDtcAttr,
+                             reinterpret_cast<SQLPOINTER>(0), 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY092");
+}
+
+// -------------------------------------------------------------------
+// Variation 28 - recognition is keyed by operation as well as scope.
+// SQL_ATTR_ROW_NUMBER is readable but not settable, so the set path
+// rejects an identifier the get path accepts.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, RowNumberIsNotSettable) {
+    EXPECT_EQ(SQL_ERROR,
+              SQLSetStmtAttr(stmt_, kRowNumberAttr,
+                             reinterpret_cast<SQLPOINTER>(1), 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY092");
+}
+
+// -------------------------------------------------------------------
+// Variation 29 - a statement attribute msodbcsql implements and this
+// driver does not: HYC00, so a caller can tell "unavailable here" from
+// "never an attribute". msodbcsql returns success, hence the skip.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, UnimplementedStatementAttributeIsNotImplemented) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    EXPECT_EQ(SQL_ERROR,
+              SQLSetStmtAttr(stmt_, kNoScanAttr,
+                             reinterpret_cast<SQLPOINTER>(0), 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
+// -------------------------------------------------------------------
+// Variation 30 - the connection-side equivalent, on the get path. MARS is
+// deferred here, so a caller probing for it gets "not implemented" rather
+// than "no such attribute" and can fall back deliberately.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, UnimplementedConnectionAttributeIsNotImplemented) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    SQLULEN out = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetConnectAttr(dbc_, kMarsEnabledAttr, &out,
+                                           sizeof(out), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HYC00");
+}
+
+// -------------------------------------------------------------------
+// Variation 31 - msodbcsql reads SQL_COPT_SS_CEKEYSTOREDATA as a struct
+// with no validation and faults on a plain buffer. Refusing it is the
+// whole point of routing unimplemented identifiers through a table
+// instead of a pointer read, so this runs on this driver only - the
+// msodbcsql leg would take down the test binary.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, HostileAttributePayloadDoesNotFault) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    unsigned char payload[8] = {};
+    EXPECT_EQ(SQL_ERROR,
+              SQLSetConnectAttr(dbc_, kCekeystoreDataAttr, payload,
+                                sizeof(payload)));
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HYC00");
+
+    // Still usable afterwards: a rejected attribute must not disturb the
+    // session.
+    EXPECT_FALSE(DbName().empty());
+}
+
+// -------------------------------------------------------------------
+// Variation 32 - the get half of the same identifier. This one does run
+// on both drivers: msodbcsql only faults on the set path, and answers the
+// get with HY010 ("function sequence error" - no keystore provider has
+// been selected). The states differ, but the contract this table exists
+// to enforce is the one both must satisfy: 1252 is a real attribute, so
+// neither driver may claim it does not exist.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, KeystoreDataGetIsRecognizedNotUnknown) {
+    unsigned char out[64] = {};
+    SQLINTEGER written = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetConnectAttr(dbc_, kCekeystoreDataAttr, out,
+                                           sizeof(out), &written));
+
+    // The shared assertion: recognized, therefore not HY092.
+    const std::string state =
+        ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, dbc_);
+    EXPECT_NE("HY092", state);
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        // No keystore provider selected, so the sequence is wrong.
+        EXPECT_EQ("HY010", state);
+    } else {
+        // Always Encrypted is deferred, so the feature is what is missing.
+        EXPECT_EQ("HYC00", state);
+    }
+
+    EXPECT_FALSE(DbName().empty());
 }

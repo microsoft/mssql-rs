@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 pub(crate) mod alloc_handle;
+mod attributes;
 mod bind_param;
 mod catalog;
 mod close_cursor;
