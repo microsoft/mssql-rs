@@ -7,13 +7,15 @@ use crate::connection::client_context::{ClientContext, ExecutionColumnEncryption
 use crate::connection::session_recovery::RecoveryContext;
 use crate::connection::transport::any_transport::AnyTransport;
 use crate::datatypes::bulk_copy_metadata::BulkCopyColumnMetadata;
+use crate::datatypes::encoder::GenericEncoder;
 use crate::datatypes::row_writer::{DefaultRowWriter, DiscardRowWriter, RowWriter};
 use crate::datatypes::sql_string::SqlString;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::sqltypes::SqlType;
+use crate::datatypes::tds_value_serializer::{PLP_NULL, PLP_TERMINATOR, PLP_UNKNOWN_LEN};
 use crate::error::Error::UsageError;
 use crate::error::{SqlErrorInfo, SqlInfoMessage};
-use crate::io::packet_writer::PacketWriter;
+use crate::io::packet_writer::{PacketWriter, SuspendedMessage, TdsPacketWriter};
 use crate::message::bulk_load::{StreamingBulkLoadWriter, build_insert_bulk_command};
 use crate::message::messages::{PacketType, ResetConnectionMode};
 use crate::message::parameters::rpc_parameters::{
@@ -196,6 +198,56 @@ pub enum CursorColumn {
     RowEnded,
 }
 
+/// Result of beginning or continuing a streamed PLP parameter write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamedParamStatus {
+    /// The server still expects a streamed parameter value. Stream its chunks
+    /// next via [`TdsClient::write_streamed_chunk`], then call
+    /// [`TdsClient::end_streamed_param`].
+    NeedData {
+        /// Name of the streamed parameter now awaiting its value chunks.
+        param_name: String,
+    },
+    /// All streamed parameters have been written, and the server response has
+    /// been positioned exactly as after a normal execute call.
+    Complete(StatementResult),
+}
+
+/// State machine for an in-progress incremental (streamed) PLP parameter write,
+/// parked as owned state on the client between calls (mirrors the read side's
+/// [`ActiveRowReadState`]). `Active` holds the suspended RPC message plus the
+/// streamed parameters whose headers have not yet been emitted.
+#[derive(Debug)]
+enum StreamedWriteState {
+    Idle,
+    Active(Box<StreamedWriteContext>),
+}
+
+/// Owned context for a suspended, partially-written streamed RPC.
+#[derive(Debug)]
+struct StreamedWriteContext {
+    /// The parked outgoing RPC message. The parameter currently open for data
+    /// has had its header (status byte + `TYPE_INFO`) written; the PLP length
+    /// field (the unknown-length opener, or `PLP_NULL`) and the value chunks are
+    /// appended afterwards by the streaming driver.
+    message: SuspendedMessage,
+    /// Streamed parameters whose headers have not yet been written, in order.
+    pending: std::collections::VecDeque<RpcParameter>,
+    /// Collation used to write `TYPE_INFO` for subsequent streamed parameters.
+    db_collation: SqlCollation,
+    /// `true` once the unknown-length PLP opener (`PLP_UNKNOWN_LEN`) has been
+    /// written for the currently-open parameter — i.e. at least one value chunk
+    /// has been emitted. The opener is written lazily (on the first chunk) so a
+    /// parameter can still resolve to NULL before any data is sent.
+    value_opened: bool,
+    /// `true` when the caller has signalled the currently-open parameter is NULL
+    /// via [`TdsClient::write_streamed_null`]. Closing the parameter then writes
+    /// `PLP_NULL` instead of an opener + terminator, and no chunks may follow.
+    null_signaled: bool,
+    /// Configured timeout reused for each resumed streaming operation.
+    timeout_sec: Option<u32>,
+}
+
 /// Active TDS connection to a SQL Server instance.
 ///
 /// Created by [`TdsConnectionProvider::create_client()`](crate::connection_provider::tds_connection_provider::TdsConnectionProvider::create_client).
@@ -317,6 +369,10 @@ pub struct TdsClient {
     /// budget-exhaustion paths are exercised without live reconnect timing.
     #[cfg(test)]
     reconnect_elapsed_for_test: Option<Duration>,
+
+    // Active incremental (streamed) PLP parameter-write state, if a streamed
+    // RPC is mid-flight. Idle for the normal atomic send path.
+    streamed_write_state: StreamedWriteState,
 }
 
 impl TdsClient {
@@ -368,6 +424,7 @@ impl TdsClient {
             active_row_read_state: ActiveRowReadState::Idle,
             #[cfg(test)]
             reconnect_elapsed_for_test: None,
+            streamed_write_state: StreamedWriteState::Idle,
         }
     }
 
@@ -958,7 +1015,7 @@ impl TdsClient {
         } = options;
         self.current_command_ce_setting = column_encryption;
 
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(crate::error::Error::UsageError(
                 ALREADY_EXECUTING_ERROR.to_string(),
             ));
@@ -1015,39 +1072,23 @@ impl TdsClient {
         } = options.into();
         self.current_command_ce_setting = column_encryption;
 
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
+        RpcParameter::reject_data_at_exec(named_params.iter())?;
 
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
-        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
-        let resolved = budget.into_timeout()?;
-        let timeout_sec = resolved.seconds();
-        let request_timeout = resolved.duration();
-
-        // Store timeout and cancel handle for this operation
-        self.remaining_request_timeout = request_timeout;
-        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
-
-        self.transport.reset_reader();
-        let database_collation = self.negotiated_settings.database_collation;
-
-        let sql_statement_value =
-            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql.clone())));
-
-        // Create the parameter list for sp_execute_sql
-        let statement_parameter = RpcParameter::new(None, StatusFlags::NONE, sql_statement_value);
-
-        // Build the comma separated list of parameters
+        let declaration_params = named_params.clone();
         let mut params_list_as_string = String::new();
-
-        build_parameter_list_string(&named_params, &mut params_list_as_string)?;
+        build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
 
         // Always Encrypted: when the connection enabled column encryption and the
         // server acknowledged the feature, ask the server which parameters need
         // encryption and encrypt them in place before sending the real RPC.
         self.ensure_force_column_encryption_supported(named_params.iter())?;
+        let (timeout_sec, request_timeout, database_collation) = self
+            .prepare_sp_executesql_command(timeout_sec, cancel_handle)
+            .await?;
+
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
                 &sql,
@@ -1063,25 +1104,11 @@ impl TdsClient {
             self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
         }
 
-        let params_as_sql_string = SqlType::NVarcharMax(Some(SqlString::from_utf8_string(
-            params_list_as_string.clone(),
-        )));
-
-        let params_parameter = RpcParameter::new(None, StatusFlags::NONE, params_as_sql_string);
-
-        // Create the parameter list for positional parameters of sp_execute_sql.
-        // These could be named parameters as well, but we want to avoid sending the name
-        // to send less data over the wire.
-        let positional_parameters_vec = vec![statement_parameter, params_parameter];
-        let positional_parameters = Some(positional_parameters_vec);
-
-        // Build the RPC request.
-        let rpc = SqlRpc::new(
-            RpcType::ProcId(RpcProcs::ExecuteSql),
-            positional_parameters,
-            Some(named_params),
+        let rpc = self.build_sp_executesql_rpc(
+            sql,
+            named_params,
+            params_list_as_string,
             &database_collation,
-            &self.execution_context,
         );
 
         let mut packet_writer =
@@ -1089,6 +1116,577 @@ impl TdsClient {
         rpc.serialize(&mut packet_writer).await?;
 
         self.position_on_first_result().await
+    }
+
+    /// Starts a parameterized `sp_executesql` whose MAX parameter values are
+    /// supplied later, in chunks (data-at-execution).
+    ///
+    /// This is the additive streaming counterpart to
+    /// [`TdsClient::execute_sp_executesql`]. Existing materialized-parameter
+    /// callers should continue using that method; this method is for
+    /// [`RpcParameter::data_at_exec`] parameters.
+    ///
+    /// Supported streamed types are listed by [`StreamedSqlType`]. Chunks are
+    /// raw wire bytes and are written verbatim, so the caller owns the encoding:
+    /// `nvarchar(max)` chunks must be UTF-16LE, and `varchar(max)`/
+    /// `varbinary(max)` chunks their corresponding single-byte/binary
+    /// representation. A zero-length stream is a present empty value; use
+    /// [`TdsClient::write_streamed_null`] for SQL `NULL`.
+    ///
+    /// The method returns [`StreamedParamStatus::NeedData`] after the RPC
+    /// prefix is parked. Supply zero or more chunks and call
+    /// [`TdsClient::end_streamed_param`]. When all parameters are complete,
+    /// the final server result is returned as
+    /// [`StreamedParamStatus::Complete`].
+    ///
+    /// Streamed parameters must be named and must use one of the
+    /// [`StreamedSqlType`] variants. Streaming is not supported when Always
+    /// Encrypted is active.
+    ///
+    /// # Errors
+    /// Returns a usage error for invalid streamed parameters or an active
+    /// command, and returns transport/serialization errors from the request.
+    pub async fn begin_sp_executesql<'a>(
+        &mut self,
+        sql: String,
+        named_params: Vec<RpcParameter>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StreamedParamStatus> {
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+
+        if self.command_is_busy() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        self.current_command_ce_setting = column_encryption;
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
+
+        let (streamed_params, materialized_params) =
+            Self::split_and_validate_streamed_params(named_params)?;
+
+        if streamed_params.is_empty() {
+            let result = self
+                .execute_sp_executesql(
+                    sql,
+                    materialized_params,
+                    ExecuteOptions {
+                        timeout: timeout_sec,
+                        cancel: cancel_handle,
+                        column_encryption,
+                    },
+                )
+                .await?;
+            return Ok(StreamedParamStatus::Complete(result));
+        }
+
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Streamed PLP parameter writes are not supported with Always Encrypted."
+                    .to_string(),
+            ));
+        }
+
+        let mut declaration_params = materialized_params.clone();
+        declaration_params.extend(streamed_params.iter().cloned());
+        let mut params_list_as_string = String::new();
+        build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+
+        let (timeout_sec, _request_timeout, database_collation) = self
+            .prepare_sp_executesql_command(timeout_sec, cancel_handle)
+            .await?;
+        let rpc = self.build_sp_executesql_rpc(
+            sql,
+            materialized_params,
+            params_list_as_string,
+            &database_collation,
+        );
+
+        self.start_sp_executesql_streamed(
+            rpc,
+            streamed_params,
+            timeout_sec,
+            cancel_handle,
+            database_collation,
+        )
+        .await
+    }
+
+    async fn prepare_sp_executesql_command(
+        &mut self,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<(Option<u32>, Option<Duration>, SqlCollation)> {
+        self.begin_command();
+        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        let request_timeout = resolved.duration();
+
+        self.remaining_request_timeout = request_timeout;
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.transport.reset_reader();
+
+        Ok((
+            timeout_sec,
+            request_timeout,
+            self.negotiated_settings.database_collation,
+        ))
+    }
+
+    fn build_sp_executesql_rpc<'a>(
+        &self,
+        sql: String,
+        named_params: Vec<RpcParameter>,
+        params_list_as_string: String,
+        database_collation: &'a SqlCollation,
+    ) -> SqlRpc<'a> {
+        let statement_parameter = RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(sql))),
+        );
+
+        let params_parameter = RpcParameter::new(
+            None,
+            StatusFlags::NONE,
+            SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
+        );
+
+        let positional_parameters = Some(vec![statement_parameter, params_parameter]);
+
+        SqlRpc::new(
+            RpcType::ProcId(RpcProcs::ExecuteSql),
+            positional_parameters,
+            Some(named_params),
+            database_collation,
+            &self.execution_context,
+        )
+    }
+
+    fn split_and_validate_streamed_params(
+        named_params: Vec<RpcParameter>,
+    ) -> TdsResult<(Vec<RpcParameter>, Vec<RpcParameter>)> {
+        let (streamed_params, materialized_params): (Vec<_>, Vec<_>) = named_params
+            .into_iter()
+            .partition(RpcParameter::is_data_at_exec);
+
+        for param in &streamed_params {
+            if param.name.is_none() {
+                return Err(UsageError("Streamed parameters must be named.".to_string()));
+            }
+        }
+
+        Ok((streamed_params, materialized_params))
+    }
+
+    async fn start_sp_executesql_streamed(
+        &mut self,
+        rpc: SqlRpc<'_>,
+        streamed_params: Vec<RpcParameter>,
+        timeout_sec: Option<u32>,
+        cancel_handle: Option<&CancelHandle>,
+        database_collation: SqlCollation,
+    ) -> TdsResult<StreamedParamStatus> {
+        let mut pending: std::collections::VecDeque<RpcParameter> =
+            streamed_params.into_iter().collect();
+        let first = pending
+            .pop_front()
+            .expect("streamed_params checked non-empty above");
+        let first_name = first
+            .name
+            .clone()
+            .expect("streamed parameter names validated above");
+
+        let mut packet_writer =
+            rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
+        // Write the RPC prefix (headers, proc, positional + materialized named
+        // params) then the first streamed parameter's header. The data-at-exec
+        // branch of `serialize` writes name + status + TYPE_INFO and stops before
+        // the value. The PLP opener is written lazily with the first chunk so the
+        // parameter can still resolve to NULL.
+        let serialization_result = async {
+            rpc.serialize_prefix(&mut packet_writer).await?;
+            first
+                .serialize(
+                    &mut packet_writer,
+                    &database_collation,
+                    false,
+                    &GenericEncoder::new(),
+                )
+                .await
+        }
+        .await;
+        if let Err(error) = serialization_result {
+            drop(packet_writer);
+            self.abort_streamed_write().await;
+            return Err(error);
+        }
+        let message = packet_writer.suspend();
+
+        self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
+            message,
+            pending,
+            db_collation: database_collation,
+            value_opened: false,
+            null_signaled: false,
+            timeout_sec,
+        }));
+
+        Ok(StreamedParamStatus::NeedData {
+            param_name: first_name,
+        })
+    }
+
+    /// Appends one value chunk to the streamed parameter currently open for
+    /// data. Call zero or more times between
+    /// a [`StreamedParamStatus::NeedData`] from
+    /// [`begin_sp_executesql`](Self::begin_sp_executesql) (or
+    /// [`end_streamed_param`](Self::end_streamed_param)) and the matching
+    /// [`end_streamed_param`](Self::end_streamed_param).
+    ///
+    /// Empty chunks are ignored: a zero-length PLP chunk header is the value
+    /// terminator, so it must never be emitted mid-value.
+    ///
+    /// # Errors
+    /// Returns a usage error if no streamed parameter is currently open, if the
+    /// parameter was already marked NULL via
+    /// [`write_streamed_null`](Self::write_streamed_null), or if `chunk` is longer
+    /// than [`u32::MAX`] bytes (the PLP chunk-length field is 32-bit).
+    pub async fn write_streamed_chunk(&mut self, chunk: &[u8]) -> TdsResult<()> {
+        if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
+            return Err(UsageError(
+                "write_streamed_chunk called with no active streamed parameter.".to_string(),
+            ));
+        }
+        if chunk.len() > u32::MAX as usize {
+            return Err(UsageError(format!(
+                "Streamed PLP chunk length {} exceeds the maximum chunk size of {} bytes.",
+                chunk.len(),
+                u32::MAX
+            )));
+        }
+
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        {
+            StreamedWriteState::Active(ctx) => ctx,
+            StreamedWriteState::Idle => {
+                return Err(UsageError(
+                    "write_streamed_chunk called with no active streamed parameter.".to_string(),
+                ));
+            }
+        };
+        let StreamedWriteContext {
+            message,
+            pending,
+            db_collation,
+            value_opened,
+            null_signaled,
+            timeout_sec,
+        } = *ctx;
+        self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
+
+        // A parameter already signalled NULL cannot carry data. Re-park the
+        // (still-clean) message and reject; this is a caller sequencing error,
+        // not a wire failure, so the stream stays usable. Checked before the
+        // empty-chunk short-circuit below so `write_streamed_chunk(&[])` after
+        // `write_streamed_null()` still errors instead of silently succeeding.
+        if null_signaled {
+            self.streamed_write_state =
+                StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                    message,
+                    pending,
+                    db_collation,
+                    value_opened,
+                    null_signaled,
+                    timeout_sec,
+                }));
+            return Err(UsageError(
+                "write_streamed_chunk called after the parameter was marked NULL.".to_string(),
+            ));
+        }
+
+        // Empty chunks are ignored: a zero-length PLP chunk header is the value
+        // terminator, so it must never be emitted mid-value. Re-park the
+        // (unchanged) message so a later chunk or the terminator continues
+        // from the same point.
+        if chunk.is_empty() {
+            self.streamed_write_state =
+                StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                    message,
+                    pending,
+                    db_collation,
+                    value_opened,
+                    null_signaled,
+                    timeout_sec,
+                }));
+            return Ok(());
+        }
+
+        let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
+        let result = async {
+            // Lazily write the unknown-length opener on the first chunk. Deferring
+            // it (rather than emitting it at header time) is what lets a streamed
+            // parameter still resolve to NULL before any data is sent.
+            if !value_opened {
+                packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
+            }
+            packet_writer.write_u32_async(chunk.len() as u32).await?;
+            packet_writer.write_async(chunk).await
+        }
+        .await;
+        let message = packet_writer.suspend();
+
+        match result {
+            Ok(()) => {
+                // Chunk framed cleanly: re-park the message so the next chunk or
+                // the terminator continues exactly where this one left off. The
+                // opener is now on the wire, so the value is committed as present.
+                self.streamed_write_state =
+                    StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                        message,
+                        pending,
+                        db_collation,
+                        value_opened: true,
+                        null_signaled: false,
+                        timeout_sec,
+                    }));
+                Ok(())
+            }
+            Err(e) => {
+                // A partial value chunk is now on the wire, so this message can no
+                // longer be continued safely. Drop it and abort the streamed
+                // write rather than re-parking it as resumable.
+                drop(message);
+                self.abort_streamed_write().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Aborts an in-progress streamed PLP write after a mid-stream failure.
+    ///
+    /// The half-written RPC message is dropped rather than re-parked, so a
+    /// subsequent [`write_streamed_chunk`](Self::write_streamed_chunk) or
+    /// [`end_streamed_param`](Self::end_streamed_param) fails cleanly (no active
+    /// stream) instead of appending to a corrupt message. The transport is closed
+    /// because RESETCONNECTION applies only to a subsequent request and cannot
+    /// terminate this incomplete RPC.
+    async fn abort_streamed_write(&mut self) {
+        self.streamed_write_state = StreamedWriteState::Idle;
+        self.execution_context.set_has_open_batch(false);
+        self.transport.mark_known_dead();
+        // TODO: Match msodbcsql's state-aware cancellation: discard an unsent
+        // request locally, or send EOM | IGNORE and drain DONE after a partial send.
+        if let Err(error) = self.transport.close_transport().await {
+            warn!(%error, "Failed to close transport after streamed write abort");
+        }
+    }
+
+    /// Cancels an in-progress streamed PLP write while the client is parked in
+    /// [`StreamedParamStatus::NeedData`](StreamedParamStatus::NeedData),
+    /// discarding the half-written RPC and closing the transport.
+    ///
+    /// This is the supported way for a caller to bail out of a streamed
+    /// parameter sequence once [`begin_sp_executesql`](Self::begin_sp_executesql)
+    /// has parked a message (for example, to service `SQLCancel` while an ODBC
+    /// driver is between `SQLPutData` calls). After this returns, no streamed
+    /// write is active, so a subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
+    /// [`write_streamed_null`](Self::write_streamed_null), or
+    /// [`end_streamed_param`](Self::end_streamed_param) fails with a usage
+    /// error. Calling this with no streamed write active is a no-op.
+    pub async fn cancel_streamed_write(&mut self) {
+        if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
+            return;
+        }
+        self.abort_streamed_write().await;
+    }
+
+    /// Marks the streamed parameter currently open for data as SQL NULL.
+    ///
+    /// Call this instead of [`write_streamed_chunk`](Self::write_streamed_chunk)
+    /// when a data-at-execution parameter resolves to NULL (the ODBC
+    /// `SQLPutData(SQL_NULL_DATA)` case). No bytes are written now; when the
+    /// parameter is closed with [`end_streamed_param`](Self::end_streamed_param)
+    /// the driver emits `PLP_NULL` instead of an unknown-length opener +
+    /// terminator. Mirrors msodbcsql, which writes `VARMAX_LENGTH_NULL` with no
+    /// chunks for a DAE parameter that resolves to NULL.
+    ///
+    /// # Errors
+    /// Returns a usage error if no streamed parameter is currently open, or if
+    /// value chunks have already been written for this parameter (a value that
+    /// has begun streaming cannot become NULL).
+    pub fn write_streamed_null(&mut self) -> TdsResult<()> {
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        {
+            StreamedWriteState::Active(ctx) => ctx,
+            StreamedWriteState::Idle => {
+                return Err(UsageError(
+                    "write_streamed_null called with no active streamed parameter.".to_string(),
+                ));
+            }
+        };
+        let StreamedWriteContext {
+            message,
+            pending,
+            db_collation,
+            value_opened,
+            null_signaled: _,
+            timeout_sec,
+        } = *ctx;
+
+        if value_opened {
+            // Chunks are already on the wire; the value cannot become NULL. Re-park
+            // the (still-clean) message — this is a caller sequencing error.
+            self.streamed_write_state =
+                StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                    message,
+                    pending,
+                    db_collation,
+                    value_opened,
+                    null_signaled: false,
+                    timeout_sec,
+                }));
+            return Err(UsageError(
+                "write_streamed_null called after value chunks were already written.".to_string(),
+            ));
+        }
+
+        self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
+            message,
+            pending,
+            db_collation,
+            value_opened: false,
+            null_signaled: true,
+            timeout_sec,
+        }));
+        Ok(())
+    }
+
+    /// Closes the streamed parameter currently open for data.
+    ///
+    /// The current parameter's value is closed on the wire:
+    /// - if it was marked NULL via [`write_streamed_null`](Self::write_streamed_null),
+    ///   `PLP_NULL` is written (no opener, no terminator);
+    /// - if one or more chunks were written, the `PLP_TERMINATOR` is written; and
+    /// - if neither (an untouched parameter), the unknown-length opener +
+    ///   terminator are written, encoding a present, zero-length value.
+    ///
+    /// If more streamed parameters remain, the next one's header is written and
+    /// [`StreamedParamStatus::NeedData`] is returned (stream its chunks next).
+    /// When the last streamed parameter closes, the RPC message is finalized and
+    /// sent, then the real server result is returned in
+    /// [`StreamedParamStatus::Complete`].
+    ///
+    /// # Errors
+    /// Returns a usage error if no streamed parameter is currently open, or an
+    /// I/O error if sending fails.
+    pub async fn end_streamed_param(&mut self) -> TdsResult<StreamedParamStatus> {
+        let ctx = match std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        {
+            StreamedWriteState::Active(ctx) => ctx,
+            StreamedWriteState::Idle => {
+                return Err(UsageError(
+                    "end_streamed_param called with no active streamed parameter.".to_string(),
+                ));
+            }
+        };
+        let StreamedWriteContext {
+            message,
+            mut pending,
+            db_collation,
+            value_opened,
+            null_signaled,
+            timeout_sec,
+        } = *ctx;
+        self.remaining_request_timeout = timeout_sec.map(|s| Duration::from_secs(u64::from(s)));
+
+        let mut packet_writer = PacketWriter::resume(message, self.transport.as_writer());
+
+        // Close the current value, then either open the next streamed parameter's
+        // header or (for the last one) finalize the send. Anything that fails
+        // mid-message aborts the whole streamed write.
+        let write_outcome = async {
+            if null_signaled {
+                // NULL: the length field is PLP_NULL and no chunks/terminator
+                // follow.
+                packet_writer.write_u64_async(PLP_NULL).await?;
+            } else {
+                // An untouched parameter never wrote its opener; write it now so
+                // the value is a present, zero-length value rather than absent.
+                if !value_opened {
+                    packet_writer.write_u64_async(PLP_UNKNOWN_LEN).await?;
+                }
+                packet_writer.write_u32_async(PLP_TERMINATOR).await?;
+            }
+            match pending.pop_front() {
+                Some(next) => {
+                    let next_name = next
+                        .name
+                        .clone()
+                        .expect("streamed parameter names validated at begin");
+                    next.serialize(
+                        &mut packet_writer,
+                        &db_collation,
+                        false,
+                        &GenericEncoder::new(),
+                    )
+                    .await?;
+                    Ok(Some(next_name))
+                }
+                None => {
+                    packet_writer.finalize().await?;
+                    Ok(None)
+                }
+            }
+        }
+        .await;
+
+        match write_outcome {
+            // Another streamed parameter is now open for data.
+            Ok(Some(next_name)) => {
+                let message = packet_writer.suspend();
+                self.streamed_write_state =
+                    StreamedWriteState::Active(Box::new(StreamedWriteContext {
+                        message,
+                        pending,
+                        db_collation,
+                        // Fresh parameter: its opener has not been written and it
+                        // has not been marked NULL.
+                        value_opened: false,
+                        null_signaled: false,
+                        timeout_sec,
+                    }));
+                Ok(StreamedParamStatus::NeedData {
+                    param_name: next_name,
+                })
+            }
+            // Last streamed parameter closed and the message was sent: consume
+            // the response exactly like execute_sp_executesql does. A failure
+            // reading the response also aborts (the request is already on the
+            // wire, so the connection must be reset before reuse).
+            Ok(None) => {
+                drop(packet_writer);
+                match self.position_on_first_result().await {
+                    Ok(result) => Ok(StreamedParamStatus::Complete(result)),
+                    Err(e) => {
+                        self.abort_streamed_write().await;
+                        Err(e)
+                    }
+                }
+            }
+            // Terminator or next-parameter header write failed mid-message: drop
+            // the half-written message and abort rather than leave it resumable.
+            Err(e) => {
+                drop(packet_writer);
+                self.abort_streamed_write().await;
+                Err(e)
+            }
+        }
     }
 
     /// Executes a bulk load operation using zero-copy streaming.
@@ -1139,7 +1737,7 @@ impl TdsClient {
     where
         R: BulkLoadRow,
     {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
@@ -1450,11 +2048,18 @@ impl TdsClient {
         let mut positional_parameters = positional_parameters;
         let mut named_parameters = named_parameters;
 
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(crate::error::Error::UsageError(
                 ALREADY_EXECUTING_ERROR.to_string(),
             ));
         };
+
+        RpcParameter::reject_data_at_exec(
+            positional_parameters
+                .iter()
+                .flatten()
+                .chain(named_parameters.iter().flatten()),
+        )?;
 
         self.begin_command();
         let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
@@ -1577,7 +2182,7 @@ impl TdsClient {
         named_params: Vec<RpcParameter>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementId> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         };
 
@@ -1757,7 +2362,7 @@ impl TdsClient {
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
         if !command_started {
-            if self.execution_context.has_open_batch() {
+            if self.command_is_busy() {
                 return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
             }
             self.begin_command();
@@ -1854,9 +2459,11 @@ impl TdsClient {
         orphaned: &mut Option<StatementId>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
+
+        RpcParameter::reject_data_at_exec(named_params.iter())?;
 
         // Open the command boundary before recovery so a transparent reconnect's
         // login info messages land in this command's buffer; the inner RPC skips
@@ -1927,7 +2534,7 @@ impl TdsClient {
         statement_id: StatementId,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
         }
 
@@ -2013,7 +2620,7 @@ impl TdsClient {
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementResult> {
         if !command_started {
-            if self.execution_context.has_open_batch() {
+            if self.command_is_busy() {
                 return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
             }
             self.begin_command();
@@ -2198,7 +2805,7 @@ impl TdsClient {
             ));
         };
         if !command_started {
-            if self.execution_context.has_open_batch() {
+            if self.command_is_busy() {
                 return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
             }
             self.begin_command();
@@ -2855,6 +3462,12 @@ impl TdsClient {
         self.execution_context.has_open_batch()
     }
 
+    /// Returns `true` when an open result batch or streamed write blocks a new command.
+    pub(in crate::connection) fn command_is_busy(&self) -> bool {
+        self.execution_context.has_open_batch()
+            || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
+    }
+
     /// Returns `true` when the client is currently positioned on a row-returning
     /// result set (the last [`execute`](Self::execute) / [`advance`](Self::advance)
     /// returned [`StatementResult::Rows`]). Row-reading via the [`ResultSet`] API
@@ -3458,7 +4071,7 @@ impl TdsClient {
             let param = &mut *params[index];
 
             let ciphertext = encrypt_parameter(
-                param.value(),
+                param.value()?,
                 plaintext_cek.as_slice(),
                 info.cipher_algorithm_id,
                 info.encryption_type,
@@ -4417,7 +5030,7 @@ impl TdsClient {
         isolation_level: TransactionIsolationLevel,
         name: Option<String>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
@@ -4448,7 +5061,7 @@ impl TdsClient {
     /// [`rollback_transaction`](Self::rollback_transaction) to partially undo work.
     #[instrument(skip(self), level = "info")]
     pub async fn save_transaction(&mut self, name: String) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot save transaction while another batch is executing.".to_string(),
             ));
@@ -4477,7 +5090,7 @@ impl TdsClient {
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot commit transaction while another batch is executing.".to_string(),
             ));
@@ -4509,7 +5122,7 @@ impl TdsClient {
         name: Option<String>,
         create_txn_params: Option<CreateTxnParams>,
     ) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot rollback transaction while another batch is executing.".to_string(),
             ));
@@ -4536,7 +5149,7 @@ impl TdsClient {
     /// Returns a result set that can be iterated with the normal row-reading API.
     #[instrument(skip(self), level = "info")]
     pub async fn get_dtc_address(&mut self) -> TdsResult<()> {
-        if self.execution_context.has_open_batch() {
+        if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot get DTC address while another batch is executing.".to_string(),
             ));
@@ -4919,6 +5532,7 @@ mod tests {
     use crate::io::token_stream::{
         ColumnPolicy, ParserContext, RowHeader, RowPauseState, RowReadResult, TdsTokenStreamReader,
     };
+    use crate::message::parameters::rpc_parameters::StreamedSqlType;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
     use crate::token::tokens::{
@@ -4943,6 +5557,9 @@ mod tests {
         /// `read_row_column` down a specific arm (e.g. a `PlpPaused` result that
         /// makes the cursor emit `CursorColumn::PlpStreaming`).
         resume_results: VecDeque<RowReadResult>,
+        /// When set, the next (and every subsequent) `send` fails, simulating a
+        /// mid-message wire failure. Shared so a test can flip it after setup.
+        send_should_fail: Arc<std::sync::atomic::AtomicBool>,
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
@@ -4958,6 +5575,7 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
             }
         }
@@ -4971,6 +5589,7 @@ mod tests {
                 packet_data: Vec::new(),
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
             }
         }
@@ -4984,6 +5603,7 @@ mod tests {
                 packet_data,
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
+                send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
             }
         }
@@ -5086,6 +5706,19 @@ mod tests {
     #[async_trait]
     impl NetworkWriter for TestTransport {
         async fn send(&mut self, data: &[u8]) -> TdsResult<()> {
+            if self.closed {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "test transport is closed".to_string(),
+                ));
+            }
+            if self
+                .send_should_fail
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::ConnectionClosed(
+                    "injected send failure".to_string(),
+                ));
+            }
             self.sent.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
@@ -5127,7 +5760,7 @@ mod tests {
             Ok(false)
         }
         fn is_connection_dead(&self) -> bool {
-            true
+            self.closed
         }
         fn connection_known_dead(&self) -> bool {
             self.known_dead
@@ -5360,6 +5993,28 @@ mod tests {
             client_context,
         );
         (client, sent)
+    }
+
+    /// Like [`create_capturing_client`], but also returns a shared flag that,
+    /// when set, makes the transport's next `send` fail — used to exercise the
+    /// mid-stream abort path of the streamed PLP write.
+    fn create_failing_capturing_client(
+        tokens: Vec<Tokens>,
+    ) -> (TdsClient, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let transport = TestTransport::with_tokens(tokens);
+        let fail = std::sync::Arc::clone(&transport.send_should_fail);
+        let transport = AnyTransport::dynamic(transport);
+        let negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let execution_context = crate::connection::execution_context::ExecutionContext::new();
+        let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        let client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            execution_context,
+            client_context,
+        );
+        (client, fail)
     }
 
     fn done_no_more() -> Tokens {
@@ -6232,6 +6887,7 @@ mod tests {
     async fn check_and_reconnect_returns_error_when_dead_and_not_recoverable() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
+        client.transport.close_transport().await.unwrap();
         // Make it not recoverable by starting a transaction
         client.execution_context.set_transaction_descriptor(42);
 
@@ -6248,7 +6904,8 @@ mod tests {
     async fn check_and_reconnect_attempts_reconnect_when_dead_and_recoverable() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
-        // Transport (TestTransport) returns is_connection_dead() = true,
+        client.transport.close_transport().await.unwrap();
+        // The closed TestTransport returns is_connection_dead() = true,
         // recovery is possible (no txn, no open batch, negotiated=true).
         // reconnect() will fail because TestTransport can't actually connect,
         // but it should be *attempted* — we'll get SessionRecoveryFailed.
@@ -8024,6 +8681,915 @@ mod tests {
             client.return_values.len(),
             1,
             "the RETURNVALUE must be surfaced as an output parameter"
+        );
+    }
+
+    // ── Streamed (data-at-execution) PLP parameter write ──
+
+    /// Reassembles the TDS packet stream captured by the mock transport into the
+    /// original contiguous request payload, stripping each 8-byte packet header.
+    fn reassemble_sent(sent: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off < sent.len() {
+            let packet_len = u16::from_be_bytes([sent[off + 2], sent[off + 3]]) as usize;
+            out.extend_from_slice(&sent[off + 8..off + packet_len]);
+            off += packet_len;
+        }
+        out
+    }
+
+    /// The 8-byte little-endian `PLP_UNKNOWN_LEN` sentinel that opens every
+    /// unknown-length PLP value on the wire.
+    const PLP_UNKNOWN_LEN_BYTES: [u8; 8] = [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    /// The 4-byte PLP terminator (a zero-length chunk header) that closes a value.
+    const PLP_TERMINATOR_BYTES: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+    /// The 8-byte little-endian `PLP_NULL` sentinel: a MAX-type value that is SQL
+    /// NULL. No chunks or terminator follow it.
+    const PLP_NULL_BYTES: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+    /// Index of the last occurrence of `needle` in `haystack`, if any.
+    fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return None;
+        }
+        (0..=haystack.len() - needle.len())
+            .rev()
+            .find(|&i| &haystack[i..i + needle.len()] == needle)
+    }
+
+    /// A data-at-execution `varbinary(max)` parameter template named `name`.
+    /// varbinary keeps chunk bytes raw (no encoding), so tests can assert the
+    /// exact wire bytes they streamed.
+    fn streamed_varbinary(name: &str) -> RpcParameter {
+        RpcParameter::data_at_exec(
+            Some(name.to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        )
+    }
+
+    /// A single streamed chunk is framed as `[u32 len][bytes]` and the value is
+    /// then closed with the PLP terminator.
+    #[tokio::test]
+    async fn streamed_write_single_chunk_frames_value_and_terminator() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@v")
+        );
+
+        let chunk = [0xAAu8; 6];
+        client.write_streamed_chunk(&chunk).await.unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).expect("value opener present");
+        let after = &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..];
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&chunk);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(after, expected.as_slice());
+
+        // The lifecycle is complete: no streamed write remains parked.
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// A streamed parameter marked NULL (before any chunk) is closed with
+    /// `PLP_NULL` — no unknown-length opener, no chunks, no terminator. Mirrors
+    /// msodbcsql's `VARMAX_LENGTH_NULL` for a data-at-execution NULL.
+    #[tokio::test]
+    async fn streamed_write_null_frames_plp_null() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_null().unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        // The streamed @v value's length field is PLP_NULL and nothing follows it
+        // (no chunks, no terminator), so it is the final value on the wire. Note
+        // the positional @statement/@params args are themselves nvarchar(max) and
+        // legitimately use PLP_UNKNOWN_LEN openers, so we assert on @v's PLP_NULL
+        // being last rather than the absence of any opener in the whole payload.
+        assert!(
+            payload.ends_with(&PLP_NULL_BYTES),
+            "a NULL streamed value must end the message with PLP_NULL and no terminator"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// Writing a chunk after marking the parameter NULL is a usage error, and the
+    /// stream stays usable (the message is not corrupted — nothing was written).
+    #[tokio::test]
+    async fn streamed_write_chunk_after_null_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_null().unwrap();
+        let err = client
+            .write_streamed_chunk(&[0x01])
+            .await
+            .expect_err("cannot write data after NULL");
+        assert!(matches!(err, UsageError(_)));
+        // Still active: end can still close it as NULL.
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Active(_)
+        ));
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+    }
+
+    /// An *empty* chunk after marking the parameter NULL must still be a usage
+    /// error, not a silent no-op: the empty-chunk short-circuit runs only after
+    /// the NULL-sequencing check, so it cannot mask this caller mistake.
+    #[tokio::test]
+    async fn streamed_write_empty_chunk_after_null_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_null().unwrap();
+        let err = client
+            .write_streamed_chunk(&[])
+            .await
+            .expect_err("an empty chunk after NULL must still error");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+    }
+
+    /// Marking a parameter NULL after chunks were already written is a usage
+    /// error: a value that has begun streaming cannot become NULL.
+    #[tokio::test]
+    async fn streamed_null_after_chunk_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_chunk(&[0x01, 0x02]).await.unwrap();
+        let err = client
+            .write_streamed_null()
+            .expect_err("cannot mark NULL after chunks were written");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// `write_streamed_null` with no active streamed parameter is a usage error.
+    #[tokio::test]
+    async fn streamed_null_without_active_stream_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        let err = client
+            .write_streamed_null()
+            .expect_err("no active streamed parameter");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// A NULL streamed parameter followed by a normal streamed parameter: the
+    /// first closes with `PLP_NULL`, the second frames its value normally, and the
+    /// lifecycle advances NeedData -> NeedData -> Done.
+    #[tokio::test]
+    async fn streamed_write_null_then_value_param() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(a, b) VALUES (@a, @b)".to_string(),
+                vec![streamed_varbinary("@a"), streamed_varbinary("@b")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        // @a is NULL.
+        client.write_streamed_null().unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@b")
+        );
+
+        // @b carries a value.
+        let value = [0x7Au8; 5];
+        client.write_streamed_chunk(&value).await.unwrap();
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        // @b's value is framed after an unknown-length opener; @a contributed a
+        // PLP_NULL and no opener.
+        let b_pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected_b = Vec::new();
+        expected_b.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        expected_b.extend_from_slice(&value);
+        expected_b.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[b_pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected_b.as_slice()
+        );
+        assert!(
+            find_last(&payload[..b_pos], &PLP_NULL_BYTES).is_some(),
+            "@a must have emitted PLP_NULL before @b's value"
+        );
+    }
+
+    /// Multiple chunks are each length-prefixed independently and the value is
+    /// closed by exactly one terminator — the incremental multi-chunk case.
+    #[tokio::test]
+    async fn streamed_write_multiple_chunks_each_length_prefixed_single_terminator() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        let chunks: [&[u8]; 3] = [&[0x01, 0x02], &[0x03, 0x04, 0x05], &[0x06]];
+        for c in chunks {
+            client.write_streamed_chunk(c).await.unwrap();
+        }
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let after = &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..];
+
+        let mut expected = Vec::new();
+        for c in chunks {
+            expected.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            expected.extend_from_slice(c);
+        }
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(after, expected.as_slice());
+    }
+
+    /// An empty chunk must be ignored, not written: a zero-length chunk header
+    /// IS the terminator, so emitting one mid-value would truncate the value on
+    /// the server. Protocol-safety analogue of the read-side early-terminator
+    /// test.
+    #[tokio::test]
+    async fn streamed_write_empty_chunk_is_skipped_not_terminator() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        client.write_streamed_chunk(&[0x11, 0x22]).await.unwrap();
+        client.write_streamed_chunk(&[]).await.unwrap(); // must be a no-op
+        client.end_streamed_param().await.unwrap();
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let after = &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..];
+
+        // Exactly one framed chunk followed by exactly one terminator; the empty
+        // chunk contributed nothing.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0x11, 0x22]);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(after, expected.as_slice());
+    }
+
+    /// Two data-at-execution parameters advance NeedData(@a) -> NeedData(@b) ->
+    /// Done, and both values are framed in order on the wire.
+    #[tokio::test]
+    async fn streamed_write_two_params_advances_need_data_then_done() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(a, b) VALUES (@a, @b)".to_string(),
+                vec![streamed_varbinary("@a"), streamed_varbinary("@b")],
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@a")
+        );
+
+        let a_value = [0xA1u8; 4];
+        client.write_streamed_chunk(&a_value).await.unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@b")
+        );
+
+        let b_value = [0xB2u8; 5];
+        client.write_streamed_chunk(&b_value).await.unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+
+        // @b is the last streamed param: its opener is the last sentinel, and the
+        // bytes after it are exactly @b's framed value + terminator.
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let b_pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected_b = Vec::new();
+        expected_b.extend_from_slice(&(b_value.len() as u32).to_le_bytes());
+        expected_b.extend_from_slice(&b_value);
+        expected_b.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[b_pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected_b.as_slice()
+        );
+
+        // @a's opener precedes @b's, and its framed value + terminator sits right
+        // after it (followed by @b's parameter header).
+        let a_pos = find_last(&payload[..b_pos], &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let mut expected_a = Vec::new();
+        expected_a.extend_from_slice(&(a_value.len() as u32).to_le_bytes());
+        expected_a.extend_from_slice(&a_value);
+        expected_a.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert!(
+            payload[a_pos + PLP_UNKNOWN_LEN_BYTES.len()..].starts_with(&expected_a),
+            "@a's framed value + terminator must immediately follow its opener"
+        );
+        assert!(a_pos < b_pos, "@a must be serialized before @b");
+    }
+
+    /// With no data-at-execution parameter, `begin_sp_executesql` delegates to
+    /// the atomic path: it sends the RPC, consumes the response, and returns
+    /// Complete without parking any streamed state.
+    #[tokio::test]
+    async fn begin_without_data_at_exec_delegates_and_returns_complete() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(id) VALUES (@id)".to_string(),
+                vec![RpcParameter::new(
+                    Some("@id".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(7)),
+                )],
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "the atomic RPC should have been sent"
+        );
+    }
+
+    /// Always Encrypted does not block the atomic fallback when there are no
+    /// data-at-execution parameters.
+    #[tokio::test]
+    async fn begin_without_data_at_exec_allows_always_encrypted_atomic_fallback() {
+        let mut client = client_over_bytes_with_ae(done_bytes(DONE_FINAL));
+
+        let status = client
+            .begin_sp_executesql("SELECT 1".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// A mid-value send failure aborts the streamed write: the error is
+    /// surfaced, the parked message is dropped (state returns to `Idle`, not left
+    /// `Active`/resumable), and the transport is closed so the incomplete RPC
+    /// cannot desynchronize a later command.
+    #[tokio::test]
+    async fn streamed_write_chunk_send_failure_aborts_stream() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Active(_)
+        ));
+
+        // Fail the next wire send; a chunk large enough to overflow the packet
+        // payload buffer forces a flush (and thus a `send`) inside
+        // write_streamed_chunk.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let big = vec![0xABu8; 10_000];
+        let _err = client
+            .write_streamed_chunk(&big)
+            .await
+            .expect_err("a send failure must surface as an error");
+
+        // The streamed write is aborted, not left resumable.
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(
+            client.is_connection_dead(),
+            "an incomplete RPC must make the connection non-reusable"
+        );
+
+        // Further streamed calls now fail cleanly (no active stream) rather than
+        // appending to the corrupt message.
+        let followup = client
+            .write_streamed_chunk(&[0x00])
+            .await
+            .expect_err("no active streamed parameter after abort");
+        assert!(matches!(followup, UsageError(_)));
+        let end = client
+            .end_streamed_param()
+            .await
+            .expect_err("no active streamed parameter after abort");
+        assert!(matches!(end, UsageError(_)));
+    }
+
+    /// A send failure while finalizing the last streamed parameter (flushing the
+    /// terminator + message) aborts the same way: error surfaced, state `Idle`,
+    /// transport closed.
+    #[tokio::test]
+    async fn end_streamed_param_send_failure_aborts_stream() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        // A small chunk stays buffered (fits one packet, no send yet).
+        client
+            .write_streamed_chunk(&[0x01, 0x02, 0x03])
+            .await
+            .unwrap();
+
+        // finalize() inside end_streamed_param flushes the message -> send fails.
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _err = client
+            .end_streamed_param()
+            .await
+            .expect_err("finalize send failure must surface");
+
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(
+            client.is_connection_dead(),
+            "a failed final send must make the connection non-reusable"
+        );
+    }
+
+    /// Beginning a streamed execution while one is already active is rejected.
+    #[tokio::test]
+    async fn begin_while_stream_active_errors() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        let err = client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect_err("cannot begin a second streamed execution while one is active");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// An unnamed data-at-execution parameter is rejected: streamed values must
+    /// be named so `sp_executesql` can match them by name.
+    #[tokio::test]
+    async fn begin_rejects_unnamed_data_at_exec_param() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let bad =
+            RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarBinaryMax);
+
+        let err = client
+            .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
+            .await
+            .expect_err("unnamed data-at-exec parameter must be rejected");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// All non-streaming execute entry points must reject data-at-exec params
+    /// with a usage error instead of panicking or writing malformed RPC values.
+    #[tokio::test]
+    async fn execute_sp_executesql_rejects_data_at_exec_params() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .execute_sp_executesql("SELECT @v".to_string(), vec![streamed_varbinary("@v")], ())
+            .await
+            .expect_err("streamed params are only valid via begin_sp_executesql");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_stored_procedure_rejects_data_at_exec_params() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .execute_stored_procedure(
+                "dbo.p".to_string(),
+                None,
+                Some(vec![streamed_varbinary("@v")]),
+                (),
+            )
+            .await
+            .expect_err("streamed params are only valid via begin_sp_executesql");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_rejects_data_at_exec_params() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let mut statement = PreparedStatement::new("SELECT @v");
+        let mut orphaned = None;
+        let err = client
+            .execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect_err("streamed params are only valid via begin_sp_executesql");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// Cancelling while idle must be a no-op that keeps the connection reusable.
+    #[tokio::test]
+    async fn cancel_streamed_write_on_idle_client_is_noop() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        client.cancel_streamed_write().await;
+        assert!(
+            !client.is_connection_dead(),
+            "cancelling while idle must not kill a reusable connection"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// Cancelling an active streamed write must discard parked state and mark
+    /// the connection dead so it cannot be reused by a pool checkout.
+    #[tokio::test]
+    async fn cancel_streamed_write_aborts_active_stream_and_marks_connection_dead() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+        assert!(matches!(
+            status,
+            StreamedParamStatus::NeedData { param_name: _ }
+        ));
+
+        client.cancel_streamed_write().await;
+
+        assert!(
+            client.is_connection_dead(),
+            "an aborted streamed write must not hand a live-looking connection back to the pool"
+        );
+        assert!(matches!(
+            client.write_streamed_chunk(&[0x01]).await,
+            Err(UsageError(_))
+        ));
+    }
+
+    /// `write_streamed_chunk` with no active streamed parameter is a usage error.
+    #[tokio::test]
+    async fn write_streamed_chunk_without_active_stream_errors() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .write_streamed_chunk(&[0x01])
+            .await
+            .expect_err("no active streamed parameter");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// `end_streamed_param` with no active streamed parameter is a usage error.
+    #[tokio::test]
+    async fn end_streamed_param_without_active_stream_errors() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .end_streamed_param()
+            .await
+            .expect_err("no active streamed parameter");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    #[tokio::test]
+    async fn write_streamed_chunk_empty_while_idle_is_usage_error() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let err = client
+            .write_streamed_chunk(&[])
+            .await
+            .expect_err("empty chunk while Idle must be a usage error");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    #[tokio::test]
+    async fn normal_command_blocked_while_streamed_write_active() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+        let err = client
+            .execute_sp_executesql("SELECT 1".to_string(), vec![], ())
+            .await
+            .expect_err("normal command must be blocked while streaming");
+        assert!(matches!(err, UsageError(_)));
+        client.write_streamed_null().unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(
+            status,
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_streamed_chunk_resets_timeout_to_configured_budget() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                ExecuteOptions::new().timeout_secs(30),
+            )
+            .await
+            .unwrap();
+        client.remaining_request_timeout = Some(Duration::from_secs(1));
+        client.write_streamed_chunk(&[0x01]).await.unwrap();
+        assert_eq!(
+            client.remaining_request_timeout,
+            Some(Duration::from_secs(30))
+        );
+        client.remaining_request_timeout = Some(Duration::from_secs(1));
+        client.end_streamed_param().await.unwrap();
+    }
+    /// Little-endian UTF-16 encoding of `s`, matching how parameter names are
+    /// written on the wire (length-prefixed unicode).
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// A materialized (send-now) named parameter and a data-at-execution one may
+    /// be mixed: the materialized value is sent atomically in the RPC prefix and
+    /// the streamed value follows. Offline analogue of the sparse non-PLP + PLP
+    /// e2e test. The materialized name precedes the streamed value opener, and
+    /// the streamed value frames correctly.
+    #[tokio::test]
+    async fn streamed_write_mixes_materialized_and_data_at_exec() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let materialized = RpcParameter::new(
+            Some("@id".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(7)),
+        );
+
+        let status = client
+            .begin_sp_executesql(
+                "INSERT INTO t(id, v) VALUES (@id, @v)".to_string(),
+                vec![materialized, streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&status, StreamedParamStatus::NeedData { param_name } if param_name == "@v")
+        );
+
+        let value = [0xCDu8; 8];
+        client.write_streamed_chunk(&value).await.unwrap();
+        assert!(matches!(
+            client.end_streamed_param().await.unwrap(),
+            StreamedParamStatus::Complete(
+                StatementResult::NoRows { .. } | StatementResult::Rows | StatementResult::End
+            )
+        ));
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+
+        // The streamed value opener is the last unknown-length sentinel, and the
+        // materialized parameter's name is serialized before it.
+        let v_pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+        let id_name = utf16le("@id");
+        let id_pos = find_last(&payload[..v_pos], &id_name)
+            .expect("materialized parameter name must be serialized before the streamed value");
+        assert!(id_pos < v_pos, "@id must precede the streamed @v value");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&value);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[v_pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
+        );
+    }
+
+    /// After `begin_sp_executesql` parks the message, the streamed state must
+    /// retain the un-emitted parameters and the collation used to write their
+    /// TYPE_INFO. Analogue of the read side's pause-state-preserves-collation
+    /// test.
+    #[tokio::test]
+    async fn streamed_write_pause_state_preserves_pending_and_collation() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        let expected_collation = client.negotiated_settings.database_collation;
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(a, b, c) VALUES (@a, @b, @c)".to_string(),
+                vec![
+                    streamed_varbinary("@a"),
+                    streamed_varbinary("@b"),
+                    streamed_varbinary("@c"),
+                ],
+                (),
+            )
+            .await
+            .unwrap();
+
+        match &client.streamed_write_state {
+            StreamedWriteState::Active(ctx) => {
+                // @a is open for data; @b and @c remain pending, in order.
+                assert_eq!(ctx.pending.len(), 2);
+                assert_eq!(ctx.pending[0].name.as_deref(), Some("@b"));
+                assert_eq!(ctx.pending[1].name.as_deref(), Some("@c"));
+                assert_eq!(ctx.db_collation, expected_collation);
+            }
+            StreamedWriteState::Idle => panic!("streamed write should be Active after begin"),
+        }
+    }
+
+    /// A single chunk larger than the TDS packet payload is split across multiple
+    /// packets on the wire yet reassembles into one contiguous length-prefixed
+    /// value. Analogue of multi-packet incremental reads.
+    #[tokio::test]
+    async fn streamed_write_large_chunk_spans_multiple_packets() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .unwrap();
+
+        // Larger than the mock transport's 4096-byte packet so the value must
+        // span several TDS packets.
+        let big: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        client.write_streamed_chunk(&big).await.unwrap();
+        client.end_streamed_param().await.unwrap();
+
+        // The captured stream is more than one packet.
+        assert!(
+            sent.lock().unwrap().len() > 4096,
+            "a 10 KB value must produce multiple TDS packets"
+        );
+
+        let payload = reassemble_sent(&sent.lock().unwrap());
+        let pos = find_last(&payload, &PLP_UNKNOWN_LEN_BYTES).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(big.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&big);
+        expected.extend_from_slice(&PLP_TERMINATOR_BYTES);
+        assert_eq!(
+            &payload[pos + PLP_UNKNOWN_LEN_BYTES.len()..],
+            expected.as_slice()
         );
     }
 

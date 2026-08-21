@@ -328,7 +328,7 @@ mod tvp_tests {
                     SqlType::NVarchar(Some(SqlString::from_utf8_string("widget".to_string())), 50),
                     SqlType::BigInt(Some(9_000_000_000)),
                     SqlType::Bit(Some(true)),
-                    SqlType::Decimal(Some(amount.clone())),
+                    SqlType::Decimal(Some(amount)),
                     SqlType::DateTime2(Some(when.clone())),
                     SqlType::VarBinary(Some(data.clone()), 64),
                     SqlType::Uuid(Some(guid)),
@@ -462,7 +462,7 @@ mod tvp_tests {
                         SqlType::Bit(Some(true)),
                         SqlType::DateTime2(Some(dt2.clone())),
                         SqlType::Uuid(Some(guid1)),
-                        SqlType::Decimal(Some(dec.clone())),
+                        SqlType::Decimal(Some(dec)),
                         nvarchar("hello", 50),
                         SqlType::VarBinary(Some(vec![0x01, 0x02, 0x03]), 32),
                     ],
@@ -683,7 +683,7 @@ mod tvp_tests {
                         vec![
                             SqlType::Int(Some((i as i32) + 1)),
                             nvarchar(names[i], 50),
-                            SqlType::Decimal(Some(amounts[i].clone())),
+                            SqlType::Decimal(Some(amounts[i])),
                             SqlType::VarBinary(Some(blobs[i].clone()), 64),
                         ]
                     })
@@ -807,7 +807,7 @@ mod tvp_tests {
                     SqlType::Time(Some(time.clone())),
                     SqlType::DateTimeOffset(Some(dto.clone())),
                     SqlType::DateTime(Some(dt.clone())),
-                    SqlType::Numeric(Some(numeric.clone())),
+                    SqlType::Numeric(Some(numeric)),
                     SqlType::Varchar(Some(SqlString::from_utf8_string("hello".to_string())), 20),
                     SqlType::Char(Some(SqlString::from_utf8_string("world".to_string())), 5),
                 ]];
