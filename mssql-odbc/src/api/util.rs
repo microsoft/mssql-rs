@@ -78,12 +78,21 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
 /// [`read_utf16`] for entry points whose length argument is a `SQLINTEGER`
 /// rather than a `SQLSMALLINT`.
 ///
+/// A length of zero reads nothing, so the pointer is never dereferenced — an
+/// application is entitled to pair a zero length with a placeholder pointer,
+/// and msodbcsql accepts that combination. A null pointer is likewise treated
+/// as an empty value rather than faulting: this is an FFI boundary, and a
+/// driver that aborts takes its host process down with it.
+///
 /// # Safety
 /// - `ptr` must be readable for `length` `SQLWCHAR`s, or up to and including the
 ///   first NUL terminator when `length == SQL_NTS`.
 /// - `length` must be non-negative or exactly `SQL_NTS`; callers validate that
 ///   first and report `HY090` otherwise.
 pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
     let slice = if length == SqlInteger::from(SQL_NTS) {
         let mut len = 0usize;
         unsafe {
@@ -93,7 +102,10 @@ pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -
         }
         unsafe { slice::from_raw_parts(ptr, len) }
     } else {
-        unsafe { slice::from_raw_parts(ptr, usize::try_from(length).unwrap_or(0)) }
+        match usize::try_from(length) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(len) => unsafe { slice::from_raw_parts(ptr, len) },
+        }
     };
     String::from_utf16_lossy(slice)
 }
@@ -377,6 +389,42 @@ mod tests {
             unsafe { read_utf16_attr(buf.as_ptr(), SqlInteger::from(SQL_NTS)) },
             "master"
         );
+    }
+
+    /// A zero length reads nothing, so the pointer must never be dereferenced —
+    /// not even to form an empty slice, which still requires alignment and so
+    /// aborts the process under Rust's UB checks. msodbcsql accepts a
+    /// placeholder pointer with a zero length, and an ODBC driver that aborts
+    /// takes its host process down with it.
+    #[test]
+    fn zero_length_never_dereferences_the_pointer() {
+        let hostile = std::ptr::without_provenance::<SqlWChar>(1);
+        assert_eq!(unsafe { read_utf16_long(hostile, 0) }, "");
+        assert_eq!(unsafe { read_utf16_attr(hostile, 0) }, "");
+        // An odd byte count below one whole SQLWCHAR is also nothing to read.
+        assert_eq!(unsafe { read_utf16_attr(hostile, 1) }, "");
+    }
+
+    /// A null pointer is an empty value rather than a fault, for the same
+    /// reason.
+    #[test]
+    fn null_pointer_reads_as_empty() {
+        let null = std::ptr::null::<SqlWChar>();
+        assert_eq!(unsafe { read_utf16_long(null, 4) }, "");
+        assert_eq!(
+            unsafe { read_utf16_long(null, SqlInteger::from(SQL_NTS)) },
+            ""
+        );
+        assert_eq!(unsafe { read_utf16_attr(null, 8) }, "");
+    }
+
+    /// A negative length that is not `SQL_NTS` is a caller error the entry
+    /// points reject with `HY090`; the reader must not turn it into a huge
+    /// slice on the way there.
+    #[test]
+    fn negative_length_reads_as_empty() {
+        let buf: Vec<SqlWChar> = "master".encode_utf16().collect();
+        assert_eq!(unsafe { read_utf16_long(buf.as_ptr(), -7) }, "");
     }
 
     #[test]
