@@ -25,9 +25,9 @@ stages:
         displayName: 'Criterion Benchmark'
         timeoutInMinutes: 30
         pool:
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-1ES-UBUSLIM
+            - imageOverride -equals RUST-UBUSLIM
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
 
