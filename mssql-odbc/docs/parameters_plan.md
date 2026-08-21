@@ -69,14 +69,9 @@ transparent reconnects.
   never sees the placeholder. Version-aware, like msodbcsql's `Sql2CDefault`,
   which reads `rgbTRANSTYPE` for a 3.51-or-earlier application and
   `rgbTRANSTYPE380` otherwise: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET`
-  default to `SQL_C_BINARY` below ODBC 3.8. `BoundParam` also records that the
-  binding was defaulted, because a resolved C type alone loses information the
-  execute path still needs - `SQL_DECIMAL` resolves to `SQL_C_CHAR`, and a NULL
-  built from that would go out as a `varchar`. A defaulted binding therefore
-  skips the conversion matrix (the resolved pairing is the SQL type's own
-  default, so it is supported by construction) and builds NULLs from
-  `ParameterType`. `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
-  time, since they need a server type name no describe call reports.
+  default to `SQL_C_BINARY` below ODBC 3.8. `SQL_SS_UDT` and `SQL_SS_TABLE` are
+  still rejected at bind time, since they need a server type name no describe
+  call reports.
 - **Value conversion** - `SQL_C_CHAR` maps to varchar and `SQL_C_WCHAR` to
   nvarchar. Indicators support `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte
   length.
@@ -144,6 +139,15 @@ output parameters, data-at-exec, parameter arrays, and TVPs.
 - **The matrix lists only implemented pairs.** A pairing accepted at bind time is
   always one the execute path can convert, so there is no bind-succeeds /
   execute-fails window. Rows and entries are added as each phase lands.
+- **A defaulted binding is checked like an explicit one.** `SQL_C_DEFAULT` is
+  resolved to its concrete C type and then run through the same matrix, so an
+  application gets the same answer whether it named the C type or let the driver
+  pick it. The alternative - exempting defaulted bindings, on the grounds that
+  `resolve_default_c_type` returns a pairing that is legal by construction -
+  makes the two spellings of the same intent disagree:
+  `SQL_C_TYPE_TIMESTAMP` + `SQL_TYPE_TIMESTAMP` is rejected at bind while
+  `SQL_C_DEFAULT` + `SQL_TYPE_TIMESTAMP` is accepted.
+
 - **Legality is decided per direction, at different moments.** msodbcsql consults
   its shared `fValidConversion` table only where both types are known up front:
   `SQLBindParameter` (`sqlcdesc.cpp`), output-parameter retrieval
@@ -174,10 +178,10 @@ one task per phase.
 | --- | --- | --- | --- |
 | P0 | [47364](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47364) | Code complete | Extract shared conversion core from `fetch_convert.rs` |
 | P1 | [47365](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47365) | Code complete, unmerged | Parameter type model, conversion matrix, `SQL_C_DEFAULT` |
-| P2 | [47366](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47366) | Not started | Safe C-buffer reader and conversion-outcome channel |
-| P3 | [47367](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47367) | Not started | Quadrant A: integer C -> integer SQL |
+| P2 | [47366](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47366) | Code complete | Safe C-buffer reader |
+| P3 | [47367](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47367) | Code complete | Quadrant A: integer C -> integer SQL |
 | P4 | [47368](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47368) | Not started | Quadrant B: character C -> character SQL |
-| P5 | [47369](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47369) | Not started | Quadrants C and D: cross conversions |
+| P5 | [47369](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47369) | Not started | Quadrants C and D: cross conversions, and the warning channel |
 | P6 | [47370](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47370) | Not started | Parity and e2e hardening |
 | P7 | [47371](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47371) | Not started | Cleanup and follow-up hooks |
 
@@ -256,31 +260,51 @@ Deviations from msodbcsql, verified against source:
   that happen to resolve alike - revisit at P3/P4 if numeric matrix rows start
   duplicating them.
 
-#### P2 - Buffer reader and outcome channel (not started)
+#### P2 - Buffer reader (code complete)
 
-- `params/buffer.rs` as the single audited unsafe input site: `read_unaligned`
-  for fixed-width C integers, `SQL_NTS` / explicit length / `buffer_length` for
-  character buffers.
-- Fix indicator handling: for fixed-width C types `StrLen_or_Ind` is not a
-  length. Only `SQL_NULL_DATA`, `SQL_DEFAULT_PARAM`, and data-at-exec values are
-  meaningful; size comes from the C type (msodbcsql `IsFixedCType` /
-  `GetLengthForFixedLengthCType`). Current code treats the indicator as a length
-  for every type.
-- Produce an `AppValue` (`Null`, `Integer`, `Text`) for the milestone subset.
-- Thread a warning channel through `build_named_params` so `SQLExecute` and
-  `SQLExecDirect` can return `SQL_SUCCESS_WITH_INFO`; it returns only
-  `Result<Vec<RpcParameter>, SqlReturn>` today. Landing it here avoids a late
-  signature change in P5.
+Landed with P3, the phase that gives its integer path a producer and a consumer.
 
-#### P3 - Integer C to integer SQL (not started)
+[`conversion/param_buffer.rs`](../src/conversion/param_buffer.rs) is the single
+audited read of application buffers, private to `conversion`. It reads in two
+steps: `read_indicator` settles NULL and the special indicators before any value
+buffer is touched, then `read_param_value` returns an owned `AppValue`
+(`Integer`, `NarrowText`, `WideText`).
 
-- Identity fast path for exact pairs (msodbcsql `IsParamConversionNeeded`).
-- Cross-width narrowing through the shared numeric model, `22003` on overflow.
-- Emit `SqlType::TinyInt` / `SmallInt` / `Int` / `BigInt` driven by
-  `ParameterType`, not the C type, including typed NULL. This is the first phase
-  where `@P1` is declared `int` instead of `nvarchar(max)`.
-- `SQL_C_TINYINT` is unsigned, matching the documented fetch decision.
-- `SQL_C_UBIGINT` above `i64::MAX` has no SQL Server target: `22003`.
+Rules it fixes:
+
+- Fixed-width C buffers are read with `read_unaligned`; ODBC promises no
+  alignment.
+- `StrLen_or_Ind` is a length only for the variable-length C types (msodbcsql's
+  `IsFixedCType`); a fixed-width type takes its size from the C type.
+- A null indicator pointer means `SQL_NTS`, not NULL.
+- A non-NULL parameter with a null `ParameterValuePtr` is `HY009` - wider than
+  msodbcsql, which leaves the reachable case unguarded.
+- `AppValue::Integer` is `i128`, so `SQL_C_UBIGINT` above `i64::MAX` reaches the
+  narrowing check intact rather than as a negative.
+
+#### P3 - Integer C to integer SQL (code complete)
+
+- `conversion_matrix.rs` gains a row per integer C type reaching all four integer
+  SQL types. Width is not legality: a value that does not fit is a runtime
+  `22003`, not a rejected binding.
+- `param_convert::integer_value` picks the `SqlType` from `ParameterType`, not
+  the C type, typed NULL included - the first phase where `@P1` is declared `int`
+  rather than `nvarchar(max)`.
+- Narrowing goes through `numeric::narrow_i128`, so parameters and fetch share
+  one range check. Overflow is `22003`, including `SQL_C_UBIGINT` above
+  `i64::MAX`, which no SQL Server type can hold.
+- `SQL_C_TINYINT` is the 2.x spelling of the signed form, so it groups with
+  `SQL_C_STINYINT`; only `SQL_C_UTINYINT` is unsigned. The fetch direction was
+  corrected to match.
+- Value failures travel as `ParamBuildError::Value(ConvError)`, so both
+  directions map `OutOfRange` to the same `22003`.
+
+Deviation: no identity fast path. msodbcsql has `IsParamConversionNeeded` to skip
+a buffer-to-buffer copy when the types already agree; this driver always decodes
+to a canonical `i128`, so there is no copy to skip.
+
+Signedness, the `22003` state and its message text, and the unaligned reads are
+all verified against msodbcsql source.
 
 #### P4 - Character C to character SQL (not started)
 
@@ -296,6 +320,18 @@ Deviations from msodbcsql, verified against source:
   longer than `ColumnSize`.
 - Keep the documented UTF-8 `SQL_C_CHAR` divergence; do not add ANSI codepage
   translation.
+- Decide what invalid UTF-8 input means. Today `bound_param_to_value` runs it
+  through `from_utf8_lossy`, so malformed bytes reach the server as U+FFFD.
+  Under a UTF-8 contract that is data loss the application is never told about;
+  `22018` (`ERR_INVALID_CHARACTER_VALUE`, already defined) is the candidate.
+- Collapse the narrow-text copies. `SQL_C_CHAR` -> `varchar` currently costs five
+  copies: the buffer read, `String::from_utf8`, `SqlString::from_utf8_string`
+  transcoding UTF-8 -> UTF-16 at double the size, `ColumnValues::String(v.clone())`
+  in `to_column_value_and_context`, then `serialize_string` decoding UTF-16 back
+  to UTF-8 before encoding to the collation codepage. Tagging the bytes
+  `EncodingType::Utf8` instead removes two of them, but `sql_string.rs` carries an
+  unresolved TODO saying UTF-8 decode "is weirdly encoded" and that UTF-16 decode
+  "works better", so this needs e2e evidence rather than a drive-by change.
 
 #### P5 - Cross conversions (not started)
 
@@ -311,6 +347,11 @@ Deviations from msodbcsql, verified against source:
   assertions with `SKIP_IF_COMPARING_MSODBCSQL()`.
 - Add `Benefits-from-mock-tds:` notes where only the round-tripped value is
   observable and the declared RPC type is not.
+- Settle one open `HY009` question: msodbcsql treats a null data pointer with a
+  zero count as `SQL_NULL_DATA` on the `SQLPutData` path (`sqlccmd.cpp:4494`).
+  If that convention also holds for a bound buffer, `SQL_C_CHAR` with a null
+  pointer and `*ind == 0` is NULL there and `HY009` here. Not settleable from
+  the source; needs a `--compare-with-msodbcsql` run on that exact binding.
 
 #### P7 - Cleanup and hooks (not started)
 

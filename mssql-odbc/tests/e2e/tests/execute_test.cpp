@@ -200,17 +200,13 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeWideCharParam) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// SQL_C_DEFAULT + SQL_INTEGER resolves to SQL_C_SLONG. That pairing is the SQL
-// type's own ODBC-defined default, so the bind is accepted - as msodbcsql
-// accepts it - rather than being re-checked against the conversion matrix.
-// Rejecting it would break the describe-then-bind flow SQLDescribeParam callers
-// use. Converting a non-NULL integer buffer is still unimplemented (P3 in
-// docs/parameters_plan.md), so that gap now surfaces at execute as HYC00.
-// msodbcsql executes successfully, hence the skip; the skip goes away when P3
-// adds the conversion.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerBindsButCannotConvertValue) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-
+// An integer parameter bound with SQL_C_DEFAULT survives the round trip: the
+// driver picks a C type for it, sends the value, and the server returns it
+// unchanged. Which C type it picks is unit-tested, not observable here.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert @P1 is declared an
+// integer rather than nvarchar(max); SQL Server implicit-converts either way.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLINTEGER value = 42;
@@ -219,8 +215,66 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerBindsButCannotConvertValue) {
                                    SQL_INTEGER, 0, 0, &value, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("42", GetColumnChar(1));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// One SQL_C_SLONG buffer binds against every integer ParameterType, and each
+// one executes and returns the value intact. Which type reaches the wire is
+// unit-tested, not observable here.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the declared type
+// actually changes across the four binds; the round-tripped text is "7" for all
+// of them, and for the pre-P3 nvarchar(max) behaviour too.
+TEST_F(PrepareExecuteLiveTest, IntegerParamAcceptsEveryIntegerTargetType) {
+    const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
+    for (SQLSMALLINT sql_type : sql_types) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLINTEGER value = 7;
+        SQLLEN ind = 0;
+        SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                        sql_type, 0, 0, &value, 0, &ind);
+        ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("7", GetColumnChar(1)) << "ParameterType " << sql_type;
+
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// A value the target type cannot hold is a conversion error at execute, not a
+// silently wrapped wire value: 300 does not fit tinyint.
+TEST_F(PrepareExecuteLiveTest, IntegerParamOutOfRangeForTargetIs22003) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 300;
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                    SQL_TINYINT, 0, 0, &value, 0, &ind);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+}
+
+// Integer -> character is quadrant C, still unimplemented, so the bind is
+// rejected up front rather than failing at execute. msodbcsql supports the
+// pairing, hence the skip; it goes away with P5.
+TEST_F(PrepareExecuteLiveTest, IntegerToCharacterConversionIsRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    SQLINTEGER value = 42;
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                    SQL_VARCHAR, 0, 0, &value, 0, &ind);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
 }
 
 // SQL Server has no interval type, so a real-but-unsupported ParameterType is
@@ -237,47 +291,194 @@ TEST_F(PrepareExecuteLiveTest, IntervalSqlTypeIsRejectedWithHyc00) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
 
-// SQL_C_DEFAULT + SQL_GUID is likewise accepted at bind time. The drivers pick
-// different default C types (this one SQL_C_GUID per the ODBC 3.x table,
-// msodbcsql SQL_C_CHAR via rgbTRANSTYPE380), but neither rejects the bind, so
-// the AB#47365 deviation no longer shows up here. Converting a non-NULL GUID
-// buffer remains unimplemented, so execute fails with HYC00 while msodbcsql
-// succeeds - hence the skip.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidBindsButCannotConvertValue) {
+// A NULL takes its type from ParameterType, so an explicitly bound integer C
+// type must produce a typed NULL rather than being rejected. The value path and
+// the NULL path of the same binding have to agree.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the typed NULL carries
+// the ParameterType's TYPE_INFO; a fetched NULL looks the same whatever it was
+// declared as.
+TEST_F(PrepareExecuteLiveTest, ExplicitIntegerParamAcceptsNull) {
+    const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
+    for (SQLSMALLINT sql_type : sql_types) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLINTEGER value = 0;
+        SQLLEN ind = SQL_NULL_DATA;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                       sql_type, 0, 0, &value, 0, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN ind_out = 0;
+        GetColumnChar(1, &ind_out);
+        EXPECT_EQ(SQL_NULL_DATA, ind_out) << "ParameterType " << sql_type;
+
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// The same NULL against a defaulted binding. An application must get the same
+// answer whether it named the C type or let the driver pick it, so this and
+// ExplicitIntegerParamAcceptsNull have to stay in step.
+//
+// Benefits-from-mock-tds: as above - only a mock server can show the two
+// spellings produce the same declaration.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeIntegerParamAcceptsNull) {
+    const SQLSMALLINT sql_types[] = {SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT};
+    for (SQLSMALLINT sql_type : sql_types) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLINTEGER value = 0;
+        SQLLEN ind = SQL_NULL_DATA;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                                       sql_type, 0, 0, &value, 0, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN ind_out = 0;
+        GetColumnChar(1, &ind_out);
+        EXPECT_EQ(SQL_NULL_DATA, ind_out) << "ParameterType " << sql_type;
+
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// ODBC never promises an aligned application buffer, so the driver reads
+// parameter values unaligned. Binding from an odd offset is the only test that
+// would fault if that ever regressed to an aligned load.
+TEST_F(PrepareExecuteLiveTest, UnalignedIntegerParamBufferIsRead) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    alignas(8) unsigned char backing[16] = {0};
+    unsigned char* misaligned = backing + 1;
+    const SQLINTEGER value = 123456789;
+    std::memcpy(misaligned, &value, sizeof(value));
+
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 0, 0, misaligned, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("123456789", GetColumnChar(1));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQL_C_TINYINT is the ODBC 2.x spelling of the *signed* form, so 0xFF is -1.
+// Only SQL_C_UTINYINT reads it as 255. msodbcsql groups SQL_C_TINYINT with
+// SQL_C_STINYINT in ConvertToChar (sqlccnvt.cpp), so both drivers must agree.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the smallint payload
+// on the wire, rather than inferring it from the rendered text.
+TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsSignedButUtinyintIsNot) {
+    struct Case {
+        SQLSMALLINT c_type;
+        const char* expected;
+    };
+    const Case cases[] = {{SQL_C_TINYINT, "-1"},
+                          {SQL_C_STINYINT, "-1"},
+                          {SQL_C_UTINYINT, "255"}};
+    for (const Case& c : cases) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        unsigned char raw = 0xFF;
+        SQLLEN ind = 0;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c.c_type,
+                                       SQL_SMALLINT, 0, 0, &raw, 0, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(c.expected, GetColumnChar(1)) << "C type " << c.c_type;
+
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// SQL_C_UBIGINT is the one C type whose range exceeds every SQL Server integer
+// target, so a value above i64::MAX is 22003 rather than a wrapped negative.
+TEST_F(PrepareExecuteLiveTest, UbigintAboveBigintMaxIs22003) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLUBIGINT value = 9223372036854775808ULL;  // i64::MAX + 1
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_UBIGINT,
+                                   SQL_BIGINT, 0, 0, &value, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+}
+
+// For a fixed-width C type StrLen_or_Ind is not a length - the size comes from
+// the C type - so a stray value is ignored rather than validated. msodbcsql
+// consults the indicator only for non-fixed C types (`!IsFixedCType(...) &&
+// cbValue > 0`, sqlccmd.cpp:4128 and :4539) and likewise overrides BufferLength
+// for them at bind (sqlcdesc.cpp:2507).
+TEST_F(PrepareExecuteLiveTest, StrayIndicatorIsIgnoredForFixedWidthCTypes) {
+    // -7 is HY090 on a character binding and ignored here; 999 would overread a
+    // 4-byte buffer if it were ever honoured as a length.
+    for (SQLLEN stray : {static_cast<SQLLEN>(-7), static_cast<SQLLEN>(0),
+                         static_cast<SQLLEN>(999)}) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLINTEGER value = 42;
+        SQLLEN ind = stray;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                       SQL_INTEGER, 0, 0, &value, 0, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("42", GetColumnChar(1)) << "indicator " << stray;
+
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// SQLBindParameter: "If StrLen_or_IndPtr is a null pointer, the driver assumes
+// that all input parameter values are non-NULL and that character and binary
+// data is null-terminated." So this is SQL_NTS, not a NULL parameter.
+TEST_F(PrepareExecuteLiveTest, NullIndicatorPointerMeansNullTerminated) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> value = {'a', 'b', 'c', '\0'};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, value.size(), 0, value.data(),
+                                   static_cast<SQLLEN>(value.size()), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("abc", GetColumnChar(1));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A defaulted binding is checked against the conversion matrix like an explicit
+// one, so an application gets the same answer either way. SQL_GUID has no
+// conversion row yet, so the bind is rejected. msodbcsql accepts it (it resolves
+// to SQL_C_CHAR via rgbTRANSTYPE380 and can convert), hence the skip.
+//
+// Re-enable as a round-trip test when SQL_C_GUID -> SQL_GUID lands.
+TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidIsRejectedAtBind) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLGUID value = {};
     SQLLEN ind = 0;
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
-                                   SQL_GUID, 0, 0, &value, sizeof(value), &ind),
-                  SQL_HANDLE_STMT, stmt_);
-
-    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
-}
-
-// A NULL needs no buffer conversion at all, so a defaulted bind of a
-// non-character type round-trips end to end. This is the describe-then-bind
-// shape SQLDescribeParam callers use, and both drivers accept it.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeNullBindsAndExecutes) {
-    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
-
-    SQLGUID value = {};
-    SQLLEN ind = SQL_NULL_DATA;
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
-                                   SQL_GUID, 0, 0, &value, sizeof(value), &ind),
-                  SQL_HANDLE_STMT, stmt_);
-
-    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-
-    SQLLEN ind_out = 0;
-    GetColumnChar(1, &ind_out);
-    EXPECT_EQ(SQL_NULL_DATA, ind_out);
-
-    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR,
+              SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
+                               SQL_GUID, 0, 0, &value, sizeof(value), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
 }
 
 // A NULL-indicator parameter produces a SQL NULL result.
