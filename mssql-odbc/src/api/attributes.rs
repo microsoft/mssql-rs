@@ -178,7 +178,7 @@ static DBC_ATTRS: &[AttrRow] = &[
     (1249, "SQL_COPT_SS_TNIR", OP_SET | OP_GET),
     (1250, "SQL_COPT_SS_COLUMN_ENCRYPTION", OP_SET | OP_GET),
     (1251, "SQL_COPT_SS_CEKEYSTOREPROVIDER", OP_SET | OP_GET),
-    (1252, "SQL_COPT_SS_CEKEYSTOREDATA", OP_SET),
+    (1252, "SQL_COPT_SS_CEKEYSTOREDATA", OP_SET | OP_GET),
     (1253, "SQL_COPT_SS_TRUSTEDCMKPATHS", OP_SET | OP_GET),
     (1254, "SQL_COPT_SS_CEKCACHETTL", OP_SET | OP_GET),
     (1255, "SQL_COPT_SS_AUTHENTICATION", OP_SET | OP_GET),
@@ -403,6 +403,34 @@ mod tests {
         }
     }
 
+    /// Both halves of `SQL_COPT_SS_CEKEYSTOREDATA` are recognized. The sweep
+    /// could not measure this pair: the set probe faults msodbcsql, so the
+    /// process died before reaching the get probe and the id was first recorded
+    /// as set-only. Measured afterwards one id per process - set faults (which
+    /// is itself proof of recognition) and get answers `HY010`, "no keystore
+    /// provider selected". Neither is `HY092`, so both flags belong here and a
+    /// caller probing for Always Encrypted gets `HYC00` on both paths.
+    #[test]
+    fn keystore_data_is_recognized_for_both_operations() {
+        for op in OPS {
+            assert_eq!(
+                native_attr_name(AttrScope::Dbc, op, 1252),
+                Some("SQL_COPT_SS_CEKEYSTOREDATA"),
+                "1252 must be recognized for {op:?}"
+            );
+        }
+    }
+
+    /// The sibling crasher, for contrast: `SQL_ATTR_ENLIST_IN_DTC` faults the
+    /// same way on set but genuinely answers `HY092` on get, so its set-only
+    /// flag survived re-measurement. Guards against "flag every crasher for
+    /// both operations" as an over-correction.
+    #[test]
+    fn enlist_in_dtc_stays_set_only() {
+        assert!(native_attr_name(AttrScope::Dbc, AttrOp::Set, 1207).is_some());
+        assert_eq!(native_attr_name(AttrScope::Dbc, AttrOp::Get, 1207), None);
+    }
+
     /// Connection attributes on a statement, and vice versa, are `HY092` in
     /// msodbcsql. Measured, not assumed.
     #[test]
@@ -417,7 +445,6 @@ mod tests {
             // SQL_ATTR_ENLIST_IN_DTC is dbc-only despite the shared range.
             assert!(native_attr_name(AttrScope::Stmt, op, 1207).is_none());
         }
-        assert!(native_attr_name(AttrScope::Dbc, AttrOp::Set, 1207).is_some());
     }
 
     /// Environment attributes never reach the driver, so neither table claims

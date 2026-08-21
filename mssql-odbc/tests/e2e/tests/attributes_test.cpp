@@ -45,6 +45,7 @@
 //   29. UnimplementedStatementAttributeIsNotImplemented- HYC00, not HY092
 //   30. UnimplementedConnectionAttributeIsNotImplemented - HYC00 on the get path
 //   31. HostileAttributePayloadDoesNotFault            - HYC00, session survives
+//   32. KeystoreDataGetIsRecognizedNotUnknown          - recognized on both, never HY092
 
 #include "odbc_test_fixture.h"
 
@@ -92,9 +93,10 @@ constexpr SQLINTEGER kRowNumberAttr = 14;
 // needs a distinguishable answer to.
 constexpr SQLINTEGER kMarsEnabledAttr = 1224;
 
-// SQL_COPT_SS_CEKEYSTOREDATA - msodbcsql dereferences the pointer as a struct
-// without validating it, so a caller passing a plain buffer faults the process.
-// This driver must refuse it cleanly instead.
+// SQL_COPT_SS_CEKEYSTOREDATA - on the set path msodbcsql dereferences the
+// pointer as a struct without validating it, so a caller passing a plain buffer
+// faults the process. This driver must refuse it cleanly instead. The get path
+// is safe on both and answers HY010 there, so it is asserted on both drivers.
 constexpr SQLINTEGER kCekeystoreDataAttr = 1252;
 
 } // namespace
@@ -552,7 +554,9 @@ TEST_F(AttributesTest, PreConnectDefaultCatalogIsNotASentinel) {
 // `set_attr` without filtering, so the answer to "is this an attribute at all?"
 // is part of the contract. Variations 24-28 are pure parity: both drivers must
 // agree. Variations 29-31 assert behavior that is deliberately this driver's
-// own, because msodbcsql implements the attribute (or faults on it).
+// own, because msodbcsql implements the attribute (or faults on it). Variation
+// 32 runs on both but expects a different SQLSTATE from each, asserting only
+// the shared half of the contract: a recognized id is never HY092.
 // ===========================================================================
 
 // -------------------------------------------------------------------
@@ -671,5 +675,36 @@ TEST_F(AttributesTest, HostileAttributePayloadDoesNotFault) {
 
     // Still usable afterwards: a rejected attribute must not disturb the
     // session.
+    EXPECT_FALSE(DbName().empty());
+}
+
+// -------------------------------------------------------------------
+// Variation 32 - the get half of the same identifier. This one does run
+// on both drivers: msodbcsql only faults on the set path, and answers the
+// get with HY010 ("function sequence error" - no keystore provider has
+// been selected). The states differ, but the contract this table exists
+// to enforce is the one both must satisfy: 1252 is a real attribute, so
+// neither driver may claim it does not exist.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, KeystoreDataGetIsRecognizedNotUnknown) {
+    unsigned char out[64] = {};
+    SQLINTEGER written = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetConnectAttr(dbc_, kCekeystoreDataAttr, out,
+                                           sizeof(out), &written));
+
+    // The shared assertion: recognized, therefore not HY092.
+    const std::string state =
+        ODBCTestUtils::GetDiagState(SQL_HANDLE_DBC, dbc_);
+    EXPECT_NE("HY092", state);
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        // No keystore provider selected, so the sequence is wrong.
+        EXPECT_EQ("HY010", state);
+    } else {
+        // Always Encrypted is deferred, so the feature is what is missing.
+        EXPECT_EQ("HYC00", state);
+    }
+
     EXPECT_FALSE(DbName().empty());
 }

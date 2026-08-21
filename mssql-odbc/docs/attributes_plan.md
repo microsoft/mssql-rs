@@ -219,7 +219,11 @@ requirement.
   `SQL_COPT_SS_ENLIST_IN_DTC` (1207) and `SQL_COPT_SS_CEKEYSTOREDATA` (1252).
   They dereference the pointer as a struct with no validation. Routing
   unimplemented identifiers through a table lookup rather than a pointer read
-  is what makes this driver immune; Variation 30 pins that down.
+  is what makes this driver immune; Variation 31 pins that down.
+- **The fault hides the get side of those ids**, which had to be measured
+  separately (§8.1 step 5). The two are not alike: 1252 answers `HY010` on get,
+  so it is recognized for both operations, while 1207 answers `HY092` and is
+  genuinely set-only. Variation 32 asserts the 1252 get path on both drivers.
 
 **Deferred to the slice that implements each attribute:** the value-kind and
 phase columns (`int` / `pointer` / `wide string`; pre-connect / post-connect /
@@ -556,11 +560,19 @@ identifier list grows or a new msodbcsql version ships:
    sweep from a wrapper that restarts it at `index + 1` after a crash and logs
    which unit died; a fault *is* a measurement — it proves msodbcsql recognized
    the identifier in that scope and operation.
-5. **Classify.** Drop `phase == "pre_connect"` rows: the Driver Manager buffers
+5. **Re-probe what the fault skipped.** Restarting at `index + 1` resumes past
+   the *remaining operations for that same id*, so a crasher arrives with only
+   the op that killed it measured. Do not infer the others. Re-run each such id
+   one per process (`probe_get_crashers.py`) and append the rows to the CSV.
+   This is not hypothetical: `SQL_COPT_SS_CEKEYSTOREDATA` (1252) was first
+   recorded set-only, but its get path answers `HY010` — recognized — while
+   `SQL_ATTR_ENLIST_IN_DTC` (1207), which faults identically, really does
+   answer `HY092` on get. Same symptom, opposite conclusion.
+6. **Classify.** Drop `phase == "pre_connect"` rows: the Driver Manager buffers
    those and returns `SUCCESS` for anything, so they say nothing about the
    driver. Treat `HY092` as "not an attribute here" and everything else —
-   success, `HYC00`, `HY011`, `HY024`, a fault — as "recognized".
-6. **Emit and verify.** Generate the two tables sorted by id with the
+   success, `HYC00`, `HY010`, `HY011`, `HY024`, a fault — as "recognized".
+7. **Emit and verify.** Generate the two tables sorted by id with the
    `OP_SET` / `OP_GET` mask per row. `tables_are_sorted_unique_and_flagged`
    enforces the invariant the binary search depends on, so a bad generation
    fails the build rather than silently mis-answering.
