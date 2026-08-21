@@ -3365,7 +3365,7 @@ mod test {
             // but the formatter must not index past its buffer if one claims to.
             let parts = DecimalParts::new(false, 38, u8::MAX, u128::MAX);
             let mut buf = [0u8; DECIMAL_STR_LEN];
-            assert!(parts.format_into(&mut buf).len() <= DECIMAL_STR_LEN);
+            assert_eq!(parts.format_into(&mut buf).len(), DECIMAL_STR_LEN);
         }
 
         #[test]

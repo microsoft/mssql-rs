@@ -6,6 +6,7 @@ use mssql_tds::connection::bulk_copy::{
 };
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
@@ -788,10 +789,11 @@ impl PyCoreCursor {
             }
             ColumnValues::Numeric(n) | ColumnValues::Decimal(n) => {
                 // Convert DecimalParts to Python Decimal object
-                let decimal_str = n.to_string();
+                let mut decimal_buf = [0u8; DECIMAL_STR_LEN];
+                let decimal_str = n.format_into(&mut decimal_buf);
                 if let Ok(decimal_module) = PyModule::import(py, "decimal")
                     && let Ok(decimal_class) = decimal_module.getattr("Decimal")
-                    && let Ok(decimal_obj) = decimal_class.call1((decimal_str.as_str(),))
+                    && let Ok(decimal_obj) = decimal_class.call1((decimal_str,))
                 {
                     return decimal_obj.into_any();
                 }
