@@ -33,6 +33,8 @@
 //   20. SetCurrentCatalogRejectsOpenCursor - 24000
 //   21. SetCurrentCatalogKeepsTransaction  - @@TRANCOUNT survives the switch
 //   22. SetCurrentCatalogQuotesIdentifier  - injection attempt stays one name
+//   23. PreConnectDefaultCatalogIsNotASentinel - "(Default)" only means
+//                                            "no change" once connected
 
 #include "odbc_test_fixture.h"
 
@@ -452,4 +454,49 @@ TEST_F(AttributesTest, SetCurrentCatalogQuotesIdentifier) {
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY024");
 
     EXPECT_EQ(before, DbName());
+}
+
+// -------------------------------------------------------------------
+// Variation 23 - "(Default)" is only a sentinel once connected. Before
+// connect it is stored like any other name, so the login fails on it just
+// as it would on a database that does not exist. msodbcsql uses the string
+// only in its DSN-setup dialog (DEFAULT_STRING, sqlsrv.h:2065), never as a
+// pre-connect attribute value, and both drivers were measured to reject it.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, PreConnectDefaultCatalogIsNotASentinel) {
+    const auto& cfg = ODBCTestConfig::Instance();
+    if (cfg.Server().empty() || cfg.Driver().empty()) {
+        GTEST_SKIP() << "Needs an explicit server/driver to omit DATABASE";
+    }
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+
+    SqlTString sentinel = ODBCTestUtils::ToSqlTStr("(Default)");
+    EXPECT_TRUE(SQL_SUCCEEDED(SQLSetConnectAttr(
+        dbc, SQL_ATTR_CURRENT_CATALOG, sentinel.data(), SQL_NTS)));
+
+    // No DATABASE keyword: the connection string would otherwise outrank the
+    // attribute and hide what the sentinel does.
+    std::string cs = "DRIVER={" + cfg.Driver() + "};SERVER=" + cfg.Server() + ";";
+    if (!cfg.TrustCert().empty()) {
+        cs += "TrustServerCertificate=" + cfg.TrustCert() + ";";
+    }
+    cs += cfg.HasCredentials()
+              ? "UID=" + cfg.Uid() + ";PWD=" + cfg.Pwd() + ";"
+              : "Trusted_Connection=Yes;";
+
+    SqlTString conn = ODBCTestUtils::ToSqlTStr(cs);
+    SQLTCHAR out[1024] = {};
+    SQLSMALLINT out_len = 0;
+    SQLRETURN ret = SQLDriverConnect(dbc, nullptr, conn.data(), SQL_NTS, out,
+                                     1024, &out_len, SQL_DRIVER_NOPROMPT);
+
+    // The server refuses the login rather than silently falling back, so a
+    // caller that meant "use the login default" learns it did not happen.
+    EXPECT_FALSE(SQL_SUCCEEDED(ret));
+    if (SQL_SUCCEEDED(ret)) {
+        SQLDisconnect(dbc);
+    }
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 }
