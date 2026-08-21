@@ -10,6 +10,9 @@
 //   6. InvalidRecordNumberErrors   - RecNumber 0/negative -> SQL_ERROR / 07009
 //   7. RecordPastCountReturnsNoData - RecNumber > SQL_DESC_COUNT -> SQL_NO_DATA
 //   8. ReadsBackValueSetBySetDescField - GET after SET round-trips SQL_C_NUMERIC
+//   9. ImpRowDescRecordPastCountReturnsNoData - IRD RecNumber > SQL_DESC_COUNT
+//      -> SQL_NO_DATA, on a prepared statement (see the test for why prepare
+//      is required)
 
 #include "odbc_test_fixture.h"
 
@@ -109,10 +112,21 @@ TEST_F(GetDescFieldLiveTest, ReadsBackValueSetBySetDescField) {
 
 // IRD supports GET on the common record fields (via the same field-access
 // model as ARD/APD/IPD) even though every SET on it is rejected — see
-// set_desc_field_test.cpp's IrdRejectsFieldWrite. A freshly-connected
-// statement has not populated the IRD yet (no query has executed), so
-// record 1 does not exist.
+// set_desc_field_test.cpp's IrdRejectsFieldWrite. A statement has not
+// populated the IRD yet (no result-set columns known), so record 1 does
+// not exist.
+//
+// The statement must be prepared first: unixODBC's Driver Manager gates
+// SQLGetDescField on an IRD to statements past STATE_S1 ("allocated, not
+// yet prepared") and returns HY007 itself — never even reaching the
+// driver — for an unprepared statement's IRD. That is a Driver-Manager
+// -level, spec-mandated check (ODBC state transition tables), not
+// something the driver controls, so querying the IRD immediately after
+// SQLAllocHandle(STMT) does not reach this driver at all on Linux.
 TEST_F(GetDescFieldLiveTest, ImpRowDescRecordPastCountReturnsNoData) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
     SQLHDESC hdesc = ImpRowDesc();
     EXPECT_EQ(SQL_NO_DATA, SQLGetDescFieldW(hdesc, 1, SQL_DESC_TYPE, nullptr, 0, nullptr));
 }

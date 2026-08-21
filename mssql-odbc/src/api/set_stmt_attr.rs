@@ -284,12 +284,12 @@ fn sql_get_stmt_attr_w_safe(
     attribute: SqlInteger,
     value_ptr: SqlPointer,
 ) -> SqlReturn {
-    // unixODBC can ask for the implicit descriptor handles while it is still
-    // finishing SQLAllocHandle(STMT). That call path already holds the
-    // statement mutex inside the Driver Manager, so taking our own stmt lock
-    // here before answering SQL_ATTR_IMP_ROW_DESC / friends can deadlock on
-    // Linux. These four handles are immutable for the statement lifetime, so
-    // return them lock-free and keep the lock for the mutable statement attrs.
+    // The four implicit descriptor handles are set once in StmtHandle::new
+    // and never reassigned (SQLSetStmtAttrW treats SQL_ATTR_APP_ROW_DESC /
+    // APP_PARAM_DESC as a no-op, matching this driver's forward-only,
+    // implicit-descriptor-only design), so answering them doesn't need the
+    // statement mutex at all — return them directly and keep the lock scoped
+    // to the mutable statement attributes below.
     match attribute {
         SQL_ATTR_APP_ROW_DESC => unsafe {
             write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
