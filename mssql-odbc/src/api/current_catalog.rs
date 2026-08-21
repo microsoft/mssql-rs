@@ -128,6 +128,12 @@ fn decide(dbc: &DbcHandle, name: &str) -> Result<CatalogAction, SqlReturn> {
     };
 
     if state.connection_state != ConnectionState::Connected {
+        // No sentinel handling here on purpose. `(Default)` is a DSN-dialog
+        // placeholder in msodbcsql (`DEFAULT_STRING`, `sqlsrv.h:2065`, used by
+        // `sqlcdlg.cpp` and the DSN field table), not a runtime pre-connect
+        // sentinel: setting it before connect stores it literally and the login
+        // then fails exactly as any unknown database would. Measured against
+        // msodbcsql 18 — see `default_sentinel_is_stored_literally_before_connect`.
         state.current_catalog = Some(name.to_string());
         debug!(name, "{SET_OP}: stored for next connect");
         return Ok(CatalogAction::Done);
@@ -220,6 +226,11 @@ pub(super) unsafe fn get_current_catalog(
         error!("SQLGetConnectAttrW(SQL_ATTR_CURRENT_CATALOG): dbc mutex poisoned");
         return SQL_ERROR;
     };
+    // This path is dispatched ahead of the integer attributes and so misses the
+    // `free_errors` in `sql_get_connect_attr_w_safe`. Without it a truncation
+    // `01004` would land behind diagnostics from the previous DBC call, and
+    // `SQLGetDiagRec(1)` would report the stale one.
+    free_errors(&mut state);
 
     let live = state
         .client
@@ -252,12 +263,10 @@ pub(super) unsafe fn get_current_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::free_handle::sql_free_handle;
     use crate::api::get_connect_attr::sql_get_connect_attr_w;
-    use crate::api::odbc_types::{
-        SQL_ATTR_CURRENT_CATALOG, SQL_HANDLE_STMT, SqlHandle, SqlSmallInt,
-    };
+    use crate::api::odbc_types::{SQL_ATTR_CURRENT_CATALOG, SqlHandle, SqlSmallInt};
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
+    use crate::api::sqlstate::ERR_CONNECTION_BUSY;
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
@@ -497,7 +506,9 @@ mod tests {
         assert_eq!(sqlstate(h.dbc), "24000");
         // The stored value is untouched by the rejected set.
         assert_eq!(get_catalog(h.dbc, 64).1, "");
-        unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
+        // Clear `active_stmt` and let `TestHandles::drop` free the statement:
+        // freeing it here would leave the raw pointer in `extra_stmts` and free
+        // it twice.
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         dbc.inner.lock().unwrap().active_stmt = None;
     }
@@ -509,6 +520,45 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         h.mark_dbc_connected();
         assert_eq!(set_catalog(h.dbc, DEFAULT_CATALOG), SQL_SUCCESS);
+    }
+
+    #[test]
+    fn default_sentinel_is_stored_literally_before_connect() {
+        // The sentinel is only meaningful once connected. msodbcsql has no
+        // pre-connect special case — `(Default)` there is a DSN-dialog
+        // placeholder — so it is stored like any other name and the login
+        // fails on it, which is the divergence-free behavior. Measured against
+        // msodbcsql 18: pre-connect `(Default)` fails the connect identically
+        // to a nonexistent database name.
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(set_catalog(h.dbc, DEFAULT_CATALOG), SQL_SUCCESS);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().current_catalog.as_deref(),
+            Some(DEFAULT_CATALOG)
+        );
+        assert_eq!(get_catalog(h.dbc, 64).1, DEFAULT_CATALOG);
+    }
+
+    #[test]
+    fn get_clears_diagnostics_from_the_previous_call() {
+        // The catalog get is dispatched ahead of the integer attributes and so
+        // misses the `free_errors` in `sql_get_connect_attr_w_safe`. Without its
+        // own call, the truncation warning below would land behind this record.
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(set_catalog(h.dbc, "reporting"), SQL_SUCCESS);
+        {
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut state = dbc.inner.lock().unwrap();
+            post_diag(&mut state, ERR_CONNECTION_BUSY);
+            assert_eq!(state.diag_records.len(), 1);
+        }
+
+        // Four bytes of room for a nine-character name: truncates.
+        let (ret, _, _) = get_catalog(h.dbc, 4);
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(sqlstate(h.dbc), "01004");
     }
 
     #[test]

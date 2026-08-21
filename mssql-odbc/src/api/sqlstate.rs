@@ -78,6 +78,10 @@ pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
     state: SQLSTATE_HY000,
     text: "Connection is busy with results for another command",
 };
+pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "A statement on this connection is unusable and did not receive the attribute",
+};
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
@@ -240,27 +244,36 @@ pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
 /// the failed `USE` produced with `IDS_HY_024` (`sqlcmisc.cpp:1873-1875`), so a
 /// missing database surfaces as `HY024` + native 911 rather than the `08004`
 /// the error-number map would otherwise give.
+///
+/// The override applies **only** to errors the engine raised. A transport or
+/// protocol failure is not the server rejecting the value, so labelling a
+/// dropped connection mid-`USE` as `HY024` would send the caller hunting for a
+/// bad catalog name. Those take `HY000`, the general error state every other
+/// execution path ([`exec_common`](super::exec_common), [`fetch`](super::fetch))
+/// already uses for a failure that is not the engine's.
 pub(crate) fn post_tds_error_as(
     state: &mut impl HasDiagnostics,
     err: &TdsError,
     forced_state: [u8; 5],
 ) {
-    if let TdsError::SqlServerError { diagnostics } = err
-        && !diagnostics.errors.is_empty()
-    {
-        for e in &diagnostics.errors {
-            let native = i32::try_from(e.number).unwrap_or(i32::MAX);
-            post_sql_error(
-                state,
-                forced_state,
-                native,
-                format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
-            );
-        }
-        post_tds_info_messages(state, &diagnostics.info_messages);
+    let TdsError::SqlServerError { diagnostics } = err else {
+        post_tds_error(state, err, SQLSTATE_HY000);
+        return;
+    };
+    if diagnostics.errors.is_empty() {
+        post_tds_error(state, err, SQLSTATE_HY000);
         return;
     }
-    post_sql_error(state, forced_state, 0, err.to_string());
+    for e in &diagnostics.errors {
+        let native = i32::try_from(e.number).unwrap_or(i32::MAX);
+        post_sql_error(
+            state,
+            forced_state,
+            native,
+            format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
+        );
+    }
+    post_tds_info_messages(state, &diagnostics.info_messages);
 }
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
@@ -731,22 +744,26 @@ mod tests {
     }
 
     #[test]
-    fn post_tds_error_as_falls_back_for_non_server_errors() {
+    fn post_tds_error_as_does_not_force_the_state_on_a_transport_failure() {
+        // A dropped connection mid-`USE` is not the engine rejecting the
+        // catalog name, so it must not inherit HY024 — a caller would go
+        // hunting for a bad database name that was never the problem.
         let records = post_as_on_dbc(
             &TdsError::ProtocolError("bad packet".into()),
             SQLSTATE_HY024,
         );
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(records[0].native_error, 0);
         assert!(records[0].message.contains("bad packet"));
     }
 
     #[test]
     fn post_tds_error_as_falls_back_when_the_error_list_is_empty() {
+        // No engine error to force the state onto, so the general default wins.
         let records = post_as_on_dbc(&TdsError::from_sql_errors(vec![]), SQLSTATE_HY024);
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(records[0].native_error, 0);
     }
 
