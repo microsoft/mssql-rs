@@ -556,7 +556,7 @@ fn hinted_string(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
     Ok(match hint.sql_type {
         InputSqlType::Char => SqlType::Char(value, checked_length(size, 8_000, "CHAR")?),
         InputSqlType::VarChar => sized_varchar(value, size),
-        InputSqlType::LongVarChar => SqlType::Text(value),
+        InputSqlType::LongVarChar => SqlType::VarcharMax(value),
         InputSqlType::WChar => SqlType::NChar(value, checked_length(size, 4_000, "NCHAR")?),
         InputSqlType::WVarChar => sized_nvarchar(value, size),
         InputSqlType::WLongVarChar => SqlType::NText(value),

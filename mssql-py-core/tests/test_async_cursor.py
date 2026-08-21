@@ -367,6 +367,23 @@ def test_setinputsizes_survives_asynchronous_execution_failure(client_context):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("use_prepare", [True, False])
+def test_setinputsizes_longvarchar_uses_varchar_max(client_context, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            statement = "DECLARE @length int = LEN(?)"
+            for value in ("value", None):
+                cursor.setinputsizes([(-1, 0, 0)])  # SQL_LONGVARCHAR
+                await cursor.execute(statement, value, use_prepare=use_prepare)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
 @pytest.mark.parametrize(
     ("value", "expected_type"),
     [
