@@ -1055,7 +1055,7 @@ fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
         ColumnValues::Real(x) => Ok(x.to_string()),
         ColumnValues::Float(x) => Ok(x.to_string()),
         ColumnValues::Bit(x) => Ok(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Ok(d.to_string()),
+        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Ok(d.to_decimal_string()),
         ColumnValues::Money(m) => Ok(money_scaled_to_string(money_scaled(m.lsb_part, m.msb_part))),
         ColumnValues::SmallMoney(m) => Ok(money_scaled_to_string(i64::from(m.int_val))),
         // `SqlString::to_utf8_string` unwraps on its UTF-8 branch; decode fallibly.

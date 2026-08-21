@@ -420,7 +420,7 @@ mod rpc_results {
         let insert_params = vec![
             make_param("@nvc", SqlType::NVarchar(Some(nvc_val.clone()), 50)),
             make_param("@nvm", SqlType::NVarcharMax(Some(nvm_val.clone()))),
-            make_param("@amt", SqlType::Decimal(Some(amt_val.clone()))),
+            make_param("@amt", SqlType::Decimal(Some(amt_val))),
             make_param("@dt2", SqlType::DateTime2(Some(dt2_val.clone()))),
             make_param("@t", SqlType::Time(Some(t_val.clone()))),
             make_param("@uid", SqlType::Uuid(Some(uid_val))),
@@ -447,7 +447,7 @@ mod rpc_results {
         let cases: Vec<(&str, &str, SqlType)> = vec![
             ("nvc", "@nvc", SqlType::NVarchar(Some(nvc_val.clone()), 50)),
             ("nvm", "@nvm", SqlType::NVarcharMax(Some(nvm_val.clone()))),
-            ("amt", "@amt", SqlType::Decimal(Some(amt_val.clone()))),
+            ("amt", "@amt", SqlType::Decimal(Some(amt_val))),
             ("dt2", "@dt2", SqlType::DateTime2(Some(dt2_val.clone()))),
             ("t", "@t", SqlType::Time(Some(t_val.clone()))),
             ("uid", "@uid", SqlType::Uuid(Some(uid_val))),

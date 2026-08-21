@@ -67,20 +67,31 @@ impl RecoveryContext {
 
     /// Initialize recovery context with connection-time settings.
     /// Called after a successful login to capture the original connection parameters
-    /// needed for reconnection validation and orchestration.
+    /// needed for reconnection validation and orchestration, and to seed the
+    /// baseline session state a reconnect's LOGIN7 must replay.
     pub fn initialize(
         &mut self,
         client_context: ClientContext,
-        tds_version: Option<TdsVersion>,
-        server_version: Option<Version>,
-        encryption_level: NegotiatedEncryptionSetting,
-        mars_enabled: bool,
+        negotiated_settings: &crate::handler::handler_factory::NegotiatedSettings,
+        login_session_state_tokens: &[SessionStateToken],
     ) {
         self.client_context = Some(Box::new(client_context));
-        self.original_tds_version = tds_version;
-        self.original_server_version = server_version;
-        self.original_encryption_level = Some(encryption_level);
-        self.original_mars_enabled = mars_enabled;
+        self.original_tds_version = negotiated_settings.login_ack_tds_version;
+        self.original_server_version = negotiated_settings.login_ack_server_version;
+        self.original_encryption_level = Some(
+            negotiated_settings
+                .session_settings
+                .negotiated_encryption_settings,
+        );
+        self.original_mars_enabled = negotiated_settings.session_settings.mars_enabled;
+        self.session_recovery_negotiated = negotiated_settings.is_session_recovery_acknowledged();
+        self.session_state_table.seed_initial_state(
+            negotiated_settings.database.clone(),
+            negotiated_settings.language.clone(),
+            negotiated_settings.database_collation,
+            login_session_state_tokens,
+            negotiated_settings.session_recovery_initial_state(),
+        );
     }
 
     /// Check whether session recovery can be attempted.
@@ -220,8 +231,6 @@ pub(crate) struct SessionStateTable {
     pub initial_language: String,
     /// Collation at connection time.
     pub initial_collation: SqlCollation,
-    /// Count of state entries currently marked as non-recoverable.
-    unrecoverable_state_count: u32,
     /// When true, the server has globally disabled recovery for this session
     /// (signaled by `sequence_number == u32::MAX` in a SESSIONSTATE token).
     pub master_recovery_disabled: bool,
@@ -237,11 +246,16 @@ impl Default for SessionStateTable {
             initial_database: String::new(),
             initial_language: String::new(),
             initial_collation: SqlCollation::default(),
-            unrecoverable_state_count: 0,
             master_recovery_disabled: false,
         }
     }
 }
+
+/// A parsed FEATUREEXTACK entry: `(state_id, value)`.
+type FeatureAckEntry = (u8, Vec<u8>);
+
+/// Where parsing a truncated FEATUREEXTACK payload failed: `(entry_offset, state_id)`.
+type FeatureAckParseError = (usize, u8);
 
 impl SessionStateTable {
     pub fn new() -> Self {
@@ -250,39 +264,145 @@ impl SessionStateTable {
 
     /// Update a session state entry from a SESSIONSTATE token.
     ///
-    /// Follows the JDBC `updateSessionState` pattern:
-    /// - First time a state_id is seen: store data, increment unrecoverable
-    ///   count if the state is not recoverable.
-    /// - Subsequent updates: only adjust unrecoverable count on a recoverable
-    ///   ↔ unrecoverable transition.
+    /// Recoverability is evaluated on demand by [`is_session_recoverable`], so
+    /// this only stores the latest record for the state id.
     pub fn update_state(&mut self, state_id: u8, sequence: u32, recoverable: bool, data: Vec<u8>) {
-        let idx = state_id as usize;
-
-        match &self.delta[idx] {
-            None => {
-                // First time seeing this state_id.
-                if !recoverable {
-                    self.unrecoverable_state_count += 1;
-                }
-            }
-            Some(existing) => {
-                // Subsequent update — adjust count only on transition.
-                if recoverable != existing.recoverable {
-                    if recoverable {
-                        self.unrecoverable_state_count =
-                            self.unrecoverable_state_count.saturating_sub(1);
-                    } else {
-                        self.unrecoverable_state_count += 1;
-                    }
-                }
-            }
-        }
-
-        self.delta[idx] = Some(SessionStateRecord {
+        self.delta[state_id as usize] = Some(SessionStateRecord {
             recoverable,
             sequence,
             data,
         });
+    }
+
+    /// Seed the baseline snapshot captured at login.
+    ///
+    /// Called once, right after a successful login, with the database/language/
+    /// collation negotiated at connect time and any SESSIONSTATE tokens the
+    /// server sent during login. Without this, `initial_*` stays empty and a
+    /// reconnect's LOGIN7 session-recovery block goes out blank, which servers
+    /// reject.
+    pub fn seed_initial_state(
+        &mut self,
+        database: String,
+        language: String,
+        collation: SqlCollation,
+        tokens: &[SessionStateToken],
+        feature_ack_initial_state: Option<&[u8]>,
+    ) {
+        self.initial_database = database;
+        self.initial_language = language;
+        self.initial_collation = collation;
+
+        // The FEATUREEXTACK payload is the recoverable baseline (initial state),
+        // applied before any SESSIONSTATE token so a same-id token (a
+        // post-baseline update) lands in the delta rather than being clobbered.
+        // Without it the reconnect LOGIN7 goes out incomplete and the server
+        // rejects it as semantically invalid (error 17897, state 81).
+        if let Some(data) = feature_ack_initial_state {
+            self.seed_initial_state_from_feature_ack(data);
+        }
+
+        // SESSIONSTATE tokens observed during login are post-baseline updates,
+        // so they belong in the delta — identical to tokens seen mid-session.
+        for token in tokens {
+            if token.sequence_number == u32::MAX {
+                self.master_recovery_disabled = true;
+                continue;
+            }
+            for entry in &token.states {
+                self.update_state(
+                    entry.state_id,
+                    token.sequence_number,
+                    entry.recoverable,
+                    entry.data.clone(),
+                );
+            }
+        }
+    }
+
+    /// Parse the packed FEATUREEXTACK session-recovery payload into
+    /// `(state_id, value)` entries. Entry format matches the reconnect wire
+    /// format: StateId (1 byte), Length (1 byte, or `0xFF` followed by a u32),
+    /// Value. Side-effect-free: returns `Err((entry_offset, state_id))` on a
+    /// truncated payload so the caller can disable recovery and log where the
+    /// parse ran off the end.
+    fn parse_feature_ack(data: &[u8]) -> Result<Vec<FeatureAckEntry>, FeatureAckParseError> {
+        let mut entries = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            let entry_start = i;
+            let state_id = data[i];
+            i += 1;
+
+            let Some(&len_byte) = data.get(i) else {
+                return Err((entry_start, state_id));
+            };
+            i += 1;
+
+            let len = if len_byte == 0xFF {
+                let Some(bytes) = i.checked_add(4).and_then(|end| data.get(i..end)) else {
+                    return Err((entry_start, state_id));
+                };
+                i += 4;
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+            } else {
+                len_byte as usize
+            };
+
+            let Some(value) = i.checked_add(len).and_then(|end| data.get(i..end)) else {
+                return Err((entry_start, state_id));
+            };
+            i += len;
+            entries.push((state_id, value.to_vec()));
+        }
+        Ok(entries)
+    }
+
+    /// Seed the login baseline (`initial_state`) from the FEATUREEXTACK payload.
+    fn seed_initial_state_from_feature_ack(&mut self, data: &[u8]) {
+        match Self::parse_feature_ack(data) {
+            Ok(entries) => {
+                for (state_id, value) in entries {
+                    self.initial_state[state_id as usize] = Some(SessionStateRecord {
+                        recoverable: true,
+                        sequence: 0,
+                        data: value,
+                    });
+                }
+            }
+            Err((offset, state_id)) => self.abort_partial_baseline(offset, state_id),
+        }
+    }
+
+    /// Apply a recovery-login FEATUREEXTACK payload to the current (`delta`)
+    /// state, mirroring msodbcsql's `ReadUpdatedSessionState(true, 0, ...)`.
+    /// Sequence number 0 marks a feature-ack replace, so the current table is
+    /// reset and repopulated from the payload rather than merged. The login
+    /// baseline is untouched; both blocks serialize on the next reconnect.
+    pub(crate) fn apply_feature_ack_to_delta(&mut self, data: &[u8]) {
+        self.delta = std::array::from_fn(|_| None);
+        match Self::parse_feature_ack(data) {
+            Ok(entries) => {
+                for (state_id, value) in entries {
+                    self.update_state(state_id, 0, true, value);
+                }
+            }
+            Err((offset, state_id)) => self.abort_partial_baseline(offset, state_id),
+        }
+    }
+
+    /// A truncated or malformed FEATUREEXTACK payload means the baseline cannot
+    /// be fully reconstructed. Disable recovery so the next reconnect fails fast
+    /// with a driver error instead of sending a partial baseline the server
+    /// rejects opaquely (error 17897, state 81). `offset` is the start of the
+    /// offending entry, correlating the warning with a wire capture.
+    fn abort_partial_baseline(&mut self, offset: usize, state_id: u8) {
+        tracing::warn!(
+            offset,
+            state_id,
+            "Malformed session-recovery FEATUREEXTACK payload; disabling recovery"
+        );
+        self.master_recovery_disabled = true;
     }
 
     /// Returns `true` if the session can be recovered after a disconnect.
@@ -291,7 +411,13 @@ impl SessionStateTable {
     /// any state entry is marked non-recoverable (e.g., open cursors, certain
     /// temp tables, specific SET options).
     pub fn is_session_recoverable(&self) -> bool {
-        !self.master_recovery_disabled && self.unrecoverable_state_count == 0
+        !self.master_recovery_disabled
+            && !self
+                .initial_state
+                .iter()
+                .chain(self.delta.iter())
+                .flatten()
+                .any(|record| !record.recoverable)
     }
 
     /// Clear accumulated delta state. Called on ENVCHANGE sub-type 18
@@ -299,7 +425,6 @@ impl SessionStateTable {
     /// (ODBC, JDBC, SqlClient) reset state on this event.
     pub fn reset(&mut self) {
         self.delta = std::array::from_fn(|_| None);
-        self.unrecoverable_state_count = 0;
         // master_recovery_disabled is NOT cleared — it persists across resets.
         // initial_state is NOT cleared — it represents the baseline snapshot.
     }
@@ -538,6 +663,158 @@ mod tests {
     }
 
     #[test]
+    fn seed_from_feature_ack_parses_server_baseline() {
+        // The 8-entry baseline the server sent in the SESSIONRECOVERY
+        // FEATUREEXTACK at login (captured from the wire). Dropping any of
+        // these makes the reconnect LOGIN7 fail with error 17897, state 81.
+        let ack = vec![
+            0x00, 0x09, 0x00, 0x60, 0x81, 0x14, 0xFF, 0xE7, 0xFF, 0xFF, 0x00, // id 0, len 9
+            0x02, 0x02, 0x07, 0x01, // id 2, len 2
+            0x04, 0x01, 0x00, // id 4, len 1
+            0x05, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, // id 5, len 4
+            0x06, 0x01, 0x00, // id 6, len 1
+            0x07, 0x01, 0x02, // id 7, len 1
+            0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // id 8, len 8
+            0x09, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, // id 9, len 4
+        ];
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state_from_feature_ack(&ack);
+
+        for (id, expected) in [
+            (
+                0usize,
+                vec![0x00, 0x60, 0x81, 0x14, 0xFF, 0xE7, 0xFF, 0xFF, 0x00],
+            ),
+            (2, vec![0x07, 0x01]),
+            (4, vec![0x00]),
+            (5, vec![0xFF, 0xFF, 0xFF, 0xFF]),
+            (6, vec![0x00]),
+            (7, vec![0x02]),
+            (8, vec![0x00; 8]),
+            (9, vec![0xFF, 0xFF, 0xFF, 0xFF]),
+        ] {
+            let record = table.initial_state[id]
+                .as_ref()
+                .unwrap_or_else(|| panic!("state {id} missing"));
+            assert_eq!(record.data, expected);
+            assert!(record.recoverable);
+            assert_eq!(record.sequence, 0);
+        }
+        // Gaps stay empty and the session remains recoverable.
+        assert!(table.initial_state[1].is_none());
+        assert!(table.initial_state[3].is_none());
+        assert!(table.is_session_recoverable());
+    }
+
+    #[test]
+    fn seed_from_feature_ack_extended_length() {
+        // Values >= 0xFF use the 0xFF marker followed by a u32 length.
+        let mut ack = vec![10u8, 0xFF];
+        ack.extend_from_slice(&300u32.to_le_bytes());
+        ack.extend_from_slice(&[0xAB; 300]);
+
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state_from_feature_ack(&ack);
+
+        let record = table.initial_state[10].as_ref().unwrap();
+        assert_eq!(record.data.len(), 300);
+        assert!(record.data.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn seed_from_feature_ack_truncated_disables_recovery() {
+        // A complete entry followed by one whose declared length runs past the
+        // buffer: the parse aborts all-or-nothing (no entries applied) and
+        // recovery is disabled so the next reconnect fails fast rather than
+        // sending a partial baseline.
+        let ack = vec![3, 1, 0xAA, 5, 10, 0x01];
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state_from_feature_ack(&ack);
+
+        assert!(table.initial_state[3].is_none());
+        assert!(table.initial_state[5].is_none());
+        assert!(table.master_recovery_disabled);
+        assert!(!table.is_session_recoverable());
+    }
+
+    #[test]
+    fn apply_feature_ack_to_delta_resets_then_reloads() {
+        // seq 0 (feature ack) replaces the current table: a stale delta entry is
+        // cleared and only the payload's entries remain; the login baseline is
+        // untouched (msodbcsql ReadUpdatedSessionState parity).
+        let ack = vec![7, 2, 0x01, 0x02];
+        let mut table = SessionStateTable::new();
+        table.update_state(3, 5, true, vec![0xAA]);
+        table.apply_feature_ack_to_delta(&ack);
+
+        assert!(table.delta[3].is_none());
+        assert!(table.initial_state[7].is_none());
+        let record = table.delta[7].as_ref().unwrap();
+        assert_eq!(record.data, vec![0x01, 0x02]);
+        assert!(record.recoverable);
+        assert_eq!(record.sequence, 0);
+    }
+
+    #[test]
+    fn seed_initial_state_forwards_feature_ack() {
+        let ack = vec![7, 2, 0x01, 0x02];
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state(
+            "master".to_string(),
+            "us_english".to_string(),
+            SqlCollation::default(),
+            &[],
+            Some(&ack),
+        );
+
+        assert_eq!(table.initial_database, "master");
+        assert_eq!(
+            table.initial_state[7].as_ref().unwrap().data,
+            vec![0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn seed_initial_state_from_tokens_tracks_recoverability() {
+        use crate::token::tokens::SessionStateEntry;
+
+        // A non-recoverable login-time SESSIONSTATE entry blocks recovery.
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state(
+            "master".to_string(),
+            "us_english".to_string(),
+            SqlCollation::default(),
+            &[SessionStateToken {
+                sequence_number: 1,
+                status: 0,
+                states: vec![SessionStateEntry {
+                    state_id: 2,
+                    recoverable: false,
+                    data: vec![0x01],
+                }],
+            }],
+            None,
+        );
+        assert!(!table.is_session_recoverable());
+
+        // sequence_number == u32::MAX globally disables recovery.
+        let mut table = SessionStateTable::new();
+        table.seed_initial_state(
+            String::new(),
+            String::new(),
+            SqlCollation::default(),
+            &[SessionStateToken {
+                sequence_number: u32::MAX,
+                status: 0,
+                states: vec![],
+            }],
+            None,
+        );
+        assert!(table.master_recovery_disabled);
+        assert!(!table.is_session_recoverable());
+    }
+
+    #[test]
     fn reset_preserves_master_recovery_disabled() {
         let mut table = SessionStateTable::new();
         table.master_recovery_disabled = true;
@@ -697,18 +974,28 @@ mod tests {
     // ── Recovery eligibility tests ──
 
     fn make_initialized_context() -> RecoveryContext {
+        use crate::message::features::session_recovery::SessionRecoveryFeature;
+        use crate::message::login::Feature;
+
         let mut ctx = RecoveryContext::new();
         let client_ctx = crate::connection::client_context::ClientContext::with_data_source(
             "tcp:localhost,1433",
         );
-        ctx.initialize(
-            client_ctx,
-            Some(TdsVersion::V7_4),
-            Some(Version::new(16, 0, 1000, 0)),
-            NegotiatedEncryptionSetting::Mandatory,
-            false,
-        );
-        ctx.session_recovery_negotiated = true;
+
+        let mut settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        settings.login_ack_tds_version = Some(TdsVersion::V7_4);
+        settings.login_ack_server_version = Some(Version::new(16, 0, 1000, 0));
+        settings.session_settings.negotiated_encryption_settings =
+            NegotiatedEncryptionSetting::Mandatory;
+        let mut feature = SessionRecoveryFeature::new(1);
+        feature.set_acknowledged(true);
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+
+        ctx.initialize(client_ctx, &settings, &[]);
         ctx
     }
 

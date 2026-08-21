@@ -99,29 +99,27 @@ fn numeric_source(value: &ColumnValues) -> Result<NumericSource, ConvError> {
         ColumnValues::Bit(b) => Ok(NumericSource::Int(i128::from(*b))),
         ColumnValues::Real(x) => Ok(NumericSource::Float(f64::from(*x))),
         ColumnValues::Float(x) => Ok(NumericSource::Float(*x)),
-        // `DecimalParts` stores a base-2^32 little-endian magnitude. A legal
-        // 38-digit value fits in 4 words and in `i128`, so it keeps its exact
-        // scaled form. A non-conforming server can still send 4 words above
-        // `i128::MAX`; that has no exact form here but is a real number, so it
-        // degrades to the `f64` reading rather than an error. Only a magnitude
-        // wider than 4 words has no reading at all.
+        // `DecimalParts` stores a 128-bit magnitude. A legal 38-digit value fits
+        // in `i128`, so it keeps its exact scaled form. A non-conforming server
+        // can still send a magnitude above `i128::MAX`; that has no exact form
+        // here but is a real number, so it degrades to the `f64` reading rather
+        // than an error.
         //
         // Matches msodbcsql: `sqlccnvt.cpp` `ConvertToFixed` returns `CVT_PREC`
         // (`IDS_22_003`) for an out-of-range numeric and reserves `CVT_ILLEGAL`
         // (`IDS_07_006`) for a source with no numeric reading, and
         // `ConvertToFloat` accumulates all four words into a double. Four words
-        // is also all `SQL_NUMERIC_STRUCT` can hold, so a wider magnitude has no
-        // msodbcsql counterpart to diverge from.
+        // is also all `SQL_NUMERIC_STRUCT` can hold, and is exactly what the
+        // magnitude is, so there is no wider case to diverge on.
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
-            let mag = d.magnitude().ok_or(ConvError::OutOfRange)?;
             let scale = u32::from(d.scale);
-            Ok(match i128::try_from(mag) {
+            Ok(match i128::try_from(d.magnitude()) {
                 Ok(m) => NumericSource::Scaled {
                     mantissa: if d.is_positive { m } else { -m },
                     scale,
                 },
                 Err(_) => {
-                    let v = mag as f64 / 10f64.powi(scale as i32);
+                    let v = d.magnitude() as f64 / 10f64.powi(scale as i32);
                     NumericSource::Float(if d.is_positive { v } else { -v })
                 }
             })
@@ -1278,21 +1276,17 @@ mod tests {
         }
     }
 
-    /// The limbs are reassembled directly, and a payload with more limbs than
-    /// 128 bits can hold is refused instead of shifting past the width. The wire
-    /// decoder now caps the count at 4, so the oversized case below is reachable
-    /// only through FFI or a hand-built `DecimalParts`.
+    /// The little-endian limbs `DecimalParts` is built from must be reassembled
+    /// into the same magnitude the wire carried, including a low limb that is
+    /// negative as `i32`.
     #[test]
     fn decimal_limbs_are_reassembled_and_bounded() {
         use mssql_tds::datatypes::decoder::DecimalParts;
 
-        let decimal = |is_positive, scale, int_parts: Vec<i32>| {
-            ColumnValues::Decimal(DecimalParts {
-                is_positive,
-                scale,
-                precision: 38,
-                int_parts,
-            })
+        let decimal = |is_positive, scale, words: &[i32]| {
+            ColumnValues::Decimal(
+                DecimalParts::try_from_words(is_positive, 38, scale, words).unwrap(),
+            )
         };
 
         let mut out: i32 = 0;
@@ -1300,7 +1294,7 @@ mod tests {
         // 12345 scaled by 10^2 is 123.45, which truncates to 123.
         let ok = unsafe {
             convert_integer_c(
-                &decimal(true, 2, vec![12345]),
+                &decimal(true, 2, &[12345]),
                 SQL_C_SLONG,
                 (&mut out as *mut i32).cast(),
                 &mut ind,
@@ -1312,7 +1306,7 @@ mod tests {
 
         unsafe {
             convert_integer_c(
-                &decimal(false, 2, vec![12345]),
+                &decimal(false, 2, &[12345]),
                 SQL_C_SLONG,
                 (&mut out as *mut i32).cast(),
                 &mut ind,
@@ -1326,7 +1320,7 @@ mod tests {
         // Same wire vector `mssql-tds` pins in `test_f64_conversion`.
         let ok = unsafe {
             convert_integer_c(
-                &decimal(true, 5, vec![-539_269_688, 2]),
+                &decimal(true, 5, &[-539_269_688, 2]),
                 SQL_C_SLONG,
                 (&mut out as *mut i32).cast(),
                 &mut ind,
@@ -1336,23 +1330,12 @@ mod tests {
         assert_eq!(ok, ConvOk::Truncated);
         assert_eq!(out, 123_456);
 
-        let err = unsafe {
-            convert_integer_c(
-                &decimal(true, 0, vec![1, 0, 0, 0, 1]),
-                SQL_C_SLONG,
-                (&mut out as *mut i32).cast(),
-                &mut ind,
-            )
-        }
-        .unwrap_err();
-        assert_eq!(err, ConvError::OutOfRange);
-
         // A magnitude filling all four limbs exceeds `i128::MAX`. It has no
         // exact scaled form, so it reads as `f64` and lands far outside a
         // 32-bit target: out of range, not an illegal cast.
         let err = unsafe {
             convert_integer_c(
-                &decimal(true, 0, vec![-1, -1, -1, -1]),
+                &decimal(true, 0, &[-1, -1, -1, -1]),
                 SQL_C_SLONG,
                 (&mut out as *mut i32).cast(),
                 &mut ind,
@@ -1366,11 +1349,7 @@ mod tests {
         // range check above or the `f64` fallback.
         let ok = unsafe {
             convert_integer_c(
-                &decimal(
-                    true,
-                    38,
-                    vec![-1, 160_047_679, 1_518_781_562, 1_262_177_448],
-                ),
+                &decimal(true, 38, &[-1, 160_047_679, 1_518_781_562, 1_262_177_448]),
                 SQL_C_SLONG,
                 (&mut out as *mut i32).cast(),
                 &mut ind,
@@ -1384,7 +1363,7 @@ mod tests {
         // agrees with the string rendering instead of refusing the value.
         let ok = unsafe {
             convert_integer_c(
-                &decimal(true, 2, vec![12345, 0, 0, 0, 0, 0]),
+                &decimal(true, 2, &[12345, 0, 0, 0, 0, 0]),
                 SQL_C_SLONG,
                 (&mut out as *mut i32).cast(),
                 &mut ind,
@@ -1693,12 +1672,7 @@ mod tests {
         let mut out: f64 = 0.0;
         let mut ind: SqlLen = 0;
         let ret = conv_f(
-            &ColumnValues::Decimal(DecimalParts {
-                is_positive: true,
-                scale: 0,
-                precision: 38,
-                int_parts: vec![-1, -1, -1, -1],
-            }),
+            &ColumnValues::Decimal(DecimalParts::new(true, 38, 0, u128::MAX)),
             SQL_C_DOUBLE,
             (&mut out as *mut f64).cast(),
             &mut ind,
@@ -1706,30 +1680,6 @@ mod tests {
         .unwrap();
         assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out, u128::MAX as f64);
-    }
-
-    /// A magnitude wider than four words has no `SQL_NUMERIC_STRUCT` (or wire)
-    /// counterpart, so there is no msodbcsql behavior to match. It is still a
-    /// numeric value we cannot represent, which is `22003`, not `07006`.
-    #[test]
-    fn oversized_decimal_into_float_target_is_out_of_range() {
-        use mssql_tds::datatypes::decoder::DecimalParts;
-
-        let mut out: f64 = 0.0;
-        let mut ind: SqlLen = 0;
-        let err = conv_f(
-            &ColumnValues::Decimal(DecimalParts {
-                is_positive: true,
-                scale: 0,
-                precision: 38,
-                int_parts: vec![1, 0, 0, 0, 1],
-            }),
-            SQL_C_DOUBLE,
-            (&mut out as *mut f64).cast(),
-            &mut ind,
-        )
-        .unwrap_err();
-        assert_eq!(err, ConvError::OutOfRange);
     }
 
     #[test]

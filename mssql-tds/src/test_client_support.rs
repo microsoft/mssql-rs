@@ -222,6 +222,7 @@ pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
     )
 }
 
@@ -248,6 +249,7 @@ pub fn tds_client_from_tokens_in_transaction(
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
     )
 }
 
@@ -513,6 +515,7 @@ pub(crate) mod byte_stream {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         )
     }
 
@@ -539,6 +542,7 @@ pub(crate) mod byte_stream {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         )
     }
 }

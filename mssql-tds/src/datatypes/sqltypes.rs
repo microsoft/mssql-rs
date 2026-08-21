@@ -306,9 +306,9 @@ impl SqlType {
                 let cv = match opt {
                     Some(v) => {
                         if matches!(self, SqlType::Numeric(_)) {
-                            ColumnValues::Numeric(v.clone())
+                            ColumnValues::Numeric(*v)
                         } else {
-                            ColumnValues::Decimal(v.clone())
+                            ColumnValues::Decimal(*v)
                         }
                     }
                     None => ColumnValues::Null,
@@ -1500,12 +1500,7 @@ mod coverage_tests {
 
     #[test]
     fn nullable_type_numeric() {
-        let dp = DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 10,
-            int_parts: vec![100],
-        };
+        let dp = DecimalParts::new(true, 10, 2, 100);
         assert_eq!(
             SqlType::Numeric(Some(dp)).get_nullable_type(),
             TdsDataType::NumericN
@@ -1586,13 +1581,8 @@ mod coverage_tests {
     #[test]
     fn to_cv_numeric_some() {
         let col = &default_collation();
-        let dp = DecimalParts {
-            is_positive: true,
-            scale: 4,
-            precision: 18,
-            int_parts: vec![42],
-        };
-        let (cv, _) = SqlType::Numeric(Some(dp.clone())).to_column_value_and_context(col);
+        let dp = DecimalParts::new(true, 18, 4, 42);
+        let (cv, _) = SqlType::Numeric(Some(dp)).to_column_value_and_context(col);
         assert_eq!(cv, ColumnValues::Numeric(dp));
     }
 
