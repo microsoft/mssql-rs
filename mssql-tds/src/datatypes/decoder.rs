@@ -2419,10 +2419,6 @@ impl DecimalParts {
         if self.is_positive { d_ret } else { -d_ret }
     }
 
-    fn clamped_scale(&self) -> usize {
-        (self.scale as usize).min(DECIMAL_STR_LEN - 3)
-    }
-
     /// The `index`-th little-endian 32-bit word of the magnitude, counting from
     /// the least significant. Words past the fourth are always zero.
     ///
