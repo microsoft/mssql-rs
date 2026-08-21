@@ -74,10 +74,18 @@ TEST_F(GetDescFieldLiveTest, AllocTypeIsAuto) {
 }
 
 TEST_F(GetDescFieldLiveTest, InvalidFieldReturnsError) {
-    // msodbcsql validates RecNumber before it decides whether a record-field
-    // identifier is recognized, so RecNumber 0 on APD yields 07009 there.
-    // Keep the pure "unknown field" assertion on a real record number instead.
+    // msodbcsql checks whether RecNumber refers to an existing record before
+    // it decides whether a record-field identifier is recognized, so an
+    // unrecognized field on a record that doesn't exist yet reports "no such
+    // record" (SQL_NO_DATA on RecNumber 1 of an empty descriptor, 07009 on
+    // RecNumber 0) instead of "unrecognized field". Grow record 1 first so
+    // the record-existence check passes and the field-recognition check is
+    // what actually runs.
     SQLHDESC hdesc = AppParamDesc();
+    ASSERT_SQL_OK(SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
+                                   reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(SQL_C_LONG)),
+                                   0),
+                  SQL_HANDLE_DESC, hdesc);
     ASSERT_SQL_ERROR(SQLGetDescFieldW(hdesc, 1, 0x7FFF, nullptr, 0, nullptr));
     EXPECT_SQLSTATE(SQL_HANDLE_DESC, hdesc, "HY091");
 }
@@ -112,9 +120,14 @@ TEST_F(GetDescFieldLiveTest, ReadsBackValueSetBySetDescField) {
 
 // IRD supports GET on the common record fields (via the same field-access
 // model as ARD/APD/IPD) even though every SET on it is rejected — see
-// set_desc_field_test.cpp's IrdRejectsFieldWrite. A statement has not
-// populated the IRD yet (no result-set columns known), so record 1 does
-// not exist.
+// set_desc_field_test.cpp's IrdRejectsFieldWrite. This driver's IRD storage
+// is independent of the live result set: reconciling it against a prepared
+// statement's real column metadata is AB#47437, not this PR (see
+// handles/desc.rs's module docs), so record 1 does not exist here even once
+// prepared. msodbcsql fully implements that wiring already and reports the
+// real column type for a one-column "SELECT 1" — a genuine, intentional
+// scope-boundary divergence, not a bug, so this only asserts on the Rust
+// leg.
 //
 // The statement must be prepared first: unixODBC's Driver Manager gates
 // SQLGetDescField on an IRD to statements past STATE_S1 ("allocated, not
@@ -124,6 +137,7 @@ TEST_F(GetDescFieldLiveTest, ReadsBackValueSetBySetDescField) {
 // something the driver controls, so querying the IRD immediately after
 // SQLAllocHandle(STMT) does not reach this driver at all on Linux.
 TEST_F(GetDescFieldLiveTest, ImpRowDescRecordPastCountReturnsNoData) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1");
     ASSERT_SQL_OK(SQLPrepare(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
                   SQL_HANDLE_STMT, stmt_);
