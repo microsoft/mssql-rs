@@ -267,7 +267,15 @@ fn do_connect(
     // Off Windows an interactive request is reported as AD integrated, the same
     // method msodbcsql falls through to there.
     let mut context = ClientContext::default();
-    context.database = params.database.clone();
+    // The connection string wins over a pre-connect
+    // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`: msodbcsql overwrites the
+    // attribute's `conninfo.DataBase` while parsing the keywords, so a caller
+    // supplying both logs in to the `Database=` one.
+    context.database = if params.database.is_empty() {
+        state.current_catalog.clone().unwrap_or_default()
+    } else {
+        params.database.clone()
+    };
 
     // Apply an app-set SQL_ATTR_LOGIN_TIMEOUT before configuring auth so an
     // explicit login timeout takes precedence over any method-specific default
