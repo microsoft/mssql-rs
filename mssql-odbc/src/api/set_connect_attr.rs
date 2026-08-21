@@ -251,6 +251,11 @@ unsafe fn sql_set_connect_attr_w_impl(
 /// Unlike the statement-level set, this is write-only: msodbcsql answers
 /// `SQLGetConnectAttr(SQL_ATTR_QUERY_TIMEOUT)` with `HY092`, so there is
 /// deliberately no matching arm in `SQLGetConnectAttrW`.
+///
+/// The fan-out is worst-wins, matching [`close_all_cursors`](super::txn): an
+/// unusable statement does not stop the walk, so the healthy ones still get the
+/// value, but the call reports `SQL_ERROR` because the attribute did not reach
+/// every statement.
 fn set_query_timeout(dbc: &DbcHandle, requested: u64) -> SqlReturn {
     let (seconds, clamped) = clamp_query_timeout(requested as usize);
 
@@ -266,28 +271,43 @@ fn set_query_timeout(dbc: &DbcHandle, requested: u64) -> SqlReturn {
         state.statements.clone()
     };
 
+    let mut poisoned = false;
     for stmt_ptr in statements {
         // SAFETY: every pointer in `statements` came from
         // `handle_to_raw::<StmtHandle>` and is owned by this DBC.
+        // A concurrent `SQLFreeHandle(SQL_HANDLE_STMT)` could still free it
+        // between the clone above and this call — the same handle-lifetime gap
+        // `close_all_cursors` and `SQLDisconnect` document (see the TODO in
+        // `disconnect.rs`), which refcounted handles will close driver-wide.
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
         match stmt.inner.lock() {
             Ok(mut stmt_state) => stmt_state.query_timeout = seconds,
-            // One unusable statement must not abort the fan-out: the connection
-            // default is already stored and the other statements still need it.
-            Err(_) => error!(?stmt_ptr, "SQLSetConnectAttrW: stmt mutex poisoned"),
+            // One unusable statement must not abort the fan-out — the others
+            // still need the value — but it does mean the attribute was not
+            // applied everywhere, so the call cannot report plain success.
+            Err(_) => {
+                error!(?stmt_ptr, "SQLSetConnectAttrW: stmt mutex poisoned");
+                poisoned = true;
+            }
         }
     }
     debug!(seconds, "SQLSetConnectAttrW: query timeout applied");
 
-    if clamped {
-        let Ok(mut state) = dbc.inner.lock() else {
-            error!("SQLSetConnectAttrW: dbc mutex poisoned");
-            return SQL_ERROR;
-        };
-        post_diag(&mut state, WARN_OPTION_VALUE_CHANGED);
-        return SQL_SUCCESS_WITH_INFO;
-    }
-    SQL_SUCCESS
+    // Worst-wins: a statement that never received the value outranks clamping.
+    let outcome = if poisoned {
+        (ERR_STATEMENT_UNUSABLE, SQL_ERROR)
+    } else if clamped {
+        (WARN_OPTION_VALUE_CHANGED, SQL_SUCCESS_WITH_INFO)
+    } else {
+        return SQL_SUCCESS;
+    };
+
+    let Ok(mut state) = dbc.inner.lock() else {
+        error!("SQLSetConnectAttrW: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    post_diag(&mut state, outcome.0);
+    outcome.1
 }
 
 /// Decodes the msodbcsql `SQL_COPT_SS_ACCESS_TOKEN` structure into the raw JWT.
@@ -495,9 +515,11 @@ mod tests {
     }
 
     #[test]
-    fn query_timeout_fan_out_skips_a_poisoned_statement() {
-        // One unusable statement must not abort the fan-out: the connection
-        // default still lands, and the healthy statements still get the value.
+    fn query_timeout_fan_out_reports_a_poisoned_statement() {
+        // Worst-wins, matching `close_all_cursors`: an unusable statement must
+        // not abort the fan-out — the connection default still lands and the
+        // healthy statements still get the value — but the attribute did not
+        // reach every statement, so the call cannot claim success.
         let mut h = TestHandles::with_env_dbc();
         let bad = h.alloc_extra_stmt();
         let good = h.alloc_extra_stmt();
@@ -511,9 +533,13 @@ mod tests {
         let ret = unsafe {
             sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 19usize as SqlPointer, 0)
         };
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, SQL_ERROR);
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
+        }
         assert_eq!(dbc.inner.lock().unwrap().stmt_query_timeout, 19);
         let good_stmt = unsafe { handle_from_raw::<StmtHandle>(good) };
         assert_eq!(good_stmt.inner.lock().unwrap().query_timeout, 19);
