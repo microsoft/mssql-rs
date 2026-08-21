@@ -100,6 +100,10 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SQL_XML", 241)?;
     m.add("SQL_JSON", 244)?;
     m.add("SQL_VECTOR", 245)?;
+    m.add("apilevel", "2.0")?;
+    m.add("threadsafety", 1)?;
+    // DB-API allows one declared style; named pyformat markers are an extension.
+    m.add("paramstyle", "qmark")?;
 
     // Test-only hook to drive PythonEntraIdTokenFactory::create_token from
     // Python tests. Underscore-prefixed to mark as internal/test-only.

@@ -8,6 +8,7 @@ use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
+use std::fmt::Write as _;
 
 use crate::types::{ParameterHint, null_sql_type, py_to_sql_type, py_to_sql_type_with_hint};
 
@@ -381,6 +382,13 @@ fn bind_named(
     hints: Option<&[ParameterHint]>,
 ) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     let (operation, names) = rewrite_placeholders(&operation, true)?;
+    if names.is_empty() && !values.is_empty() {
+        return Err(PyTypeError::new_err(format!(
+            "The SQL contains no parameter markers, but {} parameters were supplied. \
+             Named parameters use the %(name)s style.",
+            values.len()
+        )));
+    }
     let bound_parameters = names
         .into_iter()
         .enumerate()
@@ -434,7 +442,7 @@ fn rpc_parameter(
 }
 
 fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeholder>)> {
-    let mut output = String::with_capacity(sql.len());
+    let mut output = String::with_capacity(sql.len() + sql.len() / 2);
     let mut names = Vec::new();
     let mut state = ScanState::Normal;
     let mut block_comment_depth = 0usize;
@@ -468,8 +476,10 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                     chars.next();
                 }
                 ('?', _) if !named => {
-                    let rpc_name = format!("@P{}", names.len() + 1);
-                    output.push_str(&rpc_name);
+                    let start = output.len();
+                    write!(&mut output, "@P{}", names.len() + 1)
+                        .expect("writing to a String cannot fail");
+                    let rpc_name = output[start..].to_owned();
                     names.push(Placeholder {
                         rpc_name,
                         source_name: None,
@@ -510,8 +520,10 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                         if source_name.is_empty() {
                             return Err(PyTypeError::new_err("Named parameter cannot be empty"));
                         }
-                        let rpc_name = format!("@P{}", names.len() + 1);
-                        output.push_str(&rpc_name);
+                        let start = output.len();
+                        write!(&mut output, "@P{}", names.len() + 1)
+                            .expect("writing to a String cannot fail");
+                        let rpc_name = output[start..].to_owned();
                         names.push(Placeholder {
                             rpc_name,
                             source_name: Some(source_name),
@@ -599,6 +611,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["@P1", "@P2"]
         );
+    }
+
+    #[test]
+    fn rewrites_dense_positional_parameters() {
+        let sql = (0..2000).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let (sql, names) = rewrite_placeholders(&sql, false).unwrap();
+
+        assert_eq!(names.len(), 2000);
+        assert_eq!(names.first().unwrap().rpc_name, "@P1");
+        assert_eq!(names.last().unwrap().rpc_name, "@P2000");
+        assert_eq!(sql.split(", ").count(), 2000);
+        assert!(sql.starts_with("@P1, @P2"));
+        assert!(sql.ends_with("@P1999, @P2000"));
     }
 
     #[test]

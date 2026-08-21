@@ -469,4 +469,6 @@ impl PyAsyncCursor {
     // - Convert TVP row iterators directly instead of collecting Bound cells first.
     // - Add Criterion benchmarks for placeholder scanning, scalar binding,
     //   prepared reuse, and representative TVP row counts.
+    // - If placeholder benchmarks justify it, cache rewritten SQL and marker
+    //   metadata with bounded storage and explicit parameter-style invalidation.
 }

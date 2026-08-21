@@ -190,6 +190,8 @@ def test_execute_ignores_markers_in_nested_block_comments(client_context):
     [
         ("SELECT ?", {"value": 1}, "positional placeholders"),
         ("SELECT %(value)s", (1,), "named placeholders"),
+        ("SELECT :value", {"value": 1}, "Named parameters use the %\\(name\\)s style"),
+        ("SELECT %s", {"value": 1}, "Named parameters use the %\\(name\\)s style"),
         ("SELECT ?, ?", (1,), "2 parameter markers, but 1 parameters"),
         ("SELECT ?", (1, 2), "1 parameter markers, but 2 parameters"),
     ],
@@ -203,6 +205,18 @@ def test_execute_rejects_parameter_style_and_arity_mismatches(
             cursor = conn.cursor()
             with pytest.raises(TypeError, match=message):
                 cursor.execute(operation, parameters)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_execute_accepts_empty_mapping_without_markers(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            await conn.cursor().execute("SELECT 1", {})
         finally:
             await conn.close()
 
