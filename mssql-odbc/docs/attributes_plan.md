@@ -379,7 +379,7 @@ ideal rather than what this driver does.
 |---|---|---|---|
 | 1 | `MAX_ROWS` | 0 | **enforced**: bounds each result set; 0 is unlimited |
 | 2 | `NOSCAN` | 0 | stored, round-trips |
-| 3 | `MAX_LENGTH` | 0 | 0 → success; non-zero → `01S02`, stored value becomes 8000 |
+| 3 | `MAX_LENGTH` | 0 | 0 and 8000 → success; any other non-zero → `01S02` and the stored value is substituted with 8000 |
 | 4 | `ASYNC_ENABLE` | 0 | stored |
 | 8 | `KEYSET_SIZE` | 0 | 0 → success; non-zero → `01S02`, stays 0 |
 | 9 | `SQL_ROWSET_SIZE` | 1 | stored, **independent of `ROW_ARRAY_SIZE`** |
@@ -388,7 +388,9 @@ ideal rather than what this driver does.
 | 12 | `USE_BOOKMARKS` | 0 | stored |
 | 14 | `ROW_NUMBER` | — | get-only; `24000` unless positioned on a row, else 0 |
 | 15 | `ENABLE_AUTO_IPD` | 0 | stored |
-| 16–24 | bind/offset/status pointers | 0 | stored |
+| 17 | `PARAM_BIND_OFFSET_PTR` | 0 (null) | **enforced**: dereferenced at execute and added to both bound pointers |
+| 16, 18–21, 23–24 | bind/offset/status pointers | 0 | stored |
+| 22 | `PARAMSET_SIZE` | 1 | 1 → success; above 1 → `HYC00` (array binding is a deferred feature) |
 | 10014 | `METADATA_ID` | 0 | stored |
 | -1 | `CURSOR_SCROLLABLE` | `SQL_NONSCROLLABLE` | the boolean face of `CURSOR_TYPE` |
 | -2 | `CURSOR_SENSITIVITY` | `SQL_INSENSITIVE` | `SQL_UNSPECIFIED` normalises to insensitive, silently |
@@ -417,6 +419,18 @@ Four findings changed the implementation:
   validation is therefore deliberately absent; the identifiers themselves do
   reach the driver, which is also how `CURSOR_SCROLLABLE` is shown to alias
   `CURSOR_TYPE` driver-side.
+- **`MAX_ROWS` bounds catalog result sets too.** Measured: with the cap at 2,
+  `SQLTables`, `SQLColumns` and `SQLGetTypeInfo` all return exactly 2 rows on
+  msodbcsql. Because catalog functions run through `finish_execute` and then the
+  same `SQLFetch` path, this driver matches without special-casing — the shared
+  path is the correct implementation, not an accident.
+- **`PARAM_BIND_OFFSET_PTR` is honored, not inert.** msodbcsql dereferences the
+  pointer at execute and adds the byte offset to the bound value pointer *and*
+  the length/indicator pointer. Storing it without applying it would accept the
+  set and then read the wrong application buffer, which is worse than rejecting
+  it: an offset binding would silently send the wrong parameter value. The
+  offset is read once per execution, so an application can walk a buffer by
+  writing one `SQLLEN` between executes.
 
 **Known divergence:** `SQL_ATTR_CURSOR_SCROLLABLE = SQL_SCROLLABLE` succeeds on
 msodbcsql and reports `01S02` here, because scrollable cursors are a deferred

@@ -200,14 +200,18 @@ pub(super) unsafe fn build_named_params(
     op: &str,
 ) -> Result<Vec<RpcParameter>, SqlReturn> {
     let mut named_params = Vec::with_capacity(marker_count);
+    // Read once per execution: the attribute holds a pointer, and every
+    // binding shifts by the same amount.
+    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
             error!("{op}: parameter {} has no bound value", i + 1);
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
+        let bound_param = bound_param.with_bind_offset(bind_offset);
         let name = format!("@P{}", i + 1);
-        match unsafe { bound_param_to_rpc(name, bound_param) } {
+        match unsafe { bound_param_to_rpc(name, &bound_param) } {
             Ok(param) => named_params.push(param),
             Err(e) => {
                 if let ParamBuildError::InvalidLength(len) = e {

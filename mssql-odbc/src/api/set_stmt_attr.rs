@@ -493,7 +493,7 @@ mod tests {
         SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
         SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ATTR_RETRIEVE_DATA, SQL_ATTR_ROW_BIND_OFFSET_PTR,
         SQL_ATTR_ROW_OPERATION_PTR, SQL_ATTR_USE_BOOKMARKS, SQL_BIND_BY_COLUMN, SQL_NULL_HANDLE,
-        SQL_RD_ON, SQL_ROWSET_SIZE,
+        SQL_RD_ON, SQL_ROWSET_SIZE, SqlLen,
     };
     use crate::api::sqlstate::{SQLSTATE_24000, SQLSTATE_HY092};
     use crate::handles::handle_from_raw;
@@ -1143,6 +1143,30 @@ mod tests {
             );
             assert_eq!(get_attr(h.stmt, attribute), value, "readback {attribute}");
         }
+    }
+
+    /// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` holds a *pointer to* the offset, so it
+    /// is dereferenced at execute time rather than read at set time. An
+    /// application can therefore step a binding across a buffer by writing one
+    /// `SQLLEN` between executions.
+    #[test]
+    fn param_bind_offset_is_read_through_the_stored_pointer() {
+        let mut attrs = InertStmtAttrs::default();
+        assert_eq!(
+            unsafe { attrs.param_bind_offset() },
+            0,
+            "unset is no offset"
+        );
+
+        let mut offset: SqlLen = 24;
+        let slot = &raw mut offset;
+        attrs.set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, slot as SqlULen);
+        assert_eq!(unsafe { attrs.param_bind_offset() }, 24);
+
+        // Written after the set: the value is read at execute time, not
+        // captured when the attribute was assigned.
+        unsafe { slot.write(-8) };
+        assert_eq!(unsafe { attrs.param_bind_offset() }, -8);
     }
 
     /// `SQL_ROWSET_SIZE` shares a name with `SQL_ATTR_ROW_ARRAY_SIZE` but not a
