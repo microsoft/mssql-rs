@@ -12,33 +12,54 @@ use std::fmt::Write as _;
 
 use crate::types::{ParameterHint, null_sql_type, py_to_sql_type, py_to_sql_type_with_hint};
 
+/// Comparable SQL declaration metadata used to decide whether a prepared
+/// statement can be reused with a new set of bound values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ParameterMetadata {
+    /// A type whose declaration is fully represented by its SQL type name.
     Scalar(&'static str),
+    /// A decimal declaration with its family, precision, and scale.
     Decimal {
+        /// Whether the declaration uses `numeric` rather than `decimal`.
         numeric: bool,
+        /// Declared precision.
         precision: u8,
+        /// Declared scale.
         scale: u8,
     },
+    /// A temporal declaration whose identity includes fractional-second scale.
     Temporal {
+        /// SQL temporal type name.
         kind: &'static str,
+        /// Declared fractional-second scale.
         scale: u8,
     },
+    /// A character or binary declaration whose identity includes length.
     Sized {
+        /// SQL character or binary type name.
         kind: &'static str,
+        /// Declared type length.
         length: u16,
     },
+    /// A vector declaration identified by dimension count and element type.
     Vector {
+        /// Number of vector dimensions.
         dimensions: u16,
+        /// SQL vector element type.
         base_type: VectorBaseType,
     },
+    /// A `sql_variant` declaration carrying the metadata of its value.
     Variant(Box<ParameterMetadata>),
+    /// A table-valued parameter declaration identified by server type name.
     Table {
+        /// SQL schema containing the table type.
         schema: String,
+        /// Unqualified table type name.
         name: String,
     },
 }
 
+/// Extracts the declaration identity used for prepared-statement reuse.
 fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
     match value {
         SqlType::Bit(_) => ParameterMetadata::Scalar("bit"),
@@ -192,12 +213,14 @@ impl PyTableValuedParameter {
 }
 
 impl PyTableValuedParameter {
+    /// Converts this Python wrapper into the SQL type consumed by RPC binding.
     fn sql_type(&self) -> SqlType {
         // TODO: Use shared TVP ownership when mssql-tds supports Arc<TvpTableData>.
         SqlType::Table(self.type_name.clone(), self.table.clone())
     }
 }
 
+/// Validates and normalizes a possibly schema-qualified TVP type name.
 fn parse_tvp_type_name(type_name: String, schema: Option<String>) -> PyResult<TvpTypeName> {
     let parts = type_name.split('.').collect::<Vec<_>>();
     let (schema_name, type_name) = match (schema, parts.as_slice()) {
@@ -234,6 +257,7 @@ fn parse_tvp_type_name(type_name: String, schema: Option<String>) -> PyResult<Tv
     Ok(TvpTypeName::new(schema_name, type_name.to_string()))
 }
 
+/// Builds TVP column metadata and converts each row using its matching hint.
 fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyResult<TvpTableData> {
     let hints = parse_input_sizes(columns)?
         .ok_or_else(|| PyValueError::new_err("A TVP must define at least one column"))?;
@@ -277,21 +301,47 @@ fn build_tvp_table(columns: &Bound<'_, PyAny>, rows: &Bound<'_, PyAny>) -> PyRes
     Ok(TvpTableData::new(column_defs, converted_rows))
 }
 
+/// Lexer state for [`rewrite_placeholders`].
+///
+/// Only [`ScanState::Normal`] recognizes placeholders. Every other state
+/// preserves marker-like text inside a quoted token or comment.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ScanState {
+    /// Executable SQL where parameter markers may be rewritten.
     Normal,
+    /// A single-quoted string, where `''` escapes a quote.
     SingleQuote,
+    /// A double-quoted token, where `""` escapes a quote.
     DoubleQuote,
+    /// A bracketed identifier, where `]]` escapes a closing bracket.
     Bracket,
+    /// A `--` comment ending at either `\r` or `\n`.
     LineComment,
+    /// A nested `/* ... */` comment tracked by `block_comment_depth`.
     BlockComment,
 }
 
+/// A rewritten parameter marker in RPC wire order.
 struct Placeholder {
+    /// The generated `@Pn` name used in both the SQL text and RPC parameter.
     rpc_name: String,
+    /// The dictionary key for `%(name)s`, or `None` for positional `?`.
     source_name: Option<String>,
 }
 
+fn parse_pyformat_marker(sql: &str, start: usize, close: Option<usize>) -> Option<(&str, usize)> {
+    let body_start = start.checked_add("%(".len())?;
+    let close = close.filter(|close| *close >= body_start)?;
+    sql.get(close + 1..)?.strip_prefix('s')?;
+    let source_name = sql.get(body_start..close)?;
+    Some((source_name, close + ")s".len() - start))
+}
+
+/// Normalizes Python execute arguments and binds them as positional or named RPC parameters.
+///
+/// A sole dictionary selects `%(name)s` binding. A sole tuple, list, or DB-API
+/// `Row` is expanded positionally; all other argument tuples bind positionally
+/// as supplied. The returned metadata is in placeholder occurrence order.
 pub(crate) fn bind_parameters(
     operation: String,
     parameters: &Bound<'_, PyTuple>,
@@ -321,6 +371,10 @@ pub(crate) fn bind_parameters(
     bind_positional(operation, parameters.iter(), hints)
 }
 
+/// Parses `setinputsizes()` entries into validated conversion hints.
+///
+/// Each entry may be a SQL type integer or `(sql_type[, size[, scale]])`.
+/// `None` and an empty iterable both produce no hints.
 pub(crate) fn parse_input_sizes(sizes: &Bound<'_, PyAny>) -> PyResult<Option<Vec<ParameterHint>>> {
     if sizes.is_none() {
         return Ok(None);
@@ -357,6 +411,7 @@ pub(crate) fn parse_input_sizes(sizes: &Bound<'_, PyAny>) -> PyResult<Option<Vec
     Ok((!hints.is_empty()).then_some(hints))
 }
 
+/// Rewrites and binds positional values in `?` occurrence order.
 fn bind_positional<'py>(
     operation: String,
     values: impl Iterator<Item = Bound<'py, PyAny>>,
@@ -387,6 +442,7 @@ fn bind_positional<'py>(
     Ok((operation, parameters, parameter_signature))
 }
 
+/// Rewrites `%(name)s` markers and looks up each value by dictionary key.
 fn bind_named(
     operation: String,
     values: &Bound<'_, PyDict>,
@@ -421,6 +477,10 @@ fn bind_named(
     Ok((operation, parameters, parameter_signature))
 }
 
+/// Converts one Python value into an RPC parameter and its declaration metadata.
+///
+/// TVPs reject `setinputsizes()` hints and use the default-value status for a
+/// NULL table. Scalar conversion failures are exposed as Python type errors.
 fn rpc_parameter(
     name: String,
     value: &Bound<'_, PyAny>,
@@ -452,14 +512,23 @@ fn rpc_parameter(
     Ok((RpcParameter::new(Some(name), status, value), signature))
 }
 
+/// Rewrites DB-API parameter markers to SQL Server `@P1` through `@Pn` names.
+///
+/// Positional mode recognizes `?`; dictionary-backed named mode recognizes
+/// `%(name)s` and converts `%%` to `%`. A valid marker from the other mode is
+/// rejected as a style mismatch. Markers are rewritten only in
+/// [`ScanState::Normal`], while quoted tokens and comments are preserved.
+/// Malformed pyformat candidates and unsupported `:name` markers are left
+/// unchanged for the caller's marker-count validation.
 fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeholder>)> {
     let mut output = String::with_capacity(sql.len() + sql.len() / 2);
     let mut names = Vec::new();
     let mut state = ScanState::Normal;
     let mut block_comment_depth = 0usize;
     let mut chars = sql.char_indices().peekable();
+    let mut close_parentheses = sql.match_indices(')').map(|(offset, _)| offset).peekable();
 
-    while let Some((_, current)) = chars.next() {
+    while let Some((index, current)) = chars.next() {
         let next = chars.peek().map(|(_, next)| *next);
         match state {
             ScanState::Normal => match (current, next) {
@@ -506,23 +575,16 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                     chars.next();
                 }
                 ('%', Some('(')) => {
-                    chars.next();
-                    let mut source_name = String::new();
-                    let mut original = String::from("%(");
-                    let mut complete = false;
-                    while let Some((_, marker_char)) = chars.next() {
-                        original.push(marker_char);
-                        if marker_char == ')' {
-                            if chars.peek().is_some_and(|(_, next)| *next == 's') {
-                                chars.next();
-                                original.push('s');
-                                complete = true;
-                            }
-                            break;
-                        }
-                        source_name.push(marker_char);
+                    let body_start = index + "%(".len();
+                    while close_parentheses
+                        .peek()
+                        .is_some_and(|close| *close < body_start)
+                    {
+                        close_parentheses.next();
                     }
-                    if complete {
+                    if let Some((source_name, consumed)) =
+                        parse_pyformat_marker(sql, index, close_parentheses.peek().copied())
+                    {
                         if !named {
                             return Err(PyTypeError::new_err(
                                 "Parameter style mismatch: query uses named placeholders (%(name)s) but positional parameters were provided",
@@ -537,10 +599,14 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                         let rpc_name = output[start..].to_owned();
                         names.push(Placeholder {
                             rpc_name,
-                            source_name: Some(source_name),
+                            source_name: Some(source_name.to_owned()),
                         });
+                        let end = index + consumed;
+                        while chars.peek().is_some_and(|(offset, _)| *offset < end) {
+                            chars.next();
+                        }
                     } else {
-                        output.push_str(&original);
+                        output.push(current);
                     }
                 }
                 _ => output.push(current),
@@ -580,7 +646,7 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
             }
             ScanState::LineComment => {
                 output.push(current);
-                if current == '\n' {
+                if current == '\n' || current == '\r' {
                     state = ScanState::Normal;
                 }
             }
@@ -622,6 +688,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["@P1", "@P2"]
         );
+    }
+
+    #[test]
+    fn line_comment_ends_at_carriage_return() {
+        let (sql, names) = rewrite_placeholders("SELECT 1 -- c\rWHERE a = ?", false).unwrap();
+
+        assert_eq!(sql, "SELECT 1 -- c\rWHERE a = @P1");
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn line_comment_still_ends_at_crlf() {
+        let (sql, names) = rewrite_placeholders("SELECT 1 -- c\r\nWHERE a = ?", false).unwrap();
+
+        assert_eq!(sql, "SELECT 1 -- c\r\nWHERE a = @P1");
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn leading_line_comment_ends_at_carriage_return() {
+        let (sql, names) = rewrite_placeholders("-- lead\rSELECT ?, ?", false).unwrap();
+
+        assert_eq!(sql, "-- lead\rSELECT @P1, @P2");
+        assert_eq!(names.len(), 2);
     }
 
     #[test]
@@ -696,6 +786,40 @@ mod tests {
         assert_eq!(sql, "SELECT %(broken)x, @P1, %(unterminated");
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].source_name.as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn rewrites_marker_inside_a_modulo_parenthesis() {
+        let (sql, names) =
+            rewrite_placeholders("SELECT a %(SELECT c FROM t WHERE id = ?) FROM u", false).unwrap();
+
+        assert_eq!(sql, "SELECT a %(SELECT c FROM t WHERE id = @P1) FROM u");
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn unterminated_percent_paren_does_not_swallow_later_markers() {
+        let (sql, names) = rewrite_placeholders("SELECT a %(b FROM t WHERE c = ?", false).unwrap();
+
+        assert_eq!(sql, "SELECT a %(b FROM t WHERE c = @P1");
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn quoting_is_tracked_after_a_bare_percent_paren() {
+        let (sql, names) = rewrite_placeholders("SELECT a %(b, '?' , ? FROM t", false).unwrap();
+
+        assert_eq!(sql, "SELECT a %(b, '?' , @P1 FROM t");
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn repeated_malformed_percent_parens_do_not_hide_a_later_marker() {
+        let sql = format!("SELECT {} ?", "%(".repeat(2000));
+        let (rewritten, names) = rewrite_placeholders(&sql, false).unwrap();
+
+        assert!(rewritten.ends_with("@P1"));
+        assert_eq!(names.len(), 1);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use mssql_tds::core::CancelHandle;
 pub(crate) type CursorId = u64;
 pub(crate) type OperationId = u64;
 
+/// Exclusive execute ownership granted for one cursor operation.
 #[derive(Debug)]
 pub(crate) struct ExecuteClaim {
     pub(crate) operation_id: OperationId,
@@ -16,6 +17,7 @@ pub(crate) struct ExecuteClaim {
     pub(crate) drain_previous: bool,
 }
 
+/// Exclusive cursor-close ownership and its pending result-drain requirement.
 #[derive(Debug)]
 pub(crate) struct CursorCloseClaim {
     pub(crate) operation_id: OperationId,
@@ -42,10 +44,10 @@ pub(crate) enum ConnectionLifecycle {
 pub(crate) enum OperationPhase {
     Executing,
     Fetching,
-    #[allow(dead_code)]
     Closing,
 }
 
+/// The operation that currently owns the shared TDS session.
 #[derive(Debug)]
 pub(crate) struct ActiveOperation {
     pub(crate) cursor_id: Option<CursorId>,
@@ -54,12 +56,14 @@ pub(crate) struct ActiveOperation {
     pub(crate) cancel_handle: Option<CancelHandle>,
 }
 
+/// Mutex-protected connection lifecycle and operation ownership state.
 #[derive(Debug)]
 struct AsyncSessionState {
     lifecycle: ConnectionLifecycle,
     active_operation: Option<ActiveOperation>,
 }
 
+/// Connection-wide coordinator shared by the connection and all its cursors.
 #[derive(Debug)]
 pub(crate) struct AsyncConnectionState {
     next_cursor_id: AtomicU64,

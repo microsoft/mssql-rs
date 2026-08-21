@@ -55,6 +55,10 @@ fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(format!("{user_msg}: {e}"))
 }
 
+/// Maps a connection lifecycle or session-ownership rejection to `RuntimeError`.
+///
+/// A busy connection may be owned by either a cursor or another connection-level
+/// operation. DB-API-specific exception mapping is tracked separately.
 fn map_claim_error(error: ClaimError) -> PyErr {
     match error {
         ClaimError::Closing => PyRuntimeError::new_err("Connection is closing"),
@@ -64,6 +68,11 @@ fn map_claim_error(error: ClaimError) -> PyErr {
     }
 }
 
+/// Owns the session claim for an in-flight commit or rollback.
+///
+/// `complete()` releases the claim after success or a handled TDS error. Dropping
+/// before completion indicates cancellation or an interrupted protocol exchange,
+/// so the connection is marked broken before the claim is released.
 struct ConnectionOperationGuard {
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
@@ -71,6 +80,7 @@ struct ConnectionOperationGuard {
 }
 
 impl ConnectionOperationGuard {
+    /// Creates a guard for an already-acquired connection-operation claim.
     fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
         Self {
             session_state,
@@ -79,6 +89,7 @@ impl ConnectionOperationGuard {
         }
     }
 
+    /// Releases the claim and prevents drop-time connection poisoning.
     fn complete(&mut self) {
         self.session_state.release_operation(self.operation_id);
         self.completed = true;
@@ -86,6 +97,7 @@ impl ConnectionOperationGuard {
 }
 
 impl Drop for ConnectionOperationGuard {
+    /// Marks the connection broken when an operation is cancelled or interrupted.
     fn drop(&mut self) {
         if !self.completed {
             self.session_state.mark_broken();

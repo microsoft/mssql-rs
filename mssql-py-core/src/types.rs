@@ -33,14 +33,21 @@ fn uuid_type(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
     UUID_TYPE.import(py, "uuid", "UUID")
 }
 
+/// A validated ODBC-compatible `setinputsizes()` entry lowered to [`SqlType`]
+/// before TDS serialization.
 #[derive(Clone, Copy)]
 pub(crate) struct ParameterHint {
+    /// A supported ODBC SQL type code.
     sql_type: i32,
+    /// Precision, dimension count, or character/binary allocation size.
     size: u32,
+    /// Numeric or temporal scale where the selected type supports one.
     scale: u8,
 }
 
 impl ParameterHint {
+    /// Validates the type code and numeric bounds once so conversion matches
+    /// can treat any remaining arm as unreachable.
     pub(crate) fn new(sql_type: i32, size: u32, scale: u8) -> TdsResult<Self> {
         const VALID_TYPES: &[i32] = &[
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 91, 92, 93, -1, -2, -3, -4, -5, -6, -7, -8, -9,
@@ -63,16 +70,19 @@ impl ParameterHint {
         })
     }
 
+    /// Returns the validated ODBC SQL type code for TVP compatibility checks.
     pub(crate) fn sql_type(self) -> i32 {
         self.sql_type
     }
 
+    /// Returns explicit decimal precision for TVP metadata, excluding zero as unspecified.
     pub(crate) fn precision(self) -> Option<u8> {
         matches!(self.sql_type, 2 | 3)
             .then(|| u8::try_from(self.size).unwrap_or(0))
             .filter(|precision| *precision > 0)
     }
 
+    /// Returns scale only for numeric and scale-bearing temporal types.
     pub(crate) fn scale(self) -> Option<u8> {
         matches!(self.sql_type, 2 | 3 | 10 | 11 | 92 | 93 | -154 | -155).then_some(self.scale)
     }
@@ -250,6 +260,11 @@ pub(crate) fn py_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
     })
 }
 
+/// Converts a Python value according to its validated `setinputsizes()` hint.
+///
+/// Hints select the SQL type, but size handling remains type-specific: decimal
+/// precision and scale are authoritative, strings and binary values widen to
+/// fit their contents, and vector dimensions are validated against the value.
 pub(crate) fn py_to_sql_type_with_hint(
     py_obj: &Bound<'_, PyAny>,
     hint: ParameterHint,
@@ -329,6 +344,11 @@ pub(crate) fn py_to_sql_type_with_hint(
     }
 }
 
+/// Constructs the typed NULL required when inference has no Python value.
+///
+/// Variable-length types may promote to `MAX`; fixed-width types reject sizes
+/// beyond SQL Server limits. Nullable decimal precision and scale cannot yet be
+/// retained because their value-free [`SqlType`] variants do not carry them.
 pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
     let size = hint.size.max(1);
     Ok(match hint.sql_type {
@@ -380,6 +400,8 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
     })
 }
 
+/// Applies caller-specified decimal precision and scale instead of inferring
+/// them from the Python value.
 fn hinted_decimal(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {
     let precision = if hint.size == 0 { 18 } else { hint.size } as u8;
     let value = py_obj
@@ -394,6 +416,8 @@ fn hinted_decimal(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<S
     })
 }
 
+/// Preserves the requested string allocation while widening it when needed to
+/// avoid declaring a type shorter than the encoded value.
 fn hinted_string(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {
     let value = py_obj.extract::<String>().map_err(|error| {
         Error::UsageError(format!("Failed to convert parameter to string: {error}"))
@@ -417,6 +441,7 @@ fn hinted_string(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
     })
 }
 
+/// Preserves the requested binary allocation while widening it to fit the value.
 fn hinted_binary(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {
     let value = py_obj.extract::<Vec<u8>>().map_err(|error| {
         Error::UsageError(format!("Failed to convert parameter to binary: {error}"))
@@ -430,6 +455,7 @@ fn hinted_binary(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
     })
 }
 
+/// Serializes arbitrary Python values through `json.dumps` for SQL JSON parameters.
 fn hinted_json(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
     let py = py_obj.py();
     let dumps = JSON_DUMPS
@@ -448,6 +474,7 @@ fn hinted_json(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
     Ok(SqlType::Json(Some(SqlJson::from(value))))
 }
 
+/// Converts a float32 vector and rejects a conflicting hinted dimension count.
 fn hinted_vector(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {
     let values = py_obj.extract::<Vec<f32>>().map_err(|error| {
         Error::UsageError(format!("Failed to convert parameter to VECTOR: {error}"))
@@ -467,6 +494,8 @@ fn hinted_vector(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sq
     ))
 }
 
+/// Quantizes through Python `Decimal` so MONEY values use SQL Server's fixed
+/// four-digit scale before range-checking SMALLMONEY.
 fn hinted_money(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<SqlType> {
     let decimal_class = decimal_type(py_obj.py())
         .map_err(|error| Error::UsageError(format!("Failed to import Decimal: {error}")))?;
@@ -498,6 +527,7 @@ fn hinted_money(py_obj: &Bound<'_, PyAny>, hint: ParameterHint) -> TdsResult<Sql
     }
 }
 
+/// Enforces fixed-width SQL Server limits before narrowing a size to `u16`.
 fn checked_length(size: u32, maximum: u32, type_name: &str) -> TdsResult<u16> {
     if size > maximum {
         return Err(Error::UsageError(format!(
@@ -507,6 +537,7 @@ fn checked_length(size: u32, maximum: u32, type_name: &str) -> TdsResult<u16> {
     Ok(size as u16)
 }
 
+/// Selects `varchar(n)` when representable and `varchar(max)` otherwise.
 fn sized_varchar(value: Option<SqlString>, size: u32) -> SqlType {
     match u16::try_from(size) {
         Ok(size) if size <= 8_000 => SqlType::Varchar(value, size),
@@ -514,6 +545,7 @@ fn sized_varchar(value: Option<SqlString>, size: u32) -> SqlType {
     }
 }
 
+/// Selects `nvarchar(n)` when representable and `nvarchar(max)` otherwise.
 fn sized_nvarchar(value: Option<SqlString>, size: u32) -> SqlType {
     match u16::try_from(size) {
         Ok(size) if size <= 4_000 => SqlType::NVarchar(value, size),
@@ -521,6 +553,7 @@ fn sized_nvarchar(value: Option<SqlString>, size: u32) -> SqlType {
     }
 }
 
+/// Selects `varbinary(n)` when representable and `varbinary(max)` otherwise.
 fn sized_varbinary(value: Option<Vec<u8>>, size: u32) -> SqlType {
     match u16::try_from(size) {
         Ok(size) if size <= 8_000 => SqlType::VarBinary(value, size),
@@ -577,6 +610,8 @@ fn py_datetime_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
     })))
 }
 
+/// Converts Python time components to the 100-nanosecond units used by TDS,
+/// retaining the scale selected by inference or the caller's hint.
 fn py_time(py_obj: &Bound<'_, PyAny>, scale: u8) -> TdsResult<SqlTime> {
     let component = |name: &str| {
         py_obj
@@ -594,6 +629,7 @@ fn py_time(py_obj: &Bound<'_, PyAny>, scale: u8) -> TdsResult<SqlTime> {
     })
 }
 
+/// Uses Python's `Decimal` class identity rather than accepting lookalike values.
 fn is_decimal(py_obj: &Bound<'_, PyAny>) -> TdsResult<bool> {
     let decimal = decimal_type(py_obj.py())
         .map_err(|error| Error::UsageError(format!("Failed to import decimal.Decimal: {error}")))?;

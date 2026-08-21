@@ -40,13 +40,18 @@ use mssql_tds::connection::tds_client::TdsClient;
 use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
 use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
 
+/// Cursor-local state for prepared execution and deferred handle cleanup.
 #[derive(Default)]
 struct PreparedState {
+    /// The current prepared statement and its optional live server handle.
     statement: Option<PreparedStatement>,
+    /// Metadata shape used to determine whether the statement must be rebound.
     parameter_signature: Vec<ParameterMetadata>,
+    /// A superseded statement retained until its unprepare request is serialized.
     orphaned: Option<StatementId>,
 }
 
+/// Converts a failed session claim into a Python error with operation-specific busy text.
 fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static str) -> PyErr {
     match error {
         ClaimError::Closing => PyRuntimeError::new_err("Connection is closing"),
@@ -56,15 +61,18 @@ fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static s
     }
 }
 
+/// Converts a failed cursor operation claim into a Python error.
 fn map_claim_error(error: ClaimError) -> PyErr {
     map_claim_error_with_busy_message(error, "Connection is busy with another cursor operation")
 }
 
+/// Logs a TDS execution failure and exposes it as a Python runtime error.
 fn map_execute_error(error: impl std::fmt::Display) -> PyErr {
     tracing::error!("PyAsyncCursor::execute: failed: {error}");
     PyRuntimeError::new_err(format!("Query execution failed: {error}"))
 }
 
+/// Releases an execute or close claim and poisons the session if the future is interrupted.
 struct ExecuteGuard {
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
@@ -72,6 +80,7 @@ struct ExecuteGuard {
 }
 
 impl ExecuteGuard {
+    /// Guards an operation claim already acquired from the session state.
     fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
         Self {
             session_state,
@@ -80,12 +89,14 @@ impl ExecuteGuard {
         }
     }
 
+    /// Completes execution and transitions ownership to fetching or idle.
     fn complete(&mut self, has_open_batch: bool) {
         self.session_state
             .finish_execute(self.operation_id, has_open_batch);
         self.completed = true;
     }
 
+    /// Releases ownership after an outcome that was handled without interruption.
     fn fail(&mut self) {
         self.session_state.release_operation(self.operation_id);
         self.completed = true;
@@ -93,6 +104,7 @@ impl ExecuteGuard {
 }
 
 impl Drop for ExecuteGuard {
+    /// Marks the session broken when cancellation or unwinding interrupts an operation.
     fn drop(&mut self) {
         if !self.completed {
             self.session_state.mark_broken();
@@ -472,6 +484,8 @@ impl PyAsyncCursor {
     // - Convert TVP row iterators directly instead of collecting Bound cells first.
     // - Add Criterion benchmarks for placeholder scanning, scalar binding,
     //   prepared reuse, and representative TVP row counts.
-    // - If placeholder benchmarks justify it, cache rewritten SQL and marker
-    //   metadata with bounded storage and explicit parameter-style invalidation.
+    // - Placeholder rewriting still runs under the GIL before the awaitable is
+    //   returned. If benchmarks of the optimized scanner justify caching, share
+    //   rewritten SQL and marker metadata at connection scope, use borrowed raw
+    //   SQL plus parameter style for hit-path lookup, and bound retained bytes.
 }
