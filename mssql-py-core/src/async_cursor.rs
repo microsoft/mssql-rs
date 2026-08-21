@@ -348,8 +348,9 @@ impl CursorCleanup {
         };
 
         cleanup_guard.fail(has_open_batch);
-        result?;
+        // Cleanup consumes the close attempt even when draining or unprepare fails.
         self.closed.store(true, Ordering::Release);
+        result?;
         Ok(())
     }
 }
@@ -474,6 +475,10 @@ impl Drop for PyAsyncCursor {
         let session_state = self.session_state.clone();
         let claim = match session_state.claim_cursor_close(self.cursor_id) {
             Ok(claim) => claim,
+            Err(ClaimError::Closing | ClaimError::Closed) => {
+                self.closed.store(true, Ordering::Release);
+                return;
+            }
             Err(error) => {
                 tracing::warn!("PyAsyncCursor finalizer could not claim cleanup: {error:?}");
                 session_state.abandon_cursor(self.cursor_id);
@@ -733,6 +738,12 @@ impl PyAsyncCursor {
         let session_state = cleanup.session_state.clone();
         let claim = match session_state.claim_cursor_close(cleanup.cursor_id) {
             Ok(claim) => claim,
+            Err(ClaimError::Closing | ClaimError::Closed) => {
+                cleanup.closed.store(true, Ordering::Release);
+                return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                    Python::attach(|py| Ok(py.None()))
+                });
+            }
             Err(error) => {
                 cleanup_started.store(false, Ordering::Release);
                 return Err(map_claim_error(error));

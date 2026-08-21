@@ -911,6 +911,21 @@ def test_cursor_close_drains_results_and_rejects_further_use(client_context):
 
 
 @pytest.mark.integration
+def test_cursor_close_after_connection_close_is_noop(client_context):
+    async def run():
+        conn = await connect(client_context)
+        cursor = conn.cursor()
+        await conn.close()
+
+        assert await cursor.close() is None
+        assert await cursor.close() is None
+        with pytest.raises(RuntimeError, match="Cursor is closed"):
+            await cursor.execute("SELECT 1")
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_dropped_cursor_with_unread_rows_does_not_leave_connection_busy(client_context):
     async def run():
         conn = await connect(client_context)
