@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::future::Future;
+use std::mem::MaybeUninit;
 
 use crate::core::TdsResult;
 
@@ -91,6 +92,26 @@ macro_rules! define_tds_packet_reader {
                 &mut self,
                 buffer: &mut [u8],
             ) -> impl Future<Output = TdsResult<usize>> + Send;
+            /// Fills a possibly-uninitialized byte buffer.
+            fn read_bytes_uninit(
+                &mut self,
+                buffer: &mut [MaybeUninit<u8>],
+            ) -> impl Future<Output = TdsResult<usize>> + Send
+            where
+                Self: Send,
+            {
+                async move {
+                    buffer.fill(MaybeUninit::new(0));
+                    // SAFETY: every element was initialized immediately above.
+                    let initialized = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            buffer.as_mut_ptr().cast::<u8>(),
+                            buffer.len(),
+                        )
+                    };
+                    self.read_bytes(initialized).await
+                }
+            }
             fn read_u8_varbyte(&mut self) -> impl Future<Output = TdsResult<Vec<u8>>> + Send;
             #[allow(dead_code)]
             fn read_u16_varbyte(&mut self) -> impl Future<Output = TdsResult<Vec<u8>>> + Send;
