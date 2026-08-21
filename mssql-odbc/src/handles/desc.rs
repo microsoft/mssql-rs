@@ -27,6 +27,22 @@
 //! (`api::col_attribute`), and duplicating that mapping into descriptor
 //! storage ahead of the AB#47437 IRD-population design would risk the two
 //! diverging.
+//!
+//! Same scope note applies to four `DescHeader` fields the ODBC spec defines
+//! as *aliases* of statement attributes rather than as independent storage:
+//! `SQL_DESC_ARRAY_SIZE` (`SQL_ATTR_ROW_ARRAY_SIZE` / `PARAMSET_SIZE`),
+//! `SQL_DESC_BIND_TYPE` (`SQL_ATTR_ROW_BIND_TYPE`), `SQL_DESC_ARRAY_STATUS_PTR`
+//! (`SQL_ATTR_ROW_STATUS_PTR`), and `SQL_DESC_ROWS_PROCESSED_PTR`
+//! (`SQL_ATTR_ROWS_FETCHED_PTR`). `DescHeader` stores these independently of
+//! `StmtState`'s equivalent fields (`set_stmt_attr.rs`), so a
+//! `SQLSetStmtAttrW`/`SQLGetDescFieldW` pair (or the reverse) on the same
+//! logical value currently sees two unaliased copies. Nothing reads
+//! `DescHeader`'s copies outside `get_desc_field.rs`/`set_desc_field.rs`
+//! today, so this is silent rather than wrong yet — it needs wiring the two
+//! together (or picking one as the sole owner) before a block-fetch consumer
+//! reads `StmtState`'s copies and the descriptor's view of the same
+//! attribute quietly diverges. Tracked under the same AB#47437 aliasing
+//! work as the IRD/IPD record population above.
 
 use std::sync::Mutex;
 
@@ -367,10 +383,14 @@ pub(crate) fn classify_field(kind: DescKind, field: SqlUSmallInt) -> Option<Fiel
         // ---- Record fields specific to implementation descriptors -------
         SQL_DESC_NULLABLE if is_ird || is_ipd => (Record, false),
         SQL_DESC_NAME if is_ird || is_ipd => (Record, is_ipd),
-        // SQL_DESC_UNNAMED is always derived from `name` on read (see
-        // `DescRecord::name`'s doc comment) — never stored, so never
-        // writable, unlike SQL_DESC_NAME itself.
-        SQL_DESC_UNNAMED if is_ird || is_ipd => (Record, false),
+        // SQL_DESC_UNNAMED is derived from `name` on read (see
+        // `DescRecord::name`'s doc comment) rather than stored separately,
+        // but it is writable on IPD: the ODBC reference and msodbcsql's
+        // `SetIPDField` (`sqlcdesc.cpp:4873-4884`) both make `SQL_UNNAMED`
+        // (and only that value) a valid write that clears the parameter
+        // name — see `set_unnamed` in set_desc_field.rs. Read-only on IRD,
+        // matching SQL_DESC_NAME's own IRD/IPD split above.
+        SQL_DESC_UNNAMED if is_ird || is_ipd => (Record, is_ipd),
         SQL_DESC_PARAMETER_TYPE if is_ipd => (Record, true),
 
         _ => return None,
@@ -502,21 +522,25 @@ mod tests {
     }
 
     /// Regression: `SQL_DESC_UNNAMED` is derived from `name` on read
-    /// (`DescRecord`'s doc comment), never stored, so it must never be
-    /// writable — including on IPD, unlike `SQL_DESC_NAME` itself. Getting
-    /// this wrong let a `SQLSetDescFieldW(..., SQL_DESC_UNNAMED, ...)` call
-    /// reach `set_record_field`'s unmapped-field fallback instead of the
-    /// normal read-only-field diagnostic.
+    /// (`DescRecord`'s doc comment) but is writable on IPD to `SQL_UNNAMED`
+    /// — the ODBC reference and msodbcsql's `SetIPDField` both make this the
+    /// one legal write for the field (see `set_unnamed` in
+    /// set_desc_field.rs). Read-only on IRD and on the application
+    /// descriptors, where the field isn't valid at all.
     #[test]
-    fn unnamed_is_never_writable() {
+    fn unnamed_is_writable_only_on_ipd() {
         assert!(classify_field(DescKind::AppRow, SQL_DESC_UNNAMED).is_none());
         assert!(classify_field(DescKind::AppParam, SQL_DESC_UNNAMED).is_none());
-        for kind in [DescKind::ImpRow, DescKind::ImpParam] {
-            assert!(
-                !classify_field(kind, SQL_DESC_UNNAMED).unwrap().writable,
-                "{kind:?}"
-            );
-        }
+        assert!(
+            !classify_field(DescKind::ImpRow, SQL_DESC_UNNAMED)
+                .unwrap()
+                .writable
+        );
+        assert!(
+            classify_field(DescKind::ImpParam, SQL_DESC_UNNAMED)
+                .unwrap()
+                .writable
+        );
     }
 
     #[test]

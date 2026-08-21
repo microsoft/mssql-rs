@@ -284,32 +284,6 @@ fn sql_get_stmt_attr_w_safe(
     attribute: SqlInteger,
     value_ptr: SqlPointer,
 ) -> SqlReturn {
-    // The four implicit descriptor handles are set once in StmtHandle::new
-    // and never reassigned (SQLSetStmtAttrW treats SQL_ATTR_APP_ROW_DESC /
-    // APP_PARAM_DESC as a no-op, matching this driver's forward-only,
-    // implicit-descriptor-only design), so answering them doesn't need the
-    // statement mutex at all — return them directly and keep the lock scoped
-    // to the mutable statement attributes below.
-    match attribute {
-        SQL_ATTR_APP_ROW_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
-            return SQL_SUCCESS;
-        },
-        SQL_ATTR_APP_PARAM_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.apd);
-            return SQL_SUCCESS;
-        },
-        SQL_ATTR_IMP_ROW_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.ird);
-            return SQL_SUCCESS;
-        },
-        SQL_ATTR_IMP_PARAM_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
-            return SQL_SUCCESS;
-        },
-        _ => {}
-    }
-
     let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLGetStmtAttrW: stmt mutex poisoned");
         return SQL_ERROR;
@@ -344,6 +318,24 @@ fn sql_get_stmt_attr_w_safe(
         },
         SQL_ATTR_PARAMSET_SIZE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, 1);
+        },
+        // The four implicit descriptors (ARD/APD/IRD/IPD). They live on
+        // `StmtHandle` itself, not behind `inner` (set once in `new()`,
+        // never reassigned — see that field's doc comment), so nothing
+        // here needs the lock beyond the diagnostics reset above, which
+        // every attribute on this call shares regardless of which one was
+        // requested.
+        SQL_ATTR_APP_ROW_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
+        },
+        SQL_ATTR_APP_PARAM_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.apd);
+        },
+        SQL_ATTR_IMP_ROW_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ird);
+        },
+        SQL_ATTR_IMP_PARAM_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
         },
         _ => {
             error!(
@@ -750,5 +742,38 @@ mod tests {
                 assert_ne!(all[i], all[j], "descriptors {i} and {j} alias");
             }
         }
+    }
+
+    /// Regression: querying one of the four implicit descriptor attributes
+    /// must clear stale diagnostics from an earlier failed call on this
+    /// statement, same as every other `SQLGetStmtAttrW` attribute — ODBC
+    /// resets a handle's diagnostic records at the start of every call
+    /// except `SQLGetDiagRec`/`SQLGetDiagField`. An earlier implementation
+    /// answered these four attributes before the lock (and `free_errors`)
+    /// were reached, so a stale diagnostic from a prior failure survived a
+    /// subsequent `SQLGetStmtAttrW(SQL_ATTR_APP_PARAM_DESC)` call.
+    #[test]
+    fn get_descriptor_attribute_clears_stale_diagnostics() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // Any unrecognized attribute posts a diagnostic on this statement.
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                0x7FFF,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(!stmt.inner.lock().unwrap().diag_records.is_empty());
+
+        let (rc, _) = read_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert!(
+            stmt.inner.lock().unwrap().diag_records.is_empty(),
+            "stale diagnostic from the prior failure was not cleared"
+        );
     }
 }

@@ -24,11 +24,11 @@ use crate::api::odbc_types::{
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
     SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH,
     SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
-    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_ERROR, SQL_INVALID_HANDLE,
-    SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_PREC_NUMERIC,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP,
-    SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
-    SqlWChar,
+    SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT,
+    SQL_PREC_NUMERIC, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TYPE_DATE, SQL_TYPE_TIME,
+    SQL_TYPE_TIMESTAMP, SQL_UNNAMED, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_CANNOT_MODIFY_IRD, ERR_INCONSISTENT_DESCRIPTOR_INFO, ERR_INVALID_ATTRIBUTE_VALUE,
@@ -219,7 +219,10 @@ fn set_header_field(
             let requested = value_ptr as SqlULen;
             // Zero is not a valid rowset size — matches this crate's own
             // SQL_ATTR_ROW_ARRAY_SIZE validation (set_stmt_attr.rs) and the
-            // ODBC-mandated minimum of 1 row per rowset.
+            // ODBC-mandated minimum of 1 row per rowset. Deliberate
+            // divergence from msodbcsql, which stores 0 unvalidated and only
+            // clamps the upper bound (`sqlcdesc.cpp:4161-4167`) — do not
+            // "fix" this back toward msodbcsql's behavior.
             if requested == 0 {
                 error!("SQLSetDescFieldW: SQL_DESC_ARRAY_SIZE of 0 is invalid");
                 post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
@@ -301,6 +304,7 @@ fn set_record_field(
         SQL_DESC_PRECISION => set_precision(state, record_number, value_ptr),
         SQL_DESC_SCALE => set_scale(state, record_number, value_ptr),
         SQL_DESC_NAME => set_name(state, record_number, value_ptr, buffer_length),
+        SQL_DESC_UNNAMED => set_unnamed(state, record_number, value_ptr),
         SQL_DESC_PARAMETER_TYPE => set_parameter_type(state, record_number, value_ptr),
         SQL_DESC_DATA_PTR => set_data_ptr(state, record_number, value_ptr),
         SQL_DESC_INDICATOR_PTR => {
@@ -521,6 +525,20 @@ fn set_scale(
 /// changes to `SQL_C_NUMERIC` would otherwise go unnoticed; `DATA_PTR` is
 /// the last field mssql-python's binding sequence sets, so this is the
 /// natural point to catch it without deferring all the way to execute time.
+///
+/// Deliberately unconditional on whether `value_ptr` is null (an unbind).
+/// `CheckADDescRecConsistency` has an early `rgbValue == NOT_BOUND` (i.e.
+/// null) return, but msodbcsql's actual `SetADField` caller for
+/// `SQL_DESC_DATA_PTR` (`sqlcdesc.cpp:4219-4235`) defeats that shortcut on
+/// purpose: it forces `rgbValue` to a non-null sentinel before calling the
+/// check, and only assigns the real (possibly null) requested value if the
+/// check passes — so msodbcsql validates precision/scale on every
+/// `SQL_DESC_DATA_PTR` write, bind *or* unbind, matching this
+/// implementation. `NOT_BOUND`'s early return is real, but it is only ever
+/// reachable from the whole-descriptor sweep at execute time
+/// (`CheckADDescConsistency`, over each record's live `rgbValue`), a
+/// different call site skipping records nothing is currently bound to —
+/// not from a single `SQLSetDescField(SQL_DESC_DATA_PTR, ...)` call.
 fn set_data_ptr(
     state: &mut DescState,
     record_number: SqlSmallInt,
@@ -583,10 +601,38 @@ fn set_name(
     write_record_field(state, record_number, |r| r.name = name)
 }
 
+/// `SQL_DESC_UNNAMED` write (IPD only — `classify_field` marks it read-only
+/// everywhere else). The field is derived from `name` on read rather than
+/// stored separately, but `SQL_UNNAMED` is a valid write that clears the
+/// parameter name; any other value is rejected. Matches the ODBC reference
+/// (*"A driver returns SQLSTATE HY091 ... if an application attempts to set
+/// the SQL_DESC_UNNAMED field of an IPD to SQL_NAMED"*) and msodbcsql's
+/// `SetIPDField` (`sqlcdesc.cpp:4873-4884`).
+fn set_unnamed(
+    state: &mut DescState,
+    record_number: SqlSmallInt,
+    value_ptr: SqlPointer,
+) -> SqlReturn {
+    if value_ptr as SqlLen != SQL_UNNAMED {
+        error!("SQLSetDescFieldW: SQL_DESC_UNNAMED only accepts SQL_UNNAMED");
+        post_diag(state, ERR_INVALID_DESCRIPTOR_FIELD);
+        return SQL_ERROR;
+    }
+    write_record_field(state, record_number, |r| r.name.clear())
+}
+
 /// `SQL_DESC_PARAMETER_TYPE` write (IPD only). Validated against the three
 /// ODBC 3.x `SQL_PARAM_*` values this driver can act on — an arbitrary
 /// `SqlSmallInt` that merely fits the wire width (e.g. `9999`) is not a
 /// real parameter type and must not be stored as though it were.
+///
+/// Two deliberate divergences from msodbcsql's `SetIPDField`
+/// (`sqlcdesc.cpp:4855-4870`), neither exercised by an e2e parity test:
+/// msodbcsql returns `HY092` here, not `HY105` (this crate's choice is the
+/// more specific SQLSTATE the ODBC reference itself documents for this
+/// field); and msodbcsql also accepts `SQL_PARAM_INPUT_OUTPUT_STREAM` /
+/// `SQL_PARAM_OUTPUT_STREAM`, both valid per the reference — rejected here
+/// since this driver has no streamed-parameter support to back them.
 fn set_parameter_type(
     state: &mut DescState,
     record_number: SqlSmallInt,
@@ -618,7 +664,7 @@ mod tests {
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
         SQL_ATTR_APP_PARAM_DESC, SQL_C_LONG, SQL_C_WCHAR, SQL_INTEGER, SQL_INTERVAL_YEAR,
-        SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_TYPE_DATE, SqlNumericStruct,
+        SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_TYPE_DATE, SqlNumericStruct,
     };
     use crate::api::set_stmt_attr::sql_get_stmt_attr_w;
     use crate::error::diag::DiagRecord;
@@ -1261,16 +1307,40 @@ mod tests {
         assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_NULL_POINTER);
     }
 
-    /// Regression: `SQL_DESC_UNNAMED` is derived from `name`, never stored,
-    /// so it must never be writable (including on IPD) — attempting to set
-    /// it used to reach `set_record_field`'s unmapped-field fallback.
+    /// Regression: `SQL_DESC_UNNAMED` is derived from `name` on read, but is
+    /// writable on IPD to `SQL_UNNAMED` — the ODBC reference and msodbcsql's
+    /// `SetIPDField` both make this the one legal write for the field,
+    /// clearing the parameter name. Any other value (e.g. `SQL_NAMED`) is
+    /// rejected with HY091.
     #[test]
-    fn set_desc_field_unnamed_is_never_writable() {
+    fn set_desc_field_unnamed_accepts_only_sql_unnamed() {
         let h = TestHandles::with_env_dbc_stmt();
-        let ret =
-            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_UNNAMED, 1isize as SqlPointer, 0) };
+        // NUL-terminated: SQL_NTS tells read_utf16 to scan for the
+        // terminator, so the buffer must actually have one.
+        let name: Vec<u16> = "p1".encode_utf16().chain(std::iter::once(0)).collect();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_NAME,
+                name.as_ptr() as SqlPointer,
+                SQL_NTS.into(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.ipd(), 1, SQL_DESC_UNNAMED), 0);
+
+        let ret = unsafe {
+            sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_UNNAMED, SQL_NAMED as SqlPointer, 0)
+        };
         assert_eq!(ret, SQL_ERROR);
         assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_DESCRIPTOR_FIELD);
+
+        let ret = unsafe {
+            sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_UNNAMED, SQL_UNNAMED as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.ipd(), 1, SQL_DESC_UNNAMED), 1);
     }
 
     #[test]
