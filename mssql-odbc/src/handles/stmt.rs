@@ -295,6 +295,27 @@ impl InertStmtAttrs {
             None => false,
         }
     }
+
+    /// Reads the byte offset `SQL_ATTR_PARAM_BIND_OFFSET_PTR` currently points
+    /// at, or 0 when the application has not set one.
+    ///
+    /// The attribute holds a *pointer to* the offset rather than the offset
+    /// itself, so the application can move every binding by writing one
+    /// `SQLLEN` between executions. It is therefore read at execute time, not
+    /// at set time.
+    ///
+    /// # Safety
+    /// When set, the pointer must address a live, aligned `SQLLEN` for the
+    /// duration of the execution, per the `SQLSetStmtAttr` contract.
+    pub(crate) unsafe fn param_bind_offset(&self) -> isize {
+        let ptr = self
+            .get(odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR)
+            .unwrap_or(0) as *const odbc_types::SqlLen;
+        if ptr.is_null() {
+            return 0;
+        }
+        unsafe { ptr.read() }
+    }
 }
 
 /// One data-at-execution parameter: which binding it refers to and how many

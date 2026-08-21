@@ -62,9 +62,13 @@
 //   42. MaxRowsBoundsTheResultSet                      - the cap is enforced
 //   43. MaxRowsAppliesToEachResultSet                  - per result set, not per stmt
 //   44. MaxRowsCutoffLeavesTheCursorOffTheRow          - cap end == natural end
+//   45. MaxRowsBoundsCatalogResultSets                 - the cap reaches SQLTables too
+//   46. ParamBindOffsetShiftsTheBoundBuffers           - the offset is honored
 
 #include "odbc_test_fixture.h"
 
+#include <cstring>
+#include <functional>
 #include <string>
 
 #ifndef SQL_ATTR_CURRENT_CATALOG
@@ -1077,5 +1081,121 @@ TEST_F(AttributesTest, MaxRowsCutoffLeavesTheCursorOffTheRow) {
         EXPECT_EQ("24000", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 
         SQLCloseCursor(stmt_);
+    }
+}
+
+// -------------------------------------------------------------------
+// 45. MAX_ROWS bounds catalog result sets as well.
+//
+// Catalog functions are metadata RPCs whose rows come back through the
+// ordinary fetch path, and msodbcsql caps them exactly like a query. A
+// driver that special-cased catalog cursors would return more rows than
+// the application asked for.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MaxRowsBoundsCatalogResultSets) {
+    struct Case {
+        const char* label;
+        std::function<SQLRETURN()> call;
+    };
+    const Case cases[] = {
+        {"SQLTables", [&] {
+             return SQLTables(stmt_, nullptr, 0, nullptr, 0, nullptr, 0,
+                              nullptr, 0);
+         }},
+        {"SQLColumns", [&] {
+             return SQLColumns(stmt_, nullptr, 0, nullptr, 0, nullptr, 0,
+                               nullptr, 0);
+         }},
+        {"SQLGetTypeInfo", [&] {
+             return SQLGetTypeInfo(stmt_, SQL_ALL_TYPES);
+         }},
+    };
+
+    auto count_open_cursor = [&] {
+        int rows = 0;
+        while (SQL_SUCCEEDED(SQLFetch(stmt_))) {
+            ++rows;
+        }
+        return rows;
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 2));
+        ASSERT_SQL_OK(c.call(), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(2, count_open_cursor());
+        SQLCloseCursor(stmt_);
+    }
+
+    // And the cap really was the reason: without it there is more to read.
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 0));
+    ASSERT_SQL_OK(SQLGetTypeInfo(stmt_, SQL_ALL_TYPES), SQL_HANDLE_STMT, stmt_);
+    EXPECT_GT(count_open_cursor(), 2);
+    SQLCloseCursor(stmt_);
+}
+
+// -------------------------------------------------------------------
+// 46. SQL_ATTR_PARAM_BIND_OFFSET_PTR shifts the bound buffers.
+//
+// The attribute stores a pointer to an SQLLEN, and the driver adds that
+// many bytes to the parameter's value pointer and its length/indicator
+// pointer at execute time. Accepting the attribute and ignoring it would
+// silently send the wrong value, so this checks the parameter the server
+// actually received rather than a round-trip of the attribute.
+//
+// Both buffers advance by one offset, so they are laid out in a single
+// struct whose size is the stride.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamBindOffsetShiftsTheBoundBuffers) {
+#pragma pack(push, 8)
+    struct Slot {
+        SQLLEN indicator;
+        char text[8];
+    };
+#pragma pack(pop)
+
+    Slot slots[2] = {};
+    slots[0].indicator = 4;
+    std::memcpy(slots[0].text, "AAAA", 4);
+    slots[1].indicator = 4;
+    std::memcpy(slots[1].text, "BBBB", 4);
+
+    const SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
+
+    struct Case {
+        SQLLEN offset;
+        const char* expected;
+    };
+    const Case cases[] = {
+        {0, "AAAA"},
+        {static_cast<SQLLEN>(sizeof(Slot)), "BBBB"},
+        {0, "AAAA"},  // and it is not sticky
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.offset);
+        SQLLEN offset = c.offset;
+        EXPECT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+                                     &offset, 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                       SQL_VARCHAR, 8, 0, slots[0].text,
+                                       sizeof(slots[0].text),
+                                       &slots[0].indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(
+            SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        char received[32] = {};
+        SQLLEN got = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, received,
+                                 sizeof(received), &got),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_STREQ(c.expected, received);
+
+        SQLCloseCursor(stmt_);
+        SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
     }
 }
