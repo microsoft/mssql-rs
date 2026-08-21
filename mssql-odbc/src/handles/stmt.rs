@@ -207,6 +207,21 @@ pub(crate) struct StmtState {
     /// Statement attributes msodbcsql accepts and round-trips but that have no
     /// effect on this driver's forward-only, read-only cursor.
     pub(crate) inert_attrs: InertStmtAttrs,
+    /// SQL Server vendor statement attributes (`SQL_SOPT_SS_*`), which unlike
+    /// the inert set validate their value before storing it.
+    pub(crate) vendor_attrs: VendorStmtAttrs,
+    /// Query-notification message text (`SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT`)
+    /// and options (`..._OPTIONS`). The only two string-valued statement
+    /// attributes, so they sit beside [`Self::vendor_attrs`] rather than in it.
+    /// Stored and round-tripped; query notifications themselves are a separate
+    /// feature.
+    pub(crate) qn_msgtext: String,
+    pub(crate) qn_options: String,
+    /// Ordinal of the command being processed within the current batch, which
+    /// is what `SQL_SOPT_SS_CURRENT_COMMAND` reports: `0` before execute, then
+    /// one per result set begun. msodbcsql holds the final value once the batch
+    /// is exhausted rather than advancing past it.
+    pub(crate) current_command: SqlULen,
 }
 
 /// Statement attributes msodbcsql stores and round-trips without acting on,
@@ -315,6 +330,163 @@ impl InertStmtAttrs {
     }
 }
 
+/// How msodbcsql validates a vendor statement attribute's value.
+///
+/// Each rule was established by sweeping the value space against msodbcsql 18
+/// and recording where it flipped from success to `HY024`, not by reading the
+/// documented constants — two attributes accept values the headers do not name,
+/// and two reject every value the headers do name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueRule {
+    /// Accepts exactly these values.
+    OneOf(&'static [SqlULen]),
+    /// Accepts any value in this inclusive range.
+    Range(SqlULen, SqlULen),
+    /// Recognized, but refuses every value. Both attributes in this class name
+    /// features the driver does not implement (table-valued parameters, Always
+    /// Encrypted), and msodbcsql itself refuses them here too — including their
+    /// documented "off" value, and including `SQL_SOPT_SS_COLUMN_ENCRYPTION` on
+    /// a connection opened with `ColumnEncryption=Enabled`.
+    Rejected,
+    /// Reported by the get path but not settable. Set is left to fall through
+    /// to the identifier-rejection path, because msodbcsql answers `HY092`
+    /// ("invalid attribute identifier") rather than `HY024` for these.
+    GetOnly,
+}
+
+/// Vendor statement attributes, their msodbcsql defaults, and the values
+/// msodbcsql accepts for each.
+///
+/// Held as one table for the same reason as [`INERT_STMT_ATTRS`]: the default
+/// and the accept rule are both measurements, and keeping them adjacent to the
+/// identifier stops one from drifting without the other.
+const VENDOR_STMT_ATTRS: &[(SqlInteger, SqlULen, ValueRule)] = &[
+    (
+        odbc_types::SQL_SOPT_SS_TEXTPTR_LOGGING,
+        odbc_types::SQL_TL_ON,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_CURRENT_COMMAND,
+        0,
+        ValueRule::GetOnly,
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_HIDDEN_COLUMNS,
+        0,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_NOBROWSETABLE,
+        0,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_REGIONALIZE,
+        0,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_CURSOR_OPTIONS,
+        0,
+        ValueRule::Range(0, odbc_types::SQL_CO_MAX),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_NOCOUNT_STATUS,
+        odbc_types::SQL_NC_ON,
+        ValueRule::GetOnly,
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_DEFER_PREPARE,
+        odbc_types::SQL_DP_ON,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT,
+        odbc_types::SQL_QN_TIMEOUT_DEFAULT,
+        // Zero is rejected, unlike most ODBC timeouts where it means "no limit".
+        ValueRule::Range(1, u32::MAX as SqlULen),
+    ),
+    (odbc_types::SQL_SOPT_SS_PARAM_FOCUS, 0, ValueRule::Rejected),
+    (
+        odbc_types::SQL_SOPT_SS_NAME_SCOPE,
+        0,
+        ValueRule::Range(0, odbc_types::SQL_SS_NAME_SCOPE_MAX),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_COLUMN_ENCRYPTION,
+        0,
+        ValueRule::Rejected,
+    ),
+];
+
+/// Values for the [`VENDOR_STMT_ATTRS`] identifiers, positionally aligned with
+/// that table.
+#[derive(Debug, Clone)]
+pub(crate) struct VendorStmtAttrs([SqlULen; VENDOR_STMT_ATTRS.len()]);
+
+impl Default for VendorStmtAttrs {
+    fn default() -> Self {
+        let mut values = [0; VENDOR_STMT_ATTRS.len()];
+        for (slot, (_, default, _)) in values.iter_mut().zip(VENDOR_STMT_ATTRS) {
+            *slot = *default;
+        }
+        Self(values)
+    }
+}
+
+impl VendorStmtAttrs {
+    /// The identifiers this store covers, in table order. Test-only: it exists
+    /// so a new entry cannot be added without an asserted msodbcsql default.
+    #[cfg(test)]
+    pub(crate) fn identifiers() -> impl Iterator<Item = SqlInteger> {
+        VENDOR_STMT_ATTRS.iter().map(|(id, _, _)| *id)
+    }
+
+    fn index_of(attribute: SqlInteger) -> Option<usize> {
+        VENDOR_STMT_ATTRS
+            .iter()
+            .position(|(id, _, _)| *id == attribute)
+    }
+
+    /// Whether `attribute` is a vendor attribute the set path owns.
+    ///
+    /// False for the get-only identifiers, so they fall through to the
+    /// identifier-rejection path and answer `HY092` rather than `HY024`.
+    pub(crate) fn is_settable(attribute: SqlInteger) -> bool {
+        Self::index_of(attribute)
+            .is_some_and(|i| !matches!(VENDOR_STMT_ATTRS[i].2, ValueRule::GetOnly))
+    }
+
+    /// Returns the stored value, or `None` when `attribute` is not a vendor
+    /// statement attribute.
+    pub(crate) fn get(&self, attribute: SqlInteger) -> Option<SqlULen> {
+        Self::index_of(attribute).map(|i| self.0[i])
+    }
+
+    /// Validates `value` against the attribute's measured rule, storing it and
+    /// returning `true` on success.
+    ///
+    /// A rejected value leaves the previous one in place, which is what
+    /// msodbcsql does — a failed set is not a reset. Callers are expected to
+    /// have checked [`Self::is_settable`]; anything else is reported as
+    /// rejected rather than silently accepted.
+    pub(crate) fn set(&mut self, attribute: SqlInteger, value: SqlULen) -> bool {
+        let Some(i) = Self::index_of(attribute) else {
+            return false;
+        };
+        let accepted = match VENDOR_STMT_ATTRS[i].2 {
+            ValueRule::OneOf(allowed) => allowed.contains(&value),
+            ValueRule::Range(lo, hi) => (lo..=hi).contains(&value),
+            ValueRule::Rejected | ValueRule::GetOnly => false,
+        };
+        if accepted {
+            self.0[i] = value;
+        }
+        accepted
+    }
+}
+
 /// A prepared statement bundled with the marker count of its rewritten SQL, so
 /// the two can only be set together (the count is a property of the rewritten
 /// `@P1..@Pn` text and must always agree with it).
@@ -374,14 +546,32 @@ impl StmtState {
     }
 
     /// Makes `metadata` the current result set, restarting the
-    /// `SQL_ATTR_MAX_ROWS` budget.
+    /// `SQL_ATTR_MAX_ROWS` budget and advancing the batch command ordinal.
     ///
     /// The cap is per result set, so every path that advances onto a new one
     /// must come through here; assigning `column_metadata` directly would leave
     /// a spent budget in place and truncate the next result set.
+    ///
+    /// This is the *advance* form, for `SQLMoreResults`. The first result set of
+    /// a new execution goes through [`Self::begin_batch`] instead, so that the
+    /// command ordinal restarts rather than climbing across executions.
     pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
         self.column_metadata = metadata;
         self.rows_returned = 0;
+        self.current_command += 1;
+    }
+
+    /// Makes `metadata` the first result set of a new execution.
+    ///
+    /// Identical to [`Self::begin_result_set`] except that the batch command
+    /// ordinal restarts, so `SQL_SOPT_SS_CURRENT_COMMAND` answers 1 on the
+    /// first result set of every execution. msodbcsql restarts it per execute
+    /// and holds the final value across `SQLCloseCursor` /
+    /// `SQLFreeStmt(SQL_CLOSE)`, so a statement handle reused for a second
+    /// query reports 1 again rather than continuing to climb.
+    pub(crate) fn begin_batch(&mut self, metadata: Vec<ColumnMetadata>) {
+        self.current_command = 0;
+        self.begin_result_set(metadata);
     }
 
     /// Whether `SQL_ATTR_MAX_ROWS` has already been satisfied for the current
@@ -496,6 +686,10 @@ impl StmtHandle {
                 max_rows: 0,
                 rows_returned: 0,
                 inert_attrs: InertStmtAttrs::default(),
+                vendor_attrs: VendorStmtAttrs::default(),
+                qn_msgtext: String::new(),
+                qn_options: String::new(),
+                current_command: 0,
             }),
         }
     }

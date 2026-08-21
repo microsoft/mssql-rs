@@ -315,6 +315,24 @@ pub(crate) fn unimplemented_attr_diag(
     }
 }
 
+/// The statement attribute identifiers msodbcsql recognizes for `op`.
+///
+/// Test-only. It backs the assertion that every statement attribute msodbcsql
+/// answers is also answered here, so adding a row to [`STMT_ATTRS`] without
+/// implementing it fails the suite rather than surfacing as `HYC00` to an
+/// application.
+#[cfg(test)]
+pub(crate) fn stmt_attr_ids(op: AttrOp) -> impl Iterator<Item = SqlInteger> {
+    let wanted = match op {
+        AttrOp::Set => OP_SET,
+        AttrOp::Get => OP_GET,
+    };
+    STMT_ATTRS
+        .iter()
+        .filter(move |(_, _, ops)| ops & wanted != 0)
+        .map(|(id, _, _)| *id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

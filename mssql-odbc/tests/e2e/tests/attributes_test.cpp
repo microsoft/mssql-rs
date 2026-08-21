@@ -44,7 +44,7 @@
 //   26. StatementOnlyAttributeIsRejectedOnAConnection  - scope-keyed HY092
 //   27. ConnectionOnlyAttributeIsRejectedOnAStatement  - the mirror image
 //   28. RowNumberIsNotSettable                         - operation-keyed HY092
-//   29. UnimplementedStatementAttributeIsNotImplemented- HYC00, not HY092
+//   29. EveryRecognizedStatementAttributeIsAnswered    - no HY092/HYC00 left
 //   30. UnimplementedConnectionAttributeIsNotImplemented - HYC00 on the get path
 //   31. HostileAttributePayloadDoesNotFault            - HYC00, session survives
 //   32. KeystoreDataGetIsRecognizedNotUnknown          - recognized on both, never HY092
@@ -64,6 +64,17 @@
 //   44. MaxRowsCutoffLeavesTheCursorOffTheRow          - cap end == natural end
 //   45. MaxRowsBoundsCatalogResultSets                 - the cap reaches SQLTables too
 //   46. ParamBindOffsetShiftsTheBoundBuffers           - the offset is honored
+//
+// SQL Server vendor statement attributes (SQL_SOPT_SS_*):
+//   47. VendorStatementAttributeDefaultsMatchMsodbcsql - four defaults are not 0
+//   48. VendorBooleanAttributesRejectOutOfRangeValues  - driver-sourced HY024
+//   49. VendorRangeAttributesAcceptTheirWholeRange     - masks, not enumerations
+//   50. QueryNotificationTimeoutRejectsZeroAndKeepsItsValue - 0 is not "no limit"
+//   51. VendorUnsupportedFeatureAttributesRefuseEveryValue - HY024, not HY092
+//   52. VendorGetOnlyAttributesAreNotSettable          - HY092, not HY024
+//   53. CurrentCommandTracksTheResultSetOrdinal        - per execute, not a flag
+//   54. QueryNotificationStringsFollowTheByteLengthContract - bytes, not chars
+//   55. IntegerGetsReportTheValueWidth                 - StringLength on success
 
 #include "odbc_test_fixture.h"
 
@@ -105,11 +116,24 @@ constexpr SQLINTEGER kEnlistInDtcAttr = 1207;
 // SQL_ATTR_ROW_ARRAY_SIZE (Variation 35).
 constexpr SQLINTEGER kRowsetSizeAttr = 9;
 
-// SQL_SOPT_SS_DEFER_PREPARE - a vendor statement attribute msodbcsql accepts
-// and this driver defers (plan §S6), so the two legs diverge by design. Its
-// ODBC-standard neighbours are all honoured after slice S4, which is why the
-// remaining "not implemented here" example has to come from the vendor band.
-constexpr SQLINTEGER kDeferPrepareAttr = 1232;
+// SQL_SOPT_SS_* - the SQL Server vendor statement attributes (slice S6).
+// They share the 1225-1238 band with the SQL_COPT_SS_* connection attributes,
+// so recognition is keyed by scope as well as identifier: 1232 is
+// DEFER_PREPARE on a statement and PRESERVE_CURSORS on a connection.
+constexpr SQLINTEGER kSsTextptrLogging = 1225;
+constexpr SQLINTEGER kSsCurrentCommand = 1226;
+constexpr SQLINTEGER kSsHiddenColumns = 1227;
+constexpr SQLINTEGER kSsNobrowsetable = 1228;
+constexpr SQLINTEGER kSsRegionalize = 1229;
+constexpr SQLINTEGER kSsCursorOptions = 1230;
+constexpr SQLINTEGER kSsNocountStatus = 1231;
+constexpr SQLINTEGER kSsDeferPrepare = 1232;
+constexpr SQLINTEGER kSsQnTimeout = 1233;
+constexpr SQLINTEGER kSsQnMsgtext = 1234;
+constexpr SQLINTEGER kSsQnOptions = 1235;
+constexpr SQLINTEGER kSsParamFocus = 1236;
+constexpr SQLINTEGER kSsNameScope = 1237;
+constexpr SQLINTEGER kSsColumnEncryption = 1238;
 
 // SQL_ATTR_ROW_NUMBER - readable but not settable on msodbcsql, which makes it
 // the statement-side mirror of the connection-side SQL_ATTR_QUERY_TIMEOUT
@@ -689,17 +713,48 @@ TEST_F(AttributesTest, RowNumberIsNotSettable) {
 }
 
 // -------------------------------------------------------------------
-// Variation 29 - a statement attribute msodbcsql implements and this
-// driver does not: HYC00, so a caller can tell "unavailable here" from
-// "never an attribute". msodbcsql returns success, hence the skip.
+// Variation 29 - every statement attribute msodbcsql recognizes on the
+// set path is recognized here too. Before slice S6 this variation held
+// the opposite: an attribute msodbcsql accepted and this driver answered
+// with HYC00. That class is now empty, so the useful assertion is that it
+// stays empty - a new row in the recognition table that nobody wired up
+// fails here rather than reaching an application as HYC00.
+//
+// Recognition is asserted independently of the value, because 21 of these
+// reject the probe value with HY024; what must never come back is HY092
+// ("no such attribute") or HYC00 ("known but unavailable").
+//
+// SQL_ATTR_ASYNC_STMT_EVENT (29) is deliberately absent: the Driver
+// Manager answers it itself with HY118 for any driver that does not
+// advertise asynchronous notification, so it never reaches either
+// driver's set path and cannot be compared here.
+//
+// The descriptor-handle attributes (SQL_ATTR_APP_ROW_DESC and its three
+// neighbours, 10010-10013) are absent for a different reason: their value
+// is a handle, and msodbcsql dereferences it without checking, so probing
+// them with a placeholder access-violates inside the driver. Recognition
+// of those is covered by the get path instead.
 // -------------------------------------------------------------------
-TEST_F(AttributesTest, UnimplementedStatementAttributeIsNotImplemented) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+TEST_F(AttributesTest, EveryRecognizedStatementAttributeIsAnswered) {
+    const SQLINTEGER attributes[] = {
+        -2,   -1,   0,    1,    2,    3,    4,    5,    6,    7,
+        8,    9,    10,   11,   12,   15,   16,   17,   18,   19,
+        20,   21,   22,   23,   24,   25,   26,   27,   1225, 1227,
+        1228, 1229, 1230, 1232, 1233, 1234, 1235, 1236, 1237, 1238,
+        10014,
+    };
 
-    EXPECT_EQ(SQL_ERROR,
-              SQLSetStmtAttr(stmt_, kDeferPrepareAttr,
-                             reinterpret_cast<SQLPOINTER>(1), 0));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    for (SQLINTEGER attribute : attributes) {
+        SCOPED_TRACE(attribute);
+        SQLRETURN rc = SetStmtULen(attribute, 1);
+        if (SQL_SUCCEEDED(rc)) {
+            continue;
+        }
+        const std::string state =
+            ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+        EXPECT_NE("HY092", state) << "identifier not recognized";
+        EXPECT_NE("HYC00", state) << "recognized but not implemented";
+    }
 }
 
 // -------------------------------------------------------------------
@@ -1201,8 +1256,270 @@ TEST_F(AttributesTest, ParamBindOffsetShiftsTheBoundBuffers) {
     }
 }
 
+
 // -------------------------------------------------------------------
-// 47. MAX_ROWS truncates a rowset rather than rounding it.
+// Variation 47 - the SQL Server vendor statement attributes have
+// defaults, and four of them are not 0. A caller that assumes a
+// zero-initialised block reads TEXTPTR_LOGGING, NOCOUNT_STATUS and
+// DEFER_PREPARE as "off" when the driver has them on, and sees a
+// query-notification timeout of 0 rather than the five-day default.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, VendorStatementAttributeDefaultsMatchMsodbcsql) {
+    struct Case {
+        SQLINTEGER attribute;
+        SQLULEN expected;
+        const char* label;
+    } const cases[] = {
+        {kSsTextptrLogging, 1, "TEXTPTR_LOGGING"},
+        {kSsCurrentCommand, 0, "CURRENT_COMMAND"},
+        {kSsHiddenColumns, 0, "HIDDEN_COLUMNS"},
+        {kSsNobrowsetable, 0, "NOBROWSETABLE"},
+        {kSsRegionalize, 0, "REGIONALIZE"},
+        {kSsCursorOptions, 0, "CURSOR_OPTIONS"},
+        {kSsNocountStatus, 1, "NOCOUNT_STATUS"},
+        {kSsDeferPrepare, 1, "DEFER_PREPARE"},
+        {kSsQnTimeout, 432000, "QUERYNOTIFICATION_TIMEOUT"},
+        {kSsParamFocus, 0, "PARAM_FOCUS"},
+        {kSsNameScope, 0, "NAME_SCOPE"},
+        {kSsColumnEncryption, 0, "COLUMN_ENCRYPTION"},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        EXPECT_EQ(c.expected, GetStmtULen(c.attribute));
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 48 - the boolean vendor attributes take 0 and 1 and reject
+// everything else with HY024. Unlike the standard attributes, this
+// rejection comes from the driver rather than the Driver Manager, which
+// does not know these identifiers and passes their values straight
+// through.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, VendorBooleanAttributesRejectOutOfRangeValues) {
+    const SQLINTEGER attributes[] = {kSsTextptrLogging, kSsHiddenColumns,
+                                     kSsNobrowsetable, kSsRegionalize,
+                                     kSsDeferPrepare};
+
+    for (SQLINTEGER attribute : attributes) {
+        SCOPED_TRACE(attribute);
+        for (SQLULEN value : {SQLULEN{0}, SQLULEN{1}}) {
+            EXPECT_EQ(SQL_SUCCESS, SetStmtULen(attribute, value));
+            EXPECT_EQ(value, GetStmtULen(attribute));
+        }
+
+        EXPECT_EQ(SQL_ERROR, SetStmtULen(attribute, 2));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 49 - CURSOR_OPTIONS is a three-bit mask rather than an
+// enumeration, so the whole 0..7 range is legal. Treating it as a set of
+// named constants would reject combinations a caller is entitled to pass.
+// NAME_SCOPE is the neighbouring bounded range, capped at 3.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, VendorRangeAttributesAcceptTheirWholeRange) {
+    for (SQLULEN value = 0; value <= 7; ++value) {
+        SCOPED_TRACE(value);
+        EXPECT_EQ(SQL_SUCCESS, SetStmtULen(kSsCursorOptions, value));
+        EXPECT_EQ(value, GetStmtULen(kSsCursorOptions));
+    }
+    EXPECT_EQ(SQL_ERROR, SetStmtULen(kSsCursorOptions, 8));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+
+    for (SQLULEN value = 0; value <= 3; ++value) {
+        SCOPED_TRACE(value);
+        EXPECT_EQ(SQL_SUCCESS, SetStmtULen(kSsNameScope, value));
+        EXPECT_EQ(value, GetStmtULen(kSsNameScope));
+    }
+    EXPECT_EQ(SQL_ERROR, SetStmtULen(kSsNameScope, 4));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+}
+
+// -------------------------------------------------------------------
+// Variation 50 - the query-notification timeout rejects 0, which is the
+// opposite of the ODBC convention where 0 on a timeout means "no limit".
+// A driver that copied that convention would silently accept a value
+// msodbcsql refuses. A refused set also leaves the previous value alone:
+// failing is not resetting.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, QueryNotificationTimeoutRejectsZeroAndKeepsItsValue) {
+    EXPECT_EQ(SQL_ERROR, SetStmtULen(kSsQnTimeout, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+    EXPECT_EQ(SQLULEN{432000}, GetStmtULen(kSsQnTimeout));
+
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(kSsQnTimeout, 60));
+    EXPECT_EQ(SQL_ERROR, SetStmtULen(kSsQnTimeout, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+    EXPECT_EQ(SQLULEN{60}, GetStmtULen(kSsQnTimeout));
+}
+
+// -------------------------------------------------------------------
+// Variation 51 - PARAM_FOCUS and COLUMN_ENCRYPTION are recognized
+// identifiers whose features are unavailable, so every value is refused
+// with HY024 rather than the identifier being refused with HY092. The
+// distinction matters: a caller probing for Always Encrypted must be able
+// to tell "this driver knows the attribute but cannot honour it" from
+// "this is not an attribute".
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, VendorUnsupportedFeatureAttributesRefuseEveryValue) {
+    for (SQLINTEGER attribute : {kSsParamFocus, kSsColumnEncryption}) {
+        SCOPED_TRACE(attribute);
+        for (SQLULEN value : {SQLULEN{0}, SQLULEN{1}, SQLULEN{2}}) {
+            EXPECT_EQ(SQL_ERROR, SetStmtULen(attribute, value));
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+        }
+        EXPECT_EQ(SQLULEN{0}, GetStmtULen(attribute));
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 52 - CURRENT_COMMAND and NOCOUNT_STATUS are readable but not
+// settable, and the refusal is HY092 rather than the HY024 of Variation
+// 49. This is the vendor-band mirror of Variation 28: recognition is
+// keyed by operation, so "not settable" reads as an unknown identifier
+// for the set operation, not as a bad value.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, VendorGetOnlyAttributesAreNotSettable) {
+    for (SQLINTEGER attribute : {kSsCurrentCommand, kSsNocountStatus}) {
+        SCOPED_TRACE(attribute);
+        EXPECT_EQ(SQL_ERROR, SetStmtULen(attribute, 0));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY092");
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 53 - CURRENT_COMMAND is the ordinal of the result set being
+// processed, not a boolean. It starts at 0, reaches 1 on the first result
+// set, advances with SQLMoreResults, holds once the batch is exhausted,
+// and restarts at 1 on the next execution. Modelling it as a bare counter
+// agrees on the first query and diverges on the second.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, CurrentCommandTracksTheResultSetOrdinal) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1; SELECT 2; SELECT 3");
+
+    EXPECT_EQ(SQLULEN{0}, GetStmtULen(kSsCurrentCommand)) << "fresh statement";
+
+    for (int pass = 0; pass < 2; ++pass) {
+        SCOPED_TRACE(pass);
+        ASSERT_SQL_OK(
+            SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+            SQL_HANDLE_STMT, stmt_);
+
+        for (SQLULEN expected = 1; expected <= 3; ++expected) {
+            EXPECT_EQ(expected, GetStmtULen(kSsCurrentCommand));
+            if (expected < 3) {
+                ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+
+        // Exhausting the batch holds the last ordinal rather than clearing it,
+        // and so does closing the cursor.
+        EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+        EXPECT_EQ(SQLULEN{3}, GetStmtULen(kSsCurrentCommand));
+
+        SQLCloseCursor(stmt_);
+        EXPECT_EQ(SQLULEN{3}, GetStmtULen(kSsCurrentCommand))
+            << "close does not reset";
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 54 - the two query-notification attributes are the only
+// string-valued statement attributes. StringLength is a byte count on
+// both legs, so an explicit 6 stores three characters, and a get always
+// reports the full byte width even when the buffer could not hold it.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
+    SQLTCHAR buffer[32] = {};
+    SQLINTEGER written = -1;
+
+    // Both default to empty.
+    for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
+        SCOPED_TRACE(attribute);
+        written = -1;
+        EXPECT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer, sizeof(buffer),
+                                     &written),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(0, written);
+    }
+
+    SqlTString value = ODBCTestUtils::ToSqlTStr("abcdefghij");
+    SQLTCHAR* msg = const_cast<SQLTCHAR*>(value.c_str());
+
+    // A NUL-terminated set round-trips, and the two are independent.
+    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, SQL_NTS));
+    written = -1;
+    EXPECT_SQL_OK(
+        SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(20, written);
+
+    written = -1;
+    EXPECT_SQL_OK(
+        SQLGetStmtAttr(stmt_, kSsQnOptions, buffer, sizeof(buffer), &written),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, written) << "options untouched by a msgtext set";
+
+    // StringLength on the set path is bytes, so 6 stores three characters.
+    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, 6));
+    written = -1;
+    EXPECT_SQL_OK(
+        SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(6, written);
+
+    // A short buffer truncates with 01004 but still reports the full width, so
+    // a caller can size a second call from the first one's answer. A null
+    // pointer is the documented length-only query.
+    EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, SQL_NTS));
+    written = -1;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, 10, &written));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(20, written);
+
+    written = -1;
+    EXPECT_EQ(SQL_SUCCESS,
+              SQLGetStmtAttr(stmt_, kSsQnMsgtext, nullptr, 0, &written));
+    EXPECT_EQ(20, written);
+}
+
+// -------------------------------------------------------------------
+// Variation 55 - a successful integer get writes the value's width into
+// StringLength, and a failed one leaves the caller's variable alone.
+// Skipping the write on success hands back whatever was in that memory.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, IntegerGetsReportTheValueWidth) {
+    const SQLINTEGER attributes[] = {
+        SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_MAX_ROWS,       SQL_ATTR_NOSCAN,
+        SQL_ATTR_CURSOR_TYPE,   SQL_ATTR_CONCURRENCY,    SQL_ATTR_ROW_ARRAY_SIZE,
+        SQL_ATTR_METADATA_ID,   kSsDeferPrepare,         kSsCurrentCommand,
+    };
+
+    for (SQLINTEGER attribute : attributes) {
+        SCOPED_TRACE(attribute);
+        SQLULEN value = 0;
+        SQLINTEGER written = -1;
+        EXPECT_SQL_OK(
+            SQLGetStmtAttr(stmt_, attribute, &value, sizeof(value), &written),
+            SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(static_cast<SQLINTEGER>(sizeof(SQLULEN)), written);
+    }
+
+    // SQL_ATTR_ROW_NUMBER without an open cursor fails (Variation 41), and the
+    // failure must not have written a length first.
+    SQLULEN value = 0;
+    SQLINTEGER written = -12345;
+    EXPECT_EQ(SQL_ERROR, SQLGetStmtAttr(stmt_, kRowNumberAttr, &value,
+                                        sizeof(value), &written));
+    EXPECT_EQ(-12345, written);
+}
+
+// -------------------------------------------------------------------
+// 56. MAX_ROWS truncates a rowset rather than rounding it.
 //
 // SQL_ATTR_MAX_ROWS was measured against single-row fetches, which leaves
 // open whether the cap is a row budget or a rowset boundary. Measured on

@@ -568,6 +568,62 @@ pub const SYSNAMELEN: usize = 128;
 /// literally named `(Default)`.
 pub const DEFAULT_CATALOG: &str = "(Default)";
 
+// SQL Server vendor statement attributes (`SQL_SOPT_SS_*`, 1225-1238). These
+// share their numeric range with the `SQL_COPT_SS_*` connection attributes, so
+// the two are only distinguishable by the handle scope they arrive on.
+//
+// Every default and accepted-value set below was measured against msodbcsql 18
+// rather than read out of the headers, because the headers document what the
+// constants mean, not which the driver actually honors. See
+// `docs/attributes_plan.md` §S6.
+
+/// Logging of text pointers. Accepts `SQL_TL_OFF` / `SQL_TL_ON` only.
+pub const SQL_SOPT_SS_TEXTPTR_LOGGING: SqlInteger = 1225;
+/// Ordinal of the command being processed within a batch. Get-only.
+pub const SQL_SOPT_SS_CURRENT_COMMAND: SqlInteger = 1226;
+/// Exposure of the hidden key columns of a browse-mode result set.
+pub const SQL_SOPT_SS_HIDDEN_COLUMNS: SqlInteger = 1227;
+/// Suppression of the `FOR BROWSE` metadata query.
+pub const SQL_SOPT_SS_NOBROWSETABLE: SqlInteger = 1228;
+/// Client-locale conversion of date, time, and money output.
+pub const SQL_SOPT_SS_REGIONALIZE: SqlInteger = 1229;
+/// Cursor behavior bit mask (fast-forward-only, autofetch, firehose).
+pub const SQL_SOPT_SS_CURSOR_OPTIONS: SqlInteger = 1230;
+/// Whether `SET NOCOUNT` is in effect. Get-only.
+pub const SQL_SOPT_SS_NOCOUNT_STATUS: SqlInteger = 1231;
+/// Deferred preparation: skip the server round trip until execute.
+pub const SQL_SOPT_SS_DEFER_PREPARE: SqlInteger = 1232;
+/// Query-notification subscription timeout, in seconds.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT: SqlInteger = 1233;
+/// Query-notification message text. String-valued.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT: SqlInteger = 1234;
+/// Query-notification service/broker options. String-valued.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS: SqlInteger = 1235;
+/// Table-valued-parameter column focus for descriptor binding.
+pub const SQL_SOPT_SS_PARAM_FOCUS: SqlInteger = 1236;
+/// Scope of the name matching used by the catalog functions.
+pub const SQL_SOPT_SS_NAME_SCOPE: SqlInteger = 1237;
+/// Always Encrypted column-encryption mode.
+pub const SQL_SOPT_SS_COLUMN_ENCRYPTION: SqlInteger = 1238;
+
+/// `SQL_SOPT_SS_TEXTPTR_LOGGING` default: msodbcsql reports text-pointer
+/// logging on before any set, unlike most vendor options which default off.
+pub const SQL_TL_ON: SqlULen = 1;
+/// Largest `SQL_SOPT_SS_CURSOR_OPTIONS` value msodbcsql accepts. The option is
+/// a three-bit mask (fast-forward-only, autofetch, firehose autofetch), so
+/// every combination through 7 is valid and 8 is the first rejected value.
+pub const SQL_CO_MAX: SqlULen = 7;
+/// `SQL_SOPT_SS_NOCOUNT_STATUS` value msodbcsql reports. Measured constant:
+/// it answers 1 whether the session has `SET NOCOUNT ON` or `OFF`.
+pub const SQL_NC_ON: SqlULen = 1;
+/// `SQL_SOPT_SS_DEFER_PREPARE` default: deferred preparation is on.
+pub const SQL_DP_ON: SqlULen = 1;
+/// `SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT` default, in seconds (five days).
+pub const SQL_QN_TIMEOUT_DEFAULT: SqlULen = 432_000;
+/// Largest `SQL_SOPT_SS_NAME_SCOPE` value msodbcsql accepts (`TABLE`,
+/// `TABLE_TYPE`, `EXTENDED`, `SPARSE_COLUMN_SET`).
+pub const SQL_SS_NAME_SCOPE_MAX: SqlULen = 3;
+
 // Per-row status codes written into a `SQL_ATTR_ROW_STATUS_PTR` array.
 pub const SQL_ROW_SUCCESS: SqlUSmallInt = 0;
 pub const SQL_ROW_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
