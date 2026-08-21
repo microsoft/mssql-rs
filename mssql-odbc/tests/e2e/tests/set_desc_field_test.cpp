@@ -121,6 +121,9 @@ TEST_F(SetDescFieldLiveTest, IrdAllowsRowsProcessedPtr) {
 }
 
 TEST_F(SetDescFieldLiveTest, InvalidCTypeOnApdReturnsError) {
+    // msodbcsql's SQLSetDescFieldW rejects an unrecognized APD SQL_DESC_TYPE
+    // with HY021 from CheckADDescRecConsistency, not HY003.
+    SKIP_IF_COMPARING_MSODBCSQL();
     SQLHDESC hdesc = AppParamDesc();
     ASSERT_SQL_ERROR(
         SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
@@ -129,6 +132,10 @@ TEST_F(SetDescFieldLiveTest, InvalidCTypeOnApdReturnsError) {
 }
 
 TEST_F(SetDescFieldLiveTest, NumericPrecisionOutOfRangeReturnsError) {
+    // msodbcsql defers SQL_C_NUMERIC precision consistency until the binding is
+    // complete (CheckADDescRecConsistency at SQL_DESC_DATA_PTR / bind time), so
+    // this eager HY094 assertion is Rust-driver-specific.
+    SKIP_IF_COMPARING_MSODBCSQL();
     SQLHDESC hdesc = AppParamDesc();
     ASSERT_SQL_OK(
         SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,

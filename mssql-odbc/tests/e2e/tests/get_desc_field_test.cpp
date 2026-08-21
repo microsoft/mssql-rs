@@ -71,8 +71,11 @@ TEST_F(GetDescFieldLiveTest, AllocTypeIsAuto) {
 }
 
 TEST_F(GetDescFieldLiveTest, InvalidFieldReturnsError) {
+    // msodbcsql validates RecNumber before it decides whether a record-field
+    // identifier is recognized, so RecNumber 0 on APD yields 07009 there.
+    // Keep the pure "unknown field" assertion on a real record number instead.
     SQLHDESC hdesc = AppParamDesc();
-    ASSERT_SQL_ERROR(SQLGetDescFieldW(hdesc, 0, 0x7FFF, nullptr, 0, nullptr));
+    ASSERT_SQL_ERROR(SQLGetDescFieldW(hdesc, 1, 0x7FFF, nullptr, 0, nullptr));
     EXPECT_SQLSTATE(SQL_HANDLE_DESC, hdesc, "HY091");
 }
 
@@ -110,6 +113,7 @@ TEST_F(GetDescFieldLiveTest, ReadsBackValueSetBySetDescField) {
 // statement has not populated the IRD yet (no query has executed), so
 // record 1 does not exist.
 TEST_F(GetDescFieldLiveTest, ImpRowDescRecordPastCountReturnsNoData) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     SQLHDESC hdesc = ImpRowDesc();
     EXPECT_EQ(SQL_NO_DATA, SQLGetDescFieldW(hdesc, 1, SQL_DESC_TYPE, nullptr, 0, nullptr));
 }
