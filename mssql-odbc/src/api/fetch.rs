@@ -129,6 +129,43 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         }
     }
 
+    // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
+    // result set and has already received them. Report end-of-data without
+    // pulling another row, matching msodbcsql, which stops the cursor at the
+    // cap. The cursor deliberately stays open and the connection stays busy on
+    // this statement: the rest of the result set is still on the wire and
+    // SQLMoreResults / SQLCloseCursor drain it as usual.
+    {
+        let reached = match stmt.inner.lock() {
+            Ok(mut ss) => {
+                let reached = ss.max_rows_reached();
+                if reached {
+                    // Measured: after the cutoff msodbcsql answers 24000 to both
+                    // SQL_ATTR_ROW_NUMBER and SQLGetData, exactly as it does at
+                    // the natural end of a result set. The previous row must
+                    // therefore stop being readable here, not linger because the
+                    // cutoff returned before the row stream was invalidated.
+                    ss.reset_row_stream();
+                }
+                reached
+            }
+            Err(_) => {
+                error!("SQLFetch: stmt mutex poisoned checking SQL_ATTR_MAX_ROWS");
+                if let Ok(mut ds) = dbc.inner.lock() {
+                    ds.client = Some(client);
+                }
+                return SQL_ERROR;
+            }
+        };
+        if reached {
+            debug!("SQLFetch: SQL_ATTR_MAX_ROWS reached; returning SQL_NO_DATA");
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(client);
+            }
+            return SQL_NO_DATA;
+        }
+    }
+
     // Position the pull cursor on the next row without decoding any column
     // (SQLFetch semantics). Any unread remainder of the previous row —
     // including an in-flight PLP stream — is drained first (see
@@ -150,6 +187,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
                 return SQL_ERROR;
             };
             stmt_state.begin_row(); // clears per-row state and marks positioned
+            stmt_state.rows_returned += 1;
             // Drain INFO only after the lock is held so a poisoned mutex cannot
             // silently drop the messages.
             let info_messages = client.take_info_messages();
@@ -239,7 +277,7 @@ fn fetch_rows_next(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{SQL_NULL_HANDLE, SqlULen};
     use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
@@ -354,5 +392,116 @@ mod tests {
         let dbc_state = dbc_handle.inner.lock().unwrap();
         assert!(dbc_state.client.is_some());
         assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+    }
+
+    /// Builds a statement whose cursor is open on a one-column result set that
+    /// has already yielded `rows_returned` rows under a `max_rows` cap.
+    fn stmt_at_max_rows(h: &TestHandles, max_rows: SqlULen, rows_returned: SqlULen) {
+        use mssql_tds::test_client_support::{done_no_more, int_columns, tds_client_from_tokens};
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut stmt_state = stmt_handle.inner.lock().unwrap();
+            stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
+            stmt_state.begin_result_set(int_columns(1));
+            stmt_state.max_rows = max_rows;
+            stmt_state.rows_returned = rows_returned;
+            // A statement that has already returned rows is positioned on the
+            // last one, which is what makes the cutoff's row-stream reset
+            // observable rather than vacuously true.
+            stmt_state.row_positioned = rows_returned > 0;
+        }
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut dbc_state = dbc_handle.inner.lock().unwrap();
+        dbc_state.client = Some(tds_client_from_tokens(vec![done_no_more()]));
+        dbc_state.active_stmt = Some(h.stmt);
+    }
+
+    /// The cap is reached, so the fetch must report end-of-data *without*
+    /// pulling a row — the scripted client holds no rows, so a fetch that got
+    /// past the cutoff would fail rather than silently pass.
+    #[test]
+    fn fetch_at_max_rows_returns_no_data_without_pulling() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 3, 3);
+
+        assert_eq!(unsafe { sql_fetch(h.stmt) }, SQL_NO_DATA);
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        assert!(stmt_state.diag_records.is_empty(), "cap is not an error");
+        // The cursor stays open and the connection stays busy on this statement
+        // so the rest of the result set can still be drained.
+        assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+        // Measured on msodbcsql: past the cap the previous row stops being
+        // readable, so SQL_ATTR_ROW_NUMBER and SQLGetData both answer 24000 —
+        // the same state as the natural end of a result set.
+        assert!(!stmt_state.row_positioned);
+        drop(stmt_state);
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert!(dbc_state.client.is_some());
+        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+    }
+
+    /// One row below the cap the cutoff must not fire, so the fetch reaches the
+    /// wire. Asserted through the connection hand-back rather than the return
+    /// code: the cap path is the only one that leaves the statement owning the
+    /// connection, so `active_stmt` distinguishes the two paths without
+    /// depending on what the scripted result happens to answer.
+    #[test]
+    fn fetch_below_max_rows_is_not_cut_off() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 3, 2);
+
+        unsafe { sql_fetch(h.stmt) };
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert_eq!(
+            dbc_state.active_stmt, None,
+            "the fetch reached the client rather than being cut off"
+        );
+    }
+
+    /// `SQL_ATTR_MAX_ROWS = 0` is the ODBC default and means unlimited, so a
+    /// row count far above it must not be treated as having reached a cap.
+    #[test]
+    fn fetch_with_max_rows_zero_is_unlimited() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 0, 1000);
+
+        unsafe { sql_fetch(h.stmt) };
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert_eq!(
+            dbc_state.active_stmt, None,
+            "the fetch reached the client rather than being cut off"
+        );
+    }
+
+    /// The cap is per result set, so advancing onto a new one must restart the
+    /// budget; otherwise a spent cap would truncate every later result set.
+    #[test]
+    fn begin_result_set_restarts_the_max_rows_budget() {
+        use mssql_tds::test_client_support::int_columns;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut stmt_state = stmt_handle.inner.lock().unwrap();
+
+        stmt_state.max_rows = 3;
+        stmt_state.rows_returned = 3;
+        assert!(stmt_state.max_rows_reached());
+
+        stmt_state.begin_result_set(int_columns(2));
+        assert_eq!(stmt_state.rows_returned, 0);
+        assert!(!stmt_state.max_rows_reached());
+        // The cap itself is a statement attribute and survives the new result
+        // set — only the count restarts.
+        assert_eq!(stmt_state.max_rows, 3);
     }
 }
