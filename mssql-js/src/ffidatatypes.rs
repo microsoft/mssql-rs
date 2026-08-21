@@ -196,14 +196,17 @@ impl From<DecimalParts> for NapiDecimalParts {
     }
 }
 
-impl From<NapiDecimalParts> for DecimalParts {
-    fn from(napi_decimal_parts: NapiDecimalParts) -> Self {
-        DecimalParts::from_words(
+impl TryFrom<NapiDecimalParts> for DecimalParts {
+    type Error = Error;
+
+    fn try_from(napi_decimal_parts: NapiDecimalParts) -> Result<Self, Self::Error> {
+        DecimalParts::try_from_words(
             napi_decimal_parts.is_positive,
             napi_decimal_parts.precision,
             napi_decimal_parts.scale,
             &napi_decimal_parts.int_parts,
         )
+        .ok_or_else(|| Error::from_reason("Decimal magnitude exceeds 128 bits"))
     }
 }
 
@@ -564,7 +567,7 @@ impl TryFrom<Parameter> for SqlType {
                         param.data_type
                     )));
                 }
-                Ok(SqlType::Decimal(Some(decimal_parts.into())))
+                Ok(SqlType::Decimal(Some(decimal_parts.try_into()?)))
             }
             RowDataType::N(uuid) => match param.data_type {
                 SqlDataTypes::Guid => {

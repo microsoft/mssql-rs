@@ -193,7 +193,7 @@ const MAX_PLP_SIZE: usize = i32::MAX as usize;
 const MAX_DECIMAL_INT_PARTS: usize = 4;
 
 /// Byte width of a `decimal`/`numeric` magnitude: four little-endian 32-bit words.
-const DECIMAL_MAGNITUDE_BYTES: usize = MAX_DECIMAL_INT_PARTS * 4;
+pub(crate) const DECIMAL_MAGNITUDE_BYTES: usize = MAX_DECIMAL_INT_PARTS * 4;
 
 // Helper function to validate allocation size before allocating
 #[inline]
@@ -2145,6 +2145,10 @@ impl SqlTypeDecode for StringDecoder {
 /// Bytes needed to render any `decimal`/`numeric`: sign, 38 digits, decimal
 /// point, and slack for a scale that exceeds the digit count (`0.000…`).
 pub const DECIMAL_STR_LEN: usize = 48;
+const _: () = assert!(
+    DECIMAL_STR_LEN >= 42,
+    "buffer must hold 39 digits of u128::MAX plus a decimal point and sign"
+);
 
 /// TDS representation of Decimal and Numeric types.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2172,6 +2176,10 @@ impl fmt::Display for DecimalParts {
 }
 
 impl DecimalParts {
+    fn clamped_scale(&self) -> usize {
+        (self.scale as usize).min(DECIMAL_STR_LEN - 3)
+    }
+
     /// Builds a value from its unsigned magnitude, already scaled by `10^scale`.
     ///
     /// SQL Server's maximum precision of 38 digits keeps the magnitude below
@@ -2349,7 +2357,7 @@ impl DecimalParts {
         // `scale` is wire-supplied and unvalidated. A `decimal` never exceeds
         // 38, but the loop is bounded by the buffer rather than by trusting it,
         // so a malformed value renders short instead of overrunning.
-        let scale = (self.scale as usize).min(DECIMAL_STR_LEN - 3);
+        let scale = self.clamped_scale();
         let mut pos = buf.len();
         let mut emitted = 0usize;
         let mut limb = 0usize;
@@ -2406,7 +2414,7 @@ impl DecimalParts {
     fn to_f64(self) -> f64 {
         let magnitude = self.magnitude() as f64;
 
-        let d_ret = magnitude / 10.0_f64.powi(self.scale as i32);
+        let d_ret = magnitude / 10.0_f64.powi(self.clamped_scale() as i32);
 
         if self.is_positive { d_ret } else { -d_ret }
     }
@@ -2425,6 +2433,9 @@ impl DecimalParts {
 
     /// Number of little-endian 32-bit words needed to hold the magnitude, at
     /// least one so that zero still has a word.
+    ///
+    /// This is the minimal count, not the width the value was decoded from:
+    /// trailing zero words are not reported.
     pub fn word_count(&self) -> usize {
         (128 - self.magnitude().leading_zeros() as usize)
             .div_ceil(32)
@@ -2436,6 +2447,14 @@ impl DecimalParts {
     /// Words past the fourth are ignored: a `decimal`/`numeric` with precision
     /// <= 38 never sets them, and every encoder here already emits at most four.
     pub fn from_words(is_positive: bool, precision: u8, scale: u8, words: &[i32]) -> Self {
+        debug_assert!(
+            words
+                .iter()
+                .skip(MAX_DECIMAL_INT_PARTS)
+                .all(|&word| word == 0),
+            "magnitude wider than 128 bits truncated: {words:?}"
+        );
+
         let magnitude = words
             .iter()
             .take(MAX_DECIMAL_INT_PARTS)
@@ -2445,6 +2464,21 @@ impl DecimalParts {
             });
 
         Self::new(is_positive, precision, scale, magnitude)
+    }
+
+    /// Builds a value from little-endian 32-bit words, rejecting magnitudes
+    /// wider than 128 bits while accepting trailing zero padding.
+    pub fn try_from_words(
+        is_positive: bool,
+        precision: u8,
+        scale: u8,
+        words: &[i32],
+    ) -> Option<Self> {
+        words
+            .iter()
+            .skip(MAX_DECIMAL_INT_PARTS)
+            .all(|&word| word == 0)
+            .then(|| Self::from_words(is_positive, precision, scale, words))
     }
 }
 
@@ -3169,19 +3203,14 @@ mod test {
     }
 
     #[test]
-    fn test_decimal_parts_from_words_ignores_oversized_words() {
-        // A 5-word magnitude used to shift a u128 by 128 bits: a panic in debug
-        // builds and a wrapped, wrong value in release builds. The fifth word is
-        // now dropped, which is what every wire encoder here already did.
-        let parts = DecimalParts::from_words(true, 38, 0, &[1, 0, 0, 0, 1]);
-        assert_eq!(parts.magnitude(), 1);
-        assert_eq!(parts.to_decimal_string(), "1");
+    fn test_decimal_parts_try_from_words_rejects_oversized_magnitude() {
+        assert!(DecimalParts::try_from_words(true, 38, 0, &[1, 0, 0, 0, 1]).is_none());
     }
 
     #[test]
     fn test_decimal_parts_from_words_with_trailing_zero_words() {
         // Zero-padded words past the fourth carry no magnitude.
-        let parts = DecimalParts::from_words(false, 38, 2, &[12345, 0, 0, 0, 0, 0]);
+        let parts = DecimalParts::try_from_words(false, 38, 2, &[12345, 0, 0, 0, 0, 0]).unwrap();
         assert_eq!(parts.magnitude(), 12345);
         assert_eq!(parts.to_decimal_string(), "-123.45");
     }

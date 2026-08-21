@@ -38,7 +38,7 @@ use crate::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime,
 };
-use crate::datatypes::decoder::DecimalParts;
+use crate::datatypes::decoder::{DECIMAL_MAGNITUDE_BYTES, DecimalParts};
 use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo, TypeInfoVariant, is_unicode_type};
 use crate::datatypes::sqltypes::SqlType;
@@ -54,18 +54,6 @@ use crate::security::encryption::ColumnEncryptionType;
 const AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID: u8 = 0x02;
 /// The only cell-normalization rule version defined by SQL Server today.
 const SUPPORTED_NORMALIZATION_VERSION: u8 = 0x01;
-/// Number of 32-bit words in the canonical `decimal`/`numeric` magnitude.
-///
-/// The Always Encrypted normalized form for `decimal`/`numeric` is a sign byte
-/// followed by a fixed 16-byte magnitude (four 32-bit little-endian words,
-/// zero-extended). This matches SQL Server and the reference drivers (.NET
-/// `SerializeDecimal`/`SerializeSqlDecimal`, msodbcsql), so deterministic
-/// ciphertext is byte-compatible across drivers. A valid decimal magnitude
-/// (precision <= 38) always fits in 128 bits.
-const DECIMAL_MAGNITUDE_WORDS: usize = 4;
-/// The fixed magnitude width in bytes (four 32-bit words = 128 bits). A valid
-/// `decimal`/`numeric` (precision <= 38) never needs more than this.
-const DECIMAL_MAGNITUDE_BYTES: usize = DECIMAL_MAGNITUDE_WORDS * 4;
 /// Total length of the normalized `decimal`/`numeric` form: 1 sign byte plus the
 /// fixed 16-byte magnitude.
 const DECIMAL_NORMALIZED_LEN: usize = 1 + DECIMAL_MAGNITUDE_BYTES;

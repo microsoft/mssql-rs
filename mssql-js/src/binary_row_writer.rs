@@ -222,22 +222,15 @@ impl RowWriter for BinaryRowWriter {
         self.row_data.push(val.is_positive as u8);
         self.row_data.push(val.scale);
         self.row_data.push(val.precision);
-        self.row_data.push(val.word_count() as u8);
-        for i in 0..val.word_count() {
+        let word_count = val.word_count();
+        self.row_data.push(word_count as u8);
+        for i in 0..word_count {
             self.row_data.extend_from_slice(&val.word(i).to_le_bytes());
         }
     }
 
-    fn write_numeric(&mut self, _col: usize, val: DecimalParts) {
-        // Same encoding as decimal
-        self.row_data.push(TAG_DECIMAL);
-        self.row_data.push(val.is_positive as u8);
-        self.row_data.push(val.scale);
-        self.row_data.push(val.precision);
-        self.row_data.push(val.word_count() as u8);
-        for i in 0..val.word_count() {
-            self.row_data.extend_from_slice(&val.word(i).to_le_bytes());
-        }
+    fn write_numeric(&mut self, col: usize, val: DecimalParts) {
+        self.write_decimal(col, val);
     }
 
     fn write_date(&mut self, _col: usize, val: SqlDate) {
