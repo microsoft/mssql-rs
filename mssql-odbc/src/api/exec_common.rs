@@ -417,7 +417,7 @@ pub(super) fn finish_execute(
             return_client_busy(dbc, client);
             return SQL_ERROR;
         };
-        stmt_state.begin_result_set(metadata); // empty (0 columns)
+        stmt_state.begin_batch(metadata); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
@@ -453,7 +453,7 @@ pub(super) fn finish_execute(
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
-        stmt_state.begin_result_set(metadata); // empty
+        stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
@@ -475,7 +475,7 @@ pub(super) fn finish_execute(
         return_client_busy(dbc, client);
         return SQL_ERROR;
     };
-    stmt_state.begin_result_set(metadata);
+    stmt_state.begin_batch(metadata);
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);

@@ -483,20 +483,106 @@ identically to msodbcsql.
 
 ---
 
-### S6 — Vendor statement attributes (`SQL_SOPT_SS_*`)
+### S6 — Vendor statement attributes (`SQL_SOPT_SS_*`) — **shipped**
 
-> `mssql-odbc | Vendor statement attributes`
+> `mssql-odbc | Vendor statement attributes` (AB#47458)
 
-**Scope:** `TEXTPTR_LOGGING`, `CURRENT_COMMAND`, `HIDDEN_COLUMNS`,
-`NOBROWSETABLE`, `REGIONALIZE`, `CURSOR_OPTIONS`, `NOCOUNT_STATUS`,
-`DEFER_PREPARE`, `QUERYNOTIFICATION_*`, `PARAM_FOCUS`, `NAME_SCOPE`,
-`COLUMN_ENCRYPTION`. Mostly clean rejection; `DEFER_PREPARE` and `PARAM_FOCUS`
-are the two with real semantics (`PARAM_FOCUS` couples to AB#46374 Descriptors).
+**Scope:** the fourteen driver-private statement attributes in 1225–1238. These
+are below the Driver Manager's knowledge, so unlike S4 the DM neither
+range-checks values nor answers on the driver's behalf: every byte of the
+contract below is the driver's own.
 
-**Why last:** mssql-python does not set any of these. Value is pass-through
-robustness and parity-sweep completeness only.
+#### Measured contract
 
-**Size:** S–M. **Depends on:** S1.
+Measured against msodbcsql 18 with the §8 sweep plus five targeted probe
+suites; none of it came from `msodbcsql.h`.
+
+| id | attribute | shape | default | set behavior |
+|---|---|---|---|---|
+| 1225 | `TEXTPTR_LOGGING` | int | **1** | `{0,1}`, else `HY024` |
+| 1226 | `CURRENT_COMMAND` | int | 0 | **get-only** → `HY092` |
+| 1227 | `HIDDEN_COLUMNS` | int | 0 | `{0,1}` |
+| 1228 | `NOBROWSETABLE` | int | 0 | `{0,1}` |
+| 1229 | `REGIONALIZE` | int | 0 | `{0,1}` |
+| 1230 | `CURSOR_OPTIONS` | int | 0 | range `0..=7` (3-bit mask) |
+| 1231 | `NOCOUNT_STATUS` | int | **1** | **get-only** → `HY092` |
+| 1232 | `DEFER_PREPARE` | int | **1** | `{0,1}` |
+| 1233 | `QUERYNOTIFICATION_TIMEOUT` | int | **432000** | `1..=i32::MAX` — **0 is rejected** |
+| 1234 | `QUERYNOTIFICATION_MSGTEXT` | **string** | `""` | any string |
+| 1235 | `QUERYNOTIFICATION_OPTIONS` | **string** | `""` | any string |
+| 1236 | `PARAM_FOCUS` | int | 0 | **always `HY024`** |
+| 1237 | `NAME_SCOPE` | int | 0 | range `0..=3` |
+| 1238 | `COLUMN_ENCRYPTION` | int | 0 | **always `HY024`** |
+
+A rejected set leaves the previous value in place. `PARAM_FOCUS` and
+`COLUMN_ENCRYPTION` reject *every* value including 0 — `COLUMN_ENCRYPTION` does
+so even on a connection opened with `ColumnEncryption=Enabled`, so the rejection
+is unconditional rather than a licence check.
+
+Five findings changed the implementation:
+
+- **Value rejection is mandatory here, unlike S4.** S4 deliberately skipped
+  range validation because `HY024` for standard attributes is emitted by the DM
+  before dispatch. For 1225–1238 the DM has no knowledge and passes any value
+  through, so the driver must validate or it silently accepts garbage msodbcsql
+  refuses. Probes distinguish the two sources by the message's bracketed prefix.
+- **`SQLGetStmtAttrW` writes `StringLength` on integer gets.** msodbcsql writes
+  `8` on every success and leaves the pointer *untouched* on failure. An
+  application that zeroes the out-parameter and checks it cannot tell success
+  from failure on a driver that never writes.
+- **`CURRENT_COMMAND` is a per-execute result-set ordinal, not a counter.** 0 on
+  a fresh statement, 1 after execute, 2 and 3 as `SQLMoreResults` advances, and
+  it holds at the last value once the batch is exhausted. Re-executing resets it
+  to 1; `SQLCloseCursor` and `SQLFreeStmt(SQL_CLOSE)` do not reset it. Modelled
+  as `begin_batch()` (zero, then increment) versus `begin_result_set()`.
+- **`NOCOUNT_STATUS` is a constant, not session state.** It reports `1` after
+  both `SET NOCOUNT ON` and `SET NOCOUNT OFF`, so it is a fixed default rather
+  than a read of the connection's real `NOCOUNT` setting.
+- **A zero `StringLength` must never dereference the value pointer.** Found by
+  probing 1234 with a placeholder `(void*)1` and a length of 0: msodbcsql
+  returns `SQL_SUCCESS` and never touches the pointer, while this driver formed
+  a zero-length slice from it and hit Rust's alignment precondition, which is a
+  *non-unwinding* panic and therefore an `abort()`. See "Robustness fix" below.
+
+#### Robustness fix — zero-length string writes
+
+`read_utf16_long` is the shared string-reading helper behind every character
+attribute, so the abort above was reachable from
+`SQLSetConnectAttrW(dbc, SQL_ATTR_CURRENT_CATALOG, ptr, 0)` too — it predates
+S6 and shipped with S3. It is fixed at the root: a null pointer and any
+non-positive length both read as the empty string without forming a slice.
+
+This matters more than a parity nit because mssql-python loads the driver
+in-process inside CPython. An `abort()` takes down the interpreter with no
+traceback and no catchable exception. A driver at an FFI boundary must degrade,
+not die. A *non-zero* length with a bad pointer is still undefined — that is a
+genuine caller-contract violation with real data to read, and msodbcsql
+access-violates on it as well.
+
+#### Two attributes that cannot be compared through the Driver Manager
+
+- **`SQL_ATTR_ASYNC_STMT_EVENT` (29).** The sweep recorded a plain success for
+  msodbcsql, which made it look like the ideal "recognized but not implemented
+  here" exemplar. Through the DM against this driver it returns `HY118` —
+  *"Driver does not support asynchronous notification"* — from the DM itself.
+  The DM gates the identifier on the driver advertising async notification, so
+  the call never reaches the driver and no driver-side answer is observable.
+  Unit tests still cover it, because they call the entry point directly.
+- **The descriptor-handle attributes (10010–10013).** Their value *is* a handle
+  and msodbcsql dereferences it unchecked, so probing them with a placeholder
+  access-violates inside msodbcsql. Recognition is asserted through the get path
+  instead.
+
+With S6 in, no statement attribute remains that msodbcsql accepts and this
+driver refuses. Variation 29 is therefore inverted from "this one is not
+implemented" into a completeness sweep asserting that all 41 comparable
+identifiers answer with neither `HY092` nor `HYC00`.
+
+**Cross-story notes:** `PARAM_FOCUS` rejects every value today, which matches
+msodbcsql; if AB#46374 (Descriptors) later implements it, the rejection is the
+single line to revisit.
+
+**Size:** M. **Depends on:** S1, S3 (string I/O), S4 (`begin_batch` call sites).
 
 ---
 
