@@ -433,13 +433,14 @@ mod connectivity {
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let new_spid = get_spid(&mut client).await?;
+            // The query succeeding after the KILL proves the connection was
+            // transparently re-established (it would error otherwise). The SPID
+            // is deliberately NOT asserted to change: SQL Server recycles SPID
+            // numbers, so a recovered session frequently reuses the same one.
+            // connection_recovery_count is the reliable signal that a reconnect
+            // actually occurred.
+            let _ = get_spid(&mut client).await?;
 
-            assert_ne!(
-                original_spid, new_spid,
-                "SPID should change after reconnection (was {}, now {})",
-                original_spid, new_spid
-            );
             assert_eq!(
                 client.connection_recovery_count(),
                 1,

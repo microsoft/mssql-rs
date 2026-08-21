@@ -1111,5 +1111,6 @@ pub fn create_fuzz_tds_client(packet_reader: FuzzPacketReader, packet_size: u32)
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
     )
 }

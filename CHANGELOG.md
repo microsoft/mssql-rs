@@ -46,6 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- `mssql-tds`: `TdsClient::language()` now returns the language negotiated at
+  login (from the server's `ENVCHANGE`) instead of always returning an empty
+  string, matching its documentation.
+
 - `mssql-tds`: `TdsClient::read_row_column` now returns `CursorColumn::Value` as a
   struct variant, `CursorColumn::Value { value, variant_base }`, where
   `variant_base` is the underlying `TdsDataType` a `sql_variant` value carried
@@ -96,6 +100,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-tds`: idle connection resiliency (transparent session recovery) now
+  works end to end. The client-side gate that authorizes a reconnect is now set
+  from the server's `FEATUREEXTACK` acknowledgment — previously it was only ever
+  set in tests, so reconnect never ran in production despite being negotiated on
+  the wire. The recoverable session-state baseline the server sends in that
+  acknowledgment is now parsed and replayed in the reconnect `LOGIN7`, which the
+  server previously rejected as incomplete (error 17897, state 81).
 
 - `mssql-tds`: reading a fixed-width value that straddles a TDS packet boundary
   could return bytes from the wrong place or panic. The readers checked for
