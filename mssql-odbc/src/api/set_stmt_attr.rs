@@ -284,6 +284,32 @@ fn sql_get_stmt_attr_w_safe(
     attribute: SqlInteger,
     value_ptr: SqlPointer,
 ) -> SqlReturn {
+    // unixODBC can ask for the implicit descriptor handles while it is still
+    // finishing SQLAllocHandle(STMT). That call path already holds the
+    // statement mutex inside the Driver Manager, so taking our own stmt lock
+    // here before answering SQL_ATTR_IMP_ROW_DESC / friends can deadlock on
+    // Linux. These four handles are immutable for the statement lifetime, so
+    // return them lock-free and keep the lock for the mutable statement attrs.
+    match attribute {
+        SQL_ATTR_APP_ROW_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
+            return SQL_SUCCESS;
+        },
+        SQL_ATTR_APP_PARAM_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.apd);
+            return SQL_SUCCESS;
+        },
+        SQL_ATTR_IMP_ROW_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ird);
+            return SQL_SUCCESS;
+        },
+        SQL_ATTR_IMP_PARAM_DESC => unsafe {
+            write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
+            return SQL_SUCCESS;
+        },
+        _ => {}
+    }
+
     let Ok(mut state) = stmt.inner.lock() else {
         error!("SQLGetStmtAttrW: stmt mutex poisoned");
         return SQL_ERROR;
@@ -318,22 +344,6 @@ fn sql_get_stmt_attr_w_safe(
         },
         SQL_ATTR_PARAMSET_SIZE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, 1);
-        },
-        // The four implicit descriptors (ARD/APD/IRD/IPD). The Driver Manager
-        // queries these while allocating a statement to obtain the driver's
-        // descriptor handles; returning them avoids a null descriptor
-        // dereference inside the DM's `SQLExecDirectW`.
-        SQL_ATTR_APP_ROW_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
-        },
-        SQL_ATTR_APP_PARAM_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.apd);
-        },
-        SQL_ATTR_IMP_ROW_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.ird);
-        },
-        SQL_ATTR_IMP_PARAM_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.ipd);
         },
         _ => {
             error!(

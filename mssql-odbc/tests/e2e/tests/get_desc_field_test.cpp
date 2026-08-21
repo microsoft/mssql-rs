@@ -113,7 +113,6 @@ TEST_F(GetDescFieldLiveTest, ReadsBackValueSetBySetDescField) {
 // statement has not populated the IRD yet (no query has executed), so
 // record 1 does not exist.
 TEST_F(GetDescFieldLiveTest, ImpRowDescRecordPastCountReturnsNoData) {
-    SKIP_IF_COMPARING_MSODBCSQL();
     SQLHDESC hdesc = ImpRowDesc();
     EXPECT_EQ(SQL_NO_DATA, SQLGetDescFieldW(hdesc, 1, SQL_DESC_TYPE, nullptr, 0, nullptr));
 }
