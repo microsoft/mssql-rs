@@ -114,6 +114,7 @@ fn sql_exec_direct_w_safe(
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
         stmt_state.prepared = None;
+        stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         (named_params, rewritten_sql, marker_count)

@@ -3,10 +3,12 @@
 
 pub(crate) mod alloc_handle;
 mod bind_param;
+mod catalog;
 mod close_cursor;
 mod col_attribute;
 mod connect;
 mod describe_col;
+mod describe_param;
 mod disconnect;
 mod driver_connect;
 mod end_tran;

@@ -5,6 +5,11 @@ use std::slice;
 
 use crate::api::odbc_types::{SQL_NTS, SqlSmallInt, SqlWChar};
 
+/// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
+/// Shared by any RPC-backed result set (`SQLGetTypeInfo`, catalog functions)
+/// that clears it on the ODBC-mandated NOT NULL columns after execution.
+pub(crate) const COLMETA_NULLABLE_FLAG: u16 = 0x01;
+
 /// Write `value` to `ptr` if non-null. Every ODBC out-parameter pointer may
 /// legitimately be null (caller opting out of that value), so the
 /// `if (p) *p = v;` idiom appears at almost every entry point. Centralizing

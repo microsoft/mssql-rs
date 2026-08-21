@@ -21,6 +21,7 @@ use super::exec_common::{
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
+use super::util::COLMETA_NULLABLE_FLAG;
 use crate::api::odbc_types::{
     SQL_ALL_TYPES, SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DATETIME, SQL_DECIMAL,
     SQL_DOUBLE, SQL_ERROR, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY,
@@ -48,9 +49,6 @@ const ODBC_VER_KATMAI: u8 = 3;
 /// ODBC 2.x equivalents (9–11); msodbcsql sends the 2.x form to the catalog
 /// proc for 2.x applications.
 const ODBC2_DATETIME_OFFSET: SqlSmallInt = SQL_TYPE_DATE - SQL_DATETIME;
-
-/// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
-const COLMETA_NULLABLE_FLAG: u16 = 0x01;
 
 /// 1-based ODBC ordinals of the `SQLGetTypeInfo` columns the ODBC specification
 /// defines as NOT NULL. msodbcsql clears their nullable flag so `SQLDescribeCol`
@@ -154,6 +152,7 @@ fn sql_get_type_info_w_safe(
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
         stmt_state.prepared = None;
+        stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
     }

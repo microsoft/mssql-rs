@@ -41,6 +41,7 @@ pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
+pub(crate) const SQLSTATE_HY104: [u8; 5] = *b"HY104";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 // msodbcsql spells this IDS_S1_113; its `S1` prefix is the ODBC 2.x form of
 // `HY` (IDS_S1_C00 is HYC00), so the 3.x state is HY113.
@@ -127,6 +128,18 @@ pub(crate) const ERR_DATA_AT_EXEC_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
 pub(crate) const ERR_PARAM_C_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
     text: "Parameter C type not yet implemented",
+};
+pub(crate) const ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "Parameter SQL type not yet implemented",
+};
+pub(crate) const ERR_INVALID_PARAM_COLUMN_SIZE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY104,
+    text: "Invalid parameter ColumnSize for the SQL type",
+};
+pub(crate) const ERR_INVALID_PARAM_DECIMAL_DIGITS: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY104,
+    text: "Invalid parameter DecimalDigits for the SQL type",
 };
 pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
     state: SQLSTATE_22003,

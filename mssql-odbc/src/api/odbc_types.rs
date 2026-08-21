@@ -177,6 +177,7 @@ pub const SQL_API_SQLGETDATA: SqlUSmallInt = 43;
 pub const SQL_API_SQLGETFUNCTIONS: SqlUSmallInt = 44;
 pub const SQL_API_SQLGETINFO: SqlUSmallInt = 45;
 pub const SQL_API_SQLGETTYPEINFO: SqlUSmallInt = 47;
+pub const SQL_API_SQLDESCRIBEPARAM: SqlUSmallInt = 58;
 pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
 pub const SQL_API_SQLALLOCHANDLE: SqlUSmallInt = 1001;
@@ -191,6 +192,16 @@ pub const SQL_API_SQLGETSTMTATTR: SqlUSmallInt = 1014;
 pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
 pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
+
+// Catalog function identifiers (values from the official ODBC-Specification
+// sql.h/sqlext.h: https://github.com/microsoft/ODBC-Specification).
+pub const SQL_API_SQLCOLUMNS: SqlUSmallInt = 40;
+pub const SQL_API_SQLSPECIALCOLUMNS: SqlUSmallInt = 52;
+pub const SQL_API_SQLSTATISTICS: SqlUSmallInt = 53;
+pub const SQL_API_SQLTABLES: SqlUSmallInt = 54;
+pub const SQL_API_SQLFOREIGNKEYS: SqlUSmallInt = 60;
+pub const SQL_API_SQLPRIMARYKEYS: SqlUSmallInt = 65;
+pub const SQL_API_SQLPROCEDURES: SqlUSmallInt = 67;
 
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
@@ -270,6 +281,24 @@ pub const SQL_GUID: SqlSmallInt = -11;
 pub const SQL_SS_TIME2: SqlSmallInt = -154;
 pub const SQL_SS_TIMESTAMPOFFSET: SqlSmallInt = -155;
 
+/// Header of the `SQL_SS_VECTOR` client buffer that precedes the element array.
+///
+/// Only its size participates in the `ParameterSize` <-> dimension conversion,
+/// so the fields are never read directly.
+#[repr(C)]
+pub(crate) struct SqlSsVectorLayout {
+    pub(crate) dimensions: u32,
+    pub(crate) base_type: u8,
+    pub(crate) reserved: [u8; 3],
+}
+
+/// Client-side element width of a `SQL_SS_VECTOR` buffer.
+///
+/// msodbcsql always materialises vector elements as 4-byte floats regardless of
+/// the server-side base type, so `float16` vectors are widened on the way out
+/// and narrowed on the way in.
+pub(crate) const SQL_SS_VECTOR_ELEMENT_SIZE: usize = std::mem::size_of::<f32>();
+
 // ODBC C types
 pub const SQL_C_CHAR: SqlSmallInt = 1;
 pub const SQL_C_WCHAR: SqlSmallInt = -8;
@@ -286,6 +315,14 @@ pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
 // Values of NULLABLE field in descriptor
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
 pub const SQL_NULLABLE: SqlSmallInt = 1;
+
+// ---- Catalog function argument constants (SQLStatistics / SQLSpecialColumns)
+pub const SQL_INDEX_UNIQUE: SqlUSmallInt = 0;
+pub const SQL_QUICK: SqlUSmallInt = 0;
+pub const SQL_ENSURE: SqlUSmallInt = 1;
+pub const SQL_BEST_ROWID: SqlUSmallInt = 1;
+pub const SQL_SCOPE_CURROW: SqlUSmallInt = 0;
+pub const SQL_SCOPE_TRANSACTION: SqlUSmallInt = 1;
 
 // Diagnostic field identifiers (SQLGetDiagField)
 pub const SQL_DIAG_NUMBER: SqlSmallInt = 2;
