@@ -9,6 +9,7 @@ mod catalog;
 mod close_cursor;
 mod col_attribute;
 mod connect;
+mod current_catalog;
 mod describe_col;
 mod describe_param;
 mod disconnect;

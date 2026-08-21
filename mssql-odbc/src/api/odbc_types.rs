@@ -65,6 +65,7 @@ pub const SQL_ATTR_ACCESS_MODE: SqlInteger = 101;
 pub const SQL_ATTR_AUTOCOMMIT: SqlInteger = 102;
 pub const SQL_ATTR_LOGIN_TIMEOUT: SqlInteger = 103;
 pub const SQL_ATTR_TXN_ISOLATION: SqlInteger = 108;
+pub const SQL_ATTR_CURRENT_CATALOG: SqlInteger = 109;
 pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
@@ -490,6 +491,7 @@ pub const SQL_ATTR_READONLY: SqlLen = 0;
 pub const SQL_ATTR_READWRITE_UNKNOWN: SqlLen = 2;
 
 // ---- Statement attribute identifiers (SQLSetStmtAttr / SQLGetStmtAttr) ------
+pub const SQL_ATTR_QUERY_TIMEOUT: SqlInteger = 0;
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;
 pub const SQL_ATTR_CURSOR_TYPE: SqlInteger = 6;
 pub const SQL_ATTR_CONCURRENCY: SqlInteger = 7;
@@ -513,6 +515,20 @@ pub const SQL_ROWSET_SIZE_DEFAULT: SqlULen = 1;
 pub const SQL_CURSOR_FORWARD_ONLY: SqlULen = 0;
 /// `SQL_ATTR_CONCURRENCY` value: read-only.
 pub const SQL_CONCUR_READ_ONLY: SqlULen = 1;
+/// Largest `SQL_ATTR_QUERY_TIMEOUT` msodbcsql accepts; larger requests are
+/// clamped to it and reported with `01S02` (`MAX_QUERY_TIMEOUT`,
+/// msodbcsql `sqlcmisc.cpp:3988`).
+pub const MAX_QUERY_TIMEOUT: u32 = 0xfffe;
+/// Maximum length in characters of a SQL Server identifier, and so of a
+/// database name accepted by `SQL_ATTR_CURRENT_CATALOG` (msodbcsql
+/// `SYSNAMELEN`, `tds/tds.h:69`).
+pub const SYSNAMELEN: usize = 128;
+/// Catalog name that means "leave the database alone". msodbcsql's
+/// `DEFAULT_STRING` (`sqlsrv.h:2065`), short-circuited in `ChangeDatabase`
+/// (`sqlcconn.cpp:4991`) so a connection string's `Database=(Default)` and the
+/// equivalent attribute are both no-ops rather than a lookup of a database
+/// literally named `(Default)`.
+pub const DEFAULT_CATALOG: &str = "(Default)";
 
 // Per-row status codes written into a `SQL_ATTR_ROW_STATUS_PTR` array.
 pub const SQL_ROW_SUCCESS: SqlUSmallInt = 0;

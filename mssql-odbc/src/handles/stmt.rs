@@ -185,6 +185,14 @@ pub(crate) struct StmtState {
     /// The data-at-execution sequence in progress, if any. `Some` is exactly
     /// the ODBC "Need Data" state — see [`StmtState::needs_data`].
     pub(crate) dae: Option<DaeState>,
+    /// `SQL_ATTR_QUERY_TIMEOUT` in seconds; `0` (the ODBC default) means no
+    /// timeout. Seeded at allocation from the parent connection's
+    /// [`DbcState::stmt_query_timeout`].
+    ///
+    /// Stored and reported only — enforcement against a running query is
+    /// tracked separately (AB#46385), so a non-zero value does not yet cancel
+    /// anything. msodbcsql does enforce it and answers `HYT00` on expiry.
+    pub(crate) query_timeout: u32,
 }
 
 /// One data-at-execution parameter: which binding it refers to and how many
@@ -491,7 +499,11 @@ unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
 impl StmtHandle {
-    pub(crate) fn new(parent_dbc: *mut c_void) -> Self {
+    /// `query_timeout` is the parent connection's current
+    /// [`DbcState::stmt_query_timeout`](crate::handles::dbc::DbcState); a
+    /// statement starts at the connection-level default rather than always at
+    /// zero (msodbcsql `sqlcfunc.cpp:173`).
+    pub(crate) fn new(parent_dbc: *mut c_void, query_timeout: u32) -> Self {
         Self {
             object_type: HandleType::Stmt,
             parent_dbc,
@@ -523,6 +535,7 @@ impl StmtHandle {
                 bindings: Vec::new(),
                 state_flags: 0,
                 dae: None,
+                query_timeout,
             }),
         }
     }
@@ -578,7 +591,7 @@ mod tests {
     /// Runs `f` against a fresh statement's state. The handle owns descriptor
     /// allocations it frees on drop, so it has to outlive the borrow.
     fn with_state(f: impl FnOnce(&mut StmtState)) {
-        let handle = StmtHandle::new(std::ptr::null_mut());
+        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
         let mut state = handle.inner.lock().unwrap();
         f(&mut state);
     }
