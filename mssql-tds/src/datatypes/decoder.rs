@@ -1174,9 +1174,8 @@ impl GenericDecoder {
         T: TdsPacketReader + Send + Sync,
     {
         let mut plp_buffer = Vec::new();
-        let mut vector_capacity: usize = 0;
+        let mut total_len: usize = 0;
         let mut chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
-        let mut offset: usize = 0;
         #[cfg(fuzzing)]
         let mut chunk_count = 0u32;
 
@@ -1185,29 +1184,45 @@ impl GenericDecoder {
             {
                 chunk_count += 1;
                 eprintln!(
-                    "[ALLOC] read_plp_chunks_unknown_len: chunk #{chunk_count}, chunk_len={chunk_len}, total_capacity={vector_capacity}"
+                    "[ALLOC] read_plp_chunks_unknown_len: chunk #{chunk_count}, chunk_len={chunk_len}, total_len={total_len}"
                 );
             }
 
             Self::check_plp_chunk(chunk_len)?;
 
             // Use checked_add to prevent capacity overflow
-            vector_capacity = vector_capacity.checked_add(chunk_len).ok_or_else(|| {
+            total_len = total_len.checked_add(chunk_len).ok_or_else(|| {
                 crate::error::Error::ProtocolError(format!(
-                    "PLP chunk accumulation would overflow capacity: {vector_capacity} + {chunk_len}"
+                    "PLP chunk accumulation would overflow capacity: {total_len} + {chunk_len}"
                 ))
             })?;
             // Validate against MAX_PLP_SIZE after accumulation
-            if vector_capacity > MAX_PLP_SIZE {
+            if total_len > MAX_PLP_SIZE {
                 return Err(crate::error::Error::ProtocolError(format!(
-                    "PLP accumulated size {vector_capacity} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
+                    "PLP accumulated size {total_len} exceeds maximum allowed size of {MAX_PLP_SIZE} bytes (SQL Server limit: 2GB)"
                 )));
             }
-            plp_buffer.resize(vector_capacity, 0);
 
-            offset += reader
-                .read_bytes(&mut plp_buffer[offset..offset + chunk_len])
+            // Read into the buffer's spare capacity rather than growing it with
+            // `resize`. Resizing to the exact new length once per chunk
+            // zero-fills every byte immediately before the read overwrites it,
+            // and SQL Server sends `varbinary(max)` in 8000-byte chunks, so a
+            // multi-gigabyte value repeats that hundreds of thousands of times.
+            plp_buffer.reserve(chunk_len);
+            let read = reader
+                .read_bytes_uninit(&mut plp_buffer.spare_capacity_mut()[..chunk_len])
                 .await?;
+            if read != chunk_len {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP chunk read returned {read} byte(s) but the chunk header declared {chunk_len}"
+                )));
+            }
+            let new_len = plp_buffer.len() + chunk_len;
+            // SAFETY: `read_bytes_uninit` returned `Ok(chunk_len)`, so it
+            // initialized the first `chunk_len` bytes of the spare capacity
+            // reserved above.
+            unsafe { plp_buffer.set_len(new_len) };
+
             chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
         }
 

@@ -782,6 +782,25 @@ impl NetworkTransport {
         ))
     }
 
+    /// Refills the read buffer for a read that still needs `needed` bytes,
+    /// failing if the value is truncated by the end of the current message.
+    ///
+    /// Every reader loops until the buffer holds enough bytes. When part of a
+    /// value sits in the final packet of a message the rest can never arrive —
+    /// the server sends nothing further until the client issues a new request —
+    /// so the loop would go back to the socket forever instead of failing.
+    ///
+    /// A read that starts on an empty buffer is left alone even at
+    /// end-of-message: that is a caller beginning the next response, which the
+    /// transport cannot tell apart from an over-read.
+    async fn refill_for(&mut self, needed: usize) -> TdsResult<()> {
+        let available = self.tds_read_buffer.get_remaining_byte_count();
+        if available > 0 && self.message_cannot_satisfy(needed) {
+            return Err(Self::past_end_of_message_error(needed, available));
+        }
+        self.read_tds_packet().await
+    }
+
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
         let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
         if remaining_bytes > 0 {
@@ -1224,13 +1243,13 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_byte() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(1).await?;
         }
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
         while !self.tds_read_buffer.do_we_have_enough_data(2) {
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
         let result = BigEndian::read_i16(self.tds_read_buffer.get_slice());
         self.tds_read_buffer.consume_bytes(2)?;
@@ -1238,7 +1257,7 @@ impl TdsPacketReader for NetworkTransport {
     }
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
         while !self.tds_read_buffer.do_we_have_enough_data(4) {
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
         let result = BigEndian::read_i32(self.tds_read_buffer.get_slice());
         self.tds_read_buffer.consume_bytes(4)?;
@@ -1250,7 +1269,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint40() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(5).await?;
         }
     }
 
@@ -1259,7 +1278,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_float32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
     async fn read_float64(&mut self) -> TdsResult<f64> {
@@ -1267,7 +1286,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_float64() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
     }
     async fn read_int16(&mut self) -> TdsResult<i16> {
@@ -1275,7 +1294,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int16() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
@@ -1283,7 +1302,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint16() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
@@ -1291,7 +1310,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint24() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(3).await?;
         }
     }
 
@@ -1300,7 +1319,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
 
@@ -1309,7 +1328,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
     async fn read_int64(&mut self) -> TdsResult<i64> {
@@ -1317,12 +1336,12 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int64() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
     }
     async fn read_uint64(&mut self) -> TdsResult<u64> {
         while !self.tds_read_buffer.do_we_have_enough_data(8) {
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
         let result = LittleEndian::read_u64(self.tds_read_buffer.get_slice());
         self.tds_read_buffer.consume_bytes(8)?;
@@ -2959,7 +2978,7 @@ pub(crate) mod tests {
     async fn test_read_value_spanning_packet_boundary() {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        let mut stream = first.continuation().append_bytes(&[0x11, 0x22]).build();
         stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
 
         let mut reader = create_network_transport_with_data(&stream);
@@ -2971,7 +2990,7 @@ pub(crate) mod tests {
     async fn test_read_value_spanning_packet_boundary_fragmented() {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        let mut stream = first.continuation().append_bytes(&[0x11, 0x22]).build();
         stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
 
         let mut reader = create_network_transport_with_chunked_data(&stream, 3);
@@ -3020,9 +3039,15 @@ pub(crate) mod tests {
         ];
 
         let mut stream = Vec::new();
-        for payload in payloads {
+        let last_index = payloads.len() - 1;
+        for (index, payload) in payloads.iter().enumerate() {
             let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
-            stream.extend_from_slice(&packet.append_bytes(&payload).build());
+            // Every value below spans a packet boundary *inside one message*,
+            // so only the final packet carries EOM.
+            if index != last_index {
+                packet.continuation();
+            }
+            stream.extend_from_slice(&packet.append_bytes(payload).build());
         }
 
         let mut reader = create_network_transport_with_data(&stream);
@@ -3154,6 +3179,34 @@ pub(crate) mod tests {
         )
         .await
         .expect("read_bytes_uninit hung: the refill loop consumed an empty EOM packet forever");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// The scalar readers carry their own copies of the refill loop. A value
+    /// that is *partially* delivered at the end of a message can never be
+    /// completed, so it must error rather than park on a socket that will stay
+    /// silent until the client sends a new request. `read_uint32` stands in for
+    /// the whole family.
+    ///
+    /// This is the shape a drain hits after a mid-value error: the token-stream
+    /// reader is parked partway through a value, and before this check the
+    /// drain blocked here forever instead of surfacing the error.
+    #[tokio::test]
+    async fn read_uint32_spanning_end_of_message_errors_instead_of_hanging() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x01)
+            .append_byte(0x02)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.read_uint32())
+            .await
+            .expect("read_uint32 hung on a value truncated by the end of the message");
 
         assert!(
             matches!(result, Err(crate::error::Error::ProtocolError(_))),

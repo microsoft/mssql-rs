@@ -4985,18 +4985,25 @@ impl TdsClient {
         self.execution_context.set_has_open_batch(false);
 
         if let Err(error) = drain_result {
-            // The drain stopped partway through the response, so the reader is
-            // parked at an unknown offset — typically inside a value's payload,
-            // where the next bytes would be decoded as tokens. Nothing can
-            // resynchronize a TDS stream from there, so retire the connection
-            // rather than let the next command read garbage.
+            // A drain that stops partway leaves the reader parked at an unknown
+            // offset — typically inside a value's payload, where the next bytes
+            // would be decoded as tokens. Nothing can resynchronize a TDS stream
+            // from there, so retire the connection rather than let the next
+            // command read garbage.
+            //
+            // A server-reported error is different: `advance_to_rows` only
+            // surfaces one after reading the terminal DONE, so the stream is
+            // fully drained and still synchronized. Retiring there would poison
+            // a healthy pooled connection every time a batch ends in RAISERROR.
             //
             // The state above is still cleared first: leaving the batch open
             // would mask this error behind `ALREADY_EXECUTING_ERROR` on every
             // later call, which is what made the original failure look like a
             // permanent wedge.
-            self.transport.mark_known_dead();
-            self.recovery_context.session_recovery_negotiated = false;
+            if !matches!(error, crate::error::Error::SqlServerError { .. }) {
+                self.transport.mark_known_dead();
+                self.recovery_context.session_recovery_negotiated = false;
+            }
             return Err(error);
         }
         Ok(())
@@ -8445,6 +8452,7 @@ mod tests {
 
     const DONE_MORE_ERROR: u16 = 0x0003; // DONE_MORE | DONE_ERROR
     const DONE_FINAL: u16 = 0x0000;
+    const DONE_ERROR_FINAL: u16 = 0x0002; // DONE_ERROR, batch complete
 
     fn expect_sql_error(err: crate::error::Error) -> crate::error::SqlServerDiagnostics {
         match err {
@@ -8583,6 +8591,40 @@ mod tests {
         assert!(
             !client.recovery_context.session_recovery_negotiated,
             "a desynchronized session must not be silently recovered"
+        );
+    }
+
+    /// Control: the drain surfacing a *server-reported* error must not retire
+    /// the connection. `advance_to_rows` only returns `from_sql_errors` after
+    /// reading the terminal DONE, so the stream is fully drained and still
+    /// synchronized — nothing about it is unsafe to reuse.
+    ///
+    /// Without this distinction an ordinary batch like
+    /// `SELECT 1; RAISERROR('boom', 16, 1)` where the caller stops early would
+    /// poison a pooled connection every time.
+    #[tokio::test]
+    async fn close_query_drain_sql_error_leaves_connection_alive() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_ERROR_FINAL));
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        let err = client
+            .close_query()
+            .await
+            .expect_err("a server-reported error must still surface");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+
+        assert!(!client.has_open_batch(), "the batch is closed either way");
+        assert!(
+            !client.transport.connection_known_dead(),
+            "a fully drained stream must stay usable: the error came from the \
+             server, not from losing track of the stream"
         );
     }
 

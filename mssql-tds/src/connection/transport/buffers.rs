@@ -74,7 +74,13 @@ impl TdsReadBuffer {
         let bytes = self.working_buffer[position..position + N]
             .try_into()
             .expect("slice length is fixed by N");
-        self.consume_bytes(N).ok()?;
+        // The capacity check above already proves this succeeds. Were it ever to
+        // fail, `None` would report "need more data" for what is really a
+        // protocol error, sending the caller back to wait for bytes that will
+        // never arrive.
+        let consumed = self.consume_bytes(N);
+        debug_assert!(consumed.is_ok(), "capacity is checked at the top");
+        consumed.ok()?;
         Some(bytes)
     }
 
