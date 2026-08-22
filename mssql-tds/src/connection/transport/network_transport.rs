@@ -1233,7 +1233,7 @@ impl TdsPacketReader for NetworkTransport {
             self.read_tds_packet().await?;
         }
         let result = BigEndian::read_i16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
+        self.tds_read_buffer.consume_bytes(2)?;
         Ok(result)
     }
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
@@ -1241,7 +1241,7 @@ impl TdsPacketReader for NetworkTransport {
             self.read_tds_packet().await?;
         }
         let result = BigEndian::read_i32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
+        self.tds_read_buffer.consume_bytes(4)?;
         Ok(result)
     }
 
@@ -1325,7 +1325,7 @@ impl TdsPacketReader for NetworkTransport {
             self.read_tds_packet().await?;
         }
         let result = LittleEndian::read_u64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
+        self.tds_read_buffer.consume_bytes(8)?;
         Ok(result)
     }
 
@@ -1367,7 +1367,7 @@ impl TdsPacketReader for NetworkTransport {
             length_to_read -= to_read;
             total_read += to_read;
 
-            self.tds_read_buffer.consume_bytes(to_read);
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(total_read)
     }
@@ -1416,7 +1416,7 @@ impl TdsPacketReader for NetworkTransport {
             offset += to_read;
             length_to_read -= to_read;
             total_read += to_read;
-            self.tds_read_buffer.consume_bytes(to_read);
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(total_read)
     }
@@ -1505,7 +1505,7 @@ impl TdsPacketReader for NetworkTransport {
             }
 
             length_to_read -= to_read;
-            self.tds_read_buffer.consume_bytes(to_read);
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(())
     }
