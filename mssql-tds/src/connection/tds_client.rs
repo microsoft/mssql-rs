@@ -4945,15 +4945,28 @@ impl TdsClient {
     /// Any unread rows and result sets are consumed so the TDS stream is left in
     /// a clean state. Must be called (or the result sets fully iterated) before
     /// executing another query on the same connection.
+    ///
+    /// If the drain itself fails, the client state is reset regardless and the
+    /// connection is retired: a drain that stops partway leaves the reader at an
+    /// unknown offset in the response, and a TDS stream cannot be
+    /// resynchronized from there. The error is returned to the caller and later
+    /// commands fail against the dead connection rather than reading garbage.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
         if !self.execution_context.has_open_batch() {
             return Ok(());
         }
         // call next row to consume any remaining tokens
-        while self.advance_to_rows().await? {}
-        info!("No more rows to consume.");
-
+        let drain_result = loop {
+            match self.advance_to_rows().await {
+                Ok(true) => continue,
+                Ok(false) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        if drain_result.is_ok() {
+            info!("No more rows to consume.");
+        }
         // Reset the current metadata, return values, and timeout/cancel state.
         // Note: `info_messages` is intentionally NOT cleared here. Draining the
         // trailing token stream above can surface INFO/warning messages (e.g. a
@@ -4970,6 +4983,22 @@ impl TdsClient {
         self.active_row_read_state = ActiveRowReadState::Idle;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
+
+        if let Err(error) = drain_result {
+            // The drain stopped partway through the response, so the reader is
+            // parked at an unknown offset — typically inside a value's payload,
+            // where the next bytes would be decoded as tokens. Nothing can
+            // resynchronize a TDS stream from there, so retire the connection
+            // rather than let the next command read garbage.
+            //
+            // The state above is still cleared first: leaving the batch open
+            // would mask this error behind `ALREADY_EXECUTING_ERROR` on every
+            // later call, which is what made the original failure look like a
+            // permanent wedge.
+            self.transport.mark_known_dead();
+            self.recovery_context.session_recovery_negotiated = false;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -8511,6 +8540,71 @@ mod tests {
         assert!(
             !client.has_open_batch(),
             "a failed drain must still close the batch"
+        );
+    }
+
+    /// A drain that stops partway leaves the reader at an unknown offset in the
+    /// response. `close_query` must still reset its own state and retire the
+    /// connection.
+    ///
+    /// Before this fix the `?` on the drain returned early, so
+    /// `set_has_open_batch(false)` never ran. Every later call then failed with
+    /// `ALREADY_EXECUTING_ERROR` instead of the real error — the connection
+    /// looked permanently wedged, with no way to clear it.
+    #[tokio::test]
+    async fn close_query_drain_failure_closes_batch_and_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(row_int_bytes(1));
+        // Stream ends here: no terminal DONE, so the drain read fails.
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        client
+            .close_query()
+            .await
+            .expect_err("a truncated drain must surface an error");
+
+        assert!(
+            !client.has_open_batch(),
+            "a failed drain must still close the batch"
+        );
+        assert!(
+            !client.command_is_busy(),
+            "a failed drain must not leave the connection reporting ALREADY_EXECUTING_ERROR"
+        );
+        assert!(
+            client.transport.connection_known_dead(),
+            "a failed drain must retire the connection: a TDS stream cannot be \
+             resynchronized from an unknown offset"
+        );
+        assert!(
+            !client.recovery_context.session_recovery_negotiated,
+            "a desynchronized session must not be silently recovered"
+        );
+    }
+
+    /// Control: a drain that completes must leave the connection usable.
+    #[tokio::test]
+    async fn close_query_success_leaves_connection_alive() {
+        let mut client = client_over_bytes(done_bytes(DONE_FINAL));
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        client
+            .close_query()
+            .await
+            .expect("a complete drain must succeed");
+
+        assert!(
+            !client.has_open_batch(),
+            "a complete drain closes the batch"
+        );
+        assert!(
+            !client.transport.connection_known_dead(),
+            "a complete drain must not retire the connection"
         );
     }
 

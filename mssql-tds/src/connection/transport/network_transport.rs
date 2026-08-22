@@ -3088,7 +3088,7 @@ pub(crate) mod tests {
     //
     // An empty end-of-message packet is legal framing but carries no payload.
     // A bulk read still short of its target treats it as a refill that yielded
-    // nothing, and — before the no-progress guard — went straight back to the
+    // nothing, and — before the no-progress check — went straight back to the
     // socket. A real server has finished its message at that point and sends
     // nothing more until the client issues a new request, so the read blocked
     // forever.
@@ -3123,7 +3123,7 @@ pub(crate) mod tests {
     }
 
     /// `read_bytes_uninit` carries its own copy of the loop and needs the same
-    /// guard.
+    /// check.
     #[tokio::test]
     async fn read_bytes_uninit_past_end_of_message_errors_instead_of_hanging() {
         let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
@@ -3169,7 +3169,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// The guard must not fire on legitimate traffic: a value split across
+    /// Neither check must fire on legitimate traffic: a value split across
     /// packets still reads through, and an empty EOM packet that arrives when
     /// nothing is outstanding is simply consumed.
     ///
@@ -3279,7 +3279,7 @@ pub(crate) mod tests {
     }
 
     /// A value that ends exactly on the message boundary must still succeed —
-    /// the guard fires on demand exceeding what remains, not on EOM alone.
+    /// the check fires on demand exceeding what remains, not on EOM alone.
     #[tokio::test]
     async fn a_value_ending_exactly_at_end_of_message_reads_successfully() {
         let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
