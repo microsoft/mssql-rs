@@ -495,6 +495,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{
         SQL_C_CHAR, SQL_DEFAULT_PARAM, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+        sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -603,5 +604,73 @@ mod tests {
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
         assert_eq!(ret.unwrap_err(), SQL_ERROR);
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
+    }
+
+    /// A data-at-execution marker between two ordinary binds keeps its ordinal
+    /// position: the `@P1..@Pn` list still carries one entry per marker in
+    /// order, and only the middle one is staged for streaming. Pins the
+    /// interleaving that `DataAtExecutionInterleavesWithBoundParams` can only
+    /// observe through the concatenated server result.
+    #[test]
+    fn build_params_with_dae_keeps_streamed_marker_in_position() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut first: Vec<u8> = b"a\0".to_vec();
+        let mut first_ind: SqlLen = SQL_NTS as SqlLen;
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        let mut last: Vec<u8> = b"d\0".to_vec();
+        let mut last_ind: SqlLen = SQL_NTS as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .bound_params
+            .push(Some(char_param(&mut first, &mut first_ind)));
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            c_type_defaulted: false,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state
+            .bound_params
+            .push(Some(char_param(&mut last, &mut last_ind)));
+
+        let dae = unsafe { build_params_with_dae(&mut state, 3, "test") }.unwrap();
+        assert_eq!(dae.params.len(), 3);
+        assert_eq!(dae.dae_indices, vec![1]);
+        assert_eq!(dae.dae_expected_lengths, vec![None]);
+    }
+
+    /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
+    /// `SQLParamData` enforces; `SQL_DATA_AT_EXEC` promises nothing.
+    #[test]
+    fn build_params_with_dae_records_declared_length() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut ind: SqlLen = sql_len_data_at_exec(7);
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            c_type_defaulted: false,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+        }));
+
+        let dae = unsafe { build_params_with_dae(&mut state, 1, "test") }.unwrap();
+        assert_eq!(dae.dae_indices, vec![0]);
+        assert_eq!(dae.dae_expected_lengths, vec![Some(7)]);
     }
 }
