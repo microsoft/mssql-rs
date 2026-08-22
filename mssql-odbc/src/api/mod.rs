@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 pub(crate) mod alloc_handle;
+mod bind_col;
 mod bind_param;
 mod cancel;
 mod catalog;
@@ -17,6 +18,7 @@ mod exec_common;
 mod exec_direct;
 mod execute;
 pub(crate) mod fetch;
+pub(crate) mod fetch_scroll;
 pub(crate) mod free_handle;
 pub(crate) mod get_connect_attr;
 mod get_data;

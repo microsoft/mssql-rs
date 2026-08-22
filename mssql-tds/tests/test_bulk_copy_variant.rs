@@ -272,28 +272,18 @@ mod bulk_copy_variant_tests {
             .await
             .unwrap();
 
-        let decimal_val = DecimalParts {
-            precision: 18,
-            scale: 2,
-            is_positive: true,
-            int_parts: vec![123456],
-        };
+        let decimal_val = DecimalParts::new(true, 18, 2, 123456);
 
-        let numeric_val = DecimalParts {
-            precision: 10,
-            scale: 3,
-            is_positive: false,
-            int_parts: vec![987654],
-        };
+        let numeric_val = DecimalParts::new(false, 10, 3, 987654);
 
         let rows = vec![
             VariantRow {
                 id: 1,
-                variant_col: ColumnValues::Decimal(decimal_val.clone()),
+                variant_col: ColumnValues::Decimal(decimal_val),
             },
             VariantRow {
                 id: 2,
-                variant_col: ColumnValues::Numeric(numeric_val.clone()),
+                variant_col: ColumnValues::Numeric(numeric_val),
             },
         ];
 
@@ -328,8 +318,7 @@ mod bulk_copy_variant_tests {
                             assert_eq!(dec.precision, decimal_val.precision);
                             assert_eq!(dec.scale, decimal_val.scale);
                             assert_eq!(dec.is_positive, decimal_val.is_positive);
-                            // SQL Server may pad with zeros, so just check first element
-                            assert_eq!(dec.int_parts[0], decimal_val.int_parts[0]);
+                            assert_eq!(dec.magnitude(), decimal_val.magnitude());
                         } else {
                             panic!("Expected Decimal, got {:?}", row[1]);
                         }
@@ -339,8 +328,7 @@ mod bulk_copy_variant_tests {
                             assert_eq!(num.precision, numeric_val.precision);
                             assert_eq!(num.scale, numeric_val.scale);
                             assert_eq!(num.is_positive, numeric_val.is_positive);
-                            // SQL Server may pad with zeros, so just check first element
-                            assert_eq!(num.int_parts[0], numeric_val.int_parts[0]);
+                            assert_eq!(num.magnitude(), numeric_val.magnitude());
                         } else {
                             panic!("Expected Numeric, got {:?}", row[1]);
                         }
@@ -769,32 +757,22 @@ mod bulk_copy_variant_tests {
             // Decimal with zero
             VariantRow {
                 id: 14,
-                variant_col: ColumnValues::Decimal(DecimalParts {
-                    precision: 18,
-                    scale: 2,
-                    is_positive: true,
-                    int_parts: vec![0],
-                }),
+                variant_col: ColumnValues::Decimal(DecimalParts::new(true, 18, 2, 0)),
             },
             // Negative decimal
             VariantRow {
                 id: 15,
-                variant_col: ColumnValues::Decimal(DecimalParts {
-                    precision: 18,
-                    scale: 4,
-                    is_positive: false,
-                    int_parts: vec![999999],
-                }),
+                variant_col: ColumnValues::Decimal(DecimalParts::new(false, 18, 4, 999999)),
             },
             // High precision decimal
             VariantRow {
                 id: 16,
-                variant_col: ColumnValues::Decimal(DecimalParts {
-                    precision: 38,
-                    scale: 10,
-                    is_positive: true,
-                    int_parts: vec![i32::MAX, i32::MAX],
-                }),
+                variant_col: ColumnValues::Decimal(DecimalParts::new(
+                    true,
+                    38,
+                    10,
+                    9223372034707292159,
+                )),
             },
             // Date edge cases
             VariantRow {

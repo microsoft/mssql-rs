@@ -27,7 +27,7 @@ use crate::message::transaction_management::{
     TransactionManagementType,
 };
 use crate::query::result::ReturnValue;
-use crate::token::tokens::SqlCollation;
+use crate::token::tokens::{SessionStateToken, SqlCollation};
 use crate::{
     connection::execution_context::{ALREADY_EXECUTING_ERROR, ExecutionContext},
     datatypes::column_values::ColumnValues,
@@ -381,16 +381,13 @@ impl TdsClient {
         negotiated_settings: NegotiatedSettings,
         execution_context: ExecutionContext,
         client_context: ClientContext,
+        login_session_state_tokens: Vec<SessionStateToken>,
     ) -> Self {
         let mut recovery_context = RecoveryContext::new();
         recovery_context.initialize(
             client_context,
-            negotiated_settings.login_ack_tds_version,
-            negotiated_settings.login_ack_server_version,
-            negotiated_settings
-                .session_settings
-                .negotiated_encryption_settings,
-            negotiated_settings.session_settings.mars_enabled,
+            &negotiated_settings,
+            &login_session_state_tokens,
         );
 
         Self {
@@ -525,7 +522,13 @@ impl TdsClient {
             )
             .await;
             match connect_result {
-                Ok((new_transport, new_settings, new_exec_ctx, info_messages)) => {
+                Ok((
+                    new_transport,
+                    new_settings,
+                    new_exec_ctx,
+                    info_messages,
+                    session_state_tokens,
+                )) => {
                     // Validate reconnection properties match original
                     if let Err(validation_err) =
                         self.recovery_context.validate_reconnection(&new_settings)
@@ -556,8 +559,24 @@ impl TdsClient {
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
 
-                    // Reset session state table for the new session
-                    self.recovery_context.session_state_table.reset();
+                    // Mirror msodbcsql's recovery-login handling
+                    // (ReadUpdatedSessionState, seq 0): the FEATUREEXTACK payload
+                    // REPLACES the current (delta) table (reset-then-reload),
+                    // then any reconnect SESSIONSTATE tokens apply on top. The
+                    // initial baseline is untouched; both blocks serialize on the
+                    // next reconnect.
+                    if let Some(ack) = self
+                        .negotiated_settings
+                        .session_recovery_initial_state()
+                        .map(|s| s.to_vec())
+                    {
+                        self.recovery_context
+                            .session_state_table
+                            .apply_feature_ack_to_delta(&ack);
+                    }
+                    for token in &session_state_tokens {
+                        self.recovery_context.process_session_state(token)?;
+                    }
 
                     // A pending reset is satisfied — more completely than
                     // RESETCONNECTION would — by the fresh login: the new
@@ -4957,6 +4976,9 @@ impl TdsClient {
     /// Close the underlying transport, ending the TDS session.
     #[instrument(skip(self), level = "info")]
     pub async fn close_connection(&mut self) -> TdsResult<()> {
+        // An intentional close is not a recoverable disconnect: disable recovery
+        // so a later call on a lingering handle cannot silently resurrect it.
+        self.recovery_context.session_recovery_negotiated = false;
         self.transport.close_transport().await?;
         Ok(())
     }
@@ -5859,7 +5881,44 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         )
+    }
+
+    #[test]
+    fn session_recovery_wiring_from_negotiated_settings() {
+        use crate::message::features::session_recovery::SessionRecoveryFeature;
+        use crate::message::login::Feature;
+
+        let transport = AnyTransport::dynamic(TestTransport::new());
+        let mut negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let mut feature = SessionRecoveryFeature::new(1);
+        feature.set_acknowledged(true);
+        feature.deserialize(&[0x07, 0x02, 0x01, 0x02]).unwrap();
+        negotiated_settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+
+        let client = TdsClient::new(
+            transport,
+            negotiated_settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+            Vec::new(),
+        );
+
+        // The ack turns session_recovery_negotiated on (previously only ever set
+        // in tests) and seeds the baseline state for replay on reconnect.
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert_eq!(
+            client.recovery_context.session_state_table.initial_state[7]
+                .as_ref()
+                .unwrap()
+                .data,
+            vec![0x01, 0x02]
+        );
     }
 
     /// Guards the fix for #225: a large local held across an `.await` in
@@ -5973,6 +6032,7 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         )
     }
 
@@ -5991,6 +6051,7 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         );
         (client, sent)
     }
@@ -6013,6 +6074,7 @@ mod tests {
             negotiated_settings,
             execution_context,
             client_context,
+            Vec::new(),
         );
         (client, fail)
     }
@@ -6866,6 +6928,19 @@ mod tests {
         assert!(!client.recovery_context.session_recovery_negotiated);
 
         // Should return Ok(Duration::ZERO) even though transport is "dead"
+        let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn check_and_reconnect_is_noop_after_close_connection() {
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+
+        client.close_connection().await.unwrap();
+        assert!(!client.recovery_context.session_recovery_negotiated);
+
+        // A dead transport must not be resurrected once the caller closed it.
         let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
         assert_eq!(elapsed, Duration::ZERO);
     }

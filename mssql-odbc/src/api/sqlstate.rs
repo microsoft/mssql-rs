@@ -24,6 +24,7 @@ pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
 /// Communication link failure — the connection to the server broke, so a
 /// connection pool must discard the connection rather than reuse it.
 pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
+pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_22026: [u8; 5] = *b"22026";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
@@ -42,6 +43,7 @@ pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
 pub(crate) const SQLSTATE_HY092: [u8; 5] = *b"HY092";
+pub(crate) const SQLSTATE_HY106: [u8; 5] = *b"HY106";
 pub(crate) const SQLSTATE_HY096: [u8; 5] = *b"HY096";
 pub(crate) const SQLSTATE_HY104: [u8; 5] = *b"HY104";
 pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
@@ -83,6 +85,10 @@ pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
+};
+pub(crate) const ERR_FETCH_TYPE_OUT_OF_RANGE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY106,
+    text: "Fetch type out of range",
 };
 pub(crate) const ERR_INVALID_DESCRIPTOR_INDEX: DiagMsg = DiagMsg {
     state: SQLSTATE_07009,
@@ -142,6 +148,12 @@ pub(crate) const ERR_INVALID_PARAM_COLUMN_SIZE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_PARAM_DECIMAL_DIGITS: DiagMsg = DiagMsg {
     state: SQLSTATE_HY104,
     text: "Invalid parameter DecimalDigits for the SQL type",
+};
+/// A bound column delivered NULL but the application supplied no indicator to
+/// receive it, so the value cannot be reported at all.
+pub(crate) const ERR_INDICATOR_REQUIRED: DiagMsg = DiagMsg {
+    state: SQLSTATE_22002,
+    text: "Indicator variable required but not supplied",
 };
 pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
     state: SQLSTATE_22003,
