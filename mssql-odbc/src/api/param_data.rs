@@ -25,7 +25,7 @@ use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::StreamedParamStatus;
 
-use super::exec_common::{fail_with_tds, finish_execute, return_client_idle};
+use super::exec_common::{abort_dae_with_diag, fail_with_tds, finish_execute, return_client_idle};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlPointer, SqlReturn,
@@ -71,38 +71,6 @@ unsafe fn sql_param_data_impl(
     );
 
     sql_param_data_safe(statement_handle, stmt, value_ptr_ptr)
-}
-
-fn abort_dae_with_diag(
-    dbc: &crate::handles::DbcHandle,
-    stmt: &StmtHandle,
-    statement_handle: SqlHandle,
-    diag: DiagMsg,
-) -> SqlReturn {
-    let (client, prepared, orphaned) = {
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("SQLParamData: stmt mutex poisoned aborting DAE sequence");
-            return SQL_ERROR;
-        };
-        post_diag(&mut stmt_state, diag);
-        let client = stmt_state.dae_client.take();
-        let prepared = stmt_state.dae_prepared.take();
-        let orphaned = stmt_state.dae_orphaned.take();
-        stmt_state.reset_dae();
-        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-        (client, prepared, orphaned)
-    };
-
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.prepared = prepared;
-        stmt_state.pending_unprepare = orphaned;
-    }
-
-    if let Some(mut client) = client {
-        dbc.runtime.block_on(client.cancel_streamed_write());
-        return_client_idle(dbc, statement_handle, client);
-    }
-    SQL_ERROR
 }
 
 fn sql_param_data_safe(

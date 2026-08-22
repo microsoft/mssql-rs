@@ -71,9 +71,9 @@ Supplies one chunk for the currently-open DAE parameter.
 
 | `StrLen_or_Ind` value | Effect                                    |
 |-----------------------|-------------------------------------------|
-| `SQL_NULL_DATA` (-1)  | Mark the parameter as SQL `NULL`. No bytes are sent; `DataPtr` is ignored. Cannot follow a non-empty chunk. |
+| `SQL_NULL_DATA` (-1)  | Mark the parameter as SQL `NULL`. No bytes are sent; `DataPtr` is ignored. `HY020` if any value bytes were already supplied for this parameter. |
 | `0`                   | No-op: a present, zero-length value contribution. |
-| Positive integer _n_  | Send `DataPtr[0..n]` as the next chunk.    |
+| Positive integer _n_  | Send `DataPtr[0..n]` as the next chunk. `HY020` if the parameter was already marked `NULL`. |
 | Other negative        | `HY090` (invalid string or buffer length). |
 
 `SQLPutData` may be called zero or more times between consecutive
@@ -150,13 +150,19 @@ suspends the message in the `StreamedWriteState` machine.
 which writes the PLP terminator and either opens the next parameter's header
 or finalises and sends the packet.
 
-### Parameter Order Preservation
+### Parameter Order
 
-Prior to this implementation, `begin_sp_executesql` built the `@params`
-declaration string by reordering parameters (materialized first, then
-streamed). This is fixed: the declaration is now built from the original
-parameter list so the `@params` string faithfully reflects the `@P1..@Pn`
-declaration order, matching what the SQL text expects.
+Any parameter may be data-at-execution, in any position, freely interleaved
+with ordinary bound parameters. `build_params_with_dae` decides per marker,
+so a `SELECT ? + ? + ?` with only the middle parameter streamed is supported
+(`DataAtExecutionInterleavesWithBoundParams` covers exactly that).
+
+`begin_sp_executesql` does emit materialized parameters ahead of streamed ones,
+both in the `@params` declaration and on the wire. This is invisible to the
+application: `sp_executesql` binds by name, so `@P2` in the SQL text resolves to
+the `@P2` that was sent regardless of position. The partition is order-stable,
+so `dae_param_indices[k]` still identifies the k-th streamed parameter and the
+`SQLParamData` token sequence follows ascending parameter number.
 
 ### State Lifecycle
 
@@ -184,9 +190,36 @@ the transport). The ODBC layer:
 
 The application receives `SQL_ERROR` with an appropriate diagnostic.
 
+### Cancellation
+
+`SQLCancel` during a DAE sequence discards the parked request via
+`TdsClient::cancel_streamed_write`, restores the prepared plan, and returns the
+client to idle, releasing the statement from the Need Data state. This is the
+only way out of Need Data that does not involve completing or failing the
+sequence.
+
+The half-written RPC cannot be retracted, so `cancel_streamed_write` closes the
+transport and the connection reports `SQL_CD_TRUE` for
+`SQL_ATTR_CONNECTION_DEAD` afterwards; the application must reconnect unless
+connection resiliency is negotiated, in which case the next command recovers the
+session transparently. msodbcsql does better here: it discards a still-unsent
+request locally, and after a partial send terminates the packet with
+`EOM | IGNORE` and drains the `DONE`, keeping the connection alive. Matching
+that is tracked by the TODO on `TdsClient::abort_streamed_write`.
+
 ## Limitations (Phase 1)
 
-- Only `SQL_C_CHAR` and `SQL_C_WCHAR` C types are supported for DAE streaming.
+- Only `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` C types are supported for
+  DAE streaming.
 - Always Encrypted columns cannot use the DAE path.
-- `SQLExecDirect` + DAE is not yet implemented (returns `HYC00`).
+- `SQLExecDirect` + DAE is not yet implemented (returns `HYC00`). msodbcsql
+  supports this by stringifying the statement (`ProcessDAECmd`).
 - Output parameters cannot be DAE.
+- A failed DAE sequence cannot be recovered by reconnecting, because the
+  transport is suspended mid-write. msodbcsql can recover here
+  (`GetBatchCtxOrRecover`).
+- The `SQL_NULL_DATA`-after-chunks case is caught by the unixODBC 2.3.9 driver
+  manager first, which returns `HY011` before the driver is reached. The driver
+  guard still posts `HY020` per the spec for callers that bypass that driver
+  manager. The opposite direction (a chunk after `SQL_NULL_DATA`) is not
+  intercepted and surfaces the driver's `HY020`.

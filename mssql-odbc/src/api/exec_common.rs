@@ -37,6 +37,56 @@ pub(super) fn clear_exec_started(stmt: &StmtHandle) {
     }
 }
 
+/// Tears down an in-progress data-at-execution sequence and returns the
+/// connection to the idle pool.
+///
+/// The transport is mid-write when a DAE sequence is abandoned, so the parked
+/// request must be discarded via `cancel_streamed_write` before the client can
+/// serve another command. `prepared` and `pending_unprepare` are restored so the
+/// statement can simply be executed again, which is what the ODBC spec requires
+/// after `SQLCancel`.
+///
+/// `diag`, when supplied, is posted against the statement before the state is
+/// cleared.
+pub(super) fn unwind_dae(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: Option<DiagMsg>,
+) {
+    let client = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("stmt mutex poisoned unwinding DAE sequence");
+            return;
+        };
+        if let Some(diag) = diag {
+            post_diag(&mut stmt_state, diag);
+        }
+        let client = stmt_state.dae_client.take();
+        stmt_state.prepared = stmt_state.dae_prepared.take();
+        stmt_state.pending_unprepare = stmt_state.dae_orphaned.take();
+        stmt_state.reset_dae();
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        client
+    };
+
+    if let Some(mut client) = client {
+        dbc.runtime.block_on(client.cancel_streamed_write());
+        return_client_idle(dbc, statement_handle, client);
+    }
+}
+
+/// Aborts a data-at-execution sequence with a diagnostic. Always `SQL_ERROR`.
+pub(super) fn abort_dae_with_diag(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: DiagMsg,
+) -> SqlReturn {
+    unwind_dae(dbc, stmt, statement_handle, Some(diag));
+    SQL_ERROR
+}
+
 /// Acquires the connection's TDS client for an execution, enforcing the
 /// connection-busy / not-connected invariants and claiming `active_stmt`.
 pub(super) fn claim_connection(

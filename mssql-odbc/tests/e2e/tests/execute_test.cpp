@@ -186,6 +186,99 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionBinaryParam) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// SQLCancel is legal in the Need Data state and must release the statement
+// from it, so the app is not stuck issuing SQLPutData forever. The half-written
+// RPC cannot be retracted, so the transport is dropped and the connection
+// reports dead -- unlike msodbcsql, which recovers the session. See
+// `cancel_streamed_write` in mssql-tds and the limitations section of
+// docs/data-at-execution-streaming.md.
+TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    const char chunk[] = "partial";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 7),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // No data-at-execution sequence is open any more, so further chunks are a
+    // function sequence error rather than an append to a discarded message.
+    EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, const_cast<char*>(chunk), 7));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
+
+    SQLUINTEGER dead = SQL_CD_FALSE;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead,
+                                    SQL_IS_UINTEGER, nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(SQL_CD_TRUE, dead);
+}
+
+// A data-at-execution parameter may resolve to NULL: the first SQLPutData
+// carries SQL_NULL_DATA and no chunks follow, so the driver emits PLP_NULL.
+TEST_F(PrepareExecuteLiveTest, DataAtExecutionNullParam) {
+    ASSERT_SQL_OK(Prepare("SELECT COALESCE(?, 'was-null') AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    char dummy = 0;
+    ASSERT_SQL_OK(SQLPutData(stmt_, &dummy, SQL_NULL_DATA), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("was-null", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A parameter marked NULL cannot then receive value bytes: PLP_NULL is already
+// committed for it, so the chunk has nowhere to go.
+TEST_F(PrepareExecuteLiveTest, DataAtExecutionChunkAfterNullReturnsHY020) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    char dummy = 0;
+    ASSERT_SQL_OK(SQLPutData(stmt_, &dummy, SQL_NULL_DATA), SQL_HANDLE_STMT,
+                  stmt_);
+
+    char chunk[] = "abc";
+    ASSERT_EQ(SQL_ERROR, SQLPutData(stmt_, chunk, 3));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY020");
+}
+
 // A wide-character parameter binds as nvarchar and round-trips.
 TEST_F(PrepareExecuteLiveTest, WideCharParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);

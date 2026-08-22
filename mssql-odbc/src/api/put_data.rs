@@ -12,7 +12,7 @@
 
 use tracing::{debug, error};
 
-use super::exec_common::{fail_with_tds, return_client_idle};
+use super::exec_common::{abort_dae_with_diag, fail_with_tds, return_client_idle};
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_DATA, SQL_SUCCESS, SqlHandle,
@@ -91,38 +91,6 @@ unsafe fn nts_byte_count(data_ptr: SqlPointer, c_type: i16) -> usize {
     }
 }
 
-fn abort_dae_with_diag(
-    dbc: &crate::handles::DbcHandle,
-    stmt: &StmtHandle,
-    statement_handle: SqlHandle,
-    diag: DiagMsg,
-) -> SqlReturn {
-    let (client, prepared, orphaned) = {
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("SQLPutData: stmt mutex poisoned aborting DAE sequence");
-            return SQL_ERROR;
-        };
-        post_diag(&mut stmt_state, diag);
-        let client = stmt_state.dae_client.take();
-        let prepared = stmt_state.dae_prepared.take();
-        let orphaned = stmt_state.dae_orphaned.take();
-        stmt_state.reset_dae();
-        stmt_state.clear_state(crate::handles::stmt::STMT_STATE_EXEC_STARTED);
-        (client, prepared, orphaned)
-    };
-
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.prepared = prepared;
-        stmt_state.pending_unprepare = orphaned;
-    }
-
-    if let Some(mut client) = client {
-        dbc.runtime.block_on(client.cancel_streamed_write());
-        return_client_idle(dbc, statement_handle, client);
-    }
-    SQL_ERROR
-}
-
 unsafe fn sql_put_data_safe(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
@@ -158,6 +126,25 @@ unsafe fn sql_put_data_safe(
 
     // ── Null data: mark the parameter as SQL NULL ───────────────────────────
     if is_null_put {
+        // A parameter that already received value bytes cannot become NULL: the
+        // PLP body is open on the wire and a NULL marker would contradict it.
+        {
+            let Ok(stmt_state) = stmt.inner.lock() else {
+                error!("SQLPutData: stmt mutex poisoned checking null concatenation");
+                return SQL_ERROR;
+            };
+            if stmt_state.dae_current_bytes_sent > 0 {
+                drop(stmt_state);
+                error!("SQLPutData: SQL_NULL_DATA after value chunks were sent (HY020)");
+                return abort_dae_with_diag(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    ERR_ATTEMPT_TO_CONCATENATE_NULL,
+                );
+            }
+        }
+
         let write_result = {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLPutData: stmt mutex poisoned taking dae_client for null write");
@@ -239,6 +226,18 @@ unsafe fn sql_put_data_safe(
             error!("SQLPutData: stmt mutex poisoned updating DAE byte count");
             return SQL_ERROR;
         };
+        // The parameter was already signalled NULL; appending data to it is the
+        // mirror of the guard above.
+        if stmt_state.dae_current_is_null {
+            drop(stmt_state);
+            error!("SQLPutData: data chunk after SQL_NULL_DATA (HY020)");
+            return abort_dae_with_diag(
+                dbc,
+                stmt,
+                statement_handle,
+                ERR_ATTEMPT_TO_CONCATENATE_NULL,
+            );
+        }
         let new_total = stmt_state.dae_current_bytes_sent.saturating_add(byte_count);
         if let Some(expected) = stmt_state
             .dae_expected_lengths
@@ -447,6 +446,51 @@ mod tests {
         assert_eq!(
             state.diag_records[0].sql_state,
             ERR_DAE_LENGTH_MISMATCH.state
+        );
+        assert!(!state.has_state(STMT_STATE_NEED_DATA));
+    }
+
+    #[test]
+    fn null_after_value_chunks_returns_hy020() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+            state.dae_current_bytes_sent = 3;
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_ATTEMPT_TO_CONCATENATE_NULL.state
+        );
+        assert!(!state.has_state(STMT_STATE_NEED_DATA));
+    }
+
+    #[test]
+    fn value_chunk_after_null_returns_hy020() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+            state.dae_current_is_null = true;
+        }
+
+        let mut bytes = *b"abc";
+        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), 3) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_ATTEMPT_TO_CONCATENATE_NULL.state
         );
         assert!(!state.has_state(STMT_STATE_NEED_DATA));
     }

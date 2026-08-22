@@ -251,6 +251,15 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         return Err(SQL_ERROR);
     }
 
+    // A statement awaiting data-at-execution input is in the ODBC "Need Data"
+    // state, where every function other than SQLPutData/SQLParamData/SQLCancel
+    // and the diagnostic calls is a sequence error rather than a cursor error.
+    if stmt_state.has_state(STMT_STATE_NEED_DATA) {
+        error!("SQLExecute: statement is awaiting data-at-execution input");
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return Err(SQL_ERROR);
+    }
+
     if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
         error!("SQLExecute: statement has an active execute or open cursor");
         post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -373,6 +382,23 @@ mod tests {
         );
         // The pre-I/O guard must not set EXEC_STARTED.
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    #[test]
+    fn execute_while_awaiting_data_returns_function_sequence_error() {
+        // In the Need Data state the spec requires HY010, not the 24000 that a
+        // merely-busy statement gets.
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT ?");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA | STMT_STATE_EXEC_STARTED);
+        }
+        let ret = unsafe { sql_execute(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub(crate) const SQLSTATE_HYC00: [u8; 5] = *b"HYC00";
 pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
+pub(crate) const SQLSTATE_HY020: [u8; 5] = *b"HY020";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY090: [u8; 5] = *b"HY090";
 pub(crate) const SQLSTATE_HY091: [u8; 5] = *b"HY091";
@@ -153,6 +154,13 @@ pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
 pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
     state: SQLSTATE_22026,
     text: "String data, length mismatch",
+};
+// A streamed parameter is either NULL or a sequence of value chunks; mixing the
+// two in one `SQL_NEED_DATA` window has no representation on the wire
+// (msodbcsql `sqlccmd.cpp` -> IDS_HY_020).
+pub(crate) const ERR_ATTEMPT_TO_CONCATENATE_NULL: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY020,
+    text: "Attempt to concatenate a null value",
 };
 pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01S07,

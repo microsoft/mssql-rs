@@ -1053,7 +1053,7 @@ pub unsafe extern "C" fn SQLGetDescFieldW(
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn SQLCancel(_statement_handle: SqlHandle) -> SqlReturn {
+pub unsafe extern "C" fn SQLCancel(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe { super::cancel::sql_cancel(statement_handle) }
 }

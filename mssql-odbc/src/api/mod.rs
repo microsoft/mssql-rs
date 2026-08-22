@@ -3,6 +3,7 @@
 
 pub(crate) mod alloc_handle;
 mod bind_param;
+mod cancel;
 mod catalog;
 mod close_cursor;
 mod col_attribute;
