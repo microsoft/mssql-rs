@@ -162,6 +162,82 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Two streamed parameters drive the SQLParamData loop the way applications
+// actually write it: SQLParamData reports SQL_NEED_DATA once per streamed
+// parameter, handing back that parameter's ParameterValuePtr as the token, and
+// returns success only when the last one is closed.
+//
+// Every other DAE test binds a single streamed parameter, where
+// end_streamed_param always completes on the first close. This is the only test
+// that reaches the advance branch in SQLParamData (dae_current_idx += 1) and so
+// the only one that can catch the driver stalling on the first parameter,
+// skipping the second, or handing back the wrong token.
+TEST_F(PrepareExecuteLiveTest, DataAtExecutionLoopsOverMultipleStreamedParams) {
+    ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> bound_first = {'p', '\0'};
+    std::vector<SQLCHAR> bound_second = {'r', '\0'};
+    SQLLEN bound_first_ind = SQL_NTS;
+    SQLLEN bound_second_ind = SQL_NTS;
+    SQLLEN streamed_q_ind = SQL_DATA_AT_EXEC;
+    SQLLEN streamed_s_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token_q = 0;
+    SQLCHAR token_s = 0;
+
+    // Interleaved so the streamed parameters are not adjacent: p ? r ?
+    ASSERT_SQL_OK(BindChar(1, bound_first, bound_first_ind), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &token_q, 0,
+                                   &streamed_q_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindChar(3, bound_second, bound_second_ind), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 4, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &token_s, 0,
+                                   &streamed_s_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    SQLRETURN rc = SQLParamData(stmt_, &value_ptr);
+    int iterations = 0;
+    bool sent_q = false;
+    bool sent_s = false;
+
+    while (rc == SQL_NEED_DATA) {
+        ASSERT_LT(++iterations, 10) << "SQLParamData did not terminate";
+        if (value_ptr == &token_q) {
+            EXPECT_FALSE(sent_q) << "token for parameter 2 was offered twice";
+            sent_q = true;
+            const char chunk[] = "q";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 1),
+                          SQL_HANDLE_STMT, stmt_);
+        } else if (value_ptr == &token_s) {
+            EXPECT_FALSE(sent_s) << "token for parameter 4 was offered twice";
+            sent_s = true;
+            const char chunk[] = "s";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 1),
+                          SQL_HANDLE_STMT, stmt_);
+        } else {
+            FAIL() << "SQLParamData returned a token matching no streamed "
+                      "parameter";
+        }
+        rc = SQLParamData(stmt_, &value_ptr);
+    }
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    // One SQL_NEED_DATA per streamed parameter, no more and no fewer.
+    EXPECT_EQ(2, iterations);
+    EXPECT_TRUE(sent_q);
+    EXPECT_TRUE(sent_s);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("pqrs", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // Binary data-at-execution streams raw bytes as varbinary(max), including NUL
 // bytes, matching msodbcsql SQLPutData behavior for SQL_C_BINARY.
 // Benefits-from-mock-tds: the hex round trip proves only the reassembled value.
@@ -307,40 +383,68 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionChunkAfterNullReturnsHY020) {
 }
 
 // SQLExecDirect stages data-at-execution parameters the same way SQLExecute
-// does, so a streamed marker between two bound values keeps its ordinal
-// position. Unlike SQLExecute this runs ad-hoc sp_executesql with no prepared
-// plan, which is the case SQLParamData has to complete without one.
+// does, so streamed markers keep their ordinal positions among bound values.
+// Unlike SQLExecute this runs ad-hoc sp_executesql with no prepared plan, which
+// is the case SQLParamData has to complete without one. Two streamed parameters
+// so the SQLParamData loop actually iterates on this path as well.
 TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundParams) {
-    std::vector<SQLCHAR> first = {'a', '\0'};
-    std::vector<SQLCHAR> last = {'d', '\0'};
-    SQLLEN first_ind = SQL_NTS;
-    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
-    SQLLEN last_ind = SQL_NTS;
-    SQLCHAR streamed_token = 0;
+    std::vector<SQLCHAR> bound_first = {'a', '\0'};
+    std::vector<SQLCHAR> bound_second = {'c', '\0'};
+    SQLLEN bound_first_ind = SQL_NTS;
+    SQLLEN bound_second_ind = SQL_NTS;
+    SQLLEN streamed_b_ind = SQL_DATA_AT_EXEC;
+    SQLLEN streamed_d_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token_b = 0;
+    SQLCHAR token_d = 0;
 
-    ASSERT_SQL_OK(BindChar(1, first, first_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindChar(1, bound_first, bound_first_ind), SQL_HANDLE_STMT,
+                  stmt_);
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
-                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
-                                   &streamed_ind),
+                                   SQL_LONGVARCHAR, 0, 0, &token_b, 0,
+                                   &streamed_b_ind),
                   SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(BindChar(3, last, last_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindChar(3, bound_second, bound_second_ind), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 4, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &token_d, 0,
+                                   &streamed_d_ind),
+                  SQL_HANDLE_STMT, stmt_);
 
-    ASSERT_EQ(SQL_NEED_DATA, ExecDirect("SELECT ? + ? + ? AS v"));
+    ASSERT_EQ(SQL_NEED_DATA, ExecDirect("SELECT ? + ? + ? + ? AS v"));
 
     SQLPOINTER value_ptr = nullptr;
-    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
-    ASSERT_EQ(&streamed_token, value_ptr);
+    SQLRETURN rc = SQLParamData(stmt_, &value_ptr);
+    int iterations = 0;
 
-    const char first_chunk[] = "b";
-    const char second_chunk[] = "c";
-    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first_chunk), 1),
-                  SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second_chunk), 1),
-                  SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    while (rc == SQL_NEED_DATA) {
+        ASSERT_LT(++iterations, 10) << "SQLParamData did not terminate";
+        // Two chunks per parameter, so chunk reassembly is exercised inside the
+        // loop rather than only on a single-parameter statement.
+        if (value_ptr == &token_b) {
+            const char first[] = "b";
+            const char second[] = "B";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first), 1),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second), 1),
+                          SQL_HANDLE_STMT, stmt_);
+        } else if (value_ptr == &token_d) {
+            const char first[] = "d";
+            const char second[] = "D";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first), 1),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second), 1),
+                          SQL_HANDLE_STMT, stmt_);
+        } else {
+            FAIL() << "SQLParamData returned a token matching no streamed "
+                      "parameter";
+        }
+        rc = SQLParamData(stmt_, &value_ptr);
+    }
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, iterations);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("abcd", GetColumnChar(1));
+    EXPECT_EQ("abBcdD", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
