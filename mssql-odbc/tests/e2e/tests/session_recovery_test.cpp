@@ -158,3 +158,69 @@ TEST_F(SessionRecoveryLiveTest, StaleHandleAfterReconnectIsInvalidatedAndReprepa
         << "expected a fresh physical login (later connect_time) after "
            "transparent reconnect";
 }
+
+// A data-at-execution sequence that dies on the wire cannot be retracted: the
+// half-written RPC is already partly on the socket, and EOM | IGNORE only
+// retracts a message the server has not finished reading. The driver therefore
+// drops the transport (TdsClient::abort_streamed_write). The *session* survives
+// that, though: the aborted sequence clears the open-batch flag and hands the
+// client back to the connection, so the next execute sees a dead socket and
+// recovers through the same check_and_reconnect path every other command uses.
+// This is the lazy recovery msodbcsql performs in GetBatchCtxOrRecover, which
+// likewise runs at the top of the next API call rather than at failure time.
+TEST_F(SessionRecoveryLiveTest, ConnectionRecoversAfterDataAtExecutionDiesOnTheWire) {
+    const std::string kConnectTimeSql =
+        "SELECT CONVERT(varchar(30), connect_time, 121) "
+        "FROM sys.dm_exec_connections WHERE session_id = @@SPID";
+    std::string original_spid = GetStringScalar(stmt_, "SELECT @@SPID");
+    ASSERT_FALSE(original_spid.empty());
+    std::string original_connect_time = GetStringScalar(stmt_, kConnectTimeSql);
+    ASSERT_FALSE(original_connect_time.empty());
+
+    // Park a streamed parameter: SQLExecute returns SQL_NEED_DATA and
+    // SQLParamData opens the parameter for data.
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLCHAR> buffer(64 * 1024, 'x');
+    // SQL_DATA_AT_EXEC, not SQL_LEN_DATA_AT_EXEC(n): a declared length would make
+    // the driver reject an over-long chunk locally with 22026, and the chunk
+    // below would never reach the socket.
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(
+        SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR,
+                         0, 0, buffer.data(), 0, &ind),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER token = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &token));
+
+    // Kill the session out from under the parked request. The sequence is now
+    // unfinishable: the RPC prefix is already framed and the socket is gone.
+    KillSpidFromSecondConnection(original_spid);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // SQLPutData succeeds: the chunk is handed to a socket the peer has reset,
+    // and the local send buffer accepts it without an error surfacing yet.
+    ASSERT_EQ(SQL_SUCCESS, SQLPutData(stmt_, buffer.data(),
+                                      static_cast<SQLLEN>(buffer.size())));
+
+    // SQLParamData is where the sequence dies: it writes the PLP terminator,
+    // finalizes the RPC, and reads the response, so it is the first call that
+    // has to hear back from the server. HY000 is the streamed-write failure
+    // surfacing from TDS -- 22026 or HY010 would mean the driver rejected the
+    // call locally and the abort/recovery path this test exists for never ran.
+    ASSERT_EQ(SQL_ERROR, SQLParamData(stmt_, &token));
+    EXPECT_EQ("HY000", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+
+    // The sequence is over and the client is back on the connection. A fresh
+    // statement must reconnect transparently rather than inheriting the dead
+    // socket.
+    SQLHSTMT probe = SQL_NULL_HSTMT;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &probe), SQL_HANDLE_DBC,
+                  dbc_);
+    std::string recovered_connect_time = GetStringScalar(probe, kConnectTimeSql);
+    EXPECT_FALSE(recovered_connect_time.empty())
+        << "the connection did not recover after the streamed write aborted";
+    EXPECT_NE(original_connect_time, recovered_connect_time)
+        << "expected a fresh physical login after the aborted streamed write";
+    SQLFreeHandle(SQL_HANDLE_STMT, probe);
+}

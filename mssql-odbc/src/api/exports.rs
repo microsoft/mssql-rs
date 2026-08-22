@@ -531,6 +531,46 @@ pub unsafe extern "C" fn SQLExecute(statement_handle: SqlHandle) -> SqlReturn {
     unsafe { super::execute::sql_execute(statement_handle) }
 }
 
+/// Advances the data-at-execution parameter protocol.
+///
+/// Called by the application after `SQLExecute` returns `SQL_NEED_DATA`.
+/// `value_ptr_ptr`, if non-null, receives the `ParameterValuePtr` that
+/// was bound for the parameter currently awaiting data.  Returns
+/// `SQL_NEED_DATA` when more parameters still need data, or the statement
+/// result when all parameters have been supplied.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - `value_ptr_ptr`, if non-null, must be a writable `SqlPointer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLParamData(
+    statement_handle: SqlHandle,
+    value_ptr_ptr: *mut SqlPointer,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::param_data::sql_param_data(statement_handle, value_ptr_ptr) }
+}
+
+/// Supplies a data chunk for a data-at-execution parameter.
+///
+/// Must be called between `SQLParamData` calls during a data-at-execution
+/// sequence.  `strlen_or_ind` is the number of bytes in `data_ptr`, or
+/// `SQL_NULL_DATA` to mark the parameter as SQL NULL.
+///
+/// # Safety
+/// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - `data_ptr`, when `strlen_or_ind` is a positive byte count, must be
+///   readable for that many bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLPutData(
+    statement_handle: SqlHandle,
+    data_ptr: SqlPointer,
+    strlen_or_ind: SqlLen,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::put_data::sql_put_data(statement_handle, data_ptr, strlen_or_ind) }
+}
+
 // ---- Result set processing --------------------------------
 /// Fetches the next row from the current result set.
 ///
@@ -1064,7 +1104,7 @@ pub unsafe extern "C" fn SQLGetDescFieldW(
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn SQLCancel(_statement_handle: SqlHandle) -> SqlReturn {
+pub unsafe extern "C" fn SQLCancel(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
-    SQL_SUCCESS
+    unsafe { super::cancel::sql_cancel(statement_handle) }
 }
