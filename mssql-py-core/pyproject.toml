@@ -14,6 +14,7 @@ classifiers = [
 
 [tool.maturin]
 module-name = "mssql_py_core"
+features = ["pyo3/extension-module"]
 # Don't vendor shared libraries (libssl, libcrypto) into the wheel.
 # Built on manylinux_2_34 (AlmaLinux 9) so the native extension links against
 # libssl.so.3 / libcrypto.so.3 and expects the OS to provide OpenSSL 3.x at runtime.

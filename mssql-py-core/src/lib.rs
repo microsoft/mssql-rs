@@ -9,6 +9,7 @@ use mssql_tds::connection::client_context::DriverVersion;
 mod arrow_bulkcopy;
 mod async_connection;
 mod async_cursor;
+mod async_parameters;
 mod async_runtime;
 mod async_session;
 mod bulkcopy;
@@ -93,6 +94,16 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<cursor::PyCoreCursor>()?;
     m.add_class::<async_connection::PyAsyncConnection>()?;
     m.add_class::<async_cursor::PyAsyncCursor>()?;
+    m.add_class::<async_parameters::PyTableValuedParameter>()?;
+    m.add("SQL_MONEY", 60)?;
+    m.add("SQL_SMALLMONEY", 122)?;
+    m.add("SQL_XML", 241)?;
+    m.add("SQL_JSON", 244)?;
+    m.add("SQL_VECTOR", 245)?;
+    m.add("apilevel", "2.0")?;
+    m.add("threadsafety", 1)?;
+    // DB-API allows one declared style; named pyformat markers are an extension.
+    m.add("paramstyle", "qmark")?;
 
     // Test-only hook to drive PythonEntraIdTokenFactory::create_token from
     // Python tests. Underscore-prefixed to mark as internal/test-only.
