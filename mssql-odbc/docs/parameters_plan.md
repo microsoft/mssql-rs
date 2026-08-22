@@ -30,7 +30,11 @@ transparent reconnects.
   as that call's in/out `@handle`, so the server drops the old plan and prepares
   the new one in one round trip. `SQLExecDirect` supersede and
   `SQLFreeHandle(STMT)` use standalone `sp_unprepare` because they have no
-  `sp_prepexec` on which to piggyback.
+  `sp_prepexec` on which to piggyback. A data-at-execution execute also declines
+  to piggyback even though it does run `sp_prepexec`: the request stays open for
+  the whole `SQLPutData` sequence and may be cancelled before it reaches the
+  server, so evicting the superseded handle at build time could leak the plan
+  until disconnect. It rides along with the parked state instead.
 - **`sp_prepexec` failure ownership** - the pending handle remains in ODBC
   through reconnect, validation, parameter construction, and Always Encrypted
   setup. `mssql-tds` consumes it only when the prepexec RPC is ready to
@@ -364,9 +368,12 @@ accepting a pairing inbound that is rejected outbound for no principled reason.
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
   both `SQLPrepare` + `SQLExecute` and `SQLExecDirect` (see the
-  delivered-features list above and `data-at-execution-streaming.md`). Still
-  outstanding: recovering the session after an abandoned sequence instead of
-  dropping the transport, tracked on `TdsClient::abort_streamed_write`.
+  delivered-features list above and `data-at-execution-streaming.md`), and a
+  streamed execute keeps the statement prepared rather than falling back to
+  ad-hoc `sp_executesql`. Still outstanding: recovering the session after a
+  sequence that fails on the wire, which drops the transport because a request
+  interrupted mid-send cannot be retracted with `EOM | IGNORE` the way a
+  cancelled or driver-rejected one is.
 - **Canonical procedure calls / `sp_prepexecrpc`:** support ODBC canonical
   calls (`{call proc(?)}`) with the appropriate parameter-count and single-row
   parameter-set guards. Ad-hoc T-SQL currently uses `sp_prepexec`.

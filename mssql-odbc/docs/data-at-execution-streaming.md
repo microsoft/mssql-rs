@@ -157,11 +157,35 @@ rc = SQLExecute(hstmt);   /* → SQL_NEED_DATA */
 
 ### TDS Streaming
 
-When DAE parameters are detected, `SQLExecute` calls
-`TdsClient::begin_sp_executesql` with the full parameter list (materialized
-params carry real values; DAE params carry `data_at_exec()` placeholders).
-This writes the `sp_executesql` RPC header plus all non-DAE parameters, then
-suspends the message in the `StreamedWriteState` machine.
+When DAE parameters are detected, the entry point calls into the TDS client
+with the full parameter list (materialized params carry real values; DAE params
+carry `data_at_exec()` placeholders). This writes the RPC header plus all
+non-DAE parameters, then suspends the message in the `StreamedWriteState`
+machine.
+
+Which RPC that is depends on the entry point, and streaming does not change the
+choice:
+
+| Entry point | TDS call | RPC |
+|---|---|---|
+| `SQLExecute`, first execute | `begin_execute_prepared` | `sp_prepexec` |
+| `SQLExecute`, handle already cached | `begin_execute_prepared` | `sp_execute` |
+| `SQLExecDirect` | `begin_sp_executesql` | `sp_executesql` |
+
+A data-at-execution parameter therefore does not cost a prepared statement its
+plan: the streamed values go into the same procedure a materialized execute
+would have used, so one prepare serves every later execute whether or not that
+execute streams. This matches msodbcsql, which selects the procedure purely on
+whether the statement is prepared and treats DAE as orthogonal, parking a
+half-written `sp_prepexec` / `sp_execute` RPC the same way this driver does.
+`SQLExecDirect` has no plan to preserve, so it stays on ad-hoc `sp_executesql`.
+
+Because `sp_prepexec` returns its `@handle` as a RETURNVALUE that trails the
+result set, the statement id is claimed when the message is parked rather than
+when it completes. A sequence that is cancelled or fails never produces the
+handle, so `cancel_streamed_write` and `abort_streamed_write` disarm the pending
+capture; leaving it armed would divert an unrelated RPC's first return value
+into the handle map.
 
 `SQLPutData` calls `TdsClient::write_streamed_chunk` (or
 `write_streamed_null`). `SQLParamData` calls `TdsClient::end_streamed_param`
@@ -175,11 +199,13 @@ with ordinary bound parameters. `build_params_with_dae` decides per marker,
 so a `SELECT ? + ? + ?` with only the middle parameter streamed is supported
 (`DataAtExecutionInterleavesWithBoundParams` covers exactly that).
 
-`begin_sp_executesql` does emit materialized parameters ahead of streamed ones,
-both in the `@params` declaration and on the wire. This is invisible to the
-application: `sp_executesql` binds by name, so `@P2` in the SQL text resolves to
-the `@P2` that was sent regardless of position. The partition is order-stable,
-so `dae_param_indices[k]` still identifies the k-th streamed parameter and the
+Both streamed entry points emit materialized parameters ahead of streamed ones,
+on the wire and in the `@params` declaration where there is one. This is
+invisible to the application, because `build_named_params` names every parameter
+`@P{n}`: `@P2` in the SQL text resolves to the `@P2` that was sent regardless of
+position, and that holds for `sp_execute` against a cached plan just as it does
+for `sp_executesql`. The partition is order-stable, so the k-th entry in the
+parked DAE list still identifies the k-th streamed parameter and the
 `SQLParamData` token sequence follows ascending parameter number.
 
 ### State Lifecycle
@@ -192,9 +218,10 @@ so `dae_param_indices[k]` still identifies the k-th streamed parameter and the
 | After final `SQLParamData` completes | `EXEC_CONTEXT` (cursor) or idle |
 | On error | all flags cleared, connection returns to idle |
 
-The `TdsClient` is held in `StmtState::dae_client` while the DAE sequence is
-in progress. The DBC's `client` field is `None` and `active_stmt` is set to
-prevent concurrent access from other statements.
+The `TdsClient` is held in the statement's `StmtState::dae` alongside the
+prepared plan and orphaned handle the sequence suspended. The DBC's `client`
+field is `None` and `active_stmt` is set to prevent concurrent access from other
+statements.
 
 ### Error Recovery
 
@@ -202,7 +229,7 @@ If `write_streamed_chunk`, `write_streamed_null`, or `end_streamed_param`
 fails, `TdsClient::abort_streamed_write` is called internally (which closes
 the transport). The ODBC layer:
 
-1. Clears all DAE state (`reset_dae`).
+1. Clears all DAE state (`take_dae`).
 2. Writes the prepared plan back so `SQLExecute` can be retried.
 3. Returns the client to idle and posts the TDS error.
 
