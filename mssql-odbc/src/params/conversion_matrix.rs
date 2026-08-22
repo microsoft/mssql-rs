@@ -21,8 +21,9 @@
 //! `07006` from inside its converters (`ConvError::Restricted`) instead.
 
 use crate::api::odbc_types::{
-    SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_WCHAR, SQL_CHAR, SQL_LONGVARCHAR, SQL_VARCHAR, SQL_WCHAR,
-    SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
+    SQL_BINARY, SQL_C_BINARY, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_WCHAR, SQL_CHAR, SQL_LONGVARBINARY,
+    SQL_LONGVARCHAR, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
+    SqlSmallInt,
 };
 
 /// SQL types a `SQL_C_CHAR` buffer can be converted to.
@@ -30,6 +31,9 @@ const CHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_CHAR, SQL_VARCHAR, SQL_LONGVARCHAR]
 
 /// SQL types a `SQL_C_WCHAR` buffer can be converted to.
 const WCHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_WCHAR, SQL_WVARCHAR, SQL_WLONGVARCHAR];
+
+/// SQL types a `SQL_C_BINARY` buffer can be converted to.
+const BINARY_C_TARGETS: &[SqlSmallInt] = &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY];
 
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
 /// for an input parameter.
@@ -41,6 +45,7 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
     let targets: &[SqlSmallInt] = match c_type {
         SQL_C_CHAR => CHAR_C_TARGETS,
         SQL_C_WCHAR => WCHAR_C_TARGETS,
+        SQL_C_BINARY => BINARY_C_TARGETS,
         _ => return false,
     };
     targets.contains(&sql_type)
@@ -66,9 +71,17 @@ mod tests {
     }
 
     #[test]
+    fn binary_conversions_are_supported() {
+        for sql_type in [SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY] {
+            assert!(is_supported_conversion(SQL_C_BINARY, sql_type));
+        }
+    }
+
+    #[test]
     fn cross_family_character_conversions_are_unsupported() {
         assert!(!is_supported_conversion(SQL_C_CHAR, SQL_WVARCHAR));
         assert!(!is_supported_conversion(SQL_C_WCHAR, SQL_VARCHAR));
+        assert!(!is_supported_conversion(SQL_C_BINARY, SQL_VARCHAR));
     }
 
     #[test]
