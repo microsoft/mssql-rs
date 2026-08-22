@@ -51,6 +51,27 @@ impl SqlVector {
         Ok(vector)
     }
 
+    /// Creates a half-precision (float16) SqlVector from f32 values.
+    ///
+    /// Values are kept as f32 in memory and narrowed to IEEE 754 halves
+    /// (round-to-nearest-even) when written to the wire, so a round-trip is
+    /// lossy. Requires the server to have negotiated Vector feature version 2.
+    ///
+    /// # Arguments
+    /// * `values` - The vector dimension values
+    ///
+    /// # Returns
+    /// * `Ok(SqlVector)` if valid
+    /// * `Err` if validation fails (too many dimensions, exceeds size limit)
+    pub fn try_from_f16(values: Vec<f32>) -> TdsResult<Self> {
+        let vector = Self {
+            base_type: VectorBaseType::Float16,
+            data: VectorData::Float32(values),
+        };
+        vector.validate_dimensions()?;
+        Ok(vector)
+    }
+
     /// Creates a SqlVector from raw header fields and raw bytes (used during deserialization).
     /// Validates the TDS header fields then parses and stores the typed data.
     pub(crate) fn try_from_raw(
@@ -275,5 +296,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 4 * 2);
+    }
+
+    #[test]
+    fn test_from_f16_valid() {
+        let vector = SqlVector::try_from_f16(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(vector.base_type(), VectorBaseType::Float16);
+        assert_eq!(vector.dimension_count(), 3);
+        assert_eq!(vector.as_f32(), Some(&[1.0, 2.0, 3.0][..]));
+        assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 3 * 2);
+    }
+
+    #[test]
+    fn test_validate_too_many_dimensions_f16() {
+        let values = vec![0.0f32; (VectorBaseType::Float16.max_dimensions() + 1) as usize];
+        let result = SqlVector::try_from_f16(values);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_f16_allows_more_dimensions_than_f32() {
+        let values = vec![0.0f32; VectorBaseType::Float16.max_dimensions() as usize];
+        assert!(SqlVector::try_from_f16(values.clone()).is_ok());
+        assert!(SqlVector::try_from_f32(values).is_err());
     }
 }

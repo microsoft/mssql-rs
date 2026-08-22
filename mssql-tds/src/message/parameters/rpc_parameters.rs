@@ -8,7 +8,7 @@ use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
     core::TdsResult,
-    datatypes::sqldatatypes::TdsDataType,
+    datatypes::sqldatatypes::{TdsDataType, VectorBaseType},
     error::Error,
     io::packet_writer::{PacketWriter, TdsPacketWriter},
     token::tokens::SqlCollation,
@@ -140,7 +140,11 @@ impl RpcParameter {
                     None => "18, 10".to_string(), // Default precision and scale
                 }
             }
-            SqlType::Vector(_, dims, _) => dims.to_string(),
+            // `vector(N)` implies the float32 base type; float16 must be spelled out.
+            SqlType::Vector(_, dims, base_type) => match base_type {
+                VectorBaseType::Float32 => dims.to_string(),
+                VectorBaseType::Float16 => format!("{dims}, float16"),
+            },
             _ => "".to_string(),
         };
 
@@ -338,5 +342,13 @@ mod tests {
         );
         let rpc_param = RpcParameter::get_sql_name(&sql_type);
         assert_eq!(rpc_param, "vector(3)".to_string());
+
+        let sql_type = SqlType::Vector(
+            None,
+            3,
+            crate::datatypes::sqldatatypes::VectorBaseType::Float16,
+        );
+        let rpc_param = RpcParameter::get_sql_name(&sql_type);
+        assert_eq!(rpc_param, "vector(3, float16)".to_string());
     }
 }

@@ -1013,4 +1013,482 @@ mod vector_integration_tests {
             _ => panic!("Expected Vector output parameter"),
         }
     }
+
+    /// Test sending a float16 Vector as a query parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_parameter_basic() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let vector = SqlVector::try_from_f16(vec![1.0f32, 2.0f32, 3.0f32]).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), 3, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_sp_executesql(
+                "SELECT @p1 AS ReturnedVector".to_string(),
+                vec![param],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resultset = client
+            .get_current_resultset()
+            .expect("Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = resultset.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(returned_vector) => {
+                    assert_eq!(returned_vector.dimension_count(), 3);
+                    assert_eq!(returned_vector.base_type(), VectorBaseType::Float16);
+                    let values = returned_vector.as_f32().unwrap();
+                    assert!((values[0] - 1.0).abs() < 0.001);
+                    assert!((values[1] - 2.0).abs() < 0.001);
+                    assert!((values[2] - 3.0).abs() < 0.001);
+                }
+                _ => panic!("Expected Vector column value, got: {:?}", row[0]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test NULL float16 Vector parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_parameter_null() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(None, 10, VectorBaseType::Float16),
+        );
+
+        let query = "SELECT @p1 AS NullVector, CASE WHEN @p1 IS NULL THEN 1 ELSE 0 END AS IsNull";
+
+        client
+            .execute_sp_executesql(query.to_string(), vec![param], None, None)
+            .await
+            .unwrap();
+
+        let resultset = client
+            .get_current_resultset()
+            .expect("Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = resultset.next_row().await.unwrap() {
+            row_count += 1;
+            assert!(matches!(row[0], ColumnValues::Null));
+            match &row[1] {
+                ColumnValues::Int(val) => assert_eq!(*val, 1, "Expected IsNull to be 1"),
+                _ => panic!("Expected Int(1), got: {:?}", row[1]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test float16 Vector parameter in a WHERE clause against a float16 column
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_parameter_in_where_clause() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let create_table = "
+            CREATE TABLE #Vector16Test (
+                id INT,
+                vec VECTOR(3, float16)
+            );
+            INSERT INTO #Vector16Test VALUES (1, CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)));
+            INSERT INTO #Vector16Test VALUES (2, CAST('[4.0, 5.0, 6.0]' AS VECTOR(3, float16)));
+            INSERT INTO #Vector16Test VALUES (3, CAST('[1.0, 2.0, 3.0]' AS VECTOR(3, float16)));
+        ";
+
+        client
+            .execute(create_table.to_string(), None, None)
+            .await
+            .unwrap();
+
+        while client.get_current_resultset().is_some() {
+            client.move_to_next().await.unwrap();
+        }
+
+        let vector = SqlVector::try_from_f16(vec![1.0f32, 2.0f32, 3.0f32]).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), 3, VectorBaseType::Float16),
+        );
+
+        let query = "SELECT id FROM #Vector16Test WHERE VECTOR_DISTANCE('cosine', vec, @p1) < 1e-6";
+
+        client
+            .execute_sp_executesql(query.to_string(), vec![param], None, None)
+            .await
+            .unwrap();
+
+        let resultset = client
+            .get_current_resultset()
+            .expect("Expected a result set");
+        let mut found_ids = vec![];
+        while let Some(row) = resultset.next_row().await.unwrap() {
+            match &row[0] {
+                ColumnValues::Int(id) => found_ids.push(*id),
+                _ => panic!("Expected Int column, got: {:?}", row[0]),
+            }
+        }
+
+        assert_eq!(found_ids.len(), 2, "Expected 2 matching rows");
+        assert!(found_ids.contains(&1), "Expected to find id 1");
+        assert!(found_ids.contains(&3), "Expected to find id 3");
+    }
+
+    /// Test float16 Vector parameter at the maximum dimension count (3996)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_parameter_max_dimensions() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let dims = VectorBaseType::Float16.max_dimensions();
+        // Keep values within f16's exactly-representable integer range (<= 2048).
+        let values: Vec<f32> = (0..dims).map(|i| (i % 2048) as f32).collect();
+        let vector = SqlVector::try_from_f16(values.clone()).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), dims, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_sp_executesql(
+                "SELECT @p1 AS MaxVector".to_string(),
+                vec![param],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resultset = client
+            .get_current_resultset()
+            .expect("Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = resultset.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(returned_vector) => {
+                    assert_eq!(returned_vector.dimension_count(), dims);
+                    assert_eq!(returned_vector.base_type(), VectorBaseType::Float16);
+                    let returned = returned_vector.as_f32().unwrap();
+                    assert_eq!(returned, values.as_slice());
+                }
+                _ => panic!("Expected Vector column value, got: {:?}", row[0]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test that float16 narrowing is lossy but round-trips through the server
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_parameter_precision_loss() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        // 0.1 and 1/3 are not representable in f16; the server must return the
+        // same narrowed values the client sent.
+        let sent = vec![0.1f32, 1.0f32 / 3.0f32, -0.1f32];
+        let expected: Vec<f32> = sent
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let vector = SqlVector::try_from_f16(sent).unwrap();
+        let param = RpcParameter::new(
+            Some("@p1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Vector(Some(vector), 3, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_sp_executesql(
+                "SELECT @p1 AS Narrowed".to_string(),
+                vec![param],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resultset = client
+            .get_current_resultset()
+            .expect("Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = resultset.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(returned_vector) => {
+                    assert_eq!(returned_vector.base_type(), VectorBaseType::Float16);
+                    assert_eq!(returned_vector.as_f32().unwrap(), expected.as_slice());
+                }
+                _ => panic!("Expected Vector column value, got: {:?}", row[0]),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test mixing float32 and float16 Vector parameters in one call
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mixed_vector_base_type_parameters() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let vec32 = SqlVector::try_from_f32(vec![1.0f32, 2.0f32, 3.0f32]).unwrap();
+        let vec16 = SqlVector::try_from_f16(vec![4.0f32, 5.0f32, 6.0f32]).unwrap();
+
+        let params = vec![
+            RpcParameter::new(
+                Some("@p1".to_string()),
+                StatusFlags::NONE,
+                SqlType::Vector(Some(vec32), 3, VectorBaseType::Float32),
+            ),
+            RpcParameter::new(
+                Some("@p2".to_string()),
+                StatusFlags::NONE,
+                SqlType::Vector(Some(vec16), 3, VectorBaseType::Float16),
+            ),
+        ];
+
+        client
+            .execute_sp_executesql(
+                "SELECT @p1 AS Vec32, @p2 AS Vec16".to_string(),
+                params,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resultset = client
+            .get_current_resultset()
+            .expect("Expected a result set");
+        let mut row_count = 0;
+        while let Some(row) = resultset.next_row().await.unwrap() {
+            row_count += 1;
+            match &row[0] {
+                ColumnValues::Vector(v) => {
+                    assert_eq!(v.base_type(), VectorBaseType::Float32);
+                    assert_eq!(v.as_f32().unwrap(), &[1.0, 2.0, 3.0]);
+                }
+                _ => panic!("Expected Vector for first column"),
+            }
+            match &row[1] {
+                ColumnValues::Vector(v) => {
+                    assert_eq!(v.base_type(), VectorBaseType::Float16);
+                    assert_eq!(v.as_f32().unwrap(), &[4.0, 5.0, 6.0]);
+                }
+                _ => panic!("Expected Vector for second column"),
+            }
+        }
+        assert_eq!(row_count, 1, "Expected exactly 1 row");
+    }
+
+    /// Test float16 Vector as output parameter from a stored procedure
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_output_parameter() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let create_proc = "
+            CREATE PROCEDURE #TestVector16Output
+                @OutputVector VECTOR(3, float16) OUTPUT
+            AS
+            BEGIN
+                SET @OutputVector = CAST('[7.0, 8.0, 9.0]' AS VECTOR(3, float16));
+            END
+        ";
+
+        client
+            .execute(create_proc.to_string(), None, None)
+            .await
+            .unwrap();
+
+        while client.get_current_resultset().is_some() {
+            client.move_to_next().await.unwrap();
+        }
+
+        let output_param = RpcParameter::new(
+            Some("@OutputVector".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Vector(None, 3, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_stored_procedure(
+                "#TestVector16Output".to_string(),
+                None,
+                Some(vec![output_param]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let output_params = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
+
+        match &output_params[0].value {
+            ColumnValues::Vector(vector) => {
+                assert_eq!(vector.dimension_count(), 3);
+                assert_eq!(vector.base_type(), VectorBaseType::Float16);
+                let values = vector.as_f32().unwrap();
+                assert!((values[0] - 7.0).abs() < 0.001);
+                assert!((values[1] - 8.0).abs() < 0.001);
+                assert!((values[2] - 9.0).abs() < 0.001);
+            }
+            _ => panic!(
+                "Expected Vector output parameter, got: {:?}",
+                output_params[0].value
+            ),
+        }
+    }
+
+    /// Test float16 Vector as both input and output parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_input_output_parameter() {
+        use mssql_tds::datatypes::sql_vector::SqlVector;
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let create_proc = "
+            CREATE PROCEDURE #TestVector16InOut
+                @InputVector VECTOR(3, float16),
+                @OutputVector VECTOR(3, float16) OUTPUT
+            AS
+            BEGIN
+                SET @OutputVector = @InputVector;
+            END
+        ";
+
+        client
+            .execute(create_proc.to_string(), None, None)
+            .await
+            .unwrap();
+
+        while client.get_current_resultset().is_some() {
+            client.move_to_next().await.unwrap();
+        }
+
+        // 10.5 / 20.5 / 30.5 are exactly representable in f16.
+        let input_vector = SqlVector::try_from_f16(vec![10.5f32, 20.5f32, 30.5f32]).unwrap();
+        let params = vec![
+            RpcParameter::new(
+                Some("@InputVector".to_string()),
+                StatusFlags::NONE,
+                SqlType::Vector(Some(input_vector), 3, VectorBaseType::Float16),
+            ),
+            RpcParameter::new(
+                Some("@OutputVector".to_string()),
+                StatusFlags::BY_REF_VALUE,
+                SqlType::Vector(None, 3, VectorBaseType::Float16),
+            ),
+        ];
+
+        client
+            .execute_stored_procedure(
+                "#TestVector16InOut".to_string(),
+                None,
+                Some(params),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let output_params = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
+
+        match &output_params[0].value {
+            ColumnValues::Vector(vector) => {
+                assert_eq!(vector.base_type(), VectorBaseType::Float16);
+                assert_eq!(vector.as_f32().unwrap(), &[10.5, 20.5, 30.5]);
+            }
+            _ => panic!(
+                "Expected Vector output parameter, got: {:?}",
+                output_params[0].value
+            ),
+        }
+    }
+
+    /// Test NULL float16 Vector as output parameter
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_vector16_output_parameter_null() {
+        use mssql_tds::datatypes::sqltypes::SqlType;
+        use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        let create_proc = "
+            CREATE PROCEDURE #TestVector16OutputNull
+                @OutputVector VECTOR(5, float16) OUTPUT
+            AS
+            BEGIN
+                SET @OutputVector = NULL;
+            END
+        ";
+
+        client
+            .execute(create_proc.to_string(), None, None)
+            .await
+            .unwrap();
+
+        while client.get_current_resultset().is_some() {
+            client.move_to_next().await.unwrap();
+        }
+
+        let output_param = RpcParameter::new(
+            Some("@OutputVector".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Vector(None, 5, VectorBaseType::Float16),
+        );
+
+        client
+            .execute_stored_procedure(
+                "#TestVector16OutputNull".to_string(),
+                None,
+                Some(vec![output_param]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let output_params = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(output_params.len(), 1, "Expected 1 output parameter");
+        assert!(matches!(output_params[0].value, ColumnValues::Null));
+    }
 }

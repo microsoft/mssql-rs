@@ -339,9 +339,6 @@ impl TryFrom<u8> for VectorBaseType {
     }
 }
 
-/// Maximum number of dimensions in a TDS vector for the float32 base type.
-/// For other base types use [`VectorBaseType::max_dimensions`].
-pub(crate) const VECTOR_MAX_DIMENSIONS: u16 = 1998;
 /// Size of the vector header in bytes.
 pub const VECTOR_HEADER_SIZE: usize = 8;
 /// Maximum total vector payload size in bytes.
@@ -1205,11 +1202,15 @@ mod tests {
         let bt = VectorBaseType::try_from(0x00).unwrap();
         assert_eq!(bt, VectorBaseType::Float32);
         assert_eq!(bt.element_size_bytes(), 4);
+
+        let bt = VectorBaseType::try_from(0x01).unwrap();
+        assert_eq!(bt, VectorBaseType::Float16);
+        assert_eq!(bt.element_size_bytes(), 2);
     }
 
     #[test]
     fn vector_base_type_try_from_invalid() {
-        assert!(VectorBaseType::try_from(0x01).is_err());
+        assert!(VectorBaseType::try_from(0x02).is_err());
         assert!(VectorBaseType::try_from(0xFF).is_err());
     }
 
