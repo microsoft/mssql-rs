@@ -20,8 +20,8 @@ use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::{
-    PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
-    STMT_STATE_NEED_DATA,
+    DaeParam, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
+    STMT_STATE_EXEC_STARTED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -67,11 +67,8 @@ struct DaeExecution {
     /// Full parameter list in original order; DAE entries have `data_at_exec()`
     /// set and carry a `None` value.
     params: Vec<RpcParameter>,
-    /// 0-based indices (into `params`) of the DAE parameters, in order.
-    dae_indices: Vec<usize>,
-    /// Expected byte counts from `SQL_LEN_DATA_AT_EXEC(n)`, parallel to
-    /// `dae_indices`.
-    dae_expected_lengths: Vec<Option<usize>>,
+    /// The streamed parameters, in original parameter order.
+    dae_params: Vec<DaeParam>,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
 }
@@ -146,8 +143,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
 
         ExecutionStaging::NeedData(DaeExecution {
             params,
-            dae_indices,
-            dae_expected_lengths,
+            dae_params,
             prepared,
             orphaned,
         }) => {
@@ -182,7 +178,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             match begin_result {
                 Ok(StreamedParamStatus::Complete(result)) => {
                     // All params happened to be materialized (shouldn't happen
-                    // because staging only produces NeedData when dae_indices is
+                    // because staging only produces NeedData when dae_params is
                     // non-empty, but handle it defensively).
                     if let Ok(mut stmt_state) = stmt.inner.lock() {
                         stmt_state.prepared = Some(prepared);
@@ -196,8 +192,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     client,
                     Some(prepared),
                     orphaned,
-                    dae_indices,
-                    dae_expected_lengths,
+                    dae_params,
                     "SQLExecute",
                 ),
                 Err(e) => {
@@ -239,7 +234,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // A statement awaiting data-at-execution input is in the ODBC "Need Data"
     // state, where every function other than SQLPutData/SQLParamData/SQLCancel
     // and the diagnostic calls is a sequence error rather than a cursor error.
-    if stmt_state.has_state(STMT_STATE_NEED_DATA) {
+    if stmt_state.needs_data() {
         error!("SQLExecute: statement is awaiting data-at-execution input");
         post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
         return Err(SQL_ERROR);
@@ -259,11 +254,8 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
 
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
-    let ParamsWithDae {
-        params,
-        dae_indices,
-        dae_expected_lengths,
-    } = unsafe { build_params_with_dae(&mut stmt_state, marker_count, "SQLExecute") }?;
+    let ParamsWithDae { params, dae_params } =
+        unsafe { build_params_with_dae(&mut stmt_state, marker_count, "SQLExecute") }?;
 
     let prepared = stmt_state
         .prepared
@@ -277,7 +269,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 
-    if dae_indices.is_empty() {
+    if dae_params.is_empty() {
         Ok(ExecutionStaging::Ready(Execution {
             named_params: params,
             prepared,
@@ -286,8 +278,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     } else {
         Ok(ExecutionStaging::NeedData(DaeExecution {
             params,
-            dae_indices,
-            dae_expected_lengths,
+            dae_params,
             prepared,
             orphaned,
         }))
@@ -378,7 +369,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.set_state(STMT_STATE_NEED_DATA | STMT_STATE_EXEC_STARTED);
+            state.set_state(STMT_STATE_EXEC_STARTED);
+            state.dae = Some(crate::handles::stmt::DaeState::for_test(Vec::new(), None));
         }
         let ret = unsafe { sql_execute(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
@@ -530,7 +522,13 @@ mod tests {
         match staging {
             ExecutionStaging::NeedData(dae) => {
                 // The single param is DAE: its index is in dae_indices.
-                assert_eq!(dae.dae_indices, vec![0]);
+                assert_eq!(
+                    dae.dae_params,
+                    vec![DaeParam {
+                        bound_index: 0,
+                        expected_len: None
+                    }]
+                );
                 assert_eq!(dae.params.len(), 1, "one param in list");
             }
             ExecutionStaging::Ready(_) => panic!("expected NeedData staging for DAE param"),

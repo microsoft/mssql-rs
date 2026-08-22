@@ -25,8 +25,8 @@ use crate::conversion::param_convert::{
 };
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
-    STMT_STATE_NEED_DATA, StmtState,
+    DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
+    STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
 
@@ -63,10 +63,7 @@ pub(super) fn unwind_dae(
         if let Some(diag) = diag {
             post_diag(&mut stmt_state, diag);
         }
-        let client = stmt_state.dae_client.take();
-        stmt_state.prepared = stmt_state.dae_prepared.take();
-        stmt_state.pending_unprepare = stmt_state.dae_orphaned.take();
-        stmt_state.reset_dae();
+        let client = stmt_state.take_dae();
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         client
     };
@@ -83,14 +80,12 @@ pub(super) fn unwind_dae(
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn park_dae_client(
     stmt: &StmtHandle,
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
-    dae_indices: Vec<usize>,
-    dae_expected_lengths: Vec<Option<usize>>,
+    dae_params: Vec<DaeParam>,
     op: &str,
 ) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -99,17 +94,7 @@ pub(super) fn park_dae_client(
         error!("{op}: stmt mutex poisoned while parking DAE client");
         return SQL_ERROR;
     };
-    stmt_state.dae_client = Some(client);
-    stmt_state.dae_prepared = prepared;
-    stmt_state.dae_orphaned = orphaned;
-    stmt_state.dae_param_indices = dae_indices;
-    stmt_state.dae_expected_lengths = dae_expected_lengths;
-    stmt_state.dae_current_idx = 0;
-    stmt_state.dae_current_bytes_sent = 0;
-    stmt_state.dae_current_put_data_called = false;
-    stmt_state.dae_current_is_null = false;
-    stmt_state.dae_param_data_first = true;
-    stmt_state.set_state(STMT_STATE_NEED_DATA);
+    stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
     SQL_NEED_DATA
 }
 
@@ -278,17 +263,14 @@ pub(super) fn flush_pending_unprepare(
 }
 
 /// Result of [`build_params_with_dae`]: the full RPC parameter list (with
-/// data-at-execution placeholders) and the 0-based indices of those parameters.
+/// data-at-execution placeholders) and a description of those placeholders.
 pub(super) struct ParamsWithDae {
     /// All `@P1..@Pn` parameters in original order.  DAE entries carry a
     /// `data_at_exec()` flag and a `None` value; their data arrives later via
     /// `SQLPutData`.
     pub(super) params: Vec<RpcParameter>,
-    /// 0-based indices (into `params`) of every DAE entry.
-    pub(super) dae_indices: Vec<usize>,
-    /// Expected byte counts from `SQL_LEN_DATA_AT_EXEC(n)`, parallel to
-    /// `dae_indices`; `None` means `SQL_DATA_AT_EXEC`.
-    pub(super) dae_expected_lengths: Vec<Option<usize>>,
+    /// Every DAE entry, in original parameter order.
+    pub(super) dae_params: Vec<DaeParam>,
 }
 
 fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
@@ -306,7 +288,7 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 ///
 /// Parameters with `SQL_DATA_AT_EXEC` or `SQL_LEN_DATA_AT_EXEC(n)` indicators
 /// become streaming placeholders instead of having their value buffer read
-/// eagerly, and are recorded in [`ParamsWithDae::dae_indices`]; all others are
+/// eagerly, and are recorded in [`ParamsWithDae::dae_params`]; all others are
 /// converted immediately. Posts the matching diagnostic and returns
 /// `Err(SQL_ERROR)` when a marker is unbound (`07002`) or a parameter cannot be
 /// built.
@@ -322,8 +304,7 @@ pub(super) unsafe fn build_params_with_dae(
     use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
 
     let mut params = Vec::with_capacity(marker_count);
-    let mut dae_indices = Vec::new();
-    let mut dae_expected_lengths = Vec::new();
+    let mut dae_params = Vec::new();
 
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
@@ -357,8 +338,10 @@ pub(super) unsafe fn build_params_with_dae(
                 }
             };
             let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
-            dae_indices.push(i);
-            dae_expected_lengths.push(dae_expected_length(indicator));
+            dae_params.push(DaeParam {
+                bound_index: i,
+                expected_len: dae_expected_length(indicator),
+            });
             params.push(rpc);
         } else {
             match unsafe { bound_param_to_rpc(name, bound_param) } {
@@ -381,11 +364,7 @@ pub(super) unsafe fn build_params_with_dae(
         }
     }
 
-    Ok(ParamsWithDae {
-        params,
-        dae_indices,
-        dae_expected_lengths,
-    })
+    Ok(ParamsWithDae { params, dae_params })
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -553,7 +532,7 @@ mod tests {
         let mut state = stmt.inner.lock().unwrap();
         let built = unsafe { build_params_with_dae(&mut state, 0, "test") }.unwrap();
         assert!(built.params.is_empty());
-        assert!(built.dae_indices.is_empty());
+        assert!(built.dae_params.is_empty());
     }
 
     #[test]
@@ -576,7 +555,7 @@ mod tests {
 
         let built = unsafe { build_params_with_dae(&mut state, 2, "test") }.unwrap();
         assert_eq!(built.params.len(), 2);
-        assert!(built.dae_indices.is_empty());
+        assert!(built.dae_params.is_empty());
     }
 
     #[test]
@@ -648,8 +627,13 @@ mod tests {
 
         let dae = unsafe { build_params_with_dae(&mut state, 3, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
-        assert_eq!(dae.dae_indices, vec![1]);
-        assert_eq!(dae.dae_expected_lengths, vec![None]);
+        assert_eq!(
+            dae.dae_params,
+            vec![DaeParam {
+                bound_index: 1,
+                expected_len: None
+            }]
+        );
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
@@ -675,7 +659,12 @@ mod tests {
         }));
 
         let dae = unsafe { build_params_with_dae(&mut state, 1, "test") }.unwrap();
-        assert_eq!(dae.dae_indices, vec![0]);
-        assert_eq!(dae.dae_expected_lengths, vec![Some(7)]);
+        assert_eq!(
+            dae.dae_params,
+            vec![DaeParam {
+                bound_index: 0,
+                expected_len: Some(7)
+            }]
+        );
     }
 }

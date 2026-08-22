@@ -64,10 +64,6 @@ pub(crate) const STMT_STATE_EXEC_CONTEXT: u32 = 0x0000_1000;
 /// this is what stops a concurrent rebind from freeing a buffer the fill loop is
 /// still writing through: the mutating entry points refuse while it is set.
 pub(crate) const STMT_STATE_FETCH_IN_PROGRESS: u32 = 0x0000_2000;
-/// Set while the statement is suspended waiting for application calls to
-/// `SQLPutData` / `SQLParamData` to supply data-at-execution parameter values.
-/// Cleared once the final `SQLParamData` completes the execution or on error.
-pub(crate) const STMT_STATE_NEED_DATA: u32 = 0x0000_4000;
 
 /// Statement handle
 ///
@@ -186,56 +182,147 @@ pub(crate) struct StmtState {
     pub(crate) bindings: Vec<ColumnBinding>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
+    /// The data-at-execution sequence in progress, if any. `Some` is exactly
+    /// the ODBC "Need Data" state — see [`StmtState::needs_data`].
+    pub(crate) dae: Option<DaeState>,
+}
 
-    // ── Data-at-execution (DAE) streaming fields ──────────────────────────
-    // These are only populated while STMT_STATE_NEED_DATA is set.  Cleared
-    // atomically when the DAE sequence completes or is aborted.
-    /// The TDS client held between `SQLExecute` (which returned SQL_NEED_DATA)
-    /// and the final `SQLParamData` call that finishes the streaming RPC.  The
-    /// DBC's `client` field is `None` for the duration; `active_stmt` stays set
-    /// to prevent concurrent access.
-    pub(crate) dae_client: Option<TdsClient>,
-    /// The prepared plan stashed during the DAE sequence; written back to
-    /// `prepared` when execution completes.
-    pub(crate) dae_prepared: Option<PreparedPlan>,
-    /// Orphaned server handle to be released at next-execute time, stashed
+/// One data-at-execution parameter: which binding it refers to and how many
+/// bytes the application promised for it.
+///
+/// Keeping the pair together means a parameter can never be described by an
+/// index with no matching length, which two parallel `Vec`s cannot rule out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DaeParam {
+    /// 0-based index into [`StmtState::bound_params`].
+    pub(crate) bound_index: usize,
+    /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
+    /// `SQL_DATA_AT_EXEC`, where the application promised no total.
+    pub(crate) expected_len: Option<usize>,
+}
+
+/// How much of the open data-at-execution parameter the application has
+/// supplied. Reset as a unit whenever the cursor advances.
+#[derive(Debug, Default)]
+pub(crate) struct DaeProgress {
+    /// Bytes supplied by `SQLPutData`, counted before any server-side
+    /// conversion to match msodbcsql's `cbDataAppGiven`.
+    pub(crate) bytes_sent: usize,
+    /// Set by the first `SQLPutData` for this parameter, including zero-length
+    /// and NULL writes. Closing a parameter without one is a sequence error in
+    /// msodbcsql.
+    pub(crate) put_data_called: bool,
+    /// The parameter was supplied as SQL NULL, so the declared-length check is
+    /// skipped, as in msodbcsql.
+    pub(crate) is_null: bool,
+}
+
+/// A data-at-execution sequence in progress: everything the statement holds
+/// between the `SQL_NEED_DATA` returned by `SQLExecute` / `SQLExecDirect` and
+/// the `SQLParamData` that finishes the streaming RPC.
+///
+/// Grouped rather than spread across the statement so the whole sequence is
+/// established and torn down in one move, and so no field can outlive it.
+#[derive(Debug)]
+pub(crate) struct DaeState {
+    /// The streaming client, parked here while the DBC's own `client` is
+    /// `None` and its `active_stmt` keeps the connection busy. Private, with
+    /// `call_in_flight`, so the two can only move together — see
+    /// [`DaeState::checkout_client`].
+    client: Option<TdsClient>,
+    /// `true` while `SQLPutData` or `SQLParamData` holds the client for network
+    /// I/O.
+    call_in_flight: bool,
+    /// The prepared plan stashed for the sequence, written back to
+    /// [`StmtState::prepared`] when it ends. `None` for `SQLExecDirect`, which
+    /// runs ad-hoc `sp_executesql` and has no plan to restore.
+    prepared: Option<PreparedPlan>,
+    /// Orphaned server handle to release at next-execute time, stashed
     /// identically to the non-DAE path.
-    pub(crate) dae_orphaned: Option<StatementId>,
-    /// 0-based indices (into `bound_params`) of the parameters that carry a
-    /// data-at-execution indicator, in their original parameter order.  The
-    /// indices control both the `SQLParamData` pointer returned to the
-    /// application and the cursor within the TDS streaming protocol.
-    pub(crate) dae_param_indices: Vec<usize>,
-    /// Expected byte counts from `SQL_LEN_DATA_AT_EXEC(n)` for each DAE
-    /// parameter, parallel to `dae_param_indices`. `None` represents
-    /// `SQL_DATA_AT_EXEC`, where the application did not promise a total length.
-    pub(crate) dae_expected_lengths: Vec<Option<usize>>,
-    /// Which element of `dae_param_indices` the driver is currently streaming.
-    /// Incremented by `SQLParamData` each time `end_streamed_param` returns
-    /// `NeedData` for the next parameter.
-    pub(crate) dae_current_idx: usize,
-    /// Bytes supplied by `SQLPutData` for the current DAE parameter. This tracks
-    /// the application-provided byte count before any server-side conversion,
-    /// matching msodbcsql's `cbDataAppGiven`.
-    pub(crate) dae_current_bytes_sent: usize,
-    /// Set by the first `SQLPutData` call for the current parameter, including
-    /// zero-length and NULL writes. A second `SQLParamData` while this is false
-    /// is a sequence error in msodbcsql.
-    pub(crate) dae_current_put_data_called: bool,
-    /// True when the current DAE parameter was supplied as SQL NULL. Length
-    /// mismatch checks are skipped for NULL, as in msodbcsql.
-    pub(crate) dae_current_is_null: bool,
-    /// `true` immediately after `SQLExecute` returns `SQL_NEED_DATA` and
-    /// before the first `SQLParamData` call.  The first `SQLParamData` just
-    /// delivers the current parameter's `ParameterValuePtr` without calling
-    /// `end_streamed_param`; subsequent calls advance the cursor.
-    pub(crate) dae_param_data_first: bool,
-    /// `true` while `SQLPutData` or `SQLParamData` has `dae_client` checked out
-    /// for network I/O. `SQLCancel` is the one call an application may make on
-    /// a busy statement from another thread, and during this window the
-    /// statement is in `NEED_DATA` but owns neither the client nor the right to
-    /// reset the sequence: the owning thread is about to write back into it.
-    pub(crate) dae_call_in_flight: bool,
+    orphaned: Option<StatementId>,
+    /// The streamed parameters, in original parameter order.
+    params: Vec<DaeParam>,
+    /// Which of `params` is open. `None` until the first `SQLParamData`, which
+    /// only hands the application a pointer.
+    pub(crate) cursor: Option<usize>,
+    /// Progress on the parameter named by `cursor`.
+    pub(crate) progress: DaeProgress,
+}
+
+impl DaeState {
+    pub(crate) fn new(
+        client: TdsClient,
+        prepared: Option<PreparedPlan>,
+        orphaned: Option<StatementId>,
+        params: Vec<DaeParam>,
+    ) -> Self {
+        Self {
+            client: Some(client),
+            call_in_flight: false,
+            prepared,
+            orphaned,
+            params,
+            cursor: None,
+            progress: DaeProgress::default(),
+        }
+    }
+
+    /// Checks the client out for a network write, so no lock is held across the
+    /// I/O. `None` means the sequence has no client to give, which is internal
+    /// state corruption. Pairs with [`DaeState::return_client`].
+    #[must_use = "a checked-out client must be returned or disposed of"]
+    pub(crate) fn checkout_client(&mut self) -> Option<TdsClient> {
+        let client = self.client.take()?;
+        self.call_in_flight = true;
+        Some(client)
+    }
+
+    /// Parks the client back on the sequence after a write completes.
+    pub(crate) fn return_client(&mut self, client: TdsClient) {
+        self.client = Some(client);
+        self.call_in_flight = false;
+    }
+
+    /// `true` while `SQLPutData` or `SQLParamData` holds the client for network
+    /// I/O. `SQLCancel` is the one call an application may make on a busy
+    /// statement from another thread, and during this window the sequence is
+    /// not its to reset: the owning thread is about to write back into it.
+    pub(crate) fn call_in_flight(&self) -> bool {
+        self.call_in_flight
+    }
+
+    /// The parameter the cursor is on; `None` before the first `SQLParamData`
+    /// and once the last parameter has been closed.
+    pub(crate) fn current_param(&self) -> Option<&DaeParam> {
+        self.params.get(self.cursor?)
+    }
+
+    /// Opens the next parameter, discarding the closed one's progress. Called
+    /// by every `SQLParamData`, including the first, which opens parameter 0.
+    pub(crate) fn advance(&mut self) {
+        self.cursor = Some(self.cursor.map_or(0, |current| current + 1));
+        self.progress = DaeProgress::default();
+    }
+
+    /// Builds a sequence with no parked client, for tests that exercise the
+    /// validation paths reached before any network write.
+    #[cfg(test)]
+    pub(crate) fn for_test(params: Vec<DaeParam>, cursor: Option<usize>) -> Self {
+        Self {
+            client: None,
+            call_in_flight: false,
+            prepared: None,
+            orphaned: None,
+            params,
+            cursor,
+            progress: DaeProgress::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_call_in_flight(&mut self, in_flight: bool) {
+        self.call_in_flight = in_flight;
+    }
 }
 
 /// A prepared statement bundled with the marker count of its rewritten SQL, so
@@ -343,22 +430,47 @@ impl StmtState {
             );
         }
     }
-    /// Resets all data-at-execution streaming state. Call after a DAE sequence
-    /// completes (success or error). The caller is responsible for returning
-    /// `dae_client` to the DBC before calling this.
-    pub(crate) fn reset_dae(&mut self) {
-        self.dae_client = None;
-        self.dae_prepared = None;
-        self.dae_orphaned = None;
-        self.dae_param_indices.clear();
-        self.dae_expected_lengths.clear();
-        self.dae_current_idx = 0;
-        self.dae_current_bytes_sent = 0;
-        self.dae_current_put_data_called = false;
-        self.dae_current_is_null = false;
-        self.dae_param_data_first = false;
-        self.dae_call_in_flight = false;
-        self.clear_state(STMT_STATE_NEED_DATA);
+    /// Resets all data-at-execution streaming state and hands back the parked
+    /// client, if the sequence still held one. Call after a DAE sequence
+    /// completes, is cancelled, or fails.
+    ///
+    /// The prepared plan and orphaned handle the sequence was holding are
+    /// restored in the same step, so the statement is never observable as idle
+    /// but unprepared. The caller owns the returned client and must dispose of
+    /// it — `None` means a `SQLPutData` / `SQLParamData` call has it checked
+    /// out and will dispose of it itself.
+    #[must_use = "the parked client must be cancelled and returned to the connection"]
+    pub(crate) fn take_dae(&mut self) -> Option<TdsClient> {
+        let dae = self.dae.take()?;
+        self.prepared = dae.prepared;
+        self.pending_unprepare = dae.orphaned;
+        dae.client
+    }
+
+    /// `true` while the statement is in the ODBC "Need Data" state, suspended
+    /// until `SQLPutData` / `SQLParamData` supply the data-at-execution
+    /// parameter values.
+    pub(crate) fn needs_data(&self) -> bool {
+        self.dae.is_some()
+    }
+
+    /// The application's `ParameterValuePtr` for the open DAE parameter — the
+    /// token `SQLParamData` hands back so the application knows which parameter
+    /// to supply. Null when no parameter is open or its binding is gone.
+    pub(crate) fn dae_current_value_ptr(&self) -> SqlPointer {
+        self.dae_current_bound_param()
+            .map_or(std::ptr::null_mut(), |param| param.parameter_value_ptr)
+    }
+
+    /// The bound C type of the open DAE parameter, which `SQLPutData` needs to
+    /// size an `SQL_NTS` chunk.
+    pub(crate) fn dae_current_c_type(&self) -> Option<SqlSmallInt> {
+        self.dae_current_bound_param().map(|param| param.c_type)
+    }
+
+    fn dae_current_bound_param(&self) -> Option<&BoundParam> {
+        let dae_param = self.dae.as_ref()?.current_param()?;
+        self.bound_params.get(dae_param.bound_index)?.as_ref()
     }
 }
 
@@ -410,17 +522,7 @@ impl StmtHandle {
                 row_bind_offset_ptr: std::ptr::null_mut(),
                 bindings: Vec::new(),
                 state_flags: 0,
-                dae_client: None,
-                dae_prepared: None,
-                dae_orphaned: None,
-                dae_param_indices: Vec::new(),
-                dae_expected_lengths: Vec::new(),
-                dae_current_idx: 0,
-                dae_current_bytes_sent: 0,
-                dae_current_put_data_called: false,
-                dae_current_is_null: false,
-                dae_param_data_first: false,
-                dae_call_in_flight: false,
+                dae: None,
             }),
         }
     }

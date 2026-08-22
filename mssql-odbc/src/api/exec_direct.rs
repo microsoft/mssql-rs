@@ -19,8 +19,7 @@ use crate::api::odbc_types::{
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_NEED_DATA,
-    STMT_STATE_PREPARED,
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -97,7 +96,7 @@ fn sql_exec_direct_w_safe(
         // Data" state, where anything but SQLPutData/SQLParamData/SQLCancel is a
         // sequence error rather than the cursor error a merely-busy statement
         // gets.
-        if stmt_state.has_state(STMT_STATE_NEED_DATA) {
+        if stmt_state.needs_data() {
             error!("SQLExecDirectW: statement is awaiting data-at-execution input");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
@@ -134,11 +133,7 @@ fn sql_exec_direct_w_safe(
         (params_with_dae, rewritten_sql, marker_count)
     };
 
-    let ParamsWithDae {
-        params,
-        dae_indices,
-        dae_expected_lengths,
-    } = params_with_dae;
+    let ParamsWithDae { params, dae_params } = params_with_dae;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
@@ -155,25 +150,19 @@ fn sql_exec_direct_w_safe(
     // Data-at-execution parameters park the half-written RPC on the statement
     // and hand control to SQLParamData / SQLPutData. There is no prepared plan
     // to restore afterwards, so `None` is passed for it.
-    if !dae_indices.is_empty() {
+    if !dae_params.is_empty() {
         let begin_result =
             dbc.runtime
                 .block_on(client.begin_sp_executesql(rewritten_sql, params, ()));
         return match begin_result {
-            // Defensive: staging only reports DAE indices when at least one
+            // Defensive: staging only reports DAE parameters when at least one
             // placeholder is present, so the TDS layer should not complete here.
             Ok(StreamedParamStatus::Complete(_)) => {
                 finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
             }
-            Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
-                stmt,
-                client,
-                None,
-                None,
-                dae_indices,
-                dae_expected_lengths,
-                "SQLExecDirectW",
-            ),
+            Ok(StreamedParamStatus::NeedData { .. }) => {
+                park_dae_client(stmt, client, None, None, dae_params, "SQLExecDirectW")
+            }
             Err(e) => {
                 error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
                 fail_with_tds(dbc, stmt, statement_handle, client, &e)
@@ -250,7 +239,8 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            state.set_state(STMT_STATE_EXEC_STARTED | STMT_STATE_NEED_DATA);
+            state.set_state(STMT_STATE_EXEC_STARTED);
+            state.dae = Some(crate::handles::stmt::DaeState::for_test(Vec::new(), None));
         }
 
         let sql: Vec<u16> = "SELECT 1"
