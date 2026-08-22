@@ -133,6 +133,27 @@ pub(crate) fn create_network_transport_with_chunked_data(
     build_duplex_transport(client_side)
 }
 
+/// Builds a `NetworkTransport` fed `data` whose peer stays **connected** after
+/// the data is drained.
+///
+/// [`create_network_transport_with_data`] drops its writer, so a starved reader
+/// observes EOF and errors out. That masks no-progress bugs: a loop that fails
+/// to advance is rescued by the EOF rather than spinning. Holding the peer open
+/// reproduces real server behavior — the socket simply goes quiet — so a reader
+/// that cannot make progress blocks forever instead of erroring. Tests using
+/// this helper must therefore bound themselves with `tokio::time::timeout`.
+pub(crate) fn create_network_transport_with_live_peer(data: &[u8]) -> NetworkTransport {
+    let (client_side, mut server_side) = duplex(data.len().max(1));
+    let owned = data.to_vec();
+    tokio::spawn(async move {
+        let _ = server_side.write_all(&owned).await;
+        // Parks forever, keeping `server_side` alive so the reader never sees EOF.
+        std::future::pending::<()>().await;
+    });
+
+    build_duplex_transport(client_side)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
