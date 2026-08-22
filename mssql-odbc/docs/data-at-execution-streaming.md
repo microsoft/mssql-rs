@@ -216,14 +216,18 @@ client to idle, releasing the statement from the Need Data state. This is the
 only way out of Need Data that does not involve completing or failing the
 sequence.
 
-The half-written RPC cannot be retracted, so `cancel_streamed_write` closes the
-transport and the connection reports `SQL_CD_TRUE` for
-`SQL_ATTR_CONNECTION_DEAD` afterwards; the application must reconnect unless
-connection resiliency is negotiated, in which case the next command recovers the
-session transparently. msodbcsql does better here: it discards a still-unsent
-request locally, and after a partial send terminates the packet with
-`EOM | IGNORE` and drains the `DONE`, keeping the connection alive. Matching
-that is tracked by the TODO on `TdsClient::abort_streamed_write`.
+The request is retracted at the protocol level, so the connection stays usable
+and `SQL_ATTR_CONNECTION_DEAD` still reports `SQL_CD_FALSE`. Matching msodbcsql,
+the retraction depends on how much has escaped: a request still buffered in the
+client is dropped locally with no bytes sent, and one that is partially sent is
+terminated with an `EOM | IGNORE` packet so the server discards it, after which
+the `DONE` it answers with is drained. Only if that handshake itself fails is
+the transport closed, since the request is then neither complete nor
+retractable.
+
+The same path unwinds a sequence the driver rejects (`22026`, `HY020`,
+`HY010`), so a misused API call does not cost the application its connection
+either.
 
 ## Limitations (Phase 1)
 
@@ -231,9 +235,10 @@ that is tracked by the TODO on `TdsClient::abort_streamed_write`.
   DAE streaming.
 - Always Encrypted columns cannot use the DAE path.
 - Output parameters cannot be DAE.
-- A failed DAE sequence cannot be recovered by reconnecting, because the
-  transport is suspended mid-write. msodbcsql can recover here
-  (`GetBatchCtxOrRecover`).
+- A DAE sequence that fails on the wire (rather than being cancelled or
+  rejected) closes the transport, because a request interrupted by a send or
+  receive failure cannot be retracted with `EOM | IGNORE`. msodbcsql can recover
+  here (`GetBatchCtxOrRecover`).
 - The `SQL_NULL_DATA`-after-chunks case is caught by the unixODBC 2.3.9 driver
   manager first, which returns `HY011` before the driver is reached. The driver
   guard still posts `HY020` per the spec for callers that bypass that driver

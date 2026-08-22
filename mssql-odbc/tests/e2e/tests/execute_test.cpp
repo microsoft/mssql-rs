@@ -278,20 +278,11 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionBinaryParam) {
 }
 
 // SQLCancel is legal in the Need Data state and must release the statement
-// from it, so the app is not stuck issuing SQLPutData forever. The half-written
-// RPC cannot be retracted, so the transport is dropped and the connection
-// reports dead -- unlike msodbcsql, which recovers the session. See
-// `cancel_streamed_write` in mssql-tds and the limitations section of
-// docs/data-at-execution-streaming.md.
-// Benefits-from-mock-tds: the abort itself is unobservable from the client. A
-// mock TDS server could assert what this driver puts on the wire when the
-// sequence is abandoned -- today nothing, where msodbcsql sends EOM | IGNORE
-// and drains the DONE -- which is the assertion that would let this test track
-// msodbcsql instead of diverging from it.
+// from it, so the app is not stuck issuing SQLPutData forever. The abandoned
+// RPC is retracted at the protocol level, so the connection survives and the
+// statement can simply be executed again -- see `cancel_streamed_write` in
+// mssql-tds.
 TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
-    // Intentional divergence: msodbcsql leaves the connection usable here.
-    SKIP_IF_COMPARING_MSODBCSQL();
-
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -317,11 +308,23 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
     EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, const_cast<char*>(chunk), 7));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
 
-    SQLUINTEGER dead = SQL_CD_FALSE;
+    SQLUINTEGER dead = SQL_CD_TRUE;
     ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead,
                                     SQL_IS_UINTEGER, nullptr),
                   SQL_HANDLE_DBC, dbc_);
-    EXPECT_EQ(SQL_CD_TRUE, dead);
+    EXPECT_EQ(SQL_CD_FALSE, dead);
+
+    // The prepared plan was restored, so the same statement runs again on the
+    // same connection -- the point of retracting the request rather than
+    // dropping the transport.
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 7),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("partial", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // A data-at-execution parameter may resolve to NULL: the first SQLPutData
@@ -380,6 +383,23 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionChunkAfterNullReturnsHY020) {
     char chunk[] = "abc";
     ASSERT_EQ(SQL_ERROR, SQLPutData(stmt_, chunk, 3));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY020");
+
+    // Rejecting the chunk unwinds the sequence, which is the same retraction
+    // path SQLCancel takes: the application misused the API, so it must not
+    // also lose its connection.
+    SQLUINTEGER dead = SQL_CD_TRUE;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead,
+                                    SQL_IS_UINTEGER, nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(SQL_CD_FALSE, dead);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_SQL_OK(SQLPutData(stmt_, chunk, 3), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("abc", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // SQLExecDirect stages data-at-execution parameters the same way SQLExecute

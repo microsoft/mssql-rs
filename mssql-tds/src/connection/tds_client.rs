@@ -1499,8 +1499,6 @@ impl TdsClient {
         self.streamed_write_state = StreamedWriteState::Idle;
         self.execution_context.set_has_open_batch(false);
         self.transport.mark_known_dead();
-        // TODO: Match msodbcsql's state-aware cancellation: discard an unsent
-        // request locally, or send EOM | IGNORE and drain DONE after a partial send.
         if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after streamed write abort");
         }
@@ -1508,21 +1506,61 @@ impl TdsClient {
 
     /// Cancels an in-progress streamed PLP write while the client is parked in
     /// [`StreamedParamStatus::NeedData`](StreamedParamStatus::NeedData),
-    /// discarding the half-written RPC and closing the transport.
+    /// discarding the half-written RPC.
     ///
     /// This is the supported way for a caller to bail out of a streamed
     /// parameter sequence once [`begin_sp_executesql`](Self::begin_sp_executesql)
     /// has parked a message (for example, to service `SQLCancel` while an ODBC
-    /// driver is between `SQLPutData` calls). After this returns, no streamed
-    /// write is active, so a subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
+    /// driver is between `SQLPutData` calls, or to unwind after the driver
+    /// rejects a chunk). After this returns, no streamed write is active, so a
+    /// subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
     /// [`write_streamed_null`](Self::write_streamed_null), or
     /// [`end_streamed_param`](Self::end_streamed_param) fails with a usage
     /// error. Calling this with no streamed write active is a no-op.
+    ///
+    /// The connection normally survives, which is what lets an application keep
+    /// using a statement after a cancelled or rejected data-at-execution
+    /// sequence. How that is achieved depends on how much of the request has
+    /// escaped, mirroring msodbcsql's state-aware cancel:
+    ///
+    /// - nothing sent yet: the parked message is dropped locally and no bytes
+    ///   go to the server at all;
+    /// - partially sent: the message is closed with an EOM | IGNORE packet so
+    ///   the server discards it, and the DONE it answers with is consumed.
+    ///
+    /// Only if that handshake fails does the transport close, since the request
+    /// is then neither complete nor retractable.
     pub async fn cancel_streamed_write(&mut self) {
-        if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
+        let StreamedWriteState::Active(context) =
+            std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        else {
+            return;
+        };
+
+        if context.message.nothing_sent() {
+            self.execution_context.set_has_open_batch(false);
             return;
         }
-        self.abort_streamed_write().await;
+
+        let mut packet_writer = PacketWriter::resume(context.message, self.transport.as_writer());
+        let ignored = packet_writer.cancel_current_message().await;
+        drop(packet_writer);
+
+        if let Err(error) = ignored {
+            warn!(%error, "Failed to send ignore packet for cancelled streamed write");
+            self.abort_streamed_write().await;
+            return;
+        }
+
+        // The server acknowledges an ignored message with a DONE. Leaving it
+        // unread would desynchronize the next command on this connection.
+        if let Err(error) = self.drain_stream().await {
+            warn!(%error, "Failed to drain response to cancelled streamed write");
+            self.abort_streamed_write().await;
+            return;
+        }
+
+        self.execution_context.set_has_open_batch(false);
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -9423,11 +9461,11 @@ mod tests {
         ));
     }
 
-    /// Cancelling an active streamed write must discard parked state and mark
-    /// the connection dead so it cannot be reused by a pool checkout.
+    /// Cancelling before any packet has left the client discards the request
+    /// locally: nothing is written to the wire and the connection stays usable.
     #[tokio::test]
-    async fn cancel_streamed_write_aborts_active_stream_and_marks_connection_dead() {
-        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+    async fn cancel_streamed_write_before_first_packet_discards_locally() {
+        let (mut client, sent) = create_capturing_client(vec![]);
         let status = client
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
@@ -9440,16 +9478,116 @@ mod tests {
             status,
             StreamedParamStatus::NeedData { param_name: _ }
         ));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the RPC header must still be buffered, not on the wire"
+        );
 
         client.cancel_streamed_write().await;
 
         assert!(
-            client.is_connection_dead(),
-            "an aborted streamed write must not hand a live-looking connection back to the pool"
+            sent.lock().unwrap().is_empty(),
+            "a request the server never saw must not be cancelled over the wire"
         );
+        assert!(
+            !client.is_connection_dead(),
+            "abandoning an unsent request must leave the connection reusable"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
         assert!(matches!(
             client.write_streamed_chunk(&[0x01]).await,
             Err(UsageError(_))
+        ));
+    }
+
+    /// Cancelling after part of the request is on the wire closes the message
+    /// with EOM | IGNORE so the server discards it, consumes the DONE it
+    /// answers with, and keeps the connection reusable.
+    #[tokio::test]
+    async fn cancel_streamed_write_after_partial_send_ignores_and_drains() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+
+        // Overflow the payload buffer so at least one packet is flushed.
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
+        let sent_before_cancel = sent.lock().unwrap().len();
+        assert!(
+            sent_before_cancel > 0,
+            "a large chunk must have flushed at least one packet"
+        );
+
+        client.cancel_streamed_write().await;
+
+        // The trailing packet must carry EOM | IGNORE and no payload.
+        let wire = sent.lock().unwrap().clone();
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "the cancelled message must be terminated with an ignore packet"
+        );
+        assert_eq!(
+            u16::from_be_bytes([last[2], last[3]]) as usize,
+            PacketWriter::PACKET_HEADER_SIZE
+        );
+
+        assert!(
+            !client.is_connection_dead(),
+            "an ignored request leaves the connection clean for reuse"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(matches!(
+            client.write_streamed_chunk(&[0x01]).await,
+            Err(UsageError(_))
+        ));
+    }
+
+    /// If the ignore packet cannot be sent, the request is neither complete nor
+    /// retracted, so the connection must be closed rather than handed back.
+    #[tokio::test]
+    async fn cancel_streamed_write_falls_back_to_close_when_ignore_fails() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        client.cancel_streamed_write().await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a request that could not be retracted must not be reused"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
         ));
     }
 
