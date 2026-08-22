@@ -38,7 +38,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
-use tracing::{debug, error, event, info, trace};
+use tracing::{debug, error, event, info, trace, warn};
 
 #[cfg(windows)]
 use crate::connection::transport::localdb::resolve_localdb_instance;
@@ -1148,8 +1148,22 @@ impl TransportSslHandler for NetworkTransport {
 
 impl TdsPacketReader for NetworkTransport {
     fn reset_reader(&mut self) {
-        // Make sure that we have read all the data from the buffer.
-        assert!(self.tds_read_buffer.buffer_length == self.tds_read_buffer.buffer_position);
+        // Callers reset before starting a new message, so the buffer is
+        // expected to be fully consumed. Log a violation instead of asserting:
+        // `buffer_length` comes from the packet header the peer sent, so a
+        // malformed or truncated response must not be able to abort the
+        // process. Discarding the leftover bytes is what a reset means, so the
+        // outcome is the same either way.
+        let unread = self
+            .tds_read_buffer
+            .buffer_length
+            .saturating_sub(self.tds_read_buffer.buffer_position);
+        if unread > 0 {
+            warn!(
+                unread_bytes = unread,
+                "Discarding unread bytes while resetting the packet reader"
+            );
+        }
         self.tds_read_buffer
             .change_packet_size(NetworkReader::packet_size(self));
         self.tds_read_buffer.reset_to_length(0);
@@ -3302,5 +3316,35 @@ pub(crate) mod tests {
 
         assert_eq!(read, 3);
         assert_eq!(destination, [0xB1, 0xB2, 0xB3]);
+    }
+
+    /// `reset_reader` used to `assert!` that the buffer was fully consumed.
+    /// `buffer_length` is taken from the packet header the peer sent, so that
+    /// assertion put a peer-controlled value behind a process abort that stays
+    /// active in release builds. Resetting with bytes still unread now just
+    /// discards them, which is what a reset means.
+    #[tokio::test]
+    async fn reset_reader_discards_unread_bytes_instead_of_aborting() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&[0xC1, 0xC2, 0xC3, 0xC4])
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut first = [0u8; 1];
+        reader
+            .read_bytes(&mut first)
+            .await
+            .expect("the first byte must read");
+        assert_eq!(first, [0xC1]);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 3);
+
+        TdsPacketReader::reset_reader(&mut reader);
+
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            0,
+            "reset_reader must leave an empty buffer"
+        );
     }
 }
