@@ -14,7 +14,7 @@
 use tracing::{debug, error};
 
 use super::exec_common::unwind_dae;
-use crate::api::odbc_types::{SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
+use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_NEED_DATA;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -50,7 +50,7 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
     let needs_data = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLCancel: stmt mutex poisoned");
-            return SQL_SUCCESS;
+            return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
         stmt_state.has_state(STMT_STATE_NEED_DATA)

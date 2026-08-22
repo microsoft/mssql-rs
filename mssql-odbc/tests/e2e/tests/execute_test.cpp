@@ -115,6 +115,11 @@ TEST_F(PrepareExecuteLiveTest, SingleCharParam) {
 // Data-at-execution values are sent through SQLParamData / SQLPutData while
 // ordinary bound values retain their positions before and after the streamed
 // marker.
+// Benefits-from-mock-tds: the concatenated result only proves the server bound
+// the values to the right names. A mock TDS server could assert the RPC
+// actually carried three parameters, that the streamed one was declared
+// varchar(max), and that its PLP chunks were framed between the two
+// materialized values rather than merely resolving correctly by name.
 TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
 
@@ -153,6 +158,10 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
 
 // Binary data-at-execution streams raw bytes as varbinary(max), including NUL
 // bytes, matching msodbcsql SQLPutData behavior for SQL_C_BINARY.
+// Benefits-from-mock-tds: the hex round trip proves only the reassembled value.
+// A mock TDS server could assert the parameter was declared varbinary(max) and
+// that both chunks were emitted as separate PLP chunk headers under an
+// unknown-length opener, rather than coalesced into one.
 TEST_F(PrepareExecuteLiveTest, DataAtExecutionBinaryParam) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(varchar(20), ?, 2) AS v"),
                   SQL_HANDLE_STMT, stmt_);
@@ -192,7 +201,15 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionBinaryParam) {
 // reports dead -- unlike msodbcsql, which recovers the session. See
 // `cancel_streamed_write` in mssql-tds and the limitations section of
 // docs/data-at-execution-streaming.md.
+// Benefits-from-mock-tds: the abort itself is unobservable from the client. A
+// mock TDS server could assert what this driver puts on the wire when the
+// sequence is abandoned -- today nothing, where msodbcsql sends EOM | IGNORE
+// and drains the DONE -- which is the assertion that would let this test track
+// msodbcsql instead of diverging from it.
 TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
+    // Intentional divergence: msodbcsql leaves the connection usable here.
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
@@ -227,6 +244,10 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
 
 // A data-at-execution parameter may resolve to NULL: the first SQLPutData
 // carries SQL_NULL_DATA and no chunks follow, so the driver emits PLP_NULL.
+// Benefits-from-mock-tds: COALESCE only proves the server saw *a* NULL. A mock
+// TDS server could assert the parameter was serialized as PLP_NULL rather than
+// as an unknown-length opener with an immediate terminator, which is the
+// distinction this test cannot draw.
 TEST_F(PrepareExecuteLiveTest, DataAtExecutionNullParam) {
     ASSERT_SQL_OK(Prepare("SELECT COALESCE(?, 'was-null') AS v"),
                   SQL_HANDLE_STMT, stmt_);

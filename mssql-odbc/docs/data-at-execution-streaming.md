@@ -27,9 +27,10 @@ Only MAX-length character/binary SQL types are streamable:
 |----------------|--------------------------------------|------------------|
 | `SQL_C_CHAR`   | `SQL_VARCHAR`, `SQL_LONGVARCHAR`     | UTF-8 bytes      |
 | `SQL_C_WCHAR`  | `SQL_WVARCHAR`, `SQL_WLONGVARCHAR`   | UTF-16LE bytes   |
+| `SQL_C_BINARY` | `SQL_VARBINARY`, `SQL_LONGVARBINARY` | raw bytes        |
 
-Other C types (numeric, date/time, binary) and Always Encrypted parameters
-are not yet supported via DAE — use the normal bound-value path for those.
+Other C types (numeric, date/time) and Always Encrypted parameters are not yet
+supported via DAE — use the normal bound-value path for those.
 
 ## ODBC API Reference
 
@@ -37,10 +38,15 @@ are not yet supported via DAE — use the normal bound-value path for those.
 
 Set `StrLen_or_IndPtr` to point to a `SQLLEN` whose value is:
 
-- `SQL_DATA_AT_EXEC` — the data will be supplied via `SQLPutData`.
-- `SQL_LEN_DATA_AT_EXEC(length)` — same, but hints the total length (used by
-  some drivers for pre-allocation; this driver treats it identically to
-  `SQL_DATA_AT_EXEC`).
+- `SQL_DATA_AT_EXEC` — the data will be supplied via `SQLPutData`, with no
+  declared total length.
+- `SQL_LEN_DATA_AT_EXEC(length)` — same, but declares the total byte count.
+  This driver **enforces** the declaration: the bytes accumulated across the
+  parameter's `SQLPutData` calls must equal `length` exactly. Over-sending
+  fails the offending `SQLPutData` and under-sending fails the `SQLParamData`
+  that closes the parameter, both with `22026` (string data, length mismatch),
+  and both abandon the execution. Pass `SQL_DATA_AT_EXEC` when the total is not
+  known up front.
 
 The `ParameterValuePtr` field is used as an opaque application token: it is
 written to `*ValuePtrPtr` by `SQLParamData` so the application can identify
@@ -71,13 +77,17 @@ Supplies one chunk for the currently-open DAE parameter.
 
 | `StrLen_or_Ind` value | Effect                                    |
 |-----------------------|-------------------------------------------|
-| `SQL_NULL_DATA` (-1)  | Mark the parameter as SQL `NULL`. No bytes are sent; `DataPtr` is ignored. `HY020` if any value bytes were already supplied for this parameter. |
-| `0`                   | No-op: a present, zero-length value contribution. |
+| `SQL_NULL_DATA` (-1)  | Mark the parameter as SQL `NULL`. No bytes are sent; `DataPtr` is ignored. `HY020` if any earlier `SQLPutData` already supplied a value for this parameter, including a zero-length one. |
+| `0`, `DataPtr` non-null | A present, zero-length value contribution. No bytes go on the wire, but the parameter is now committed to a value and can no longer become `NULL`. |
+| `0`, `DataPtr` null   | Equivalent to `SQL_NULL_DATA`, matching msodbcsql. |
 | Positive integer _n_  | Send `DataPtr[0..n]` as the next chunk. `HY020` if the parameter was already marked `NULL`. |
+| `SQL_NTS`             | Send `DataPtr` up to its NUL terminator (`u16` units for `SQL_C_WCHAR`). `HY009` if `DataPtr` is null. |
 | Other negative        | `HY090` (invalid string or buffer length). |
 
-`SQLPutData` may be called zero or more times between consecutive
-`SQLParamData` calls.
+`SQLPutData` must be called **at least once** for every parameter the DAE
+sequence opens: the `SQLParamData` that closes a parameter returns `HY010` if
+no chunk call was made. An intentionally empty (but non-`NULL`) value therefore
+needs one `SQLPutData` call with a non-null `DataPtr` and length `0`.
 
 ## C Example
 

@@ -161,6 +161,10 @@ pub(crate) unsafe fn bound_param_to_value(
                 unsafe { read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec) };
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
+        SQL_C_BINARY => {
+            let bytes = unsafe { read_binary_bytes(param, len_spec)? };
+            SqlType::VarBinaryMax(Some(bytes))
+        }
         // Non-character default C types reach here only through an explicit
         // binding; this driver does not yet convert their buffers.
         other => return Err(ParamBuildError::UnsupportedCType(other)),
@@ -214,6 +218,7 @@ fn null_value(param: &BoundParam) -> Result<TypedValue, ParamBuildError> {
     match param.c_type {
         SQL_C_CHAR => Ok((SqlType::VarcharMax(None), None)),
         SQL_C_WCHAR => Ok((SqlType::NVarcharMax(None), None)),
+        SQL_C_BINARY => Ok((SqlType::VarBinaryMax(None), None)),
         other => Err(ParamBuildError::UnsupportedCType(other)),
     }
 }
@@ -412,6 +417,38 @@ unsafe fn read_char_bytes(ptr: *const u8, len_spec: SqlLen) -> Vec<u8> {
     unsafe { slice::from_raw_parts(ptr, len).to_vec() }
 }
 
+/// Reads raw (`SQL_C_BINARY`) bytes.
+///
+/// Binary buffers have no terminator, so the length must be stated. `len_spec`
+/// is the indicator value when the application supplied an indicator pointer;
+/// `SQL_NTS` here means it did not, and the ODBC contract falls back to
+/// `BufferLength`. A binding that states neither has no readable extent, so it
+/// is rejected rather than guessed at.
+///
+/// # Safety
+/// `param.parameter_value_ptr`, if non-null, must be readable for the resolved
+/// byte count.
+unsafe fn read_binary_bytes(
+    param: &BoundParam,
+    len_spec: SqlLen,
+) -> Result<Vec<u8>, ParamBuildError> {
+    let len = if len_spec == SQL_NTS as SqlLen {
+        if param.buffer_length < 0 {
+            return Err(ParamBuildError::InvalidLength(param.buffer_length));
+        }
+        param.buffer_length
+    } else {
+        len_spec
+    };
+    if param.parameter_value_ptr.is_null() || len == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(
+        unsafe { slice::from_raw_parts(param.parameter_value_ptr as *const u8, len as usize) }
+            .to_vec(),
+    )
+}
+
 /// Reads wide (`SQL_C_WCHAR`) data as UTF-16LE bytes. `len_spec` is a **byte**
 /// count per the ODBC spec, or `SQL_NTS` for a NUL-terminated string.
 ///
@@ -482,6 +519,44 @@ mod tests {
             SqlType::VarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hello"),
             other => panic!("expected VarcharMax(Some), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn binary_with_indicator_length_becomes_varbinary() {
+        let mut buf: Vec<u8> = vec![0x01, 0x00, 0xFF, 0x7E];
+        let mut ind: SqlLen = 4;
+        let p = param(SQL_C_BINARY, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarBinaryMax(Some(b)) => assert_eq!(b, vec![0x01, 0x00, 0xFF, 0x7E]),
+            other => panic!("expected VarBinaryMax(Some), got {other:?}"),
+        }
+    }
+
+    /// Without an indicator pointer a binary buffer has no stated length, so
+    /// the binding's `BufferLength` supplies it.
+    #[test]
+    fn binary_without_indicator_uses_buffer_length() {
+        let mut buf: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut p = param(
+            SQL_C_BINARY,
+            buf.as_mut_ptr() as *mut c_void,
+            std::ptr::null_mut(),
+        );
+        p.buffer_length = 2;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarBinaryMax(Some(b)) => assert_eq!(b, vec![0xDE, 0xAD]),
+            other => panic!("expected VarBinaryMax(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_null_indicator_becomes_typed_null() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::VarBinaryMax(None)));
     }
 
     #[test]

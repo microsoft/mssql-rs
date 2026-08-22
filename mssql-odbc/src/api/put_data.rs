@@ -30,12 +30,22 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// - `data_ptr`, when `strlen_or_ind` is a positive byte count, must be
 ///   readable for that many bytes and must remain valid for the duration of
 ///   this call.
+/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null, aligned
+///   for the bound parameter's C type, and NUL-terminated within an allocation
+///   it owns: the terminator search reads `u16` units for `SQL_C_WCHAR` and
+///   `u8` units otherwise, and runs off the end of the allocation if no
+///   terminator is present.
 pub(crate) unsafe fn sql_put_data(
     statement_handle: SqlHandle,
     data_ptr: SqlPointer,
     strlen_or_ind: SqlLen,
 ) -> SqlReturn {
-    debug!(?statement_handle, strlen_or_ind, "SQLPutData called");
+    debug!(
+        ?statement_handle,
+        ?data_ptr,
+        strlen_or_ind,
+        "SQLPutData called"
+    );
     crate::ffi_entry!("SQLPutData", unsafe {
         sql_put_data_impl(statement_handle, data_ptr, strlen_or_ind)
     })
@@ -126,16 +136,19 @@ unsafe fn sql_put_data_safe(
 
     // ── Null data: mark the parameter as SQL NULL ───────────────────────────
     if is_null_put {
-        // A parameter that already received value bytes cannot become NULL: the
-        // PLP body is open on the wire and a NULL marker would contradict it.
+        // A parameter that already received a value contribution cannot become
+        // NULL. Any prior `SQLPutData` in this window supplied a present value —
+        // including a zero-length one, which commits the parameter to empty
+        // rather than NULL — so the test is whether a chunk call happened at
+        // all, not whether it carried bytes.
         {
             let Ok(stmt_state) = stmt.inner.lock() else {
                 error!("SQLPutData: stmt mutex poisoned checking null concatenation");
                 return SQL_ERROR;
             };
-            if stmt_state.dae_current_bytes_sent > 0 {
+            if stmt_state.dae_current_put_data_called {
                 drop(stmt_state);
-                error!("SQLPutData: SQL_NULL_DATA after value chunks were sent (HY020)");
+                error!("SQLPutData: SQL_NULL_DATA after a value contribution (HY020)");
                 return abort_dae_with_diag(
                     dbc,
                     stmt,
@@ -175,12 +188,18 @@ unsafe fn sql_put_data_safe(
 
         return match write_result {
             Some(Ok(())) => SQL_SUCCESS,
-            Some(Err((client, prepared, orphaned, e))) => {
+            Some(Err((mut client, prepared, orphaned, e))) => {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.prepared = prepared;
                     stmt_state.pending_unprepare = orphaned;
                 }
                 error!(%e, "SQLPutData: write_streamed_null failed");
+                // Not every rejection tears the stream down — a sequencing
+                // error re-parks the message and leaves the write active. The
+                // client is about to go back to the idle pool, so discard any
+                // half-written request first; this is a no-op once the stream
+                // has already aborted itself.
+                dbc.runtime.block_on(client.cancel_streamed_write());
                 fail_with_tds(dbc, stmt, statement_handle, client, &e)
             }
             None => {
@@ -292,9 +311,14 @@ unsafe fn sql_put_data_safe(
             SQL_SUCCESS
         }
         Err(e) => {
-            // The write failed; abort_streamed_write was called internally.
-            // Clean up the DAE sequence.
+            // A mid-stream I/O failure aborts the write internally, but the
+            // caller-error rejections (oversized chunk, no active parameter)
+            // return before touching the stream and leave it active. Cancel
+            // unconditionally so the client never re-enters the idle pool with
+            // a half-written request parked on it; this is a no-op when the
+            // stream already aborted.
             error!(%e, "SQLPutData: write_streamed_chunk failed");
+            dbc.runtime.block_on(client.cancel_streamed_write());
             let (prepared, orphaned) = {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     let p = stmt_state.dae_prepared.take();
@@ -458,7 +482,34 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_NEED_DATA);
             state.dae_param_data_first = false;
+            state.dae_current_put_data_called = true;
             state.dae_current_bytes_sent = 3;
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_ATTEMPT_TO_CONCATENATE_NULL.state
+        );
+        assert!(!state.has_state(STMT_STATE_NEED_DATA));
+    }
+
+    /// A zero-length chunk with a non-null pointer is a present empty value, so
+    /// the parameter is already committed to being non-NULL even though no
+    /// bytes were sent.
+    #[test]
+    fn null_after_empty_value_chunk_returns_hy020() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+            state.dae_current_put_data_called = true;
+            state.dae_current_bytes_sent = 0;
         }
 
         let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) };
