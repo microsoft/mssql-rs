@@ -230,6 +230,12 @@ pub(crate) struct StmtState {
     /// delivers the current parameter's `ParameterValuePtr` without calling
     /// `end_streamed_param`; subsequent calls advance the cursor.
     pub(crate) dae_param_data_first: bool,
+    /// `true` while `SQLPutData` or `SQLParamData` has `dae_client` checked out
+    /// for network I/O. `SQLCancel` is the one call an application may make on
+    /// a busy statement from another thread, and during this window the
+    /// statement is in `NEED_DATA` but owns neither the client nor the right to
+    /// reset the sequence: the owning thread is about to write back into it.
+    pub(crate) dae_call_in_flight: bool,
 }
 
 /// A prepared statement bundled with the marker count of its rewritten SQL, so
@@ -351,6 +357,7 @@ impl StmtState {
         self.dae_current_put_data_called = false;
         self.dae_current_is_null = false;
         self.dae_param_data_first = false;
+        self.dae_call_in_flight = false;
         self.clear_state(STMT_STATE_NEED_DATA);
     }
 }
@@ -413,6 +420,7 @@ impl StmtHandle {
                 dae_current_put_data_called: false,
                 dae_current_is_null: false,
                 dae_param_data_first: false,
+                dae_call_in_flight: false,
             }),
         }
     }

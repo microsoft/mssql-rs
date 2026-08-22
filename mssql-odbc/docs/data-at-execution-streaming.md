@@ -21,13 +21,21 @@ SQLParamData    → SQL_NEED_DATA  (if more DAE params) or SQL_SUCCESS (done)
 
 ## Supported Types
 
-Only MAX-length character/binary SQL types are streamable:
+Streamability is decided by the **C type** alone. The bound SQL type is not
+consulted: every streamed parameter is declared `varchar(max)`,
+`nvarchar(max)`, or `varbinary(max)` on the wire, and the server converts to the
+column's own type on assignment.
 
-| C Type         | SQL Type(s)                          | Wire encoding    |
-|----------------|--------------------------------------|------------------|
-| `SQL_C_CHAR`   | `SQL_VARCHAR`, `SQL_LONGVARCHAR`     | UTF-8 bytes      |
-| `SQL_C_WCHAR`  | `SQL_WVARCHAR`, `SQL_WLONGVARCHAR`   | UTF-16LE bytes   |
-| `SQL_C_BINARY` | `SQL_VARBINARY`, `SQL_LONGVARBINARY` | raw bytes        |
+| C Type         | Declared as        | Wire encoding    |
+|----------------|--------------------|------------------|
+| `SQL_C_CHAR`   | `varchar(max)`     | UTF-8 bytes      |
+| `SQL_C_WCHAR`  | `nvarchar(max)`    | UTF-16LE bytes   |
+| `SQL_C_BINARY` | `varbinary(max)`   | raw bytes        |
+
+So the fixed-width SQL types (`SQL_CHAR`, `SQL_WCHAR`, `SQL_BINARY`) stream just
+as the MAX ones do, as do `SQL_VARCHAR` / `SQL_WVARCHAR` / `SQL_VARBINARY` and
+their `LONG` variants — any SQL type the conversion matrix pairs with one of the
+three C types above.
 
 Other C types (numeric, date/time) and Always Encrypted parameters are not yet
 supported via DAE — use the normal bound-value path for those.

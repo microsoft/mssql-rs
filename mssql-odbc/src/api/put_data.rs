@@ -165,13 +165,19 @@ unsafe fn sql_put_data_safe(
             };
             stmt_state.dae_current_put_data_called = true;
             stmt_state.dae_current_is_null = true;
-            match stmt_state.dae_client.as_mut() {
-                Some(c) => match c.write_streamed_null() {
-                    Ok(()) => Some(Ok(())),
+            // Taken rather than borrowed so the failure arm can move the client
+            // into the error path without a second lookup that would have to be
+            // unwrapped: a panic here would poison this mutex and strand the
+            // parked client.
+            match stmt_state.dae_client.take() {
+                Some(mut client) => match client.write_streamed_null() {
+                    Ok(()) => {
+                        stmt_state.dae_client = Some(client);
+                        Some(Ok(()))
+                    }
                     Err(error) => {
                         // If the null write fails, move the client into the
                         // error path after its stream was aborted.
-                        let client = stmt_state.dae_client.take().unwrap();
                         let prepared = stmt_state.dae_prepared.take();
                         let orphaned = stmt_state.dae_orphaned.take();
                         stmt_state.reset_dae();
@@ -240,6 +246,20 @@ unsafe fn sql_put_data_safe(
         strlen_or_ind as usize
     };
 
+    // (NULL, 0) and SQL_NULL_DATA are the only legal null-pointer forms and
+    // both returned above, so a null pointer with bytes to send would reach
+    // `from_raw_parts(null, n)`. That is undefined behavior in Rust before a
+    // single byte is read, so it cannot be left to the driver manager the way
+    // msodbcsql does. Checked ahead of the counters below: a rejected call must
+    // not move the parameter's byte total.
+    if data_ptr.is_null() && byte_count > 0 {
+        error!("SQLPutData: null data pointer with length {strlen_or_ind} (HY009)");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_diag(&mut stmt_state, ERR_INVALID_NULL_POINTER);
+        }
+        return SQL_ERROR;
+    }
+
     {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLPutData: stmt mutex poisoned updating DAE byte count");
@@ -288,7 +308,10 @@ unsafe fn sql_put_data_safe(
             return SQL_ERROR;
         };
         match stmt_state.dae_client.take() {
-            Some(c) => c,
+            Some(c) => {
+                stmt_state.dae_call_in_flight = true;
+                c
+            }
             None => {
                 error!("SQLPutData: dae_client is None — internal state corruption");
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -304,10 +327,12 @@ unsafe fn sql_put_data_safe(
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLPutData: stmt mutex poisoned returning dae_client after write");
                 // Client is now floating — return it to idle to avoid a leak.
+                dbc.runtime.block_on(client.cancel_streamed_write());
                 return_client_idle(dbc, statement_handle, client);
                 return SQL_ERROR;
             };
             stmt_state.dae_client = Some(client);
+            stmt_state.dae_call_in_flight = false;
             SQL_SUCCESS
         }
         Err(e) => {
@@ -319,18 +344,14 @@ unsafe fn sql_put_data_safe(
             // stream already aborted.
             error!(%e, "SQLPutData: write_streamed_chunk failed");
             dbc.runtime.block_on(client.cancel_streamed_write());
-            let (prepared, orphaned) = {
-                if let Ok(mut stmt_state) = stmt.inner.lock() {
-                    let p = stmt_state.dae_prepared.take();
-                    let o = stmt_state.dae_orphaned.take();
-                    stmt_state.reset_dae();
-                    stmt_state.clear_state(crate::handles::stmt::STMT_STATE_EXEC_STARTED);
-                    (p, o)
-                } else {
-                    (None, None)
-                }
-            };
+            // Restored under the same lock that clears the DAE and executing
+            // states, so the statement is never observable as idle but
+            // unprepared.
             if let Ok(mut stmt_state) = stmt.inner.lock() {
+                let prepared = stmt_state.dae_prepared.take();
+                let orphaned = stmt_state.dae_orphaned.take();
+                stmt_state.reset_dae();
+                stmt_state.clear_state(crate::handles::stmt::STMT_STATE_EXEC_STARTED);
                 stmt_state.prepared = prepared;
                 stmt_state.pending_unprepare = orphaned;
             }
@@ -395,6 +416,27 @@ mod tests {
             state.diag_records[0].sql_state,
             ERR_INVALID_STRING_OR_BUFFER_LENGTH.state
         );
+    }
+
+    #[test]
+    fn null_pointer_with_positive_length_returns_hy009() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA);
+            state.dae_param_data_first = false;
+        }
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), 5) };
+        assert_eq!(ret, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_INVALID_NULL_POINTER.state
+        );
+        // Rejecting must not charge the parameter for bytes never sent.
+        assert_eq!(state.dae_current_bytes_sent, 0);
+        assert!(!state.dae_current_put_data_called);
     }
 
     #[test]

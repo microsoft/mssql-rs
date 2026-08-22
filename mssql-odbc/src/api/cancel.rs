@@ -14,6 +14,7 @@
 use tracing::{debug, error};
 
 use super::exec_common::unwind_dae;
+use super::sqlstate::{ERR_FUNCTION_SEQUENCE, post_diag};
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_NEED_DATA;
@@ -53,7 +54,25 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
-        stmt_state.has_state(STMT_STATE_NEED_DATA)
+        if !stmt_state.has_state(STMT_STATE_NEED_DATA) {
+            false
+        } else if stmt_state.dae_call_in_flight {
+            // Another thread is inside SQLPutData or SQLParamData with the
+            // client checked out. Unwinding now would clear the sequence
+            // without cancelling the in-flight write, and that thread would
+            // then write the client back into state this call had already
+            // reset.
+            //
+            // SQLCancel can abandon a sequence that is idle between calls, but
+            // it cannot yet interrupt one in progress. Reporting failure is the
+            // honest answer -- claiming success would tell the application the
+            // statement was released when it was not.
+            error!("SQLCancel: data-at-execution call in progress on another thread (HY010)");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        } else {
+            true
+        }
     };
 
     if needs_data {
@@ -104,5 +123,29 @@ mod tests {
         assert!(state.dae_param_indices.is_empty());
         assert_eq!(state.dae_current_bytes_sent, 0);
         assert!(!state.dae_param_data_first);
+    }
+
+    /// SQLCancel is legal from another thread while the statement is busy, so
+    /// it can land while SQLPutData holds the client for network I/O. It must
+    /// not clear the sequence out from under that call, and must not report
+    /// success it did not achieve.
+    #[test]
+    fn cancel_during_in_flight_dae_call_reports_hy010() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_NEED_DATA | STMT_STATE_EXEC_STARTED);
+            state.dae_param_indices.push(0);
+            state.dae_call_in_flight = true;
+        }
+
+        assert_eq!(SQL_ERROR, unsafe { sql_cancel(h.stmt) });
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        // The sequence is untouched, so the owning thread can still finish it.
+        assert!(state.has_state(STMT_STATE_NEED_DATA));
+        assert!(!state.dae_param_indices.is_empty());
     }
 }

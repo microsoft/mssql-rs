@@ -129,8 +129,8 @@ pub(crate) const ERR_INVALID_USE_OF_DEFAULT_PARAM: DiagMsg = DiagMsg {
     state: SQLSTATE_07S01,
     text: "Invalid use of default parameter",
 };
-pub(crate) const ERR_DATA_AT_EXEC_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
+pub(crate) const ERR_DATA_AT_EXEC_NOT_STAGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
     text: "Data-at-execution parameter reached the materializing conversion path",
 };
 pub(crate) const ERR_PARAM_C_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {

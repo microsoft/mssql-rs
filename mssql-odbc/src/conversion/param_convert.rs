@@ -34,7 +34,7 @@ use crate::api::odbc_types::{
     SQL_WVARCHAR, SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
-    DiagMsg, ERR_DATA_AT_EXEC_NOT_IMPLEMENTED, ERR_INVALID_PARAM_COLUMN_SIZE,
+    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_INVALID_PARAM_COLUMN_SIZE,
     ERR_INVALID_PARAM_DECIMAL_DIGITS, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
     ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
@@ -53,11 +53,12 @@ pub(crate) enum ParamBuildError {
     /// Backstop only: bind time rejects any C type the conversion matrix does
     /// not list, so reaching this means the matrix and this module disagree.
     UnsupportedCType(SqlSmallInt),
-    /// Backstop only: `SQLExecute` and `SQLExecDirect` both stage
-    /// data-at-execution parameters as streaming placeholders before reaching
-    /// this module, so an indicator that survives to here means the value
-    /// buffer holds an application token rather than data.
-    DataAtExecUnsupported,
+    /// Backstop only: data-at-execution is supported, but `SQLExecute` and
+    /// `SQLExecDirect` stage those parameters as streaming placeholders before
+    /// reaching this module. An indicator that survives to here means staging
+    /// missed the parameter, so the value buffer holds the application's token
+    /// rather than data. Reported as a driver error, not "not implemented".
+    DataAtExecNotStaged,
     /// `StrLen_or_Ind` was `SQL_DEFAULT_PARAM` on a statement that is not a
     /// canonical procedure call.
     InvalidUseOfDefaultParam,
@@ -75,7 +76,7 @@ impl ParamBuildError {
     pub(crate) fn diag(self) -> DiagMsg {
         match self {
             Self::UnsupportedCType(_) => ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
-            Self::DataAtExecUnsupported => ERR_DATA_AT_EXEC_NOT_IMPLEMENTED,
+            Self::DataAtExecNotStaged => ERR_DATA_AT_EXEC_NOT_STAGED,
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::InvalidParameterSize(_) => ERR_INVALID_PARAM_COLUMN_SIZE,
@@ -126,9 +127,11 @@ pub(crate) unsafe fn bound_param_to_value(
         }
         // Never reached through SQLExecute / SQLExecDirect, which stage these
         // as streaming placeholders. Refusing here keeps the application's
-        // dummy token from being read as a value if that routing ever breaks.
-        if ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
-            return Err(ParamBuildError::DataAtExecUnsupported);
+        // dummy token from being read as a value if that routing ever breaks,
+        // and reports the staging bug instead of the misleading "invalid
+        // length" the negative indicator would otherwise draw below.
+        if is_data_at_exec_indicator(ind) {
+            return Err(ParamBuildError::DataAtExecNotStaged);
         }
         // Any remaining negative indicator  is invalid for an input parameter
         if ind < 0 && ind != SQL_NTS as SqlLen {
@@ -599,7 +602,18 @@ mod tests {
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamBuildError::DataAtExecUnsupported);
+        assert_eq!(err, ParamBuildError::DataAtExecNotStaged);
+    }
+
+    /// `SQL_LEN_DATA_AT_EXEC(n)` encodes as a large negative indicator, which
+    /// would otherwise be caught by the invalid-length check below it and
+    /// misreported as a bad buffer length.
+    #[test]
+    fn data_at_exec_with_declared_length_is_rejected() {
+        let mut ind: SqlLen = SQL_LEN_DATA_AT_EXEC_OFFSET - 16;
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::DataAtExecNotStaged);
     }
 
     #[test]

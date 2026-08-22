@@ -20,6 +20,11 @@
 //! `SQLExecute` just delivers the pointer; every subsequent call closes the
 //! current parameter on the wire and either opens the next or completes the
 //! execution.
+//!
+//! Each parameter requires at least one `SQLPutData` call before the
+//! `SQLParamData` that closes it; closing a parameter that received none is a
+//! sequence error (`HY010`). An empty — as opposed to NULL — value is supplied
+//! with a non-null pointer and a length of zero.
 
 use tracing::{debug, error};
 
@@ -27,13 +32,13 @@ use mssql_tds::connection::tds_client::StreamedParamStatus;
 
 use super::exec_common::{abort_dae_with_diag, fail_with_tds, finish_execute, return_client_idle};
 use super::sqlstate::*;
+use super::util::write_if_some;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlPointer, SqlReturn,
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{STMT_STATE_EXEC_STARTED, STMT_STATE_NEED_DATA};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-
 /// Advances the data-at-execution parameter protocol.
 ///
 /// `value_ptr_ptr`, when non-null, receives the `ParameterValuePtr` that was
@@ -112,9 +117,7 @@ fn sql_param_data_safe(
     };
 
     // Write the current parameter's application token to *value_ptr_ptr.
-    if !value_ptr_ptr.is_null() {
-        unsafe { *value_ptr_ptr = current_ptr };
-    }
+    unsafe { write_if_some(value_ptr_ptr, current_ptr) };
 
     if is_first_call {
         // First SQLParamData: just deliver the pointer and wait for SQLPutData.
@@ -163,7 +166,10 @@ fn sql_param_data_safe(
             return SQL_ERROR;
         };
         match stmt_state.dae_client.take() {
-            Some(c) => c,
+            Some(c) => {
+                stmt_state.dae_call_in_flight = true;
+                c
+            }
             None => {
                 error!("SQLParamData: dae_client is None — internal state corruption");
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -180,11 +186,17 @@ fn sql_param_data_safe(
             let next_ptr = {
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned advancing DAE index");
-                    // Put client back in DBC idle since we can't store it.
+                    // The RPC is still open on the next parameter and the
+                    // statement can no longer hold the client. Discard the
+                    // half-written request before the client goes back to the
+                    // idle pool, or the next command on it fails as already
+                    // executing.
+                    dbc.runtime.block_on(client.cancel_streamed_write());
                     return_client_idle(dbc, statement_handle, client);
                     return SQL_ERROR;
                 };
                 stmt_state.dae_client = Some(client);
+                stmt_state.dae_call_in_flight = false;
                 stmt_state.dae_current_idx += 1;
                 stmt_state.dae_current_bytes_sent = 0;
                 stmt_state.dae_current_put_data_called = false;
@@ -203,31 +215,31 @@ fn sql_param_data_safe(
                     .unwrap_or(std::ptr::null_mut())
             };
 
-            if !value_ptr_ptr.is_null() {
-                unsafe { *value_ptr_ptr = next_ptr };
-            }
+            unsafe { write_if_some(value_ptr_ptr, next_ptr) };
             SQL_NEED_DATA
         }
 
         Ok(StreamedParamStatus::Complete(_result)) => {
             // All DAE parameters are done.  Recover the prepared plan and
             // orphan, then run the standard finish path.
-            let (prepared, orphaned) = {
+            //
+            // Restoring them in the same critical section that clears the DAE
+            // and executing states matters: a statement observed between the
+            // two would look idle but unprepared, and a concurrent SQLExecute
+            // would report 07002 instead of re-running the plan.
+            {
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned on completion");
                     return_client_idle(dbc, statement_handle, client);
                     return SQL_ERROR;
                 };
-                let p = stmt_state.dae_prepared.take();
-                let o = stmt_state.dae_orphaned.take();
+                let prepared = stmt_state.dae_prepared.take();
+                let orphaned = stmt_state.dae_orphaned.take();
                 stmt_state.reset_dae();
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-                (p, o)
-            };
-
-            // Write the prepared plan back so the statement remains prepared
-            // and re-executable.
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                // Written back so the statement remains prepared and
+                // re-executable. `SQLExecDirect` parks no plan, so this is
+                // legitimately `None` on that path.
                 stmt_state.prepared = prepared;
                 stmt_state.pending_unprepare = orphaned;
             }
