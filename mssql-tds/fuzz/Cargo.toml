@@ -14,6 +14,17 @@ tokio = { version = "1.45.1", features = ["full"] }
 arbitrary = { version = "1.3", features = ["derive"] }
 async-trait = "0.1"
 
+# Build OpenSSL from vendored source for the fuzz targets instead of linking the
+# system library. mssql-tds pulls in openssl-sys on Linux (via native-tls and the
+# direct `openssl` dependency), which normally needs `libssl-dev` + `pkg-config`
+# from apt. Scheduled fuzz runs were failing to compile openssl-sys whenever the
+# Ubuntu apt mirror was transiently unreachable and those packages couldn't be
+# installed. Vendoring makes the fuzz build self-contained (only a C compiler and
+# perl are required, both present on the CI image) so a flaky mirror no longer
+# breaks fuzzing. Scoped to the fuzz crate; the shipped library build is unchanged.
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+openssl = { version = "0.10.66", features = ["vendored"] }
+
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
