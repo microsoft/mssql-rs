@@ -431,7 +431,15 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
         post_tds_info_messages(state, &diagnostics.info_messages);
         return;
     }
-    post_sql_error(state, default, 0, err.to_string());
+    // An unacknowledged connection reset is a property of the link, not of the
+    // statement that happened to carry the bit: `TdsClient` has already marked
+    // the connection dead, so every call site must report it as a communication
+    // failure regardless of the SQLSTATE its own context would suggest.
+    let sqlstate = match err {
+        TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
+        _ => default,
+    };
+    post_sql_error(state, sqlstate, 0, err.to_string());
 }
 
 /// Post one ODBC diagnostic record per SQL Server INFO token.

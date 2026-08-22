@@ -332,6 +332,24 @@ impl<'a> PacketWriter<'a> {
 
         send_data_fut.await?;
 
+        // The header just written reached the wire, so any reset bit it carried
+        // is now the server's to acknowledge. An ignore packet asks the server
+        // to discard the message, so it is deliberately not recorded — treating
+        // it as carrying the reset could condemn a healthy session.
+        //
+        // This exemption assumes the ignored message is a single packet. For a
+        // multi-packet message, packet #1 already recorded the dispatch and a
+        // later ignore packet does not undo it: the server discards the whole
+        // message (reset included) while the client still believes the bit
+        // landed, so the next request settles it as "reset done" and an unreset
+        // session can go back to the pool. Latent today — `cancel_current_message`
+        // is the only ignore-packet emitter and is `#[cfg(test)]`-only. If that
+        // changes, the cancel path must clear the dispatch record *and* re-arm
+        // the mode so the bit rides the next request.
+        if reset_mode != ResetConnectionMode::None && !is_ignore_packet {
+            self.network_writer.note_reset_dispatched();
+        }
+
         // Check timeout after the write completes.
         if let Some(max_timeout) = self.max_timeout_sec {
             let elapsed = self.start_time.elapsed().as_secs();
@@ -635,6 +653,7 @@ pub(crate) mod tests {
         pub(crate) size: u32,
         pub(crate) data: Vec<u8>,
         pub(crate) reset_mode: ResetConnectionMode,
+        pub(crate) reset_dispatched: bool,
     }
 
     impl MockNetworkWriter {
@@ -643,6 +662,7 @@ pub(crate) mod tests {
                 size,
                 data: vec![],
                 reset_mode: ResetConnectionMode::None,
+                reset_dispatched: false,
             }
         }
     }
@@ -666,10 +686,19 @@ pub(crate) mod tests {
 
         fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
             self.reset_mode = mode;
+            self.reset_dispatched = false;
         }
 
         fn take_reset_mode(&mut self) -> ResetConnectionMode {
             std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
+        }
+
+        fn note_reset_dispatched(&mut self) {
+            self.reset_dispatched = true;
+        }
+
+        fn take_reset_dispatched(&mut self) -> bool {
+            std::mem::replace(&mut self.reset_dispatched, false)
         }
     }
 
@@ -823,6 +852,46 @@ pub(crate) mod tests {
         );
         // And the connection's pending reset has been cleared (one-shot).
         assert_eq!(mock.take_reset_mode(), ResetConnectionMode::None);
+        // The bit reached the wire, so the server now owes an acknowledgement.
+        assert!(
+            mock.take_reset_dispatched(),
+            "sending the first packet must record that the reset bit went out"
+        );
+    }
+
+    /// An ignore packet asks the server to discard the whole message. Recording
+    /// its header as having delivered the reset would leave `TdsClient` waiting
+    /// for an acknowledgement that may never come, and condemn a healthy
+    /// session for it.
+    #[test]
+    fn ignored_message_does_not_record_a_reset_dispatch() {
+        let mut mock = MockNetworkWriter::new(16);
+        mock.set_reset_mode(ResetConnectionMode::Reset);
+
+        let mut writer = PacketWriter::new(PacketType::SqlBatch, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        block_on(writer.cancel_current_message()).unwrap();
+
+        assert!(!mock.take_reset_dispatched());
+    }
+
+    /// A message type the reset bit may not ride (MS-TDS 2.2.3.1.2) must leave
+    /// the armed request alone and record no dispatch.
+    #[test]
+    fn ineligible_message_neither_consumes_nor_dispatches_the_reset() {
+        let mut mock = MockNetworkWriter::new(16);
+        mock.set_reset_mode(ResetConnectionMode::Reset);
+
+        let mut writer = PacketWriter::new(PacketType::PreLogin, &mut mock, None, None);
+        block_on(writer.write_byte_async(0xAB)).unwrap();
+        block_on(writer.finalize()).unwrap();
+
+        assert!(!mock.take_reset_dispatched());
+        assert_eq!(
+            mock.take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the arm must survive for the next eligible request"
+        );
     }
 
     /// Splits the raw network bytes into individual TDS packets, returning the

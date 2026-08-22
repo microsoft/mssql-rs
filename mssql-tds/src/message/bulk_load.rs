@@ -1149,6 +1149,11 @@ mod ae_colmetadata_tests {
         fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
             NegotiatedEncryptionSetting::NoEncryption
         }
+        // This writer never carries a reset, so there is nothing to record.
+        fn note_reset_dispatched(&mut self) {}
+        fn take_reset_dispatched(&mut self) -> bool {
+            false
+        }
     }
 
     fn deterministic_int_column() -> BulkCopyColumnMetadata {

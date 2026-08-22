@@ -319,6 +319,14 @@ pub enum Error {
     /// Cryptographic failure in the Always Encrypted column-encryption data path.
     #[error("Column encryption error: {0}")]
     ColumnEncryptionError(String),
+
+    /// A request carried the RESETCONNECTION packet-header bit, but its response
+    /// never contained the `ResetConnection` ENVCHANGE. The session was
+    /// therefore never returned to its login defaults and must not be reused.
+    #[error(
+        "The connection reset was not acknowledged by the server, so the session was not returned to its login defaults"
+    )]
+    ConnectionResetNotAcknowledged,
 }
 
 /// Helper for `SqlServerError` display formatting.

@@ -53,6 +53,7 @@ pub struct ScriptedToken(Tokens);
 struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     reset_mode: ResetConnectionMode,
+    reset_dispatched: bool,
     known_dead: bool,
 }
 
@@ -61,6 +62,7 @@ impl TokenReplayTransport {
         Self {
             pending_tokens: VecDeque::from(tokens),
             reset_mode: ResetConnectionMode::None,
+            reset_dispatched: false,
             known_dead: false,
         }
     }
@@ -157,9 +159,16 @@ impl NetworkWriter for TokenReplayTransport {
     }
     fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
         self.reset_mode = mode;
+        self.reset_dispatched = false;
     }
     fn take_reset_mode(&mut self) -> ResetConnectionMode {
         std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
+    }
+    fn note_reset_dispatched(&mut self) {
+        self.reset_dispatched = true;
+    }
+    fn take_reset_dispatched(&mut self) -> bool {
+        std::mem::replace(&mut self.reset_dispatched, false)
     }
 }
 
@@ -464,6 +473,11 @@ pub(crate) mod byte_stream {
         fn set_reset_mode(&mut self, _mode: ResetConnectionMode) {}
         fn take_reset_mode(&mut self) -> ResetConnectionMode {
             ResetConnectionMode::None
+        }
+        // This transport never carries a reset, so there is nothing to record.
+        fn note_reset_dispatched(&mut self) {}
+        fn take_reset_dispatched(&mut self) -> bool {
+            false
         }
     }
 
