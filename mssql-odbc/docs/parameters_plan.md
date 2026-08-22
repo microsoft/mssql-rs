@@ -363,10 +363,10 @@ accepting a pairing inbound that is rejected outbound for no principled reason.
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
-  `SQLPrepare` + `SQLExecute` (see the delivered-features list above and
-  `data-at-execution-streaming.md`). Still outstanding: the `SQLExecDirect`
-  branch, which needs its own staging path because the statement text is not
-  prepared before the streamed values are required.
+  both `SQLPrepare` + `SQLExecute` and `SQLExecDirect` (see the
+  delivered-features list above and `data-at-execution-streaming.md`). Still
+  outstanding: recovering the session after an abandoned sequence instead of
+  dropping the transport, tracked on `TdsClient::abort_streamed_write`.
 - **Canonical procedure calls / `sp_prepexecrpc`:** support ODBC canonical
   calls (`{call proc(?)}`) with the appropriate parameter-count and single-row
   parameter-set guards. Ad-hoc T-SQL currently uses `sp_prepexec`.

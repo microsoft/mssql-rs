@@ -13,10 +13,11 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
     ParamsWithDae, build_params_with_dae, claim_connection, fail_with_tds, finish_execute,
+    park_dae_client,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlReturn};
+use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
 use crate::handles::stmt::{
     PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
@@ -190,31 +191,15 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     let _ = result; // result handled by finish_execute below
                     finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
                 }
-                Ok(StreamedParamStatus::NeedData { .. }) => {
-                    // Park the client in the statement for SQLParamData/SQLPutData.
-                    // The DBC keeps active_stmt set (connection appears busy).
-                    let mut stored = false;
-                    if let Ok(mut stmt_state) = stmt.inner.lock() {
-                        stmt_state.dae_client = Some(client);
-                        stmt_state.dae_prepared = Some(prepared);
-                        stmt_state.dae_orphaned = orphaned;
-                        stmt_state.dae_param_indices = dae_indices;
-                        stmt_state.dae_expected_lengths = dae_expected_lengths;
-                        stmt_state.dae_current_idx = 0;
-                        stmt_state.dae_current_bytes_sent = 0;
-                        stmt_state.dae_current_put_data_called = false;
-                        stmt_state.dae_current_is_null = false;
-                        stmt_state.dae_param_data_first = true;
-                        stmt_state.set_state(STMT_STATE_NEED_DATA);
-                        stored = true;
-                    }
-                    if !stored {
-                        error!("SQLExecute: stmt mutex poisoned while parking DAE client");
-                        // client is already consumed into stmt_state attempt; can't recover cleanly
-                        return SQL_ERROR;
-                    }
-                    SQL_NEED_DATA
-                }
+                Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
+                    stmt,
+                    client,
+                    Some(prepared),
+                    orphaned,
+                    dae_indices,
+                    dae_expected_lengths,
+                    "SQLExecute",
+                ),
                 Err(e) => {
                     error!(%e, "SQLExecute: begin_sp_executesql failed");
                     if let Ok(mut stmt_state) = stmt.inner.lock() {

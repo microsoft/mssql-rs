@@ -222,8 +222,6 @@ that is tracked by the TODO on `TdsClient::abort_streamed_write`.
 - Only `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` C types are supported for
   DAE streaming.
 - Always Encrypted columns cannot use the DAE path.
-- `SQLExecDirect` + DAE is not yet implemented (returns `HYC00`). msodbcsql
-  supports this by stringifying the statement (`ProcessDAECmd`).
 - Output parameters cannot be DAE.
 - A failed DAE sequence cannot be recovered by reconnecting, because the
   transport is suspended mid-write. msodbcsql can recover here

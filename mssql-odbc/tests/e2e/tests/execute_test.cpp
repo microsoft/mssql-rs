@@ -45,6 +45,12 @@ protected:
         return SQLPrepare(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
     }
 
+    // Direct-execution helper.
+    SQLRETURN ExecDirect(const std::string& sql) {
+        SqlTString s = ODBCTestUtils::ToSqlTStr(sql);
+        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
+    }
+
     // Bind a narrow (SQL_C_CHAR / varchar) input parameter held in |store|.
     // |store| must outlive the SQLExecute call (bound by reference).
     SQLRETURN BindChar(SQLUSMALLINT param, std::vector<SQLCHAR>& store,
@@ -298,6 +304,99 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionChunkAfterNullReturnsHY020) {
     char chunk[] = "abc";
     ASSERT_EQ(SQL_ERROR, SQLPutData(stmt_, chunk, 3));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY020");
+}
+
+// SQLExecDirect stages data-at-execution parameters the same way SQLExecute
+// does, so a streamed marker between two bound values keeps its ordinal
+// position. Unlike SQLExecute this runs ad-hoc sp_executesql with no prepared
+// plan, which is the case SQLParamData has to complete without one.
+TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundParams) {
+    std::vector<SQLCHAR> first = {'a', '\0'};
+    std::vector<SQLCHAR> last = {'d', '\0'};
+    SQLLEN first_ind = SQL_NTS;
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLLEN last_ind = SQL_NTS;
+    SQLCHAR streamed_token = 0;
+
+    ASSERT_SQL_OK(BindChar(1, first, first_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindChar(3, last, last_ind), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, ExecDirect("SELECT ? + ? + ? AS v"));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&streamed_token, value_ptr);
+
+    const char first_chunk[] = "b";
+    const char second_chunk[] = "c";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first_chunk), 1),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second_chunk), 1),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("abcd", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Completing a direct-execution streaming sequence must leave the statement
+// reusable. SQLParamData restores the prepared plan it parked, which is absent
+// here -- a statement wrongly left marked prepared or busy would fail this.
+TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionStatementIsReusable) {
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, ExecDirect("SELECT ? AS v"));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    const char chunk[] = "streamed";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 8),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("streamed", GetColumnChar(1));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // The statement is no longer streaming, so an ordinary direct execution on
+    // the same handle succeeds.
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(ExecDirect("SELECT 'reused' AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("reused", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// In the Need Data state only SQLPutData / SQLParamData / SQLCancel are legal,
+// so a second SQLExecDirect is a sequence error rather than the cursor-state
+// error a merely-busy statement gets.
+TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
+    // Leaves the connection dead: the parked RPC cannot be retracted.
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, ExecDirect("SELECT ? AS v"));
+
+    EXPECT_EQ(SQL_ERROR, ExecDirect("SELECT 1"));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
+
+    EXPECT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // A wide-character parameter binds as nvarchar and round-trips.

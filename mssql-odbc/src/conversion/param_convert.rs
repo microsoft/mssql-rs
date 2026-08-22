@@ -53,7 +53,10 @@ pub(crate) enum ParamBuildError {
     /// Backstop only: bind time rejects any C type the conversion matrix does
     /// not list, so reaching this means the matrix and this module disagree.
     UnsupportedCType(SqlSmallInt),
-    /// The parameter uses data-at-execution (`SQLPutData`).
+    /// Backstop only: `SQLExecute` and `SQLExecDirect` both stage
+    /// data-at-execution parameters as streaming placeholders before reaching
+    /// this module, so an indicator that survives to here means the value
+    /// buffer holds an application token rather than data.
     DataAtExecUnsupported,
     /// `StrLen_or_Ind` was `SQL_DEFAULT_PARAM` on a statement that is not a
     /// canonical procedure call.
@@ -121,6 +124,9 @@ pub(crate) unsafe fn bound_param_to_value(
         if ind == SQL_DEFAULT_PARAM {
             return Err(ParamBuildError::InvalidUseOfDefaultParam);
         }
+        // Never reached through SQLExecute / SQLExecDirect, which stage these
+        // as streaming placeholders. Refusing here keeps the application's
+        // dummy token from being read as a value if that routing ever breaks.
         if ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
             return Err(ParamBuildError::DataAtExecUnsupported);
         }

@@ -11,21 +11,22 @@ use tracing::error;
 
 use std::collections::VecDeque;
 
-use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
+use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SqlHandle, SqlLen, SqlReturn,
+    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
 };
 use crate::conversion::param_convert::{
     ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
 };
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
+    PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
+    STMT_STATE_NEED_DATA, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
 
@@ -74,6 +75,42 @@ pub(super) fn unwind_dae(
         dbc.runtime.block_on(client.cancel_streamed_write());
         return_client_idle(dbc, statement_handle, client);
     }
+}
+
+/// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
+/// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
+/// `active_stmt` set, so the connection stays busy for the duration.
+///
+/// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
+/// and has no plan to restore when the sequence completes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn park_dae_client(
+    stmt: &StmtHandle,
+    client: TdsClient,
+    prepared: Option<PreparedPlan>,
+    orphaned: Option<StatementId>,
+    dae_indices: Vec<usize>,
+    dae_expected_lengths: Vec<Option<usize>>,
+    op: &str,
+) -> SqlReturn {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        // The client has nowhere to go: the statement that owns it is
+        // unreachable and the DBC still records it as busy.
+        error!("{op}: stmt mutex poisoned while parking DAE client");
+        return SQL_ERROR;
+    };
+    stmt_state.dae_client = Some(client);
+    stmt_state.dae_prepared = prepared;
+    stmt_state.dae_orphaned = orphaned;
+    stmt_state.dae_param_indices = dae_indices;
+    stmt_state.dae_expected_lengths = dae_expected_lengths;
+    stmt_state.dae_current_idx = 0;
+    stmt_state.dae_current_bytes_sent = 0;
+    stmt_state.dae_current_put_data_called = false;
+    stmt_state.dae_current_is_null = false;
+    stmt_state.dae_param_data_first = true;
+    stmt_state.set_state(STMT_STATE_NEED_DATA);
+    SQL_NEED_DATA
 }
 
 /// Aborts a data-at-execution sequence with a diagnostic. Always `SQL_ERROR`.
@@ -240,44 +277,6 @@ pub(super) fn flush_pending_unprepare(
     }
 }
 
-/// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
-/// parameters, reading application value buffers by reference. Posts the
-/// matching diagnostic and returns `Err(SQL_ERROR)` when a marker is unbound
-/// (`07002`) or a parameter cannot be built. Shared by `SQLExecute`
-/// and `SQLExecDirect`; `op` names the entry point for traceable diagnostics.
-///
-/// # Safety
-/// Each bound parameter's value/indicator pointers must still satisfy the
-/// `SQLBindParameter` contract; the buffers are read here.
-pub(super) unsafe fn build_named_params(
-    stmt_state: &mut StmtState,
-    marker_count: usize,
-    op: &str,
-) -> Result<Vec<RpcParameter>, SqlReturn> {
-    let mut named_params = Vec::with_capacity(marker_count);
-    for i in 0..marker_count {
-        let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
-            error!("{op}: parameter {} has no bound value", i + 1);
-            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
-            return Err(SQL_ERROR);
-        };
-        let name = format!("@P{}", i + 1);
-        match unsafe { bound_param_to_rpc(name, bound_param) } {
-            Ok(param) => named_params.push(param),
-            Err(e) => {
-                if let ParamBuildError::InvalidLength(len) = e {
-                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
-                } else {
-                    error!("{op}: parameter {} rejected: {}", i + 1, e.diag().text);
-                }
-                post_diag(stmt_state, e.diag());
-                return Err(SQL_ERROR);
-            }
-        }
-    }
-    Ok(named_params)
-}
-
 /// Result of [`build_params_with_dae`]: the full RPC parameter list (with
 /// data-at-execution placeholders) and the 0-based indices of those parameters.
 pub(super) struct ParamsWithDae {
@@ -300,17 +299,21 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
     }
 }
 
-/// Variant of [`build_named_params`] that recognises data-at-execution
-/// indicators and returns them as streaming-placeholder parameters instead of
-/// converting the value buffer eagerly.
+/// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
+/// parameters, reading application value buffers by reference. Shared by
+/// `SQLExecute` and `SQLExecDirect`; `op` names the entry point for traceable
+/// diagnostics.
 ///
 /// Parameters with `SQL_DATA_AT_EXEC` or `SQL_LEN_DATA_AT_EXEC(n)` indicators
-/// are recorded in [`ParamsWithDae::dae_indices`]; all others are converted
-/// immediately.  Returns `Err(SQL_ERROR)` for unbound markers or unsupported
-/// types.
+/// become streaming placeholders instead of having their value buffer read
+/// eagerly, and are recorded in [`ParamsWithDae::dae_indices`]; all others are
+/// converted immediately. Posts the matching diagnostic and returns
+/// `Err(SQL_ERROR)` when a marker is unbound (`07002`) or a parameter cannot be
+/// built.
 ///
 /// # Safety
-/// Same contract as [`build_named_params`].
+/// Each bound parameter's value/indicator pointers must still satisfy the
+/// `SQLBindParameter` contract; the buffers are read here.
 pub(super) unsafe fn build_params_with_dae(
     stmt_state: &mut StmtState,
     marker_count: usize,
@@ -544,16 +547,17 @@ mod tests {
     }
 
     #[test]
-    fn build_named_params_zero_markers_yields_empty() {
+    fn build_params_zero_markers_yields_empty() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
-        let params = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
-        assert!(params.is_empty());
+        let built = unsafe { build_params_with_dae(&mut state, 0, "test") }.unwrap();
+        assert!(built.params.is_empty());
+        assert!(built.dae_indices.is_empty());
     }
 
     #[test]
-    fn build_named_params_builds_one_per_marker() {
+    fn build_params_builds_one_per_marker() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
@@ -570,18 +574,19 @@ mod tests {
             .bound_params
             .push(Some(char_param(&mut buf2, &mut ind2)));
 
-        let params = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
-        assert_eq!(params.len(), 2);
+        let built = unsafe { build_params_with_dae(&mut state, 2, "test") }.unwrap();
+        assert_eq!(built.params.len(), 2);
+        assert!(built.dae_indices.is_empty());
     }
 
     #[test]
-    fn build_named_params_unbound_marker_posts_07002() {
+    fn build_params_unbound_marker_posts_07002() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         // One marker expected, but nothing bound.
         let mut state = stmt.inner.lock().unwrap();
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
-        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        let ret = unsafe { build_params_with_dae(&mut state, 1, "test") };
+        assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
     }
 
@@ -589,7 +594,7 @@ mod tests {
     /// asserted through the poster, since the enum-level check cannot catch a
     /// dropped `post_diag` or the wrong `DiagMsg`.
     #[test]
-    fn build_named_params_default_param_posts_07s01() {
+    fn build_params_default_param_posts_07s01() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
@@ -601,8 +606,8 @@ mod tests {
             .bound_params
             .push(Some(char_param(&mut buf, &mut ind)));
 
-        let ret = unsafe { build_named_params(&mut state, 1, "test") };
-        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        let ret = unsafe { build_params_with_dae(&mut state, 1, "test") };
+        assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
     }
 

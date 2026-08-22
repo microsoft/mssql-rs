@@ -131,7 +131,7 @@ pub(crate) const ERR_INVALID_USE_OF_DEFAULT_PARAM: DiagMsg = DiagMsg {
 };
 pub(crate) const ERR_DATA_AT_EXEC_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
-    text: "Data-at-execution parameters not yet implemented",
+    text: "Data-at-execution parameter reached the materializing conversion path",
 };
 pub(crate) const ERR_PARAM_C_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,

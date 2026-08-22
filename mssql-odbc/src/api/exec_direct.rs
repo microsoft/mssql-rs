@@ -5,8 +5,11 @@
 
 use tracing::{debug, error};
 
+use mssql_tds::connection::tds_client::StreamedParamStatus;
+
 use super::exec_common::{
-    build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+    ParamsWithDae, build_params_with_dae, claim_connection, fail_with_tds, finish_execute,
+    flush_pending_unprepare, park_dae_client,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -16,7 +19,8 @@ use crate::api::odbc_types::{
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
+    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_NEED_DATA,
+    STMT_STATE_PREPARED,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -83,12 +87,21 @@ fn sql_exec_direct_w_safe(
     let dbc = stmt.parent_dbc();
 
     // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count) = {
+    let (params_with_dae, rewritten_sql, marker_count) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        // A statement awaiting data-at-execution input is in the ODBC "Need
+        // Data" state, where anything but SQLPutData/SQLParamData/SQLCancel is a
+        // sequence error rather than the cursor error a merely-busy statement
+        // gets.
+        if stmt_state.has_state(STMT_STATE_NEED_DATA) {
+            error!("SQLExecDirectW: statement is awaiting data-at-execution input");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
         if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
             error!("SQLExecDirectW: statement has an active execute or open cursor");
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -98,8 +111,9 @@ fn sql_exec_direct_w_safe(
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
         let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
-        let named_params =
-            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
+        let params_with_dae =
+            match unsafe { build_params_with_dae(&mut stmt_state, marker_count, "SQLExecDirectW") }
+            {
                 Ok(params) => params,
                 Err(rc) => return rc,
             };
@@ -117,8 +131,14 @@ fn sql_exec_direct_w_safe(
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (named_params, rewritten_sql, marker_count)
+        (params_with_dae, rewritten_sql, marker_count)
     };
+
+    let ParamsWithDae {
+        params,
+        dae_indices,
+        dae_expected_lengths,
+    } = params_with_dae;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
@@ -132,12 +152,41 @@ fn sql_exec_direct_w_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
+    // Data-at-execution parameters park the half-written RPC on the statement
+    // and hand control to SQLParamData / SQLPutData. There is no prepared plan
+    // to restore afterwards, so `None` is passed for it.
+    if !dae_indices.is_empty() {
+        let begin_result =
+            dbc.runtime
+                .block_on(client.begin_sp_executesql(rewritten_sql, params, ()));
+        return match begin_result {
+            // Defensive: staging only reports DAE indices when at least one
+            // placeholder is present, so the TDS layer should not complete here.
+            Ok(StreamedParamStatus::Complete(_)) => {
+                finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+            }
+            Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
+                stmt,
+                client,
+                None,
+                None,
+                dae_indices,
+                dae_expected_lengths,
+                "SQLExecDirectW",
+            ),
+            Err(e) => {
+                error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
+                fail_with_tds(dbc, stmt, statement_handle, client, &e)
+            }
+        };
+    }
+
     // Parameterized text runs via sp_executesql (direct execution, no cached
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
     // STMT lock is held during I/O.
     let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
         dbc.runtime
-            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, ()))
+            .block_on(client.execute_sp_executesql(rewritten_sql, params, ()))
             .map(|_| ())
     } else {
         // Statement-wise navigation: position on the batch's first statement
@@ -189,6 +238,32 @@ mod tests {
         let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    /// A statement awaiting `SQLPutData` is in the Need Data state, where the
+    /// spec calls anything but SQLPutData/SQLParamData/SQLCancel a sequence
+    /// error. Without the dedicated guard this falls through to the
+    /// cursor-state check and reports 24000 instead.
+    #[test]
+    fn exec_direct_during_need_data_posts_hy010() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_STARTED | STMT_STATE_NEED_DATA);
+        }
+
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY010);
     }
 
     #[test]
