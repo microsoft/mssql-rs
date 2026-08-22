@@ -16,7 +16,7 @@ use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 use crate::connection::client_context::ClientContext;
 use crate::connection::transport::network_transport::NetworkTransport;
 use crate::connection::transport::ssl_handler::SslHandler;
-use crate::message::messages::PacketType;
+use crate::message::messages::{PacketStatusFlags, PacketType};
 
 macro_rules! append_method {
     ($name:ident, $type:ty, $size:expr_2021, $write_fn:ident) => {
@@ -52,6 +52,17 @@ impl TestPacketBuilder {
 
     pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> &mut TestPacketBuilder {
         self.data.extend_from_slice(bytes);
+        self
+    }
+
+    /// Clears the end-of-message flag so this packet is framed as a
+    /// continuation of a multi-packet message.
+    ///
+    /// [`new`](Self::new) sets EOM by default, which is right for a
+    /// single-packet message but wrong for every packet of a message except the
+    /// last one.
+    pub(crate) fn continuation(&mut self) -> &mut TestPacketBuilder {
+        self.data[1] &= !(PacketStatusFlags::Eom as u8);
         self
     }
 

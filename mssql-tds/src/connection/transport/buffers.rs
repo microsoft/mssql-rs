@@ -14,6 +14,13 @@ pub(crate) struct TdsReadBuffer {
     pub(crate) pending_bytes: usize,
     /// The offset where pending bytes are located in working_buffer.
     pub(crate) pending_bytes_offset: usize,
+    /// Whether the most recently framed packet carried the end-of-message flag.
+    ///
+    /// Once the terminating packet of a message has been framed, the server
+    /// sends nothing further until the client issues a new request. Readers use
+    /// this to fail a short read instead of blocking on a socket that will stay
+    /// silent.
+    pub(crate) end_of_message: bool,
 }
 
 impl TdsReadBuffer {
@@ -26,6 +33,7 @@ impl TdsReadBuffer {
             working_buffer: vec![0; packet_storage],
             pending_bytes: 0,
             pending_bytes_offset: 0,
+            end_of_message: false,
         }
     }
 
@@ -37,6 +45,7 @@ impl TdsReadBuffer {
             self.buffer_length = 0;
             self.pending_bytes = 0;
             self.pending_bytes_offset = 0;
+            self.end_of_message = false;
         }
     }
 
@@ -128,9 +137,14 @@ impl TdsReadBuffer {
     }
 
     /// Sets the position to 0 and the length to the specified length.
+    ///
+    /// Also clears the end-of-message flag: the buffer no longer holds a framed
+    /// packet, so the previous message's terminator says nothing about what
+    /// comes next.
     pub(crate) fn reset_to_length(&mut self, length: usize) {
         self.buffer_position = 0;
         self.buffer_length = length;
+        self.end_of_message = false;
     }
 
     pub(crate) fn shift_data_to_front(&mut self) {
