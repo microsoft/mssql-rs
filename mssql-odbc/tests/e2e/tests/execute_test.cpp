@@ -563,7 +563,12 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionStatementIsReusable) {
 // so a second SQLExecDirect is a sequence error rather than the cursor-state
 // error a merely-busy statement gets.
 TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
-    // Leaves the connection dead: the parked RPC cannot be retracted.
+    // Deliberate divergence, not a driver-death workaround: msodbcsql parks the
+    // half-written RPC under STMT_ST_EXECSTARTED (sqlccmd.cpp:1701), and
+    // SQLExecDirectW tests that bit in the same branch as an open cursor
+    // (sqlccmd.cpp:2898), so it answers 24000. Need Data is a sequence error,
+    // and unixODBC forwards the call rather than rejecting it, so the driver
+    // has to say HY010 itself.
     SKIP_IF_COMPARING_MSODBCSQL();
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;

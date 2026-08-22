@@ -157,9 +157,14 @@ unsafe fn sql_put_data_safe(
             // unwrapped: a panic here would poison this mutex and strand the
             // parked client.
             let checked_out = stmt_state.dae.as_mut().and_then(|dae| {
+                // Checked out before the progress flags move. If the client is
+                // unavailable nothing is written, and a rejected call must not
+                // leave the parameter marked NULL — same contract as the
+                // byte-total guards below.
+                let client = dae.checkout_client()?;
                 dae.progress.put_data_called = true;
                 dae.progress.is_null = true;
-                dae.checkout_client()
+                Some(client)
             });
             let Some(mut client) = checked_out else {
                 error!("SQLPutData: DAE client is unavailable — internal state corruption");
@@ -241,7 +246,10 @@ unsafe fn sql_put_data_safe(
         return SQL_ERROR;
     }
 
-    {
+    // The client is checked out in the same lock as the counter update, and
+    // before it, so a call that cannot write leaves the parameter's byte total
+    // where it was. A zero-length chunk writes nothing and needs no client.
+    let checked_out = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLPutData: stmt mutex poisoned updating DAE byte count");
             return SQL_ERROR;
@@ -270,38 +278,39 @@ unsafe fn sql_put_data_safe(
             error!("SQLPutData: DAE data exceeds SQL_LEN_DATA_AT_EXEC length");
             return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_DAE_LENGTH_MISMATCH);
         }
-        dae.progress.bytes_sent = new_total;
-        dae.progress.put_data_called = true;
-    }
 
-    if byte_count == 0 {
+        let client = if byte_count == 0 {
+            None
+        } else {
+            match stmt_state
+                .dae
+                .as_mut()
+                .and_then(|dae| dae.checkout_client())
+            {
+                Some(client) => Some(client),
+                None => {
+                    error!("SQLPutData: DAE client is unavailable — internal state corruption");
+                    post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                    return SQL_ERROR;
+                }
+            }
+        };
+
+        if let Some(dae) = stmt_state.dae.as_mut() {
+            dae.progress.bytes_sent = new_total;
+            dae.progress.put_data_called = true;
+        }
+        client
+    };
+
+    let Some(mut client) = checked_out else {
         // Zero-length chunk with a non-null pointer supplies an empty value.
         // NULL/0 is handled above as SQL NULL to match msodbcsql.
         return SQL_SUCCESS;
-    }
+    };
 
     // Safety: caller guarantees data_ptr is readable for byte_count bytes.
     let chunk = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) };
-
-    // Take the client out of stmt for the async write, then put it back.
-    let mut client = {
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("SQLPutData: stmt mutex poisoned taking the DAE client");
-            return SQL_ERROR;
-        };
-        match stmt_state
-            .dae
-            .as_mut()
-            .and_then(|dae| dae.checkout_client())
-        {
-            Some(client) => client,
-            None => {
-                error!("SQLPutData: DAE client is unavailable — internal state corruption");
-                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
-                return SQL_ERROR;
-            }
-        }
-    };
 
     let write_result = dbc.runtime.block_on(client.write_streamed_chunk(chunk));
 
@@ -460,35 +469,61 @@ mod tests {
 
     #[test]
     fn nts_chunk_length_is_counted_before_terminator() {
+        // Counting the terminator would make "abc\0" four bytes. The length
+        // guard is what makes that observable without a live client: declared
+        // at 3, a correct count fits and a terminator-inclusive one overruns.
+        // A mismatch aborts the sequence, so `dae` being gone is the tell.
+        for (declared, expect_overrun) in [(3usize, false), (2usize, true)] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.dae = Some(open_dae(Some(declared)));
+                state.bound_params.push(Some(crate::params::BoundParam {
+                    input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
+                    c_type: SQL_C_CHAR,
+                    c_type_defaulted: false,
+                    sql_type: crate::api::odbc_types::SQL_VARCHAR,
+                    column_size: 0,
+                    decimal_digits: 0,
+                    parameter_value_ptr: std::ptr::null_mut(),
+                    buffer_length: 0,
+                    strlen_or_ind_ptr: std::ptr::null_mut(),
+                }));
+            }
+
+            let mut bytes = b"abc\0".to_vec();
+            let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), SQL_NTS as SqlLen) };
+            assert_eq!(ret, SQL_ERROR, "declared {declared}: no client to write to");
+
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(
+                state.dae.is_none(),
+                expect_overrun,
+                "declared {declared}: three data bytes must fit in 3 but not in 2"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_client_checkout_leaves_progress_untouched() {
+        // A call that cannot write must not move the parameter's counters, or a
+        // retry would resume from a byte total the server never received.
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(open_dae(None));
-            state.bound_params.push(Some(crate::params::BoundParam {
-                input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
-                c_type: SQL_C_CHAR,
-                c_type_defaulted: false,
-                sql_type: crate::api::odbc_types::SQL_VARCHAR,
-                column_size: 0,
-                decimal_digits: 0,
-                parameter_value_ptr: std::ptr::null_mut(),
-                buffer_length: 0,
-                strlen_or_ind_ptr: std::ptr::null_mut(),
-            }));
         }
 
-        let mut bytes = b"abc\0".to_vec();
-        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), SQL_NTS as SqlLen) };
-        assert_eq!(
-            ret, SQL_ERROR,
-            "no TDS client is present for the actual write"
-        );
+        let mut bytes = b"abc".to_vec();
+        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), 3) };
+        assert_eq!(ret, SQL_ERROR);
 
         let state = stmt.inner.lock().unwrap();
         let dae = state.dae.as_ref().expect("sequence still active");
-        assert_eq!(dae.progress.bytes_sent, 3);
-        assert!(dae.progress.put_data_called);
+        assert_eq!(dae.progress.bytes_sent, 0);
+        assert!(!dae.progress.put_data_called);
     }
 
     #[test]

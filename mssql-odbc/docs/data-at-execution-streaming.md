@@ -195,7 +195,7 @@ or finalises and sends the packet.
 ### Parameter Order
 
 Any parameter may be data-at-execution, in any position, freely interleaved
-with ordinary bound parameters. `build_params_with_dae` decides per marker,
+with ordinary bound parameters. `build_named_params` decides per marker,
 so a `SELECT ? + ? + ?` with only the middle parameter streamed is supported
 (`DataAtExecutionInterleavesWithBoundParams` covers exactly that).
 
