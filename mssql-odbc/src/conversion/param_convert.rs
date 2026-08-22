@@ -20,11 +20,13 @@ use std::slice;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
-use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, RpcTypeMetadata, StatusFlags};
+use mssql_tds::message::parameters::rpc_parameters::{
+    RpcParameter, RpcTypeMetadata, StatusFlags, StreamedSqlType,
+};
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR, SQL_DATA_AT_EXEC,
-    SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
+    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
+    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
     SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NTS, SQL_NULL_DATA,
     SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
     SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
@@ -32,7 +34,7 @@ use crate::api::odbc_types::{
     SQL_WVARCHAR, SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
-    DiagMsg, ERR_DATA_AT_EXEC_NOT_IMPLEMENTED, ERR_INVALID_PARAM_COLUMN_SIZE,
+    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_INVALID_PARAM_COLUMN_SIZE,
     ERR_INVALID_PARAM_DECIMAL_DIGITS, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
     ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
@@ -51,8 +53,12 @@ pub(crate) enum ParamBuildError {
     /// Backstop only: bind time rejects any C type the conversion matrix does
     /// not list, so reaching this means the matrix and this module disagree.
     UnsupportedCType(SqlSmallInt),
-    /// The parameter uses data-at-execution (`SQLPutData`).
-    DataAtExecUnsupported,
+    /// Backstop only: data-at-execution is supported, but `SQLExecute` and
+    /// `SQLExecDirect` stage those parameters as streaming placeholders before
+    /// reaching this module. An indicator that survives to here means staging
+    /// missed the parameter, so the value buffer holds the application's token
+    /// rather than data. Reported as a driver error, not "not implemented".
+    DataAtExecNotStaged,
     /// `StrLen_or_Ind` was `SQL_DEFAULT_PARAM` on a statement that is not a
     /// canonical procedure call.
     InvalidUseOfDefaultParam,
@@ -70,7 +76,7 @@ impl ParamBuildError {
     pub(crate) fn diag(self) -> DiagMsg {
         match self {
             Self::UnsupportedCType(_) => ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
-            Self::DataAtExecUnsupported => ERR_DATA_AT_EXEC_NOT_IMPLEMENTED,
+            Self::DataAtExecNotStaged => ERR_DATA_AT_EXEC_NOT_STAGED,
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::InvalidParameterSize(_) => ERR_INVALID_PARAM_COLUMN_SIZE,
@@ -119,8 +125,13 @@ pub(crate) unsafe fn bound_param_to_value(
         if ind == SQL_DEFAULT_PARAM {
             return Err(ParamBuildError::InvalidUseOfDefaultParam);
         }
-        if ind == SQL_DATA_AT_EXEC || ind <= SQL_LEN_DATA_AT_EXEC_OFFSET {
-            return Err(ParamBuildError::DataAtExecUnsupported);
+        // Never reached through SQLExecute / SQLExecDirect, which stage these
+        // as streaming placeholders. Refusing here keeps the application's
+        // dummy token from being read as a value if that routing ever breaks,
+        // and reports the staging bug instead of the misleading "invalid
+        // length" the negative indicator would otherwise draw below.
+        if is_data_at_exec_indicator(ind) {
+            return Err(ParamBuildError::DataAtExecNotStaged);
         }
         // Any remaining negative indicator  is invalid for an input parameter
         if ind < 0 && ind != SQL_NTS as SqlLen {
@@ -159,6 +170,10 @@ pub(crate) unsafe fn bound_param_to_value(
                 unsafe { read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec) };
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
+        SQL_C_BINARY => {
+            let bytes = unsafe { read_binary_bytes(param, len_spec)? };
+            SqlType::VarBinaryMax(Some(bytes))
+        }
         // Non-character default C types reach here only through an explicit
         // binding; this driver does not yet convert their buffers.
         other => return Err(ParamBuildError::UnsupportedCType(other)),
@@ -167,6 +182,24 @@ pub(crate) unsafe fn bound_param_to_value(
     Ok((value, None))
 }
 
+/// Returns `true` when `indicator` is a data-at-execution value
+/// (`SQL_DATA_AT_EXEC` or any value at or below `SQL_LEN_DATA_AT_EXEC_OFFSET`).
+pub(crate) fn is_data_at_exec_indicator(indicator: SqlLen) -> bool {
+    indicator == SQL_DATA_AT_EXEC || indicator <= SQL_LEN_DATA_AT_EXEC_OFFSET
+}
+
+/// Builds the streaming placeholder type for a data-at-execution bound
+/// parameter. The actual bytes arrive later via `SQLPutData`.
+pub(crate) fn dae_placeholder_type(
+    c_type: SqlSmallInt,
+) -> Result<StreamedSqlType, ParamBuildError> {
+    match c_type {
+        SQL_C_CHAR => Ok(StreamedSqlType::VarcharMax),
+        SQL_C_WCHAR => Ok(StreamedSqlType::NVarcharMax),
+        SQL_C_BINARY => Ok(StreamedSqlType::VarBinaryMax),
+        other => Err(ParamBuildError::UnsupportedCType(other)),
+    }
+}
 /// A TDS value plus the precision/scale the RPC layer must use for both the
 /// `@P1 <type>` declaration and the wire `TYPE_INFO`.
 type TypedValue = (SqlType, Option<RpcTypeMetadata>);
@@ -194,6 +227,7 @@ fn null_value(param: &BoundParam) -> Result<TypedValue, ParamBuildError> {
     match param.c_type {
         SQL_C_CHAR => Ok((SqlType::VarcharMax(None), None)),
         SQL_C_WCHAR => Ok((SqlType::NVarcharMax(None), None)),
+        SQL_C_BINARY => Ok((SqlType::VarBinaryMax(None), None)),
         other => Err(ParamBuildError::UnsupportedCType(other)),
     }
 }
@@ -392,6 +426,38 @@ unsafe fn read_char_bytes(ptr: *const u8, len_spec: SqlLen) -> Vec<u8> {
     unsafe { slice::from_raw_parts(ptr, len).to_vec() }
 }
 
+/// Reads raw (`SQL_C_BINARY`) bytes.
+///
+/// Binary buffers have no terminator, so the length must be stated. `len_spec`
+/// is the indicator value when the application supplied an indicator pointer;
+/// `SQL_NTS` here means it did not, and the ODBC contract falls back to
+/// `BufferLength`. A binding that states neither has no readable extent, so it
+/// is rejected rather than guessed at.
+///
+/// # Safety
+/// `param.parameter_value_ptr`, if non-null, must be readable for the resolved
+/// byte count.
+unsafe fn read_binary_bytes(
+    param: &BoundParam,
+    len_spec: SqlLen,
+) -> Result<Vec<u8>, ParamBuildError> {
+    let len = if len_spec == SQL_NTS as SqlLen {
+        if param.buffer_length < 0 {
+            return Err(ParamBuildError::InvalidLength(param.buffer_length));
+        }
+        param.buffer_length
+    } else {
+        len_spec
+    };
+    if param.parameter_value_ptr.is_null() || len == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(
+        unsafe { slice::from_raw_parts(param.parameter_value_ptr as *const u8, len as usize) }
+            .to_vec(),
+    )
+}
+
 /// Reads wide (`SQL_C_WCHAR`) data as UTF-16LE bytes. `len_spec` is a **byte**
 /// count per the ODBC spec, or `SQL_NTS` for a NUL-terminated string.
 ///
@@ -465,6 +531,44 @@ mod tests {
     }
 
     #[test]
+    fn binary_with_indicator_length_becomes_varbinary() {
+        let mut buf: Vec<u8> = vec![0x01, 0x00, 0xFF, 0x7E];
+        let mut ind: SqlLen = 4;
+        let p = param(SQL_C_BINARY, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarBinaryMax(Some(b)) => assert_eq!(b, vec![0x01, 0x00, 0xFF, 0x7E]),
+            other => panic!("expected VarBinaryMax(Some), got {other:?}"),
+        }
+    }
+
+    /// Without an indicator pointer a binary buffer has no stated length, so
+    /// the binding's `BufferLength` supplies it.
+    #[test]
+    fn binary_without_indicator_uses_buffer_length() {
+        let mut buf: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut p = param(
+            SQL_C_BINARY,
+            buf.as_mut_ptr() as *mut c_void,
+            std::ptr::null_mut(),
+        );
+        p.buffer_length = 2;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarBinaryMax(Some(b)) => assert_eq!(b, vec![0xDE, 0xAD]),
+            other => panic!("expected VarBinaryMax(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_null_indicator_becomes_typed_null() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::VarBinaryMax(None)));
+    }
+
+    #[test]
     fn wchar_explicit_length_becomes_nvarchar() {
         let mut buf: Vec<u16> = "hi".encode_utf16().collect();
         let mut ind: SqlLen = (buf.len() * 2) as SqlLen;
@@ -498,7 +602,18 @@ mod tests {
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamBuildError::DataAtExecUnsupported);
+        assert_eq!(err, ParamBuildError::DataAtExecNotStaged);
+    }
+
+    /// `SQL_LEN_DATA_AT_EXEC(n)` encodes as a large negative indicator, which
+    /// would otherwise be caught by the invalid-length check below it and
+    /// misreported as a bad buffer length.
+    #[test]
+    fn data_at_exec_with_declared_length_is_rejected() {
+        let mut ind: SqlLen = SQL_LEN_DATA_AT_EXEC_OFFSET - 16;
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::DataAtExecNotStaged);
     }
 
     #[test]
