@@ -297,7 +297,6 @@ pub(crate) struct PlpChunkStreamReader {
     chunk_remaining: usize,
     reached_end: bool,
     total_read: usize,
-    chunks_seen: u32,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -308,7 +307,6 @@ impl PlpChunkStreamReader {
             chunk_remaining: 0,
             reached_end: false,
             total_read: 0,
-            chunks_seen: 0,
         }
     }
 
@@ -383,15 +381,6 @@ impl PlpChunkStreamReader {
                 )));
             }
             return Ok(false);
-        }
-
-        self.chunks_seen += 1;
-        if self.chunks_seen > GenericDecoder::MAX_PLP_CHUNKS {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "Too many PLP chunks: {} (max {})",
-                self.chunks_seen,
-                GenericDecoder::MAX_PLP_CHUNKS
-            )));
         }
 
         if chunk_len > GenericDecoder::MAX_PLP_CHUNK_SIZE {
@@ -612,10 +601,6 @@ impl GenericDecoder {
     const SQL_PLP_UNKNOWNLEN: usize = 0xfffffffffffffffe;
     #[cfg_attr(not(test), allow(dead_code))]
     const SQL_PLP_MAXLEN: usize = 0xfffffffffffffffd;
-    #[cfg(fuzzing)]
-    const MAX_PLP_CHUNKS: u32 = 1000;
-    #[cfg(not(fuzzing))]
-    const MAX_PLP_CHUNKS: u32 = 100000;
     #[cfg(fuzzing)]
     const MAX_PLP_CHUNK_SIZE: usize = 8 * 1024;
     #[cfg(not(fuzzing))]
@@ -1192,19 +1177,19 @@ impl GenericDecoder {
         let mut vector_capacity: usize = 0;
         let mut chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
         let mut offset: usize = 0;
+        #[cfg(fuzzing)]
         let mut chunk_count = 0u32;
 
         while chunk_len > 0 {
-            chunk_count += 1;
-
             #[cfg(fuzzing)]
             {
+                chunk_count += 1;
                 eprintln!(
                     "[ALLOC] read_plp_chunks_unknown_len: chunk #{chunk_count}, chunk_len={chunk_len}, total_capacity={vector_capacity}"
                 );
             }
 
-            Self::check_plp_chunk(chunk_count, chunk_len)?;
+            Self::check_plp_chunk(chunk_len)?;
 
             // Use checked_add to prevent capacity overflow
             vector_capacity = vector_capacity.checked_add(chunk_len).ok_or_else(|| {
@@ -1229,15 +1214,17 @@ impl GenericDecoder {
         Ok(plp_buffer)
     }
 
-    /// Validates a PLP chunk header against the per-value chunk limits.
-    fn check_plp_chunk(chunk_count: u32, chunk_len: usize) -> TdsResult<()> {
-        if chunk_count > Self::MAX_PLP_CHUNKS {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "Too many PLP chunks: {chunk_count} (max {})",
-                Self::MAX_PLP_CHUNKS
-            )));
-        }
-
+    /// Validates a PLP chunk header against the per-chunk size limit.
+    ///
+    /// There is deliberately no cap on the *number* of chunks. Every PLP loop
+    /// consumes a strictly positive `chunk_len` per iteration and is bounded by
+    /// a total-byte check (`MAX_PLP_SIZE`, the wire-declared length, or the
+    /// destination slice), so the work a peer can induce is already
+    /// proportional to the bytes it actually sends. A chunk *count* limit adds
+    /// no protection and silently caps the value size a client can read: SQL
+    /// Server emits `varbinary(max)` in 8000-byte chunks, so a 100 000-chunk
+    /// cap rejected any LOB above ~763 MB even though the protocol allows 2 GB.
+    fn check_plp_chunk(chunk_len: usize) -> TdsResult<()> {
         // Limit individual chunk size
         if chunk_len > Self::MAX_PLP_CHUNK_SIZE {
             return Err(crate::error::Error::ProtocolError(format!(
@@ -1289,16 +1276,19 @@ impl GenericDecoder {
     {
         let mut chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
         let mut offset: usize = 0;
+        #[cfg(fuzzing)]
         let mut chunk_count = 0u32;
 
         while chunk_len > 0 {
-            chunk_count += 1;
             #[cfg(fuzzing)]
-            eprintln!(
-                "[ALLOC] read_plp_chunks_into_slice: chunk #{chunk_count}, chunk_len={chunk_len}, wire_declared_len={declared_len}, destination_len={}",
-                dest.len()
-            );
-            Self::check_plp_chunk(chunk_count, chunk_len)?;
+            {
+                chunk_count += 1;
+                eprintln!(
+                    "[ALLOC] read_plp_chunks_into_slice: chunk #{chunk_count}, chunk_len={chunk_len}, wire_declared_len={declared_len}, destination_len={}",
+                    dest.len()
+                );
+            }
+            Self::check_plp_chunk(chunk_len)?;
 
             let end_offset = offset.checked_add(chunk_len).ok_or_else(|| {
                 crate::error::Error::ProtocolError(format!(
@@ -4558,23 +4548,33 @@ mod test {
             );
         }
 
+        /// The chunk *count* cap that used to live here was removed: it was a
+        /// fuzz-only tripwire that leaked into production builds and silently
+        /// capped readable LOB size. Streaming many small chunks must now
+        /// succeed — the stream is bounded by bytes, not by chunk count.
+        #[cfg(not(fuzzing))]
         #[tokio::test]
-        async fn plp_chunk_stream_reader_chunk_count_limit_errors() {
-            let mut stream = PlpChunkStreamReader {
-                length: PlpChunkReadLength::Unknown,
-                chunk_remaining: 0,
-                reached_end: false,
-                total_read: 0,
-                chunks_seen: GenericDecoder::MAX_PLP_CHUNKS,
-            };
-            let mut reader = ByteReader::new(vec![1, 0, 0, 0]);
-            let mut out = [0u8; 1];
+        async fn plp_chunk_stream_reader_accepts_more_chunks_than_the_removed_count_cap() {
+            let mut reader = ByteReader::new(unknown_len_plp_wire(REMOVED_MAX_PLP_CHUNKS + 1));
+            let mut stream = PlpChunkStreamReader::begin(&mut reader)
+                .await
+                .expect("begin")
+                .expect("not null");
 
-            let err = stream.read_into(&mut reader, &mut out).await.unwrap_err();
-            assert!(
-                err.to_string().contains("Too many PLP chunks"),
-                "unexpected error: {err}"
-            );
+            let mut total = 0usize;
+            let mut out = [0u8; 1];
+            loop {
+                let read = stream.read_into(&mut reader, &mut out).await.expect(
+                    "streaming past the removed chunk-count cap must not fail: a chunk count \
+                     limit rejects large LOBs that the protocol allows",
+                );
+                if read == 0 {
+                    break;
+                }
+                total += read;
+            }
+
+            assert_eq!(total, REMOVED_MAX_PLP_CHUNKS + 1);
         }
 
         #[tokio::test]
@@ -4584,7 +4584,6 @@ mod test {
                 chunk_remaining: 0,
                 reached_end: false,
                 total_read: MAX_PLP_SIZE,
-                chunks_seen: 0,
             };
             let mut reader = ByteReader::new(vec![1, 0, 0, 0]);
             let mut out = [0u8; 1];
@@ -4612,6 +4611,74 @@ mod test {
                     .contains("exceeds maximum allowed chunk size"),
                 "unexpected error: {err}"
             );
+        }
+
+        /// The chunk-count cap that used to bound every PLP read. It was
+        /// introduced as a `#[cfg(fuzzing)]`-only tripwire, then hoisted into
+        /// production builds by a commit titled "Fix clippy warnings". SQL
+        /// Server emits `varbinary(max)` in 8000-byte chunks, so this cap
+        /// rejected any LOB above ~763 MB with "Too many PLP chunks" even
+        /// though TDS allows 2 GB. It is gone; these tests keep it gone.
+        #[cfg(not(fuzzing))]
+        const REMOVED_MAX_PLP_CHUNKS: usize = 100_000;
+
+        /// Builds an unknown-length PLP value made of `chunks` single-byte
+        /// chunks, terminated by the zero-length chunk.
+        #[cfg(not(fuzzing))]
+        fn unknown_len_plp_wire(chunks: usize) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(8 + chunks * 5 + 4);
+            buf.extend_from_slice(&0xFFFFFFFFFFFFFFFEu64.to_le_bytes());
+            for i in 0..chunks {
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                buf.push(i as u8);
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf
+        }
+
+        /// Unknown-length path: a value split into more chunks than the removed
+        /// cap allowed must decode, not error.
+        #[cfg(not(fuzzing))]
+        #[tokio::test]
+        async fn read_plp_bytes_accepts_more_chunks_than_the_removed_count_cap() {
+            let chunks = REMOVED_MAX_PLP_CHUNKS + 1;
+            let mut reader = ByteReader::new(unknown_len_plp_wire(chunks));
+
+            let value = GenericDecoder::read_plp_bytes(&mut reader)
+                .await
+                .expect(
+                    "a PLP value split into more chunks than the removed cap must decode: \
+                     rejecting it caps readable LOB size far below the 2 GB the protocol allows",
+                )
+                .expect("not null");
+
+            assert_eq!(value.len(), chunks);
+            assert_eq!(value[0], 0);
+            assert_eq!(value[chunks - 1], ((chunks - 1) % 256) as u8);
+        }
+
+        /// Known-length path (`read_plp_chunks_into_slice`) carried the same
+        /// cap and needs the same guarantee.
+        #[cfg(not(fuzzing))]
+        #[tokio::test]
+        async fn read_plp_bytes_accepts_many_chunks_for_a_known_length_value() {
+            let chunks = REMOVED_MAX_PLP_CHUNKS + 1;
+            let mut buf = Vec::with_capacity(8 + chunks * 5 + 4);
+            buf.extend_from_slice(&(chunks as u64).to_le_bytes());
+            for i in 0..chunks {
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                buf.push(i as u8);
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes());
+
+            let mut reader = ByteReader::new(buf);
+            let value = GenericDecoder::read_plp_bytes(&mut reader)
+                .await
+                .expect("known-length PLP value with many chunks must decode")
+                .expect("not null");
+
+            assert_eq!(value.len(), chunks);
+            assert_eq!(value[chunks - 1], ((chunks - 1) % 256) as u8);
         }
 
         #[tokio::test]
