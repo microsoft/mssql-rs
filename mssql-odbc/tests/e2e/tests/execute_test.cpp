@@ -238,6 +238,64 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionLoopsOverMultipleStreamedParams) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Data-at-execution must not cost the statement its prepared plan: the streamed
+// values go into the same sp_prepexec / sp_execute the statement would have used
+// with materialized values, so one prepare serves every later execute regardless
+// of whether that execute streams.
+//
+// The third execute drops the SQL_DATA_AT_EXEC indicator without rebinding,
+// which is legal -- the indicator is read per execute -- and takes the
+// materialized branch through the same handle. A driver that fell back to ad-hoc
+// sp_executesql for the streamed executes would still pass on values; what it
+// could not do is keep the plan across the switch in both directions.
+// Benefits-from-mock-tds: the values only prove each execute ran. A mock TDS
+// server could assert the first execute was sp_prepexec and the next two were
+// sp_execute against the same handle, which is the actual claim here.
+TEST_F(PrepareExecuteLiveTest, DataAtExecutionKeepsStatementPreparedAcrossExecutes) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> buffer(16, 0);
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, buffer.data(),
+                                   static_cast<SQLLEN>(buffer.size()), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // First streamed execute: prepares and executes in one round trip.
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    const char first[] = "first";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first), 5),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("first", GetColumnChar(1));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Second streamed execute: no re-prepare, the cached handle is reused.
+    ind = SQL_DATA_AT_EXEC;
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    const char second[] = "second";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second), 6),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("second", GetColumnChar(1));
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Third execute supplies the value inline through the same binding and the
+    // same prepared handle.
+    const char third[] = "third";
+    std::memcpy(buffer.data(), third, sizeof(third));
+    ind = SQL_NTS;
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("third", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // Binary data-at-execution streams raw bytes as varbinary(max), including NUL
 // bytes, matching msodbcsql SQLPutData behavior for SQL_C_BINARY.
 // Benefits-from-mock-tds: the hex round trip proves only the reassembled value.

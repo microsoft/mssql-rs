@@ -8,7 +8,7 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::StreamedParamStatus;
 
 use super::exec_common::{
-    ParamsWithDae, build_params_with_dae, claim_connection, fail_with_tds, finish_execute,
+    ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
     flush_pending_unprepare, park_dae_client,
 };
 use super::sqlstate::*;
@@ -86,7 +86,7 @@ fn sql_exec_direct_w_safe(
     let dbc = stmt.parent_dbc();
 
     // Check STMT state, gather parameter values, and reset prior context.
-    let (params_with_dae, rewritten_sql, marker_count) = {
+    let (named_params, rewritten_sql, marker_count) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -110,9 +110,8 @@ fn sql_exec_direct_w_safe(
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
         let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
-        let params_with_dae =
-            match unsafe { build_params_with_dae(&mut stmt_state, marker_count, "SQLExecDirectW") }
-            {
+        let named_params =
+            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
                 Ok(params) => params,
                 Err(rc) => return rc,
             };
@@ -130,10 +129,10 @@ fn sql_exec_direct_w_safe(
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (params_with_dae, rewritten_sql, marker_count)
+        (named_params, rewritten_sql, marker_count)
     };
 
-    let ParamsWithDae { params, dae_params } = params_with_dae;
+    let ParamsWithDae { params, dae_params } = named_params;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
@@ -158,6 +157,10 @@ fn sql_exec_direct_w_safe(
             // Defensive: staging only reports DAE parameters when at least one
             // placeholder is present, so the TDS layer should not complete here.
             Ok(StreamedParamStatus::Complete(_)) => {
+                error!(
+                    dae_param_count = dae_params.len(),
+                    "SQLExecDirectW: begin_sp_executesql completed despite data-at-execution parameters"
+                );
                 finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
             }
             Ok(StreamedParamStatus::NeedData { .. }) => {

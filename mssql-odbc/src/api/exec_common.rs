@@ -262,7 +262,7 @@ pub(super) fn flush_pending_unprepare(
     }
 }
 
-/// Result of [`build_params_with_dae`]: the full RPC parameter list (with
+/// Result of [`build_named_params`]: the full RPC parameter list (with
 /// data-at-execution placeholders) and a description of those placeholders.
 pub(super) struct ParamsWithDae {
     /// All `@P1..@Pn` parameters in original order.  DAE entries carry a
@@ -296,7 +296,7 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// # Safety
 /// Each bound parameter's value/indicator pointers must still satisfy the
 /// `SQLBindParameter` contract; the buffers are read here.
-pub(super) unsafe fn build_params_with_dae(
+pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
     op: &str,
@@ -526,17 +526,17 @@ mod tests {
     }
 
     #[test]
-    fn build_params_zero_markers_yields_empty() {
+    fn build_named_params_zero_markers_yields_empty() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
-        let built = unsafe { build_params_with_dae(&mut state, 0, "test") }.unwrap();
+        let built = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
         assert!(built.params.is_empty());
         assert!(built.dae_params.is_empty());
     }
 
     #[test]
-    fn build_params_builds_one_per_marker() {
+    fn build_named_params_builds_one_per_marker() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
@@ -553,18 +553,18 @@ mod tests {
             .bound_params
             .push(Some(char_param(&mut buf2, &mut ind2)));
 
-        let built = unsafe { build_params_with_dae(&mut state, 2, "test") }.unwrap();
+        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
         assert_eq!(built.params.len(), 2);
         assert!(built.dae_params.is_empty());
     }
 
     #[test]
-    fn build_params_unbound_marker_posts_07002() {
+    fn build_named_params_unbound_marker_posts_07002() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         // One marker expected, but nothing bound.
         let mut state = stmt.inner.lock().unwrap();
-        let ret = unsafe { build_params_with_dae(&mut state, 1, "test") };
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
         assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
     }
@@ -573,7 +573,7 @@ mod tests {
     /// asserted through the poster, since the enum-level check cannot catch a
     /// dropped `post_diag` or the wrong `DiagMsg`.
     #[test]
-    fn build_params_default_param_posts_07s01() {
+    fn build_named_params_default_param_posts_07s01() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
@@ -585,7 +585,7 @@ mod tests {
             .bound_params
             .push(Some(char_param(&mut buf, &mut ind)));
 
-        let ret = unsafe { build_params_with_dae(&mut state, 1, "test") };
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
         assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
     }
@@ -596,7 +596,7 @@ mod tests {
     /// interleaving that `DataAtExecutionInterleavesWithBoundParams` can only
     /// observe through the concatenated server result.
     #[test]
-    fn build_params_with_dae_keeps_streamed_marker_in_position() {
+    fn build_named_params_keeps_streamed_marker_in_position() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
@@ -625,7 +625,7 @@ mod tests {
             .bound_params
             .push(Some(char_param(&mut last, &mut last_ind)));
 
-        let dae = unsafe { build_params_with_dae(&mut state, 3, "test") }.unwrap();
+        let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
         assert_eq!(
             dae.dae_params,
@@ -639,7 +639,7 @@ mod tests {
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
     /// `SQLParamData` enforces; `SQL_DATA_AT_EXEC` promises nothing.
     #[test]
-    fn build_params_with_dae_records_declared_length() {
+    fn build_named_params_records_declared_length() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
@@ -658,7 +658,7 @@ mod tests {
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
         }));
 
-        let dae = unsafe { build_params_with_dae(&mut state, 1, "test") }.unwrap();
+        let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
         assert_eq!(
             dae.dae_params,
             vec![DaeParam {

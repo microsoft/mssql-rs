@@ -12,7 +12,7 @@ use mssql_tds::connection::tds_client::{
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    ParamsWithDae, build_params_with_dae, claim_connection, fail_with_tds, finish_execute,
+    ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
     park_dae_client,
 };
 use super::sqlstate::*;
@@ -62,7 +62,7 @@ struct Execution {
 }
 
 /// Values gathered when at least one bound parameter carries a data-at-execution
-/// indicator and the statement will be streamed via `begin_sp_executesql`.
+/// indicator and the statement will be streamed via `begin_execute_prepared`.
 struct DaeExecution {
     /// Full parameter list in original order; DAE entries have `data_at_exec()`
     /// set and carry a `None` value.
@@ -95,6 +95,10 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
                 Ok(client) => client,
                 Err(rc) => {
+                    // Staging moved the prepared statement (and any pending orphan) out;
+                    // a failed connection claim runs nothing, so put them back so the
+                    // statement stays prepared and re-executable. `claim_connection`
+                    // already cleared `EXEC_STARTED`.
                     if let Ok(mut stmt_state) = stmt.inner.lock() {
                         stmt_state.prepared = Some(prepared);
                         stmt_state.pending_unprepare = orphaned;
@@ -104,6 +108,8 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             };
 
             if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
+                // Nothing ran, so put the staged statement (and any pending orphan)
+                // back before reporting, exactly as the failed-claim path does.
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.prepared = Some(prepared);
                     stmt_state.pending_unprepare = orphaned;
@@ -111,6 +117,14 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
+            // `execute_prepared` owns the whole recovery sequence: reconnect once up
+            // front (mirrors msodbcsql `GetBatchCtxOrRecover`), charge it against the
+            // command timeout, then reuse the cached handle or transparently re-prepare
+            // when it belongs to a superseded session (msodbcsql `FIsReprepareRequired`).
+            // A still-live orphaned handle is released by piggyback on the re-prepare.
+            //
+            // Command timeout (SQL_ATTR_QUERY_TIMEOUT) isn't wired up yet; the default
+            // `ExecuteOptions` means no per-command limit.
             let exec_result = dbc.runtime.block_on(client.execute_prepared(
                 &mut prepared.stmt,
                 named_params,
@@ -118,6 +132,9 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 ExecuteOptions::default(),
             ));
 
+            // Write the statement back along with any orphan that was not consumed
+            // because execution failed before the prepexec send boundary. The fresh
+            // handle's RETURNVALUE arrives after the result set and is captured later.
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.prepared = Some(prepared);
                 stmt_state.pending_unprepare = orphaned;
@@ -131,6 +148,12 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 }
             };
 
+            // A prepared statement runs a single SQL statement. If it produced no result
+            // set (DML / no-row), drain its trailing tokens so the statement is left idle
+            // and immediately re-executable (msodbcsql parity) instead of leaving a
+            // 0-column cursor open. A row-returning statement keeps its cursor open for
+            // SQLFetch; its `@handle` RETURNVALUE (sp_prepexec) is captured later at
+            // drain time (SQLCloseCursor / the DDL finish path).
             if !matches!(stmt_result, StatementResult::Rows)
                 && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
             {
@@ -144,12 +167,14 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_params,
-            prepared,
-            orphaned,
+            mut prepared,
+            mut orphaned,
         }) => {
             let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
                 Ok(client) => client,
                 Err(rc) => {
+                    // Same restore-on-failure contract as the non-streaming arm:
+                    // nothing ran, so the statement must stay prepared.
                     if let Ok(mut stmt_state) = stmt.inner.lock() {
                         stmt_state.prepared = Some(prepared);
                         stmt_state.pending_unprepare = orphaned;
@@ -166,12 +191,18 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
-            // Use the prepared SQL text with ad-hoc sp_executesql (no caching)
-            // since the streaming API doesn't go through sp_prepexec.
-            let sql = prepared.stmt.sql().to_string();
-            let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
-                sql,
+            // Data-at-execution keeps the prepared path: `begin_execute_prepared`
+            // streams the values into the same `sp_execute` / `sp_prepexec` RPC a
+            // materialized execute would have used, so the statement stays
+            // prepared and reuses its handle across executes (msodbcsql parity).
+            // The orphan is not piggybacked here — the request stays open for the
+            // whole SQLPutData sequence and may never reach the server — so it
+            // rides along with the parked state and is released by the next
+            // execute or by SQLFreeHandle.
+            let begin_result = dbc.runtime.block_on(client.begin_execute_prepared(
+                &mut prepared.stmt,
                 params,
+                &mut orphaned,
                 ExecuteOptions::default(),
             ));
 
@@ -180,6 +211,10 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     // All params happened to be materialized (shouldn't happen
                     // because staging only produces NeedData when dae_params is
                     // non-empty, but handle it defensively).
+                    error!(
+                        dae_param_count = dae_params.len(),
+                        "SQLExecute: begin_execute_prepared completed despite data-at-execution parameters"
+                    );
                     if let Ok(mut stmt_state) = stmt.inner.lock() {
                         stmt_state.prepared = Some(prepared);
                         stmt_state.pending_unprepare = orphaned;
@@ -196,7 +231,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     "SQLExecute",
                 ),
                 Err(e) => {
-                    error!(%e, "SQLExecute: begin_sp_executesql failed");
+                    error!(%e, "SQLExecute: begin_execute_prepared failed");
                     if let Ok(mut stmt_state) = stmt.inner.lock() {
                         stmt_state.prepared = Some(prepared);
                         stmt_state.pending_unprepare = orphaned;
@@ -255,8 +290,10 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
     let ParamsWithDae { params, dae_params } =
-        unsafe { build_params_with_dae(&mut stmt_state, marker_count, "SQLExecute") }?;
+        unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
+    // All fallible validation passed: move the prepared plan out (written
+    // back after the execute) and take any orphaned handle for piggyback drop.
     let prepared = stmt_state
         .prepared
         .take()
@@ -445,6 +482,8 @@ mod tests {
 
     #[test]
     fn stage_execution_without_pending_has_no_orphaned_handle() {
+        // Nothing pending: staging threads no orphan, so the execute won't
+        // piggyback a drop.
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "SELECT 1");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };

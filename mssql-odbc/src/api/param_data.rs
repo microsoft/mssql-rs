@@ -28,7 +28,7 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::StreamedParamStatus;
+use mssql_tds::connection::tds_client::{StatementResult, StreamedParamStatus};
 
 use super::exec_common::{abort_dae_with_diag, fail_with_tds, finish_execute, return_client_idle};
 use super::sqlstate::*;
@@ -200,14 +200,14 @@ fn sql_param_data_safe(
             SQL_NEED_DATA
         }
 
-        Ok(StreamedParamStatus::Complete(_result)) => {
+        Ok(StreamedParamStatus::Complete(result)) => {
             // All DAE parameters are done.  `take_dae` recovers the prepared
             // plan and orphan in the same critical section that ends the
             // sequence: a statement observed between the two would look idle
             // but unprepared, and a concurrent SQLExecute would report 07002
             // instead of re-running the plan. `SQLExecDirect` parks no plan, so
             // a `None` plan is legitimate there.
-            {
+            let was_prepared = {
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned on completion");
                     return_client_idle(dbc, statement_handle, client);
@@ -220,6 +220,23 @@ fn sql_param_data_safe(
                 let parked = stmt_state.take_dae();
                 debug_assert!(parked.is_none(), "the client is checked out by this call");
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+                stmt_state.prepared.is_some()
+            };
+
+            // Same contract as the non-streaming `SQLExecute` arm: a prepared
+            // statement runs one SQL statement, so a no-row result must have its
+            // trailing tokens drained (including `sp_prepexec`'s `@handle`
+            // RETURNVALUE, which is what materializes the handle for reuse)
+            // instead of leaving a 0-column cursor open. `SQLExecDirect` streams
+            // ad-hoc `sp_executesql` with no parked plan and no trailing handle,
+            // so it keeps the batch-navigation behaviour `finish_execute` gives
+            // it.
+            if was_prepared
+                && !matches!(result, StatementResult::Rows)
+                && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
+            {
+                error!(%e, "SQLParamData: draining no-row prepared result failed");
+                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
             finish_execute(dbc, stmt, statement_handle, client, "SQLParamData")
