@@ -316,7 +316,6 @@ pub enum VectorBaseType {
     /// 32-bit floating point (0x00)
     Float32 = 0x00,
     /// 16-bit (half-precision) floating point (0x01).
-    /// Requires server-side Vector feature version >= 2.
     Float16 = 0x01,
 }
 
@@ -1409,9 +1408,9 @@ mod tests {
         assert_eq!(bt, VectorBaseType::Float32);
         assert_eq!(bt.element_size_bytes(), 4);
 
-        let bt = VectorBaseType::try_from(0x01).unwrap();
-        assert_eq!(bt, VectorBaseType::Float16);
-        assert_eq!(bt.element_size_bytes(), 2);
+        let bt16 = VectorBaseType::try_from(0x01).unwrap();
+        assert_eq!(bt16, VectorBaseType::Float16);
+        assert_eq!(bt16.element_size_bytes(), 2);
     }
 
     #[test]

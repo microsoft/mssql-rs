@@ -12,7 +12,7 @@ use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::lcid_encoding::lcid_to_encoding;
 use crate::datatypes::sql_json::SqlJson;
 use crate::datatypes::sql_vector::{SqlVector, VectorData};
-use crate::datatypes::sqldatatypes::{TdsDataType, VectorBaseType};
+use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::sqltypes::get_time_length_from_scale;
 use crate::error::Error;
 use crate::io::packet_writer::{PacketWriter, TdsPacketWriter, TdsPacketWriterUnchecked};
@@ -1711,23 +1711,14 @@ impl TdsValueSerializer {
 
         // Values
         match &value.data {
-            VectorData::Float32(vs) => match value.base_type() {
-                VectorBaseType::Float32 => {
-                    for f in vs {
-                        // Write f32 as i32 little-endian (bit-compatible)
-                        writer.write_i32_async((*f).to_bits() as i32).await?;
-                    }
+            VectorData::Float32(vs) => {
+                for f in vs {
+                    // Write f32 as i32 little-endian (bit-compatible)
+                    writer.write_i32_async((*f).to_bits() as i32).await?;
                 }
-                VectorBaseType::Float16 => {
-                    // Narrow to IEEE 754 half-precision (round-to-nearest-even)
-                    for f in vs {
-                        writer
-                            .write_u16_async(half::f16::from_f32(*f).to_bits())
-                            .await?;
-                    }
-                }
-            },
+            }
             VectorData::Float16(vs) => {
+                // Narrow to IEEE 754 half-precision (round-to-nearest-even)
                 for f in vs {
                     writer
                         .write_u16_async(half::f16::from_f32(*f).to_bits())

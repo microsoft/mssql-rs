@@ -76,7 +76,7 @@ pub enum VectorVersion {
     Off,
     /// Support Vector feature version 1 (float32 dimension type)
     V1,
-    /// Support Vector feature version 2 (adds float16 dimension type)
+    /// Support Vector feature version 2 (float16 and float32 dimension types)
     V2,
 }
 

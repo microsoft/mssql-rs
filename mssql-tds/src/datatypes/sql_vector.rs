@@ -8,15 +8,11 @@ use crate::datatypes::sqldatatypes::{
 use crate::error::Error;
 
 /// Enum representing the typed data stored in a SqlVector.
-///
-/// Note: this is the *decoded* representation. The wire-level base type is
-/// preserved on [`SqlVector::base_type`]. For example, a `Float16` vector
-/// arrives over the wire as 16-bit IEEE 754 half-precision values but is
-/// decoded into `Float32` for ergonomic access (JS / Python lack first-class
-/// f16 support). Use [`SqlVector::base_type`] to inspect the original type.
+/// In future, this enum will be extended to support additional base types
+/// such as Float16, Int32, etc.
 #[derive(Debug, PartialEq, Clone)]
 pub enum VectorData {
-    /// Single-precision (32-bit) float vector.
+    /// Single-precision float vector.
     Float32(Vec<f32>),
     /// Half-precision float vector (stored in memory as f32).
     Float16(Vec<f32>),
@@ -53,22 +49,14 @@ impl SqlVector {
         Ok(vector)
     }
 
-    /// Creates a half-precision (float16) SqlVector from f32 values.
-    ///
-    /// Values are kept as f32 in memory and narrowed to IEEE 754 halves
-    /// (round-to-nearest-even) when written to the wire, so a round-trip is
-    /// lossy. Requires the server to have negotiated Vector feature version 2.
+    /// Creates a new SqlVector with the specified values, tagged for Float16 storage.
     ///
     /// # Arguments
-    /// * `values` - The vector dimension values
-    ///
-    /// # Returns
-    /// * `Ok(SqlVector)` if valid
-    /// * `Err` if validation fails (too many dimensions, exceeds size limit)
+    /// * `values` - The vector dimension values (passed as f32, but treated as Float16)
     pub fn try_from_f16(values: Vec<f32>) -> TdsResult<Self> {
         let vector = Self {
             base_type: VectorBaseType::Float16,
-            data: VectorData::Float32(values),
+            data: VectorData::Float16(values),
         };
         vector.validate_dimensions()?;
         Ok(vector)
@@ -109,14 +97,14 @@ impl SqlVector {
                 VectorData::Float32(f32_values)
             }
             VectorBaseType::Float16 => {
-                // Decode 16-bit IEEE 754 halves into f32. Storing as f32 keeps
-                // FFI surfaces (JS / Python) simple since neither has first-class
-                // f16 support.
+                // For Vector V2, SQL Server sends 16-bit Float16 types.
+                // Since JavaScript and Python standard APIs do not commonly support native Float16 memory views,
+                // we decode these half-precision bits (via the `half` crate) into standard f32 memory representations.
                 let f32_values: Vec<f32> = raw_bytes
                     .chunks_exact(2)
                     .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
                     .collect();
-                VectorData::Float32(f32_values)
+                VectorData::Float16(f32_values)
             }
         };
 
@@ -129,9 +117,8 @@ impl SqlVector {
     }
 
     /// Returns a reference to the dimension values as a float slice.
-    ///
-    /// Float16 vectors are decoded to f32 at deserialization time, so this
-    /// always returns `Some` for vectors received from the server.
+    /// Since both Float32 and Float16 are stored natively as f32, this returns `Some` for both.
+    /// Returns `None` if the vector data cannot be represented as an f32 slice.
     pub fn as_f32(&self) -> Option<&[f32]> {
         match &self.data {
             VectorData::Float32(v) => Some(v),
@@ -155,14 +142,13 @@ impl SqlVector {
     }
 
     /// Returns the total size in bytes (header + dimension values) on the wire.
-    /// Used during serialization (Phase 3). Sized by the base type, not the
-    /// decoded storage.
+    /// Used during serialization (Phase 3).
     pub(crate) fn total_size(&self) -> usize {
-        let element_count = match &self.data {
-            VectorData::Float32(v) => v.len(),
-            VectorData::Float16(v) => v.len(),
+        let element_bytes = match &self.data {
+            VectorData::Float32(v) => v.len() * self.base_type.element_size_bytes(),
+            VectorData::Float16(v) => v.len() * self.base_type.element_size_bytes(),
         };
-        VECTOR_HEADER_SIZE + element_count * self.base_type.element_size_bytes()
+        VECTOR_HEADER_SIZE + element_bytes
     }
 
     /// Validates the vector dimensions (count and total size).

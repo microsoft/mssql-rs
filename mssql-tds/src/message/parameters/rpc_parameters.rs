@@ -6,10 +6,11 @@ use bitflags::bitflags;
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_tvp::TvpTypeName;
+use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
     core::TdsResult,
-    datatypes::sqldatatypes::{TdsDataType, VectorBaseType},
+    datatypes::sqldatatypes::TdsDataType,
     error::Error,
     io::packet_writer::{PacketWriter, TdsPacketWriter},
     token::tokens::SqlCollation,
