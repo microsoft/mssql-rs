@@ -511,8 +511,7 @@ impl ClientContext {
                 port: 1433,
                 instance_name: None,
             },
-            // TODO: make V2 as default when full V2 support is added
-            vector_version: VectorVersion::V1,
+            vector_version: VectorVersion::V2,
             column_encryption_setting: ColumnEncryptionSetting::Disabled,
             column_encryption_key_store_providers: std::sync::Arc::new(
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
@@ -574,8 +573,7 @@ impl ClientContext {
                 port: 1433,
                 instance_name: None,
             },
-            // TODO: make V2 as default when full V2 support is added
-            vector_version: VectorVersion::V1,
+            vector_version: VectorVersion::V2,
             column_encryption_setting: ColumnEncryptionSetting::Disabled,
             column_encryption_key_store_providers: std::sync::Arc::new(
                 crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),

@@ -710,8 +710,14 @@ impl BulkCopyColumnMetadata {
             SqlDbType::Variant => "sql_variant".to_string(),
             SqlDbType::Json => "nvarchar(max)".to_string(),
             SqlDbType::Vector => {
+                use crate::datatypes::sqldatatypes::VectorBaseType;
+
                 let dims = self.vector_dimensions()?;
-                format!("vector({})", dims)
+                // `vector(N)` implies the float32 base type; float16 must be spelled out.
+                match VectorBaseType::try_from(self.scale)? {
+                    VectorBaseType::Float32 => format!("vector({})", dims),
+                    VectorBaseType::Float16 => format!("vector({}, float16)", dims),
+                }
             }
         })
     }
@@ -1520,6 +1526,34 @@ mod tests {
             )
             .with_scale(0);
         assert_eq!(meta.get_sql_type_definition().unwrap(), "vector(3)");
+    }
+
+    #[test]
+    fn vector_dimensions_valid_float16() {
+        use crate::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        // Float16 (scale=1), element_size=2, 3 dimensions: header(8) + 3*2 = 14
+        let meta = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(
+                (VECTOR_HEADER_SIZE + 3 * 2) as i32,
+                TypeLength::Variable((VECTOR_HEADER_SIZE + 3 * 2) as i32),
+            )
+            .with_scale(1);
+        assert_eq!(meta.vector_dimensions().unwrap(), 3);
+    }
+
+    #[test]
+    fn vector_sql_type_definition_float16() {
+        use crate::datatypes::sqldatatypes::VECTOR_HEADER_SIZE;
+        let meta = BulkCopyColumnMetadata::new("v", SqlDbType::Vector, 0xF5)
+            .with_length(
+                (VECTOR_HEADER_SIZE + 3 * 2) as i32,
+                TypeLength::Variable((VECTOR_HEADER_SIZE + 3 * 2) as i32),
+            )
+            .with_scale(1);
+        assert_eq!(
+            meta.get_sql_type_definition().unwrap(),
+            "vector(3, float16)"
+        );
     }
 
     #[test]

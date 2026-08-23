@@ -1717,8 +1717,13 @@ impl TdsValueSerializer {
                     writer.write_i32_async((*f).to_bits() as i32).await?;
                 }
             }
-            VectorData::Float16(_) => {
-                todo!("Phase 2: Float16 serialization");
+            VectorData::Float16(vs) => {
+                // Narrow to IEEE 754 half-precision (round-to-nearest-even)
+                for f in vs {
+                    writer
+                        .write_u16_async(half::f16::from_f32(*f).to_bits())
+                        .await?;
+                }
             }
         }
 
@@ -3741,6 +3746,72 @@ mod serializer_tests {
         assert_eq!(&p[0..4], &13u32.to_le_bytes());
         assert_eq!(p[4], 0xE7); // NVARCHAR
         assert_eq!(p[5], 0x07); // prop_len = 7
+    }
+
+    // ── serialize_vector ──
+
+    fn vector_ctx(exact_size: usize) -> TdsTypeContext {
+        let mut ctx = nullable_ctx(crate::datatypes::sqldatatypes::TdsDataType::Vector as u8);
+        ctx.max_size = exact_size;
+        ctx
+    }
+
+    #[test]
+    fn vector_float32_elements() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let vector =
+            crate::datatypes::sql_vector::SqlVector::try_from_f32(vec![1.0, 2.0, 3.0]).unwrap();
+        let ctx = vector_ctx(8 + 3 * 4);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Vector(vector),
+            &ctx,
+        ))
+        .unwrap();
+        let p = payload(&w);
+        assert_eq!(&p[0..2], &20u16.to_le_bytes()); // 8 header + 3 * 4
+        assert_eq!(&p[2..10], &[0xA9, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(&p[10..14], &1.0f32.to_le_bytes());
+        assert_eq!(&p[14..18], &2.0f32.to_le_bytes());
+        assert_eq!(&p[18..22], &3.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn vector_float16_elements() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let vector =
+            crate::datatypes::sql_vector::SqlVector::try_from_f16(vec![1.0, 2.0, 3.0]).unwrap();
+        let ctx = vector_ctx(8 + 3 * 2);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Vector(vector),
+            &ctx,
+        ))
+        .unwrap();
+        let p = payload(&w);
+        assert_eq!(&p[0..2], &14u16.to_le_bytes()); // 8 header + 3 * 2
+        // base type byte is 0x01 (float16)
+        assert_eq!(&p[2..10], &[0xA9, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(&p[10..16], &[0x00, 0x3C, 0x00, 0x40, 0x00, 0x42]);
+    }
+
+    #[test]
+    fn vector_float16_rounds_to_nearest_even() {
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        // 0.1 is not representable in f16; nearest half is 0x2E66.
+        let vector = crate::datatypes::sql_vector::SqlVector::try_from_f16(vec![0.1]).unwrap();
+        let ctx = vector_ctx(8 + 2);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut w,
+            &ColumnValues::Vector(vector),
+            &ctx,
+        ))
+        .unwrap();
+        let p = payload(&w);
+        assert_eq!(&p[10..12], &0x2E66u16.to_le_bytes());
     }
 }
 
