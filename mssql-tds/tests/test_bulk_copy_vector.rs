@@ -751,4 +751,261 @@ mod bulk_copy_vector_tests {
         }
         assert_eq!(row_count, 2, "Expected 2 rows in result set");
     }
+
+    /// Bulk copy float16 values that are not exactly representable as IEEE 754
+    /// halves, verifying the server round-trips the narrowed values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_vector16_precision_loss() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyVector16Precision (id INT NOT NULL, vector_col VECTOR(4, float16))"
+                    .to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let sent = vec![0.1f32, 1.0 / 3.0, -0.1, 65504.0];
+        let expected: Vec<f32> = sent
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let rows = vec![Vector16Row {
+            id: 1,
+            vector_col: Some(sent.clone()),
+        }];
+
+        let result = {
+            let bulk_copy = BulkCopy::new(&mut client, "#BulkCopyVector16Precision");
+            bulk_copy
+                .batch_size(1000)
+                .write_to_server_zerocopy(&rows)
+                .await
+                .expect("Bulk copy failed")
+        };
+        assert_eq!(result.rows_affected, 1, "Expected 1 row to be inserted");
+
+        client
+            .execute(
+                "SELECT vector_col FROM #BulkCopyVector16Precision".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to select data");
+
+        let mut row_count = 0;
+        if let Some(resultset) = client.get_current_resultset() {
+            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+                row_count += 1;
+                if let ColumnValues::Vector(vec) = &row[0] {
+                    assert_eq!(vec.base_type(), VectorBaseType::Float16);
+                    assert_eq!(
+                        vec.as_f32().expect("Expected f32 values"),
+                        expected.as_slice()
+                    );
+                } else {
+                    panic!("Expected Vector, got {:?}", row[0]);
+                }
+            }
+        }
+        assert_eq!(row_count, 1, "Expected 1 row in result set");
+    }
+
+    /// Bulk copy into a table holding both float32 and float16 vector columns,
+    /// exercising per-column base types in the bulk load column metadata.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_mixed_vector_base_types() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyMixedVectorTest (id INT NOT NULL, vec32 VECTOR(3), vec16 VECTOR(3, float16) NULL)"
+                    .to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        #[derive(Debug, Clone)]
+        struct MixedVectorRow {
+            id: i32,
+            vec32: Vec<f32>,
+            vec16: Option<Vec<f32>>,
+        }
+
+        #[async_trait]
+        impl BulkLoadRow for MixedVectorRow {
+            async fn write_to_packet(
+                &self,
+                writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+                column_index: &mut usize,
+            ) -> TdsResult<()> {
+                writer
+                    .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                    .await?;
+                *column_index += 1;
+                writer
+                    .write_column_value(
+                        *column_index,
+                        &ColumnValues::Vector(SqlVector::try_from_f32(self.vec32.clone())?),
+                    )
+                    .await?;
+                *column_index += 1;
+                let vec16_val = if let Some(vec_data) = &self.vec16 {
+                    ColumnValues::Vector(SqlVector::try_from_f16(vec_data.clone())?)
+                } else {
+                    ColumnValues::Null
+                };
+                writer.write_column_value(*column_index, &vec16_val).await?;
+                *column_index += 1;
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl BulkLoadRow for &MixedVectorRow {
+            async fn write_to_packet(
+                &self,
+                writer: &mut mssql_tds::message::bulk_load::StreamingBulkLoadWriter<'_>,
+                column_index: &mut usize,
+            ) -> TdsResult<()> {
+                writer
+                    .write_column_value(*column_index, &ColumnValues::Int(self.id))
+                    .await?;
+                *column_index += 1;
+                writer
+                    .write_column_value(
+                        *column_index,
+                        &ColumnValues::Vector(SqlVector::try_from_f32(self.vec32.clone())?),
+                    )
+                    .await?;
+                *column_index += 1;
+                let vec16_val = if let Some(vec_data) = &self.vec16 {
+                    ColumnValues::Vector(SqlVector::try_from_f16(vec_data.clone())?)
+                } else {
+                    ColumnValues::Null
+                };
+                writer.write_column_value(*column_index, &vec16_val).await?;
+                *column_index += 1;
+                Ok(())
+            }
+        }
+
+        let vec32_row1 = vec![1.5, 2.5, 3.5];
+        let vec16_row1 = vec![4.0, 5.0, 6.0];
+        let vec32_row2 = vec![-1.5, 0.0, 7.25];
+
+        let rows = vec![
+            MixedVectorRow {
+                id: 1,
+                vec32: vec32_row1.clone(),
+                vec16: Some(vec16_row1.clone()),
+            },
+            MixedVectorRow {
+                id: 2,
+                vec32: vec32_row2.clone(),
+                vec16: None,
+            },
+        ];
+
+        let result = {
+            let bulk_copy = BulkCopy::new(&mut client, "#BulkCopyMixedVectorTest");
+            bulk_copy
+                .batch_size(1000)
+                .write_to_server_zerocopy(&rows)
+                .await
+                .expect("Bulk copy failed")
+        };
+        assert_eq!(result.rows_affected, 2, "Expected 2 rows to be inserted");
+
+        client
+            .execute(
+                "SELECT id, vec32, vec16 FROM #BulkCopyMixedVectorTest ORDER BY id".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to select data");
+
+        let mut row_count = 0;
+        if let Some(resultset) = client.get_current_resultset() {
+            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+                row_count += 1;
+                assert_eq!(row[0], ColumnValues::Int(row_count));
+
+                let expected32 = match row_count {
+                    1 => &vec32_row1,
+                    2 => &vec32_row2,
+                    _ => panic!("Unexpected row count: {}", row_count),
+                };
+                if let ColumnValues::Vector(vec) = &row[1] {
+                    assert_eq!(vec.base_type(), VectorBaseType::Float32);
+                    assert_eq!(
+                        vec.as_f32().expect("Expected f32 values"),
+                        expected32.as_slice()
+                    );
+                } else {
+                    panic!("Expected Vector, got {:?}", row[1]);
+                }
+
+                match (row_count, &row[2]) {
+                    (1, ColumnValues::Vector(vec)) => {
+                        assert_eq!(vec.base_type(), VectorBaseType::Float16);
+                        assert_eq!(
+                            vec.as_f32().expect("Expected f32 values"),
+                            vec16_row1.as_slice()
+                        );
+                    }
+                    (2, ColumnValues::Null) => {}
+                    _ => panic!("Unexpected value for row {}: {:?}", row_count, row[2]),
+                }
+            }
+        }
+        assert_eq!(row_count, 2, "Expected 2 rows in result set");
+    }
+
+    /// A float16 vector whose dimension count does not match the target column
+    /// must be rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bulk_copy_vector16_dimension_mismatch() {
+        let mut client = begin_connection(&build_tcp_datasource()).await;
+
+        client
+            .execute(
+                "CREATE TABLE #BulkCopyVector16MismatchTest (id INT NOT NULL, vector_col VECTOR(3, float16))"
+                    .to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        for (id, values) in [(1, vec![1.0, 2.0]), (2, vec![1.0, 2.0, 3.0, 4.0])] {
+            let dims = values.len();
+            let rows = vec![Vector16Row {
+                id,
+                vector_col: Some(values),
+            }];
+
+            let result = {
+                let bulk_copy = BulkCopy::new(&mut client, "#BulkCopyVector16MismatchTest");
+                bulk_copy
+                    .batch_size(1000)
+                    .write_to_server_zerocopy(&rows)
+                    .await
+            };
+
+            assert!(
+                result.is_err(),
+                "Expected bulk copy to fail with dimension mismatch ({} vs 3)",
+                dims
+            );
+        }
+    }
 }
