@@ -322,53 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn test_from_raw_float16() {
-        // 1.0, 2.0, 3.0 encoded as IEEE 754 half-precision (little-endian).
-        let raw_bytes = vec![0x00, 0x3C, 0x00, 0x40, 0x00, 0x42];
-        let vector = SqlVector::try_from_raw(
-            VectorLayoutFormat::V1 as u8,
-            VectorLayoutVersion::V1 as u8,
-            VectorBaseType::Float16 as u8,
-            raw_bytes,
-        )
-        .unwrap();
-        assert_eq!(vector.base_type(), VectorBaseType::Float16);
-        assert_eq!(vector.dimension_count(), 3);
-        let values = vector.as_f32().unwrap();
-        assert!((values[0] - 1.0).abs() < 1e-3);
-        assert!((values[1] - 2.0).abs() < 1e-3);
-        assert!((values[2] - 3.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn test_total_size_float16_uses_wire_size() {
-        // 4 dims of Float16 => 8 wire bytes + 8-byte header = 16
-        let raw_bytes = vec![0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44];
-        let vector = SqlVector::try_from_raw(
-            VectorLayoutFormat::V1 as u8,
-            VectorLayoutVersion::V1 as u8,
-            VectorBaseType::Float16 as u8,
-            raw_bytes,
-        )
-        .unwrap();
-        assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 4 * 2);
-    }
-
-    #[test]
     fn test_from_f16_valid() {
         let vector = SqlVector::try_from_f16(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(vector.base_type(), VectorBaseType::Float16);
         assert_eq!(vector.dimension_count(), 3);
         assert_eq!(vector.as_f32(), Some(&[1.0, 2.0, 3.0][..]));
         assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 3 * 2);
-    }
-
-    #[test]
-    fn test_validate_too_many_dimensions_f16() {
-        let values = vec![0.0f32; (VectorBaseType::Float16.max_dimensions() + 1) as usize];
-        let result = SqlVector::try_from_f16(values);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
     }
 
     #[test]

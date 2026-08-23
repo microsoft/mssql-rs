@@ -590,8 +590,7 @@ mod bulk_copy_vector_tests {
             .execute(
                 "CREATE TABLE #BulkCopyVector16Test (id INT NOT NULL, vector_col VECTOR(3, float16) NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -633,15 +632,14 @@ mod bulk_copy_vector_tests {
         client
             .execute(
                 "SELECT id, vector_col FROM #BulkCopyVector16Test ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 let expected = match row_count {
                     1 => Some(&test_vec1),
@@ -677,8 +675,7 @@ mod bulk_copy_vector_tests {
                     "CREATE TABLE #BulkCopyVector16Large (id INT NOT NULL, embedding VECTOR({}, float16))",
                     dims
                 ),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -711,15 +708,14 @@ mod bulk_copy_vector_tests {
         client
             .execute(
                 "SELECT id, embedding FROM #BulkCopyVector16Large ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 let expected = match row_count {
                     1 => &vec1,
@@ -752,8 +748,7 @@ mod bulk_copy_vector_tests {
             .execute(
                 "CREATE TABLE #BulkCopyVector16Precision (id INT NOT NULL, vector_col VECTOR(4, float16))"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -782,15 +777,14 @@ mod bulk_copy_vector_tests {
         client
             .execute(
                 "SELECT vector_col FROM #BulkCopyVector16Precision".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 if let ColumnValues::Vector(vec) = &row[0] {
                     assert_eq!(vec.base_type(), VectorBaseType::Float16);
@@ -816,8 +810,7 @@ mod bulk_copy_vector_tests {
             .execute(
                 "CREATE TABLE #BulkCopyMixedVectorTest (id INT NOT NULL, vec32 VECTOR(3), vec16 VECTOR(3, float16) NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -917,15 +910,14 @@ mod bulk_copy_vector_tests {
         client
             .execute(
                 "SELECT id, vec32, vec16 FROM #BulkCopyMixedVectorTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 assert_eq!(row[0], ColumnValues::Int(row_count));
 
@@ -970,8 +962,7 @@ mod bulk_copy_vector_tests {
             .execute(
                 "CREATE TABLE #BulkCopyVector16MismatchTest (id INT NOT NULL, vector_col VECTOR(3, float16))"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
