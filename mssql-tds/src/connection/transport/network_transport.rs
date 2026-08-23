@@ -774,6 +774,26 @@ impl NetworkTransport {
             && needed > self.tds_read_buffer.get_remaining_byte_count()
     }
 
+    /// True when a read that is already partway through a value cannot be
+    /// completed, because the message it is being read from has ended.
+    ///
+    /// `consumed_any` reports whether the caller has already copied bytes of
+    /// this value out of the buffer; bytes still sitting in the buffer count
+    /// too. Either way the value has started, so the remainder can only arrive
+    /// in the current message — and that message is over.
+    ///
+    /// A read that begins *exactly* at a boundary is deliberately not caught.
+    /// The transport cannot tell a caller starting the next message apart from
+    /// one over-reading the last, and both handshake and attention paths
+    /// legitimately do the former: the login exchange is multi-leg, and the
+    /// DONE carrying ATTN arrives in a message of its own. Distinguishing them
+    /// needs a layer that knows whether another message is expected, which the
+    /// transport is not. See the note in `refill_for`.
+    fn value_truncated_by_message_end(&self, consumed_any: bool, needed: usize) -> bool {
+        (consumed_any || self.tds_read_buffer.get_remaining_byte_count() > 0)
+            && self.message_cannot_satisfy(needed)
+    }
+
     /// Error for a read that extends past the end of the current message.
     fn past_end_of_message_error(outstanding: usize, available: usize) -> crate::error::Error {
         crate::error::Error::ProtocolError(format!(
@@ -785,18 +805,38 @@ impl NetworkTransport {
     /// Refills the read buffer for a read that still needs `needed` bytes,
     /// failing if the value is truncated by the end of the current message.
     ///
+    /// Every reader loops until the buffer holds enough bytes. Once the
+    /// terminating packet of a message has been framed the server sends nothing
+    /// further until the client issues a new request, so a loop that goes back
+    /// to the socket parks there forever instead of failing.
+    ///
+    /// This is deliberately the same unconditional rule the bulk loops apply:
+    /// the two families must agree on identical input. Sending a request clears
+    /// the boundary (see [`NetworkWriter::send`]), so a reader legitimately
+    /// waiting for the next response is never caught by this.
+    /// Refills the read buffer for a scalar read that still needs `needed`
+    /// bytes, failing if the value is truncated by the end of the message.
+    ///
     /// Every reader loops until the buffer holds enough bytes. When part of a
     /// value sits in the final packet of a message the rest can never arrive —
     /// the server sends nothing further until the client issues a new request —
     /// so the loop would go back to the socket forever instead of failing.
     ///
-    /// A read that starts on an empty buffer is left alone even at
-    /// end-of-message: that is a caller beginning the next response, which the
-    /// transport cannot tell apart from an over-read.
+    /// The bulk loops apply the identical rule through
+    /// [`Self::value_truncated_by_message_end`], so the two families agree on
+    /// every input.
+    ///
+    /// Known gap: a read that begins exactly at a message boundary is still
+    /// allowed through, so it can block if the server has nothing more to send.
+    /// Catching that needs the caller to say whether another message is
+    /// expected — the handshake and attention paths cross boundaries here on
+    /// purpose — which is a layer above this one.
     async fn refill_for(&mut self, needed: usize) -> TdsResult<()> {
-        let available = self.tds_read_buffer.get_remaining_byte_count();
-        if available > 0 && self.message_cannot_satisfy(needed) {
-            return Err(Self::past_end_of_message_error(needed, available));
+        if self.value_truncated_by_message_end(false, needed) {
+            return Err(Self::past_end_of_message_error(
+                needed,
+                self.tds_read_buffer.get_remaining_byte_count(),
+            ));
         }
         self.read_tds_packet().await
     }
@@ -1353,7 +1393,7 @@ impl TdsPacketReader for NetworkTransport {
         let mut length_to_read = buffer.len();
         let mut offset = 0;
         while length_to_read > 0 {
-            if self.message_cannot_satisfy(length_to_read) {
+            if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
                 return Err(Self::past_end_of_message_error(
                     length_to_read,
                     self.tds_read_buffer.get_remaining_byte_count(),
@@ -1374,7 +1414,17 @@ impl TdsPacketReader for NetworkTransport {
             );
 
             if to_read == 0 {
-                return Err(Self::no_progress_error(length_to_read));
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
+                }
+                if total_read > 0 {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                // Nothing of this value has been read yet, so the empty
+                // end-of-message packet belongs to the previous message rather
+                // than truncating this read. Refill and carry on, matching what
+                // the scalar readers do at the same boundary.
+                continue;
             }
 
             // Copy from self.working_buffer to buffer from self.buffer_position to offset.
@@ -1399,7 +1449,7 @@ impl TdsPacketReader for NetworkTransport {
         let mut length_to_read = buffer.len();
         let mut offset = 0;
         while length_to_read > 0 {
-            if self.message_cannot_satisfy(length_to_read) {
+            if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
                 return Err(Self::past_end_of_message_error(
                     length_to_read,
                     self.tds_read_buffer.get_remaining_byte_count(),
@@ -1418,7 +1468,13 @@ impl TdsPacketReader for NetworkTransport {
             );
 
             if to_read == 0 {
-                return Err(Self::no_progress_error(length_to_read));
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
+                }
+                if total_read > 0 {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                continue;
             }
 
             let source = &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
@@ -1499,7 +1555,8 @@ impl TdsPacketReader for NetworkTransport {
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
         let mut length_to_read = skip_count;
         while length_to_read > 0 {
-            if self.message_cannot_satisfy(length_to_read) {
+            let skipped_any = length_to_read < skip_count;
+            if self.value_truncated_by_message_end(skipped_any, length_to_read) {
                 return Err(Self::past_end_of_message_error(
                     length_to_read,
                     self.tds_read_buffer.get_remaining_byte_count(),
@@ -1520,7 +1577,13 @@ impl TdsPacketReader for NetworkTransport {
             );
 
             if to_read == 0 {
-                return Err(Self::no_progress_error(length_to_read));
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
+                }
+                if skipped_any {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                continue;
             }
 
             length_to_read -= to_read;
@@ -3111,6 +3174,10 @@ pub(crate) mod tests {
     /// The same packet *with* EOM set is legal — an empty end-of-message packet
     /// terminates a message — so it is consumed and the reader carries on to
     /// the payload of the next packet.
+    ///
+    /// The bulk loops must reach the same verdict on the same bytes: a read
+    /// that has not yet consumed anything is starting a new message, not
+    /// over-reading the last one.
     #[tokio::test]
     async fn test_payload_free_eom_packet_is_accepted() {
         let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
@@ -3118,8 +3185,18 @@ pub(crate) mod tests {
         stream.extend_from_slice(&next.append_byte(0x7F).build());
 
         let mut reader = create_network_transport_with_data(&stream);
-
         assert_eq!(reader.read_byte().await.unwrap(), 0x7F);
+
+        let mut reader = create_network_transport_with_data(&stream);
+        let mut one = [0u8; 1];
+        assert_eq!(reader.read_bytes(&mut one).await.unwrap(), 1);
+        assert_eq!(one[0], 0x7F, "read_bytes must agree with read_byte");
+
+        let mut reader = create_network_transport_with_data(&stream);
+        reader
+            .skip_bytes(1)
+            .await
+            .expect("skip_bytes must agree with read_byte");
     }
 
     // ---------------------------------------------------------------------
