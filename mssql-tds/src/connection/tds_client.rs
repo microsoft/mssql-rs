@@ -3054,6 +3054,18 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Retires the connection after the reader has lost track of the stream.
+    ///
+    /// Every way a drain can fail — a dead socket, a protocol error, an elapsed
+    /// timeout, a cancellation — stops it before the terminal DONE, so bytes of
+    /// the response are still unread and the next command would decode them as
+    /// tokens. A TDS stream cannot be resynchronized from an unknown offset, so
+    /// the connection must not go back to a pool.
+    fn retire_desynchronized_connection(&mut self) {
+        self.transport.mark_known_dead();
+        self.recovery_context.session_recovery_negotiated = false;
+    }
+
     /// Drains all remaining tokens from the stream until a terminal DONE token.
     /// Collects any ERROR tokens encountered and returns them.
     ///
@@ -3406,7 +3418,12 @@ impl TdsClient {
                     match drain_result {
                         Ok(mut drain_errors) => all_errors.append(&mut drain_errors),
                         Err(e) => {
-                            warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                            warn!(error = ?e, "Drain after statement error failed; retiring the connection");
+                            // The SQL error still surfaces to the caller, but the
+                            // stream is now desynchronized. Without this the error
+                            // returns as `SqlServerError`, which callers treat as a
+                            // healthy connection reporting a failed statement.
+                            self.retire_desynchronized_connection();
                         }
                     }
                     return Err(crate::error::Error::from_sql_errors(all_errors));
@@ -4823,7 +4840,11 @@ impl TdsClient {
                 match drain_result {
                     Ok(drain_errors) => all_errors.extend(drain_errors),
                     Err(e) => {
-                        warn!(error = ?e, "Drain after statement error failed; connection may not be reusable");
+                        warn!(error = ?e, "Drain after statement error failed; retiring the connection");
+                        // Mirrors the ERROR arm in `advance_to_result_boundary`:
+                        // the SQL error still surfaces, but a stream we gave up on
+                        // must not be handed back to a pool as `SqlServerError`.
+                        self.retire_desynchronized_connection();
                     }
                 }
                 Err(crate::error::Error::from_sql_errors(all_errors))
@@ -4991,18 +5012,23 @@ impl TdsClient {
             // from there, so retire the connection rather than let the next
             // command read garbage.
             //
-            // A server-reported error is different: `advance_to_rows` only
-            // surfaces one after reading the terminal DONE, so the stream is
-            // fully drained and still synchronized. Retiring there would poison
-            // a healthy pooled connection every time a batch ends in RAISERROR.
+            // A server-reported error is different: the batch ran and failed,
+            // and the reader is still on a token boundary, so retiring would
+            // poison a healthy pooled connection every time a batch ends in
+            // RAISERROR.
+            //
+            // `SqlServerError` alone does not prove the stream is intact — the
+            // ERROR-token handlers build one even when their own drain fails.
+            // Those arms call `retire_desynchronized_connection` themselves, so
+            // by the time such an error reaches here the transport is already
+            // marked dead and this exemption cannot revive it.
             //
             // The state above is still cleared first: leaving the batch open
             // would mask this error behind `ALREADY_EXECUTING_ERROR` on every
             // later call, which is what made the original failure look like a
             // permanent wedge.
             if !matches!(error, crate::error::Error::SqlServerError { .. }) {
-                self.transport.mark_known_dead();
-                self.recovery_context.session_recovery_negotiated = false;
+                self.retire_desynchronized_connection();
             }
             return Err(error);
         }
@@ -8595,9 +8621,10 @@ mod tests {
     }
 
     /// Control: the drain surfacing a *server-reported* error must not retire
-    /// the connection. `advance_to_rows` only returns `from_sql_errors` after
-    /// reading the terminal DONE, so the stream is fully drained and still
-    /// synchronized — nothing about it is unsafe to reuse.
+    /// the connection. Here the drain reaches the terminal DONE, so the stream
+    /// is fully consumed and still synchronized — nothing about it is unsafe to
+    /// reuse. (The case where the drain itself fails is covered by
+    /// `error_token_with_truncated_remainder_retires_connection`.)
     ///
     /// Without this distinction an ordinary batch like
     /// `SELECT 1; RAISERROR('boom', 16, 1)` where the caller stops early would
@@ -8625,6 +8652,64 @@ mod tests {
             !client.transport.connection_known_dead(),
             "a fully drained stream must stay usable: the error came from the \
              server, not from losing track of the stream"
+        );
+    }
+
+    /// An ERROR token whose *drain* then fails still builds a `SqlServerError`,
+    /// so the error type alone cannot tell a failed batch apart from a lost
+    /// stream. The handler must retire the connection at the point it gives up.
+    #[tokio::test]
+    async fn error_token_with_truncated_remainder_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+        // Stream ends here: that DONE said more was coming, so the drain fails.
+
+        let mut client = client_over_bytes(stream);
+        let err = client
+            .advance_to_result_boundary()
+            .await
+            .expect_err("a statement error must surface as an error");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+
+        assert!(
+            client.transport.connection_known_dead(),
+            "a drain that gave up mid-stream must retire the connection even \
+             though the error it returns is a SqlServerError"
+        );
+        assert!(
+            !client.recovery_context.session_recovery_negotiated,
+            "a desynchronized session must not be silently recovered"
+        );
+    }
+
+    /// End-to-end version of the above through `close_query`, which exempts
+    /// `SqlServerError` from retirement. This pins that the exemption cannot
+    /// resurrect a connection whose stream was already abandoned.
+    #[tokio::test]
+    async fn close_query_sql_error_over_truncated_stream_still_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_MORE_ERROR));
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        let err = client
+            .close_query()
+            .await
+            .expect_err("the server-reported error must still surface");
+
+        let diagnostics = expect_sql_error(err);
+        assert_eq!(diagnostics.errors[0].number, 1222);
+
+        assert!(
+            client.transport.connection_known_dead(),
+            "the SqlServerError exemption must not hand back a connection whose \
+             stream was abandoned mid-response"
         );
     }
 
