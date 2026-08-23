@@ -60,7 +60,7 @@ pub fn create_context() -> ClientContext {
                 .map_err(|_| std::env::VarError::NotPresent)
         })
         .expect("SQL_PASSWORD environment variable not set and /tmp/password could not be read");
-    context.database = "master".to_string();
+    context.database = env::var("DB_DATABASE").unwrap_or_else(|_| "master".to_string());
     context.encryption_options = EncryptionOptions {
         mode: EncryptionSetting::On,
         trust_server_certificate: trust_server_certificate(),
