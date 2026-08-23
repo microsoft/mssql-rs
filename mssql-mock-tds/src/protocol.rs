@@ -33,11 +33,13 @@ pub enum ProtocolError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     SqlBatch = 0x01,
+    FedAuthToken = 0x08,
     PreLogin = 0x12,
     TabularResult = 0x04,
     Attention = 0x06,
     Login7 = 0x10,
     RpcRequest = 0x03,
+    TransactionManager = 0x0E,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -46,11 +48,13 @@ impl TryFrom<u8> for PacketType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x01 => Ok(PacketType::SqlBatch),
+            0x08 => Ok(PacketType::FedAuthToken),
             0x12 => Ok(PacketType::PreLogin),
             0x04 => Ok(PacketType::TabularResult),
             0x06 => Ok(PacketType::Attention),
             0x10 => Ok(PacketType::Login7),
             0x03 => Ok(PacketType::RpcRequest),
+            0x0E => Ok(PacketType::TransactionManager),
             _ => Err(ProtocolError::InvalidPacketType(value)),
         }
     }
@@ -149,6 +153,7 @@ pub enum TokenType {
     Done = 0xFD,
     DoneProc = 0xFE,
     DoneInProc = 0xFF,
+    FedAuthInfo = 0xEE,
     EnvChange = 0xE3,
     LoginAck = 0xAD,
     Error = 0xAA,
@@ -479,6 +484,78 @@ pub fn build_feature_ext_ack_fedauth() -> BytesMut {
     token_data
 }
 
+/// Parse a FedAuthToken packet payload and extract the raw token bytes.
+pub fn parse_fedauth_token(packet_data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if packet_data.len() < 8 {
+        return Err(ProtocolError::Protocol(
+            "FedAuthToken packet too short".to_string(),
+        ));
+    }
+
+    let total_length =
+        u32::from_le_bytes(packet_data[0..4].try_into().expect("slice with known size")) as usize;
+    let token_length =
+        u32::from_le_bytes(packet_data[4..8].try_into().expect("slice with known size")) as usize;
+
+    if total_length + size_of::<u32>() != packet_data.len() {
+        return Err(ProtocolError::Protocol(format!(
+            "FedAuthToken payload length mismatch: declared {total_length}, actual {}",
+            packet_data.len()
+        )));
+    }
+
+    if total_length != token_length + size_of::<u32>() {
+        return Err(ProtocolError::Protocol(format!(
+            "FedAuthToken inner length mismatch: declared {token_length} token bytes inside {total_length} byte payload"
+        )));
+    }
+
+    Ok(packet_data[8..].to_vec())
+}
+
+/// Build a TabularResult packet containing a FedAuth challenge.
+pub fn build_fedauth_challenge_response(sts_url: &str, spn: &str) -> BytesMut {
+    let mut response = build_feature_ext_ack_fedauth();
+    response.extend_from_slice(&build_fedauth_info_token(sts_url, spn));
+    wrap_in_packet(PacketType::TabularResult, response)
+}
+
+fn build_fedauth_info_token(sts_url: &str, spn: &str) -> BytesMut {
+    let options = [(0x01_u8, sts_url), (0x02_u8, spn)];
+    let mut token_data = BytesMut::new();
+    token_data.put_u8(TokenType::FedAuthInfo as u8);
+
+    let option_headers_len = options.len() * 9;
+    let encoded_values: Vec<Vec<u8>> = options
+        .iter()
+        .map(|(_, value)| {
+            value
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect::<Vec<u8>>()
+        })
+        .collect();
+    let string_bytes_len: usize = encoded_values.iter().map(Vec::len).sum();
+    let payload_len = size_of::<u32>() + option_headers_len + string_bytes_len;
+
+    token_data.put_i32_le(payload_len as i32);
+    token_data.put_u32_le(options.len() as u32);
+
+    let mut current_offset = (size_of::<u32>() + option_headers_len) as u32;
+    for ((option_id, _), encoded) in options.iter().zip(encoded_values.iter()) {
+        token_data.put_u8(*option_id);
+        token_data.put_u32_le(encoded.len() as u32);
+        token_data.put_u32_le(current_offset);
+        current_offset += encoded.len() as u32;
+    }
+
+    for encoded in encoded_values {
+        token_data.extend_from_slice(&encoded);
+    }
+
+    token_data
+}
+
 /// Build a LoginAck token response with EnvChange for collation
 pub fn build_login_ack() -> BytesMut {
     let mut token_data = BytesMut::new();
@@ -614,6 +691,85 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data
 }
 
+/// Transaction Manager request types (MS-TDS SQLTransactionManagerRequest).
+pub const TM_BEGIN_XACT: u16 = 5;
+pub const TM_COMMIT_XACT: u16 = 7;
+pub const TM_ROLLBACK_XACT: u16 = 8;
+
+/// Parse the RequestType field from a TransactionManager (0x0E) packet body.
+///
+/// The body begins with an ALL_HEADERS block (a u32 little-endian total length
+/// followed by that many bytes of headers), after which comes the u16
+/// little-endian RequestType. Returns `None` if the body is too short.
+pub fn parse_transaction_manager_request(packet_body: &[u8]) -> Option<u16> {
+    if packet_body.len() < 4 {
+        return None;
+    }
+
+    let all_headers_len = u32::from_le_bytes([
+        packet_body[0],
+        packet_body[1],
+        packet_body[2],
+        packet_body[3],
+    ]) as usize;
+
+    // RequestType is a u16 immediately after the ALL_HEADERS block.
+    if packet_body.len() < all_headers_len + 2 {
+        return None;
+    }
+
+    Some(u16::from_le_bytes([
+        packet_body[all_headers_len],
+        packet_body[all_headers_len + 1],
+    ]))
+}
+
+/// Build the token stream (EnvChange + Done) that answers a TransactionManager
+/// request. Begin/commit/rollback requests get a matching transaction EnvChange
+/// so the client's connection setup can complete; any other request just gets a
+/// Done token. The returned bytes are the raw tokens and still need to be
+/// wrapped in a TabularResult packet by the caller.
+pub fn build_transaction_manager_response(request_type: u16) -> BytesMut {
+    let mut tokens = BytesMut::new();
+
+    // Fixed 8-byte transaction descriptor handed to the client. Any non-zero
+    // value works for the mock; the client only echoes it back in the
+    // ALL_HEADERS of subsequent requests.
+    const XACT_DESCRIPTOR: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0];
+
+    // EnvChange transaction sub-types.
+    let env_type = match request_type {
+        TM_BEGIN_XACT => Some(8u8),     // Begin Transaction
+        TM_COMMIT_XACT => Some(9u8),    // Commit Transaction
+        TM_ROLLBACK_XACT => Some(10u8), // Rollback Transaction
+        _ => None,
+    };
+
+    if let Some(env_type) = env_type {
+        // Build the EnvChange payload first so we can prefix its length.
+        let mut payload = BytesMut::new();
+        payload.put_u8(env_type);
+        if env_type == 8 {
+            // Begin: NewValue = descriptor, OldValue = empty.
+            payload.put_u8(XACT_DESCRIPTOR.len() as u8);
+            payload.put_slice(&XACT_DESCRIPTOR);
+            payload.put_u8(0);
+        } else {
+            // Commit/Rollback: NewValue = empty, OldValue = descriptor.
+            payload.put_u8(0);
+            payload.put_u8(XACT_DESCRIPTOR.len() as u8);
+            payload.put_slice(&XACT_DESCRIPTOR);
+        }
+
+        tokens.put_u8(TokenType::EnvChange as u8);
+        tokens.put_u16_le(payload.len() as u16);
+        tokens.extend_from_slice(&payload);
+    }
+
+    tokens.extend_from_slice(&build_done_token(0));
+    tokens
+}
+
 /// Build an INFO token (0xAB) matching the TDS wire format.
 ///
 /// Wire layout (all integers little-endian):
@@ -662,9 +818,53 @@ pub fn build_info_token(info: &crate::query_response::InfoMessage) -> BytesMut {
     buf
 }
 
+/// Build a raw ERROR token (0xAA) followed by a DONE token carrying the MORE
+/// and ERROR flags. Models a statement-scoped error inside a multi-statement
+/// batch: the batch is not aborted, so the server keeps streaming afterward.
+/// The returned bytes are raw tokens (no packet wrapper).
+pub fn build_leading_error_tokens(error: &crate::query_response::LeadingError) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    buf.put_u8(TokenType::Error as u8);
+    let length_pos = buf.len();
+    buf.put_u16_le(0); // placeholder for token length
+
+    buf.put_u32_le(error.number);
+    buf.put_u8(1); // state
+    buf.put_u8(error.severity);
+
+    let message_utf16: Vec<u16> = error.message.encode_utf16().collect();
+    buf.put_u16_le(message_utf16.len() as u16);
+    for ch in message_utf16 {
+        buf.put_u16_le(ch);
+    }
+
+    buf.put_u8(0); // server name (empty)
+    buf.put_u8(0); // procedure name (empty)
+    buf.put_u32_le(1); // line number
+
+    let token_length = (buf.len() - length_pos - 2) as u16;
+    let mut length_bytes = &mut buf[length_pos..length_pos + 2];
+    length_bytes.put_u16_le(token_length);
+
+    // DONE with DONE_MORE (0x01) | DONE_ERROR (0x02): the batch continues.
+    buf.put_u8(TokenType::Done as u8);
+    buf.put_u16_le(0x0003);
+    buf.put_u16_le(0x00C1); // CurCmd: SELECT
+    buf.put_u64_le(0); // row count
+
+    buf
+}
+
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
     let mut result = BytesMut::new();
+
+    // A statement-scoped error preceding the result set: emit the ERROR token
+    // and its DONE (MORE) before the ColMetadata so the row set still streams.
+    if let Some(leading_error) = &response.leading_error {
+        result.extend_from_slice(&build_leading_error_tokens(leading_error));
+    }
 
     // ColMetadata token (0x81)
     result.put_u8(TokenType::ColMetadata as u8);
@@ -1021,5 +1221,104 @@ mod tests {
 
         let result = parse_login7_auth(&payload);
         assert_eq!(result.user_agent, None);
+    }
+
+    #[test]
+    fn test_parse_transaction_manager_request() {
+        // ALL_HEADERS block: u32 LE length (covers itself), then RequestType u16 LE.
+        let mut body = BytesMut::new();
+        let all_headers_len: u32 = 18;
+        body.put_u32_le(all_headers_len);
+        body.put_slice(&vec![0u8; all_headers_len as usize - 4]);
+        body.put_u16_le(TM_BEGIN_XACT);
+
+        assert_eq!(
+            parse_transaction_manager_request(&body),
+            Some(TM_BEGIN_XACT)
+        );
+    }
+
+    #[test]
+    fn test_parse_transaction_manager_request_too_short() {
+        assert_eq!(parse_transaction_manager_request(&[0u8; 2]), None);
+
+        // Declares a header length but the RequestType is missing.
+        let mut body = BytesMut::new();
+        body.put_u32_le(8);
+        body.put_slice(&[0u8; 4]);
+        assert_eq!(parse_transaction_manager_request(&body), None);
+    }
+
+    #[test]
+    fn test_build_transaction_manager_response_begin() {
+        let tokens = build_transaction_manager_response(TM_BEGIN_XACT);
+
+        // Starts with an EnvChange token whose sub-type is Begin (8).
+        assert_eq!(tokens[0], TokenType::EnvChange as u8);
+        let payload_len = u16::from_le_bytes([tokens[1], tokens[2]]) as usize;
+        assert_eq!(tokens[3], 8);
+
+        // A Done token follows the EnvChange block.
+        let done_start = 3 + payload_len;
+        assert_eq!(tokens[done_start], TokenType::Done as u8);
+    }
+
+    #[test]
+    fn test_build_transaction_manager_response_commit_and_rollback() {
+        for (req, sub_type) in [(TM_COMMIT_XACT, 9u8), (TM_ROLLBACK_XACT, 10u8)] {
+            let tokens = build_transaction_manager_response(req);
+            assert_eq!(tokens[0], TokenType::EnvChange as u8);
+            assert_eq!(tokens[3], sub_type);
+        }
+    }
+
+    #[test]
+    fn test_build_transaction_manager_response_unknown() {
+        // An unrecognized request type yields just a Done token (no EnvChange).
+        let tokens = build_transaction_manager_response(0);
+        assert_eq!(tokens[0], TokenType::Done as u8);
+    }
+
+    #[test]
+    fn test_build_leading_error_tokens_layout() {
+        use crate::query_response::LeadingError;
+        let tokens = build_leading_error_tokens(&LeadingError::new(1222, 16, "lock timeout"));
+
+        // Starts with an ERROR token carrying the supplied error number.
+        assert_eq!(tokens[0], TokenType::Error as u8);
+        let number = u32::from_le_bytes([tokens[3], tokens[4], tokens[5], tokens[6]]);
+        assert_eq!(number, 1222);
+
+        // Ends with a DONE token whose status carries DONE_MORE | DONE_ERROR,
+        // signalling the batch continues after the statement-scoped error.
+        let done_pos = tokens.len() - 13;
+        assert_eq!(tokens[done_pos], TokenType::Done as u8);
+        let status = u16::from_le_bytes([tokens[done_pos + 1], tokens[done_pos + 2]]);
+        assert_eq!(status, 0x0003);
+    }
+
+    #[test]
+    fn test_build_query_result_prepends_leading_error() {
+        use crate::query_response::{
+            ColumnDefinition, ColumnValue, LeadingError, QueryResponse, Row, SqlDataType,
+        };
+        let response = QueryResponse::new(
+            vec![ColumnDefinition::new("id", SqlDataType::Int)],
+            vec![Row::new(vec![ColumnValue::Int(10)])],
+        )
+        .with_leading_error(LeadingError::new(1222, 16, "lock timeout"));
+
+        let with_error = build_query_result(&response);
+        // First token after the packet header is the ERROR token, not ColMetadata.
+        assert_eq!(with_error[PACKET_HEADER_SIZE], TokenType::Error as u8);
+
+        // Without a leading error the same response starts with ColMetadata.
+        let mut plain = response.clone();
+        plain.leading_error = None;
+        let without_error = build_query_result(&plain);
+        assert_eq!(
+            without_error[PACKET_HEADER_SIZE],
+            TokenType::ColMetadata as u8
+        );
     }
 }

@@ -149,12 +149,13 @@ extends:
             # Collect wheels
             $wheelsDir = "$(Build.StagingDirectory)/wheels"
             New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
-            $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse
+            $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse |
+              Where-Object { $_.FullName -match '[\\/]+wheels[\\/][^\\/]+\.whl$' }
             if ($wheels.Count -eq 0) {
               Write-Error "No wheels found to package. Aborting."
               exit 1
             }
-            $wheels | Copy-Item -Destination $wheelsDir
+            $wheels | Copy-Item -Destination $wheelsDir -Force
             Write-Host "Collected $($wheels.Count) wheels"
 
             # Create .nuspec

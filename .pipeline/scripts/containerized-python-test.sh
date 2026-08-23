@@ -7,6 +7,10 @@ update-ca-certificates
 # Source cargo environment
 source ~/.cargo/env
 
+# A fresh ARM64 build container can contain the pinned toolchain metadata
+# without rustc, which maturin needs to detect the host target.
+rustup component add rustc
+
 # Set Python path
 export PATH="/usr/local/bin:$PATH"
 

@@ -7,8 +7,10 @@ mod common;
 mod client_based_iterators {
     use crate::common::{build_tcp_datasource, create_context, init_tracing};
     use futures::lock::Mutex;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
     use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+    use mssql_tds::datatypes::column_values::ColumnValues;
+    use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::datatypes::sqltypes::SqlType;
     use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
     use std::sync::Arc;
@@ -28,14 +30,14 @@ mod client_based_iterators {
             .await?;
         let query = "SELECT TOP(2) * FROM sys.databases; SELECT 1";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -62,14 +64,14 @@ mod client_based_iterators {
             FROM sys.databases 
             ORDER BY name;";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
 
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -91,7 +93,7 @@ mod client_based_iterators {
             .await?;
         let query = "SELECT TOP(2) * FROM sys.databases; SELECT 1";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
 
         if client.next_row().await?.is_some() {
@@ -104,12 +106,12 @@ mod client_based_iterators {
             "Expected 1 row from the incomplete result set execution"
         );
         let mut row_count = 0;
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -134,17 +136,17 @@ mod client_based_iterators {
             .await?;
         let query = "bad bad query";
 
-        let err = client.execute(query.to_string(), None, None).await;
+        let err = client.execute(query.to_string(), ()).await;
         assert!(err.is_err(), "Expected error for bad query");
 
         let query = "SELECT TOP(2) * FROM sys.databases; SELECT 1";
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
         let mut row_count = 0;
         loop {
             while client.next_row().await?.is_some() {
                 row_count += 1;
             }
-            if !client.move_to_next().await? {
+            if !client.advance_to_rows().await? {
                 break;
             }
         }
@@ -167,12 +169,10 @@ mod client_based_iterators {
         let create_database_query = "IF DB_ID('TestDB') IS NULL CREATE DATABASE TestDB";
 
         client
-            .execute(create_database_query.to_string(), None, None)
+            .execute(create_database_query.to_string(), ())
             .await?;
         let use_database_query = "USE TestDB";
-        client
-            .execute(use_database_query.to_string(), None, None)
-            .await?;
+        client.execute(use_database_query.to_string(), ()).await?;
 
         Ok(())
     }
@@ -199,7 +199,7 @@ mod client_based_iterators {
         client
             .lock()
             .await
-            .execute(create_proc.to_string(), None, None)
+            .execute(create_proc.to_string(), ())
             .await?;
         client.lock().await.close_query().await?;
 
@@ -219,27 +219,28 @@ mod client_based_iterators {
         client
             .lock()
             .await
-            .execute_stored_procedure(proc_name, None, Some(named_parameters), None, None)
+            .execute_stored_procedure(proc_name, None, Some(named_parameters), ())
             .await?;
         let mut binding = client.lock().await;
-        let result_set = binding.get_current_resultset();
-        if let Some(result_set) = result_set {
-            let _ = result_set.get_metadata();
+        assert!(
+            binding.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            let _ = binding.get_metadata();
             let mut row_count = 0;
 
-            while (result_set.next_row().await?).is_some() {
+            while (binding.next_row().await?).is_some() {
                 row_count += 1;
             }
             assert_eq!(
                 row_count, 1,
                 "Expected 1 row from the stored procedure execution with output parameter"
             );
-        } else {
-            panic!("Expected a result set from stored procedure execution, but got None");
         }
 
         // Move once more till we read the return values.
-        while binding.move_to_next().await? {
+        while binding.advance_to_rows().await? {
             // Continue to next result set if available
         }
 
@@ -270,13 +271,11 @@ mod client_based_iterators {
                 CAST('2024-03-15 14:30:45.1234567 +05:30' AS DATETIMEOFFSET(7)) AS datetimeoffset_col
         "#;
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         // Get metadata and verify it was parsed correctly
-        let resultset = client
-            .get_current_resultset()
-            .expect("Expected a resultset");
-        let metadata = resultset.get_metadata();
+        assert!(client.on_rows(), "Expected a resultset");
+        let metadata = client.get_metadata();
 
         // Verify we have 6 columns
         assert_eq!(metadata.len(), 6, "Expected 6 date/time columns");
@@ -334,7 +333,7 @@ mod client_based_iterators {
         );
 
         // Also verify we can read the actual values
-        let row = resultset.next_row().await?.expect("Expected a row");
+        let row = client.next_row().await?.expect("Expected a row");
 
         // Just verify we got values of the right types
         match &row[0] {
@@ -398,7 +397,7 @@ mod client_based_iterators {
                             REPLICATE('Y', 5000) AS AnotherLargeColumn,
                             1 AS SmallColumn";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         let mut row_count = 0;
         while let Some(row) = client.next_row().await? {
@@ -447,7 +446,7 @@ mod client_based_iterators {
 
         // First query: large data
         let query1 = "SELECT REPLICATE('A', 6000) AS Col1";
-        client.execute(query1.to_string(), None, None).await?;
+        client.execute(query1.to_string(), ()).await?;
 
         let mut count = 0;
         while let Some(row) = client.next_row().await? {
@@ -464,7 +463,7 @@ mod client_based_iterators {
 
         // Second query: even larger data
         let query2 = "SELECT REPLICATE('B', 7000) AS Col1, REPLICATE('C', 7000) AS Col2";
-        client.execute(query2.to_string(), None, None).await?;
+        client.execute(query2.to_string(), ()).await?;
 
         count = 0;
         while let Some(row) = client.next_row().await? {
@@ -487,7 +486,7 @@ mod client_based_iterators {
 
         // Third query: small data (verifies buffer works correctly after large data)
         let query3 = "SELECT 42 AS SmallValue";
-        client.execute(query3.to_string(), None, None).await?;
+        client.execute(query3.to_string(), ()).await?;
 
         count = 0;
         while let Some(row) = client.next_row().await? {
@@ -525,7 +524,7 @@ mod client_based_iterators {
         //   ERROR("First error") → DONE(ERROR,MORE) → ERROR("Second error") → DONE(ERROR)
         let query = "RAISERROR('First error', 16, 1); RAISERROR('Second error', 16, 1)";
 
-        let result = client.execute(query.to_string(), None, None).await;
+        let result = client.execute(query.to_string(), ()).await;
         assert!(
             result.is_err(),
             "Expected error from batch with multiple RAISERRORs"
@@ -542,7 +541,8 @@ mod client_based_iterators {
         );
 
         // Verify multiple errors are collected in the error variant
-        if let mssql_tds::error::Error::SqlServerError { errors } = &err {
+        if let mssql_tds::error::Error::SqlServerError { diagnostics } = &err {
+            let errors = &diagnostics.errors;
             assert_eq!(
                 errors.len(),
                 2,
@@ -556,7 +556,7 @@ mod client_based_iterators {
         }
 
         // Connection must remain usable after multiple errors
-        client.execute("SELECT 1".to_string(), None, None).await?;
+        client.execute("SELECT 1".to_string(), ()).await?;
         let mut row_count = 0;
         while client.next_row().await?.is_some() {
             row_count += 1;
@@ -583,7 +583,7 @@ mod client_based_iterators {
 
         let query = "SELECT * FROM nonexistent_table_abc_1; SELECT * FROM nonexistent_table_abc_2";
 
-        let result = client.execute(query.to_string(), None, None).await;
+        let result = client.execute(query.to_string(), ()).await;
         assert!(
             result.is_err(),
             "Expected error from referencing nonexistent tables"
@@ -591,7 +591,8 @@ mod client_based_iterators {
 
         // SQL Server may abort batch after first object-resolution failure,
         // so we may get 1 or 2 errors depending on server behavior.
-        if let mssql_tds::error::Error::SqlServerError { errors } = result.unwrap_err() {
+        if let mssql_tds::error::Error::SqlServerError { diagnostics } = result.unwrap_err() {
+            let errors = &diagnostics.errors;
             assert!(!errors.is_empty(), "Expected at least one error");
             assert!(
                 errors[0].message.contains("nonexistent_table_abc_1"),
@@ -603,9 +604,7 @@ mod client_based_iterators {
         }
 
         // Connection must remain usable
-        client
-            .execute("SELECT 42 AS val".to_string(), None, None)
-            .await?;
+        client.execute("SELECT 42 AS val".to_string(), ()).await?;
         let mut row_count = 0;
         while let Some(row) = client.next_row().await? {
             row_count += 1;
@@ -641,7 +640,7 @@ mod client_based_iterators {
         // second statement fails with an error
         let query = "SELECT 1; RAISERROR('Batch error after success', 16, 1)";
 
-        client.execute(query.to_string(), None, None).await?;
+        client.execute(query.to_string(), ()).await?;
 
         // Consume the first result set
         let mut row_count = 0;
@@ -651,16 +650,14 @@ mod client_based_iterators {
         assert_eq!(row_count, 1, "Expected 1 row from SELECT 1");
 
         // Advancing to the next result should hit the error
-        let next_result = client.move_to_next().await;
+        let next_result = client.advance_to_rows().await;
         assert!(
             next_result.is_err(),
             "Expected error from RAISERROR after SELECT"
         );
 
         // Connection must remain usable
-        client
-            .execute("SELECT 99 AS val".to_string(), None, None)
-            .await?;
+        client.execute("SELECT 99 AS val".to_string(), ()).await?;
         let mut row_count2 = 0;
         while client.next_row().await?.is_some() {
             row_count2 += 1;
@@ -701,9 +698,13 @@ mod client_based_iterators {
             CAST(NEWID() AS UNIQUEIDENTIFIER) AS uid"
             .to_string();
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        assert!(
+            client.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 15);
 
             use mssql_tds::datatypes::column_values::ColumnValues;
@@ -754,10 +755,14 @@ mod client_based_iterators {
             CAST(N'fixed' AS NCHAR(10)) AS nc"
             .to_string();
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let meta = resultset.get_metadata().clone();
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        assert!(
+            client.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            let meta = client.get_metadata().clone();
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 4);
             for col in &row {
                 assert!(matches!(
@@ -794,9 +799,13 @@ mod client_based_iterators {
             CAST(0.000001 AS DECIMAL(38,6)) AS d2"
             .to_string();
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        assert!(
+            client.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 3);
             for col in &row {
                 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -828,9 +837,13 @@ mod client_based_iterators {
             CAST('<r>1</r>' AS XML) AS x"
         );
 
-        client.execute(query, None, None).await?;
-        if let Some(resultset) = client.get_current_resultset() {
-            let row = resultset.next_row().await?.expect("expected a row");
+        client.execute(query, ()).await?;
+        assert!(
+            client.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            let row = client.next_row().await?.expect("expected a row");
             assert_eq!(row.len(), 4);
             use mssql_tds::datatypes::column_values::ColumnValues;
             match &row[0] {
@@ -844,6 +857,586 @@ mod client_based_iterators {
             assert!(matches!(row[2], ColumnValues::Bytes(_)));
             assert!(matches!(row[3], ColumnValues::Xml(_)));
         }
+        client.close_query().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_two_rows_column_2_then_4_non_plp_then_plp() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT
+                CAST(1 AS INT) AS c1,
+                CAST(N'row1-c2' AS NVARCHAR(100)) AS c2,
+                CAST(3 AS INT) AS c3,
+                CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c4,
+                CAST(5 AS INT) AS c5
+            UNION ALL
+            SELECT
+                CAST(11 AS INT) AS c1,
+                CAST(N'row2-c2' AS NVARCHAR(100)) AS c2,
+                CAST(13 AS INT) AS c3,
+                CAST(REPLICATE(CAST('B' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c4,
+                CAST(15 AS INT) AS c5
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+
+        assert!(
+            client.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            // Row 1: position, then pull c2 (0-based 1) and c4 (0-based 3, PLP).
+            assert!(client.next_row_cursor().await?);
+            let c2 = client.read_row_column(1).await?;
+            assert!(matches!(
+                &c2,
+                CursorColumn::Value { value: ColumnValues::String(s), .. } if s.to_utf8_string() == "row1-c2"
+            ));
+            assert!(matches!(
+                client.read_row_column(3).await?,
+                CursorColumn::PlpStreaming { collation: None }
+            ));
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c4 = Vec::new();
+            loop {
+                let chunk = client.read_active_plp_chunk(&mut buf).await?;
+                first_row_c4.extend_from_slice(&buf[..chunk.read]);
+                if chunk.reached_end {
+                    break;
+                }
+                assert!(
+                    chunk.read > 0,
+                    "Expected progress while draining first-row c4"
+                );
+            }
+            assert_eq!(first_row_c4.len(), 9000);
+            assert!(first_row_c4.iter().all(|b| *b == b'A'));
+
+            // Row 2: advancing drains row1's remaining columns automatically.
+            assert!(client.next_row_cursor().await?);
+            let c2b = client.read_row_column(1).await?;
+            assert!(matches!(
+                &c2b,
+                CursorColumn::Value { value: ColumnValues::String(s), .. } if s.to_utf8_string() == "row2-c2"
+            ));
+            assert!(matches!(
+                client.read_row_column(3).await?,
+                CursorColumn::PlpStreaming { collation: None }
+            ));
+
+            let mut second_row_c4 = Vec::new();
+            loop {
+                let chunk = client.read_active_plp_chunk(&mut buf).await?;
+                second_row_c4.extend_from_slice(&buf[..chunk.read]);
+                if chunk.reached_end {
+                    break;
+                }
+                assert!(
+                    chunk.read > 0,
+                    "Expected progress while draining second-row c4"
+                );
+            }
+            assert_eq!(second_row_c4.len(), 9000);
+            assert!(second_row_c4.iter().all(|b| *b == b'B'));
+
+            // No third row: advancing drains row2's tail and reaches end-of-set.
+            assert!(!client.next_row_cursor().await?);
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    /// A `sql_variant` value's declared base type is only on the wire — `varchar`
+    /// and `nvarchar` both decode to `ColumnValues::String`, so the value alone
+    /// cannot distinguish them. The variant is the *second* column so a base type
+    /// captured for it cannot be mistaken for column 0's, and the rows differ so
+    /// the base is proven to be re-read per row rather than latched.
+    #[tokio::test]
+    async fn read_row_column_reports_the_variant_base_type() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT CAST(1 AS INT) AS c1, CAST(CAST('abc' AS VARCHAR(10)) AS SQL_VARIANT) AS c2
+            UNION ALL
+            SELECT CAST(2 AS INT), CAST(CAST(N'xyz' AS NVARCHAR(10)) AS SQL_VARIANT)
+            UNION ALL
+            SELECT CAST(3 AS INT), CAST(NULL AS SQL_VARIANT)
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+        assert!(client.on_rows());
+
+        // Row 1: varchar under the variant.
+        assert!(client.next_row_cursor().await?);
+        assert_eq!(
+            client.read_row_column(0).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Int(1),
+                variant_base: None
+            },
+            "a non-variant column has no base type"
+        );
+        match client.read_row_column(1).await? {
+            CursorColumn::Value {
+                value: ColumnValues::String(s),
+                variant_base,
+            } => {
+                assert_eq!(s.to_utf8_string(), "abc");
+                assert_eq!(variant_base, Some(TdsDataType::BigVarChar));
+            }
+            other => panic!("expected a varchar variant, got {other:?}"),
+        }
+
+        // Row 2: nvarchar decodes to the same ColumnValues shape as row 1, so
+        // only the base type tells them apart.
+        assert!(client.next_row_cursor().await?);
+        assert_eq!(
+            client.read_row_column(0).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Int(2),
+                variant_base: None
+            }
+        );
+        match client.read_row_column(1).await? {
+            CursorColumn::Value {
+                value: ColumnValues::String(s),
+                variant_base,
+            } => {
+                assert_eq!(s.to_utf8_string(), "xyz");
+                assert_eq!(variant_base, Some(TdsDataType::NVarChar));
+            }
+            other => panic!("expected an nvarchar variant, got {other:?}"),
+        }
+
+        // Row 3: a NULL variant carries no base type, and must not report the
+        // previous row's.
+        assert!(client.next_row_cursor().await?);
+        assert_eq!(
+            client.read_row_column(1).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Null,
+                variant_base: None
+            },
+            "a NULL variant has no base type to report"
+        );
+
+        assert!(!client.next_row_cursor().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sparse_two_rows_nbcrow_column_1_then_2_plp_pause_and_resume()
+    -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        // Nullable c1 forces NBCROW token emission; c2 is PLP payload.
+        let query = "
+            SELECT
+                CAST(NULL AS INT) AS c1,
+                CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c2,
+                CAST(103 AS INT) AS c3
+            UNION ALL
+            SELECT
+                CAST(NULL AS INT) AS c1,
+                CAST(REPLICATE(CAST('B' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)) AS c2,
+                CAST(203 AS INT) AS c3
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+
+        assert!(
+            client.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            // Row 1: c1 (0-based 0) is NULL (NBCROW), c2 (0-based 1) is PLP.
+            assert!(client.next_row_cursor().await?);
+            assert_eq!(
+                client.read_row_column(0).await?,
+                CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None
+                }
+            );
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming { collation: None }
+            ));
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c2 = Vec::new();
+            loop {
+                let chunk = client.read_active_plp_chunk(&mut buf).await?;
+                first_row_c2.extend_from_slice(&buf[..chunk.read]);
+                if chunk.reached_end {
+                    break;
+                }
+                assert!(
+                    chunk.read > 0,
+                    "Expected progress while draining first-row c2"
+                );
+            }
+            assert_eq!(first_row_c2.len(), 9000);
+            assert!(first_row_c2.iter().all(|b| *b == b'A'));
+
+            // Row 2.
+            assert!(client.next_row_cursor().await?);
+            assert_eq!(
+                client.read_row_column(0).await?,
+                CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None
+                }
+            );
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming { collation: None }
+            ));
+
+            let mut second_row_c2 = Vec::new();
+            loop {
+                let chunk = client.read_active_plp_chunk(&mut buf).await?;
+                second_row_c2.extend_from_slice(&buf[..chunk.read]);
+                if chunk.reached_end {
+                    break;
+                }
+                assert!(
+                    chunk.read > 0,
+                    "Expected progress while draining second-row c2"
+                );
+            }
+            assert_eq!(second_row_c2.len(), 9000);
+            assert!(second_row_c2.iter().all(|b| *b == b'B'));
+
+            assert!(!client.next_row_cursor().await?);
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sparse_two_rows_column_2_then_4_plp_then_non_plp() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let query = "
+            SELECT
+                CAST(21 AS INT) AS c1,
+                CAST(REPLICATE(CAST(N'X' AS NVARCHAR(MAX)), 9000) AS NVARCHAR(MAX)) AS c2,
+                CAST(23 AS INT) AS c3,
+                CAST(24 AS INT) AS c4,
+                CAST(25 AS INT) AS c5
+            UNION ALL
+            SELECT
+                CAST(31 AS INT) AS c1,
+                CAST(REPLICATE(CAST(N'Y' AS NVARCHAR(MAX)), 9000) AS NVARCHAR(MAX)) AS c2,
+                CAST(33 AS INT) AS c3,
+                CAST(34 AS INT) AS c4,
+                CAST(35 AS INT) AS c5
+        "
+        .to_string();
+        client.execute(query, ()).await?;
+
+        assert!(
+            client.on_rows(),
+            "expected the result set to be positioned on rows"
+        );
+        {
+            // Row 1: c2 (0-based 1) is PLP nvarchar(max), then c4 (0-based 3) INT.
+            assert!(client.next_row_cursor().await?);
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming { collation: Some(_) }
+            ));
+
+            let mut buf = [0u8; 2048];
+            let mut first_row_c2 = Vec::new();
+            loop {
+                let chunk = client.read_active_plp_chunk(&mut buf).await?;
+                first_row_c2.extend_from_slice(&buf[..chunk.read]);
+                if chunk.reached_end {
+                    break;
+                }
+                assert!(
+                    chunk.read > 0,
+                    "Expected progress while draining first-row c2"
+                );
+            }
+            assert_eq!(first_row_c2.len(), 18_000);
+            assert!(first_row_c2.chunks_exact(2).all(|c| c == [b'X', 0]));
+
+            let c4 = client.read_row_column(3).await?;
+            assert_eq!(
+                c4,
+                CursorColumn::Value {
+                    value: ColumnValues::Int(24),
+                    variant_base: None
+                }
+            );
+
+            // Row 2.
+            assert!(client.next_row_cursor().await?);
+            assert!(matches!(
+                client.read_row_column(1).await?,
+                CursorColumn::PlpStreaming { collation: Some(_) }
+            ));
+
+            let mut second_row_c2 = Vec::new();
+            loop {
+                let chunk = client.read_active_plp_chunk(&mut buf).await?;
+                second_row_c2.extend_from_slice(&buf[..chunk.read]);
+                if chunk.reached_end {
+                    break;
+                }
+                assert!(
+                    chunk.read > 0,
+                    "Expected progress while draining second-row c2"
+                );
+            }
+            assert_eq!(second_row_c2.len(), 18_000);
+            assert!(second_row_c2.chunks_exact(2).all(|c| c == [b'Y', 0]));
+
+            let c4b = client.read_row_column(3).await?;
+            assert_eq!(
+                c4b,
+                CursorColumn::Value {
+                    value: ColumnValues::Int(34),
+                    variant_base: None
+                }
+            );
+
+            assert!(!client.next_row_cursor().await?);
+        }
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    // Positions on each row without pulling any column, so advancing drains the
+    // whole row through `DiscardRowWriter`. The drain path decodes every
+    // non-PLP column into the discard sink, exercising its `write_*` methods
+    // across a broad spread of fixed- and variable-length types.
+    #[tokio::test]
+    async fn drain_row_with_diverse_types_via_discard_writer() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        let row = "
+            SELECT
+                CAST(NULL AS INT)                         AS c_null,
+                CAST(1 AS BIT)                            AS c_bit,
+                CAST(2 AS TINYINT)                        AS c_tinyint,
+                CAST(3 AS SMALLINT)                       AS c_smallint,
+                CAST(4 AS INT)                            AS c_int,
+                CAST(5 AS BIGINT)                         AS c_bigint,
+                CAST(1.5 AS REAL)                         AS c_real,
+                CAST(2.5 AS FLOAT)                        AS c_float,
+                CAST(N'txt' AS NVARCHAR(50))              AS c_nvarchar,
+                CAST(0x0102 AS VARBINARY(50))             AS c_varbinary,
+                CAST(12.34 AS DECIMAL(10,2))              AS c_decimal,
+                CAST(56.78 AS NUMERIC(18,4))              AS c_numeric,
+                CAST('2020-01-02' AS DATE)                AS c_date,
+                CAST('12:34:56' AS TIME)                  AS c_time,
+                CAST('2020-01-02 12:34:56' AS DATETIME)   AS c_datetime,
+                CAST('2020-01-02 12:34' AS SMALLDATETIME) AS c_smalldatetime,
+                CAST('2020-01-02 12:34:56.123' AS DATETIME2)       AS c_datetime2,
+                CAST('2020-01-02 12:34:56 +05:30' AS DATETIMEOFFSET) AS c_dto,
+                CAST(123.45 AS MONEY)                     AS c_money,
+                CAST(6.78 AS SMALLMONEY)                  AS c_smallmoney,
+                CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS UNIQUEIDENTIFIER) AS c_uuid";
+        let query = format!("{row} UNION ALL {row}");
+        client.execute(query, ()).await?;
+
+        assert!(client.on_rows(), "Expected a resultset");
+        // Position both rows and advance without pulling any column, forcing
+        // each row's columns to drain through the discard sink.
+        assert!(client.next_row_cursor().await?);
+        assert!(client.next_row_cursor().await?);
+        assert!(!client.next_row_cursor().await?);
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    // Pulling a column index at or beyond the row's column count must be
+    // rejected without consuming the row, and the cursor must stay usable so a
+    // subsequent in-range pull still succeeds.
+    #[tokio::test]
+    async fn read_row_column_out_of_range_is_rejected() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "SELECT CAST(10 AS INT) AS c1, CAST(20 AS INT) AS c2".to_string(),
+                (),
+            )
+            .await?;
+
+        assert!(client.on_rows(), "Expected a resultset");
+        assert!(client.next_row_cursor().await?);
+
+        // Two columns (0, 1); index 2 is out of range.
+        assert!(
+            client.read_row_column(2).await.is_err(),
+            "Out-of-range column pull should error"
+        );
+
+        // Cursor re-parked: a valid pull still returns the column value.
+        assert_eq!(
+            client.read_row_column(0).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Int(10),
+                variant_base: None
+            }
+        );
+
+        assert!(!client.next_row_cursor().await?);
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    // Pulling a column that precedes the cursor's current position is a
+    // forward-only violation: its bytes are already gone, so the pull reports
+    // AlreadyConsumed and leaves the cursor where it is for a later valid pull.
+    #[tokio::test]
+    async fn read_row_column_backward_reports_already_consumed() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "SELECT CAST(10 AS INT) AS c1, CAST(20 AS INT) AS c2, CAST(30 AS INT) AS c3"
+                    .to_string(),
+                (),
+            )
+            .await?;
+
+        assert!(client.on_rows(), "Expected a resultset");
+        assert!(client.next_row_cursor().await?);
+
+        // Pull the middle column c2 (0-based 1); the cursor pauses at c3, so
+        // the row stays paused (not fully consumed).
+        assert_eq!(
+            client.read_row_column(1).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None
+            }
+        );
+
+        // c1 (0-based 0) is now behind the cursor: forward-only violation.
+        assert_eq!(
+            client.read_row_column(0).await?,
+            CursorColumn::AlreadyConsumed
+        );
+
+        assert!(!client.next_row_cursor().await?);
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    // Reading a row's *last* column advances the cursor to idle: the row is no
+    // longer positioned, so a subsequent out-of-range or backward pull reports
+    // `RowEnded` rather than erroring or reporting `AlreadyConsumed`. The ODBC
+    // layer, which needs to reject a rewind past the last column, tracks the
+    // last-read column itself instead of relying on this tds-level distinction.
+    #[tokio::test]
+    async fn read_row_column_after_last_column_reports_row_ended() -> mssql_tds::core::TdsResult<()>
+    {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute(
+                "SELECT CAST(10 AS INT) AS c1, CAST(20 AS INT) AS c2".to_string(),
+                (),
+            )
+            .await?;
+
+        assert!(client.on_rows(), "Expected a resultset");
+        assert!(client.next_row_cursor().await?);
+
+        // Read the last column (0-based 1); the cursor advances to idle.
+        assert_eq!(
+            client.read_row_column(1).await?,
+            CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None
+            }
+        );
+
+        // Out-of-range and backward pulls both collapse to RowEnded once idle.
+        assert_eq!(client.read_row_column(2).await?, CursorColumn::RowEnded);
+        assert_eq!(client.read_row_column(0).await?, CursorColumn::RowEnded);
+
+        // No further row is positioned.
+        assert!(!client.next_row_cursor().await?);
+
+        client.close_query().await?;
+        Ok(())
+    }
+
+    /// Pins the `Idle` arm of `read_row_column`: once the result set is drained
+    /// (no row positioned), every pull — in range, out of range, or backward —
+    /// reports `RowEnded`.
+    #[tokio::test]
+    async fn read_row_column_when_idle_reports_row_ended() -> mssql_tds::core::TdsResult<()> {
+        let context = create_context();
+        let provider = TdsConnectionProvider {};
+        let mut client = provider
+            .create_client(context, &build_tcp_datasource(), None)
+            .await?;
+
+        client
+            .execute("SELECT CAST(10 AS INT) AS c1".to_string(), ())
+            .await?;
+
+        assert!(client.on_rows(), "Expected a resultset");
+        // Drain the single-row result set without ever pulling a column, so the
+        // state machine lands in `Idle`.
+        assert!(client.next_row_cursor().await?);
+        assert!(!client.next_row_cursor().await?);
+
+        // In-range, out-of-range and backward pulls all collapse to `RowEnded`
+        // once idle — no error, no `AlreadyConsumed`.
+        assert_eq!(client.read_row_column(0).await?, CursorColumn::RowEnded);
+        assert_eq!(client.read_row_column(5).await?, CursorColumn::RowEnded);
+
         client.close_query().await?;
         Ok(())
     }

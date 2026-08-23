@@ -2,14 +2,16 @@
 // Licensed under the MIT License.
 
 use crate::connection::client_context::{
-    ClientContext, TdsAuthenticationMethod, TransportContext, VectorVersion,
+    ClientContext, ColumnEncryptionSetting, TdsAuthenticationMethod, TransportContext,
+    VectorVersion,
 };
 use crate::message::features::jsonfeature::JsonFeature;
 use crate::message::login_options::{
     OptionFlags1, OptionFlags2, OptionFlags3, OptionsValue, TdsVersion, TypeFlags,
 };
-use crate::message::messages::{PacketType, Request, TdsError};
+use crate::message::messages::{PacketType, Request};
 
+use crate::error::{SqlErrorInfo, SqlInfoMessage};
 use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
 use crate::token::fed_auth_info::{FedAuthInfoToken, SspiToken};
 use crate::token::login_ack::LoginAckToken;
@@ -21,6 +23,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use super::features::always_encrypted::AlwaysEncryptedFeature;
 use super::features::fedauth::FedAuthFeature;
 use super::features::session_recovery::SessionRecoveryFeature;
 use super::features::useragent::UserAgentFeature;
@@ -114,6 +117,12 @@ pub(crate) trait Feature: Send + Sync + Debug {
     async fn serialize(&self, packet_writer: &mut PacketWriter) -> TdsResult<()>;
     fn deserialize(&mut self, data: &[u8]) -> TdsResult<()>;
 
+    /// Raw FEATUREEXTACK initial session-state payload, if this feature carries
+    /// one. Only SessionRecovery does; it must be echoed in the reconnect LOGIN7.
+    fn session_recovery_initial_state(&self) -> Option<&[u8]> {
+        None
+    }
+
     #[allow(dead_code)]
     // This method is not used currently, and exists for completeness.
     fn is_acknowledged(&self) -> bool;
@@ -147,6 +156,7 @@ impl FeaturesRequest {
         access_token: Option<String>,
         prelogin_fedauth_response: bool,
         vector_version: VectorVersion,
+        column_encryption_setting: ColumnEncryptionSetting,
         user_agent_feature: UserAgentFeature,
     ) -> Self {
         let mut features: HashMap<FeatureExtension, Box<dyn Feature>> = HashMap::new();
@@ -160,6 +170,13 @@ impl FeaturesRequest {
         features.insert(FeatureExtension::UserAgent, Box::new(user_agent_feature));
         if let Some(vector_feature) = Option::<VectorFeature>::from(vector_version) {
             features.insert(FeatureExtension::Vector, Box::new(vector_feature));
+        }
+
+        if column_encryption_setting == ColumnEncryptionSetting::Enabled {
+            features.insert(
+                FeatureExtension::AlwaysEncrypted,
+                Box::new(AlwaysEncryptedFeature::default()),
+            );
         }
 
         if authentication_options != TdsAuthenticationMethod::SSPI
@@ -253,6 +270,22 @@ impl FeaturesRequest {
 
 use crate::connection::session_recovery::SessionRecoveryData;
 
+/// Emits a warning when Always Encrypted is enabled on the connection but no
+/// column master key store providers are registered. Without a provider, every
+/// encrypt/decrypt later fails with a `ColumnEncryptionError`; warning here turns
+/// that confusing first-query failure into an actionable connection-setup hint.
+fn warn_if_always_encrypted_has_no_providers(context: &ClientContext) {
+    if context.column_encryption_setting == ColumnEncryptionSetting::Enabled
+        && context.column_encryption_key_store_providers.is_empty()
+    {
+        tracing::warn!(
+            "Always Encrypted is enabled on this connection but no column master key store \
+             providers are registered; encrypted columns and parameters cannot resolve their \
+             keys until a provider (e.g. MSSQL_CERTIFICATE_STORE) is registered"
+        );
+    }
+}
+
 impl From<(&ClientContext, bool)> for FeaturesRequest {
     fn from(context_and_prelogin_fedauth_flag: (&ClientContext, bool)) -> Self {
         let context = context_and_prelogin_fedauth_flag.0;
@@ -261,8 +294,11 @@ impl From<(&ClientContext, bool)> for FeaturesRequest {
             context.access_token.clone(),
             context_and_prelogin_fedauth_flag.1,
             context.vector_version,
+            context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
+
+        warn_if_always_encrypted_has_no_providers(context);
 
         if context.connect_retry_count > 0 {
             request.features.insert(
@@ -289,8 +325,11 @@ impl FeaturesRequest {
             context.access_token.clone(),
             prelogin_fedauth_response,
             context.vector_version,
+            context.column_encryption_setting,
             UserAgentFeature::new(context),
         );
+
+        warn_if_always_encrypted_has_no_providers(context);
 
         if context.connect_retry_count > 0 {
             let feature = if let Some(recovery_data) = recovery_data {
@@ -393,13 +432,15 @@ impl LoginRequestModel<'_> {
 pub(crate) struct LoginResponseModel {
     pub change_properties: EnvChangeProperties,
     pub features: FeaturesRequest,
-    pub tds_error: Option<TdsError>,
+    pub errors: Vec<SqlErrorInfo>,
     pub success_token: Option<LoginAckToken>,
     pub fed_auth_info: Option<FedAuthInfoToken>,
     /// SSPI challenge token from server for integrated authentication
     pub sspi_token: Option<SspiToken>,
     /// Session state tokens received during login, for transfer to RecoveryContext.
     pub session_state_tokens: Vec<SessionStateToken>,
+    /// Informational messages received during login.
+    pub info_messages: Vec<SqlInfoMessage>,
 }
 
 #[repr(u8)]
@@ -421,11 +462,12 @@ impl LoginResponseModel {
         LoginResponseModel {
             change_properties: EnvChangeProperties::default(),
             features,
-            tds_error: None,
+            errors: Vec::new(),
             success_token: None,
             fed_auth_info: None,
             sspi_token: None,
             session_state_tokens: Vec::new(),
+            info_messages: Vec::new(),
         }
     }
 
@@ -451,6 +493,17 @@ impl LoginResponseModel {
                 }
                 EnvChangeTokenSubType::CharacterSet => {
                     self.change_properties.char_set = Some(string_change.new_value().clone());
+                    Ok(())
+                }
+                EnvChangeTokenSubType::DatabaseMirroringPartner => {
+                    // The server advertises the mirroring/failover partner during
+                    // login for mirrored or AlwaysOn databases. We do not act on it
+                    // yet, but it must be consumed so login can proceed.
+                    event!(
+                        Level::DEBUG,
+                        "Ignoring database mirroring partner: {:?}",
+                        string_change.new_value()
+                    );
                     Ok(())
                 }
                 _ => {
@@ -518,7 +571,7 @@ impl LoginResponseModel {
             return LoginResponseStatus::Success;
         }
 
-        if self.tds_error.is_some() {
+        if !self.errors.is_empty() {
             return LoginResponseStatus::Error;
         }
 
@@ -663,8 +716,9 @@ impl LoginResponse {
                                 Level::ERROR,
                                 "Received Error token during login response parsing."
                             );
-                            response_model.tds_error = Some(TdsError::new(error_token));
-                            // Decide if you want to break here, or keep looping.
+                            response_model.errors.push(SqlErrorInfo::from(&error_token));
+                            // Keep looping so every ERROR/INFO token in the login
+                            // response is captured, not just the first.
                         }
                         Tokens::FeatureExtAck(_t) => {
                             for f in _t.acknowledged_features().iter() {
@@ -677,12 +731,13 @@ impl LoginResponse {
                             response_model.fed_auth_info = Some(fed_auth_info_token);
                             break;
                         }
-                        Tokens::Info(_t) => {
+                        Tokens::Info(t) => {
                             event!(
                                 Level::INFO,
                                 "Received {:?} during login response parsing.",
                                 token_type
                             );
+                            response_model.info_messages.push(SqlInfoMessage::from(&t));
                         }
                         Tokens::SessionState(session_state) => {
                             event!(
@@ -1614,7 +1669,7 @@ mod tests {
     #[test]
     fn get_status_error() {
         let mut model = make_response_model();
-        model.tds_error = Some(TdsError::new(ErrorToken {
+        model.errors.push(SqlErrorInfo::from(&ErrorToken {
             number: 1,
             state: 0,
             severity: 16,

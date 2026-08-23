@@ -1,0 +1,1669 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Connection string parsing for ODBC `SQLDriverConnect`.
+//!
+//! A single-pass, character-by-character state machine that mirrors the behavior
+//! of the msodbcsql driver's `ParseAttrStr`
+//! (`Sql/Ntdbms/sqlncli/odbc/sqlcconn.cpp`). The intent is byte-for-byte parity
+//! with the shipping ODBC driver, including its quirks. See
+//! [`docs/connection_string_parser.md`](../../docs/connection_string_parser.md).
+//!
+//! Key behaviors reproduced from msodbcsql:
+//! - The key is scanned until `=` and **reads through `;`** — a token without its
+//!   own `=` is merged with following text until an `=` or end-of-string.
+//! - If no `=` is found in the remainder, parsing **stops** (whatever was parsed
+//!   so far is kept) and a warning (`01S00`) is raised.
+//! - Keys and values are **never trimmed**; only leading whitespace/`;` before a
+//!   key is skipped. `Server =host` therefore does *not* match (trailing space).
+//! - `{braced}` values are only brace-quoted when `{` is the **first** character
+//!   of the value; braces elsewhere are literal (`PWD=a{b}c` stores `a{b}c`).
+//!   A braced value ends at a single `}`, and `}}` is an escape for a literal `}`.
+//!   There is **no `{{` escape** — the opening `{` is consumed as the delimiter and
+//!   any subsequent `{` is literal (`PWD={{a}` stores `{a`). The asymmetry mirrors
+//!   msodbcsql: only the terminator `}` is ambiguous inside the quote, so only it
+//!   needs escaping.
+//! - A braced value must be followed by `;` or end-of-string; trailing junk after
+//!   `}` stops parsing with a warning.
+//! - Unknown keywords never fail the parse — they are ignored with a warning.
+//!   Only an invalid *value* for a recognized, validated key is a hard error.
+
+use std::fmt;
+
+use crate::connection::odbc_supported_auth_keywords::is_recognized_keyword;
+use tracing::warn;
+
+// Recognized msodbcsql keywords we accept but do not act on. Mirrors the
+// non-acted-on entries of msodbcsql's `x_rgLookup` table (including synonyms and
+// deprecated keys). Recognized keys never raise the 01S00 "invalid attribute"
+// warning even when unsupported; only genuinely unknown keys do.
+//
+// Note: unlike ADO.NET/OLE DB, the msodbcsql ODBC parser does NOT recognize
+// `Initial Catalog` or `User Id`; those are intentionally absent here so they are
+// treated as unknown, matching the driver.
+const KNOWN_IGNORED_KEYS: &[&str] = &[
+    "savefile",
+    "filedsn",
+    "dsn",
+    "description",
+    "desc",
+    "driver",
+    "app",
+    "wsid",
+    "language",
+    "network",
+    "net",
+    "mars_connection",
+    "failover_partner",
+    "failoverpartnerspn",
+    "autotranslate",
+    "querylog_on",
+    "querylogfile",
+    "querylogtime",
+    "statslog_on",
+    "statslogfile",
+    "regional",
+    "quotedid",
+    "ansinpw",
+    "attachdbfilename",
+    "clientcertificate",
+    "columnencryption",
+    "transparentnetworkipresolution",
+    "keystoreauthentication",
+    "keystoreprincipalid",
+    "keystoresecret",
+    "keystorelocation",
+    "usefmtonly",
+    "clientkey",
+    "replication",
+    "longasmax",
+    "getdataextensions",
+    "retryexec",
+    "concatnullyieldsnull",
+    "vectortypesupport",
+    // Deprecated keys kept for back-compat (msodbcsql KEY_UNUSED entries).
+    "oemtoansi",
+    "translationname",
+    "translationoption",
+    "translationdll",
+    "fastconnectoption",
+    "useprocforprepare",
+    "fallback",
+];
+
+// Valid attribute values
+const YES_NO: &[&str] = &["yes", "no"];
+const ENCRYPT_VALUES: &[&str] = &["yes", "mandatory", "no", "optional", "strict"];
+const APPLICATION_INTENT_VALUES: &[&str] = &["ReadOnly", "ReadWrite"];
+// Shown in the diagnostic when a numeric attribute (PacketSize, ConnectRetryCount,
+// …) is given a non-numeric or negative value.
+const INTEGER_EXPECTED: &[&str] = &["a non-negative integer"];
+
+// msodbcsql range-validates ConnectRetryCount / ConnectRetryInterval at parse time
+// and rejects out-of-range values (E_FAIL) — see sqlcconn.cpp — so we mirror that
+// here rather than clamping downstream.
+const CONNECT_RETRY_COUNT_MAX: u32 = 255;
+const CONNECT_RETRY_INTERVAL_MIN: u32 = 1;
+const CONNECT_RETRY_INTERVAL_MAX: u32 = 60;
+const CONNECT_RETRY_COUNT_EXPECTED: &[&str] = &["an integer in the range 0 to 255"];
+const CONNECT_RETRY_INTERVAL_EXPECTED: &[&str] = &["an integer in the range 1 to 60"];
+
+// Recognized `Authentication=` keywords (mirrors `auth_method_from_keyword`).
+// Used only for the diagnostic hint; the accept/reject decision is delegated to
+// `is_recognized_keyword` so the two never drift.
+const AUTHENTICATION_VALUES: &[&str] = &[
+    "SqlPassword",
+    "ActiveDirectoryIntegrated",
+    "ActiveDirectoryPassword",
+    "ActiveDirectoryInteractive",
+    "ActiveDirectoryMSI",
+    "ActiveDirectoryManagedIdentity",
+    "ActiveDirectoryServicePrincipal",
+    "ActiveDirectoryDefault",
+    "ActiveDirectoryDeviceCodeFlow",
+    "ActiveDirectoryWorkloadIdentity",
+];
+
+#[derive(Copy, Clone)]
+enum ConnAttrKey {
+    Server,
+    Database,
+    Uid,
+    Pwd,
+    TrustServerCert,
+    Encrypt,
+    Authentication,
+    TrustedConnection,
+    ServerSpn,
+    ApplicationIntent,
+    MultiSubnetFailover,
+    ConnectRetryCount,
+    ConnectRetryInterval,
+    KeepAlive,
+    KeepAliveInterval,
+    IpAddressPreference,
+    PacketSize,
+    HostNameInCert,
+    ServerCertificate,
+    Count,
+}
+
+impl ConnAttrKey {
+    const COUNT: usize = ConnAttrKey::Count as usize;
+
+    const fn idx(self) -> usize {
+        self as usize
+    }
+}
+
+fn validate_attr(
+    key: &str,
+    value: &str,
+    valid: &'static [&'static str],
+) -> Result<(), InvalidAttrValue> {
+    if valid.iter().any(|v| v.eq_ignore_ascii_case(value)) {
+        Ok(())
+    } else {
+        Err(InvalidAttrValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected: valid,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InvalidAttrValue {
+    pub(crate) key: String,
+    pub(crate) value: String,
+    pub(crate) expected: &'static [&'static str],
+}
+
+impl fmt::Display for InvalidAttrValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid value '{}' for '{}'; expected one of: {}",
+            self.value,
+            self.key,
+            self.expected.join(", ")
+        )
+    }
+}
+
+/// Parsed connection parameters extracted from an ODBC connection string.
+#[derive(Clone, Default)]
+pub(crate) struct ConnectionParams {
+    pub(crate) server: String,
+    pub(crate) database: String,
+    pub(crate) uid: String,
+    pub(crate) pwd: String,
+    pub(crate) trust_server_certificate: bool,
+    pub(crate) encrypt: Option<String>,
+    pub(crate) authentication: Option<String>,
+    pub(crate) trusted_connection: Option<bool>,
+    pub(crate) server_spn: Option<String>,
+    pub(crate) application_intent: Option<String>,
+    pub(crate) multi_subnet_failover: Option<bool>,
+    pub(crate) connect_retry_count: Option<u32>,
+    pub(crate) connect_retry_interval: Option<u32>,
+    pub(crate) keep_alive: Option<u32>,
+    pub(crate) keep_alive_interval: Option<u32>,
+    pub(crate) ip_address_preference: Option<String>,
+    pub(crate) packet_size: Option<u32>,
+    pub(crate) host_name_in_certificate: Option<String>,
+    pub(crate) server_certificate: Option<String>,
+}
+
+impl ConnectionParams {
+    pub(crate) fn fmt_as_odbc_conn_str(&self) -> String {
+        let mut parts = Vec::new();
+
+        if !self.server.is_empty() {
+            parts.push(format!("Server={}", quote_odbc_value(&self.server)));
+        }
+        if !self.database.is_empty() {
+            parts.push(format!("Database={}", quote_odbc_value(&self.database)));
+        }
+        if !self.uid.is_empty() {
+            parts.push(format!("UID={}", quote_odbc_value(&self.uid)));
+        }
+        if !self.pwd.is_empty() {
+            parts.push("PWD=******".to_string());
+        }
+        if self.trust_server_certificate {
+            parts.push("TrustServerCertificate=yes".to_string());
+        }
+        if let Some(encrypt) = &self.encrypt {
+            parts.push(format!("Encrypt={encrypt}"));
+        }
+        if let Some(authentication) = &self.authentication {
+            parts.push(format!("Authentication={authentication}"));
+        }
+        if let Some(trusted_connection) = self.trusted_connection {
+            parts.push(format!(
+                "Trusted_Connection={}",
+                if trusted_connection { "yes" } else { "no" }
+            ));
+        }
+        if let Some(server_spn) = &self.server_spn {
+            parts.push(format!("ServerSPN={}", quote_odbc_value(server_spn)));
+        }
+        if let Some(application_intent) = &self.application_intent {
+            parts.push(format!("ApplicationIntent={application_intent}"));
+        }
+        if let Some(multi_subnet_failover) = self.multi_subnet_failover {
+            parts.push(format!(
+                "MultiSubnetFailover={}",
+                if multi_subnet_failover { "yes" } else { "no" }
+            ));
+        }
+        if let Some(connect_retry_count) = self.connect_retry_count {
+            parts.push(format!("ConnectRetryCount={connect_retry_count}"));
+        }
+        if let Some(connect_retry_interval) = self.connect_retry_interval {
+            parts.push(format!("ConnectRetryInterval={connect_retry_interval}"));
+        }
+        if let Some(keep_alive) = self.keep_alive {
+            parts.push(format!("KeepAlive={keep_alive}"));
+        }
+        if let Some(keep_alive_interval) = self.keep_alive_interval {
+            parts.push(format!("KeepAliveInterval={keep_alive_interval}"));
+        }
+        if let Some(ip_address_preference) = &self.ip_address_preference {
+            parts.push(format!("IpAddressPreference={ip_address_preference}"));
+        }
+        if let Some(packet_size) = self.packet_size {
+            parts.push(format!("PacketSize={packet_size}"));
+        }
+        if let Some(host_name_in_certificate) = &self.host_name_in_certificate {
+            parts.push(format!(
+                "HostnameInCertificate={}",
+                quote_odbc_value(host_name_in_certificate)
+            ));
+        }
+        if let Some(server_certificate) = &self.server_certificate {
+            parts.push(format!(
+                "ServerCertificate={}",
+                quote_odbc_value(server_certificate)
+            ));
+        }
+
+        parts.join(";")
+    }
+}
+
+/// Quote a free-form value for the redacted ODBC connection-string rendering used
+/// in diagnostic logs. Values containing a delimiter (`;`), brace, or `=` are
+/// wrapped in braces with any inner `}` doubled — matching the parser's
+/// brace-quoting rules — so the logged string stays unambiguous. Ordinary values
+/// are returned unchanged.
+fn quote_odbc_value(value: &str) -> String {
+    if value.contains([';', '{', '}', '=']) {
+        format!("{{{}}}", value.replace('}', "}}"))
+    } else {
+        value.to_string()
+    }
+}
+
+impl fmt::Debug for ConnectionParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionParams")
+            .field("server", &self.server)
+            .field("database", &self.database)
+            .field("uid", &self.uid)
+            .field("pwd", &"<REDACTED>")
+            .field("trust_server_certificate", &self.trust_server_certificate)
+            .field("encrypt", &self.encrypt)
+            .field("authentication", &self.authentication)
+            .field("trusted_connection", &self.trusted_connection)
+            .field("server_spn", &self.server_spn)
+            .field("application_intent", &self.application_intent)
+            .field("multi_subnet_failover", &self.multi_subnet_failover)
+            .field("connect_retry_count", &self.connect_retry_count)
+            .field("connect_retry_interval", &self.connect_retry_interval)
+            .field("keep_alive", &self.keep_alive)
+            .field("keep_alive_interval", &self.keep_alive_interval)
+            .field("ip_address_preference", &self.ip_address_preference)
+            .field("packet_size", &self.packet_size)
+            .field("host_name_in_certificate", &self.host_name_in_certificate)
+            .field("server_certificate", &self.server_certificate)
+            .finish()
+    }
+}
+
+/// Classification of a connection-string key against the msodbcsql keyword table.
+enum KeyClass {
+    /// Recognized and acted upon; maps to a [`ConnectionParams`] field.
+    Mapped(ConnAttrKey),
+    /// Recognized by msodbcsql but not acted upon here; raises no warning.
+    Ignored,
+    /// Not a recognized keyword; raises an `01S00` warning but never fails.
+    Unknown,
+}
+
+/// The whitespace set used by msodbcsql's `ISSPACE`: space, form-feed, newline,
+/// carriage return, tab, and vertical tab. Deliberately narrower than
+/// [`char::is_whitespace`] to match the driver exactly.
+fn is_odbc_space(c: char) -> bool {
+    matches!(c, ' ' | '\u{0c}' | '\n' | '\r' | '\t' | '\u{0b}')
+}
+
+/// Connection-string keys we act on, paired with their target [`ConnectionParams`]
+/// slot. Keys are lowercase for case-insensitive matching. Several spellings may
+/// share one slot; a shared slot yields first-wins semantics across the synonym
+/// group, matching msodbcsql. The `server`/`addr`/`address` group is the one
+/// exception — a non-empty `Address`/`Addr` takes precedence over `Server`
+/// regardless of position (msodbcsql `sqlcconn.cpp` builds its login target from
+/// `KEY_ADDR` when Address has a value, else `KEY_SERVER`), so it is resolved in
+/// `parse_connection_string` rather than through this table's first-wins path.
+///
+/// This table is the single source of truth for *which* keys are acted on. Adding
+/// a key still requires a matching `ConnectionParams` field plus arms in
+/// `assign_value` (compiler-enforced), `fmt_as_odbc_conn_str`, and the `Debug` impl.
+const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
+    ("server", ConnAttrKey::Server),
+    ("addr", ConnAttrKey::Server),
+    ("address", ConnAttrKey::Server),
+    ("database", ConnAttrKey::Database),
+    ("uid", ConnAttrKey::Uid),
+    ("pwd", ConnAttrKey::Pwd),
+    ("trustservercertificate", ConnAttrKey::TrustServerCert),
+    ("encrypt", ConnAttrKey::Encrypt),
+    ("authentication", ConnAttrKey::Authentication),
+    ("trusted_connection", ConnAttrKey::TrustedConnection),
+    ("serverspn", ConnAttrKey::ServerSpn),
+    ("applicationintent", ConnAttrKey::ApplicationIntent),
+    ("multisubnetfailover", ConnAttrKey::MultiSubnetFailover),
+    ("connectretrycount", ConnAttrKey::ConnectRetryCount),
+    ("connectretryinterval", ConnAttrKey::ConnectRetryInterval),
+    ("keepalive", ConnAttrKey::KeepAlive),
+    ("keepaliveinterval", ConnAttrKey::KeepAliveInterval),
+    ("ipaddresspreference", ConnAttrKey::IpAddressPreference),
+    ("packetsize", ConnAttrKey::PacketSize),
+    ("hostnameincertificate", ConnAttrKey::HostNameInCert),
+    ("servercertificate", ConnAttrKey::ServerCertificate),
+];
+
+fn classify_key(lower: &str) -> KeyClass {
+    if let Some((_, slot)) = MAPPED_KEYS.iter().find(|(name, _)| *name == lower) {
+        KeyClass::Mapped(*slot)
+    } else if KNOWN_IGNORED_KEYS.contains(&lower) {
+        KeyClass::Ignored
+    } else {
+        KeyClass::Unknown
+    }
+}
+
+/// Validate and store a parsed value for a recognized, acted-upon key.
+///
+/// Returns `Err(InvalidAttrValue)` for an invalid value on a validated key,
+/// mirroring msodbcsql's `E_FAIL` from `IsAttrStrValid` (a hard connect failure).
+fn assign_value(
+    params: &mut ConnectionParams,
+    slot: ConnAttrKey,
+    lower: &str,
+    value: &str,
+) -> Result<(), InvalidAttrValue> {
+    match slot {
+        // The server/addr/address group is resolved in `parse_connection_string`
+        // (Address takes precedence over Server), so this arm is never reached; it
+        // only keeps the match exhaustive.
+        ConnAttrKey::Server => params.server = value.to_string(),
+        ConnAttrKey::Database => params.database = value.to_string(),
+        ConnAttrKey::Uid => params.uid = value.to_string(),
+        ConnAttrKey::Pwd => params.pwd = value.to_string(),
+        ConnAttrKey::TrustServerCert => {
+            validate_attr(lower, value, YES_NO)?;
+            params.trust_server_certificate = is_yes(value);
+        }
+        ConnAttrKey::Encrypt => {
+            validate_attr(lower, value, ENCRYPT_VALUES)?;
+            params.encrypt = Some(value.to_string());
+        }
+        ConnAttrKey::Authentication => {
+            // Recognized-keyword check is delegated to mssql-tds (the source of
+            // truth). Whether a recognized method is *implemented* is gated later;
+            // parsing only rejects values mssql-tds does not recognize.
+            if !is_recognized_keyword(value) {
+                return Err(InvalidAttrValue {
+                    key: lower.to_string(),
+                    value: value.to_string(),
+                    expected: AUTHENTICATION_VALUES,
+                });
+            }
+            params.authentication = Some(value.to_string());
+        }
+        ConnAttrKey::TrustedConnection => {
+            validate_attr(lower, value, YES_NO)?;
+            params.trusted_connection = Some(is_yes(value));
+        }
+        ConnAttrKey::ServerSpn => params.server_spn = Some(value.to_string()),
+        ConnAttrKey::ApplicationIntent => {
+            validate_attr(lower, value, APPLICATION_INTENT_VALUES)?;
+            params.application_intent = Some(value.to_string());
+        }
+        ConnAttrKey::MultiSubnetFailover => {
+            validate_attr(lower, value, YES_NO)?;
+            params.multi_subnet_failover = Some(is_yes(value));
+        }
+        ConnAttrKey::ConnectRetryCount => {
+            params.connect_retry_count = Some(parse_uint_in_range(
+                lower,
+                value,
+                0,
+                CONNECT_RETRY_COUNT_MAX,
+                CONNECT_RETRY_COUNT_EXPECTED,
+            )?);
+        }
+        ConnAttrKey::ConnectRetryInterval => {
+            params.connect_retry_interval = Some(parse_uint_in_range(
+                lower,
+                value,
+                CONNECT_RETRY_INTERVAL_MIN,
+                CONNECT_RETRY_INTERVAL_MAX,
+                CONNECT_RETRY_INTERVAL_EXPECTED,
+            )?);
+        }
+        ConnAttrKey::KeepAlive => {
+            params.keep_alive = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::KeepAliveInterval => {
+            params.keep_alive_interval = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::IpAddressPreference => {
+            // msodbcsql accepts any value and falls back unknown ones to IPv4First
+            // at connect time (see `apply_connection_params`); no parse-time reject.
+            params.ip_address_preference = Some(value.to_string());
+        }
+        ConnAttrKey::PacketSize => {
+            params.packet_size = Some(parse_uint(lower, value)?);
+        }
+        ConnAttrKey::HostNameInCert => {
+            params.host_name_in_certificate = Some(value.to_string());
+        }
+        ConnAttrKey::ServerCertificate => {
+            params.server_certificate = Some(value.to_string());
+        }
+        ConnAttrKey::Count => {}
+    }
+    Ok(())
+}
+
+/// Parse an ODBC connection string into [`ConnectionParams`].
+///
+/// A single-pass, character-by-character state machine that reproduces the
+/// behavior of msodbcsql's `ParseAttrStr`. See the module-level documentation for
+/// the full list of reproduced quirks.
+///
+/// Returns `Ok((params, has_warnings))` on success, or `Err(InvalidAttrValue)`
+/// for an invalid value on a recognized, validated key (msodbcsql `E_FAIL`).
+/// `has_warnings` is true when any `01S00` condition was hit (unknown key, missing
+/// `=`, missing value, unterminated brace, or data after a braced value).
+///
+/// Worked examples (input on the left, resulting behavior on the right):
+///
+/// ```text
+/// "Server=host;UID=sa;PWD=p"      -> server="host", uid="sa", pwd="p", no warnings
+/// "Server=host;Foo=1;UID=sa"      -> Foo is unknown: warns, discarded; UID still set
+/// "Server=host;QuotedId=yes"       -> recognized-but-ignored: no warning
+/// "Server=host;PWD={p;w=d}"       -> braces quote ';' and '=': pwd="p;w=d"
+/// "Server=host;PWD={a}}b}"        -> "}}" escapes one '}': pwd="a}b"
+/// "Server=host;Encrypt=banana"    -> Err(InvalidAttrValue): validated key, bad value
+/// "Server=host;junk"              -> no '=' in "junk": warns and stops
+/// ```
+pub(crate) fn parse_connection_string(
+    input: &str,
+) -> Result<(ConnectionParams, bool), InvalidAttrValue> {
+    // The parser walks `chars` with a single cursor `i`. Each loop iteration
+    // consumes exactly one `key=value` pair (plus its trailing ';'), in four
+    // phases: (1) skip leading separators, (2) read the key up to '=', (3) read
+    // the value (brace-quoted or plain), (4) validate/store. All offsets are in
+    // `char`s, not bytes, so multi-byte UTF-8 values are handled correctly.
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    // Bounds-checked cursor read: returns None past end-of-input instead of
+    // panicking. This crate is loaded via FFI where a panic is fatal, so all
+    // character access goes through `.get()` (never `chars[i]`).
+    let peek = |idx: usize| chars.get(idx).copied();
+
+    let mut params = ConnectionParams::default();
+    // One "already seen" flag per acted-on key so the *first* occurrence of a
+    // recognized key wins and later duplicates are ignored (e.g. in
+    // "Database=a;Database=b" the stored database is "a"). The `server`/`addr`/
+    // `address` group is the exception: it is resolved out-of-band below so a
+    // non-empty Address/Addr can take precedence over Server (msodbcsql parity),
+    // while still applying first-wins within each spelling.
+    let mut seen_slots = [false; ConnAttrKey::COUNT];
+    let mut server_kw: Option<String> = None;
+    let mut address_kw: Option<String> = None;
+    let mut has_warnings = false;
+
+    loop {
+        // Clean end-of-input guard (msodbcsql `ParseAttrStr` outer-loop condition,
+        // sqlcconn.cpp line 4299: `for (...; cchAttrStr && *lpsz; )`). This is
+        // checked *before* skipping separators, so the loop only exits cleanly
+        // (no warning) when the previous iteration left the cursor exactly at
+        // end-of-input — i.e. a value that ran to the end, or exactly ONE trailing
+        // separator consumed by the Phase-5 step below. A run of 2+ trailing
+        // separators (or a trailing ';' followed by whitespace) is NOT consumed
+        // here; instead a fresh iteration starts, the Phase-1 skip lands on
+        // end-of-input, and the empty key read in Phase 2 raises 01S00 — matching
+        // msodbcsql exactly (e.g. "Server=h;UID=u;" is clean, "…;;" warns).
+        if i >= n {
+            break;
+        }
+
+        // Phase 1 — skip any run of whitespace and ';' before the key. Only the
+        // key's *position* is whitespace-tolerant, not its content. So in
+        // ";;  Server=host" the leading ";;  " is skipped, but in "Server =host"
+        // the trailing space stays part of the key ("server ") and won't match.
+        while matches!(peek(i), Some(c) if is_odbc_space(c) || c == ';') {
+            i += 1;
+        }
+
+        // Phase 2 — read the key up to '='. This reads *through* ';', so a token
+        // without its own '=' is merged with the following text until an '=' or
+        // end-of-input. Example: in "Server=h;bogus;UID=u" the second key scan
+        // yields "bogus;UID" (one key), so UID is swallowed and never set.
+        let key_start = i;
+        while matches!(peek(i), Some(c) if c != '=') {
+            i += 1;
+        }
+        if i >= n {
+            // No '=' in the remainder: stop parsing, keeping what we have (S_FALSE).
+            // Two shapes reach here, both mapping to msodbcsql's line-4320 S_FALSE:
+            //   1. a real token without '=', e.g. "Server=h;trailingjunk" — stores
+            //      server="h", then stops here;
+            //   2. an *empty* key at end-of-input, reached when Phase 1 skipped a
+            //      trailing run of 2+ separators / whitespace (e.g. "Server=h;;")
+            //      — the degenerate final iteration that makes msodbcsql warn.
+            warn!("invalid connection string attribute (no '=' separator)");
+            has_warnings = true;
+            break;
+        }
+        let key: String = chars.get(key_start..i).unwrap_or_default().iter().collect();
+        i += 1; // consume '='
+        // Key matching is case-insensitive, so lowercase once up front.
+        let lower = key.to_ascii_lowercase();
+
+        // Phase 2b — classify the key. A recognized, first-seen, acted-upon key
+        // gets a slot to receive the value; everything else parses the value but
+        // discards it (mirrors msodbcsql leaving `lpszValue` unstored). `target`
+        // is `Some(slot)` only when we will actually store the value.
+        // Set when this iteration's key is in the `server`/`addr`/`address` group;
+        // the value is captured after Phase 4 so Address can take precedence over
+        // Server once both values are known.
+        let mut server_group_is_addr: Option<bool> = None;
+        let target = match classify_key(&lower) {
+            KeyClass::Mapped(ConnAttrKey::Server) => {
+                server_group_is_addr = Some(lower == "addr" || lower == "address");
+                None
+            }
+            KeyClass::Mapped(slot) => {
+                let idx = slot.idx();
+                if seen_slots[idx] {
+                    None // duplicate recognized key: first occurrence wins
+                } else {
+                    seen_slots[idx] = true;
+                    Some(slot)
+                }
+            }
+            KeyClass::Ignored => None,
+            KeyClass::Unknown => {
+                warn!(key = %key, "unknown connection string attribute");
+                has_warnings = true;
+                None
+            }
+        };
+
+        // No value after '=': stop parsing (S_FALSE). Example: "Server=h;UID="
+        // (the '=' is the last char) warns and stops with server="h".
+        if i >= n {
+            warn!("invalid connection string attribute (missing value)");
+            has_warnings = true;
+            break;
+        }
+
+        // Phase 3 — read the value. `stop_after` records a structural problem
+        // that forces the loop to end *after* the value is stored (msodbcsql
+        // stores first, then bails).
+        let mut value = String::new();
+        let mut stop_after = false;
+        if peek(i) == Some('{') {
+            // Brace-quoted value: everything up to the matching single '}' is
+            // literal, so ';' and '=' inside braces are NOT separators. Used for
+            // passwords like "{p;w=d}" that contain reserved characters.
+            i += 1;
+            let mut terminated = false;
+            while let Some(c) = peek(i) {
+                if c == '}' {
+                    // "}}" is an escape for a single literal '}'. Example:
+                    // "{a}}b}" -> value "a}b" (the doubled brace is consumed as
+                    // one '}', the later single '}' terminates the value).
+                    if peek(i + 1) == Some('}') {
+                        value.push('}');
+                        i += 2;
+                        continue;
+                    }
+                    terminated = true;
+                    break;
+                }
+                value.push(c);
+                i += 1;
+            }
+            if terminated {
+                i += 1; // consume closing '}'
+                // A braced value must be followed by ';' or end-of-input. Trailing
+                // junk (e.g. "{val}junk") is a structural error: warn and stop,
+                // but the already-collected "val" is still stored below.
+                if matches!(peek(i), Some(c) if c != ';') {
+                    warn!("invalid connection string attribute (data after braced value)");
+                    has_warnings = true;
+                    stop_after = true;
+                }
+            } else {
+                // No closing '}' before end-of-input (e.g. "{abc"): the value ran
+                // to the end. Store what we have, warn, and stop.
+                warn!("unterminated braced value in connection string");
+                has_warnings = true;
+                stop_after = true;
+            }
+        } else {
+            // Plain value: read verbatim up to the next ';' (or end). No trimming
+            // — "Server= host " stores the value as " host " with both spaces.
+            while let Some(c) = peek(i) {
+                if c == ';' {
+                    break;
+                }
+                value.push(c);
+                i += 1;
+            }
+        }
+
+        // Phase 4 — validate and store. msodbcsql stores the value before its
+        // brace-close checks, so a value with trailing junk is still stored before
+        // we stop. An invalid value on a validated key fails immediately (E_FAIL)
+        // and aborts the whole parse via the `?`.
+        if let Some(is_addr) = server_group_is_addr {
+            // First-wins within each spelling; the Address-vs-Server precedence is
+            // resolved after the loop from `server_kw`/`address_kw`.
+            let captured = if is_addr {
+                &mut address_kw
+            } else {
+                &mut server_kw
+            };
+            if captured.is_none() {
+                *captured = Some(value.clone());
+            }
+        } else if let Some(slot) = target {
+            assign_value(&mut params, slot, &lower, &value)?;
+        }
+
+        if stop_after {
+            break;
+        }
+
+        // Phase 5 — consume exactly ONE trailing ';' separator (msodbcsql
+        // sqlcconn.cpp lines 4463-4467) and continue with the next pair. Consuming
+        // only one is what distinguishes a clean single trailing ';' (cursor lands
+        // exactly at end-of-input -> top-of-loop guard exits with no warning) from a
+        // run of 2+ (cursor lands on the next ';', so a degenerate final iteration
+        // runs and warns). At end-of-input this is a no-op.
+        if i < n {
+            i += 1;
+        }
+    }
+
+    // Resolve the `server`/`addr`/`address` group to match msodbcsql `sqlcconn.cpp`
+    // (login target = KEY_ADDR when Address has a value, else KEY_SERVER): a
+    // non-empty Address/Addr wins over Server regardless of position; an empty or
+    // absent Address falls back to Server.
+    params.server = match address_kw {
+        Some(addr) if !addr.is_empty() => addr,
+        _ => server_kw.unwrap_or_default(),
+    };
+
+    Ok((params, has_warnings))
+}
+
+fn is_yes(value: &str) -> bool {
+    value.eq_ignore_ascii_case("yes")
+}
+
+/// Parse a non-negative integer attribute value. Rejects non-numeric or negative
+/// input with `InvalidAttrValue` (msodbcsql `E_FAIL`). Range handling is per-key:
+/// `ConnectRetryCount` / `ConnectRetryInterval` are range-validated at parse time
+/// via [`parse_uint_in_range`] (msodbcsql rejects out-of-range values here);
+/// `PacketSize` is instead clamped to the range mssql-tds accepts when mapping onto
+/// the client context (see `apply_connection_params`).
+fn parse_uint(key: &str, value: &str) -> Result<u32, InvalidAttrValue> {
+    value.parse::<u32>().map_err(|_| InvalidAttrValue {
+        key: key.to_string(),
+        value: value.to_string(),
+        expected: INTEGER_EXPECTED,
+    })
+}
+
+/// Like [`parse_uint`], but also rejects values outside the inclusive `[min, max]`
+/// range with `InvalidAttrValue` (E_FAIL), mirroring msodbcsql's parse-time range
+/// validation for `ConnectRetryCount` / `ConnectRetryInterval`.
+fn parse_uint_in_range(
+    key: &str,
+    value: &str,
+    min: u32,
+    max: u32,
+    expected: &'static [&'static str],
+) -> Result<u32, InvalidAttrValue> {
+    let parsed = parse_uint(key, value)?;
+    if (min..=max).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(InvalidAttrValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::cs;
+
+    #[test]
+    fn basic_connection_string() {
+        let (params, has_warnings) = parse_connection_string(&cs(
+            "Server=localhost,1434;Database=master;UID=sa;<PW>=secret;TrustServerCertificate=yes",
+        ))
+        .unwrap();
+        assert!(!has_warnings);
+        assert_eq!(params.server, "localhost,1434");
+        assert_eq!(params.database, "master");
+        assert_eq!(params.uid, "sa");
+        assert_eq!(params.pwd, "secret");
+        assert!(params.trust_server_certificate);
+    }
+
+    #[test]
+    fn server_formats() {
+        let (p, ..) = parse_connection_string(&cs("Server=myhost;UID=u;<PW>=p")).unwrap();
+        assert_eq!(p.server, "myhost");
+
+        let (p, ..) = parse_connection_string(&cs("Server=tcp:myhost,2000;UID=u;<PW>=p")).unwrap();
+        assert_eq!(p.server, "tcp:myhost,2000");
+
+        let (p, ..) = parse_connection_string(&cs("Server=::1;UID=u;<PW>=p")).unwrap();
+        assert_eq!(p.server, "::1");
+
+        let (p, ..) = parse_connection_string(&cs("Server=host,abc;UID=u;<PW>=p")).unwrap();
+        assert_eq!(p.server, "host,abc");
+    }
+
+    #[test]
+    fn braced_values() {
+        let (p, ..) =
+            parse_connection_string(&cs("Server=host;<PW>={pass;with=special};UID=user")).unwrap();
+        assert_eq!(p.pwd, "pass;with=special");
+        assert_eq!(p.uid, "user");
+
+        let (p, ..) = parse_connection_string(&cs("Server=h;<PW>={a=b;c=d};UID=u")).unwrap();
+        assert_eq!(p.pwd, "a=b;c=d");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn key_matching_is_case_insensitive() {
+        let (p, warn) = parse_connection_string(&cs(
+            "SERVER=host;uid=user;<PW>=pass;trustservercertificate=Yes",
+        ))
+        .unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "host");
+        assert_eq!(p.uid, "user");
+        assert_eq!(p.pwd, "pass");
+        assert!(p.trust_server_certificate);
+    }
+
+    #[test]
+    fn adonet_only_keywords_are_unknown() {
+        // msodbcsql's ODBC parser does NOT recognize `Initial Catalog`, `User Id`,
+        // or `Password` (those are ADO.NET / OLE DB spellings). They are treated as
+        // unknown keys: the mapped field stays unset and a warning is raised.
+        let (p, warn) =
+            parse_connection_string("Server=host;Initial Catalog=mydb;UID=u;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.database, "");
+
+        let (p, warn) = parse_connection_string("Server=host;User Id=admin;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.uid, "");
+
+        let (p, warn) = parse_connection_string("Server=host;UID=u;Password=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "");
+    }
+
+    #[test]
+    fn separator_and_empty_edge_cases() {
+        let (p, warn) = parse_connection_string("").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "");
+
+        // Empty value mid-string is fine (only end-of-string right after '=' stops).
+        let (p, warn) = parse_connection_string(&cs("Server=host;Database=;UID=u;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.database, "");
+        assert_eq!(p.uid, "u");
+
+        // Trailing separator is skipped cleanly.
+        let (p, warn) = parse_connection_string(&cs("Server=host;UID=u;<PW>=p;")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "host");
+
+        // Runs of separators are skipped.
+        let (p, warn) = parse_connection_string(&cs("Server=host;;;UID=u;;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.uid, "u");
+
+        // Leading separators are skipped.
+        let (p, warn) = parse_connection_string(&cs(";;Server=host;UID=u;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "host");
+    }
+
+    #[test]
+    fn whitespace_is_not_trimmed() {
+        // msodbcsql skips only leading whitespace before a key. Trailing space in a
+        // key (before '=') stays part of the key, so it no longer matches; spaces in
+        // a value are preserved verbatim.
+        let (p, warn) =
+            parse_connection_string(&cs(" Server = host ; UID = user ; <PW> = pass ")).unwrap();
+        assert!(warn); // "Server ", " UID ", " PWD " are all unknown
+        assert_eq!(p.server, "");
+        assert_eq!(p.uid, "");
+        assert_eq!(p.pwd, "");
+
+        // With exact keys, values keep their surrounding spaces.
+        let (p, warn) = parse_connection_string("Server= host ;UID=u;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, " host ");
+    }
+
+    #[test]
+    fn encrypt_values() {
+        for (input, expected) in [
+            ("yes", "yes"),
+            ("strict", "strict"),
+            ("Mandatory", "Mandatory"),
+            ("Optional", "Optional"),
+        ] {
+            let (p, _) =
+                parse_connection_string(&cs(&format!("Server=h;UID=u;<PW>=p;Encrypt={input}")))
+                    .unwrap();
+            assert_eq!(p.encrypt.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn duplicates_follow_first_wins() {
+        let (p, ..) =
+            parse_connection_string(&cs("Server=first;Server=second;UID=u;<PW>=p")).unwrap();
+        assert_eq!(p.server, "first");
+
+        let (p, ..) =
+            parse_connection_string(&cs("UID=first;User Id=second;<PW>=p;Server=h")).unwrap();
+        assert_eq!(p.uid, "first");
+
+        let (p, ..) =
+            parse_connection_string(&cs("Server=h;UID=u;<PW>=p;Encrypt=yes;Encrypt=banana"))
+                .unwrap();
+        assert_eq!(p.encrypt.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn invalid_attr_values() {
+        let err = parse_connection_string(&cs("Server=h;UID=u;<PW>=p;Encrypt=true")).unwrap_err();
+        assert_eq!(err.key, "encrypt");
+        assert_eq!(err.value, "true");
+
+        let err = parse_connection_string(&cs("Server=h;UID=u;<PW>=p;TrustServerCertificate=1"))
+            .unwrap_err();
+        assert_eq!(err.key, "trustservercertificate");
+        assert_eq!(err.value, "1");
+    }
+
+    #[test]
+    fn malformed_tokens_set_warning() {
+        // A token without its own '=' merges with the following text (the key scan
+        // reads through ';'). Here the key becomes "bogus;UID", so UID is swallowed
+        // and never set; PWD still parses afterwards.
+        let (p, warn) = parse_connection_string(&cs("Server=h;bogus;UID=u;<PW>=p")).unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "h");
+        assert_eq!(p.uid, "");
+        assert_eq!(p.pwd, "p");
+
+        // Empty key (value with no key) warns but parsing continues past it.
+        let (p, warn) = parse_connection_string(&cs("Server=h;=orphan;UID=u;<PW>=p")).unwrap();
+        assert!(warn);
+        assert_eq!(p.uid, "u");
+
+        // Both in one string
+        let (_, warn) =
+            parse_connection_string(&cs("noequals;=empty;Server=h;UID=u;<PW>=p")).unwrap();
+        assert!(warn);
+
+        // Clean string has no warnings
+        let (_, warn) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
+        assert!(!warn);
+
+        // Unknown but well-formed keys are ignored with warning.
+        let (_, warn) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p;FooBar=1")).unwrap();
+        assert!(warn);
+
+        // Known-but-ignored keys should not warn.
+        let (_, warn) = parse_connection_string(&cs(
+            "Driver={ODBC Driver 18 for SQL Server};Server=h;UID=u;<PW>=p",
+        ))
+        .unwrap();
+        assert!(!warn);
+    }
+
+    #[test]
+    fn unterminated_brace_sets_warning() {
+        // Missing closing '}' — consumes rest of string as value, warns
+        let (p, warn) = parse_connection_string(&cs("Server=h;<PW>={abc;UID=u")).unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "abc;UID=u");
+        assert_eq!(p.uid, ""); // UID was swallowed into the braced value
+    }
+
+    #[test]
+    fn debug_redacts_password() {
+        let (p, _) = parse_connection_string(&cs("Server=h;UID=u;<PW>=secret123")).unwrap();
+        let debug_str = format!("{p:?}");
+        assert!(debug_str.contains("<REDACTED>"));
+        assert!(!debug_str.contains("secret123"));
+    }
+
+    #[test]
+    fn fmt_as_odbc_conn_str_redacts_password() {
+        let (p, _) =
+            parse_connection_string(&cs("Server=h;Database=db;UID=u;<PW>=secret;Encrypt=strict"))
+                .unwrap();
+        assert_eq!(
+            p.fmt_as_odbc_conn_str(),
+            cs("Server=h;Database=db;UID=u;<PW>=******;Encrypt=strict")
+        );
+    }
+
+    // ── Authentication / Trusted_Connection (T0) ─────────────
+
+    #[test]
+    fn authentication_recognized_keywords() {
+        for kw in [
+            "SqlPassword",
+            "ActiveDirectoryIntegrated",
+            "ActiveDirectoryPassword",
+            "ActiveDirectoryInteractive",
+            "ActiveDirectoryMSI",
+            "ActiveDirectoryServicePrincipal",
+            "ActiveDirectoryDefault",
+            "ActiveDirectoryDeviceCodeFlow",
+            "ActiveDirectoryWorkloadIdentity",
+            "ActiveDirectoryManagedIdentity",
+        ] {
+            let (p, warn) =
+                parse_connection_string(&format!("Server=h;UID=u;PWD=p;Authentication={kw}"))
+                    .unwrap();
+            assert_eq!(p.authentication.as_deref(), Some(kw), "keyword {kw}");
+            assert!(!warn, "recognized Authentication should not warn: {kw}");
+        }
+    }
+
+    #[test]
+    fn authentication_case_insensitive_recognized() {
+        // Recognized case-insensitively; the raw value is preserved as given.
+        let (p, ..) = parse_connection_string(
+            "Server=h;UID=u;PWD=p;authentication=activedirectoryintegrated",
+        )
+        .unwrap();
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("activedirectoryintegrated")
+        );
+    }
+
+    #[test]
+    fn authentication_unrecognized_is_error() {
+        let err =
+            parse_connection_string("Server=h;UID=u;PWD=p;Authentication=NotReal").unwrap_err();
+        assert_eq!(err.key, "authentication");
+        assert_eq!(err.value, "NotReal");
+    }
+
+    #[test]
+    fn authentication_managed_identity_is_accepted() {
+        // Exceed-parity (#46066): the classic C++ msodbcsql driver accepts only
+        // ActiveDirectoryMSI (dlgattr.h), but we also accept ActiveDirectoryManagedIdentity
+        // to match MS Learn docs and sibling drivers (JDBC/.NET/go-sqlcmd). Managed identity
+        // needs no UID/PWD.
+        let (p, warn) =
+            parse_connection_string("Server=h;Authentication=ActiveDirectoryManagedIdentity")
+                .unwrap();
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("ActiveDirectoryManagedIdentity")
+        );
+        assert!(!warn);
+    }
+
+    #[test]
+    fn authentication_empty_reset_vs_end_of_string() {
+        // Empty Authentication mid-string is an intentional reset (mssql-tds treats
+        // it as recognized); stored as Some("") to preserve the distinction from unset.
+        let (p, warn) = parse_connection_string("Server=h;Authentication=;UID=u;PWD=p").unwrap();
+        assert_eq!(p.authentication.as_deref(), Some(""));
+        assert!(!warn);
+
+        // But `Authentication=` at the very end of the string hits end-of-input right
+        // after '=' — msodbcsql stops with S_FALSE and the value is never set.
+        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD=p;Authentication=").unwrap();
+        assert_eq!(p.authentication, None);
+        assert!(warn);
+    }
+
+    #[test]
+    fn trusted_connection_yes_no() {
+        let (p, ..) = parse_connection_string("Server=h;Trusted_Connection=Yes").unwrap();
+        assert_eq!(p.trusted_connection, Some(true));
+
+        let (p, ..) = parse_connection_string("Server=h;Trusted_Connection=no").unwrap();
+        assert_eq!(p.trusted_connection, Some(false));
+    }
+
+    #[test]
+    fn trusted_connection_invalid_is_error() {
+        let err = parse_connection_string("Server=h;Trusted_Connection=1").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+        assert_eq!(err.value, "1");
+
+        let err = parse_connection_string("Server=h;Trusted_Connection=true").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+    }
+
+    #[test]
+    fn trusted_connection_no_longer_silently_ignored() {
+        // Previously in KNOWN_IGNORED_KEYS and dropped without capture. Now parsed;
+        // still no 01S00 warning, but the value is retained.
+        let (p, warn) = parse_connection_string("Server=h;Trusted_Connection=Yes").unwrap();
+        assert!(!warn);
+        assert_eq!(p.trusted_connection, Some(true));
+    }
+
+    #[test]
+    fn auth_keys_follow_first_wins() {
+        let (p, ..) = parse_connection_string(
+            "Server=h;Authentication=ActiveDirectoryIntegrated;Authentication=SqlPassword",
+        )
+        .unwrap();
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("ActiveDirectoryIntegrated")
+        );
+
+        let (p, ..) =
+            parse_connection_string("Server=h;Trusted_Connection=Yes;Trusted_Connection=No")
+                .unwrap();
+        assert_eq!(p.trusted_connection, Some(true));
+    }
+
+    #[test]
+    fn auth_and_existing_keys_together() {
+        let (p, warn) = parse_connection_string(
+            "Server=h;Database=db;UID=u;PWD=p;Encrypt=strict;Authentication=ActiveDirectoryServicePrincipal",
+        )
+        .unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "h");
+        assert_eq!(p.database, "db");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "p");
+        assert_eq!(p.encrypt.as_deref(), Some("strict"));
+        assert_eq!(
+            p.authentication.as_deref(),
+            Some("ActiveDirectoryServicePrincipal")
+        );
+    }
+
+    #[test]
+    fn new_auth_fields_default_none() {
+        let (p, ..) = parse_connection_string("Server=h;UID=u;PWD=p").unwrap();
+        assert_eq!(p.authentication, None);
+        assert_eq!(p.trusted_connection, None);
+    }
+
+    #[test]
+    fn auth_fields_render_without_leaking_secrets() {
+        let (p, ..) = parse_connection_string(
+            "Server=h;UID=u;PWD=secret;Authentication=ActiveDirectoryIntegrated;Trusted_Connection=Yes",
+        )
+        .unwrap();
+
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("ActiveDirectoryIntegrated"));
+        assert!(dbg.contains("<REDACTED>"));
+        assert!(!dbg.contains("secret"));
+
+        let s = p.fmt_as_odbc_conn_str();
+        assert!(s.contains("Authentication=ActiveDirectoryIntegrated"));
+        assert!(s.contains("Trusted_Connection=yes"));
+        assert!(s.contains("PWD=******"));
+        assert!(!s.contains("secret"));
+    }
+
+    // ── Exhaustive msodbcsql `ParseAttrStr` fidelity quirks ──────────────
+
+    #[test]
+    fn key_scan_reads_through_separator() {
+        // A token without its own '=' merges with following text: the key scan does
+        // not stop on ';'. Here the key is "foo;Server", so Server is never set.
+        let (p, warn) = parse_connection_string("foo;Server=host;UID=u;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn missing_equals_stops_parsing() {
+        // No '=' in the remainder → S_FALSE, stop. Everything parsed so far is kept,
+        // but nothing after the malformed tail is parsed.
+        let (p, warn) = parse_connection_string("Server=host;UID=u;trailingjunk").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "host");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "");
+    }
+
+    #[test]
+    fn missing_value_at_end_stops_parsing() {
+        // End-of-input immediately after '=' → S_FALSE, stop with the value unset.
+        let (p, warn) = parse_connection_string("Server=host;UID=u;Database=").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "host");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.database, "");
+    }
+
+    #[test]
+    fn empty_value_midstring_is_not_a_stop() {
+        // An empty value is fine when a ';' (not end-of-input) follows the '='.
+        let (p, warn) = parse_connection_string("Server=host;Database=;UID=u;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.database, "");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "p");
+    }
+
+    #[test]
+    fn braced_double_brace_escape() {
+        // '}}' inside a braced value is a literal '}'.
+        let (p, warn) = parse_connection_string("Server=h;PWD={a}}b};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "a}b");
+        assert_eq!(p.uid, "u");
+
+        // Multiple escapes.
+        let (p, warn) = parse_connection_string("Server=h;PWD={p}}}}q};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "p}}q");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn braced_value_preserves_separators_and_equals() {
+        let (p, warn) = parse_connection_string("Server=h;PWD={a;b=c d};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "a;b=c d");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn junk_after_braced_value_stops_parsing() {
+        // A braced value must be followed by ';' or end-of-input. Trailing junk after
+        // '}' stops parsing with a warning — the value is still stored first.
+        let (p, warn) = parse_connection_string("Server=h;PWD={val}junk;UID=u").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "val");
+        assert_eq!(p.uid, ""); // parsing stopped, UID never reached
+    }
+
+    #[test]
+    fn braced_value_at_end_of_string() {
+        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD={secret}").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "secret");
+    }
+
+    #[test]
+    fn unterminated_brace_swallows_rest_and_stops() {
+        let (p, warn) = parse_connection_string("Server=h;PWD={abc;UID=u").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "abc;UID=u");
+        assert_eq!(p.uid, "");
+    }
+
+    #[test]
+    fn brace_not_at_value_start_is_literal() {
+        // '{' is only special as the first character of the value.
+        let (p, warn) = parse_connection_string("Server=h;UID=u;PWD=a{b}c").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "a{b}c");
+    }
+
+    #[test]
+    fn open_brace_is_never_an_escape() {
+        // Only the first '{' opens brace-quoting; a second '{' right after it is a
+        // literal character (there is no '{{' escape, unlike '}}'). Here the value
+        // "{{a}" is: 1st '{' delimiter, 2nd '{' literal, '}' terminator -> "{a".
+        let (p, warn) = parse_connection_string("Server=h;PWD={{a};UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.pwd, "{a");
+        assert_eq!(p.uid, "u");
+    }
+
+    #[test]
+    fn doubled_open_then_doubled_close_at_end_is_unterminated() {
+        // "{{}}": 1st '{' opens, 2nd '{' literal, "}}" escapes to one literal '}',
+        // then end-of-string arrives with no terminating '}' -> unterminated brace.
+        // The collected "{}" is still stored, and parsing warns and stops.
+        let (p, warn) = parse_connection_string("Server=h;PWD={{}}").unwrap();
+        assert!(warn);
+        assert_eq!(p.pwd, "{}");
+    }
+
+    #[test]
+    fn recognized_but_ignored_keys_do_not_warn() {
+        for key in [
+            "Driver",
+            "DSN",
+            "APP",
+            "WSID",
+            "Language",
+            "Network",
+            "MARS_Connection",
+            "AutoTranslate",
+            "QuotedId",
+            "ColumnEncryption",
+            "TransparentNetworkIPResolution",
+            "OEMToANSI",
+        ] {
+            let s = format!("Server=h;{key}=whatever;UID=u;PWD=p");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn, "recognized-but-ignored key should not warn: {key}");
+            assert_eq!(p.server, "h", "key {key}");
+            assert_eq!(p.uid, "u", "key {key}");
+        }
+    }
+
+    #[test]
+    fn addr_and_address_map_to_server() {
+        for key in ["Addr", "Address", "ADDR", "address"] {
+            let s = format!("{key}=host1;UID=u;<PW>=p");
+            let (p, warn) = parse_connection_string(&cs(&s)).unwrap();
+            assert!(!warn, "{key} should map cleanly to Server");
+            assert_eq!(p.server, "host1", "key {key}");
+        }
+    }
+
+    #[test]
+    fn address_takes_precedence_over_server() {
+        // msodbcsql parity (sqlcconn.cpp): a non-empty Address/Addr wins over Server
+        // regardless of position. (mssql-python never sends both — it collapses the
+        // synonym group first — so this only affects direct ODBC callers.)
+        for s in [
+            "Server=srv;Address=addr;UID=u",
+            "Address=addr;Server=srv;UID=u",
+            "Server=srv;Addr=addr;UID=u",
+            "Addr=addr;Server=srv;UID=u",
+        ] {
+            let (p, warn) = parse_connection_string(s).unwrap();
+            assert!(!warn, "input: {s}");
+            assert_eq!(p.server, "addr", "input: {s}");
+        }
+    }
+
+    #[test]
+    fn empty_address_falls_back_to_server() {
+        let (p, warn) = parse_connection_string("Server=srv;Address=;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "srv");
+    }
+
+    #[test]
+    fn server_group_is_first_wins_within_each_spelling() {
+        let (p, _) = parse_connection_string("Server=first;Server=second;UID=u").unwrap();
+        assert_eq!(p.server, "first");
+
+        let (p, _) = parse_connection_string("Address=first;Address=second;UID=u").unwrap();
+        assert_eq!(p.server, "first");
+    }
+
+    #[test]
+    fn string_pass_through_keys_are_stored_verbatim() {
+        let (p, warn) = parse_connection_string(
+            "Server=h;ServerSPN=MSSQLSvc/host:1433;HostnameInCertificate=cn.example.com;ServerCertificate=C:\\certs\\srv.pem;UID=u",
+        )
+        .unwrap();
+        assert!(!warn);
+        assert_eq!(p.server_spn.as_deref(), Some("MSSQLSvc/host:1433"));
+        assert_eq!(
+            p.host_name_in_certificate.as_deref(),
+            Some("cn.example.com")
+        );
+        assert_eq!(p.server_certificate.as_deref(), Some("C:\\certs\\srv.pem"));
+    }
+
+    #[test]
+    fn application_intent_is_validated() {
+        for (val, expected) in [("ReadOnly", "ReadOnly"), ("readwrite", "readwrite")] {
+            let s = format!("Server=h;ApplicationIntent={val};UID=u");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn);
+            assert_eq!(p.application_intent.as_deref(), Some(expected));
+        }
+        let err = parse_connection_string("Server=h;ApplicationIntent=sideways;UID=u").unwrap_err();
+        assert_eq!(err.key, "applicationintent");
+        assert_eq!(err.value, "sideways");
+    }
+
+    #[test]
+    fn multi_subnet_failover_is_yes_no() {
+        let (p, _) = parse_connection_string("Server=h;MultiSubnetFailover=Yes;UID=u").unwrap();
+        assert_eq!(p.multi_subnet_failover, Some(true));
+        let (p, _) = parse_connection_string("Server=h;MultiSubnetFailover=no;UID=u").unwrap();
+        assert_eq!(p.multi_subnet_failover, Some(false));
+        let err = parse_connection_string("Server=h;MultiSubnetFailover=maybe;UID=u").unwrap_err();
+        assert_eq!(err.key, "multisubnetfailover");
+    }
+
+    #[test]
+    fn ip_address_preference_accepts_any_value() {
+        for val in ["IPv4First", "ipv6first", "UsePlatformDefault"] {
+            let s = format!("Server=h;IpAddressPreference={val};UID=u");
+            let (p, warn) = parse_connection_string(&s).unwrap();
+            assert!(!warn);
+            assert_eq!(p.ip_address_preference.as_deref(), Some(val));
+        }
+        // msodbcsql falls back unknown values to IPv4First at connect time rather
+        // than rejecting them at parse; the raw value is stored verbatim here.
+        let (p, warn) = parse_connection_string("Server=h;IpAddressPreference=IPv7;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.ip_address_preference.as_deref(), Some("IPv7"));
+    }
+
+    #[test]
+    fn connect_retry_values_reject_out_of_range() {
+        let err = parse_connection_string("Server=h;ConnectRetryCount=256;UID=u").unwrap_err();
+        assert_eq!(err.key, "connectretrycount");
+        assert_eq!(err.value, "256");
+
+        for bad in ["0", "61"] {
+            let s = format!("Server=h;ConnectRetryInterval={bad};UID=u");
+            let err = parse_connection_string(&s).unwrap_err();
+            assert_eq!(err.key, "connectretryinterval", "interval {bad}");
+        }
+
+        // Boundary values are accepted (count 0..=255, interval 1..=60).
+        let (p, _) =
+            parse_connection_string("Server=h;ConnectRetryCount=0;ConnectRetryInterval=1;UID=u")
+                .unwrap();
+        assert_eq!(p.connect_retry_count, Some(0));
+        assert_eq!(p.connect_retry_interval, Some(1));
+        let (p, _) =
+            parse_connection_string("Server=h;ConnectRetryCount=255;ConnectRetryInterval=60;UID=u")
+                .unwrap();
+        assert_eq!(p.connect_retry_count, Some(255));
+        assert_eq!(p.connect_retry_interval, Some(60));
+    }
+
+    #[test]
+    fn integer_keys_parse_and_reject_non_numeric() {
+        let (p, warn) = parse_connection_string(
+            "Server=h;ConnectRetryCount=3;ConnectRetryInterval=20;KeepAlive=45;KeepAliveInterval=7;PacketSize=8192;UID=u",
+        )
+        .unwrap();
+        assert!(!warn);
+        assert_eq!(p.connect_retry_count, Some(3));
+        assert_eq!(p.connect_retry_interval, Some(20));
+        assert_eq!(p.keep_alive, Some(45));
+        assert_eq!(p.keep_alive_interval, Some(7));
+        assert_eq!(p.packet_size, Some(8192));
+
+        for key in [
+            "ConnectRetryCount",
+            "ConnectRetryInterval",
+            "KeepAlive",
+            "KeepAliveInterval",
+            "PacketSize",
+        ] {
+            let s = format!("Server=h;{key}=lots;UID=u");
+            let err = parse_connection_string(&s).unwrap_err();
+            assert_eq!(err.key, key.to_ascii_lowercase(), "key {key}");
+            assert_eq!(err.value, "lots");
+        }
+    }
+
+    #[test]
+    fn integer_keys_reject_negative_values() {
+        let err = parse_connection_string("Server=h;ConnectRetryCount=-1;UID=u").unwrap_err();
+        assert_eq!(err.key, "connectretrycount");
+        assert_eq!(err.value, "-1");
+    }
+
+    #[test]
+    fn new_keys_are_case_insensitive() {
+        let (p, warn) =
+            parse_connection_string("server=h;APPLICATIONINTENT=ReadOnly;packetsize=512;UID=u")
+                .unwrap();
+        assert!(!warn);
+        assert_eq!(p.application_intent.as_deref(), Some("ReadOnly"));
+        assert_eq!(p.packet_size, Some(512));
+    }
+
+    #[test]
+    fn new_key_first_occurrence_wins() {
+        let (p, warn) =
+            parse_connection_string("Server=h;PacketSize=512;PacketSize=1024;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.packet_size, Some(512));
+    }
+
+    #[test]
+    fn fmt_as_odbc_conn_str_includes_new_keys() {
+        let (p, _) = parse_connection_string(
+            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
+        )
+        .unwrap();
+        let out = p.fmt_as_odbc_conn_str();
+        for expected in [
+            "ApplicationIntent=ReadOnly",
+            "MultiSubnetFailover=yes",
+            "ConnectRetryCount=2",
+            "ConnectRetryInterval=10",
+            "KeepAlive=30",
+            "KeepAliveInterval=1",
+            "PacketSize=4096",
+            "IpAddressPreference=IPv4First",
+            "ServerSPN=svc",
+            "HostnameInCertificate=cn",
+            "ServerCertificate=/tmp/c.pem",
+        ] {
+            assert!(out.contains(expected), "missing {expected} in {out}");
+        }
+    }
+
+    #[test]
+    fn fmt_as_odbc_conn_str_quotes_values_with_delimiters() {
+        let (p, _) = parse_connection_string("Server=h;Database={my;db};UID=u").unwrap();
+        assert_eq!(p.database, "my;db");
+        let out = p.fmt_as_odbc_conn_str();
+        // The `;` in the value would otherwise split the logged pair into two.
+        assert!(
+            out.contains("Database={my;db}"),
+            "delimiter value not brace-quoted in {out}"
+        );
+    }
+
+    #[test]
+    fn quote_odbc_value_wraps_and_escapes() {
+        assert_eq!(quote_odbc_value("plain"), "plain");
+        assert_eq!(quote_odbc_value("a;b"), "{a;b}");
+        assert_eq!(quote_odbc_value("a}b"), "{a}}b}");
+        assert_eq!(quote_odbc_value("k=v"), "{k=v}");
+    }
+
+    #[test]
+    fn unknown_keys_warn_but_never_fail() {
+        let (p, warn) = parse_connection_string("Server=h;TotallyMadeUp=1;UID=u;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.server, "h");
+        assert_eq!(p.uid, "u");
+        assert_eq!(p.pwd, "p");
+    }
+
+    #[test]
+    fn duplicate_recognized_key_first_wins() {
+        let (p, warn) =
+            parse_connection_string("Server=first;Server=second;UID=a;UID=b;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.server, "first");
+        assert_eq!(p.uid, "a");
+    }
+
+    #[test]
+    fn invalid_value_is_hard_error_not_warning() {
+        // Encrypt is a validated key; an invalid value is E_FAIL (Err), not a warning.
+        let err = parse_connection_string("Server=h;UID=u;PWD=p;Encrypt=banana").unwrap_err();
+        assert_eq!(err.key, "encrypt");
+        assert_eq!(err.value, "banana");
+
+        let err = parse_connection_string("Server=h;Trusted_Connection=maybe;UID=u").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+        assert_eq!(err.value, "maybe");
+    }
+
+    #[test]
+    fn value_validation_is_case_insensitive() {
+        let (p, warn) = parse_connection_string("Server=h;Encrypt=STRICT;UID=u").unwrap();
+        assert!(!warn);
+        assert_eq!(p.encrypt.as_deref(), Some("STRICT"));
+
+        let (p, ..) = parse_connection_string("Server=h;TrustServerCertificate=YES;UID=u").unwrap();
+        assert!(p.trust_server_certificate);
+    }
+
+    #[test]
+    fn whitespace_in_validated_value_is_not_trimmed_and_is_invalid() {
+        // msodbcsql validates the value verbatim: `IsAttrStrValid` requires an exact
+        // length match (cchKeyVal == wcslen(OPTIONON)) *and* a case-insensitive content
+        // match, so any surrounding whitespace fails the length gate -> E_FAIL hard stop.
+        // Our `validate_attr` uses `eq_ignore_ascii_case` on the whole value, which
+        // enforces the same length+content check, so the value is never trimmed.
+        for cs in [
+            "Server=h;TrustServerCertificate= Yes;UID=u",
+            "Server=h;TrustServerCertificate=Yes ;UID=u",
+            "Server=h;TrustServerCertificate=\tYes;UID=u",
+        ] {
+            let err = parse_connection_string(cs).unwrap_err();
+            assert_eq!(err.key, "trustservercertificate");
+        }
+
+        // Same rule holds for the other validated keys (Encrypt, Trusted_Connection).
+        let err = parse_connection_string("Server=h;Encrypt= Strict;UID=u").unwrap_err();
+        assert_eq!(err.key, "encrypt");
+        assert_eq!(err.value, " Strict");
+
+        let err = parse_connection_string("Server=h;Trusted_Connection=Yes ").unwrap_err();
+        assert_eq!(err.key, "trusted_connection");
+        assert_eq!(err.value, "Yes ");
+    }
+
+    #[test]
+    fn only_ascii_odbc_whitespace_is_skipped_before_key() {
+        // Tab / newline / CR before a key are skipped like a space.
+        let (p, warn) = parse_connection_string("Server=h;\t\r\nUID=u;PWD=p").unwrap();
+        assert!(!warn);
+        assert_eq!(p.uid, "u");
+
+        // A non-breaking space is NOT ODBC whitespace, so it becomes part of the key.
+        let (p, warn) = parse_connection_string("Server=h;\u{00a0}UID=u;PWD=p").unwrap();
+        assert!(warn);
+        assert_eq!(p.uid, "");
+    }
+
+    #[test]
+    fn empty_and_separator_only_inputs() {
+        // Only a truly empty string exits cleanly (msodbcsql outer-loop guard
+        // `cchAttrStr && *lpsz` is false immediately -> S_OK, no warning).
+        let (p, warn) = parse_connection_string("").unwrap();
+        assert!(!warn, "empty input should not warn");
+        assert_eq!(p.server, "");
+
+        // A string made only of separators / whitespace DOES warn: the skip run
+        // lands on end-of-input, leaving a degenerate empty key with no '=', which
+        // is msodbcsql's line-4320 S_FALSE (01S00). Verified against ODBC Driver 18.
+        for input in [";", ";;;", "   ", " ; ; "] {
+            let (p, warn) = parse_connection_string(input).unwrap();
+            assert!(
+                warn,
+                "input {input:?} should warn (empty key at end-of-input)"
+            );
+            assert_eq!(p.server, "", "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn trailing_separator_run_matches_msodbcsql() {
+        // msodbcsql consumes exactly ONE separator after a value, then re-enters the
+        // parse loop. So a single trailing ';' is clean, but a run of 2+ (or a ';'
+        // followed by whitespace) starts a fresh iteration that finds an empty key
+        // at end-of-input and posts 01S00. Leading and middle separator runs are
+        // always clean because they are followed by a real key. Every case below was
+        // confirmed by direct probing of ODBC Driver 18 (see the e2e parity test).
+
+        // Clean: value at end, single trailing ';', and leading/middle runs.
+        for input in [
+            "Server=host;UID=u;PWD=p",
+            "Server=host;UID=u;PWD=p;",
+            ";;;Server=host;UID=u;PWD=p",
+            "Server=host;;;UID=u;;;PWD=p",
+        ] {
+            let (p, warn) = parse_connection_string(input).unwrap();
+            assert!(!warn, "input {input:?} should not warn");
+            assert_eq!(p.server, "host", "input {input:?}");
+            assert_eq!(p.uid, "u", "input {input:?}");
+            assert_eq!(p.pwd, "p", "input {input:?}");
+        }
+
+        // Warns: a trailing run of 2+ separators, or a trailing ';' + whitespace.
+        for input in [
+            "Server=host;UID=u;PWD=p;;",
+            "Server=host;UID=u;PWD=p;;;",
+            "Server=host;UID=u;PWD=p; ",
+            ";;;Server=host;;;UID=u;;;PWD=p;;;",
+        ] {
+            let (p, warn) = parse_connection_string(input).unwrap();
+            assert!(
+                warn,
+                "input {input:?} should warn on trailing separator run"
+            );
+            assert_eq!(p.server, "host", "input {input:?}");
+            assert_eq!(p.uid, "u", "input {input:?}");
+            assert_eq!(p.pwd, "p", "input {input:?}");
+        }
+    }
+}

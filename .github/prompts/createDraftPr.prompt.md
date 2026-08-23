@@ -2,8 +2,7 @@
 name: createDraftPr
 description: Describe when to use this prompt
 ---
-Using #microsoft/azure-devops-mcp create a DRAFT PR for this branch. The organization is sqlclient drivers, project is mssql-rs, the repository is mssql-rs and target branch is the `development` branch. 
-If the MCP server is not available, then try to use Az CLI. 
+Create a DRAFT GitHub PR for this branch in the `microsoft/mssql-rs` repository, targeting the `main` branch.
 
 Do not use unicode characters or superlatives in the PR description.
 

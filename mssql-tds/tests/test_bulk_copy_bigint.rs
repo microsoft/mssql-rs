@@ -8,7 +8,7 @@ mod bulk_copy_bigint_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
 
@@ -94,8 +94,7 @@ mod bulk_copy_bigint_tests {
                     value3 BIGINT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -141,14 +140,13 @@ mod bulk_copy_bigint_tests {
         client
             .execute(
                 "SELECT COUNT(*) as cnt FROM #BulkCopyTestBigInt".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to count rows");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read count")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read count")
         {
             println!("DEBUG: Actual rows in database: {:?}", row[0]);
         }
@@ -164,15 +162,14 @@ mod bulk_copy_bigint_tests {
             .execute(
                 "SELECT id, value1, value2, value3 FROM #BulkCopyTestBigInt ORDER BY id"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -217,8 +214,7 @@ mod bulk_copy_bigint_tests {
                     value3 BIGINT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -253,16 +249,12 @@ mod bulk_copy_bigint_tests {
 
         // Verify count
         client
-            .execute(
-                "SELECT COUNT(*) FROM #BulkCopyLargeBigInt".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT COUNT(*) FROM #BulkCopyLargeBigInt".to_string(), ())
             .await
             .expect("Failed to select count");
 
-        if let Some(resultset) = client.get_current_resultset()
-            && let Some(row) = resultset.next_row().await.expect("Failed to read row")
+        if client.on_rows()
+            && let Some(row) = client.next_row().await.expect("Failed to read row")
         {
             assert_eq!(row[0], ColumnValues::Int(100));
         }
@@ -281,8 +273,7 @@ mod bulk_copy_bigint_tests {
                     value2 BIGINT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -388,15 +379,14 @@ mod bulk_copy_bigint_tests {
         client
             .execute(
                 "SELECT id, value1, value2 FROM #BulkCopyNullsBigInt ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {
@@ -438,8 +428,7 @@ mod bulk_copy_bigint_tests {
                     value1 BIGINT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -472,8 +461,7 @@ mod bulk_copy_bigint_tests {
                     value2 BIGINT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -592,8 +580,7 @@ mod bulk_copy_bigint_tests {
                     zero_value BIGINT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create test table");
@@ -629,17 +616,13 @@ mod bulk_copy_bigint_tests {
 
         // Verify the extreme values were inserted correctly
         client
-            .execute(
-                "SELECT id, min_value, max_value, zero_value FROM #BulkCopyTestBigIntExtreme ORDER BY id".to_string(),
-                None,
-                None,
-            )
+            .execute("SELECT id, min_value, max_value, zero_value FROM #BulkCopyTestBigIntExtreme ORDER BY id".to_string(), ())
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 match row_count {
                     1 => {

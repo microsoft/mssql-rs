@@ -108,16 +108,18 @@ where
                 len_byte as u32
             };
 
-            // Validate state_len against remaining token data.
-            if bytes_read + state_len > total_length {
+            // Validate state_len against remaining token data. Compare via subtraction
+            // because `bytes_read + state_len` overflows u32 when state_len is large
+            // (state_len is attacker-controlled, up to u32::MAX via the 0xFF extended
+            // encoding). `bytes_read < total_length` is guaranteed by the loop guard.
+            let remaining = total_length - bytes_read;
+            if state_len > remaining {
                 return Err(crate::error::Error::ProtocolError(format!(
                     "SESSIONSTATE: state data length {state_len} exceeds remaining \
-                     token bytes ({} remaining)",
-                    total_length - bytes_read
+                     token bytes ({remaining} remaining)"
                 )));
             }
 
-            // Read state data.
             let mut data = vec![0u8; state_len as usize];
             if state_len > 0 {
                 reader.read_bytes(&mut data).await?;
@@ -297,5 +299,27 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("too short"));
+    }
+
+    #[tokio::test]
+    async fn reject_extended_length_overflow() {
+        // Regression: a 0xFF-encoded state_len near u32::MAX previously triggered
+        // `bytes_read + state_len` overflow in the bounds check.
+        let mut bytes = Vec::new();
+        let total_len: u32 = 11; // bytes after total_length: seq(4) + status(1) + state_id(1) + len_byte(1) + extended_len(4)
+        bytes.extend_from_slice(&total_len.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // sequence_number
+        bytes.push(0x00); // status
+        bytes.push(0x00); // state_id
+        bytes.push(0xFF); // len_byte marker; followed by u32 length
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // extended length = u32::MAX
+        let mut reader = MockReader::new(bytes);
+        let parser = SessionStateTokenParser;
+        let context = ParserContext::default();
+
+        let result = parser.parse(&mut reader, &context).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("exceeds remaining"));
     }
 }

@@ -12,16 +12,19 @@ use crate::connection::connection_actions::{
 use crate::connection::instance_cache::InstanceCache;
 use crate::connection::session_recovery::SessionRecoveryData;
 use crate::connection::tds_client::TdsClient;
+use crate::connection::transport::any_transport::AnyTransport;
 use crate::connection::transport::network_transport;
+#[cfg(fuzzing)]
 use crate::connection::transport::tds_transport::TdsTransport;
 #[cfg(windows)]
 use crate::core::EncryptionSetting;
 use crate::core::{CancelHandle, TdsResult};
 use crate::error::Error::{OperationCancelledError, TimeoutError};
-use crate::error::{Error, TimeoutErrorType};
+use crate::error::{Error, SqlInfoMessage, TimeoutErrorType};
 use crate::handler::handler_factory::HandlerFactory;
 use crate::io::token_stream::GenericTokenParserRegistry;
 use crate::ssrp;
+use crate::token::tokens::SessionStateToken;
 
 #[cfg(fuzzing)]
 use crate::io::token_stream::TdsTokenStreamReader;
@@ -60,14 +63,22 @@ impl TdsConnectionProvider {
             + crate::io::packet_reader::TdsPacketReader
             + 'static,
     {
-        let (transport, negotiated_settings, execution_context) =
-            Self::connect_with_transport(&context, &context.transport_context, transport).await?;
-        Ok(TdsClient::new(
+        let (
+            transport,
+            negotiated_settings,
+            execution_context,
+            info_messages,
+            session_state_tokens,
+        ) = Self::connect_with_transport(&context, &context.transport_context, transport).await?;
+        let mut client = TdsClient::new(
             transport,
             negotiated_settings,
             execution_context,
             context,
-        ))
+            session_state_tokens,
+        );
+        client.extend_info_messages(info_messages);
+        Ok(client)
     }
 
     /// Create a client from a datasource string.
@@ -138,6 +149,22 @@ impl TdsConnectionProvider {
             let mut exec_context = ExecutionContext::new();
             let mut cache_key: Option<(String, String)> = None;
 
+            // Compute the overall login deadline up front. It bounds the
+            // shared-memory shortcut below and the connect/retry loop — the phases
+            // that run the TDS/auth handshake. Name resolution is bounded
+            // separately and is not covered by this deadline: SSRP uses its own
+            // `ssrp_timeout_ms` (default 1s) and LocalDB resolution is a local pipe
+            // lookup. `login_timeout` falls back to `connect_timeout` for callers
+            // that only set the historical single knob; `0` means "no deadline".
+            // `connect_timeout` still bounds each individual TCP-connect attempt,
+            // so an unreachable host fails fast even when the login budget is large
+            // (e.g. interactive sign-in).
+            let login_timeout = context.login_timeout.unwrap_or(context.connect_timeout);
+            let deadline = match login_timeout {
+                1.. => Some(Instant::now() + Duration::from_secs(login_timeout.into())),
+                _ => None,
+            };
+
             // Try Shared Memory before SSRP for local named instances (Windows only).
             // SM doesn't need instance resolution — it uses the name directly.
             // If SM succeeds, we skip SSRP entirely. This matches ODBC/SNI behavior.
@@ -146,10 +173,12 @@ impl TdsConnectionProvider {
                 && let Some(sm_transport) = action_chain.first_shared_memory_transport()
             {
                 debug!("Trying Shared Memory before SSRP");
-                let timeout_duration = match context.connect_timeout {
-                    1.. => Some(Duration::from_secs(context.connect_timeout.into())),
-                    _ => None,
-                };
+                // Bound the shared-memory attempt (which wraps the full TDS/auth
+                // handshake) by the remaining login budget rather than
+                // `connect_timeout`, so interactive sign-in against a local named
+                // instance isn't cancelled after the default 15s.
+                let timeout_duration =
+                    deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
                 let connect_future =
                     Self::connect_with_transport_context(context, &sm_transport, None);
                 let sm_result = match timeout_duration.as_ref() {
@@ -162,16 +191,32 @@ impl TdsConnectionProvider {
                     None => connect_future.await,
                 };
                 match sm_result {
-                    Ok((transport, negotiated_settings, execution_context)) => {
+                    Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                         debug!("Shared Memory connection succeeded, skipping SSRP");
-                        return Ok(TdsClient::new(
+                        let mut client = TdsClient::new(
                             transport,
                             negotiated_settings,
                             execution_context,
                             context.clone(),
-                        ));
+                            session_state_tokens,
+                        );
+                        client.extend_info_messages(info_messages);
+                        return Ok(client);
                     }
                     Err(err) => {
+                        // Only transient (transport-level) shared-memory failures
+                        // fall through to SSRP/TCP. A definitive failure — e.g. the
+                        // user cancelled interactive sign-in (`AuthenticationDenied`)
+                        // or the login was rejected — would recur on every transport,
+                        // and falling through would relaunch the interactive browser.
+                        // Surface it immediately.
+                        if !err.is_transient_connect_error() {
+                            debug!(
+                                "Shared Memory failed permanently ({}), not falling through",
+                                err
+                            );
+                            return Err(err);
+                        }
                         debug!("Shared Memory failed ({}), falling through to SSRP", err);
                     }
                 }
@@ -270,10 +315,6 @@ impl TdsConnectionProvider {
 
             let connect_retry_count = context.connect_retry_count;
             let connect_retry_interval = Duration::from_secs(context.connect_retry_interval.into());
-            let deadline = match context.connect_timeout {
-                1.. => Some(Instant::now() + Duration::from_secs(context.connect_timeout.into())),
-                _ => None,
-            };
 
             let cancellation_token = cancel_handle.map(|handle| handle.cancel_token.child_token());
 
@@ -345,14 +386,17 @@ impl TdsConnectionProvider {
                     // Handle redirections
                     loop {
                         match connection_result {
-                            Ok((transport, negotiated_settings, execution_context)) => {
+                            Ok((transport, negotiated_settings, execution_context, info_messages, session_state_tokens)) => {
                                 debug!("Connection successful via action chain");
-                                return Ok(TdsClient::new(
+                                let mut client = TdsClient::new(
                                     transport,
                                     negotiated_settings,
                                     execution_context,
                                     context.clone(),
-                                ));
+                                    session_state_tokens,
+                                );
+                                client.extend_info_messages(info_messages);
+                                return Ok(client);
                             }
                             Err(Error::Redirection { host, port }) => {
                                 info!("Redirection to: {:?}, {:?}", host, port);
@@ -512,9 +556,11 @@ impl TdsConnectionProvider {
         transport_context: &TransportContext,
         recovery_data: Option<Box<SessionRecoveryData>>,
     ) -> TdsResult<(
-        Box<dyn TdsTransport>,
+        AnyTransport,
         crate::handler::handler_factory::NegotiatedSettings,
         crate::connection::execution_context::ExecutionContext,
+        Vec<SqlInfoMessage>,
+        Vec<SessionStateToken>,
     )> {
         // Create network transport directly
         // Convert connect_timeout from seconds to milliseconds
@@ -537,19 +583,21 @@ impl TdsConnectionProvider {
         };
         let session_result = factory
             .session_handler(transport_context)
-            .execute(&mut *transport)
+            .execute(&mut transport)
             .await;
 
         match session_result {
-            Ok(negotiated_settings) => {
+            Ok((negotiated_settings, info_messages, session_state_tokens)) => {
                 // Create execution context for the new connection
                 let execution_context =
                     crate::connection::execution_context::ExecutionContext::new();
 
                 Ok((
-                    transport as Box<dyn TdsTransport>,
+                    AnyTransport::network(transport),
                     negotiated_settings,
                     execution_context,
+                    info_messages,
+                    session_state_tokens,
                 ))
             }
             Err(err) => {
@@ -569,9 +617,11 @@ impl TdsConnectionProvider {
         transport_context: &TransportContext,
         mut transport: T,
     ) -> TdsResult<(
-        Box<dyn TdsTransport>,
+        AnyTransport,
         crate::handler::handler_factory::NegotiatedSettings,
         crate::connection::execution_context::ExecutionContext,
+        Vec<SqlInfoMessage>,
+        Vec<SessionStateToken>,
     )>
     where
         T: TdsTransport
@@ -590,15 +640,17 @@ impl TdsConnectionProvider {
             .await;
 
         match session_result {
-            Ok(negotiated_settings) => {
+            Ok((negotiated_settings, info_messages, session_state_tokens)) => {
                 // Create execution context for the new connection
                 let execution_context =
                     crate::connection::execution_context::ExecutionContext::new();
 
                 Ok((
-                    Box::new(transport) as Box<dyn TdsTransport>,
+                    AnyTransport::dynamic(transport),
                     negotiated_settings,
                     execution_context,
+                    info_messages,
+                    session_state_tokens,
                 ))
             }
             Err(err) => {
@@ -669,6 +721,53 @@ mod tests {
     #[test]
     fn msf_with_explicit_port_ok() {
         assert!(validate_multi_subnet_failover(true, "", false).is_ok());
+    }
+
+    // ── Shared-memory fall-through policy ──
+
+    /// Both arms of the `Err` branch in the shared-memory shortcut.
+    ///
+    /// That branch is Windows-only and needs a live named instance to reach
+    /// end to end, so the policy it applies is asserted directly here: this is
+    /// the decision that determines whether *every* local named-instance
+    /// connection gets a second chance over TCP.
+    #[cfg(windows)]
+    #[test]
+    fn shared_memory_falls_through_only_on_transient_failures() {
+        use crate::security::SecurityError;
+
+        // Falls through to SSRP/TCP. The shared-memory endpoint was absent or
+        // unresponsive; TCP is a different path and may well succeed.
+        for err in [
+            Error::ConnectionError("shared memory endpoint not found".to_string()),
+            Error::TimeoutError(TimeoutErrorType::String(
+                "Timeout while connecting via Shared Memory".to_string(),
+            )),
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such pipe",
+            )),
+        ] {
+            assert!(
+                err.is_transient_connect_error(),
+                "should retry over TCP: {err}"
+            );
+        }
+
+        // Surfaced immediately. The handshake got far enough to be refused, so
+        // it would be refused identically over TCP — and retrying would raise a
+        // second interactive sign-in prompt for a user who just cancelled one.
+        for err in [
+            Error::Security(SecurityError::AuthenticationDenied(
+                "user cancelled the sign-in".to_string(),
+            )),
+            Error::ProtocolError("unexpected token in login response".to_string()),
+        ] {
+            assert!(
+                !err.is_transient_connect_error(),
+                "should not fall through: {err}"
+            );
+        }
     }
 
     // ── Connection retry tests ──

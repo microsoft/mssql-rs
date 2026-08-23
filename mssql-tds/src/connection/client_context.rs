@@ -80,6 +80,45 @@ pub enum VectorVersion {
     V2,
 }
 
+/// Controls the Always Encrypted (column encryption) behavior for a connection.
+///
+/// When `Enabled`, the client negotiates the Column Encryption (TCE) feature during
+/// login, transparently encrypts parameters targeting encrypted columns, and decrypts
+/// encrypted result columns. When `Disabled` (the default), the feature is not
+/// negotiated and the connection behaves as if Always Encrypted is unavailable.
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
+pub enum ColumnEncryptionSetting {
+    /// Always Encrypted is disabled. The TCE feature is not requested. (Default.)
+    #[default]
+    Disabled,
+    /// Always Encrypted is enabled. The TCE feature is negotiated during login.
+    Enabled,
+}
+
+/// Per-execution override of the connection's Always Encrypted behavior.
+///
+/// A command may override the connection-level [`ColumnEncryptionSetting`] for a
+/// single execution. The default, [`UseConnectionSetting`](Self::UseConnectionSetting),
+/// inherits the connection's behavior. The override only has effect when the
+/// server acknowledged the Column Encryption feature during login (which only
+/// happens when the connection requested [`ColumnEncryptionSetting::Enabled`]).
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
+pub enum ExecutionColumnEncryptionSetting {
+    /// Inherit the connection's [`ColumnEncryptionSetting`]. (Default.)
+    #[default]
+    UseConnectionSetting,
+    /// Encrypt parameters targeting encrypted columns and decrypt encrypted
+    /// result columns for this command.
+    Enabled,
+    /// Decrypt encrypted result columns but send parameters unencrypted. Useful
+    /// when a command reads encrypted columns but its parameters do not target
+    /// any encrypted column.
+    ResultSetOnly,
+    /// Disable Always Encrypted for this command: parameters are sent
+    /// unencrypted and result columns are not decrypted.
+    Disabled,
+}
+
 /// Provides a trait for creating Entra ID tokens.
 #[async_trait]
 pub trait EntraIdTokenFactory: Send + Sync {
@@ -105,6 +144,10 @@ where
         Box::new(self.clone())
     }
 }
+
+/// Default connection timeout in seconds, and the value the ODBC layer reports
+/// for `SQL_ATTR_LOGIN_TIMEOUT` when the application has not set one.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 15;
 
 /// Authentication method for the TDS connection.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
@@ -186,7 +229,17 @@ pub struct ClientContext {
     /// Note: Not yet implemented internally - this field is reserved for future use.
     pub connect_retry_interval: u32,
     /// Connection timeout in seconds.
+    ///
+    /// Bounds each individual TCP-connect attempt (the network reach), not the
+    /// whole login. See [`Self::login_timeout`] for the overall login deadline.
+    /// Defaults to [`DEFAULT_CONNECT_TIMEOUT_SECS`].
     pub connect_timeout: u32,
+    /// Overall login deadline in seconds, covering the network connect, the TDS
+    /// handshake, and any auth token acquisition (e.g. the interactive browser
+    /// flow). `None` falls back to [`Self::connect_timeout`] (preserving the
+    /// historical single-knob behavior); `Some(0)` disables the deadline (wait
+    /// indefinitely). Maps to the ODBC `SQL_ATTR_LOGIN_TIMEOUT` attribute.
+    pub login_timeout: Option<u32>,
     /// Initial database catalog.
     pub database: String,
     /// The original data source string used to create this connection.
@@ -253,6 +306,38 @@ pub struct ClientContext {
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
+    /// Always Encrypted (column encryption) setting for the connection.
+    /// Default: [`ColumnEncryptionSetting::Disabled`].
+    pub column_encryption_setting: ColumnEncryptionSetting,
+    /// Registry of column master key store providers used to unwrap column
+    /// encryption keys for Always Encrypted. Empty by default.
+    pub(crate) column_encryption_key_store_providers:
+        std::sync::Arc<crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry>,
+    /// Cache of decrypted column encryption keys, shared across the connection
+    /// (and its session-recovery clones) so a CMK only unwraps a CEK once.
+    pub(crate) cek_cache: std::sync::Arc<crate::security::keystore::CekCache>,
+    /// Per-server allow-list of trusted column master key (CMK) paths for Always
+    /// Encrypted, keyed by server name (case-insensitive). When a non-empty list
+    /// is configured for the connected server, the driver only unwraps a column
+    /// encryption key whose CMK path is in the list, defending against a
+    /// malicious server that points the client at an attacker-controlled CMK. A
+    /// server with no entry (or an empty list) is unrestricted.
+    ///
+    /// `None` (unrestricted) by default. Boxed behind an `Option` so the common
+    /// case — connections that never opt into trusted paths — costs a single
+    /// pointer (8 bytes) instead of an inline 48-byte `HashMap`. (An
+    /// `Option<HashMap>` alone would not shrink: the map's internal non-null
+    /// pointer gives `Option` a free niche, so it stays 48 bytes — the `Box` is
+    /// what buys the reduction.) Keeping this by-value field small keeps the
+    /// `ClientContext`-carrying connect future off the `clippy::large_futures`
+    /// budget.
+    //
+    // The `#[allow]` is deliberate: `clippy::box_collection` flags `Box<HashMap>`
+    // as redundant heap-on-heap, but here the boxing is the whole point — it
+    // moves the map's 48-byte inline control block off the by-value
+    // `ClientContext` so the connect future stays small.
+    #[allow(clippy::box_collection)]
+    pub(crate) trusted_master_key_paths: Option<Box<HashMap<String, Vec<String>>>>,
     /// UserAgent telemetry payload components.
     pub user_agent: UserAgent,
 }
@@ -299,6 +384,81 @@ impl UserAgent {
 }
 
 impl ClientContext {
+    /// Registers a column master key store provider used to unwrap column
+    /// encryption keys for Always Encrypted.
+    ///
+    /// `name` is matched case-insensitively against the `key_store_name`
+    /// carried in the result-set CEK table (for example
+    /// `MSSQL_CERTIFICATE_STORE`). Register providers before creating the
+    /// client so they are available for the first encrypted query or bulk copy.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use mssql_tds::security::RsaKeyStoreProvider;
+    ///
+    /// let mut provider = RsaKeyStoreProvider::new();
+    /// provider.add_key_from_pem("CurrentUser/My/<thumbprint>", pem_bytes)?;
+    ///
+    /// let mut context = ClientContext::with_data_source("tcp:localhost,1433");
+    /// context.register_column_encryption_key_store_provider(
+    ///     "MSSQL_CERTIFICATE_STORE",
+    ///     Arc::new(provider),
+    /// );
+    /// ```
+    pub fn register_column_encryption_key_store_provider(
+        &mut self,
+        name: impl AsRef<str>,
+        provider: std::sync::Arc<dyn crate::security::ColumnEncryptionKeyStoreProvider>,
+    ) {
+        std::sync::Arc::make_mut(&mut self.column_encryption_key_store_providers)
+            .register(name, provider);
+    }
+
+    /// Registers the allow-list of trusted column master key (CMK) paths for
+    /// `server_name`, enabling the Always Encrypted trusted-master-key-path
+    /// check for that server.
+    ///
+    /// When a non-empty list is registered for the connected server, the driver
+    /// only unwraps a column encryption key whose CMK path matches one of the
+    /// listed paths (compared case-insensitively); any other path is rejected.
+    /// This defends against a compromised or malicious server that points the
+    /// client at an attacker-controlled column master key. A server with no
+    /// registered list (or an empty list) is unrestricted, so this is a
+    /// per-server opt-in, matching .NET
+    /// `SqlConnection.ColumnEncryptionTrustedMasterKeyPaths`.
+    ///
+    /// `server_name` is matched case-insensitively against the connected
+    /// server's name (the host portion of the data source).
+    pub fn register_trusted_master_key_paths(
+        &mut self,
+        server_name: impl AsRef<str>,
+        key_paths: Vec<String>,
+    ) {
+        self.trusted_master_key_paths
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .insert(server_name.as_ref().to_ascii_uppercase(), key_paths);
+    }
+
+    /// Returns the trusted column master key path allow-list configured for the
+    /// currently connected server, or an empty slice when the server is
+    /// unrestricted (no list registered, or none registered at all). An empty
+    /// slice means "no restriction".
+    pub(crate) fn trusted_key_paths_for_current_server(&self) -> &[String] {
+        let Some(paths) = self
+            .trusted_master_key_paths
+            .as_ref()
+            .filter(|paths| !paths.is_empty())
+        else {
+            return &[];
+        };
+        let server = self
+            .transport_context
+            .get_server_name()
+            .to_ascii_uppercase();
+        paths.get(&server).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Creates a new ClientContext with the specified data source.
     /// The data source is mandatory for establishing a connection.
     ///
@@ -317,7 +477,8 @@ impl ClientContext {
             change_password: "".to_string(),
             connect_retry_count: 1,
             connect_retry_interval: 10,
-            connect_timeout: 15,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT_SECS,
+            login_timeout: None,
             database: "".to_string(),
             data_source: data_source.to_string(),
             keep_alive_in_ms: 30_000, // 30 seconds (SQL Server default)
@@ -351,6 +512,12 @@ impl ClientContext {
                 instance_name: None,
             },
             vector_version: VectorVersion::V2,
+            column_encryption_setting: ColumnEncryptionSetting::Disabled,
+            column_encryption_key_store_providers: std::sync::Arc::new(
+                crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
+            ),
+            cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
+            trusted_master_key_paths: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -372,7 +539,8 @@ impl ClientContext {
             change_password: "".to_string(),
             connect_retry_count: 1,
             connect_retry_interval: 10,
-            connect_timeout: 15,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT_SECS,
+            login_timeout: None,
             database: "".to_string(),
             data_source: "".to_string(),
             keep_alive_in_ms: 30_000, // 30 seconds (SQL Server default)
@@ -406,6 +574,12 @@ impl ClientContext {
                 instance_name: None,
             },
             vector_version: VectorVersion::V2,
+            column_encryption_setting: ColumnEncryptionSetting::Disabled,
+            column_encryption_key_store_providers: std::sync::Arc::new(
+                crate::security::keystore::ColumnEncryptionKeyStoreProviderRegistry::new(),
+            ),
+            cek_cache: std::sync::Arc::new(crate::security::keystore::CekCache::new()),
+            trusted_master_key_paths: None,
             user_agent: UserAgent::default(),
         }
     }
@@ -466,7 +640,10 @@ impl ClientContext {
         IntegratedAuthConfig {
             server_spn: self.server_spn.clone(),
             security_package: Default::default(),
-            channel_bindings: None, // Set during TLS handshake
+            // Populated post-handshake in `send_login7_request` from the TLS
+            // engine's channel binding token (see
+            // `NetworkWriter::channel_binding_token`).
+            channel_bindings: None,
             is_loopback,
         }
     }
@@ -608,6 +785,7 @@ impl Clone for ClientContext {
             connect_retry_count: self.connect_retry_count,
             connect_retry_interval: self.connect_retry_interval,
             connect_timeout: self.connect_timeout,
+            login_timeout: self.login_timeout,
             database: self.database.clone(),
             data_source: self.data_source.clone(),
             keep_alive_in_ms: self.keep_alive_in_ms,
@@ -637,6 +815,12 @@ impl Clone for ClientContext {
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
+            column_encryption_setting: self.column_encryption_setting,
+            column_encryption_key_store_providers: self
+                .column_encryption_key_store_providers
+                .clone(),
+            cek_cache: self.cek_cache.clone(),
+            trusted_master_key_paths: self.trusted_master_key_paths.clone(),
             user_agent: self.user_agent.clone(),
         }
     }
@@ -951,6 +1135,7 @@ mod tests {
         assert_eq!(ctx.data_source, "tcp:myserver,1433");
         // Other defaults should still be set
         assert_eq!(ctx.connect_timeout, 15);
+        assert_eq!(ctx.login_timeout, None);
         assert_eq!(ctx.packet_size, 8000);
         assert_eq!(ctx.application_name, "TDSX Rust Client");
     }
@@ -969,6 +1154,32 @@ mod tests {
         let ctx = ClientContext::with_data_source("tcp:myserver,1433");
         let cloned = ctx.clone();
         assert_eq!(cloned.data_source, "tcp:myserver,1433");
+    }
+
+    #[test]
+    fn trusted_master_key_paths_are_per_server_and_case_insensitive() {
+        let mut ctx = ClientContext::with_data_source("tcp:myserver,1433");
+        let _ = ctx.parse_datasource("tcp:myserver,1433");
+
+        // No configuration at all: the current server is unrestricted.
+        assert!(ctx.trusted_key_paths_for_current_server().is_empty());
+
+        // A list configured for a different server leaves this one unrestricted.
+        ctx.register_trusted_master_key_paths("otherserver", vec!["p".to_string()]);
+        assert!(ctx.trusted_key_paths_for_current_server().is_empty());
+
+        // A list for this server (registered with different casing) applies.
+        ctx.register_trusted_master_key_paths("MYSERVER", vec!["path/a".to_string()]);
+        assert_eq!(
+            ctx.trusted_key_paths_for_current_server(),
+            &["path/a".to_string()]
+        );
+
+        // Cloning preserves the configuration.
+        assert_eq!(
+            ctx.clone().trusted_key_paths_for_current_server(),
+            &["path/a".to_string()]
+        );
     }
 
     #[test]

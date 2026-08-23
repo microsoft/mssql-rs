@@ -1,0 +1,59 @@
+[package]
+name = "mssql-odbc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "msodbcsql18"
+crate-type = ["cdylib"]
+
+[dependencies]
+mssql-tds = { path = "../mssql-tds" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tracing = { version = "0.1.43", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+# The azure SDK only ships a rustls-based reqwest transport (its `reqwest_rustls`
+# default), which drags in the vulnerable `ring` crate. Disable those defaults and
+# force reqwest onto native-tls (OpenSSL/Schannel), matching mssql-tds's TLS stack.
+azure_identity = { version = "1.0", default-features = false, features = ["tokio"] }
+azure_core = { version = "1.1", default-features = false, features = [
+    "reqwest",
+    "reqwest_deflate",
+    "reqwest_gzip",
+    "tokio",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
+url = "2"
+# Collision-resistant digest for the Entra credential cache key (AB#46409) —
+# a plain SipHash/DefaultHasher digest is only DoS-resistant, not designed to
+# make two different secrets un-collidable, and a collision would let a new
+# connection silently reuse a stale cached credential built from a different
+# secret.
+sha2 = "0.11.0"
+
+# `ActiveDirectoryInteractive` delegates the sign-in UI to `mssql-auth.dll`
+# (OneAuth), the same library msodbcsql loads. The `windows` crate supplies the
+# loader, COM apartment, and message-pump entry points that hosting its window
+# requires; mssql-tds already depends on it at the same version.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# Enable the `test-util` feature on mssql-tds so unit tests can build a
+# `TdsClient` driven by scripted TDS tokens (see `mssql_tds::test_client_support`)
+# to cover client-driven ODBC paths without a live server.
+mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
+# Matches the version mssql-tds resolves (workspace lock: 1.x) so the `Uuid`
+# type in tests is the same crate instance as `ColumnValues::Uuid`.
+uuid = "1"
+
+[build-dependencies]

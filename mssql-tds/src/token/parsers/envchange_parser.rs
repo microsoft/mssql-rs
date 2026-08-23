@@ -174,10 +174,11 @@ where
                 EnvChangeContainer::from((old_descriptor, new_descriptor))
             }
             EnvChangeTokenSubType::DatabaseMirroringPartner => {
-                return Err(crate::error::Error::UnimplementedFeature {
-                    feature: "DatabaseMirroringPartner".to_string(),
-                    context: "EnvChange token parsing not yet implemented".to_string(),
-                });
+                // MS-TDS 2.2.7.9: the new value carries the mirroring/failover
+                // partner server name as a B_VARCHAR; the old value is empty.
+                let new_value = reader.read_varchar_u8_length().await?;
+                let old_value = reader.read_varchar_u8_length().await?;
+                EnvChangeContainer::from((old_value, new_value))
             }
             EnvChangeTokenSubType::PromoteTransaction => {
                 return Err(crate::error::Error::UnimplementedFeature {
@@ -378,6 +379,41 @@ mod tests {
                     EnvChangeContainer::String(value_pair) => {
                         assert_eq!(value_pair.new_value(), "UTF8");
                         assert_eq!(value_pair.old_value(), "ASCII");
+                    }
+                    _ => panic!("Expected String container"),
+                }
+            }
+            _ => panic!("Expected EnvChange token"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_database_mirroring_partner_change() {
+        // Sent during login for mirrored/AlwaysOn databases: new value carries the
+        // partner server name, old value is empty. See issue microsoft/mssql-python#600.
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_varchar_u8("partner.contoso.com"));
+        body.extend_from_slice(&encode_varchar_u8(""));
+        let data = build_envchange_token(
+            EnvChangeTokenSubType::DatabaseMirroringPartner.as_u8(),
+            body,
+        );
+
+        let mut reader = MockReader::new(data);
+        let parser = EnvChangeTokenParser::default();
+        let context = ParserContext::default();
+        let result = parser.parse(&mut reader, &context).await.unwrap();
+
+        match result {
+            Tokens::EnvChange(token) => {
+                assert_eq!(
+                    token.sub_type,
+                    EnvChangeTokenSubType::DatabaseMirroringPartner
+                );
+                match token.change_type {
+                    EnvChangeContainer::String(value_pair) => {
+                        assert_eq!(value_pair.new_value(), "partner.contoso.com");
+                        assert_eq!(value_pair.old_value(), "");
                     }
                     _ => panic!("Expected String container"),
                 }
@@ -898,28 +934,6 @@ mod tests {
         match result {
             Err(crate::error::Error::UnimplementedFeature { feature, .. }) => {
                 assert_eq!(feature, "UnicodeDataSortingComparisonFlags");
-            }
-            _ => panic!("Expected UnimplementedFeature error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_parse_unimplemented_database_mirroring_partner() {
-        let body = Vec::new();
-        let data = build_envchange_token(
-            EnvChangeTokenSubType::DatabaseMirroringPartner.as_u8(),
-            body,
-        );
-
-        let mut reader = MockReader::new(data);
-        let parser = EnvChangeTokenParser::default();
-        let context = ParserContext::default();
-        let result = parser.parse(&mut reader, &context).await;
-
-        assert!(result.is_err());
-        match result {
-            Err(crate::error::Error::UnimplementedFeature { feature, .. }) => {
-                assert_eq!(feature, "DatabaseMirroringPartner");
             }
             _ => panic!("Expected UnimplementedFeature error"),
         }

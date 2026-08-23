@@ -5,6 +5,7 @@ use bitflags::bitflags;
 
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
+use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sqltypes::SqlType;
 use crate::{
     core::TdsResult,
@@ -13,6 +14,15 @@ use crate::{
     io::packet_writer::{PacketWriter, TdsPacketWriter},
     token::tokens::SqlCollation,
 };
+
+/// Maximum byte length sent inline (non-PLP) for a BIGVARBINARY value; longer
+/// ciphertexts use PLP chunked encoding. Mirrors JDBC
+/// `DataTypes.SHORT_VARTYPE_MAX_BYTES`.
+const SHORT_VARTYPE_MAX_BYTES: usize = 8000;
+
+/// PLP length sentinel written as the BIGVARBINARY max length for values that
+/// exceed [`SHORT_VARTYPE_MAX_BYTES`]. Mirrors JDBC `DataTypes.SQL_USHORTVARMAXLEN`.
+const SQL_USHORTVARMAXLEN: u16 = 0xFFFF;
 
 bitflags! {
     /// TDS RPC parameter status flags.
@@ -36,6 +46,100 @@ bitflags! {
     }
 }
 
+/// Cipher metadata for an encrypted RPC parameter.
+///
+/// Written as the `CryptoMetaData` block following an encrypted parameter's
+/// value in an RPC request (MS-TDS 2.2.6.6). These fields are populated from
+/// the results of `sp_describe_parameter_encryption`. Mirrors JDBC
+/// `writeCryptoMetaData`.
+#[derive(Debug, Clone)]
+pub(crate) struct RpcEncryptionMetadata {
+    /// Cipher algorithm id (`0x02` = `AEAD_AES_256_CBC_HMAC_SHA256`, see
+    /// `AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID`).
+    pub(crate) cipher_algorithm_id: u8,
+    /// Encryption type (`1` = deterministic, `2` = randomized).
+    pub(crate) encryption_type: u8,
+    /// Database id of the column encryption key.
+    pub(crate) database_id: i32,
+    /// Column encryption key id.
+    pub(crate) cek_id: i32,
+    /// Column encryption key version.
+    pub(crate) cek_version: i32,
+    /// Column encryption key metadata version (8 bytes).
+    pub(crate) cek_md_version: [u8; 8],
+    /// Normalization rule version (currently `1`).
+    pub(crate) normalization_rule_version: u8,
+}
+
+/// Precision and scale for a parameter whose value cannot carry them.
+///
+/// A `None`-valued `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`
+/// has no value to read precision and scale from, so a typed NULL would
+/// otherwise fall back to the TDS defaults. Supplying this metadata drives both
+/// the SQL declaration text and the wire `TYPE_INFO`, so the two cannot
+/// disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RpcTypeMetadata {
+    /// Decimal/numeric precision.
+    pub precision: Option<u8>,
+    /// Decimal/numeric or temporal scale.
+    pub scale: Option<u8>,
+}
+
+/// An encrypted RPC parameter value: the ciphertext (or `None` for an encrypted
+/// NULL) plus the cipher metadata the server needs to decrypt it.
+#[derive(Debug, Clone)]
+pub(crate) struct EncryptedRpcValue {
+    /// Ciphertext bytes, or `None` for a NULL value.
+    pub(crate) ciphertext: Option<Vec<u8>>,
+    /// Cipher metadata describing how the value was encrypted.
+    pub(crate) metadata: RpcEncryptionMetadata,
+}
+
+/// Wire-type selector for a data-at-execution (streamed) PLP parameter.
+///
+/// Limited to the MAX types, whose TYPE_INFO is fully determined by the variant
+/// itself and whose value body is plain PLP framing: unknown-length opener,
+/// length-prefixed chunks, terminator. That is what lets the parameter header be
+/// written before the total value length is known. Callers buffer any other type
+/// and send it materialized.
+///
+/// TODO: extend to the remaining PLP types (`xml`, `json`, `udt`, `text`, `ntext`,
+/// `image`) for parity with the incremental read path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamedSqlType {
+    /// Unicode MAX text.
+    NVarcharMax,
+    /// Single-byte MAX text.
+    VarcharMax,
+    /// MAX binary data.
+    VarBinaryMax,
+}
+
+impl StreamedSqlType {
+    /// Declaration name for the `sp_executesql` `@params` string. Delegates to
+    /// [`RpcParameter::get_sql_name_impl`] on the equivalent materialized
+    /// [`SqlType`] rather than duplicating the `nvarchar(MAX)` / `varchar(MAX)`
+    /// / `varbinary(MAX)` strings, so the two can't drift apart.
+    fn sql_name(self) -> TdsResult<String> {
+        RpcParameter::get_sql_name_impl(&self.as_sql_type(), None)
+    }
+
+    fn as_sql_type(self) -> SqlType {
+        match self {
+            Self::NVarcharMax => SqlType::NVarcharMax(None),
+            Self::VarcharMax => SqlType::VarcharMax(None),
+            Self::VarBinaryMax => SqlType::VarBinaryMax(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RpcValue {
+    Materialized(SqlType),
+    Streamed(StreamedSqlType),
+}
+
 /// A single parameter in a TDS RPC request.
 ///
 /// Construct with [`RpcParameter::new`], supplying an optional name, status
@@ -54,7 +158,24 @@ pub struct RpcParameter {
 
     /// The data type and value of the parameter.
     ///  This is used to determine how to serialize the value.
-    value: SqlType,
+    value: RpcValue,
+
+    /// Precision/scale for a value template that cannot carry them itself.
+    /// Applied to both the SQL declaration and the wire `TYPE_INFO`.
+    type_metadata: Option<RpcTypeMetadata>,
+
+    /// When present, the parameter is sent encrypted (Always Encrypted): the
+    /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
+    /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
+    encrypted: Option<EncryptedRpcValue>,
+
+    /// When `true`, the caller requires this parameter to be encrypted: if
+    /// `sp_describe_parameter_encryption` reports the target column as not
+    /// encrypted (or Always Encrypted is not enabled for the command), the
+    /// driver fails rather than sending the value as plaintext. Mirrors .NET
+    /// `SqlParameter.ForceColumnEncryption`; a client-side directive that is
+    /// never sent on the wire.
+    force_column_encryption: bool,
 }
 
 impl RpcParameter {
@@ -63,26 +184,122 @@ impl RpcParameter {
         Self {
             name,
             options,
-            value,
+            value: RpcValue::Materialized(value),
+            type_metadata: None,
+            encrypted: None,
+            force_column_encryption: false,
         }
+    }
+
+    /// Creates a data-at-execution (streamed) RPC parameter.
+    pub fn data_at_exec(
+        name: Option<String>,
+        options: StatusFlags,
+        sql_type: StreamedSqlType,
+    ) -> Self {
+        Self {
+            name,
+            options,
+            value: RpcValue::Streamed(sql_type),
+            type_metadata: None,
+            encrypted: None,
+            force_column_encryption: false,
+        }
+    }
+
+    /// Returns `true` if this parameter's value is supplied via the
+    /// data-at-execution (streamed) path.
+    pub(crate) fn is_data_at_exec(&self) -> bool {
+        matches!(self.value, RpcValue::Streamed(_))
+    }
+
+    /// Returns a usage error if any parameter in `params` is data-at-execution
+    /// (streamed). Call from every public entry point that accepts
+    /// [`RpcParameter`]s other than
+    /// [`TdsClient::begin_sp_executesql`](crate::connection::tds_client::TdsClient::begin_sp_executesql),
+    /// which is the only method that understands the streamed lifecycle —
+    /// every other path would otherwise either panic (see [`RpcParameter::value`])
+    /// or serialize a parameter header with no value body and desync the
+    /// connection.
+    pub(crate) fn reject_data_at_exec<'p>(
+        params: impl IntoIterator<Item = &'p RpcParameter>,
+    ) -> TdsResult<()> {
+        if params.into_iter().any(RpcParameter::is_data_at_exec) {
+            return Err(Error::UsageError(
+                "Data-at-execution parameters require begin_sp_executesql.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Supplies precision/scale for a value template that cannot carry them —
+    /// a typed NULL `Decimal`/`Numeric` or `Time`/`DateTime2`/`DateTimeOffset`.
+    ///
+    /// The same metadata drives the SQL declaration and the wire `TYPE_INFO`,
+    /// so a caller cannot declare `decimal(12,3)` while sending `NUMERIC(1,0)`.
+    pub fn with_type_metadata(mut self, metadata: RpcTypeMetadata) -> Self {
+        self.type_metadata = Some(metadata);
+        self
+    }
+
+    pub(crate) fn sql_declaration(&self) -> TdsResult<String> {
+        match &self.value {
+            RpcValue::Materialized(value) => Self::get_sql_name(value, self.type_metadata),
+            RpcValue::Streamed(streamed) => streamed.sql_name(),
+        }
+    }
+
+    /// Requires this parameter to be encrypted under Always Encrypted.
+    ///
+    /// When set, the driver fails with a usage error if the server reports the
+    /// target column as not encrypted, or if Always Encrypted is not enabled for
+    /// the command — instead of silently sending the value as plaintext. This
+    /// defends against a compromised or misconfigured server downgrading a
+    /// parameter to harvest its plaintext. Mirrors .NET
+    /// `SqlParameter.ForceColumnEncryption`.
+    pub fn with_force_column_encryption(mut self, force: bool) -> Self {
+        self.force_column_encryption = force;
+        self
+    }
+
+    /// Returns `true` if the caller required this parameter to be encrypted.
+    pub(crate) fn force_column_encryption(&self) -> bool {
+        self.force_column_encryption
     }
 
     /// Get the SQL type name from a SqlType value for use in parameter declarations.
     /// This is used to build the parameter list string for sp_executesql and sp_prepare.
+    ///
+    /// `metadata` supplies precision/scale for a value template that cannot
+    /// carry them itself (a typed NULL `decimal`, `time`, ...); pass `None` when
+    /// the value speaks for itself.
+    ///
+    /// Returns [`Error::ImplementationError`] if the `SqlType` maps to a [`TdsDataType`]
+    /// variant that has no SQL declaration name (see [`TdsDataType::get_meta_type_name`]).
     #[cfg(fuzzing)]
-    pub fn get_sql_name(value: &SqlType) -> String {
-        Self::get_sql_name_impl(value)
+    pub fn get_sql_name(value: &SqlType, metadata: Option<RpcTypeMetadata>) -> TdsResult<String> {
+        Self::get_sql_name_impl(value, metadata)
     }
 
     #[cfg(not(fuzzing))]
-    pub(crate) fn get_sql_name(value: &SqlType) -> String {
-        Self::get_sql_name_impl(value)
+    pub(crate) fn get_sql_name(
+        value: &SqlType,
+        metadata: Option<RpcTypeMetadata>,
+    ) -> TdsResult<String> {
+        Self::get_sql_name_impl(value, metadata)
     }
 
-    fn get_sql_name_impl(value: &SqlType) -> String {
+    fn get_sql_name_impl(value: &SqlType, metadata: Option<RpcTypeMetadata>) -> TdsResult<String> {
+        // Table-valued parameters are declared by their schema-qualified table
+        // type name with the mandatory `READONLY` suffix, not via a base TDS
+        // type name (which `get_meta_type_name` would reject for `SqlTable`).
+        if let SqlType::Table(type_name, _) = value {
+            return Ok(Self::format_tvp_sql_name(type_name));
+        }
+
         // For nullable types, we need to check the actual datatype to derive the name.
         let tds_type = TdsDataType::from(value);
-        let type_name = tds_type.get_meta_type_name();
+        let type_name = tds_type.get_meta_type_name()?;
 
         let len_in_metadata = match value {
             SqlType::NVarcharMax(_) | SqlType::VarBinaryMax(_) | SqlType::VarcharMax(_) => {
@@ -107,40 +324,57 @@ impl RpcParameter {
                 // For binary types, we need to send the length.
                 len.to_string()
             }
+            SqlType::Char(_, len) | SqlType::NChar(_, len) => {
+                // For Char and NChar, send the declared length as `char(N)` / `nchar(N)`.
+                len.to_string()
+            }
             SqlType::Time(time) => {
                 // For time, we need to send the scale as the length.
-                match time {
+                match (metadata.and_then(|m| m.scale), time) {
+                    (Some(scale), _) => scale.to_string(),
                     // If the time is not specified, we assume the default scale.
                     // This is a common case for time types.
-                    Some(time) => time.get_scale().to_string(),
+                    (None, Some(time)) => time.get_scale().to_string(),
                     _ => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for Time
                 }
             }
             SqlType::DateTime2(datetime2) => {
                 // For DateTime2, we need to send the scale as the length.
-                match datetime2 {
-                    Some(val) => val.time.get_scale().to_string(),
-                    None => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTime2
+                match (metadata.and_then(|m| m.scale), datetime2) {
+                    (Some(scale), _) => scale.to_string(),
+                    (None, Some(val)) => val.time.get_scale().to_string(),
+                    _ => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTime2
                 }
             }
             SqlType::DateTimeOffset(datetimeoffset) => {
                 // For DateTimeoffset, we need to send the scale as the length.
-                match datetimeoffset {
-                    Some(val) => val.datetime2.time.get_scale().to_string(),
-                    None => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTimeOffset
+                match (metadata.and_then(|m| m.scale), datetimeoffset) {
+                    (Some(scale), _) => scale.to_string(),
+                    (None, Some(val)) => val.datetime2.time.get_scale().to_string(),
+                    _ => DEFAULT_VARTIME_SCALE.to_string(), // Default scale for DateTimeOffset
                 }
             }
             SqlType::Decimal(value) | SqlType::Numeric(value) => {
                 // For Decimal and Numeric, we need to send the precision and scale as the length.
                 // The format is "precision,scale".
-                match value {
-                    Some(parts) => {
+                match (metadata, value) {
+                    (
+                        Some(RpcTypeMetadata {
+                            precision: Some(p),
+                            scale,
+                        }),
+                        _,
+                    ) => {
+                        format!("{},{}", p, scale.unwrap_or(0))
+                    }
+                    (_, Some(parts)) => {
                         format!("{},{}", parts.precision, parts.scale)
                     }
-                    None => "18, 10".to_string(), // Default precision and scale
+                    _ => "18, 10".to_string(), // Default precision and scale
                 }
             }
-            // `vector(N)` implies the float32 base type; float16 must be spelled out.
+            // `vector(N)` implies the float32 base type; float16 must be spelled
+            // out explicitly (msodbcsql `Sql/Ntdbms/sqlncli/odbc/sqlccmd.cpp`).
             SqlType::Vector(_, dims, base_type) => match base_type {
                 VectorBaseType::Float32 => dims.to_string(),
                 VectorBaseType::Float16 => format!("{dims}, float16"),
@@ -149,10 +383,22 @@ impl RpcParameter {
         };
 
         if len_in_metadata.is_empty() {
-            type_name.to_string()
+            Ok(type_name.to_string())
         } else {
-            format!("{type_name}({len_in_metadata})").to_string()
+            Ok(format!("{type_name}({len_in_metadata})"))
         }
+    }
+
+    /// Formats a table-valued parameter's declaration name for `sp_executesql`,
+    /// e.g. `[dbo].[MyType] READONLY`.
+    ///
+    /// The schema defaults to `dbo` when unspecified (SQL Server's default
+    /// schema). The catalog/database part is intentionally omitted: SQL Server
+    /// forbids cross-database TVP types in parameter declarations. The
+    /// `READONLY` suffix is mandatory for TVP parameters.
+    fn format_tvp_sql_name(type_name: &TvpTypeName) -> String {
+        let schema = type_name.schema_name.as_deref().unwrap_or("dbo");
+        format!("[{schema}].[{}] READONLY", type_name.type_name)
     }
 
     /// Serializes the RPC parameter into the provided `PacketWriter`.
@@ -197,26 +443,226 @@ impl RpcParameter {
             }
         }
 
+        // Data-at-execution: the value is streamed later in chunks. Reuse the
+        // exact opening the atomic PLP path emits — status byte and TYPE_INFO —
+        // and stop *before* the PLP length field. The length field (the
+        // unknown-length opener `PLP_UNKNOWN_LEN`, or `PLP_NULL`), the value
+        // chunks and the terminator are written afterwards by the streaming
+        // driver. Deferring the length field is what lets a streamed parameter
+        // still resolve to NULL before any data is sent. This is the write
+        // analogue of the incremental read's pause point: the same serialize
+        // method, parked partway through the value.
+        if let RpcValue::Streamed(st) = self.value {
+            if self.encrypted.is_some() {
+                return Err(Error::UsageError(
+                    "Encrypted parameters cannot be streamed incrementally.".to_string(),
+                ));
+            }
+            packet_writer.write_byte_async(self.options.bits()).await?;
+            st.as_sql_type()
+                .write_type_info(packet_writer, db_collation, None, None)
+                .await?;
+            return Ok(());
+        }
+
+        // Encrypted parameters bypass the normal value encoder: the ciphertext
+        // is sent as a BIGVARBINARY with the ENCRYPTED status flag and a
+        // trailing CryptoMetaData block (Always Encrypted).
+        if let Some(encrypted) = &self.encrypted {
+            self.write_encrypted(packet_writer, db_collation, encrypted)
+                .await?;
+            return Ok(());
+        }
+
         // Write the options byte.
         packet_writer.write_byte_async(self.options.bits()).await?;
 
+        let value = match &self.value {
+            RpcValue::Materialized(value) => value,
+            RpcValue::Streamed(_) => unreachable!("streamed value handled above"),
+        };
         encoder
-            .encode_sqlvalue(packet_writer, &self.value, db_collation)
+            .encode_sqlvalue(packet_writer, value, db_collation, self.type_metadata)
+            .await?;
+        Ok(())
+    }
+
+    /// Marks this parameter as encrypted, supplying the ciphertext (or `None`
+    /// for an encrypted NULL) and the cipher metadata. When set, [`serialize`]
+    /// writes the value as a BIGVARBINARY with the ENCRYPTED status flag and a
+    /// trailing CryptoMetaData block instead of encoding the plaintext value.
+    pub(crate) fn set_encrypted(
+        &mut self,
+        ciphertext: Option<Vec<u8>>,
+        metadata: RpcEncryptionMetadata,
+    ) {
+        self.encrypted = Some(EncryptedRpcValue {
+            ciphertext,
+            metadata,
+        });
+    }
+
+    /// Returns the parameter's plaintext value. Used by the parameter-encryption
+    /// path to normalize and encrypt the value before sending.
+    ///
+    /// # Errors
+    /// Returns a usage error for a data-at-execution (streamed) parameter:
+    /// callers must guard with [`RpcParameter::reject_data_at_exec`] before
+    /// reaching a path that calls this, since streamed values are only
+    /// supported via `begin_sp_executesql`.
+    pub(crate) fn value(&self) -> TdsResult<&SqlType> {
+        match &self.value {
+            RpcValue::Materialized(value) => Ok(value),
+            RpcValue::Streamed(_) => Err(Error::UsageError(
+                "Data-at-execution parameters are only supported via begin_sp_executesql."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Returns `true` when the parameter is passed by reference (an output or
+    /// input/output parameter). Used when building the
+    /// `sp_describe_parameter_encryption` request for a stored procedure, where
+    /// output parameters must be marked `OUTPUT` in both the `EXEC` statement
+    /// and the parameter declaration.
+    pub(crate) fn is_output(&self) -> bool {
+        self.options.contains(StatusFlags::BY_REF_VALUE)
+    }
+
+    /// Serializes the parameter's value in its encrypted form: the ENCRYPTED
+    /// status flag, a BIGVARBINARY TYPE_INFO carrying the ciphertext, the
+    /// plaintext base TYPE_INFO, and the trailing CryptoMetaData block.
+    /// Encrypted values carry no collation. Mirrors JDBC
+    /// `writeEncryptedRPCByteArray` + `writeCryptoMetaData` and dotnet
+    /// `WriteEncryptionMetadata` (MS-TDS 2.2.6.6).
+    async fn write_encrypted(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        db_collation: &SqlCollation,
+        encrypted: &EncryptedRpcValue,
+    ) -> TdsResult<()> {
+        // Always mark the parameter encrypted, preserving any output flag.
+        let status = self.options | StatusFlags::ENCRYPTED;
+        packet_writer.write_byte_async(status.bits()).await?;
+
+        // The ciphertext is transmitted as BIGVARBINARY.
+        packet_writer
+            .write_byte_async(TdsDataType::BigVarBinary as u8)
+            .await?;
+
+        Self::write_encrypted_value(packet_writer, encrypted.ciphertext.as_deref()).await?;
+
+        // The CryptoMetaData is preceded by the plaintext base TYPE_INFO so the
+        // server knows the underlying type of the encrypted value. Always
+        // Encrypted requires this base type to match the encrypted column
+        // exactly (the server performs no implicit conversion for encrypted
+        // operands). On the normal RPC path a `bit` value is sent as `INTN(1)`,
+        // which the server reads as `tinyint`; for an encrypted `bit` parameter
+        // that mismatch raises an "operand type clash" against a `bit` column,
+        // so `bit` must be written as `BITN` here instead.
+        match self.value()? {
+            SqlType::Bit(_) => {
+                packet_writer
+                    .write_byte_async(TdsDataType::BitN as u8)
+                    .await?;
+                packet_writer.write_byte_async(1u8).await?;
+            }
+            other => {
+                other
+                    .write_type_info(packet_writer, db_collation, None, None)
+                    .await?;
+            }
+        }
+        Self::write_crypto_metadata(packet_writer, &encrypted.metadata).await?;
+        Ok(())
+    }
+
+    /// Writes the BIGVARBINARY max-length, actual-length, and value bytes for an
+    /// encrypted parameter. Short values (<= 8000 bytes) are written inline;
+    /// longer values use PLP chunked encoding. A `None` value is written as a
+    /// NULL (actual length `-1`).
+    async fn write_encrypted_value(
+        packet_writer: &mut PacketWriter<'_>,
+        value: Option<&[u8]>,
+    ) -> TdsResult<()> {
+        let len = value.map_or(0, <[u8]>::len);
+        let is_short = len <= SHORT_VARTYPE_MAX_BYTES;
+
+        // Declared max length: 8000 for short values, PLP sentinel otherwise.
+        if is_short {
+            packet_writer
+                .write_u16_async(SHORT_VARTYPE_MAX_BYTES as u16)
+                .await?;
+        } else {
+            packet_writer.write_u16_async(SQL_USHORTVARMAXLEN).await?;
+        }
+
+        match value {
+            // NULL value: actual length of -1.
+            None => packet_writer.write_i16_async(-1).await?,
+            Some(bytes) if is_short => {
+                packet_writer.write_u16_async(len as u16).await?;
+                if len > 0 {
+                    packet_writer.write_async(bytes).await?;
+                }
+            }
+            Some(bytes) => {
+                // PLP: 8-byte total length, then a single length-prefixed chunk,
+                // then the PLP terminator (4 zero bytes). The chunk length is a
+                // `u32`, so a value larger than `u32::MAX` cannot be expressed
+                // as one chunk — guard rather than truncate `len as u32` and
+                // emit a corrupt PLP stream.
+                if len > u32::MAX as usize {
+                    return Err(crate::error::Error::ColumnEncryptionError(format!(
+                        "encrypted value length {len} exceeds the maximum PLP chunk size ({})",
+                        u32::MAX
+                    )));
+                }
+                packet_writer.write_u64_async(len as u64).await?;
+                packet_writer.write_u32_async(len as u32).await?;
+                packet_writer.write_async(bytes).await?;
+                packet_writer.write_u32_async(0).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the CryptoMetaData block for an encrypted parameter. Mirrors JDBC
+    /// `writeCryptoMetaData` (MS-TDS 2.2.6.6).
+    async fn write_crypto_metadata(
+        packet_writer: &mut PacketWriter<'_>,
+        metadata: &RpcEncryptionMetadata,
+    ) -> TdsResult<()> {
+        packet_writer
+            .write_byte_async(metadata.cipher_algorithm_id)
+            .await?;
+        packet_writer
+            .write_byte_async(metadata.encryption_type)
+            .await?;
+        packet_writer.write_i32_async(metadata.database_id).await?;
+        packet_writer.write_i32_async(metadata.cek_id).await?;
+        packet_writer.write_i32_async(metadata.cek_version).await?;
+        packet_writer.write_async(&metadata.cek_md_version).await?;
+        packet_writer
+            .write_byte_async(metadata.normalization_rule_version)
             .await?;
         Ok(())
     }
 
     /// Access to the value field for fuzzing
     #[cfg(fuzzing)]
-    pub fn get_value(&self) -> &SqlType {
-        &self.value
+    pub fn get_value(&self) -> TdsResult<&SqlType> {
+        self.value()
     }
 }
 
 /// Builds a comma-separated list of parameter names and types for the RPC call.
 /// This is used to construct the parameter declaration string for sp_executesql.
 #[cfg(fuzzing)]
-pub fn build_parameter_list_string(named_params: &Vec<RpcParameter>, params_list: &mut String) {
+pub fn build_parameter_list_string(
+    named_params: &Vec<RpcParameter>,
+    params_list: &mut String,
+) -> TdsResult<()> {
     build_parameter_list_string_impl(named_params, params_list)
 }
 
@@ -224,17 +670,20 @@ pub fn build_parameter_list_string(named_params: &Vec<RpcParameter>, params_list
 pub(crate) fn build_parameter_list_string(
     named_params: &Vec<RpcParameter>,
     params_list: &mut String,
-) {
+) -> TdsResult<()> {
     build_parameter_list_string_impl(named_params, params_list)
 }
 
-fn build_parameter_list_string_impl(named_params: &Vec<RpcParameter>, params_list: &mut String) {
+fn build_parameter_list_string_impl(
+    named_params: &Vec<RpcParameter>,
+    params_list: &mut String,
+) -> TdsResult<()> {
     let mut first_param = true;
     for param in named_params {
         if let Some(param_name) = &param.name {
             // TODO: while persisting types with length, we need to compute the length and
             // add the length after the type name. e.g. Nvarchar(200), varchar(100) etc.
-            let param_type_name = RpcParameter::get_sql_name(&param.value);
+            let param_type_name = param.sql_declaration()?;
             if first_param {
                 first_param = false;
             } else {
@@ -243,6 +692,7 @@ fn build_parameter_list_string_impl(named_params: &Vec<RpcParameter>, params_lis
             params_list.push_str(&format!("{param_name} {param_type_name} "));
         }
     }
+    Ok(())
 }
 
 impl From<&SqlType> for TdsDataType {
@@ -280,6 +730,8 @@ impl From<&SqlType> for TdsDataType {
             SqlType::DateTime(_) => TdsDataType::DateTime,
             SqlType::Date(_) => TdsDataType::DateN,
             SqlType::Vector(_, _, _) => TdsDataType::Vector,
+            SqlType::Variant(_) => TdsDataType::SsVariant,
+            SqlType::Table(_, _) => TdsDataType::SqlTable,
         }
     }
 }
@@ -287,68 +739,523 @@ impl From<&SqlType> for TdsDataType {
 #[cfg(test)]
 mod tests {
     use crate::datatypes::sqltypes::SqlType;
-    use crate::message::parameters::rpc_parameters::RpcParameter;
+    use crate::error::Error;
+    use crate::message::parameters::rpc_parameters::{
+        EncryptedRpcValue, RpcEncryptionMetadata, RpcParameter, RpcTypeMetadata, StatusFlags,
+        StreamedSqlType, build_parameter_list_string,
+    };
+
+    use crate::datatypes::encoder::GenericEncoder;
+    use crate::io::packet_writer::PacketWriter;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
+    use crate::message::messages::PacketType;
+    use crate::token::tokens::SqlCollation;
+    use futures::executor::block_on;
+
+    /// Returns the RPC payload bytes written to the packet writer, stripping the
+    /// 8-byte packet header.
+    fn payload(writer: &PacketWriter) -> Vec<u8> {
+        writer.get_payload().into_inner()[8..].to_vec()
+    }
+
+    /// Sample cipher metadata for encrypted-parameter serialization tests.
+    fn sample_metadata() -> RpcEncryptionMetadata {
+        RpcEncryptionMetadata {
+            cipher_algorithm_id: 2,
+            encryption_type: 1,
+            database_id: 7,
+            cek_id: 11,
+            cek_version: 3,
+            cek_md_version: [1, 2, 3, 4, 5, 6, 7, 8],
+            normalization_rule_version: 1,
+        }
+    }
+
+    /// The CryptoMetaData block bytes for [`sample_metadata`].
+    fn sample_metadata_bytes() -> Vec<u8> {
+        let mut b = vec![0x02, 0x01]; // cipher_algorithm_id, encryption_type
+        b.extend_from_slice(&7i32.to_le_bytes()); // database_id
+        b.extend_from_slice(&11i32.to_le_bytes()); // cek_id
+        b.extend_from_slice(&3i32.to_le_bytes()); // cek_version
+        b.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // cek_md_version
+        b.push(0x01); // normalization_rule_version
+        b
+    }
+
+    fn serialize_param(param: &RpcParameter) -> Vec<u8> {
+        // Use a packet size large enough that even the PLP test stays within a
+        // single packet, so the payload is contiguous (no interspersed headers).
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let encoder = GenericEncoder {};
+        block_on(param.serialize(&mut w, &collation, false, &encoder)).unwrap();
+        payload(&w)
+    }
+
+    /// Serializes just the TYPE_INFO for a value (the plaintext base type info
+    /// written before the CryptoMetaData of an encrypted parameter).
+    fn type_info_bytes(value: &SqlType) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        block_on(value.write_type_info(&mut w, &collation, None, None)).unwrap();
+        payload(&w)
+    }
+
+    /// A short encrypted value is serialized as a BIGVARBINARY with the
+    /// ENCRYPTED status flag, an inline length-prefixed value, and the trailing
+    /// CryptoMetaData block.
+    #[test]
+    fn serialize_encrypted_short_value() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(5)),
+        );
+        param.set_encrypted(Some(vec![0xAA, 0xBB, 0xCC, 0xDD]), sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&8000u16.to_le_bytes()); // max length
+        expected.extend_from_slice(&4u16.to_le_bytes()); // actual length
+        expected.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // ciphertext
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Int(Some(5)))); // base TYPE_INFO
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// An encrypted `bit` parameter writes its base TYPE_INFO as `BITN(1)`
+    /// (0x68, 0x01), not the `INTN(1)` (0x26, 0x01 = tinyint) the normal RPC
+    /// path uses. Always Encrypted does no implicit conversion, so an `INTN(1)`
+    /// base type clashes with a `bit` column ("operand type clash").
+    #[test]
+    fn serialize_encrypted_bit_writes_bitn_base_type() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Bit(Some(true)),
+        );
+        param.set_encrypted(Some(vec![0xAA, 0xBB]), sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&8000u16.to_le_bytes()); // max length
+        expected.extend_from_slice(&2u16.to_le_bytes()); // actual length
+        expected.extend_from_slice(&[0xAA, 0xBB]); // ciphertext
+        expected.extend_from_slice(&[0x68, 0x01]); // base TYPE_INFO: BITN, length 1
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// An encrypted NULL value writes an actual length of -1 and no value bytes,
+    /// still followed by the CryptoMetaData block.
+    #[test]
+    fn serialize_encrypted_null_value() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(None),
+        );
+        param.set_encrypted(None, sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&8000u16.to_le_bytes()); // max length
+        expected.extend_from_slice(&(-1i16).to_le_bytes()); // NULL actual length
+        expected.extend_from_slice(&type_info_bytes(&SqlType::Int(None))); // base TYPE_INFO
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// A value longer than 8000 bytes uses PLP chunked encoding: a PLP max-length
+    /// sentinel, an 8-byte total length, a single length-prefixed chunk, and the
+    /// PLP terminator, then the CryptoMetaData block.
+    #[test]
+    fn serialize_encrypted_plp_value() {
+        let ciphertext = vec![0x55u8; 8001];
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarBinaryMax(None),
+        );
+        param.set_encrypted(Some(ciphertext.clone()), sample_metadata());
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
+        expected.push(0x08); // status: ENCRYPTED
+        expected.push(0xA5); // type: BIGVARBINARY
+        expected.extend_from_slice(&0xFFFFu16.to_le_bytes()); // PLP max-length sentinel
+        expected.extend_from_slice(&8001u64.to_le_bytes()); // total length
+        expected.extend_from_slice(&8001u32.to_le_bytes()); // chunk length
+        expected.extend_from_slice(&ciphertext); // chunk data
+        expected.extend_from_slice(&0u32.to_le_bytes()); // PLP terminator
+        expected.extend_from_slice(&type_info_bytes(&SqlType::VarBinaryMax(None))); // base TYPE_INFO
+        expected.extend_from_slice(&sample_metadata_bytes());
+
+        assert_eq!(serialize_param(&param), expected);
+    }
+
+    /// The ENCRYPTED status flag is forced on even when the parameter's options
+    /// did not include it, preserving the BY_REF (output) flag.
+    #[test]
+    fn serialize_encrypted_preserves_output_flag() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::BY_REF_VALUE,
+            SqlType::Int(Some(5)),
+        );
+        param.set_encrypted(Some(vec![0x01]), sample_metadata());
+
+        let bytes = serialize_param(&param);
+        // Status byte follows the 5-byte name prefix.
+        assert_eq!(
+            bytes[5],
+            StatusFlags::BY_REF_VALUE.bits() | StatusFlags::ENCRYPTED.bits()
+        );
+    }
+
+    /// `EncryptedRpcValue` round-trips through `set_encrypted`.
+    #[test]
+    fn set_encrypted_stores_value() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(5)),
+        );
+        param.set_encrypted(Some(vec![9, 9]), sample_metadata());
+        let stored: &EncryptedRpcValue = param.encrypted.as_ref().expect("encrypted set");
+        assert_eq!(stored.ciphertext.as_deref(), Some(&[9u8, 9][..]));
+        assert_eq!(stored.metadata.cek_id, 11);
+    }
 
     #[test]
     fn test_get_sql_names() {
-        let sql_type = SqlType::NVarchar(None, 50);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "nvarchar(50)".to_string());
+        let decimal =
+            crate::datatypes::decoder::DecimalParts::from_i64(12345, 18, 5).expect("decimal parts");
+        let cases: Vec<(SqlType, &str)> = vec![
+            (SqlType::NVarchar(None, 50), "nvarchar(50)"),
+            (SqlType::VarBinary(None, 100), "varbinary(100)"),
+            (SqlType::Time(None), "time(7)"),
+            (SqlType::DateTimeOffset(None), "datetimeoffset(7)"),
+            (SqlType::DateTime2(None), "datetime2(7)"),
+            (SqlType::NVarcharMax(None), "nvarchar(MAX)"),
+            (SqlType::VarcharMax(None), "varchar(MAX)"),
+            (SqlType::NVarchar(None, 4000), "nvarchar(4000)"),
+            (SqlType::Varchar(None, 4000), "varchar(4000)"),
+            (SqlType::VarBinary(None, 4000), "varbinary(4000)"),
+            (SqlType::VarBinaryMax(None), "varbinary(MAX)"),
+            (
+                SqlType::Vector(
+                    None,
+                    3,
+                    crate::datatypes::sqldatatypes::VectorBaseType::Float32,
+                ),
+                "vector(3)",
+            ),
+            // GH #45: SqlType::Numeric must not error when generating the RPC parameter
+            // declaration. Covers both the value-present and value-absent paths.
+            (SqlType::Numeric(Some(decimal)), "numeric(18,5)"),
+            (SqlType::Numeric(None), "numeric(18, 10)"),
+            // Sibling fix: SqlType::Char / SqlType::NChar must produce `char(N)` / `nchar(N)`.
+            (SqlType::Char(None, 10), "char(10)"),
+            (SqlType::NChar(None, 25), "nchar(25)"),
+            // sql_variant declares as `sql_variant` with no length suffix.
+            (
+                SqlType::Variant(Box::new(SqlType::Int(Some(1)))),
+                "sql_variant",
+            ),
+        ];
+        for (sql_type, expected) in cases {
+            let rpc_param = RpcParameter::get_sql_name(&sql_type, None)
+                .unwrap_or_else(|e| panic!("get_sql_name failed for {sql_type:?}: {e}"));
+            assert_eq!(rpc_param, expected, "case: {sql_type:?}");
+        }
+    }
 
-        let sql_type = SqlType::VarBinary(None, 100);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varbinary(100)".to_string());
+    /// The declaration text and the wire `TYPE_INFO` must come from the same
+    /// [`RpcTypeMetadata`]: declaring `decimal(12,3)` while serializing
+    /// `NUMERIC(1,0)` would truncate the first non-NULL value sent.
+    #[test]
+    fn type_metadata_drives_declaration_and_wire_metadata() {
+        let param = RpcParameter::new(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Decimal(None),
+        )
+        .with_type_metadata(RpcTypeMetadata {
+            precision: Some(12),
+            scale: Some(3),
+        });
 
-        let sql_type = SqlType::Time(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "time(7)".to_string());
+        let mut declarations = String::new();
+        build_parameter_list_string(&vec![param.clone()], &mut declarations).unwrap();
+        assert_eq!(declarations, "@P1 decimal(12,3) ");
 
-        let sql_type = SqlType::DateTimeOffset(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "datetimeoffset(7)".to_string());
-
-        let sql_type = SqlType::DateTime2(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "datetime2(7)".to_string());
-
-        let sql_type = SqlType::NVarcharMax(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "nvarchar(MAX)".to_string());
-
-        let sql_type = SqlType::VarcharMax(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varchar(MAX)".to_string());
-
-        let sql_type = SqlType::NVarchar(None, 4000);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "nvarchar(4000)".to_string());
-
-        let sql_type = SqlType::Varchar(None, 4000);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varchar(4000)".to_string());
-
-        let sql_type = SqlType::VarBinary(None, 4000);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varbinary(4000)".to_string());
-
-        let sql_type = SqlType::VarBinaryMax(None);
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "varbinary(MAX)".to_string());
-
-        let sql_type = SqlType::Vector(
-            None,
-            3,
-            crate::datatypes::sqldatatypes::VectorBaseType::Float32,
+        // Layout: name (len 3, "@P1" UTF-16LE), status, then TYPE_INFO
+        // `NUMERICN, max_len, precision, scale`.
+        let bytes = serialize_param(&param);
+        let type_info = &bytes[1 + 3 * 2 + 1..];
+        assert_eq!(
+            type_info[0],
+            crate::datatypes::sqldatatypes::TdsDataType::NumericN as u8
         );
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "vector(3)".to_string());
-
-        let sql_type = SqlType::Vector(
-            None,
-            3,
-            crate::datatypes::sqldatatypes::VectorBaseType::Float16,
+        assert_eq!(
+            (type_info[2], type_info[3]),
+            (12, 3),
+            "wire precision/scale must match the declaration"
         );
-        let rpc_param = RpcParameter::get_sql_name(&sql_type);
-        assert_eq!(rpc_param, "vector(3, float16)".to_string());
+    }
+
+    /// A typed NULL `time`/`datetime2`/`datetimeoffset` has no value to read a
+    /// scale from, so the metadata must drive the declaration.
+    #[test]
+    fn type_metadata_supplies_temporal_scale() {
+        let cases = [
+            (SqlType::Time(None), "time(4)"),
+            (SqlType::DateTime2(None), "datetime2(4)"),
+            (SqlType::DateTimeOffset(None), "datetimeoffset(4)"),
+        ];
+        let metadata = RpcTypeMetadata {
+            precision: None,
+            scale: Some(4),
+        };
+        for (sql_type, expected) in cases {
+            assert_eq!(
+                RpcParameter::get_sql_name(&sql_type, Some(metadata)).unwrap(),
+                expected,
+                "case: {sql_type:?}"
+            );
+        }
+    }
+
+    /// `vector(N)` implies float32; a float16 vector must say so explicitly.
+    #[test]
+    fn vector_declaration_spells_out_float16() {
+        use crate::datatypes::sqldatatypes::VectorBaseType;
+        assert_eq!(
+            RpcParameter::get_sql_name(&SqlType::Vector(None, 3, VectorBaseType::Float32), None)
+                .unwrap(),
+            "vector(3)"
+        );
+        assert_eq!(
+            RpcParameter::get_sql_name(&SqlType::Vector(None, 3, VectorBaseType::Float16), None)
+                .unwrap(),
+            "vector(3, float16)"
+        );
+    }
+
+    /// `get_sql_name` must surface `Error::ImplementationError` when the underlying
+    /// `TdsDataType` has no SQL declaration name, rather than panicking. There is no
+    /// `SqlType` that currently routes to such a variant, so this is exercised by
+    /// constructing the `TdsDataType` directly.
+    #[test]
+    fn test_get_sql_name_propagates_implementation_error() {
+        use crate::datatypes::sqldatatypes::TdsDataType;
+        let err = TdsDataType::IntN.get_meta_type_name().expect_err(
+            "TdsDataType::IntN should have no SQL declaration name; \
+             update test if you added a mapping.",
+        );
+        assert!(matches!(err, Error::ImplementationError(_)));
+    }
+
+    /// Table-valued parameters are declared by their schema-qualified table type
+    /// name with the mandatory `READONLY` suffix; the schema defaults to `dbo`.
+    #[test]
+    fn test_get_sql_name_tvp() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+
+        let schema_qualified = SqlType::Table(
+            TvpTypeName::new(Some("sales".to_string()), "OrderList".to_string()),
+            None,
+        );
+        assert_eq!(
+            RpcParameter::get_sql_name(&schema_qualified, None).unwrap(),
+            "[sales].[OrderList] READONLY"
+        );
+
+        let default_schema = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
+        assert_eq!(
+            RpcParameter::get_sql_name(&default_schema, None).unwrap(),
+            "[dbo].[OrderList] READONLY"
+        );
+    }
+
+    /// A `SqlType::Table` maps to the `SqlTable` TDS wire type.
+    #[test]
+    fn test_tds_data_type_from_table() {
+        use crate::datatypes::sql_tvp::TvpTypeName;
+        use crate::datatypes::sqldatatypes::TdsDataType;
+
+        let value = SqlType::Table(TvpTypeName::new(None, "OrderList".to_string()), None);
+        assert_eq!(TdsDataType::from(&value), TdsDataType::SqlTable);
+    }
+
+    /// `value()` returns a reference to the parameter's plaintext value, which
+    /// the parameter-encryption path uses before encrypting.
+    #[test]
+    fn value_returns_plaintext() {
+        let param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(42)),
+        );
+        assert_eq!(param.value().unwrap(), &SqlType::Int(Some(42)));
+    }
+
+    /// Serializes a data-at-execution PLP parameter via the normal `serialize`
+    /// path (which, for a `data_at_exec` param, writes only the header and opens
+    /// the value), returning the payload bytes.
+    fn streamed_header_bytes(param: &RpcParameter, is_positional: bool) -> Vec<u8> {
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let encoder = GenericEncoder {};
+        block_on(param.serialize(&mut w, &collation, is_positional, &encoder)).unwrap();
+        payload(&w)
+    }
+
+    /// A named data-at-execution `nvarchar(max)` param serializes to just the
+    /// header: name prefix, status-flags byte, then the value's TYPE_INFO. The
+    /// PLP length field (opener or NULL), value bytes and terminator are all
+    /// written later by the streaming driver, not here.
+    #[test]
+    fn serialize_data_at_exec_named() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::NVarcharMax,
+        );
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(StatusFlags::NONE.bits()); // status flags
+        expected.extend_from_slice(&type_info_bytes(&SqlType::NVarcharMax(None))); // TYPE_INFO
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
+    /// A named data-at-execution `varchar(max)` param serializes with the same
+    /// header shape as the other MAX types, using the varchar TYPE_INFO. Covers
+    /// the third streamable type (nvarchar/varchar/varbinary all supported).
+    #[test]
+    fn serialize_data_at_exec_varchar_max_named() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarcharMax,
+        );
+
+        let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
+        expected.push(StatusFlags::NONE.bits()); // status flags
+        expected.extend_from_slice(&type_info_bytes(&SqlType::VarcharMax(None))); // TYPE_INFO
+
+        assert_eq!(streamed_header_bytes(&param, false), expected);
+    }
+
+    /// A positional data-at-execution param writes a zero-length name byte in
+    /// place of the name, then the same status/TYPE_INFO header (no length field).
+    #[test]
+    fn serialize_data_at_exec_positional() {
+        let param =
+            RpcParameter::data_at_exec(None, StatusFlags::NONE, StreamedSqlType::VarBinaryMax);
+
+        let mut expected = vec![0x00]; // zero-length name (positional)
+        expected.push(StatusFlags::NONE.bits());
+        expected.extend_from_slice(&type_info_bytes(&SqlType::VarBinaryMax(None)));
+
+        assert_eq!(streamed_header_bytes(&param, true), expected);
+    }
+
+    /// Every streamed type declares itself in the `sp_executesql` `@params`
+    /// string under its own T-SQL name, so the server binds the same type it
+    /// sees in TYPE_INFO.
+    #[test]
+    fn streamed_params_declare_their_sql_type_name() {
+        let cases = [
+            (StreamedSqlType::NVarcharMax, "nvarchar(MAX)"),
+            (StreamedSqlType::VarcharMax, "varchar(MAX)"),
+            (StreamedSqlType::VarBinaryMax, "varbinary(MAX)"),
+        ];
+
+        for (streamed, expected_name) in cases {
+            let params = vec![RpcParameter::data_at_exec(
+                Some("@p".to_string()),
+                StatusFlags::NONE,
+                streamed,
+            )];
+            let mut list = String::new();
+            build_parameter_list_string(&params, &mut list).unwrap();
+            assert_eq!(list, format!("@p {expected_name} "), "for {streamed:?}");
+        }
+    }
+
+    /// The constructor only accepts streamable wire types.
+    #[test]
+    fn data_at_exec_constructor_requires_streamed_sql_type() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        );
+        assert!(param.is_data_at_exec());
+    }
+
+    /// Encrypted parameters cannot be streamed incrementally.
+    #[test]
+    fn serialize_data_at_exec_rejects_encrypted() {
+        let mut param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        );
+        param.set_encrypted(Some(vec![0x01, 0x02]), sample_metadata());
+
+        let mut mock = MockNetworkWriter::new(16384);
+        let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let collation = SqlCollation::default();
+        let encoder = GenericEncoder {};
+        let err = block_on(param.serialize(&mut w, &collation, false, &encoder))
+            .expect_err("encrypted parameter must be rejected");
+        assert!(matches!(err, Error::UsageError(_)));
+    }
+
+    /// `value()` on a streamed parameter must return a usage error, not panic:
+    /// it is reachable from safe code (e.g. parameter-encryption / describe
+    /// paths) whenever a caller bypasses [`RpcParameter::reject_data_at_exec`].
+    #[test]
+    fn value_on_streamed_param_returns_usage_error() {
+        let param = RpcParameter::data_at_exec(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        );
+        assert!(matches!(param.value(), Err(Error::UsageError(_))));
+    }
+
+    /// `reject_data_at_exec` is the shared guard every non-streaming entry
+    /// point uses to reject a streamed parameter before it can reach
+    /// [`RpcParameter::value`] or an incomplete serialization.
+    #[test]
+    fn reject_data_at_exec_rejects_only_streamed_params() {
+        let materialized = RpcParameter::new(
+            Some("@id".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        );
+        assert!(RpcParameter::reject_data_at_exec([&materialized]).is_ok());
+
+        let streamed = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        );
+        let err = RpcParameter::reject_data_at_exec([&materialized, &streamed])
+            .expect_err("a streamed parameter in the list must be rejected");
+        assert!(matches!(err, Error::UsageError(_)));
     }
 }

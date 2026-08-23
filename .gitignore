@@ -64,3 +64,5 @@ crash-*
 *.pptx
 
 .venv-pycore/mssql-py-core/pytest-smoke-results.xml
+
+ghcookies.txt

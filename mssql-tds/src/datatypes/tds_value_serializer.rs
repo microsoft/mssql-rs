@@ -479,8 +479,7 @@ impl TdsValueSerializer {
         // Pad with zeros if value has fewer chunks than needed
         let chunks_needed = value_bytes / 4;
         for i in 0..chunks_needed {
-            let chunk = value.int_parts.get(i).copied().unwrap_or(0);
-            writer.write_i32_async(chunk).await?;
+            writer.write_i32_async(value.word(i)).await?;
         }
 
         Ok(())
@@ -1728,6 +1727,13 @@ impl TdsValueSerializer {
                     }
                 }
             },
+            VectorData::Float16(vs) => {
+                for f in vs {
+                    writer
+                        .write_u16_async(half::f16::from_f32(*f).to_bits())
+                        .await?;
+                }
+            }
         }
 
         Ok(())
@@ -3057,12 +3063,7 @@ mod serializer_tests {
         let mut ctx = nullable_ctx(0x6A); // DecimalN
         ctx.precision = Some(5);
         ctx.scale = Some(2);
-        let val = ColumnValues::Decimal(DecimalParts {
-            is_positive: true,
-            scale: 2,
-            precision: 5,
-            int_parts: vec![12345],
-        });
+        let val = ColumnValues::Decimal(DecimalParts::new(true, 5, 2, 12345));
         block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
         // precision 5 → value_bytes=4, total_length=5
         // [5, 1(positive), 12345 as i32 LE]
@@ -3077,12 +3078,7 @@ mod serializer_tests {
         let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         let mut ctx = nullable_ctx(0x6A);
         ctx.precision = Some(9);
-        let val = ColumnValues::Decimal(DecimalParts {
-            is_positive: false,
-            scale: 0,
-            precision: 9,
-            int_parts: vec![100],
-        });
+        let val = ColumnValues::Decimal(DecimalParts::new(false, 9, 0, 100));
         block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
         let mut expected = vec![0x05, 0x00]; // length=5, sign=0 (negative)
         expected.extend_from_slice(&100i32.to_le_bytes());
@@ -3105,12 +3101,7 @@ mod serializer_tests {
         let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         let mut ctx = nullable_ctx(0x6A);
         ctx.precision = Some(18);
-        let val = ColumnValues::Decimal(DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 18,
-            int_parts: vec![1, 2],
-        });
+        let val = ColumnValues::Decimal(DecimalParts::new(true, 18, 0, 8589934593));
         block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
         // precision 18 → value_bytes=8, total=9
         let mut expected = vec![0x09, 0x01]; // length=9, sign=positive
@@ -3678,12 +3669,7 @@ mod serializer_tests {
         let mut ctx = nullable_ctx(0x6A);
         ctx.precision = Some(15);
         ctx.scale = Some(0);
-        let val = ColumnValues::Decimal(DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 15,
-            int_parts: vec![1, 2],
-        });
+        let val = ColumnValues::Decimal(DecimalParts::new(true, 15, 0, 8589934593));
         block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
         let mut expected = vec![0x09, 0x01]; // length=9, sign=positive
         expected.extend_from_slice(&1i32.to_le_bytes());
@@ -3698,12 +3684,7 @@ mod serializer_tests {
         let mut ctx = nullable_ctx(0x6A);
         ctx.precision = Some(25);
         ctx.scale = Some(0);
-        let val = ColumnValues::Decimal(DecimalParts {
-            is_positive: false,
-            scale: 0,
-            precision: 25,
-            int_parts: vec![1, 2, 3],
-        });
+        let val = ColumnValues::Decimal(DecimalParts::new(false, 25, 0, 55340232229718589441));
         block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
         let mut expected = vec![0x0D, 0x00]; // length=13, sign=negative
         expected.extend_from_slice(&1i32.to_le_bytes());
@@ -3718,12 +3699,7 @@ mod serializer_tests {
         let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
         let mut ctx = nullable_ctx(0x6A);
         ctx.precision = Some(39);
-        let val = ColumnValues::Decimal(DecimalParts {
-            is_positive: true,
-            scale: 0,
-            precision: 39,
-            int_parts: vec![1],
-        });
+        let val = ColumnValues::Decimal(DecimalParts::new(true, 39, 0, 1));
         assert!(block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).is_err());
     }
 

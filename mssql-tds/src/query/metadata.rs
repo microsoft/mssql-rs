@@ -26,6 +26,15 @@ pub struct ColumnMetadata {
     /// Optional four-part name (`server.catalog.schema.table`) when the server
     /// includes table-name metadata (e.g., browse-mode queries).
     pub multi_part_name: Option<MultiPartName>,
+    /// Always Encrypted cryptographic metadata, present only for encrypted
+    /// columns when column encryption has been negotiated for the connection.
+    ///
+    /// When set, `data_type`/`type_info` describe the on-the-wire (ciphertext)
+    /// type, while the contained [`CryptoMetadata`] carries the underlying
+    /// plaintext type and the key/algorithm needed to decrypt the column.
+    #[allow(dead_code)]
+    // Populated during COLMETADATA parsing; consumed by result-set decryption in a later phase.
+    pub(crate) crypto_metadata: Option<CryptoMetadata>,
 }
 
 impl ColumnMetadata {
@@ -45,13 +54,26 @@ impl ColumnMetadata {
     pub fn is_computed(&self) -> bool {
         (self.flags & 0x20) != 0x00
     }
-    /// Column is a sparse column set (`xml COLUMN_SET FOR ALL_SPARSE_COLUMNS`).
+    /// Column is a sparse column set (`xml COLUMN_SET FOR ALL_SPARSE_COLUMNS`),
+    /// `fSparseColumnSet`, bit 10 of the COLMETADATA Flags word.
     pub fn is_sparse_column_set(&self) -> bool {
-        (self.flags & 0x1000) != 0x00
+        (self.flags & 0x0400) != 0x00
     }
-    /// Column is protected by Always Encrypted.
+    /// Column is protected by Always Encrypted (`fEncrypted`, bit 11 of the
+    /// COLMETADATA Flags word).
     pub fn is_encrypted(&self) -> bool {
+        (self.flags & 0x0800) != 0x00
+    }
+    /// Column is hidden (`fHidden`, bit 13 of the COLMETADATA Flags word), for
+    /// example a `FOR BROWSE` key column.
+    pub fn is_hidden(&self) -> bool {
         (self.flags & 0x2000) != 0x00
+    }
+    /// Column is a key column used in cursor operations (`fKey`, bit 14 of the
+    /// COLMETADATA Flags word). A driver uses this to build positioned-update
+    /// predicates (`WHERE` clauses) for updatable server cursors.
+    pub fn is_key_column(&self) -> bool {
+        (self.flags & 0x4000) != 0x00
     }
     /// Column uses Partially Length-prefixed (PLP) encoding (e.g., `varchar(max)`).
     pub fn is_plp(&self) -> bool {
@@ -59,6 +81,44 @@ impl ColumnMetadata {
             self.type_info.type_info_variant,
             TypeInfoVariant::PartialLen(_, _, _, _, _)
         )
+    }
+
+    /// Classifies the wire encoding of this column when it is streamed as a PLP
+    /// (partially-length-prefixed) value, or `None` for non-PLP columns.
+    ///
+    /// This is exhaustive over the PLP type set so a new PLP type can't silently
+    /// fall through to a wrong default. Note `json` is UTF-8 on the wire (no
+    /// collation) and is kept distinct from `varchar(max)` single-byte text —
+    /// they only coincide today because the single-byte path is a verbatim copy;
+    /// once codepage conversion lands for `varchar(max)`, folding `json` into it
+    /// would corrupt data.
+    pub fn plp_encoding(&self) -> Option<PlpEncoding> {
+        if !self.is_plp() {
+            return None;
+        }
+        Some(match self.data_type {
+            // UTF-16LE on the wire.
+            TdsDataType::NVarChar | TdsDataType::NChar | TdsDataType::Xml => PlpEncoding::Utf16Text,
+            // UTF-8 on the wire, carries no collation.
+            TdsDataType::Json => PlpEncoding::Utf8Text,
+            // Single-byte / codepage text.
+            TdsDataType::BigVarChar
+            | TdsDataType::BigChar
+            | TdsDataType::VarChar
+            | TdsDataType::Char
+            | TdsDataType::Text => PlpEncoding::SingleByteText,
+            // Opaque bytes.
+            TdsDataType::BigVarBinary
+            | TdsDataType::BigBinary
+            | TdsDataType::VarBinary
+            | TdsDataType::Binary
+            | TdsDataType::Image
+            | TdsDataType::Udt
+            | TdsDataType::Vector => PlpEncoding::Binary,
+            // Any other type that is somehow flagged PLP: treat as opaque bytes
+            // rather than guessing a text codepage.
+            _ => PlpEncoding::Binary,
+        })
     }
     /// Returns the scale for decimal/numeric/time types.
     ///
@@ -68,6 +128,28 @@ impl ColumnMetadata {
         match self.type_info.type_info_variant {
             TypeInfoVariant::VarLenScale(_, scale) => Some(scale),
             TypeInfoVariant::VarLenPrecisionScale(_, _, _, scale) => Some(scale),
+            _ => None,
+        }
+    }
+
+    /// Returns the precision (max decimal digits) for numeric types.
+    ///
+    /// - `decimal`/`numeric` → declared precision (1–38).
+    /// - `money` → 19, `smallmoney` → 10 (T-SQL fixed precisions).
+    /// - `MoneyN` → 19 if 8-byte payload, 10 if 4-byte payload.
+    /// - All other types → `None`.
+    pub fn get_precision(&self) -> Option<u8> {
+        use crate::datatypes::sqldatatypes::{FixedLengthTypes, VariableLengthTypes};
+
+        match self.type_info.type_info_variant {
+            TypeInfoVariant::VarLenPrecisionScale(_, _, precision, _) => Some(precision),
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Money) => Some(19),
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Money4) => Some(10),
+            TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, length) => match length {
+                8 => Some(19),
+                4 => Some(10),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -82,6 +164,21 @@ impl ColumnMetadata {
             _ => None,
         }
     }
+}
+
+/// Wire encoding of a PLP (partially-length-prefixed) column, returned by
+/// [`ColumnMetadata::plp_encoding`]. A streaming consumer uses this to pick the
+/// delivered SQL C type and any transcoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlpEncoding {
+    /// `nvarchar(max)`, `nchar`, `xml` — UTF-16LE on the wire.
+    Utf16Text,
+    /// `json` — UTF-8 on the wire, no collation.
+    Utf8Text,
+    /// `varchar(max)`, `char`, `text` — single-byte / codepage text.
+    SingleByteText,
+    /// `varbinary(max)`, `image`, `udt`, `vector` — opaque bytes.
+    Binary,
 }
 
 impl fmt::Display for ColumnMetadata {
@@ -114,22 +211,96 @@ pub struct MultiPartName {
     pub(crate) table_name: String,
 }
 
-#[derive(Debug)]
-#[allow(dead_code)] // For column encryption metadata which is not implemented yet.
-pub(crate) struct ColumnEncryptionMetadata {
-    pub key_count: u8,
-    pub key_details: Vec<ColumnEncryptionKeyDetails>,
-    pub db_id: u32,
-    pub key_id: u32,
+impl MultiPartName {
+    /// Server name component, if provided by the server.
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    /// Catalog (database) name component, if provided by the server.
+    pub fn catalog_name(&self) -> Option<&str> {
+        self.catalog_name.as_deref()
+    }
+
+    /// Schema name component, if provided by the server.
+    pub fn schema_name(&self) -> Option<&str> {
+        self.schema_name.as_deref()
+    }
+
+    /// Table name component. Always present when a `MultiPartName` is returned
+    /// (may be empty if the server sent an empty string).
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)] // For column encryption metadata which is not implemented yet.
-pub(crate) struct ColumnEncryptionKeyDetails {
-    pub encrypted_cek: Vec<u8>,
-    pub algo: String,
-    pub key_path: String,
+/// A single encrypted value of a column encryption key (CEK), as carried in the
+/// COLMETADATA CEK table.
+///
+/// A CEK may have more than one encrypted value (one per column master key that
+/// wraps it) to support key rotation; any one of them can be used to recover the
+/// plaintext CEK.
+#[derive(Clone)]
+pub(crate) struct EncryptedCekValue {
+    /// The encrypted CEK bytes (ciphertext produced by the column master key).
+    pub encrypted_key: Vec<u8>,
+    /// Name of the key store provider (e.g. `MSSQL_CERTIFICATE_STORE`, `AZURE_KEY_VAULT`).
     pub key_store_name: String,
+    /// Provider-specific path identifying the column master key.
+    pub key_path: String,
+    /// Name of the asymmetric algorithm used to encrypt the CEK (e.g. `RSA_OAEP`).
+    pub algorithm_name: String,
+}
+
+impl fmt::Debug for EncryptedCekValue {
+    /// Redacts here rather than in each holder: this value is reachable by `{:?}`
+    /// from [`CekTableEntry`], `ColMetadataToken`, `Tokens`, and `ParserContext`,
+    /// including the row parsers' TRACE logging of the whole metadata token.
+    /// Deriving `Debug` would print the wrapped-key ciphertext and the column
+    /// master key path (e.g. an Azure Key Vault URI) at every one of those sites.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedCekValue")
+            .field("encrypted_key_len", &self.encrypted_key.len())
+            .field("algorithm_name", &self.algorithm_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One entry in the COLMETADATA CEK table, describing a column encryption key
+/// and the encrypted values from which its plaintext can be recovered.
+#[derive(Debug, Clone)]
+pub(crate) struct CekTableEntry {
+    /// Database identifier the CEK belongs to.
+    pub database_id: i32,
+    /// CEK identifier.
+    pub cek_id: i32,
+    /// CEK version.
+    pub cek_version: i32,
+    /// CEK metadata version (8 bytes).
+    pub cek_md_version: [u8; 8],
+    /// Encrypted CEK values, one per column master key that wraps this CEK.
+    pub encrypted_cek_values: Vec<EncryptedCekValue>,
+}
+
+/// Per-column cryptographic metadata for an Always Encrypted column, parsed from
+/// the COLMETADATA token when column encryption has been negotiated.
+#[derive(Debug, Clone)]
+pub(crate) struct CryptoMetadata {
+    /// Ordinal into the result set's CEK table identifying the wrapping key.
+    pub cek_table_ordinal: u16,
+    /// Underlying SQL Server data type of the column before encryption.
+    pub base_data_type: TdsDataType,
+    /// Wire descriptor for the underlying (plaintext) type.
+    pub base_type_info: TypeInfo,
+    /// Cipher algorithm identifier (`0x02` = `AEAD_AES_256_CBC_HMAC_SHA256`, see
+    /// `AEAD_AES_256_CBC_HMAC_SHA256_ALGORITHM_ID`; `0x00` = custom).
+    pub cipher_algorithm_id: u8,
+    /// Custom cipher algorithm name; present only when `cipher_algorithm_id` is `0`.
+    pub cipher_algorithm_name: Option<String>,
+    /// Encryption type byte (`1` = deterministic, `2` = randomized).
+    pub encryption_type: u8,
+    /// Normalization rule version byte.
+    pub normalization_rule_version: u8,
 }
 
 #[cfg(test)]
@@ -156,6 +327,7 @@ mod tests {
             data_type: TdsDataType::IntN,
             column_name: "test_column".to_string(),
             multi_part_name: None,
+            crypto_metadata: None,
         }
     }
 
@@ -206,23 +378,119 @@ mod tests {
     #[test]
     fn test_is_sparse_column_set() {
         let metadata =
-            create_test_column_metadata(0x1000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+            create_test_column_metadata(0x0400, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(metadata.is_sparse_column_set());
+
+        // 0x1000 is fUnused1, not fSparseColumnSet.
+        let metadata =
+            create_test_column_metadata(0x1000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_sparse_column_set());
 
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(!metadata.is_sparse_column_set());
     }
 
+    /// Builds a PLP column of the given SQL Server type: `is_plp()` keys off the
+    /// `PartialLen` type-info variant while `plp_encoding()` keys off
+    /// `data_type`, so both must be set for a faithful fixture.
+    fn plp_column(data_type: TdsDataType) -> ColumnMetadata {
+        let mut column = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarChar, None, None, None, None),
+        );
+        column.data_type = data_type;
+        column
+    }
+
+    #[test]
+    fn test_plp_encoding_classifies_full_type_set() {
+        // UTF-16LE text.
+        for dt in [TdsDataType::NVarChar, TdsDataType::NChar, TdsDataType::Xml] {
+            assert_eq!(
+                plp_column(dt).plp_encoding(),
+                Some(PlpEncoding::Utf16Text),
+                "{dt:?} should be Utf16Text"
+            );
+        }
+
+        // json is UTF-8 on the wire and must stay distinct from single-byte
+        // text, otherwise codepage conversion for varchar(max) would corrupt it.
+        assert_eq!(
+            plp_column(TdsDataType::Json).plp_encoding(),
+            Some(PlpEncoding::Utf8Text),
+            "json should be Utf8Text, not SingleByteText"
+        );
+
+        // Single-byte / codepage text.
+        assert_eq!(
+            plp_column(TdsDataType::BigVarChar).plp_encoding(),
+            Some(PlpEncoding::SingleByteText)
+        );
+
+        // Opaque bytes.
+        for dt in [
+            TdsDataType::BigVarBinary,
+            TdsDataType::Image,
+            TdsDataType::Udt,
+        ] {
+            assert_eq!(
+                plp_column(dt).plp_encoding(),
+                Some(PlpEncoding::Binary),
+                "{dt:?} should be Binary"
+            );
+        }
+
+        // Non-PLP columns have no PLP encoding.
+        let non_plp =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert_eq!(non_plp.plp_encoding(), None);
+
+        // A type somehow PLP-flagged but outside every classified arm falls
+        // through to opaque Binary rather than guessing a text codepage.
+        assert_eq!(
+            plp_column(TdsDataType::IntN).plp_encoding(),
+            Some(PlpEncoding::Binary),
+            "an unclassified PLP-flagged type should default to Binary"
+        );
+    }
+
     #[test]
     fn test_is_encrypted() {
         let metadata =
-            create_test_column_metadata(0x2000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+            create_test_column_metadata(0x0800, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(metadata.is_encrypted());
+
+        // 0x2000 is fHidden (FOR BROWSE), not fEncrypted.
+        let metadata =
+            create_test_column_metadata(0x2000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_encrypted());
 
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert!(!metadata.is_encrypted());
+    }
+
+    #[test]
+    fn test_is_hidden() {
+        let metadata =
+            create_test_column_metadata(0x2000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(metadata.is_hidden());
+
+        let metadata =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_hidden());
+    }
+
+    #[test]
+    fn test_is_key_column() {
+        let metadata =
+            create_test_column_metadata(0x4000, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(metadata.is_key_column());
+
+        let metadata =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert!(!metadata.is_key_column());
     }
 
     #[test]
@@ -261,6 +529,91 @@ mod tests {
         let metadata =
             create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
         assert_eq!(metadata.get_scale(), None);
+    }
+
+    #[test]
+    fn test_get_precision_decimal_numeric() {
+        // VarLenPrecisionScale: declared precision returned verbatim, regardless of scale.
+        let dec = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 17, 38, 4),
+        );
+        assert_eq!(dec.get_precision(), Some(38));
+
+        let num = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::NumericN, 9, 18, 0),
+        );
+        assert_eq!(num.get_precision(), Some(18));
+    }
+
+    #[test]
+    fn test_get_precision_money_types() {
+        // money/smallmoney have T-SQL fixed precisions; MoneyN dispatches on wire length.
+        let cases = [
+            (TypeInfoVariant::FixedLen(FixedLengthTypes::Money), Some(19)),
+            (
+                TypeInfoVariant::FixedLen(FixedLengthTypes::Money4),
+                Some(10),
+            ),
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 8),
+                Some(19),
+            ),
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 4),
+                Some(10),
+            ),
+            // MoneyN only ever carries 4 or 8 on the wire; anything else is malformed.
+            (
+                TypeInfoVariant::VarLen(VariableLengthTypes::MoneyN, 6),
+                None,
+            ),
+        ];
+        for (variant, expected) in cases {
+            let meta = create_test_column_metadata(0x00, variant);
+            assert_eq!(meta.get_precision(), expected);
+        }
+    }
+
+    #[test]
+    fn test_get_precision_none_for_non_numeric() {
+        // Variants that don't carry numeric precision all return None.
+        let cases = [
+            TypeInfoVariant::FixedLen(FixedLengthTypes::Int4),
+            TypeInfoVariant::VarLen(VariableLengthTypes::IntN, 4),
+            TypeInfoVariant::VarLenScale(VariableLengthTypes::TimeN, 7),
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarChar, None, None, None, None),
+        ];
+        for variant in cases {
+            let meta = create_test_column_metadata(0x00, variant);
+            assert_eq!(meta.get_precision(), None);
+        }
+    }
+
+    #[test]
+    fn test_get_precision_varlen_precision_scale() {
+        let metadata = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenPrecisionScale(VariableLengthTypes::DecimalN, 18, 38, 4),
+        );
+        assert_eq!(metadata.get_precision(), Some(38));
+    }
+
+    #[test]
+    fn test_get_precision_varlen_scale_only_is_none() {
+        let metadata = create_test_column_metadata(
+            0x00,
+            TypeInfoVariant::VarLenScale(VariableLengthTypes::TimeN, 7),
+        );
+        assert_eq!(metadata.get_precision(), None);
+    }
+
+    #[test]
+    fn test_get_precision_none() {
+        let metadata =
+            create_test_column_metadata(0x00, TypeInfoVariant::FixedLen(FixedLengthTypes::Int4));
+        assert_eq!(metadata.get_precision(), None);
     }
 
     #[test]
@@ -325,6 +678,29 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_part_name_accessors() {
+        let multi_part = MultiPartName {
+            server_name: Some("server".to_string()),
+            catalog_name: Some("catalog".to_string()),
+            schema_name: Some("dbo".to_string()),
+            table_name: "users".to_string(),
+        };
+        assert_eq!(multi_part.server_name(), Some("server"));
+        assert_eq!(multi_part.catalog_name(), Some("catalog"));
+        assert_eq!(multi_part.schema_name(), Some("dbo"));
+        assert_eq!(multi_part.table_name(), "users");
+    }
+
+    #[test]
+    fn test_multi_part_name_accessors_default() {
+        let multi_part = MultiPartName::default();
+        assert_eq!(multi_part.server_name(), None);
+        assert_eq!(multi_part.catalog_name(), None);
+        assert_eq!(multi_part.schema_name(), None);
+        assert_eq!(multi_part.table_name(), "");
+    }
+
+    #[test]
     fn test_multi_part_name_clone() {
         let multi_part = MultiPartName {
             server_name: Some("server".to_string()),
@@ -344,5 +720,24 @@ mod tests {
         let cloned = metadata.clone();
         assert_eq!(cloned.column_name, "test_column");
         assert_eq!(cloned.flags, 0x01);
+    }
+
+    #[test]
+    fn encrypted_cek_value_debug_redacts_key_material() {
+        let rendered = format!(
+            "{:?}",
+            EncryptedCekValue {
+                encrypted_key: vec![0x2A; 4],
+                key_store_name: "AZURE_KEY_VAULT".to_string(),
+                key_path: "https://vault.example/keys/cmk".to_string(),
+                algorithm_name: "RSA_OAEP".to_string(),
+            }
+        );
+
+        assert!(!rendered.contains("42"));
+        assert!(!rendered.contains("vault.example"));
+        assert!(!rendered.contains("AZURE_KEY_VAULT"));
+        assert!(rendered.contains("encrypted_key_len: 4"));
+        assert!(rendered.contains("RSA_OAEP"));
     }
 }

@@ -6,18 +6,19 @@ mod common;
 
 mod connectivity {
 
-    use std::{collections::HashMap, env};
+    use std::{collections::HashMap, env, sync::Arc};
 
+    use azure_core::cloud::{CloudConfiguration, CustomConfiguration};
     use azure_core::credentials::TokenCredential;
+    use azure_core::http::ClientOptions;
     use mssql_tds::connection::client_context::CloneableEntraIdTokenFactory;
 
-    use crate::common::{create_context, get_scalar_value, init_tracing};
+    use crate::common::{build_tcp_datasource, create_context, get_scalar_value, init_tracing};
     use azure_identity::{
-        DefaultAzureCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-        TokenCredentialOptions,
+        DeveloperToolsCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
     };
     use dotenv::dotenv;
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::EncryptionOptions;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::{
@@ -32,19 +33,12 @@ mod connectivity {
     const SCOPE: &str = "https://database.windows.net/.default";
 
     async fn generate_access_token() -> String {
-        // let azclicred = AzureCliCredential::new();
-
-        let mut credential_options = TokenCredentialOptions::default();
-        credential_options.set_authority_host(
-            "https://login.windows.net/E8F4741A-817A-403A-B28F-200D2B07D656".to_string(),
-        );
-
-        let credential = DefaultAzureCredential::new();
+        let credential = DeveloperToolsCredential::new(None);
 
         let token_response = credential.unwrap().get_token(&[SCOPE], None).await;
 
         let secret = token_response.as_ref().unwrap().token.secret();
-        print!("{secret}");
+        debug_assert!(!secret.is_empty(), "empty access token");
         secret.to_string()
     }
 
@@ -53,10 +47,15 @@ mod connectivity {
         sts: String,
         auth_method: &TdsAuthenticationMethod,
     ) -> String {
-        // let azclicred = AzureCliCredential::new();
         let scopes = &[spn.as_ref()];
-        let mut credential_options = TokenCredentialOptions::default();
-        credential_options.set_authority_host(sts);
+        // `CustomConfiguration` is `#[non_exhaustive]`, so it must be built by
+        // mutating a default; the field-reassign lint does not fire on it.
+        let mut custom = CustomConfiguration::default();
+        custom.authority_host = sts;
+        let client_options = ClientOptions {
+            cloud: Some(Arc::new(CloudConfiguration::Custom(custom))),
+            ..Default::default()
+        };
         let token_response = match auth_method {
             TdsAuthenticationMethod::Password => todo!(),
             TdsAuthenticationMethod::SSPI => todo!(),
@@ -66,14 +65,14 @@ mod connectivity {
             TdsAuthenticationMethod::ActiveDirectoryServicePrincipal => todo!(),
             TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
                 let options = ManagedIdentityCredentialOptions {
-                    credential_options,
+                    client_options,
                     user_assigned_id: None,
                 };
                 let vm_credential = ManagedIdentityCredential::new(Some(options)).unwrap();
                 vm_credential.get_token(scopes, None).await
             }
             TdsAuthenticationMethod::ActiveDirectoryDefault => {
-                let credential = DefaultAzureCredential::new();
+                let credential = DeveloperToolsCredential::new(None);
                 credential.unwrap().get_token(scopes, None).await
             }
             TdsAuthenticationMethod::ActiveDirectoryMSI => todo!(),
@@ -83,7 +82,7 @@ mod connectivity {
         };
 
         let secret = token_response.as_ref().unwrap().token.secret();
-        print!("{secret}");
+        debug_assert!(!secret.is_empty(), "empty access token");
         secret.to_string()
     }
 
@@ -143,16 +142,15 @@ mod connectivity {
     pub async fn select_1() {
         let access_token = generate_access_token().await;
         let context = create_context_with_accesstoken(access_token);
-        let host = env::var("DB_HOST").expect("DB_HOST environment variable not set");
-        let datasource = format!("tcp:{},1433", host);
+        let datasource = build_tcp_datasource();
         let provider = TdsConnectionProvider {};
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
         let command = "select 1".to_string();
-        connection.execute(command, None, None).await.unwrap();
+        connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -165,16 +163,15 @@ mod connectivity {
     pub async fn test_authentication_provider() {
         let context =
             create_context_with_auth_method(TdsAuthenticationMethod::ActiveDirectoryDefault);
-        let host = env::var("DB_HOST").expect("DB_HOST environment variable not set");
-        let datasource = format!("tcp:{},1433", host);
+        let datasource = build_tcp_datasource();
         let provider = TdsConnectionProvider {};
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
         let command = "select 1".to_string();
-        connection.execute(command, None, None).await.unwrap();
+        connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -216,16 +213,15 @@ mod connectivity {
         let access_token = generate_access_token().await;
         let mut context = create_context_with_accesstoken(access_token);
         context.encryption_options.trust_server_certificate = true;
-        let host = env::var("DB_HOST").expect("DB_HOST environment variable not set");
-        let datasource = format!("tcp:{},1433", host);
+        let datasource = build_tcp_datasource();
         let provider = TdsConnectionProvider {};
         let connection_result = provider.create_client(context, &datasource, None).await;
         let mut connection = connection_result.unwrap();
         let command = "select 1".to_string();
-        connection.execute(command, None, None).await.unwrap();
+        connection.execute(command, ()).await.unwrap();
 
-        if let Some(resultset) = connection.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.unwrap() {
+        if connection.on_rows() {
+            while let Some(row) = connection.next_row().await.unwrap() {
                 for cell in row {
                     print!("{cell:?},");
                 }
@@ -251,7 +247,7 @@ mod connectivity {
         let command =
             "select host_name from sys.dm_exec_sessions where client_interface_name = 'TdsX'"
                 .to_string();
-        client.execute(command, None, None).await.unwrap();
+        client.execute(command, ()).await.unwrap();
         let col_hostname = get_scalar_value(&mut client).await.unwrap();
         if let Some(column_value) = col_hostname {
             match column_value {
@@ -280,7 +276,7 @@ mod connectivity {
             .await
             .unwrap();
         let command = "select 1".to_string();
-        client.execute(command, None, None).await.unwrap();
+        client.execute(command, ()).await.unwrap();
         let col_hostname = get_scalar_value(&mut client).await.unwrap();
         if let Some(column_value) = col_hostname {
             match column_value {
@@ -315,9 +311,7 @@ mod connectivity {
         async fn get_spid(
             client: &mut mssql_tds::connection::tds_client::TdsClient,
         ) -> Result<i16, Box<dyn std::error::Error>> {
-            client
-                .execute("SELECT @@SPID".to_string(), None, None)
-                .await?;
+            client.execute("SELECT @@SPID".to_string(), ()).await?;
             let value = get_scalar_value(client).await?;
             match value {
                 Some(ColumnValues::SmallInt(spid)) => Ok(spid),
@@ -330,7 +324,7 @@ mod connectivity {
             client: &mut mssql_tds::connection::tds_client::TdsClient,
             query: &str,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            client.execute(query.to_string(), None, None).await?;
+            client.execute(query.to_string(), ()).await?;
             while client.next_row().await?.is_some() {}
             client.close_query().await?;
             Ok(())
@@ -341,7 +335,7 @@ mod connectivity {
             client: &mut mssql_tds::connection::tds_client::TdsClient,
             query: &str,
         ) -> Result<String, Box<dyn std::error::Error>> {
-            client.execute(query.to_string(), None, None).await?;
+            client.execute(query.to_string(), ()).await?;
             let value = get_scalar_value(client).await?;
             match value {
                 Some(ColumnValues::String(s)) => Ok(s.to_string()),
@@ -439,13 +433,14 @@ mod connectivity {
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let new_spid = get_spid(&mut client).await?;
+            // The query succeeding after the KILL proves the connection was
+            // transparently re-established (it would error otherwise). The SPID
+            // is deliberately NOT asserted to change: SQL Server recycles SPID
+            // numbers, so a recovered session frequently reuses the same one.
+            // connection_recovery_count is the reliable signal that a reconnect
+            // actually occurred.
+            let _ = get_spid(&mut client).await?;
 
-            assert_ne!(
-                original_spid, new_spid,
-                "SPID should change after reconnection (was {}, now {})",
-                original_spid, new_spid
-            );
             assert_eq!(
                 client.connection_recovery_count(),
                 1,
@@ -509,6 +504,182 @@ mod connectivity {
             Ok(())
         }
 
+        // ── Prepared-Handle Invalidation Across Reconnect ─────────────
+
+        /// A prepared-statement handle belongs to the session that created it.
+        /// After a transparent reconnect the server-side handle is gone, so
+        /// reusing it via `sp_execute` fails with error 8179 ("Could not find
+        /// prepared statement with handle"), while a fresh `sp_prepexec` on the
+        /// recovered session succeeds.
+        ///
+        /// This is the hazard the ODBC layer's epoch gate (`plan_execution`)
+        /// prevents: it stamps each handle with the recovery count and
+        /// re-prepares instead of reusing a handle from a superseded session.
+        /// Recovery is caller-owned here — we drive it via `check_and_reconnect`,
+        /// exactly as `SQLExecute` does, and the RPCs never self-recover.
+        #[tokio::test]
+        async fn stale_prepared_handle_after_reconnect_is_invalidated()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use mssql_tds::connection::tds_client::ResultSet;
+            use mssql_tds::datatypes::sqltypes::SqlType;
+            use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+            let make_param = || {
+                RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(7)),
+                )
+            };
+
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            assert!(
+                client.is_session_recovery_enabled(),
+                "session recovery must be negotiated for this scenario"
+            );
+
+            // Prepare + execute "SELECT @P1" and capture the server-side handle.
+            let mut orphan = None;
+            let (statement_id, _) = client
+                .execute_sp_prepexec_for_test(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    &mut orphan,
+                    (),
+                )
+                .await?;
+            while client.next_row().await?.is_some() {}
+            client.advance().await?;
+            let handle = client
+                .prepared_handle_for_test(statement_id)
+                .expect("sp_prepexec should surface the @handle during drain");
+            assert!(handle > 0);
+
+            // Kill the owning session from a second connection, then force
+            // recovery through the caller-owned entry point.
+            let spid = get_spid(&mut client).await?;
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            client.check_and_reconnect_for_test(None, None).await?;
+            assert_eq!(
+                client.connection_recovery_count(),
+                1,
+                "connection should have reconnected exactly once"
+            );
+
+            // Reusing the pre-reconnect handle must fail: it lived in the dead
+            // session, so the new session rejects it with error 8179. The
+            // reconnect dropped the client's entry, so re-seed it to get the
+            // stale handle back onto the wire.
+            assert_eq!(
+                client.prepared_handle_for_test(statement_id),
+                None,
+                "reconnect must drop the dead session's handle"
+            );
+            let stale = client.register_prepared_handle_for_test(handle);
+            let reuse = client
+                .execute_sp_execute_for_test(stale, None, Some(vec![make_param()]), ())
+                .await;
+            let err = reuse.expect_err("sp_execute on a superseded-session handle must fail");
+            assert!(
+                err.to_string()
+                    .to_lowercase()
+                    .contains("prepared statement"),
+                "expected a 'could not find prepared statement' (8179) error, got: {err}"
+            );
+
+            // A fresh prepare on the recovered session works — the statement
+            // remains usable once the caller re-prepares.
+            let mut orphan = None;
+            client
+                .execute_sp_prepexec_for_test(
+                    "SELECT @P1".to_string(),
+                    vec![make_param()],
+                    &mut orphan,
+                    (),
+                )
+                .await?;
+            Ok(())
+        }
+
+        /// The managed API's headline guarantee, and the counterpart to the raw
+        /// test above: re-executing the *same* `PreparedStatement` after the
+        /// session died transparently reconnects, re-prepares against the new
+        /// session, and returns the right value — with no caller step at all.
+        #[tokio::test]
+        async fn execute_prepared_reprepares_transparently_after_reconnect()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use mssql_tds::connection::tds_client::PreparedStatement;
+            use mssql_tds::datatypes::sqltypes::SqlType;
+            use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+
+            let make_param = || {
+                RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(7)),
+                )
+            };
+
+            let provider = TdsConnectionProvider {};
+            let mut client = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            assert!(
+                client.is_session_recovery_enabled(),
+                "session recovery must be negotiated for this scenario"
+            );
+
+            let mut statement = PreparedStatement::new("SELECT @P1");
+            let mut orphaned = None;
+
+            client
+                .execute_prepared(&mut statement, vec![make_param()], &mut orphaned, ())
+                .await?;
+            let value = get_scalar_value(&mut client).await?;
+            assert!(matches!(value, Some(ColumnValues::Int(7))));
+            let first_id = statement
+                .id()
+                .expect("the first execute must materialize the statement");
+
+            // Kill the owning session; the handle behind `first_id` dies with it.
+            let spid = get_spid(&mut client).await?;
+            let mut killer = provider
+                .create_client(create_context(), &build_tcp_datasource(), None)
+                .await?;
+            exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            client
+                .execute_prepared(&mut statement, vec![make_param()], &mut orphaned, ())
+                .await?;
+            let value = get_scalar_value(&mut client).await?;
+            assert!(
+                matches!(value, Some(ColumnValues::Int(7))),
+                "the same statement must re-prepare and return its value, got {value:?}"
+            );
+
+            assert_eq!(
+                client.connection_recovery_count(),
+                1,
+                "the execute should have recovered the connection itself"
+            );
+            assert_ne!(
+                statement.id(),
+                Some(first_id),
+                "re-preparing must issue a new identity, not reuse the dead session's"
+            );
+
+            Ok(())
+        }
+
         // ── Recovery Blocked by Transaction ───────────────────────────
 
         /// When a transaction is active and the connection is killed, recovery
@@ -534,7 +705,7 @@ mod connectivity {
             exec_and_drain(&mut killer, &format!("KILL {}", spid)).await?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let result = client.execute("SELECT 1".to_string(), None, None).await;
+            let result = client.execute("SELECT 1".to_string(), ()).await;
             assert!(
                 result.is_err(),
                 "Should fail when connection is dead and transaction is active"

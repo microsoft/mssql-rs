@@ -8,7 +8,7 @@ mod bulk_copy_variant_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::{
         ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
@@ -77,8 +77,7 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantIntTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -131,15 +130,14 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantIntTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 assert_eq!(row[0], ColumnValues::Int(row_count));
 
@@ -163,12 +161,8 @@ mod bulk_copy_variant_tests {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
         client
-            .execute(
-                "CREATE TABLE #VariantFloatMoneyTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #VariantFloatMoneyTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -216,15 +210,14 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantFloatMoneyTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 assert_eq!(row[0], ColumnValues::Int(row_count));
 
@@ -274,34 +267,23 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantDecimalTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
-        let decimal_val = DecimalParts {
-            precision: 18,
-            scale: 2,
-            is_positive: true,
-            int_parts: vec![123456],
-        };
+        let decimal_val = DecimalParts::new(true, 18, 2, 123456);
 
-        let numeric_val = DecimalParts {
-            precision: 10,
-            scale: 3,
-            is_positive: false,
-            int_parts: vec![987654],
-        };
+        let numeric_val = DecimalParts::new(false, 10, 3, 987654);
 
         let rows = vec![
             VariantRow {
                 id: 1,
-                variant_col: ColumnValues::Decimal(decimal_val.clone()),
+                variant_col: ColumnValues::Decimal(decimal_val),
             },
             VariantRow {
                 id: 2,
-                variant_col: ColumnValues::Numeric(numeric_val.clone()),
+                variant_col: ColumnValues::Numeric(numeric_val),
             },
         ];
 
@@ -319,15 +301,14 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantDecimalTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 assert_eq!(row[0], ColumnValues::Int(row_count));
 
@@ -337,8 +318,7 @@ mod bulk_copy_variant_tests {
                             assert_eq!(dec.precision, decimal_val.precision);
                             assert_eq!(dec.scale, decimal_val.scale);
                             assert_eq!(dec.is_positive, decimal_val.is_positive);
-                            // SQL Server may pad with zeros, so just check first element
-                            assert_eq!(dec.int_parts[0], decimal_val.int_parts[0]);
+                            assert_eq!(dec.magnitude(), decimal_val.magnitude());
                         } else {
                             panic!("Expected Decimal, got {:?}", row[1]);
                         }
@@ -348,8 +328,7 @@ mod bulk_copy_variant_tests {
                             assert_eq!(num.precision, numeric_val.precision);
                             assert_eq!(num.scale, numeric_val.scale);
                             assert_eq!(num.is_positive, numeric_val.is_positive);
-                            // SQL Server may pad with zeros, so just check first element
-                            assert_eq!(num.int_parts[0], numeric_val.int_parts[0]);
+                            assert_eq!(num.magnitude(), numeric_val.magnitude());
                         } else {
                             panic!("Expected Numeric, got {:?}", row[1]);
                         }
@@ -367,12 +346,8 @@ mod bulk_copy_variant_tests {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
         client
-            .execute(
-                "CREATE TABLE #VariantStringBytesTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #VariantStringBytesTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -406,15 +381,14 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantStringBytesTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 assert_eq!(row[0], ColumnValues::Int(row_count));
 
@@ -443,8 +417,7 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantDateTimeTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -523,15 +496,14 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantDateTimeTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 assert_eq!(row[0], ColumnValues::Int(row_count));
 
@@ -602,8 +574,7 @@ mod bulk_copy_variant_tests {
             .execute(
                 "CREATE TABLE #VariantUuidNullTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
@@ -636,15 +607,14 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #VariantUuidNullTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
                 assert_eq!(row[0], ColumnValues::Int(row_count));
 
@@ -671,12 +641,8 @@ mod bulk_copy_variant_tests {
 
         // Create temp table with sql_variant column
         client
-            .execute(
-                "CREATE TABLE #BulkCopyVariantUnsupportedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #BulkCopyVariantUnsupportedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -720,12 +686,8 @@ mod bulk_copy_variant_tests {
 
         // Create temp table with sql_variant column
         client
-            .execute(
-                "CREATE TABLE #BulkCopyVariantEdgeCaseTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #BulkCopyVariantEdgeCaseTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 
@@ -795,32 +757,22 @@ mod bulk_copy_variant_tests {
             // Decimal with zero
             VariantRow {
                 id: 14,
-                variant_col: ColumnValues::Decimal(DecimalParts {
-                    precision: 18,
-                    scale: 2,
-                    is_positive: true,
-                    int_parts: vec![0],
-                }),
+                variant_col: ColumnValues::Decimal(DecimalParts::new(true, 18, 2, 0)),
             },
             // Negative decimal
             VariantRow {
                 id: 15,
-                variant_col: ColumnValues::Decimal(DecimalParts {
-                    precision: 18,
-                    scale: 4,
-                    is_positive: false,
-                    int_parts: vec![999999],
-                }),
+                variant_col: ColumnValues::Decimal(DecimalParts::new(false, 18, 4, 999999)),
             },
             // High precision decimal
             VariantRow {
                 id: 16,
-                variant_col: ColumnValues::Decimal(DecimalParts {
-                    precision: 38,
-                    scale: 10,
-                    is_positive: true,
-                    int_parts: vec![i32::MAX, i32::MAX],
-                }),
+                variant_col: ColumnValues::Decimal(DecimalParts::new(
+                    true,
+                    38,
+                    10,
+                    9223372034707292159,
+                )),
             },
             // Date edge cases
             VariantRow {
@@ -868,15 +820,14 @@ mod bulk_copy_variant_tests {
         client
             .execute(
                 "SELECT id, variant_col FROM #BulkCopyVariantEdgeCaseTest ORDER BY id".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to select data");
 
         let mut row_count = 0;
-        if let Some(resultset) = client.get_current_resultset() {
-            while let Some(row) = resultset.next_row().await.expect("Failed to read row") {
+        if client.on_rows() {
+            while let Some(row) = client.next_row().await.expect("Failed to read row") {
                 row_count += 1;
 
                 // Verify ID
@@ -960,12 +911,8 @@ mod bulk_copy_variant_tests {
         let mut client = begin_connection(&build_tcp_datasource()).await;
 
         client
-            .execute(
-                "CREATE TABLE #VariantOversizedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
-                    .to_string(),
-                None,
-                None,
-            )
+            .execute("CREATE TABLE #VariantOversizedTest (id INT NOT NULL, variant_col SQL_VARIANT NULL)"
+                    .to_string(), ())
             .await
             .unwrap();
 

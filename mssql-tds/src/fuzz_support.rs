@@ -7,14 +7,17 @@ pub use crate::connection::tds_client::TdsClient;
 pub use crate::connection_provider::tds_connection_provider::TdsConnectionProvider;
 pub use crate::io::packet_reader::TdsPacketReader;
 pub use crate::io::token_stream::{
-    GenericTokenParserRegistry, ParserContext, RowReadResult, TdsTokenStreamReader,
-    TokenParserRegistry, TokenStreamReader,
+    ColumnPolicy, GenericTokenParserRegistry, ParserContext, PlpPauseState, RowHeader,
+    RowPauseState, RowReadResult, TdsTokenStreamReader, TokenParserRegistry, TokenStreamReader,
 };
 pub use crate::token::parsers::common::TokenParser;
 pub use crate::token::parsers::{
     FuzzDoneTokenParser as DoneTokenParser, FuzzEnvChangeTokenParser as EnvChangeTokenParser,
 };
 pub use crate::token::tokens::{SqlCollation, Tokens};
+
+// Re-export the DER/PEM framing fuzz entry point.
+pub use crate::security::crypto::fuzz_der_framing;
 
 // Re-export bulk copy internals for fuzz targets
 use crate::connection::bulk_copy::BulkCopyOptions;
@@ -30,6 +33,7 @@ pub fn build_insert_bulk_command(
 }
 
 // Import types we need internally
+use crate::connection::transport::any_transport::AnyTransport;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::NegotiatedEncryptionSetting;
 use crate::datatypes::row_writer::RowWriter;
@@ -61,10 +65,58 @@ impl FuzzReader {
             position: 0,
         }
     }
+
+    fn try_read_array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.position.checked_add(N)?;
+        let bytes = self.data.get(self.position..end)?.try_into().ok()?;
+        self.position = end;
+        Some(bytes)
+    }
 }
 
-#[async_trait]
 impl TdsPacketReader for FuzzReader {
+    fn try_read_byte(&mut self) -> Option<u8> {
+        self.try_read_array().map(|[value]| value)
+    }
+
+    fn try_read_int16(&mut self) -> Option<i16> {
+        self.try_read_array().map(i16::from_le_bytes)
+    }
+
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        self.try_read_array().map(u16::from_le_bytes)
+    }
+
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        let [b0, b1, b2] = self.try_read_array()?;
+        Some(u32::from_le_bytes([b0, b1, b2, 0]))
+    }
+
+    fn try_read_int32(&mut self) -> Option<i32> {
+        self.try_read_array().map(i32::from_le_bytes)
+    }
+
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        self.try_read_array().map(u32::from_le_bytes)
+    }
+
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        let [b0, b1, b2, b3, b4] = self.try_read_array()?;
+        Some(u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]))
+    }
+
+    fn try_read_int64(&mut self) -> Option<i64> {
+        self.try_read_array().map(i64::from_le_bytes)
+    }
+
+    fn try_read_float32(&mut self) -> Option<f32> {
+        self.try_read_array().map(f32::from_le_bytes)
+    }
+
+    fn try_read_float64(&mut self) -> Option<f64> {
+        self.try_read_array().map(f64::from_le_bytes)
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         if self.position >= self.data.len() {
             return Err(mssql_tds_error_eof());
@@ -268,7 +320,6 @@ impl TdsPacketReader for FuzzReader {
 /// Always-EOF reader for fuzz targets that only care about context variations.
 pub struct EmptyReader;
 
-#[async_trait]
 impl TdsPacketReader for EmptyReader {
     async fn read_byte(&mut self) -> TdsResult<u8> {
         Err(mssql_tds_error_eof())
@@ -429,10 +480,266 @@ impl NetworkWriter for MockWriter {
     }
 }
 
+/// Concrete packet-reader used by the fuzz harness.
+///
+/// `TdsPacketReader` returns `impl Future` per method, which makes it dyn-incompatible.
+/// The harness only ever supplies one of two readers, so an enum recovers the runtime
+/// choice that `Box<dyn TdsPacketReader>` previously provided, with static dispatch.
+pub enum FuzzPacketReader {
+    /// Reads from the fuzzer-supplied byte slice.
+    Fuzz(FuzzReader),
+    /// Always reports end-of-stream.
+    Empty(EmptyReader),
+}
+
+impl FuzzPacketReader {
+    /// Builds a reader over the fuzzer-supplied input.
+    pub fn from_data(data: &[u8]) -> Self {
+        Self::Fuzz(FuzzReader::new(data))
+    }
+
+    /// Builds a reader that always reports end-of-stream.
+    pub fn empty() -> Self {
+        Self::Empty(EmptyReader)
+    }
+}
+
+impl TdsPacketReader for FuzzPacketReader {
+    fn try_read_byte(&mut self) -> Option<u8> {
+        match self {
+            Self::Fuzz(r) => r.try_read_byte(),
+            Self::Empty(r) => r.try_read_byte(),
+        }
+    }
+
+    fn try_read_int16(&mut self) -> Option<i16> {
+        match self {
+            Self::Fuzz(r) => r.try_read_int16(),
+            Self::Empty(r) => r.try_read_int16(),
+        }
+    }
+
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint16(),
+            Self::Empty(r) => r.try_read_uint16(),
+        }
+    }
+
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint24(),
+            Self::Empty(r) => r.try_read_uint24(),
+        }
+    }
+
+    fn try_read_int32(&mut self) -> Option<i32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_int32(),
+            Self::Empty(r) => r.try_read_int32(),
+        }
+    }
+
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint32(),
+            Self::Empty(r) => r.try_read_uint32(),
+        }
+    }
+
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        match self {
+            Self::Fuzz(r) => r.try_read_uint40(),
+            Self::Empty(r) => r.try_read_uint40(),
+        }
+    }
+
+    fn try_read_int64(&mut self) -> Option<i64> {
+        match self {
+            Self::Fuzz(r) => r.try_read_int64(),
+            Self::Empty(r) => r.try_read_int64(),
+        }
+    }
+
+    fn try_read_float32(&mut self) -> Option<f32> {
+        match self {
+            Self::Fuzz(r) => r.try_read_float32(),
+            Self::Empty(r) => r.try_read_float32(),
+        }
+    }
+
+    fn try_read_float64(&mut self) -> Option<f64> {
+        match self {
+            Self::Fuzz(r) => r.try_read_float64(),
+            Self::Empty(r) => r.try_read_float64(),
+        }
+    }
+
+    async fn read_byte(&mut self) -> TdsResult<u8> {
+        match self {
+            Self::Fuzz(r) => r.read_byte().await,
+            Self::Empty(r) => r.read_byte().await,
+        }
+    }
+
+    async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
+        match self {
+            Self::Fuzz(r) => r.read_int16_big_endian().await,
+            Self::Empty(r) => r.read_int16_big_endian().await,
+        }
+    }
+
+    async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
+        match self {
+            Self::Fuzz(r) => r.read_int32_big_endian().await,
+            Self::Empty(r) => r.read_int32_big_endian().await,
+        }
+    }
+
+    async fn read_uint40(&mut self) -> TdsResult<u64> {
+        match self {
+            Self::Fuzz(r) => r.read_uint40().await,
+            Self::Empty(r) => r.read_uint40().await,
+        }
+    }
+
+    async fn read_float32(&mut self) -> TdsResult<f32> {
+        match self {
+            Self::Fuzz(r) => r.read_float32().await,
+            Self::Empty(r) => r.read_float32().await,
+        }
+    }
+
+    async fn read_float64(&mut self) -> TdsResult<f64> {
+        match self {
+            Self::Fuzz(r) => r.read_float64().await,
+            Self::Empty(r) => r.read_float64().await,
+        }
+    }
+
+    async fn read_int16(&mut self) -> TdsResult<i16> {
+        match self {
+            Self::Fuzz(r) => r.read_int16().await,
+            Self::Empty(r) => r.read_int16().await,
+        }
+    }
+
+    async fn read_uint16(&mut self) -> TdsResult<u16> {
+        match self {
+            Self::Fuzz(r) => r.read_uint16().await,
+            Self::Empty(r) => r.read_uint16().await,
+        }
+    }
+
+    async fn read_uint24(&mut self) -> TdsResult<u32> {
+        match self {
+            Self::Fuzz(r) => r.read_uint24().await,
+            Self::Empty(r) => r.read_uint24().await,
+        }
+    }
+
+    async fn read_int32(&mut self) -> TdsResult<i32> {
+        match self {
+            Self::Fuzz(r) => r.read_int32().await,
+            Self::Empty(r) => r.read_int32().await,
+        }
+    }
+
+    async fn read_uint32(&mut self) -> TdsResult<u32> {
+        match self {
+            Self::Fuzz(r) => r.read_uint32().await,
+            Self::Empty(r) => r.read_uint32().await,
+        }
+    }
+
+    async fn read_int64(&mut self) -> TdsResult<i64> {
+        match self {
+            Self::Fuzz(r) => r.read_int64().await,
+            Self::Empty(r) => r.read_int64().await,
+        }
+    }
+
+    async fn read_uint64(&mut self) -> TdsResult<u64> {
+        match self {
+            Self::Fuzz(r) => r.read_uint64().await,
+            Self::Empty(r) => r.read_uint64().await,
+        }
+    }
+
+    async fn read_bytes(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
+        match self {
+            Self::Fuzz(r) => r.read_bytes(buffer).await,
+            Self::Empty(r) => r.read_bytes(buffer).await,
+        }
+    }
+
+    async fn read_u8_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+        match self {
+            Self::Fuzz(r) => r.read_u8_varbyte().await,
+            Self::Empty(r) => r.read_u8_varbyte().await,
+        }
+    }
+
+    async fn read_u16_varbyte(&mut self) -> TdsResult<Vec<u8>> {
+        match self {
+            Self::Fuzz(r) => r.read_u16_varbyte().await,
+            Self::Empty(r) => r.read_u16_varbyte().await,
+        }
+    }
+
+    async fn read_varchar_u16_length(&mut self) -> TdsResult<Option<String>> {
+        match self {
+            Self::Fuzz(r) => r.read_varchar_u16_length().await,
+            Self::Empty(r) => r.read_varchar_u16_length().await,
+        }
+    }
+
+    async fn read_varchar_u8_length(&mut self) -> TdsResult<String> {
+        match self {
+            Self::Fuzz(r) => r.read_varchar_u8_length().await,
+            Self::Empty(r) => r.read_varchar_u8_length().await,
+        }
+    }
+
+    async fn read_unicode(&mut self, string_length: usize) -> TdsResult<String> {
+        match self {
+            Self::Fuzz(r) => r.read_unicode(string_length).await,
+            Self::Empty(r) => r.read_unicode(string_length).await,
+        }
+    }
+
+    async fn read_unicode_with_byte_length(&mut self, byte_length: usize) -> TdsResult<String> {
+        match self {
+            Self::Fuzz(r) => r.read_unicode_with_byte_length(byte_length).await,
+            Self::Empty(r) => r.read_unicode_with_byte_length(byte_length).await,
+        }
+    }
+
+    async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
+        match self {
+            Self::Fuzz(r) => r.skip_bytes(skip_count).await,
+            Self::Empty(r) => r.skip_bytes(skip_count).await,
+        }
+    }
+
+    async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+        match self {
+            Self::Fuzz(r) => r.cancel_read_stream().await,
+            Self::Empty(r) => r.cancel_read_stream().await,
+        }
+    }
+
+    fn reset_reader(&mut self) {
+        match self {
+            Self::Fuzz(r) => r.reset_reader(),
+            Self::Empty(r) => r.reset_reader(),
+        }
+    }
+}
+
 /// MockTransport simulates a transport layer for fuzzing
 pub struct MockTransport {
-    token_stream_reader:
-        TokenStreamReader<Box<dyn TdsPacketReader + Send + Sync>, GenericTokenParserRegistry>,
+    token_stream_reader: TokenStreamReader<FuzzPacketReader, GenericTokenParserRegistry>,
     mock_writer: MockWriter,
     packet_size: u32,
     encryption_setting: NegotiatedEncryptionSetting,
@@ -448,7 +755,7 @@ impl std::fmt::Debug for MockTransport {
 }
 
 impl MockTransport {
-    pub fn new(packet_reader: Box<dyn TdsPacketReader + Send + Sync>, packet_size: u32) -> Self {
+    pub fn new(packet_reader: FuzzPacketReader, packet_size: u32) -> Self {
         let parser_registry = Box::new(GenericTokenParserRegistry::default());
         let token_stream_reader = TokenStreamReader::new(packet_reader, parser_registry);
 
@@ -463,11 +770,6 @@ impl MockTransport {
 
 #[async_trait]
 impl NetworkReader for MockTransport {
-    async fn receive(&mut self, buffer: &mut [u8]) -> TdsResult<usize> {
-        buffer.fill(0);
-        Ok(buffer.len())
-    }
-
     fn packet_size(&self) -> u32 {
         self.packet_size
     }
@@ -530,10 +832,59 @@ impl TdsTokenStreamReader for MockTransport {
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
         self.token_stream_reader
-            .receive_row_into(context, remaining_request_timeout, cancel_handle, writer)
+            .receive_row_into(
+                context,
+                remaining_request_timeout,
+                cancel_handle,
+                plan,
+                writer,
+            )
+            .await
+    }
+
+    async fn receive_row_header(
+        &mut self,
+        context: &ParserContext,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> TdsResult<RowHeader> {
+        self.token_stream_reader
+            .receive_row_header(context, remaining_request_timeout, cancel_handle)
+            .await
+    }
+
+    async fn resume_row_into(
+        &mut self,
+        pause_state: RowPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        plan: ColumnPolicy,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        self.token_stream_reader
+            .resume_row_into(
+                pause_state,
+                remaining_request_timeout,
+                cancel_handle,
+                plan,
+                writer,
+            )
+            .await
+    }
+
+    async fn read_active_plp_bytes(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        remaining_request_timeout: Option<Duration>,
+        cancel_handle: Option<&CancelHandle>,
+        out: &mut [u8],
+    ) -> TdsResult<usize> {
+        self.token_stream_reader
+            .read_active_plp_bytes(plp_state, remaining_request_timeout, cancel_handle, out)
             .await
     }
 }
@@ -568,8 +919,47 @@ impl TdsTransport for MockTransport {
     }
 }
 
-#[async_trait]
 impl TdsPacketReader for MockTransport {
+    fn try_read_byte(&mut self) -> Option<u8> {
+        self.token_stream_reader.packet_reader.try_read_byte()
+    }
+
+    fn try_read_int16(&mut self) -> Option<i16> {
+        self.token_stream_reader.packet_reader.try_read_int16()
+    }
+
+    fn try_read_uint16(&mut self) -> Option<u16> {
+        self.token_stream_reader.packet_reader.try_read_uint16()
+    }
+
+    fn try_read_uint24(&mut self) -> Option<u32> {
+        self.token_stream_reader.packet_reader.try_read_uint24()
+    }
+
+    fn try_read_int32(&mut self) -> Option<i32> {
+        self.token_stream_reader.packet_reader.try_read_int32()
+    }
+
+    fn try_read_uint32(&mut self) -> Option<u32> {
+        self.token_stream_reader.packet_reader.try_read_uint32()
+    }
+
+    fn try_read_uint40(&mut self) -> Option<u64> {
+        self.token_stream_reader.packet_reader.try_read_uint40()
+    }
+
+    fn try_read_int64(&mut self) -> Option<i64> {
+        self.token_stream_reader.packet_reader.try_read_int64()
+    }
+
+    fn try_read_float32(&mut self) -> Option<f32> {
+        self.token_stream_reader.packet_reader.try_read_float32()
+    }
+
+    fn try_read_float64(&mut self) -> Option<f64> {
+        self.token_stream_reader.packet_reader.try_read_float64()
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         self.token_stream_reader.packet_reader.read_byte().await
     }
@@ -709,10 +1099,7 @@ pub fn create_test_execution_context() -> crate::connection::execution_context::
 }
 
 /// Helper function to create TdsClient for fuzzing
-pub fn create_fuzz_tds_client(
-    packet_reader: Box<dyn TdsPacketReader + Send + Sync>,
-    packet_size: u32,
-) -> TdsClient {
+pub fn create_fuzz_tds_client(packet_reader: FuzzPacketReader, packet_size: u32) -> TdsClient {
     let mock_transport = MockTransport::new(packet_reader, packet_size);
     let negotiated_settings = create_test_negotiated_settings();
     let execution_context = create_test_execution_context();
@@ -720,9 +1107,10 @@ pub fn create_fuzz_tds_client(
         crate::connection::client_context::ClientContext::with_data_source("tcp:localhost,1433");
 
     TdsClient::new(
-        Box::new(mock_transport),
+        AnyTransport::dynamic(mock_transport),
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
     )
 }

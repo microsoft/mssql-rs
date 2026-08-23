@@ -1,0 +1,128 @@
+# filepath: .pipeline/templates/test-matrix-odbc-template.yml
+#
+# Linux amd64 test matrix for the mssql-odbc C++ gtest e2e suite. Downloads the
+# prebuilt ODBC drop (driver .so + ctest binaries) published by Build_Linux,
+# restores it to mssql-odbc/tests/e2e/build, brings up SQL Server on a shared
+# docker network, then reruns the prebuilt binaries in each distro container via
+# run_e2e.sh --skip-build (no rebuild). Mirrors test-matrix-template.yml.
+
+parameters:
+  matrix: {}
+  artifactName: 'Odbc_Linux_x64'
+  nameSuffix: ''
+
+jobs:
+  - job: Test_Odbc_Matrix${{ parameters.nameSuffix }}
+    displayName: ODBC e2e Linux amd64
+    strategy:
+      matrix: ${{ parameters.matrix }}
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+      - template: generate-sql-password-template.yml
+        parameters:
+          osType: Linux
+      - task: DockerInstaller@0
+        inputs:
+          dockerVersion: '29.0.0'
+      - template: install-ubuntu-dependency.yaml
+        parameters:
+          installAzCli: false
+      - task: DownloadPipelineArtifact@2
+        inputs:
+          buildType: 'current'
+          artifactName: ${{ parameters.artifactName }}
+          targetPath: '$(Pipeline.Workspace)/odbc-drop'
+        displayName: 'Download ODBC drop'
+      - script: |
+          set -e
+          echo "container=$(container) entry=$(entry)"
+
+          # Restore the prebuilt build tree (driver .so staged inside) to the
+          # exact repo-relative path it was built at, so the absolute paths
+          # baked into CTestTestfile.cmake resolve inside the test container
+          # (both jobs mount the repo at /workspace).
+          rm -rf mssql-odbc/tests/e2e/build
+          cp -r "$(Pipeline.Workspace)/odbc-drop/build" mssql-odbc/tests/e2e/build
+
+          # SQL Server needs a cert to serve TLS; generate and mount one.
+          scripts/generate_cert.sh
+          scripts/generate_mock_tds_server_certs.sh
+          sudo chown 10001:0 mssql.*
+
+          docker network create testnet
+
+          # The e2e binaries are prebuilt (no cargo build to absorb SQL Server's
+          # first-boot window), so gate on the SA login being live before running
+          # them — otherwise the first live test races SQL init and gets 18456.
+          # SQL Server 2025 intermittently hits a SQLPAL startup assertion on these
+          # agents and the container dies; restart it if it crashes before the SA
+          # login is accepted.
+          start_sql() {
+            if [ -n "${sql_cid:-}" ]; then
+              docker rm -f "$sql_cid" >/dev/null 2>&1 || true
+            fi
+            sql_cid=$(docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=$SQL_PASSWORD" \
+              -p 1433:1433 --hostname sql1 --network testnet \
+              -v $PWD/conf/mssql.conf:/var/opt/mssql/mssql.conf \
+              -v $PWD/mssql.pem:/etc/ssl/certs/mssql.pem \
+              -v $PWD/mssql.key:/etc/ssl/private/mssql.key \
+              -u 0:0 -d mcr.microsoft.com/mssql/server:2025-latest)
+          }
+          wait_sql_ready() {
+            for _ in $(seq 1 60); do
+              if docker exec "$sql_cid" /opt/mssql-tools18/bin/sqlcmd \
+                  -S localhost -U sa -P "$SQL_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1; then
+                return 0
+              fi
+              if [ "$(docker inspect -f '{{.State.Running}}' "$sql_cid" 2>/dev/null)" != "true" ]; then
+                return 1
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          echo "Starting SQL Server and waiting for the SA login..."
+          ready=0
+          for attempt in 1 2 3; do
+            start_sql
+            if wait_sql_ready; then
+              ready=1
+              echo "SQL Server ready (attempt $attempt)."
+              break
+            fi
+            echo "SQL Server not ready on attempt $attempt; container logs (tail 100):" >&2
+            docker logs --tail 100 "$sql_cid" >&2 || true
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "ERROR: SQL Server did not become ready after 3 attempts." >&2
+            exit 1
+          fi
+
+          bash .pipeline/scripts/docker-cargo-run.sh --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            -e "ODBC_TEST_SERVER=sql1" \
+            -e "ODBC_TEST_UID=sa" \
+            -e "ODBC_TEST_PWD=$(SQL_PASSWORD)" \
+            -e "ODBC_TEST_TRUST_CERT=Yes" \
+            -e "ODBC_E2E_RETRIES=3" \
+            -e "RUST_BACKTRACE=full" \
+            --network testnet \
+            $(container) /workspace/scripts/dockerentry/$(entry)
+        workingDirectory: "$(Build.SourcesDirectory)"
+        displayName: Run ODBC e2e in container
+        condition: succeeded()
+        env:
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+          CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        displayName: "Publish ODBC e2e results"
+        inputs:
+          testResultsFormat: "JUnit"
+          testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+          testRunTitle: $(System.PhaseName)

@@ -1,0 +1,1139 @@
+# Shared validation stages consumed by validation-pipeline.yml (development CI/PR)
+# and validation-pipeline-ci.yml (GitHub main CI). Single source of truth for stages.
+
+parameters:
+- name: buildType
+  displayName: Type of the build to produce
+  type: string
+  values:
+  - Both
+  - Debug
+  - Release
+  default: Both
+
+- name: RunFuzz
+  displayName: Run Fuzz Tests (30 min)
+  type: boolean
+  default: false
+
+- name: RunLongHaul
+  displayName: Run Long-Haul BCP Test (30 min)
+  type: boolean
+  default: false
+
+- name: includeInfraStages
+  displayName: Include infra stages (Long-Haul, Private Link Smoke) that require the 'Magnitude Test' service connection
+  type: boolean
+  default: true
+
+- name: sqlInstanceMode
+  displayName: SQL host cardinality for ARM test stages (shared = one SQL host per stage; per-job = one per matrix entry)
+  type: string
+  values:
+  - shared
+  - per-job
+  default: shared
+
+- name: sqlImageTag
+  displayName: SQL Server docker image tag for ARM test stages
+  type: string
+  default: '2025-latest'
+
+stages:
+- stage: EvaluateDuplicate
+  displayName: Evaluate PR duplicate
+  condition: and(eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+  - job: Evaluate
+    displayName: Check prior successful PR validation
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+    - bash: |
+        set -euo pipefail
+        python3 .pipeline/scripts/evaluate-duplicate-pr.py
+      name: SetDuplicateState
+      displayName: Check duplicate PR head commit
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+- stage: Build
+  displayName: Build Stage
+  dependsOn:
+    - EvaluateDuplicate
+  condition: >-
+    and(
+      not(canceled()),
+      eq('${{ parameters.RunFuzz }}', 'false'),
+      eq('${{ parameters.RunLongHaul }}', 'false'),
+      or(
+        ne(variables['Build.Reason'], 'PullRequest'),
+        ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true')
+      )
+    )
+  jobs:
+  # On-demand x64 SQL host for the ARM64 builds' integration tests. ARM agents
+  # cannot run the x64 SQL Server image natively, so Build_Linux_ARM and the
+  # Windows ARM ODBC e2e leg connect cross-pool to this host instead. PR-only:
+  # the ARM builds only run their test pass on PRs, and this job would otherwise
+  # idle an x64 agent on every merge.
+  - template: sql-host-template.yml
+    parameters:
+      instanceId: build_arm
+      expectedSentinels: build_arm,build_win_arm
+      sqlImageTag: ${{ parameters.sqlImageTag }}
+      jobCondition: eq(variables['Build.Reason'], 'PullRequest')
+  - job: Build_Windows
+    displayName: Build Windows
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-Win22-Sql25-1P
+    variables:
+      # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: sql-setup-template.yml
+        parameters:
+          buildTarget: Windows
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Windows
+      - template: install-dependencies.yml
+        parameters:
+          osType: Windows
+      - template: build-template.yml
+        parameters:
+          osType: Windows
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E "not (test(connectivity))"
+          enableOdbcE2E: true
+      # Extended Protection (EPA) channel-binding test.
+      # Runs AFTER the main test pass. Runs the same integrated-auth encrypted
+      # login test under two server configurations, expecting success in both:
+      #   1. EPA = Off      -- baseline (channel binding not enforced).
+      #   2. EPA = Required -- the server rejects any login lacking a valid
+      #      channel binding, so a successful login proves we send a real,
+      #      server-validated tls-unique token.
+      # Reverts EPA to Off in `finally` so a failure still restores the
+      # instance. Each registry change requires a SQL service restart, handled
+      # by the script.
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $spns = @("MSSQLSvc/localhost:1433", "MSSQLSvc/$($env:COMPUTERNAME):1433")
+          $configured = $false
+          try {
+            foreach ($level in @('Off', 'Required')) {
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level $level -ForceEncryption 'Yes' `
+                -AcceptedNtlmSpns $spns -RestartService $true
+              $configured = $true
+
+              Write-Host "Running EPA channel-binding test with Extended Protection = $level"
+              cargo nextest run --frozen --package mssql-tds `
+                -E 'test(epa_channel_binding)' --no-fail-fast --profile ci
+              if ($LASTEXITCODE -ne 0) { throw "EPA channel-binding test failed with EPA=$level (exit $LASTEXITCODE)" }
+            }
+          }
+          finally {
+            if ($configured) {
+              Write-Host 'Reverting Extended Protection to Off...'
+              ./.pipeline/scripts/Configure-ExtendedProtection.ps1 `
+                -InstanceName 'MSSQLSERVER' -Level 'Off' -ForceEncryption 'No' -RestartService $true
+            }
+          }
+        displayName: 'Extended Protection (EPA) channel-binding test'
+        condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+        env:
+          EPA_TEST: '1'
+          SSPI_TEST: '1'
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          RUST_BACKTRACE: full
+      - task: PublishTestResults@2
+        condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+        displayName: 'Publish EPA test results'
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
+          testRunTitle: 'Extended Protection (EPA)'
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Windows
+            architecture: x64
+
+  - job: Build_Windows_Arm
+    displayName: Build Windows ARM
+    pool:
+      name: RUST-1ES-POOL-ARM-WUS3
+      demands:
+        - imageOverride -equals RUST-WINSRV-ARM
+    variables:
+      # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      # Add Node.js to PATH for Azure DevOps tasks
+      # Using x64 Node.js via Windows ARM64 emulation since ARM64 Node isn't available
+      - pwsh: ./scripts/setup-nodejs-path.ps1
+        displayName: 'Add Node.js to PATH for ADO tasks'
+
+      # Create Node.js in the agent's externals folder where ADO tasks expect it
+      - pwsh: ./scripts/install-nodejs-to-agent.ps1
+        displayName: 'Install Node.js to agent externals folder'
+
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Windows
+
+      - template: install-dependencies.yml
+        parameters:
+          osType: Windows
+          enableJsDeps: false
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Windows
+            architecture: arm64
+            # Python 3.10 excluded - limited ARM64 support
+            pythonVersions:
+            - '3.11'
+            - '3.12'
+            - '3.13'
+            - '3.14'
+
+      # ODBC C++ e2e against the cross-pool x64 SQL host booted above. This image
+      # has no local SQL Server, so it joins the same artifact-sentinel rendezvous
+      # Build_Linux_ARM uses. Intentionally no `dependsOn` on the SQL host job.
+      - template: odbc-e2e-windows-remote-sql-template.yml
+        parameters:
+          sqlReadyInstanceId: build_arm
+          sentinelName: build_win_arm
+          testRunTitle: 'ODBC e2e (Windows ARM)'
+
+  - job: Build_Linux
+    displayName: Build Linux
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: build-template-container.yml
+        parameters:
+          architecture: x64
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          enableJsBuild: true
+          enableJsTest: true
+          additionalPythonTestArgs: '--coverage'
+          collectPythonCoverage: true
+          collectRustCoverage: true
+      - template: build-template-alpine.yml
+        parameters:
+          osType: Linux
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Linux
+            architecture: x64
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Alpine
+            architecture: x64
+      - template: build-odbc-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Linux_x64'
+      - template: build-odbc-alpine-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Musl_x64'
+      - template: build-odbc-glibc228-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_glibc228_x64'
+
+  - job: Build_Linux_ARM
+    displayName: Build Linux ARM
+    pool:
+      name: RUST-1ES-POOL-ARM-WUS3
+      demands:
+        - imageOverride -equals RUST-UBUNTU-ARM64
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - script: |
+          .pipeline/scripts/print-disk-info.sh
+        displayName: 'Print debug information about agent'
+
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: build-template-container.yml
+        parameters:
+          architecture: ARM64
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          additionalPythonTestArgs: '--skip-integration'
+      - template: build-template-alpine.yml
+        parameters:
+          osType: Linux
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+      # Wheels are not consumed by anything in a PR run (PrivateLink_Smoke, the
+      # only consumer, is non-PR only), so build them on CI runs only.
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Linux
+            architecture: ARM64
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: Alpine
+            architecture: ARM64
+      - template: build-odbc-template.yml
+        parameters:
+          architecture: ARM64
+          artifactName: 'Odbc_Linux_arm64'
+      - template: build-odbc-alpine-template.yml
+        parameters:
+          architecture: ARM64
+          artifactName: 'Odbc_Musl_arm64'
+      - template: build-odbc-glibc228-template.yml
+        parameters:
+          architecture: ARM64
+          buildImage: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
+          artifactName: 'Odbc_glibc228_arm64'
+  - job: Build_MacOS
+    displayName: Build MacOS
+    pool:
+      name: Azure Pipelines
+      vmImage: macOS-latest
+    variables:
+      # For details on this CARGO_TARGET_DIR setting, see https://eng.ms/docs/more/rust/topics/onebranch-workaround
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: MacOS
+      - template: install-dependencies.yml
+        parameters:
+          osType: MacOS 
+      - template: build-template.yml
+        parameters:
+          osType: MacOS
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          # JS build and macOS wheels dominate this job's runtime and nothing in a
+          # PR run consumes their output, so they only run on CI (non-PR) builds.
+          enableJsBuild: ${{ ne(variables['Build.Reason'], 'PullRequest') }}
+          enableTests: false
+      - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        - template: build-python-wheels-template.yml
+          parameters:
+            osType: MacOS
+            architecture: x64
+
+  - job: Test_MacOS
+    displayName: Test MacOS
+    pool:
+      name: Azure Pipelines
+      vmImage: macOS-latest
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+      TRUST_SERVER_CERTIFICATE: 'true'
+    steps:
+      - template: sql-setup-template.yml
+        parameters:
+          buildTarget: MacOS
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: MacOS
+      - template: install-dependencies.yml
+        parameters:
+          osType: MacOS
+      - script: |
+          set -euo pipefail
+          colima status
+          docker ps -a
+          docker inspect sqlserver --format \
+            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
+          docker exec sqlserver \
+            /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U SA -P "$SQL_PASSWORD" \
+            -C -b -Q "SELECT 1"
+          nc -z -v 127.0.0.1 1433
+        displayName: 'Verify macOS SQL Server before tests'
+        env:
+          SQL_PASSWORD: $(SQL_PASSWORD)
+      - template: build-template.yml
+        parameters:
+          osType: MacOS
+          buildType: ${{ parameters.buildType }}
+          testFilter: -E 'not (test(connectivity))'
+          enableClippy: false
+      - script: |
+          set +e
+          echo "=== Colima status ==="
+          colima status || true
+          echo "=== Docker containers ==="
+          docker ps -a || true
+          echo "=== SQL Server state ==="
+          docker inspect sqlserver --format \
+            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}' || true
+          echo "=== SQL Server logs ==="
+          docker logs --tail 500 sqlserver || true
+          echo "=== Host port 1433 ==="
+          lsof -nP -iTCP:1433 -sTCP:LISTEN || true
+          exit 0
+        displayName: 'Diagnose macOS SQL Server failure'
+        condition: or(failed(), canceled())
+
+# Kerberos tests for PRs (fast - 2 distros: ubuntu22 + alpine318)
+- stage: Kerberos_Test_PR
+  displayName: Kerberos Test (PR)
+  dependsOn:
+    - EvaluateDuplicate
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
+  jobs:
+    - template: kerberos-test-template.yml
+      parameters:
+        profiles:
+          - ubuntu22
+          - alpine318
+        testTimeout: 45
+        useArchive: false  # PR builds compile from source to validate the PR code
+
+# Kerberos tests for merge (full matrix across all distros)
+- stage: Kerberos_Test_Full
+  displayName: Kerberos Test (Full Matrix)
+  dependsOn:
+    - Build
+  # Scope success to the Build stage explicitly. Bare succeeded() evaluates the
+  # whole dependency graph, so the PR-only EvaluateDuplicate stage (skipped on
+  # non-PR CI runs) would otherwise make this stage skip in CI.
+  condition: and(succeeded('Build'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+    - template: kerberos-test-template.yml
+      parameters:
+        profiles:
+          - ubuntu22
+          - ubuntu24
+          - alpine318
+          - alpine319
+          - alpine320
+          - alpine321
+          - debian
+          - rhel9
+          - oracle9
+        testTimeout: 120
+        # useArchive: true (default) - uses pre-built nextest archives for faster testing
+
+- stage: Fuzz
+  displayName: Fuzz Testing Stage
+  dependsOn: []
+  condition: eq('${{ parameters.RunFuzz }}', 'true')
+  jobs:
+  - job: Fuzz_TokenStream_Linux
+    displayName: Fuzz Test Token Stream Linux (30 min)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 1800
+          fuzzTarget: fuzz_token_stream
+
+  - job: Fuzz_TdsClient_Linux
+    displayName: Fuzz Test TdsClient Linux (30 min)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 1800
+          fuzzTarget: fuzz_tds_client
+
+  - job: Fuzz_Additional_Targets_Linux
+    displayName: Fuzz Additional Targets Linux (Serial - 5 min each)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_provider
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_api_inputs
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_parameter_encoding
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_provider_network
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_provider_context
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_bulk_copy
+
+- stage: Build_mssql_python
+  dependsOn:
+    - EvaluateDuplicate
+  condition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'), ne(dependencies.EvaluateDuplicate.outputs['Evaluate.SetDuplicateState.skipDuplicate'], 'true'))
+  displayName: Build mssql-python
+  jobs:
+  - job: Build_mssql_python_Linux
+    displayName: Build mssql-python (cross-repo)
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: test-mssql-python-template.yml
+
+  - job: Build_mssql_python_MacOS
+    displayName: Build mssql-python macOS (cross-repo)
+    pool:
+      name: Azure Pipelines
+      vmImage: macOS-latest
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: test-mssql-python-macos-template.yml
+
+  # Same upstream suite, but with mssql-python's bundled msodbcsql18 binary
+  # replaced by the Rust mssql-odbc driver. Failures and crashes are expected
+  # while the driver is in development, so the job is informational: only a
+  # broken harness fails it, and each test file runs in its own bounded process.
+  #
+  # Deliberately always-on rather than behind an opt-in parameter like RunFuzz /
+  # RunLongHaul: the point is a continuous compatibility signal for a driver
+  # under active development, which an opt-in flag nobody remembers to set would
+  # not give. The job timeout is a ceiling for the pathological all-files-hang
+  # case, not the expected runtime - the first full run took ~9m, and the
+  # runner's own 110m budget bounds the normal path.
+  #
+  # The time bounds nest deliberately: the runner caps the whole test loop at
+  # pytestTotalBudget (110m), the test step backstops a wedged `docker exec` at
+  # 130m, and the job allows 150m so the ~20m left over covers setup (image pull,
+  # apt, cargo build, pybind build) and still guarantees the publish and cleanup
+  # steps run. A job cancelled by the server for timeout skips
+  # `condition: always()` steps, which would lose the report this job exists to
+  # produce.
+  - job: Test_mssql_python_on_mssql_odbc
+    displayName: mssql-python suite on mssql-odbc driver (cross-repo)
+    timeoutInMinutes: 150
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+      - template: test-mssql-python-odbc-template.yml
+
+- stage: Test_alpine
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Alpine
+  jobs:
+    - template: test-matrix-template-alpine.yml
+      parameters:
+        artifactName: 'Build_Linux'
+        matrix:
+          Alpine3_18:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+            entry: alpine.sh
+          Alpine3_19:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+            entry: alpine.sh
+          Alpine3_20:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+            entry: alpine.sh
+          Alpine3_21:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+            entry: alpine.sh
+    # mssql-odbc musl e2e reuses this Alpine stage (same pool; no extra stage or
+    # agent allocation). Driver + ctest are prebuilt on the Alpine 3.18 (musl)
+    # build image and rerun on every listed tag (all ship libssl.so.3 + unixODBC).
+    - template: test-matrix-odbc-template.yml
+      parameters:
+        artifactName: 'Odbc_Musl_x64'
+        nameSuffix: _musl
+        matrix:
+          Alpine3_18:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+            entry: odbc-e2e-alpine.sh
+          Alpine3_19:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+            entry: odbc-e2e-alpine.sh
+          Alpine3_20:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+            entry: odbc-e2e-alpine.sh
+          Alpine3_21:
+            container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+            entry: odbc-e2e-alpine.sh
+
+- stage: Test_alpine_arm64
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Alpine arm64
+  jobs:
+    # nextest (musl) and mssql-odbc (musl) arm64 both need a cross-pool x64 SQL
+    # host. In shared mode this stage owns ONE host (shared_musl) that both
+    # matrices consume, so we don't allocate a second SQL host agent. Each
+    # matrix publishes its own teardown sentinels (ODBC prefixed 'odbc_'); the
+    # host releases once every expected sentinel arrives.
+    - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
+      - template: sql-host-template.yml
+        parameters:
+          instanceId: shared_musl
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          expectedSentinels: 'Alpine3_18,Alpine3_19,Alpine3_20,Alpine3_21,odbc_Alpine3_18,odbc_Alpine3_19,odbc_Alpine3_20,odbc_Alpine3_21'
+      - template: test-matrix-template-alpine_arm64.yml
+        parameters:
+          manageSqlHost: false
+          artifactName: 'Build_Linux_ARM'
+          poolName: RUST-1ES-POOL-ARM-WUS3
+          poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
+          sqlInstanceMode: shared
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          targets:
+            - name: Alpine3_18
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+              entry: alpine.sh
+            - name: Alpine3_19
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+              entry: alpine.sh
+            - name: Alpine3_20
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+              entry: alpine.sh
+            - name: Alpine3_21
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+              entry: alpine.sh
+      - template: test-matrix-odbc-template-arm64.yml
+        parameters:
+          manageSqlHost: false
+          sqlReadyInstanceId: shared_musl
+          sentinelPrefix: 'odbc_'
+          sqlInstanceMode: shared
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          artifactName: 'Odbc_Musl_arm64'
+          targets:
+            - name: Alpine3_18
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+              entry: odbc-e2e-alpine.sh
+            - name: Alpine3_19
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+              entry: odbc-e2e-alpine.sh
+            - name: Alpine3_20
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+              entry: odbc-e2e-alpine.sh
+            - name: Alpine3_21
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+              entry: odbc-e2e-alpine.sh
+    # per-job mode: each matrix entry gets its own SQL host (nextest hosts are
+    # '<name>_musl', ODBC hosts 'odbc_<name>'), so no host is shared.
+    - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
+      - template: test-matrix-template-alpine_arm64.yml
+        parameters:
+          artifactName: 'Build_Linux_ARM'
+          poolName: RUST-1ES-POOL-ARM-WUS3
+          poolImageOverride: imageOverride -equals RUST-UBUNTU-ARM64
+          sqlInstanceMode: per-job
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          targets:
+            - name: Alpine3_18
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+              entry: alpine.sh
+            - name: Alpine3_19
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+              entry: alpine.sh
+            - name: Alpine3_20
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+              entry: alpine.sh
+            - name: Alpine3_21
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+              entry: alpine.sh
+      - template: test-matrix-odbc-template-arm64.yml
+        parameters:
+          sqlInstanceMode: per-job
+          sentinelPrefix: 'odbc_'
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          artifactName: 'Odbc_Musl_arm64'
+          targets:
+            - name: Alpine3_18
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.18
+              entry: odbc-e2e-alpine.sh
+            - name: Alpine3_19
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.19
+              entry: odbc-e2e-alpine.sh
+            - name: Alpine3_20
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.20
+              entry: odbc-e2e-alpine.sh
+            - name: Alpine3_21
+              container: ghcr.io/microsoft/mssql-rs/import/alpine:3.21
+              entry: odbc-e2e-alpine.sh
+
+- stage: Test_amd64
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Linux amd64
+  jobs:
+    - template: test-matrix-template.yml
+      parameters:
+        matrix:
+          DebianBookworm:
+            container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+            entry: deb-bookworm.sh
+          AzLinux3:
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+            entry: azlinux3.sh
+          RHEL9:
+            container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
+            entry: rhel.sh
+          OracleLinux9:
+            container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
+            entry: rhel.sh
+          SLES15:
+            container: registry.suse.com/suse/sle15
+            entry: sles.sh
+          Ubuntu22:
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+            entry: deb-bookworm.sh
+          Ubuntu24:
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+            entry: deb-bookworm.sh
+
+    # mssql-odbc e2e reuses this amd64 stage (same pool; no extra stage or agent
+    # allocation). Modern-glibc track: driver + ctest are prebuilt on Ubuntu
+    # 22.04 (glibc 2.35, OpenSSL 3 / libssl.so.3), so only glibc >= 2.35 distros
+    # that ship libssl.so.3 are listed. RHEL 9 / Oracle 9 (glibc 2.34) are
+    # excluded; RHEL 8 is covered by the glibc-2.28 track below.
+    - template: test-matrix-odbc-template.yml
+      parameters:
+        artifactName: 'Odbc_Linux_x64'
+        matrix:
+          DebianBookworm:
+            container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+            entry: odbc-e2e-deb.sh
+          Ubuntu22:
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+            entry: odbc-e2e-deb.sh
+          Ubuntu24:
+            container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+            entry: odbc-e2e-deb.sh
+          AzLinux3:
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+            entry: odbc-e2e-azlinux3.sh
+    # glibc-2.28 track: driver + ctest are prebuilt on manylinux_2_28
+    # (AlmaLinux 8, glibc 2.28, OpenSSL 1.1) so they load on RHEL 8 / UBI 8
+    # (libssl.so.1.1), where the modern glibc 2.35 / OpenSSL 3 binaries would not.
+    - template: test-matrix-odbc-template.yml
+      parameters:
+        artifactName: 'Odbc_glibc228_x64'
+        nameSuffix: _glibc228
+        matrix:
+          RHEL8:
+            container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi8:latest
+            entry: odbc-e2e-rhel.sh
+
+
+- stage: Test_arm64
+  dependsOn: 
+    - Build
+  condition: and(ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  displayName: Test Linux arm64
+  jobs:
+    # nextest and mssql-odbc arm64 both need a cross-pool x64 SQL host (arm
+    # agents can't run the x64 SQL image). In shared mode this stage owns ONE
+    # host (shared) consumed by both matrices, avoiding a second SQL host agent.
+    # The ODBC matrix only lists glibc >= 2.35 / libssl.so.3 distros because its
+    # binaries are prebuilt on the arm64 Ubuntu 22.04 build image.
+    - ${{ if eq(parameters.sqlInstanceMode, 'shared') }}:
+      - template: sql-host-template.yml
+        parameters:
+          instanceId: shared
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          expectedSentinels: 'DebianBookworm,AzLinux3,RHEL9,OracleLinux9,SLES15,Ubuntu22,Ubuntu24,odbc_DebianBookworm,odbc_Ubuntu22,odbc_Ubuntu24,odbc_AzLinux3,odbc_RHEL8'
+      - template: test-matrix-template-arm64.yml
+        parameters:
+          manageSqlHost: false
+          sqlInstanceMode: shared
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          targets:
+            - name: DebianBookworm
+              container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+              entry: deb-bookworm.sh
+            - name: AzLinux3
+              container: mcr.microsoft.com/azurelinux/base/core:3.0
+              entry: azlinux3.sh
+            - name: RHEL9
+              container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
+              entry: rhel.sh
+            - name: OracleLinux9
+              container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
+              entry: rhel.sh
+            - name: SLES15
+              container: registry.suse.com/suse/sle15
+              entry: sles.sh
+            - name: Ubuntu22
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+              entry: deb-bookworm.sh
+            - name: Ubuntu24
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+              entry: deb-bookworm.sh
+      - template: test-matrix-odbc-template-arm64.yml
+        parameters:
+          manageSqlHost: false
+          sqlReadyInstanceId: shared
+          sentinelPrefix: 'odbc_'
+          sqlInstanceMode: shared
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          artifactName: 'Odbc_Linux_arm64'
+          targets:
+            - name: DebianBookworm
+              container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+              entry: odbc-e2e-deb.sh
+            - name: Ubuntu22
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+              entry: odbc-e2e-deb.sh
+            - name: Ubuntu24
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+              entry: odbc-e2e-deb.sh
+            - name: AzLinux3
+              container: mcr.microsoft.com/azurelinux/base/core:3.0
+              entry: odbc-e2e-azlinux3.sh
+      # glibc-2.28 arm64 track: driver + ctest prebuilt on manylinux_2_28 aarch64
+      # (glibc 2.28, OpenSSL 1.1) so they load on RHEL 8 / UBI 8 arm64. Shares the
+      # same cross-pool x64 SQL host; teardown sentinel odbc_RHEL8 is enumerated
+      # in the shared host's expectedSentinels above.
+      - template: test-matrix-odbc-template-arm64.yml
+        parameters:
+          manageSqlHost: false
+          sqlReadyInstanceId: shared
+          sentinelPrefix: 'odbc_'
+          nameSuffix: _glibc228
+          sqlInstanceMode: shared
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          artifactName: 'Odbc_glibc228_arm64'
+          targets:
+            - name: RHEL8
+              container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi8:latest
+              entry: odbc-e2e-rhel.sh
+    # per-job mode: nextest hosts and ODBC hosts (prefixed 'odbc_') are distinct,
+    # so each matrix entry manages its own SQL host.
+    - ${{ if eq(parameters.sqlInstanceMode, 'per-job') }}:
+      - template: test-matrix-template-arm64.yml
+        parameters:
+          sqlInstanceMode: per-job
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          targets:
+            - name: DebianBookworm
+              container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+              entry: deb-bookworm.sh
+            - name: AzLinux3
+              container: mcr.microsoft.com/azurelinux/base/core:3.0
+              entry: azlinux3.sh
+            - name: RHEL9
+              container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi9:latest
+              entry: rhel.sh
+            - name: OracleLinux9
+              container: ghcr.io/microsoft/mssql-rs/import/oraclelinux:9
+              entry: rhel.sh
+            - name: SLES15
+              container: registry.suse.com/suse/sle15
+              entry: sles.sh
+            - name: Ubuntu22
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+              entry: deb-bookworm.sh
+            - name: Ubuntu24
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+              entry: deb-bookworm.sh
+      - template: test-matrix-odbc-template-arm64.yml
+        parameters:
+          sqlInstanceMode: per-job
+          sentinelPrefix: 'odbc_'
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          artifactName: 'Odbc_Linux_arm64'
+          targets:
+            - name: DebianBookworm
+              container: ghcr.io/microsoft/mssql-rs/import/debian:bookworm
+              entry: odbc-e2e-deb.sh
+            - name: Ubuntu22
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:22.04
+              entry: odbc-e2e-deb.sh
+            - name: Ubuntu24
+              container: ghcr.io/microsoft/mssql-rs/import/ubuntu:24.04
+              entry: odbc-e2e-deb.sh
+            - name: AzLinux3
+              container: mcr.microsoft.com/azurelinux/base/core:3.0
+              entry: odbc-e2e-azlinux3.sh
+      # glibc-2.28 arm64 per-job: own SQL host (odbc_RHEL8), prebuilt on
+      # manylinux_2_28 aarch64 so it loads on RHEL 8 / UBI 8 arm64.
+      - template: test-matrix-odbc-template-arm64.yml
+        parameters:
+          sqlInstanceMode: per-job
+          sentinelPrefix: 'odbc_'
+          nameSuffix: _glibc228
+          sqlImageTag: ${{ parameters.sqlImageTag }}
+          artifactName: 'Odbc_glibc228_arm64'
+          targets:
+            - name: RHEL8
+              container: ghcr.io/microsoft/mssql-rs/import/redhat/ubi8:latest
+              entry: odbc-e2e-rhel.sh
+
+# Merge the mssql-tds Rust coverage from every OS that runs the tests
+# (Build_Windows, Build_Linux, Test_MacOS), the ODBC C++ e2e coverage
+# (Build_Linux x64 and Build_Windows), and the mssql-py-core coverage from the
+# Python tests (Build_Linux) into one Cobertura report. ADO does not merge
+# coverage across stages/jobs, so it is combined here and published as
+# CoberturaCoverage (the artifact the GitHub diff-cover workflow consumes) and
+# to the ADO coverage tab.
+- stage: Coverage
+  displayName: Merge Coverage
+  dependsOn:
+    - Build
+  condition: and(succeeded('Build'), eq(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+  jobs:
+  - job: Merge_Coverage
+    displayName: Merge Rust and Python coverage
+    pool:
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    steps:
+      - checkout: self
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-tds) Windows coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageRust_Windows'
+          targetPath: '$(Pipeline.Workspace)/cov-rust-windows'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-tds) Linux coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageRust_Linux'
+          targetPath: '$(Pipeline.Workspace)/cov-rust-linux'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download ODBC e2e Linux coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageOdbcE2E_Linux'
+          targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-linux'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download ODBC e2e Windows coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageOdbcE2E_Windows'
+          targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-windows'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-tds) macOS coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageRust_MacOS'
+          targetPath: '$(Pipeline.Workspace)/cov-rust-macos'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Python (mssql-py-core) coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoveragePython'
+          targetPath: '$(Pipeline.Workspace)/cov-python'
+      - task: DownloadPipelineArtifact@2
+        displayName: Download Rust (mssql-py-core) coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoveragePyCoreRust'
+          targetPath: '$(Pipeline.Workspace)/cov-pycore-rust'
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(Build.SourcesDirectory)/target"
+          inputs=()
+          # Each OS emits its mssql-tds + mssql-odbc report with repo-root-relative
+          # paths, so the same source file lines up across reports and coverage is
+          # unioned: a line covered on any OS counts as covered in the merged result.
+          # The ODBC e2e reports (Linux x64 and Windows) are also repo-root-relative
+          # and add coverage for lines reachable only through the ODBC Driver Manager.
+          for report in \
+            "$(Pipeline.Workspace)/cov-rust-windows/cobertura.xml" \
+            "$(Pipeline.Workspace)/cov-rust-linux/cobertura.xml" \
+            "$(Pipeline.Workspace)/cov-rust-macos/cobertura.xml" \
+            "$(Pipeline.Workspace)/cov-odbc-e2e-linux/cobertura-odbc-e2e.xml" \
+            "$(Pipeline.Workspace)/cov-odbc-e2e-windows/cobertura-odbc-e2e.xml"; do
+            [ -f "$report" ] && inputs+=("$report")
+          done
+          # mssql-py-core coverage is measured from within its own crate
+          # directory, so prefix its relative filenames to make them repo-root
+          # relative in the merged report. Both the Python bindings coverage and
+          # the Rust unit test coverage use the same crate prefix so they union.
+          py="$(Pipeline.Workspace)/cov-python/pycore-cobertura.xml"
+          [ -f "$py" ] && inputs+=("$py::mssql-py-core")
+          pyrust="$(Pipeline.Workspace)/cov-pycore-rust/pycore-rust-cobertura.xml"
+          [ -f "$pyrust" ] && inputs+=("$pyrust::mssql-py-core")
+          if [ ${#inputs[@]} -eq 0 ]; then
+            echo "##vso[task.logissue type=warning]No coverage inputs found to merge"
+            exit 0
+          fi
+          python3 .pipeline/scripts/merge-cobertura.py \
+            --output "$(Build.SourcesDirectory)/target/cobertura.xml" \
+            "${inputs[@]}"
+          echo "##vso[task.setvariable variable=coverageMerged]true"
+        displayName: Merge Cobertura reports
+      - task: PublishPipelineArtifact@1
+        condition: and(succeeded(), eq(variables['coverageMerged'], 'true'))
+        displayName: Publish merged Cobertura coverage artifact
+        inputs:
+          targetPath: '$(Build.SourcesDirectory)/target/cobertura.xml'
+          artifactName: 'CoberturaCoverage'
+      # PublishCodeCoverageResults@2 renders the ADO coverage tab HTML with
+      # ReportGenerator, which requires .NET. The slim Linux agent does not ship
+      # it, so install it explicitly; otherwise the coverage tab reports that the
+      # HTML report was not found.
+      - task: UseDotNet@2
+        condition: and(succeeded(), eq(variables['coverageMerged'], 'true'))
+        displayName: Install .NET for coverage HTML rendering
+        inputs:
+          packageType: 'sdk'
+          version: '8.x'
+      - task: PublishCodeCoverageResults@2
+        condition: and(succeeded(), eq(variables['coverageMerged'], 'true'))
+        displayName: Publish merged coverage results
+        inputs:
+          summaryFileLocation: '$(Build.SourcesDirectory)/target/cobertura.xml'
+          pathToSources: '$(Build.SourcesDirectory)'
+
+- ${{ if eq(parameters.includeInfraStages, true) }}:
+  # Long-haul BCP test stage (30 minutes)
+  - stage: LongHaul
+    displayName: Long-Haul BCP Test (30 min)
+    dependsOn: []
+    condition: eq('${{ parameters.RunLongHaul }}', 'true')
+    jobs:
+    - job: LongHaul_BCP_Test
+      displayName: Long-Haul BCP Test Ubuntu
+      pool:
+        name: RUST-1ES-POOL-WUS3
+        demands:
+          - imageOverride -equals RUST-1ES-UBUSLIM
+      variables:
+        CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      steps:
+        - template: test-longhaul-template.yml
+          parameters:
+            durationSeconds: 1800  # 30 minutes
+            batchSize: 1000
+            testSelector: '-m "longhaul" -k "not arrow"'
+            resultsFile: 'pytest-longhaul-results.xml'
+            testRunTitle: 'LongHaul-BCP-Test'
+
+    # Arrow long-haul runs as its own job so it executes in parallel with the
+    # tuple long-haul; total stage wall-clock stays ~30 min instead of doubling.
+    - job: LongHaul_BCP_Arrow_Test
+      displayName: Long-Haul BCP Arrow Test Ubuntu
+      pool:
+        name: RUST-1ES-POOL-WUS3
+        demands:
+          - imageOverride -equals RUST-1ES-UBUSLIM
+      variables:
+        CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+      steps:
+        - template: test-longhaul-template.yml
+          parameters:
+            durationSeconds: 1800  # 30 minutes
+            batchSize: 1000
+            testSelector: '-m "longhaul" -k "arrow"'
+            resultsFile: 'pytest-longhaul-arrow-results.xml'
+            testRunTitle: 'LongHaul-BCP-Arrow-Test'
+
+  # Private-link smoke test for mssql-py-core (non-PR only)
+  # Deploys wheel into ACI on trusted VNet, runs pytest suite via managed identity
+  - stage: PrivateLink_Smoke
+    displayName: Private Link Smoke Test
+    dependsOn:
+      - Build
+    # Scope success to the Build stage explicitly. Bare succeeded() evaluates the
+    # whole dependency graph, so the PR-only EvaluateDuplicate stage (skipped on
+    # non-PR CI runs) would otherwise make this stage skip in CI.
+    condition: and(succeeded('Build'), ne(variables['Build.Reason'], 'PullRequest'), eq('${{ parameters.RunFuzz }}', 'false'), eq('${{ parameters.RunLongHaul }}', 'false'))
+    jobs:
+      - template: private-link-smoke-template.yml

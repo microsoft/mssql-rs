@@ -88,7 +88,7 @@ where
         // This is the value from a stored procedure's RETURN statement
         let value = reader.read_int32().await?;
 
-        Ok(Tokens::from(ReturnStatusToken { _value: value }))
+        Ok(Tokens::from(ReturnStatusToken { value }))
     }
 }
 
@@ -106,7 +106,7 @@ mod tests {
 
         match result {
             Tokens::ReturnStatus(token) => {
-                assert_eq!(token._value, 0);
+                assert_eq!(token.value, 0);
             }
             _ => panic!("Expected ReturnStatus token"),
         }
@@ -121,7 +121,7 @@ mod tests {
 
         match result {
             Tokens::ReturnStatus(token) => {
-                assert_eq!(token._value, -1);
+                assert_eq!(token.value, -1);
             }
             _ => panic!("Expected ReturnStatus token"),
         }
@@ -136,7 +136,7 @@ mod tests {
 
         match result {
             Tokens::ReturnStatus(token) => {
-                assert_eq!(token._value, 42);
+                assert_eq!(token.value, 42);
             }
             _ => panic!("Expected ReturnStatus token"),
         }
@@ -151,7 +151,7 @@ mod tests {
 
         match result {
             Tokens::ReturnStatus(token) => {
-                assert_eq!(token._value, i32::MAX);
+                assert_eq!(token.value, i32::MAX);
             }
             _ => panic!("Expected ReturnStatus token"),
         }
@@ -166,7 +166,7 @@ mod tests {
 
         match result {
             Tokens::ReturnStatus(token) => {
-                assert_eq!(token._value, i32::MIN);
+                assert_eq!(token.value, i32::MIN);
             }
             _ => panic!("Expected ReturnStatus token"),
         }

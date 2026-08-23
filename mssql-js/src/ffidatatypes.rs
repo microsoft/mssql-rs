@@ -141,6 +141,8 @@ impl TryFrom<TdsDataType> for SqlDataTypes {
             TdsDataType::None => Err(()),
             // TODO(Phase 3): Add Vector to SqlDataTypes enum and implement proper conversion
             TdsDataType::Vector => Err(()),
+            // Table-valued parameters are not representable as a scalar JS data type.
+            TdsDataType::SqlTable => Err(()),
         }
     }
 
@@ -187,19 +189,24 @@ impl From<DecimalParts> for NapiDecimalParts {
             is_positive: decimal_parts.is_positive,
             scale: decimal_parts.scale,
             precision: decimal_parts.precision,
-            int_parts: decimal_parts.int_parts,
+            int_parts: (0..decimal_parts.word_count())
+                .map(|i| decimal_parts.word(i))
+                .collect(),
         }
     }
 }
 
-impl From<NapiDecimalParts> for DecimalParts {
-    fn from(napi_decimal_parts: NapiDecimalParts) -> Self {
-        DecimalParts {
-            is_positive: napi_decimal_parts.is_positive,
-            scale: napi_decimal_parts.scale,
-            precision: napi_decimal_parts.precision,
-            int_parts: napi_decimal_parts.int_parts,
-        }
+impl TryFrom<NapiDecimalParts> for DecimalParts {
+    type Error = Error;
+
+    fn try_from(napi_decimal_parts: NapiDecimalParts) -> Result<Self, Self::Error> {
+        DecimalParts::try_from_words(
+            napi_decimal_parts.is_positive,
+            napi_decimal_parts.precision,
+            napi_decimal_parts.scale,
+            &napi_decimal_parts.int_parts,
+        )
+        .ok_or_else(|| Error::from_reason("Decimal magnitude exceeds 128 bits"))
     }
 }
 
@@ -560,7 +567,7 @@ impl TryFrom<Parameter> for SqlType {
                         param.data_type
                     )));
                 }
-                Ok(SqlType::Decimal(Some(decimal_parts.into())))
+                Ok(SqlType::Decimal(Some(decimal_parts.try_into()?)))
             }
             RowDataType::N(uuid) => match param.data_type {
                 SqlDataTypes::Guid => {
@@ -657,5 +664,22 @@ pub fn transform_col(col: ColumnValues) -> RowDataType {
             // Temporary placeholder - return null for now
             RowDataType::F(Null)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_decimal_magnitude_is_rejected() {
+        let decimal = NapiDecimalParts {
+            is_positive: true,
+            scale: 0,
+            precision: 38,
+            int_parts: vec![1, 0, 0, 0, 1],
+        };
+
+        assert!(DecimalParts::try_from(decimal).is_err());
     }
 }

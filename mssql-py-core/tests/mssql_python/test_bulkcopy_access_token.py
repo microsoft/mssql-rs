@@ -1,17 +1,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for the fresh-token-at-bulkcopy-time flow.
+"""Tests for AAD token acquisition and access-token context handling.
 
-Validates the integrated mssql-python ↔ mssql-tds behaviour:
+Validates the mssql-python ↔ mssql-py-core integration points this module owns:
   1. AADAuth.get_raw_token() acquires a fresh JWT each invocation.
   2. AADAuth.get_token() returns an ODBC struct wrapping that JWT.
-  3. process_connection_string() propagates auth_type correctly.
-  4. Connection._auth_type is populated from the connection string.
-  5. cursor.bulkcopy() acquires a fresh token at call time (not cached).
-  6. Token cleanup removes access_token from pycore_context after bulk copy.
-  7. Rust-side dict_to_client_context selects AccessToken auth when
-     access_token key is present (covered by mssql-tds unit tests).
+  3. mssql_py_core.PyCoreConnection accepts an access_token context and
+     rejects access_token combined with uid/pwd.
+
+The end-to-end bulkcopy token flow (fresh token per call, Connection._auth_type
+population, pycore_context cleanup) is covered in test_auth_resolution_e2e.py.
 
 Run via:  bash dev/test-python.sh --mssql-python
 
@@ -178,134 +177,6 @@ class TestAADAuthErrors:
 
 
 # ===========================================================================
-# process_connection_string tests
-# ===========================================================================
-
-class TestProcessConnectionString:
-    """Validate that process_connection_string extracts auth_type correctly."""
-
-    @patch("mssql_python.auth.get_auth_token", return_value=b"\x00" * 8)
-    def test_interactive_auth_type(self, _mock_token):
-        from mssql_python.auth import process_connection_string
-        import platform
-
-        conn_str = "Server=myserver;Database=mydb;Authentication=ActiveDirectoryInteractive"
-        if platform.system().lower() != "windows":
-            _, attrs, auth_type = process_connection_string(conn_str)
-            assert auth_type == "interactive"
-            assert attrs is not None
-            assert 1256 in attrs
-
-    @patch("mssql_python.auth.get_auth_token", return_value=b"\x00" * 8)
-    def test_default_auth_type(self, _mock_token):
-        from mssql_python.auth import process_connection_string
-
-        conn_str = "Server=myserver;Database=mydb;Authentication=ActiveDirectoryDefault"
-        _, attrs, auth_type = process_connection_string(conn_str)
-        assert auth_type == "default"
-
-    @patch("mssql_python.auth.get_auth_token", return_value=b"\x00" * 8)
-    def test_devicecode_auth_type(self, _mock_token):
-        from mssql_python.auth import process_connection_string
-
-        conn_str = "Server=myserver;Database=mydb;Authentication=ActiveDirectoryDeviceCode"
-        _, attrs, auth_type = process_connection_string(conn_str)
-        assert auth_type == "devicecode"
-
-    def test_no_auth_returns_none(self):
-        from mssql_python.auth import process_connection_string
-
-        conn_str = f"Server=myserver;Database=mydb;UID=sa;PWD={FAKE_PWD}"
-        _, attrs, auth_type = process_connection_string(conn_str)
-        assert auth_type is None
-        assert attrs is None
-
-    @patch("mssql_python.auth.get_auth_token", return_value=b"\x00" * 8)
-    def test_sensitive_params_removed(self, _mock_token):
-        from mssql_python.auth import process_connection_string
-
-        conn_str = f"Server=myserver;Database=mydb;UID=sa;PWD={FAKE_PWD};Authentication=ActiveDirectoryDefault"
-        processed, _, _ = process_connection_string(conn_str)
-        lower = processed.lower()
-        assert "uid=" not in lower
-        assert "pwd=" not in lower
-
-    def test_empty_conn_str_raises(self):
-        from mssql_python.auth import process_connection_string
-        with pytest.raises(ValueError):
-            process_connection_string("")
-
-    def test_invalid_type_raises(self):
-        from mssql_python.auth import process_connection_string
-        with pytest.raises(ValueError):
-            process_connection_string(12345)
-
-    @patch("mssql_python.auth.get_auth_token", return_value=b"\x00" * 8)
-    def test_returns_three_tuple(self, _mock_token):
-        """process_connection_string always returns a 3-tuple."""
-        from mssql_python.auth import process_connection_string
-
-        result = process_connection_string(
-            "Server=x;Database=y;Authentication=ActiveDirectoryDefault"
-        )
-        assert len(result) == 3
-
-
-# ===========================================================================
-# process_auth_parameters unit tests
-# ===========================================================================
-
-class TestProcessAuthParameters:
-    """Low-level tests for the parameter parser."""
-
-    def test_extracts_interactive(self):
-        from mssql_python.auth import process_auth_parameters
-        import platform
-
-        params = ["Server=x", "Authentication=ActiveDirectoryInteractive"]
-        _, auth_type = process_auth_parameters(params)
-
-        if platform.system().lower() == "windows":
-            assert auth_type is None
-        else:
-            assert auth_type == "interactive"
-
-    def test_extracts_devicecode(self):
-        from mssql_python.auth import process_auth_parameters
-        _, auth_type = process_auth_parameters(
-            ["Server=x", "Authentication=ActiveDirectoryDeviceCode"]
-        )
-        assert auth_type == "devicecode"
-
-    def test_extracts_default(self):
-        from mssql_python.auth import process_auth_parameters
-        _, auth_type = process_auth_parameters(
-            ["Server=x", "Authentication=ActiveDirectoryDefault"]
-        )
-        assert auth_type == "default"
-
-    def test_no_auth_param(self):
-        from mssql_python.auth import process_auth_parameters
-        _, auth_type = process_auth_parameters(["Server=x", "Database=y"])
-        assert auth_type is None
-
-    def test_case_insensitive(self):
-        from mssql_python.auth import process_auth_parameters
-        _, auth_type = process_auth_parameters(
-            ["Authentication=ACTIVEDIRECTORYDEFAULT"]
-        )
-        assert auth_type == "default"
-
-    def test_preserves_other_params(self):
-        from mssql_python.auth import process_auth_parameters
-        params = ["Server=mysvr", "Encrypt=yes", "Authentication=ActiveDirectoryDefault"]
-        modified, _ = process_auth_parameters(params)
-        joined = ";".join(modified).lower()
-        assert "server=mysvr" in joined
-        assert "encrypt=yes" in joined
-
-
-# ===========================================================================
 # Rust-side access_token context validation (via mssql_py_core)
 # ===========================================================================
 
@@ -423,40 +294,3 @@ class TestTokenStructEncoding:
         assert struct.unpack("<I", s[:4])[0] == 0
         assert len(s) == 4
 
-
-# ===========================================================================
-# remove_sensitive_params tests
-# ===========================================================================
-
-class TestRemoveSensitiveParams:
-    """Verify credential scrubbing from connection params."""
-
-    def test_removes_uid_pwd_auth(self):
-        from mssql_python.auth import remove_sensitive_params
-        params = [
-            "Server=mysvr",
-            "UID=sa",
-            f"PWD={FAKE_PWD}",
-            "Authentication=ActiveDirectoryDefault",
-            "Database=mydb",
-        ]
-        result = remove_sensitive_params(params)
-        joined = ";".join(result).lower()
-        assert "uid=" not in joined
-        assert "pwd=" not in joined
-        assert "authentication=" not in joined
-        assert "server=mysvr" in joined
-        assert "database=mydb" in joined
-
-    def test_case_insensitive_removal(self):
-        from mssql_python.auth import remove_sensitive_params
-        params = ["Server=x", "Uid=SA", "Pwd=P@ss"]
-        result = remove_sensitive_params(params)
-        assert len(result) == 1
-        assert result[0] == "Server=x"
-
-    def test_preserves_non_sensitive(self):
-        from mssql_python.auth import remove_sensitive_params
-        params = ["Server=x", "Encrypt=yes", "TrustServerCertificate=true"]
-        result = remove_sensitive_params(params)
-        assert len(result) == 3

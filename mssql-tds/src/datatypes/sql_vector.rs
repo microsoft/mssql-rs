@@ -18,6 +18,8 @@ use crate::error::Error;
 pub enum VectorData {
     /// Single-precision (32-bit) float vector.
     Float32(Vec<f32>),
+    /// Half-precision float vector (stored in memory as f32).
+    Float16(Vec<f32>),
 }
 
 /// Represents a SQL Server Vector data type value.
@@ -85,6 +87,18 @@ impl SqlVector {
         VectorLayoutVersion::try_from(layout_version)?;
         let base_type_enum = VectorBaseType::try_from(base_type)?;
 
+        // Validate that the payload size matches the element size precisely
+        if !raw_bytes
+            .len()
+            .is_multiple_of(base_type_enum.element_size_bytes())
+        {
+            return Err(Error::ProtocolError(format!(
+                "Malformed vector payload: byte length ({}) is not a multiple of the element size ({})",
+                raw_bytes.len(),
+                base_type_enum.element_size_bytes()
+            )));
+        }
+
         // Parse raw bytes into typed data based on base type
         let data = match base_type_enum {
             VectorBaseType::Float32 => {
@@ -121,6 +135,7 @@ impl SqlVector {
     pub fn as_f32(&self) -> Option<&[f32]> {
         match &self.data {
             VectorData::Float32(v) => Some(v),
+            VectorData::Float16(v) => Some(v),
         }
     }
 
@@ -128,6 +143,7 @@ impl SqlVector {
     pub fn dimension_count(&self) -> u16 {
         match &self.data {
             VectorData::Float32(v) => v.len() as u16,
+            VectorData::Float16(v) => v.len() as u16,
         }
     }
 
@@ -144,6 +160,7 @@ impl SqlVector {
     pub(crate) fn total_size(&self) -> usize {
         let element_count = match &self.data {
             VectorData::Float32(v) => v.len(),
+            VectorData::Float16(v) => v.len(),
         };
         VECTOR_HEADER_SIZE + element_count * self.base_type.element_size_bytes()
     }
@@ -152,6 +169,7 @@ impl SqlVector {
     fn validate_dimensions(&self) -> TdsResult<()> {
         let dimension_count = match &self.data {
             VectorData::Float32(v) => v.len(),
+            VectorData::Float16(v) => v.len(),
         };
 
         if dimension_count == 0 {
@@ -203,6 +221,14 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_too_many_dimensions_f16() {
+        let values = vec![0.0f32; (VectorBaseType::Float16.max_dimensions() + 1) as usize];
+        let result = SqlVector::try_from_f16(values);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
     fn test_validate_unsupported_format() {
         let raw_bytes = 1.0_f32.to_le_bytes().to_vec();
         let result = SqlVector::try_from_raw(
@@ -239,6 +265,21 @@ mod tests {
     }
 
     #[test]
+    fn test_from_raw_float16() {
+        let raw_bytes = vec![0, 60]; // 1.0f16 in little-endian (0x3C00)
+        let vector = SqlVector::try_from_raw(
+            VectorLayoutFormat::V1 as u8,
+            VectorLayoutVersion::V1 as u8,
+            VectorBaseType::Float16 as u8,
+            raw_bytes,
+        )
+        .unwrap();
+        assert_eq!(vector.base_type(), VectorBaseType::Float16);
+        assert_eq!(vector.dimension_count(), 1);
+        assert_eq!(vector.as_f32().unwrap(), &[1.0]);
+    }
+
+    #[test]
     fn test_validate_unsupported_base_type() {
         let raw_bytes = 1.0_f32.to_le_bytes().to_vec();
         let result = SqlVector::try_from_raw(
@@ -256,6 +297,21 @@ mod tests {
         let values = vec![1.0, 2.0, 3.0];
         let vector = SqlVector::try_from_f32(values).unwrap();
         assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 3 * 4); // 8 + 12 = 20
+    }
+
+    #[test]
+    fn test_total_size_float16_uses_wire_size() {
+        let raw_bytes = vec![0, 60, 0, 60, 0, 60]; // 3 float16 elements
+        let vector = SqlVector::try_from_raw(
+            VectorLayoutFormat::V1 as u8,
+            VectorLayoutVersion::V1 as u8,
+            VectorBaseType::Float16 as u8,
+            raw_bytes,
+        )
+        .unwrap();
+        // Native V1 wrapper (f32) has 3 elements. Float16 size is 2 bytes per element.
+        // Should calculate 8 (header) + 3*2 = 14 bytes
+        assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 3 * 2);
     }
 
     #[test]

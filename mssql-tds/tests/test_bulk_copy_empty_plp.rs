@@ -8,7 +8,7 @@ mod bulk_copy_empty_plp_tests {
     use crate::common::{begin_connection, build_tcp_datasource, init_tracing};
     use async_trait::async_trait;
     use mssql_tds::connection::bulk_copy::{BulkCopy, BulkLoadRow};
-    use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient};
+    use mssql_tds::connection::tds_client::ResultSet;
     use mssql_tds::core::TdsResult;
     use mssql_tds::datatypes::column_values::ColumnValues;
     use mssql_tds::datatypes::sql_string::SqlString;
@@ -115,8 +115,7 @@ mod bulk_copy_empty_plp_tests {
                     tail INT NOT NULL
                 )"
                 .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to create temp table");
@@ -167,16 +166,15 @@ mod bulk_copy_empty_plp_tests {
             .execute(
                 "SELECT id, nvc_max, vc_max, vb_max, tail FROM #BulkCopyEmptyPlp ORDER BY id"
                     .to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .expect("Failed to query temp table");
 
-        let resultset = client.get_current_resultset().expect("No resultset");
+        assert!(client.on_rows(), "No resultset");
 
         // Row 1: non-empty values
-        let r1 = resultset.next_row().await.unwrap().unwrap();
+        let r1 = client.next_row().await.unwrap().unwrap();
         assert_eq!(r1[0], ColumnValues::Int(1));
         match &r1[1] {
             ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "hello"),
@@ -194,7 +192,7 @@ mod bulk_copy_empty_plp_tests {
 
         // Row 2: empty values — must round-trip as empty (not NULL) and
         // must not corrupt the trailing INT column.
-        let r2 = resultset.next_row().await.unwrap().unwrap();
+        let r2 = client.next_row().await.unwrap().unwrap();
         assert_eq!(r2[0], ColumnValues::Int(2));
         match &r2[1] {
             ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), ""),
@@ -212,7 +210,7 @@ mod bulk_copy_empty_plp_tests {
         assert_eq!(r2[4], ColumnValues::Int(200));
 
         // Row 3: NULL values
-        let r3 = resultset.next_row().await.unwrap().unwrap();
+        let r3 = client.next_row().await.unwrap().unwrap();
         assert_eq!(r3[0], ColumnValues::Int(3));
         assert!(matches!(r3[1], ColumnValues::Null));
         assert!(matches!(r3[2], ColumnValues::Null));
@@ -220,7 +218,7 @@ mod bulk_copy_empty_plp_tests {
         assert_eq!(r3[4], ColumnValues::Int(300));
 
         // Row 4: non-empty after empties — confirms stream alignment held
-        let r4 = resultset.next_row().await.unwrap().unwrap();
+        let r4 = client.next_row().await.unwrap().unwrap();
         assert_eq!(r4[0], ColumnValues::Int(4));
         match &r4[1] {
             ColumnValues::String(s) => assert_eq!(s.to_utf8_string(), "world"),

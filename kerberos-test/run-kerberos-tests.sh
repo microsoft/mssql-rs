@@ -175,8 +175,19 @@ if [ "$ARCHIVE_MODE" = true ]; then
     echo ""
     echo "Step 4: Install cargo-nextest..."
     echo "----------------------------------------------"
+    # Pre-built client images ship cargo-nextest in /usr/local/bin. Skip the
+    # source build when that copy is the pinned version; reinstall (and say so)
+    # when it is missing or a different version, so image drift is visible.
     docker exec "$CONTAINER_NAME" bash -c '
-        cargo install cargo-nextest --version 0.9.99 --locked
+        NEXTEST_VERSION=0.9.99
+        HAVE=$(cargo nextest --version 2>/dev/null)
+        case "$HAVE" in
+            *"$NEXTEST_VERSION"*)
+                echo "cargo-nextest $NEXTEST_VERSION already present (pre-built image)"
+                exit 0 ;;
+        esac
+        [ -n "$HAVE" ] && echo "Found [$HAVE], want $NEXTEST_VERSION; reinstalling"
+        cargo install cargo-nextest --version "$NEXTEST_VERSION" --locked --force
     '
     echo "✓ cargo-nextest installed"
     
@@ -259,8 +270,19 @@ OUTER_EOF
         echo ""
         echo "Step 4: Install cargo-nextest (CI mode)..."
         echo "----------------------------------------------"
+        # Pre-built client images ship cargo-nextest in /usr/local/bin. Skip the
+        # source build when that copy is the pinned version; reinstall (and say so)
+        # when it is missing or a different version, so image drift is visible.
         docker exec "$CONTAINER_NAME" bash -c '
-            cargo install cargo-nextest --version 0.9.99 --locked
+            NEXTEST_VERSION=0.9.99
+            HAVE=$(cargo nextest --version 2>/dev/null)
+            case "$HAVE" in
+                *"$NEXTEST_VERSION"*)
+                    echo "cargo-nextest $NEXTEST_VERSION already present (pre-built image)"
+                    exit 0 ;;
+            esac
+            [ -n "$HAVE" ] && echo "Found [$HAVE], want $NEXTEST_VERSION; reinstalling"
+            cargo install cargo-nextest --version "$NEXTEST_VERSION" --locked --force
         '
         echo "✓ cargo-nextest installed"
     fi

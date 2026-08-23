@@ -25,25 +25,75 @@ steps:
     inputs:
       targetType: 'inline'
       script: |
+        $ErrorActionPreference = 'Stop'
+
+        # sqlcmd exits 0 even when the batch fails unless -b is passed. Without it a
+        # startup-time deadlock (Msg 1205) on ALTER LOGIN left sa disabled, the step
+        # still reported success, and every integration test later failed with a
+        # confusing "Login failed for user 'sa'. Reason: The account is disabled."
+        function Invoke-Sql {
+          param(
+            [Parameter(Mandatory = $true)][string[]]$Arguments,
+            [Parameter(Mandatory = $true)][string]$Description,
+            [int]$MaxAttempts = 5
+          )
+          for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            $output = & sqlcmd -b @Arguments 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $prev
+            if ($output.Trim()) { Write-Host $output.Trim() }
+            if ($code -eq 0) { return }
+            Write-Host "##[warning]${Description}: sqlcmd exited $code (attempt $attempt/$MaxAttempts)"
+            if ($attempt -lt $MaxAttempts) { Start-Sleep -Seconds (5 * $attempt) }
+          }
+          throw "${Description}: sqlcmd still failing after $MaxAttempts attempts."
+        }
+
+        # A restarted instance accepts connections before startup recovery finishes;
+        # issuing ALTER LOGIN during that window is what produced the deadlock.
+        function Wait-ForSql {
+          param([string[]]$ConnArgs = @(), [string]$Label = 'MSSQLSERVER', [int]$TimeoutSec = 180)
+          $deadline = (Get-Date).AddSeconds($TimeoutSec)
+          while ((Get-Date) -lt $deadline) {
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & sqlcmd @ConnArgs -b -l 5 -Q "SELECT 1" *> $null
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $prev
+            if ($code -eq 0) { Write-Host "$Label is accepting connections."; return }
+            Start-Sleep -Seconds 5
+          }
+          throw "$Label did not accept connections within $TimeoutSec seconds."
+        }
+
+        $pw = $env:SQL_PASSWORD
+
         echo "Creating users, setting up test user and restarting SQL server"
         Restart-Service -Name 'MSSQLSERVER' -Force
-        
-        sqlcmd -Q "ALTER LOGIN sa ENABLE;"
-        sqlcmd -Q "ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;"
-        sqlcmd -Q "ALTER LOGIN sa WITH PASSWORD = '$(SQL_PASSWORD)'"
-        sqlcmd -Q "CREATE LOGIN testuser WITH PASSWORD = '$(SQL_PASSWORD)', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;"
+        Wait-ForSql -Label 'MSSQLSERVER'
+
+        Invoke-Sql -Description 'Enable sa' -Arguments @('-Q', 'ALTER LOGIN sa ENABLE;')
+        Invoke-Sql -Description 'Relax sa password policy' -Arguments @('-Q', 'ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;')
+        Invoke-Sql -Description 'Set sa password' -Arguments @('-Q', "ALTER LOGIN sa WITH PASSWORD = '$pw'")
+        Invoke-Sql -Description 'Create or update testuser' -Arguments @('-Q', "IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$pw', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH PASSWORD = '$pw'; ALTER LOGIN testuser ENABLE;")
         Restart-Service -Name 'MSSQLSERVER' -Force
-        sqlcmd -Q "ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"
-        sqlcmd -S localhost,1433 -U sa -P $(SQL_PASSWORD) -Q "SELECT @@VERSION"
+        Wait-ForSql -Label 'MSSQLSERVER'
+        Invoke-Sql -Description 'Grant testuser sysadmin' -Arguments @('-Q', 'ALTER SERVER ROLE sysadmin ADD MEMBER testuser;')
+        Invoke-Sql -Description 'Verify sa login' -Arguments @('-S', 'localhost,1433', '-U', 'sa', '-P', $pw, '-Q', 'SELECT @@VERSION')
 
         # Setup the same logins on the SQLDEV named instance (used by SSRP tests)
         $svc = Get-Service -Name 'MSSQL$SQLDEV' -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -eq 'Running') {
           echo "Configuring logins on SQLDEV instance..."
-          sqlcmd -S "localhost\SQLDEV" -C -Q "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2"
-          sqlcmd -S "localhost\SQLDEV" -C -Q "ALTER LOGIN sa ENABLE; ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN sa WITH PASSWORD = '$(SQL_PASSWORD)'; IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$(SQL_PASSWORD)', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"
+          $dev = @('-S', 'localhost\SQLDEV', '-C')
+          Wait-ForSql -ConnArgs $dev -Label 'SQLDEV'
+          Invoke-Sql -Description 'SQLDEV mixed-mode auth' -Arguments ($dev + @('-Q', "EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'LoginMode', REG_DWORD, 2"))
+          Invoke-Sql -Description 'SQLDEV logins' -Arguments ($dev + @('-Q', "ALTER LOGIN sa ENABLE; ALTER LOGIN sa WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN sa WITH PASSWORD = '$pw'; IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'testuser') CREATE LOGIN testuser WITH PASSWORD = '$pw', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF; ALTER LOGIN testuser WITH PASSWORD = '$pw'; ALTER LOGIN testuser ENABLE; ALTER SERVER ROLE sysadmin ADD MEMBER testuser;"))
           Restart-Service -Name 'MSSQL$SQLDEV' -Force
-          sqlcmd -S "localhost\SQLDEV" -C -U sa -P "$(SQL_PASSWORD)" -Q "SELECT @@VERSION"
+          Wait-ForSql -ConnArgs $dev -Label 'SQLDEV'
+          Invoke-Sql -Description 'Verify SQLDEV sa login' -Arguments ($dev + @('-U', 'sa', '-P', $pw, '-Q', 'SELECT @@VERSION'))
           echo "SQLDEV instance configured."
         } else {
           echo "SQLDEV instance not found or not running — skipping."
@@ -222,19 +272,33 @@ steps:
       docker run \
         --name sqlserver \
         -e ACCEPT_EULA=Y \
-        -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
+        -e "MSSQL_SA_PASSWORD=$SQL_PASSWORD" \
         -p 1433:1433 \
         -d mcr.microsoft.com/mssql/server:2025-latest
 
       echo "Waiting for SQL Server to start..."
+      ready=false
       for i in $(seq 1 30); do
-        docker exec sqlserver \
+        if docker exec sqlserver \
           /opt/mssql-tools18/bin/sqlcmd \
-          -S localhost -U SA -P "$(SQL_PASSWORD)" \
-          -C -Q "SELECT 1" 2>/dev/null && break
+          -S localhost -U SA -P "$SQL_PASSWORD" \
+          -C -b -Q "SELECT 1" 2>/dev/null; then
+          ready=true
+          break
+        fi
         echo "  attempt $i/30..."
         sleep 2
       done
+
+      if [ "$ready" != true ]; then
+        echo "SQL Server failed readiness checks"
+        set +e
+        docker ps -a
+        docker inspect sqlserver --format \
+          'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
+        docker logs --tail 500 sqlserver
+        exit 1
+      fi
     displayName: 'Start SQL Server (Docker, no TLS certs)'
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)

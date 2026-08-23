@@ -21,7 +21,7 @@ Tests that need real Azure AD infra or Kerberos are skipped unless env vars are 
 import os
 import re
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 from dotenv import load_dotenv
@@ -379,11 +379,19 @@ class TestADServicePrincipal:
 
 
 # ═════════════════════════════════════════════════════════════════
-#  SECTION 10 — §3.3 Auth + TC clashes (#24–#29)
+#  SECTION 10 — §3.3 Auth + TC clashes (#24–#26, #28–#29)
 # ═════════════════════════════════════════════════════════════════
 
 class TestAuthTcClash:
-    """§3.3 #24–#29 — Auth keyword + TC=Yes is always an error."""
+    """§3.3 Auth keyword + TC=Yes is always an error (#24–#26, #28–#29).
+
+    #27 (ADInteractive) and ADDefault are not testable at this layer:
+    mssql-python strips Trusted_Connection for token-bearing AD modes, so
+    ODBC never sees the clash. Covered in test_auth_resolution.py
+    (TestAuthTcClashes::test_27_ad_interactive_tc,
+    TestAuthTcClashesExtended::test_ad_default_tc) and in Rust
+    (odbc_authentication_validator::tests::auth_plus_tc_rejected).
+    """
 
     def test_row24_tc_yes_sqlpassword(self):
         """#24  TC=Yes + SqlPassword → ERROR."""
@@ -400,15 +408,6 @@ class TestAuthTcClash:
         cs = _base(tc="Yes", auth="ActiveDirectoryIntegrated")
         _expect_connect_error(cs)
 
-    def test_row27_tc_yes_ad_interactive(self):
-        """#27  TC=Yes + ADInteractive → ERROR.
-        Must mock token acquisition — mssql_python's auth.py intercepts
-        Interactive before ODBC sees the conn string.
-        """
-        cs = _base(tc="Yes", auth="ActiveDirectoryInteractive")
-        with patch("mssql_python.auth.get_auth_token", return_value=None):
-            _expect_connect_error(cs)
-
     def test_row28_tc_yes_admsi(self):
         """#28  TC=Yes + ADMSI → ERROR."""
         cs = _base(tc="Yes", auth="ActiveDirectoryMSI")
@@ -418,14 +417,6 @@ class TestAuthTcClash:
         """#29  TC=Yes + ADSPA → ERROR."""
         cs = _base(tc="Yes", auth="ActiveDirectoryServicePrincipal", uid="c", pwd="s")
         _expect_connect_error(cs)
-
-    def test_tc_yes_ad_default(self):
-        """TC=Yes + ADDefault → ERROR (not in §3.3 — ADDefault is mssql-python-specific).
-        Must mock — auth.py intercepts Default before ODBC sees the clash.
-        """
-        cs = _base(tc="Yes", auth="ActiveDirectoryDefault")
-        with patch("mssql_python.auth.get_auth_token", return_value=None):
-            _expect_connect_error(cs)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -950,7 +941,7 @@ class TestBulkcopyTokenAcquisition:
                 with pytest.raises(RuntimeError, match="Spy stop"):
                     cur.bulkcopy(_BULKCOPY_TABLE, [(1, "test")], timeout=30)
 
-            mock_get.assert_called_once_with(auth_type)
+            mock_get.assert_called_once_with(auth_type, None)
 
     def test_token_acquisition_failure_raises(self, sql_conn_with_fake_auth):
         """If get_raw_token fails, _bulkcopy raises RuntimeError."""

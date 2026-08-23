@@ -3,7 +3,10 @@
 
 use crate::error::Error;
 use crate::error::Error::OperationCancelledError;
+use futures::FutureExt;
+use futures::future::Either;
 use std::future::Future;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 /// Alias for `Result<T, crate::error::Error>` used throughout the crate.
@@ -39,19 +42,21 @@ impl CancelHandle {
         Self::from(self.cancel_token.child_token())
     }
 
-    pub(crate) async fn run_until_cancelled<F, ResultType>(
-        cancel_handle: Option<&CancelHandle>,
+    pub(crate) fn run_until_cancelled<'a, F, ResultType>(
+        cancel_handle: Option<&'a CancelHandle>,
         f: F,
-    ) -> F::Output
+    ) -> impl Future<Output = F::Output> + Send + 'a
     where
-        F: Future<Output = TdsResult<ResultType>> + Send,
+        F: Future<Output = TdsResult<ResultType>> + Send + 'a,
     {
         match cancel_handle {
-            Some(handle) => match handle.cancel_token.run_until_cancelled(f).await {
-                Some(result) => result,
-                None => Err(OperationCancelledError("Request was cancelled".to_string())),
-            },
-            None => f.await,
+            Some(handle) => Either::Left(handle.cancel_token.run_until_cancelled(f).map(
+                |result| match result {
+                    Some(result) => result,
+                    None => Err(OperationCancelledError("Request was cancelled".to_string())),
+                },
+            )),
+            None => Either::Right(f),
         }
     }
 }
@@ -206,6 +211,20 @@ mod tests {
             CancelHandle::run_until_cancelled(Some(&handle), async { Ok(99) }).await;
         assert_eq!(result.unwrap(), 99);
     }
+
+    #[tokio::test]
+    async fn run_until_cancelled_with_cancelled_handle_stops_pending_future() {
+        let handle = CancelHandle::new();
+        handle.cancel_token.cancel();
+
+        let result = CancelHandle::run_until_cancelled(
+            Some(&handle),
+            std::future::pending::<TdsResult<i32>>(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+    }
 }
 
 /// TLS and encryption settings for a TDS connection.
@@ -220,7 +239,7 @@ pub struct EncryptionOptions {
     /// Path to a DER or PEM encoded X.509 certificate file for certificate pinning.
     /// When specified, the driver performs an exact binary match between the provided
     /// certificate and the server's certificate, bypassing standard CA chain validation.
-    pub server_certificate: Option<String>,
+    pub server_certificate: Option<PathBuf>,
 }
 
 impl EncryptionOptions {

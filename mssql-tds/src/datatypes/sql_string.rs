@@ -12,7 +12,7 @@ use super::{
 };
 
 /// Character encoding used by a [`SqlString`].
-#[derive(PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum EncodingType {
     /// UTF-8 encoding.
     Utf8,

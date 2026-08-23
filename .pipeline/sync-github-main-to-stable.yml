@@ -1,0 +1,113 @@
+# Pipeline to create a PR from GitHub main into the Azure DevOps stable branch.
+# The pipeline source is GitHub microsoft/mssql-rs, so it triggers natively on
+# every update to main (via the Azure Pipelines GitHub App) and can also be run
+# manually. The Azure Repos mssql-rs repository is a 'git' resource we push the
+# sync branch to and open the PR against, authenticated with System.AccessToken.
+# Skips PR creation if:
+# - An active PR into the target branch from the sync branch already exists
+# - There are no changes between GitHub main and the target branch
+#
+# Prerequisites:
+# - GitHub microsoft/mssql-rs configured as this pipeline's source repository.
+# - The Build Service identity has Contribute + Create branch on the Azure Repos
+#   mssql-rs repository and permission to create pull requests.
+
+trigger:
+- main
+
+pr: none
+
+parameters:
+- name: syncBranch
+  displayName: Intermediate ADO branch carrying GitHub main
+  type: string
+  default: sync/github-main-to-stable
+
+resources:
+  repositories:
+  # Azure Repos mssql-rs: we push the sync branch here and open the PR.
+  # NOTE: 'name' and 'ref' are resolved before parameters, so they cannot be
+  # parameterized. The target repo (mssql-rs) and branch (stable) are therefore
+  # hard-coded here and mirrored into the script env below to keep them in sync.
+  - repository: ado
+    type: git
+    name: mssql-rs/mssql-rs
+    ref: refs/heads/stable
+
+pool:
+  name: RUST-1ES-POOL-WUS3
+  demands:
+    - imageOverride -equals RUST-1ES-UBUSLIM
+
+steps:
+# GitHub main (self): the source we are syncing from.
+- checkout: self
+  fetchDepth: 0
+  path: s/gh
+
+# Azure Repos mssql-rs: persistCredentials lets us push back using
+# System.AccessToken.
+- checkout: ado
+  fetchDepth: 0
+  persistCredentials: true
+  path: s/ado
+
+- script: |
+    set -euo pipefail
+
+    ADO_DIR="$(Agent.BuildDirectory)/s/ado"
+    GH_DIR="$(Agent.BuildDirectory)/s/gh"
+
+    cd "$ADO_DIR"
+
+    # Bring GitHub main's commit (and object closure) into the Azure Repos clone.
+    # The GitHub checkout is in detached HEAD, so fetch by HEAD. ADO checkouts
+    # don't populate origin/<branch> tracking refs, so capture both sides from
+    # FETCH_HEAD rather than relying on origin/$TARGET_BRANCH.
+    git fetch "$GH_DIR" HEAD
+    GH_MAIN_SHA="$(git rev-parse FETCH_HEAD)"
+    echo "GitHub main is at $GH_MAIN_SHA"
+
+    git fetch origin "$TARGET_BRANCH"
+    TARGET_SHA="$(git rev-parse FETCH_HEAD)"
+    echo "$TARGET_BRANCH is at $TARGET_SHA"
+
+    if git diff --quiet "$TARGET_SHA..$GH_MAIN_SHA"; then
+      echo "No changes between GitHub main and $TARGET_BRANCH. Skipping."
+      exit 0
+    fi
+    echo "Changes detected between GitHub main and $TARGET_BRANCH."
+
+    # Refresh the sync branch to the latest GitHub main so any open PR updates too.
+    git push origin --force "$GH_MAIN_SHA:refs/heads/$SYNC_BRANCH"
+
+    PR_EXISTS=$(az repos pr list \
+      --organization "$(System.TeamFoundationCollectionUri)" \
+      --project "$(System.TeamProject)" \
+      --repository "$ADO_REPOSITORY" \
+      --source-branch "$SYNC_BRANCH" \
+      --target-branch "$TARGET_BRANCH" \
+      --status active \
+      --query "[0].pullRequestId" \
+      --output tsv)
+
+    if [ -n "$PR_EXISTS" ]; then
+      echo "Active PR #$PR_EXISTS for $SYNC_BRANCH -> $TARGET_BRANCH already exists. Branch updated; skipping create."
+      exit 0
+    fi
+
+    echo "No active PR found. Creating PR $SYNC_BRANCH -> $TARGET_BRANCH."
+    az repos pr create \
+      --organization "$(System.TeamFoundationCollectionUri)" \
+      --project "$(System.TeamProject)" \
+      --repository "$ADO_REPOSITORY" \
+      --source-branch "$SYNC_BRANCH" \
+      --target-branch "$TARGET_BRANCH" \
+      --title "Sync GitHub main to $TARGET_BRANCH" \
+      --description $'Sync of GitHub microsoft/mssql-rs main into the '"$TARGET_BRANCH"$' branch.\n\nBefore merging, ensure CI has had a good run on GitHub main.'
+  displayName: Sync GitHub main to target branch
+  env:
+    TARGET_BRANCH: stable
+    SYNC_BRANCH: ${{ parameters.syncBranch }}
+    ADO_REPOSITORY: mssql-rs
+    AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

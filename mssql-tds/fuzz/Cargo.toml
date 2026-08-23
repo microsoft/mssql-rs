@@ -72,3 +72,10 @@ path = "fuzz_targets/fuzz_bulk_copy.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_der_framing"
+path = "fuzz_targets/fuzz_der_framing.rs"
+test = false
+doc = false
+bench = false

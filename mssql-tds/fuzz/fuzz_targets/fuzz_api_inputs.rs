@@ -29,7 +29,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::datatypes::sql_string::SqlString;
-use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags, build_parameter_list_string};
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, RpcTypeMetadata, StatusFlags, build_parameter_list_string};
 
 /// Maximum string length to prevent fuzzer timeouts
 const MAX_STRING_LEN: usize = 2048;
@@ -180,12 +180,33 @@ impl FuzzSqlType {
     }
 }
 
+/// Fuzzed precision/scale override.
+///
+/// These feed both the rendered declaration and the wire `TYPE_INFO` header, so
+/// fuzzing them covers the arithmetic in `get_sql_name` for decimal precision
+/// and temporal scale, including values the server would never send.
+#[derive(Debug, Arbitrary)]
+struct FuzzTypeMetadata {
+    precision: Option<u8>,
+    scale: Option<u8>,
+}
+
+impl FuzzTypeMetadata {
+    fn to_type_metadata(&self) -> Option<RpcTypeMetadata> {
+        match (self.precision, self.scale) {
+            (None, None) => None,
+            (precision, scale) => Some(RpcTypeMetadata { precision, scale }),
+        }
+    }
+}
+
 /// Fuzzed RPC parameter
 #[derive(Debug, Arbitrary)]
 struct FuzzRpcParameter {
     name: Option<String>,
     value: FuzzSqlType,
     is_output: bool,
+    metadata: FuzzTypeMetadata,
 }
 
 impl FuzzRpcParameter {
@@ -197,7 +218,11 @@ impl FuzzRpcParameter {
         };
         
         let sql_type = self.value.to_sql_type();
-        RpcParameter::new(self.name.clone(), flags, sql_type)
+        let param = RpcParameter::new(self.name.clone(), flags, sql_type);
+        match self.metadata.to_type_metadata() {
+            Some(metadata) => param.with_type_metadata(metadata),
+            None => param,
+        }
     }
 }
 
@@ -205,7 +230,7 @@ impl FuzzRpcParameter {
 #[derive(Debug, Arbitrary)]
 enum FuzzScenario {
     /// Test get_sql_name with a single SqlType
-    GetSqlName(FuzzSqlType),
+    GetSqlName(FuzzSqlType, FuzzTypeMetadata),
     
     /// Test RpcParameter::new with various inputs
     CreateParameter(FuzzRpcParameter),
@@ -221,25 +246,28 @@ fuzz_target!(|data: &[u8]| {
     };
     
     match scenario {
-        FuzzScenario::GetSqlName(mut fuzz_type) => {
+        FuzzScenario::GetSqlName(mut fuzz_type, metadata) => {
             // Test RpcParameter::get_sql_name() which generates SQL type names
             // This tests string formatting, length handling, and edge cases
             let sql_type = fuzz_type.to_sql_type();
-            let _type_name = RpcParameter::get_sql_name(&sql_type);
+            let _type_name = RpcParameter::get_sql_name(&sql_type, metadata.to_type_metadata());
             
             // The function should never panic, even with:
             // - MAX lengths (> 4000 for NVarchar, > 8000 for Varchar)
             // - Zero lengths
             // - Extreme decimal precision/scale
             // - None values for nullable types
+            // - Precision/scale overrides outside the ranges SQL Server allows
         }
         
         FuzzScenario::CreateParameter(mut fuzz_param) => {
             // Test RpcParameter::new() constructor
             let param = fuzz_param.to_rpc_parameter();
             
-            // Also test get_sql_name on this parameter's type
-            let _type_name = RpcParameter::get_sql_name(param.get_value());
+            // Also test get_sql_name on this parameter's type. `to_rpc_parameter`
+            // always builds a materialized parameter, so `get_value()` cannot
+            // return the data-at-execution usage error here.
+            let _type_name = RpcParameter::get_sql_name(param.get_value().unwrap(), None);
         }
         
         FuzzScenario::BuildParameterList(mut fuzz_params) => {
@@ -262,7 +290,7 @@ fuzz_target!(|data: &[u8]| {
             // - Memory allocation for large parameter lists
             // - Handling of None parameter names
             let mut params_list = String::new();
-            build_parameter_list_string(&rpc_params, &mut params_list);
+            let _ = build_parameter_list_string(&rpc_params, &mut params_list);
         }
     }
 });

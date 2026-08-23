@@ -24,7 +24,7 @@ parameters:
 - name: alpineimagetag
   displayName: Alpine Image Tag
   type: string
-  default: 'tdslibrs.azurecr.io/build/alpine:3.18'
+  default: 'ghcr.io/microsoft/mssql-rs/build/alpine:3.18'
 
 steps:
 - script: |
@@ -32,10 +32,7 @@ steps:
   displayName: Set Archive file name 
   condition: succeeded()
   
-- template: azure-cli-login-template.yml
-
 - script: |
-    az acr login -n tdslibrs
     bash .pipeline/scripts/docker-cargo-run.sh \
       -v "$PWD:/workspace" \
       -e "ARCHIVE_NAME=tdslib-nextest-musl.tar.zst" \

@@ -17,65 +17,16 @@ steps:
     installAzCli: false
     installDocker: true
 
-- template: azure-cli-login-template.yml
-
-- task: AzureCLI@2
-  displayName: Login to ACR and pull build image
-  inputs:
-    azureSubscription: 'Magnitude Test'
-    scriptType: 'bash'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      az acr login --name tdslibrs
-      docker pull tdslibrs.azurecr.io/build/ubuntu:22.04
+- script: |
+    set -euo pipefail
+    docker pull ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04
+  displayName: Pull build image
 
 - script: |
     set -euo pipefail
-    
-    # Determine which mssql-python branch to test against
-    # Default to main, but allow override via PR description
-    # Format in PR description: "mssql-python-branch: feature/my-branch"
-    MSSQL_PYTHON_BRANCH="main"
-    
-    if [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
-      echo "PR build detected (PR #${SYSTEM_PULLREQUEST_PULLREQUESTID})"
-      
-      # Install azure-devops extension
-      echo "Installing azure-devops CLI extension..."
-      az extension add --name azure-devops --yes --allow-preview true 2>/dev/null || echo "Extension may already be installed"
-      
-      # Configure defaults for the CLI
-      az devops configure --defaults organization="${SYSTEM_COLLECTIONURI}" project="${SYSTEM_TEAMPROJECT}"
-      
-      # Get PR description using Azure DevOps CLI (uses AZURE_DEVOPS_EXT_PAT for auth)
-      PR_DESC=$(az repos pr show --id "${SYSTEM_PULLREQUEST_PULLREQUESTID}" --query description -o tsv 2>&1) || {
-        echo "##[warning]Failed to get PR description: $PR_DESC"
-        PR_DESC=""
-      }
-      
-      if [ -n "$PR_DESC" ]; then
-        echo "PR description found (length: ${#PR_DESC} chars)"
-        # Extract branch name - match word chars, slashes, hyphens, dots only (no HTML tags or special chars)
-        BRANCH_OVERRIDE=$(echo "$PR_DESC" | grep -oP 'mssql-python-branch:\s*\K[a-zA-Z0-9_/.-]+' | head -1 | tr -d '[:space:]' || true)
-        if [ -n "$BRANCH_OVERRIDE" ]; then
-          MSSQL_PYTHON_BRANCH="$BRANCH_OVERRIDE"
-          echo "##[section]Using mssql-python branch override: $MSSQL_PYTHON_BRANCH"
-        else
-          echo "No branch override found in PR description"
-        fi
-      else
-        echo "PR description is empty or could not be retrieved"
-      fi
-    else
-      echo "Not a PR build (SYSTEM_PULLREQUEST_PULLREQUESTID not set)"
-    fi
-    
-    echo "Cloning microsoft/mssql-python (branch: $MSSQL_PYTHON_BRANCH)..."
-    if ! git clone --depth 1 -b "$MSSQL_PYTHON_BRANCH" https://github.com/microsoft/mssql-python.git ../mssql-python 2>/dev/null; then
-      echo "##[warning]Branch '$MSSQL_PYTHON_BRANCH' not found, falling back to main"
-      git clone --depth 1 -b main https://github.com/microsoft/mssql-python.git ../mssql-python
-    fi
-    
+
+    bash .pipeline/scripts/clone-mssql-python.sh
+
     # Generate Certificate for SQL Server
     bash scripts/generate_cert.sh    
     sudo chown 10001:0 mssql.*
@@ -106,7 +57,7 @@ steps:
 
 # Run test-python.sh --mssql-python (builds ddbc + py-core, runs tests)
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     # Build connection string for mssql-python tests (expects DB_CONNECTION_STRING env var)
     # Format matches mssql-python's pr-validation-pipeline.yml: Uid/Pwd (not User Id/Password)
@@ -152,7 +103,7 @@ steps:
 
 # Build wheel artifact (reuse already-built .so files from test step)
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     docker run --rm \
       -v $PWD:/workspace \

@@ -36,7 +36,32 @@ parameters:
   type: string
   default: ''
 
+- name: collectPythonCoverage
+  displayName: Collect Cobertura coverage for mssql-py-core from the Python tests
+  type: boolean
+  default: false
+
+- name: collectRustCoverage
+  displayName: Publish the mssql-tds Rust Cobertura coverage as a per-OS artifact for merging
+  type: boolean
+  default: false
+
 steps:
+# ARM64 integration tests connect cross-pool to an on-demand x64 SQL host
+# (Sql_Host_build_arm). Derive the SA password from build context so this job
+# and the SQL host agree without sharing a secret. Runs before the generate
+# step, which then no-ops (it honors the SQL_PASSWORD_GENERATED marker).
+- ${{ if eq(parameters.architecture, 'ARM64') }}:
+  - bash: |
+      set -euo pipefail
+      bash .pipeline/scripts/sql-host/derive-sql-password.sh
+    displayName: 'Derive SQL_PASSWORD from build context (ARM cross-pool)'
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    workingDirectory: '$(Build.SourcesDirectory)'
+    env:
+      BUILD_BUILDID: $(Build.BuildId)
+      SYSTEM_COLLECTIONID: $(System.CollectionId)
+
 - template: generate-sql-password-template.yml
   parameters:
     osType: Linux
@@ -79,48 +104,72 @@ steps:
     df -h "$WORK_DISK"
   displayName: Relocate Docker storage to work folder disk
 
-- template: azure-cli-login-template.yml
-
-- task: AzureCLI@2
-  displayName: Login to ACR and pull build image
-  inputs:
-    azureSubscription: 'Magnitude Test'
-    scriptType: 'bash'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      az acr login --name tdslibrs
-      docker pull tdslibrs.azurecr.io/build/ubuntu:22.04
-
 - script: |
     set -euo pipefail
-    # Generate Certificate
-    bash scripts/generate_cert.sh    
-    sudo chown 10001:0 mssql.*
+    docker pull ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04
+  displayName: Pull build image
 
-    # Create docker network
-    docker network create testnet
+- ${{ if ne(parameters.architecture, 'ARM64') }}:
+  - script: |
+      set -euo pipefail
+      # Generate Certificate
+      bash scripts/generate_cert.sh    
+      sudo chown 10001:0 mssql.*
 
-    # Start SQL Server
-    docker run -e "ACCEPT_EULA=Y" \
-      -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
-      -p 1433:1433 \
-      --hostname sql1 \
-      --network testnet \
-      --name sqlserver \
-      -v $PWD/conf/mssql.conf:/var/opt/mssql/mssql.conf \
-      -v $PWD/mssql.pem:/etc/ssl/certs/mssql.pem \
-      -v $PWD/mssql.key:/etc/ssl/private/mssql.key \
-      -u 0:0 \
-      -d mcr.microsoft.com/mssql/server:2025-latest
+      # Create docker network
+      docker network create testnet
 
-    echo "Waiting for SQL Server to start..."
-    sleep 10
-  displayName: Setup SQL Server in Docker
-  env:
-    SQL_PASSWORD: $(SQL_PASSWORD)
+      # Start SQL Server
+      docker run -e "ACCEPT_EULA=Y" \
+        -e "MSSQL_SA_PASSWORD=$(SQL_PASSWORD)" \
+        -p 1433:1433 \
+        --hostname sql1 \
+        --network testnet \
+        --name sqlserver \
+        -v $PWD/conf/mssql.conf:/var/opt/mssql/mssql.conf \
+        -v $PWD/mssql.pem:/etc/ssl/certs/mssql.pem \
+        -v $PWD/mssql.key:/etc/ssl/private/mssql.key \
+        -u 0:0 \
+        -d mcr.microsoft.com/mssql/server:2025-latest
+
+      echo "Waiting for SQL Server to start..."
+      sleep 10
+    displayName: Setup SQL Server in Docker
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+
+# ARM64 cannot run the x64 SQL image well; it connects cross-pool to the
+# Sql_Host_build_arm host instead. Still generate a cert + create the docker
+# network so the shared "Build in Container" step's ca.crt mount and
+# --network testnet work on both PRs and merges (on PRs the poll step below
+# overwrites the certs with the ones the SQL host actually presents).
+- ${{ if eq(parameters.architecture, 'ARM64') }}:
+  - script: |
+      set -euo pipefail
+      bash scripts/generate_cert.sh
+      sudo chown 10001:0 mssql.*
+      docker network create testnet
+    displayName: Prepare certs and docker network (ARM cross-pool SQL)
+
+  - script: |
+      set -euo pipefail
+      bash .pipeline/scripts/sql-host/poll-for-endpoint.sh
+    displayName: Wait for cross-pool SQL host endpoint
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    workingDirectory: '$(Build.SourcesDirectory)'
+    env:
+      # Suffix with the stage attempt so a stage rerun reads this attempt's
+      # freshly-published endpoint, not a stale one from a prior attempt.
+      ARTIFACT_NAME: 'sql-ready-build_arm-$(System.StageAttempt)'
+      BUILD_BUILDID: $(Build.BuildId)
+      BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+      SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      AGENT_TEMPDIRECTORY: $(Agent.TempDirectory)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     # Set IS_PR_BUILD flag
     if [ "$(Build.Reason)" = "PullRequest" ]; then
@@ -157,7 +206,7 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       -v $PWD:/workspace \
@@ -173,7 +222,7 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       -v $PWD:/workspace \
@@ -188,28 +237,127 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
-- script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
-    
-    bash .pipeline/scripts/docker-cargo-run.sh --rm \
-      --network testnet \
-      -v $PWD:/workspace \
-      -v $HOME/.cargo/registry:/root/.cargo/registry \
-      -v $HOME/.cargo/git:/root/.cargo/git \
-      -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
-      -e SQL_PASSWORD="$(SQL_PASSWORD)" \
-      -e DB_HOST="sql1" \
-      -e CERT_HOST_NAME="sql1" \
-      -e RUST_BACKTRACE=full \
-      -w /workspace \
-      $BUILD_IMAGE \
-      /workspace/.pipeline/scripts/containerized-test.sh ${{ parameters.testFilter }}
-  displayName: Run Tests and Coverage
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-  env:
-    SQL_PASSWORD: $(SQL_PASSWORD)
-    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+- ${{ if ne(parameters.architecture, 'ARM64') }}:
+  - script: |
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+      
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        --network testnet \
+        -v $PWD:/workspace \
+        -v $HOME/.cargo/registry:/root/.cargo/registry \
+        -v $HOME/.cargo/git:/root/.cargo/git \
+        -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
+        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e DB_HOST="sql1" \
+        -e CERT_HOST_NAME="sql1" \
+        -e RUST_BACKTRACE=full \
+        -w /workspace \
+        $BUILD_IMAGE \
+        /workspace/.pipeline/scripts/containerized-test.sh ${{ parameters.testFilter }}
+    displayName: Run Tests and Coverage
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+  # ODBC C++ gtest e2e suite against the same in-network SQL Server (sql1) this
+  # job already uses. Runs inside the build container; the containerized script
+  # installs cmake + unixODBC-dev (absent from the build image) then invokes
+  # run_e2e.sh. PR-only, matching the Rust test pass above.
+  #
+  # ODBC_E2E_COMPARE also installs the Microsoft ODBC Driver 18 and reruns the
+  # suite against it, so a behavioural divergence between the Rust driver and
+  # msodbcsql18 fails the build. Only this leg does it: it owns a local SQL
+  # Server in docker, so the doubled test time is contained.
+  - script: |
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        --network testnet \
+        -v $PWD:/workspace \
+        -v $HOME/.cargo/registry:/root/.cargo/registry \
+        -v $HOME/.cargo/git:/root/.cargo/git \
+        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_SERVER="sql1" \
+        -e ODBC_TEST_UID="sa" \
+        -e ODBC_TEST_PWD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_TRUST_CERT="Yes" \
+        -e ODBC_E2E_RETRIES="3" \
+        -e ODBC_E2E_COVERAGE="${{ lower(parameters.collectRustCoverage) }}" \
+        -e ODBC_E2E_COMPARE="1" \
+        -e ODBC_E2E_MSODBCSQL_VERSION="$(msodbcsqlVersion)" \
+        -e RUST_BACKTRACE=full \
+        -w /workspace \
+        $BUILD_IMAGE \
+        /workspace/.pipeline/scripts/containerized-odbc-e2e.sh
+    displayName: Run ODBC e2e tests (with msodbcsql parity comparison)
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+# ARM64 runs the same test pass but against the cross-pool SQL host resolved
+# by poll-for-endpoint.sh (DB_HOST/DB_PORT). TRUST_SERVER_CERTIFICATE bypasses
+# cert-chain validation so no host-specific cert wiring is needed on the wire.
+- ${{ if eq(parameters.architecture, 'ARM64') }}:
+  - script: |
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+      
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        --network testnet \
+        -v $PWD:/workspace \
+        -v $HOME/.cargo/registry:/root/.cargo/registry \
+        -v $HOME/.cargo/git:/root/.cargo/git \
+        -v $PWD/ca.crt:/usr/local/share/ca-certificates/mssql-ca.crt:ro \
+        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e DB_USERNAME="sa" \
+        -e DB_HOST="$(DB_HOST)" \
+        -e DB_PORT="$(DB_PORT)" \
+        -e TRUST_SERVER_CERTIFICATE="true" \
+        -e RUST_BACKTRACE=full \
+        -w /workspace \
+        $BUILD_IMAGE \
+        /workspace/.pipeline/scripts/containerized-test.sh ${{ parameters.testFilter }}
+    displayName: Run Tests and Coverage
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      DB_HOST: $(DB_HOST)
+      DB_PORT: $(DB_PORT)
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+  # ODBC C++ gtest e2e suite against the cross-pool SQL host (DB_HOST:DB_PORT).
+  # TrustServerCertificate=Yes (ODBC_TEST_TRUST_CERT) bypasses cert validation,
+  # matching the Rust ARM test pass above. PR-only.
+  - script: |
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        --network testnet \
+        -v $PWD:/workspace \
+        -v $HOME/.cargo/registry:/root/.cargo/registry \
+        -v $HOME/.cargo/git:/root/.cargo/git \
+        -e SQL_PASSWORD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_SERVER="$(DB_HOST),$(DB_PORT)" \
+        -e ODBC_TEST_UID="sa" \
+        -e ODBC_TEST_PWD="$(SQL_PASSWORD)" \
+        -e ODBC_TEST_TRUST_CERT="Yes" \
+        -e ODBC_E2E_RETRIES="3" \
+        -e RUST_BACKTRACE=full \
+        -w /workspace \
+        $BUILD_IMAGE \
+        /workspace/.pipeline/scripts/containerized-odbc-e2e.sh
+    displayName: Run ODBC e2e tests
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      DB_HOST: $(DB_HOST)
+      DB_PORT: $(DB_PORT)
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 - task: PublishTestResults@2
   condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
@@ -221,12 +369,65 @@ steps:
     failTaskOnFailedTests: false
     publishRunAttachments: true
 
-- task: PublishCodeCoverageResults@2
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-  displayName: Publish coverage results
+# ODBC e2e JUnit (written by run_e2e.sh inside the container to the mounted
+# workspace). Shared by the x64 and ARM ODBC steps above; PR-only.
+#
+# ODBC e2e runs on Linux x64 + ARM only. Windows is intentionally excluded: the
+# driver exports a Unicode-only surface with no SQLConnectW, so the Windows Driver
+# Manager classifies it as ANSI and the live tests fail at SQLDriverConnect with
+# IM001. Re-enable a Windows ODBC e2e step once the driver exports SQLConnectW.
+- task: PublishTestResults@2
+  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+  displayName: Publish ODBC e2e test results
   inputs:
-    summaryFileLocation: $(Build.SourcesDirectory)/target/lcov.info
-    pathToSources: $(Build.SourcesDirectory)
+    testResultsFormat: JUnit
+    testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+    testRunTitle: $(System.PhaseName)-ODBC
+    failTaskOnFailedTests: false
+    publishRunAttachments: true
+
+# Reference-driver leg, produced only by the x64 job (ODBC_E2E_COMPARE=1).
+# Published so a parity divergence can be triaged from the test tab rather than
+# by reading the build log.
+- ${{ if ne(parameters.architecture, 'ARM64') }}:
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish ODBC e2e test results (msodbcsql reference)
+    continueOnError: true
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
+      testRunTitle: $(System.PhaseName)-ODBC-msodbcsql
+      failTaskOnFailedTests: false
+      publishRunAttachments: true
+
+# Coverage is not published to the ADO coverage tab from this job. The Linux
+# mssql-tds Rust Cobertura report is published as a per-OS artifact; the
+# Coverage stage merges the Windows/Linux/macOS Rust reports with the
+# mssql-py-core Python report and publishes the single combined report to the
+# ADO coverage tab, because ADO does not merge coverage across stages/jobs.
+- ${{ if eq(parameters.collectRustCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish mssql-tds Linux Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/cobertura.xml
+      artifactName: CoberturaCoverageRust_Linux
+
+# ODBC C++ e2e coverage: the instrumented driver is exercised through the
+# unixODBC Driver Manager as a separate process, so this report adds coverage
+# for mssql-odbc (and statically-linked mssql-tds) lines reachable only via the
+# ODBC surface. Best-effort (continueOnError) so a coverage hiccup never fails
+# the build; the Merge Coverage stage skips it if absent.
+- ${{ if eq(parameters.collectRustCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish ODBC e2e Linux Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml
+      artifactName: CoberturaCoverageOdbcE2E_Linux
 
 - task: CopyFiles@2
   displayName: Copy Rust Debug Build
@@ -258,7 +459,7 @@ steps:
 
 - ${{ if eq(parameters.enableJsBuild, true) }}:
   - script: |
-      BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
       
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         -v $PWD:/workspace \
@@ -275,7 +476,7 @@ steps:
 
 - ${{ if eq(parameters.enableJsTest, true) }}:
   - script: |
-      BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+      BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
       
       bash .pipeline/scripts/docker-cargo-run.sh --rm \
         --network testnet \
@@ -302,8 +503,49 @@ steps:
       testResultsFiles: $(Build.SourcesDirectory)/mssql-js/junit.xml
       testRunTitle: $(System.PhaseName)-Js
 
+# mssql-py-core is outside the workspace, so its Rust unit tests are not part of
+# the mssql-tds nextest run above. Run them in the build container and publish
+# the JUnit results to the ADO test tab. Pure unit tests, so no SQL Server needed.
 - script: |
-    BUILD_IMAGE="tdslibrs.azurecr.io/build/ubuntu:22.04"
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
+
+    bash .pipeline/scripts/docker-cargo-run.sh --rm \
+      -v $PWD:/workspace \
+      -v $HOME/.cargo/registry:/root/.cargo/registry \
+      -v $HOME/.cargo/git:/root/.cargo/git \
+      -w /workspace \
+      $BUILD_IMAGE \
+      /workspace/.pipeline/scripts/containerized-pycore-rust-test.sh
+  displayName: Run Rust unit tests (mssql-py-core)
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
+  env:
+    CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+    CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+
+- task: PublishTestResults@2
+  condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'), ne('${{ parameters.architecture }}', 'ARM64'))
+  displayName: Publish mssql-py-core Rust test results
+  inputs:
+    testResultsFormat: JUnit
+    testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/target/nextest/ci/junit.xml
+    testRunTitle: $(System.PhaseName)-PyCore-Rust
+    failTaskOnFailedTests: false
+    publishRunAttachments: true
+
+# Cobertura from the mssql-py-core Rust unit tests (produced by the step above).
+# Merged with the mssql-py-core Python coverage under the same crate prefix in
+# the Coverage stage, since ADO does not merge coverage across stages/jobs.
+- ${{ if eq(parameters.collectPythonCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish mssql-py-core Rust Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/pycore-rust-cobertura.xml
+      artifactName: CoberturaCoveragePyCoreRust
+
+- script: |
+    BUILD_IMAGE="ghcr.io/microsoft/mssql-rs/build/ubuntu:22.04"
     
     bash .pipeline/scripts/docker-cargo-run.sh --rm \
       --network testnet \
@@ -332,6 +574,40 @@ steps:
     testResultsFormat: JUnit
     testResultsFiles: $(Build.SourcesDirectory)/mssql-py-core/pytest-results.xml
     testRunTitle: $(System.PhaseName)-Python
+
+# Publish the mssql-py-core Cobertura coverage produced by the Python tests
+# (test-python.sh --coverage). Merged with the Windows Rust coverage in the
+# Coverage stage, since ADO does not merge coverage across stages/jobs.
+- ${{ if eq(parameters.collectPythonCoverage, true) }}:
+  - task: PublishPipelineArtifact@1
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Publish mssql-py-core Cobertura coverage artifact
+    continueOnError: true
+    inputs:
+      targetPath: $(Build.SourcesDirectory)/target/pycore-cobertura.xml
+      artifactName: CoberturaCoveragePython
+
+# Release the cross-pool SQL host: publishing this sentinel is what unblocks
+# Sql_Host_build_arm's wait-for-teardown step. always() so failures and
+# cancellations still release the host.
+- ${{ if eq(parameters.architecture, 'ARM64') }}:
+  - script: |
+      mkdir -p "$(Agent.TempDirectory)/teardown"
+      echo "$(System.JobName) done at $(date -u +%FT%TZ)" \
+        > "$(Agent.TempDirectory)/teardown/done.txt"
+    displayName: 'Stage teardown sentinel (release SQL host)'
+    condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish teardown sentinel (release SQL host)'
+    condition: and(always(), eq(variables['Build.Reason'], 'PullRequest'))
+    inputs:
+      targetPath: '$(Agent.TempDirectory)/teardown'
+      # Suffix with the stage attempt so a rerun publishes a fresh name instead
+      # of colliding with the prior attempt's artifact; the host waits on the
+      # matching $(System.StageAttempt) via SENTINEL_SUFFIX.
+      artifact: 'build_arm-$(System.StageAttempt)'
+      publishLocation: 'pipeline'
 
 - script: |
     docker stop sqlserver || true

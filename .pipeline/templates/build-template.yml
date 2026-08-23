@@ -36,15 +36,15 @@ parameters:
   type: boolean
   default: true
 
-- name: enableRustBuild
-  displayName: Enable standalone Rust Debug/Release build steps
-  type: boolean
-  default: true
-
 - name: enableClippy
   displayName: Enable Rust Clippy lint step
   type: boolean
   default: true
+
+- name: enableOdbcE2E
+  displayName: Enable ODBC C++ e2e suite (Windows, PR only) with coverage
+  type: boolean
+  default: false
 
 steps:
 - template: generate-sql-password-template.yml
@@ -53,17 +53,6 @@ steps:
 
 - script: cargo fetch
   displayName: Fetch Crates
-
-- ${{ if eq(parameters.enableRustBuild, true) }}:
-  - script: |
-      cargo build --frozen 2>&1
-    displayName: Rust Debug Build
-    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
-
-  - script: |
-      cargo build --frozen --release 2>&1
-    displayName: Rust Release Build
-    condition: and(succeeded(), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')), eq(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if and(eq(parameters.enableClippy, true), eq(parameters.osType, 'Windows')) }}:
   - pwsh: ./scripts/bclippy.ps1
@@ -103,9 +92,18 @@ steps:
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
 - ${{ if eq(parameters.enableTests, true) }}:
-  - script: cargo install cargo-llvm-cov --version 0.6.16 --locked && cargo install cargo-nextest --version 0.9.99 --locked
-    displayName: Install llvm-cov and nextest 
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+  # The hosted macOS agent took up to ~10 minutes to compile these from source
+  # and would sometimes time out, so install the published prebuilt binaries
+  # there. Other platforms keep the source build.
+  - ${{ if eq(parameters.osType, 'MacOS') }}:
+    - script: ./.pipeline/scripts/install-coverage-tools-macos.sh
+      displayName: Install llvm-cov and nextest
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ if ne(parameters.osType, 'MacOS') }}:
+    - script: cargo install cargo-llvm-cov --version 0.6.16 --locked && cargo install cargo-nextest --version 0.9.99 --locked
+      displayName: Install llvm-cov and nextest 
+      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
   # Generate test certificates for mock TDS server TLS tests
   - ${{ if eq(parameters.osType, 'Windows') }}:
@@ -120,18 +118,10 @@ steps:
     displayName: Clean up old coverage files
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
-  - ${{ if eq(parameters.osType, 'Linux') }}:
-    - script: |
-        echo "##vso[task.setvariable variable=ARCHIVE_NAME;isOutput=false]tdslib-nextest.tar.zst"   
-        cargo install cargo-nextest  --version 0.9.99 --locked
-        cd mssql-tds && cargo nextest archive --archive-file tdslib-nextest.tar.zst && cp tdslib-nextest.tar.zst $(Build.ArtifactStagingDirectory) && mv tdslib-nextest.tar.zst ../ 
-      displayName: Archive nextest results
-      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-
   - script: |
         export CERT_HOST_NAME="sql1"
-        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --no-fail-fast --profile ci --success-output immediate
-    displayName: Run tests (mssql-tds package only)
+        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssql-odbc --no-fail-fast --profile ci --success-output immediate
+    displayName: Run tests (mssql-tds and mssql-odbc packages)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
@@ -146,17 +136,13 @@ steps:
       testResultsFiles: $(Build.SourcesDirectory)/target/nextest/ci/junit.xml
       testRunTitle: $(System.PhaseName)
 
-  - script: cargo llvm-cov report --package mssql-tds --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
+  # `test_client_support.rs` is test-only scaffolding (gated behind the
+  # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
+  # unit tests; it is not product code, so it is excluded from coverage.
+  - script: cargo llvm-cov report --package mssql-tds --package mssql-odbc --ignore-filename-regex 'test_client_support\.rs' --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in lcov format (mssql-tds package only)
-
-  - ${{ if eq(parameters.osType, 'Linux') }}:
-    - bash: |
-        echo "Running mssql-py-core Rust unit tests..."
-        cd mssql-py-core && cargo test --frozen -- --show-output
-      displayName: Run Rust unit tests (mssql-py-core)
-      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: Save code coverage in lcov format (mssql-tds and mssql-odbc)
 
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |
@@ -167,34 +153,91 @@ steps:
       env:
         SQL_PASSWORD: $(SQL_PASSWORD)
 
-  - ${{ if eq(parameters.osType, 'Windows') }}:
-    - task: PublishCodeCoverageResults@2
-      condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
-      displayName: "Publish coverage results"
-      inputs:
-        summaryFileLocation: "$(Build.SourcesDirectory)/target/lcov.info"
-        pathToSources: "$(Build.SourcesDirectory)"
+  # Coverage is not published to the ADO coverage tab from the individual OS
+  # jobs. Each OS produces its own mssql-tds Rust Cobertura report as a per-OS
+  # artifact; the Coverage stage merges the Windows/Linux/macOS Rust reports
+  # with the mssql-py-core Python report and publishes the single combined
+  # report to the ADO coverage tab, because ADO does not merge coverage across
+  # stages/jobs. The merged report is what the GitHub diff-cover workflow uses.
+  - script: cargo llvm-cov report --package mssql-tds --package mssql-odbc --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    workingDirectory: "$(Build.SourcesDirectory)"
+    displayName: Save code coverage in Cobertura format (mssql-tds and mssql-odbc)
 
-- ${{ if eq(parameters.enableRustBuild, true) }}:
-  - task: CopyFiles@2
-    displayName: Copy Rust Debug Build
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'),  or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')))
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish Cobertura coverage artifact"
     inputs:
-      SourceFolder: '$(CARGO_TARGET_DIR)/debug'
-      Contents: |
-        *
-        !.cargo-lock
-      TargetFolder: '$(Build.ArtifactStagingDirectory)/debug'
+      targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
+      artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
 
-  - task: CopyFiles@2
-    displayName: Copy Rust Release Build
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), or( eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')))
+# ODBC C++ e2e suite (Windows only). The gtest suite loads the Rust ODBC driver
+# DLL through the Windows Driver Manager as separate processes, so its execution
+# was contributing zero coverage. run_e2e.ps1 -Coverage instruments the driver
+# via cargo llvm-cov, lets the gtest processes emit .profraw, and produces a
+# repo-root-relative Cobertura report for mssql-odbc (and statically-linked
+# mssql-tds). The report is unioned into the Merge Coverage stage so lines
+# reachable only via the ODBC surface count toward PR diff coverage.
+- ${{ if and(eq(parameters.osType, 'Windows'), eq(parameters.enableOdbcE2E, true)) }}:
+  # Reference driver for the parity comparison below, installed by
+  # install-msodbcsql.ps1. Pinned to the msodbcsqlVersion pipeline variable so a
+  # new upstream release can't silently change what the parity table compares
+  # against. It installs as "ODBC Driver 18 for SQL Server"; the Rust driver
+  # registers separately as "... (Rust)", so the two coexist.
+  - task: PowerShell@2
+    displayName: Install msodbcsql $(msodbcsqlVersion) (parity reference driver)
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     inputs:
-      SourceFolder: '$(CARGO_TARGET_DIR)/release'
-      Contents: |
-        *
-        !.cargo-lock
-      TargetFolder: '$(Build.ArtifactStagingDirectory)/release'
+      pwsh: true
+      filePath: $(Build.SourcesDirectory)/.pipeline/scripts/install-msodbcsql.ps1
+      arguments: -Version '$(msodbcsqlVersion)'
+
+  - pwsh: |
+      $env:ODBC_TEST_SERVER   = 'localhost'
+      $env:ODBC_TEST_UID      = 'sa'
+      $env:ODBC_TEST_PWD      = $env:SQL_PASSWORD
+      $env:ODBC_TEST_TRUST_CERT = 'Yes'
+      # Explicit -CoverageOutput under $(Build.SourcesDirectory)/target keeps the
+      # publish path deterministic regardless of the job's CARGO_TARGET_DIR.
+      # -CompareWithMsodbcsql reruns the suite against the driver installed
+      # above; the script fails on any parity divergence.
+      ./mssql-odbc/tests/e2e/run_e2e.ps1 -Retries 3 -Coverage `
+        -CompareWithMsodbcsql `
+        -CoverageOutput "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
+    displayName: Run ODBC C++ e2e tests (Windows) with coverage and msodbcsql parity comparison
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      RUST_BACKTRACE: full
+
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e test results (Windows)"
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+      testRunTitle: $(System.PhaseName)-OdbcE2E
+
+  # Reference-driver leg. Published so a parity divergence can be triaged from
+  # the test tab rather than by reading the build log.
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e test results (Windows, msodbcsql reference)"
+    continueOnError: true
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-msodbcsql.xml
+      testRunTitle: $(System.PhaseName)-OdbcE2E-msodbcsql
+
+  # Best-effort (continueOnError) so a coverage hiccup never fails the build; the
+  # Merge Coverage stage skips it if absent.
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e Windows Cobertura coverage artifact"
+    continueOnError: true
+    inputs:
+      targetPath: "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
+      artifactName: "CoberturaCoverageOdbcE2E_Windows"
 
 - ${{ if eq(parameters.enableJsBuild, true) }}:
   - bash: |
@@ -246,10 +289,3 @@ steps:
       testResultsFormat: "JUnit"
       testResultsFiles: $(Build.SourcesDirectory)/mssql-js/junit.xml
       testRunTitle: $(System.PhaseName)-Js
-
-- task: PublishBuildArtifacts@1
-  displayName: Publish Build Drop
-  inputs:
-    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-    ArtifactName: $(System.PhaseName)
-    publishLocation: Container

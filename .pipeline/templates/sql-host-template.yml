@@ -1,0 +1,154 @@
+# Template: sql-host-template.yml
+#
+# Defines a single x64 1ES "SQL host" job that boots a SQL Server docker
+# container, publishes its private-VNet endpoint to dependent test jobs via
+# a `sql-ready-<instanceId>` pipeline artifact, then blocks until those test
+# jobs publish their teardown sentinel artifacts (each named by the raw
+# sentinel name listed in expectedSentinels, e.g. Ubuntu24, build_arm), and
+# finally tears the container down in an always() step.
+#
+# Why two-way artifact sentinels (and not ADO `dependsOn` + output vars):
+#   ADO will not start a `dependsOn`-linked job until the producer job
+#   COMPLETES. If the test job depended on this job, this job could not
+#   complete until tests publish their teardown sentinels, which they cannot do until
+#   they are allowed to start — a deadlock that ends only when the SQL
+#   host's MAX_LIFETIME_MINUTES cap fires (after which the SQL container
+#   is torn down before the tests get a chance to run). The two-way artifact
+#   handshake removes the ADO `dependsOn`, so SQL host and test jobs run
+#   concurrently and synchronise via pipeline artifacts.
+#
+# Caller contract:
+#   * The dependent test job must NOT add `dependsOn` on this job.
+#   * The dependent test job must call sql-host/poll-for-endpoint.sh with
+#     ARTIFACT_NAME='sql-ready-<instanceId>-$(System.StageAttempt)' before it
+#     tries to connect.
+#   * The dependent test job must publish a pipeline artifact whose name is
+#     '<sentinel>-$(System.StageAttempt)', where <sentinel> is listed in
+#     `expectedSentinels`, once it has finished using the SQL host (use
+#     `condition: always()` so cancellations and failures still release the
+#     host). The `-$(System.StageAttempt)` suffix namespaces the rendezvous per
+#     stage attempt so reruns don't collide with or match prior attempts; this
+#     job appends the same suffix to `expectedSentinels` via SENTINEL_SUFFIX.
+#   * The SA password is derived deterministically from build context by
+#     sql-host/derive-sql-password.sh, so the same script must be invoked
+#     in the dependent test job to recompute the same value.
+#
+# Cross-pool reachability assumption: the configured x64 pool and the ARM
+# pool that consumes the endpoint share a VNet, and the IP we publish is
+# routable from those ARM agents on `sqlHostPort`.
+
+parameters:
+  - name: instanceId
+    type: string
+  - name: expectedSentinels
+    # Comma-separated list of pipeline-artifact names to wait for.
+    type: string
+  - name: sqlImageTag
+    type: string
+    default: '2025-latest'
+  - name: maxLifetimeMinutes
+    type: number
+    default: 120
+  - name: poolName
+    type: string
+    default: 'RUST-1ES-POOL-WUS3'
+  - name: poolImageOverride
+    type: string
+    default: 'imageOverride -equals RUST-1ES-UBUSLIM'
+  - name: jobCondition
+    # Job-level condition. Defaults to succeeded(); callers that only need the
+    # SQL host on PRs (e.g. the Build stage) pass a Build.Reason check.
+    type: string
+    default: succeeded()
+
+jobs:
+  - job: Sql_Host_${{ parameters.instanceId }}
+    displayName: 'SQL host (${{ parameters.instanceId }})'
+    condition: ${{ parameters.jobCondition }}
+    # Generous ADO-level safety net; the real cap is enforced by the watcher
+    # script via MAX_LIFETIME_MINUTES (parameter below) and is always lower.
+    timeoutInMinutes: 240
+    pool:
+      name: ${{ parameters.poolName }}
+      demands:
+        - ${{ parameters.poolImageOverride }}
+    variables:
+      INSTANCE_ID: ${{ parameters.instanceId }}
+      SQL_IMAGE_TAG: ${{ parameters.sqlImageTag }}
+      EXPECTED_SENTINELS: ${{ parameters.expectedSentinels }}
+      MAX_LIFETIME_MINUTES: ${{ parameters.maxLifetimeMinutes }}
+    steps:
+      - bash: |
+          set -euo pipefail
+          bash .pipeline/scripts/sql-host/derive-sql-password.sh
+        displayName: 'Derive shared SQL_PASSWORD from build context'
+        workingDirectory: '$(Build.SourcesDirectory)'
+        env:
+          BUILD_BUILDID: $(Build.BuildId)
+          SYSTEM_COLLECTIONID: $(System.CollectionId)
+
+      - task: DockerInstaller@0
+        inputs:
+          dockerVersion: '29.0.0'
+
+      - template: install-ubuntu-dependency.yaml
+        parameters:
+          installAzCli: false
+          installDocker: true
+
+      - script: |
+          set -euo pipefail
+          bash .pipeline/scripts/sql-host/start.sh
+        name: publish
+        displayName: 'Boot SQL Server and stage endpoint payload'
+        workingDirectory: '$(Build.SourcesDirectory)'
+        env:
+          SQL_PASSWORD: $(SQL_PASSWORD)
+          INSTANCE_ID: $(INSTANCE_ID)
+          SQL_IMAGE_TAG: $(SQL_IMAGE_TAG)
+          BUILD_ARTIFACTSTAGINGDIRECTORY: $(Build.ArtifactStagingDirectory)
+          # Embedded in endpoint.txt as a wall-clock deadline so test jobs
+          # can fail fast if they queued long enough that the SQL host is
+          # about to be torn down.
+          MAX_LIFETIME_MINUTES: $(MAX_LIFETIME_MINUTES)
+          # Avoid host port 1433: the NRMS subnet baseline and various
+          # platform policies frequently single out 1433 for restriction.
+          # Use a non-standard port and let the published endpoint sentinel
+          # propagate it to dependent test jobs.
+          SQL_HOST_PORT: '14333'
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish sql-ready sentinel (unblocks test jobs)'
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)/sql-endpoint-$(INSTANCE_ID)'
+          # Suffix with the stage attempt so a stage rerun publishes a fresh
+          # artifact name instead of colliding with the prior attempt's, and
+          # the paired poll-for-endpoint reads this attempt's endpoint (not a
+          # stale one). Consumers append the same $(System.StageAttempt).
+          artifact: 'sql-ready-$(INSTANCE_ID)-$(System.StageAttempt)'
+          publishLocation: 'pipeline'
+
+      - script: |
+          set -euo pipefail
+          bash .pipeline/scripts/sql-host/wait-for-teardown.sh
+        displayName: 'Wait for test-completion sentinels'
+        workingDirectory: '$(Build.SourcesDirectory)'
+        env:
+          EXPECTED_SENTINELS: $(EXPECTED_SENTINELS)
+          # Wait on this stage attempt's teardown sentinels (publishers suffix
+          # their artifact names with the same value), so a rerun never matches
+          # a previous attempt's leftover sentinels.
+          SENTINEL_SUFFIX: '-$(System.StageAttempt)'
+          BUILD_BUILDID: $(Build.BuildId)
+          SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+          SYSTEM_TEAMPROJECT: $(System.TeamProject)
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          MAX_LIFETIME_MINUTES: $(MAX_LIFETIME_MINUTES)
+
+      - script: |
+          bash .pipeline/scripts/sql-host/teardown.sh
+        displayName: 'Tear down SQL Server container'
+        condition: always()
+        workingDirectory: '$(Build.SourcesDirectory)'
+        env:
+          INSTANCE_ID: $(INSTANCE_ID)

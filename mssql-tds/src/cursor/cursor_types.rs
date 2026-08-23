@@ -172,7 +172,9 @@ bitflags! {
         const MISSING        = 0x0000_0002;
         /// Position is past the end of the keyset.
         const END_OF_KEYSET  = 0x0000_0004;
-        /// Position is past the end of the result set (includes END_OF_KEYSET).
+        /// Position is past the end of the result set. Per the sp_cursorfetch
+        /// spec this is `0x0C` (keyset + results bits), so
+        /// `END_OF_RESULTS.contains(END_OF_KEYSET)` is true by design.
         const END_OF_RESULTS = 0x0000_000C;
         /// Row was inserted since the keyset was built.
         const ADDED          = 0x0000_0010;

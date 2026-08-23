@@ -89,11 +89,7 @@ fn get_trace_log_path() -> Option<PathBuf> {
     if !dir.exists()
         && let Err(e) = create_dir_all(&dir)
     {
-        eprintln!(
-            "[mssql-py-core] ERROR: Could not create log directory '{}': {}",
-            dir.display(),
-            e
-        );
+        eprintln!("[mssql-py-core] ERROR: Could not create log directory {dir:?}: {e}");
         return None;
     }
 
@@ -143,8 +139,7 @@ pub(crate) fn init_tracing() {
                                 .event_format(LogFormatter);
 
                             eprintln!(
-                                "[mssql-py-core] Created log file → {}",
-                                log_path.display()
+                                "[mssql-py-core] Created log file → {log_path:?}"
                             );
 
                             // Store guard to keep async writer alive
@@ -162,9 +157,7 @@ pub(crate) fn init_tracing() {
                         }
                         Err(e) => {
                             eprintln!(
-                                "[mssql-py-core] ERROR: Could not create trace log file '{}': {}. Tracing will be disabled.",
-                                log_path.display(),
-                                e
+                                "[mssql-py-core] ERROR: Could not create trace log file {log_path:?}: {e}. Tracing will be disabled."
                             );
                         }
                     }

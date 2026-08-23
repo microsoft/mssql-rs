@@ -18,8 +18,7 @@ pub(crate) struct VectorFeature {
 impl VectorFeature {
     /// The maximum Vector feature version supported by this library.
     /// This represents the highest version this TDS client can negotiate with the server.
-    /// Version 1 supports single-precision float (float32) dimension type.
-    /// Version 2 adds half-precision float (float16) dimension type.
+    /// Version 2 supports float16 and float32 dimension types.
     pub const VERSION: u8 = 2;
 
     /// Creates a new VectorFeature instance with the specified client version.
@@ -150,7 +149,7 @@ mod tests {
     #[test]
     fn test_deserialize_invalid_version() {
         let mut feature = VectorFeature::default();
-        let data = vec![3u8]; // Server claims a version greater than client supports
+        let data = vec![3u8]; // Server supports version 3
         let result = feature.deserialize(&data);
         assert!(result.is_err());
         assert!(
@@ -185,8 +184,8 @@ mod tests {
     }
 
     #[test]
-    fn test_acknowledged_and_negotiated_version() {
-        let mut feature = VectorFeature::default();
+    fn test_negotiate_v1_client_v1_server() {
+        let mut feature = VectorFeature::new(1);
         assert!(!feature.is_acknowledged());
         assert_eq!(feature.negotiated_version(), 0);
 
@@ -196,5 +195,33 @@ mod tests {
 
         assert!(feature.is_acknowledged());
         assert_eq!(feature.negotiated_version(), 1);
+    }
+
+    #[test]
+    fn test_negotiate_v2_client_v1_server() {
+        let mut feature = VectorFeature::default(); // Client supports up to version 2;
+        assert!(!feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 0);
+
+        // Simulate server acknowledgment with version 1 (downgrade fallback)
+        feature.set_acknowledged(true);
+        feature.deserialize(&[1u8]).unwrap();
+
+        assert!(feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 1);
+    }
+
+    #[test]
+    fn test_negotiate_v2_client_v2_server() {
+        let mut feature = VectorFeature::new(2);
+        assert!(!feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 0);
+
+        // Simulate server acknowledgment with version 2
+        feature.set_acknowledged(true);
+        feature.deserialize(&[2u8]).unwrap();
+
+        assert!(feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 2);
     }
 }

@@ -1,3 +1,5 @@
+# Scheduled fuzz testing. Source repo is GitHub microsoft/mssql-rs, so the
+# schedule targets GitHub main.
 name: Rust TDS Lib Fuzz Testing
 trigger: none
 
@@ -7,7 +9,6 @@ schedules:
   branches:
     include:
     - main
-    - development
   always: true
 
 extends:
