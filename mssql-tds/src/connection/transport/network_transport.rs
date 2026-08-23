@@ -756,6 +756,7 @@ impl NetworkTransport {
     /// message actually contains.
     ///
     /// Neither case can make progress, so fail loudly instead of hanging.
+    #[cold]
     fn no_progress_error(outstanding: usize) -> crate::error::Error {
         crate::error::Error::ProtocolError(format!(
             "TDS read made no progress: {outstanding} more byte(s) required but the packet \
@@ -795,6 +796,7 @@ impl NetworkTransport {
     }
 
     /// Error for a read that extends past the end of the current message.
+    #[cold]
     fn past_end_of_message_error(outstanding: usize, available: usize) -> crate::error::Error {
         crate::error::Error::ProtocolError(format!(
             "TDS read extends past the end of the message: {outstanding} more byte(s) required \
@@ -802,18 +804,6 @@ impl NetworkTransport {
         ))
     }
 
-    /// Refills the read buffer for a read that still needs `needed` bytes,
-    /// failing if the value is truncated by the end of the current message.
-    ///
-    /// Every reader loops until the buffer holds enough bytes. Once the
-    /// terminating packet of a message has been framed the server sends nothing
-    /// further until the client issues a new request, so a loop that goes back
-    /// to the socket parks there forever instead of failing.
-    ///
-    /// This is deliberately the same unconditional rule the bulk loops apply:
-    /// the two families must agree on identical input. Sending a request clears
-    /// the boundary (see [`NetworkWriter::send`]), so a reader legitimately
-    /// waiting for the next response is never caught by this.
     /// Refills the read buffer for a scalar read that still needs `needed`
     /// bytes, failing if the value is truncated by the end of the message.
     ///
