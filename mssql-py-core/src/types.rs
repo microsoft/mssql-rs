@@ -1478,6 +1478,7 @@ mod tests {
     #[test]
     fn column_values_map_to_matching_scalar_sql_types() {
         let decimal = DecimalParts::from_string("1.25", 3, 2).unwrap();
+        let numeric = DecimalParts::from_string("1.25", 3, 2).unwrap();
 
         assert!(matches!(
             column_value_to_sql_type(ColumnValues::TinyInt(1)),
@@ -1504,11 +1505,11 @@ mod tests {
             SqlType::Float(Some(2.5))
         ));
         assert!(matches!(
-            column_value_to_sql_type(ColumnValues::Decimal(decimal.clone())),
+            column_value_to_sql_type(ColumnValues::Decimal(decimal)),
             SqlType::Decimal(Some(_))
         ));
         assert!(matches!(
-            column_value_to_sql_type(ColumnValues::Numeric(decimal)),
+            column_value_to_sql_type(ColumnValues::Numeric(numeric)),
             SqlType::Numeric(Some(_))
         ));
         assert!(matches!(
