@@ -8,6 +8,10 @@
 # This ties each ACR image and ACI instance back to the pipeline run.
 
 parameters:
+- name: poolName
+  type: string
+  default: 'RUST-X64-WUS3'
+
 - name: wheelArtifact
   displayName: Name of the published wheel artifact
   type: string
@@ -41,11 +45,11 @@ parameters:
 
 - name: vnet
   type: string
-  default: vnet-sqldrivers-trusted-westus3
+  default: vnet-sqldrivers-trusted-westus3-01
 
 - name: subnet
   type: string
-  default: default2
+  default: snet-aci-01
 
 - name: miName
   type: string
@@ -70,9 +74,9 @@ jobs:
 - job: PrivateLink_Smoke
   displayName: Private Link Smoke Test (ACI)
   pool:
-    name: RUST-1ES-POOL-WUS3
+    name: ${{ parameters.poolName }}
     demands:
-      - imageOverride -equals RUST-1ES-UBUSLIM
+      - imageOverride -equals RUST-UBUSLIM
   timeoutInMinutes: 30
   steps:
   # --- Login ---

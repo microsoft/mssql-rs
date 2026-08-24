@@ -26,8 +26,8 @@ describes integration verification.
 5. Apply the requested autocommit mode and serve the borrower.
 
 The reset call in step 3 only arms the TDS reset bit. The isolation call in
-step 4 carries that bit and verifies the server acknowledgement, so there is no
-dedicated reset round trip.
+step 4 carries that bit; `TdsClient` verifies the server's acknowledgement on
+whichever request carries it, so there is no dedicated reset round trip.
 
 ## State model
 
@@ -36,11 +36,13 @@ The similar reset flags belong to different layers:
 | State | Owner | Meaning | Cleared when |
 |---|---|---|---|
 | `pending_reset` | TDS transport | One-shot `RESETCONNECTION` or `RESETCONNECTIONSKIPTRAN` bit for the next eligible packet | The packet writer consumes it |
-| `reset_pending` | `TdsClient` | A reset was armed but no `ResetConnection` ENVCHANGE has confirmed it | ENVCHANGE arrives, or a successful reconnect creates a clean session |
-| `pending_reset_ack` | ODBC DBC | Checkout must emit a carrying request and verify its acknowledgement | The isolation handler completes or fails |
+| `reset_dispatched` | TDS transport | A packet header carrying that bit reached the wire | `TdsClient` takes it, or a new reset is armed |
+| `reset_state` | `TdsClient` | `Idle` / `Armed` (bit set, not yet sent) / `AwaitingAck` (bit sent, ENVCHANGE owed) | ENVCHANGE arrives, verification fails the request, or a successful reconnect creates a clean session |
+| `server_isolation_unknown` | ODBC DBC | The cached isolation level is no longer evidence about the server | An isolation SET reaches the server, or a new login starts from a known state |
+| `reset_generation` | ODBC DBC | Monotonic count of armed resets; an isolation SET only clears the invalidation it actually satisfied | Never (monotonic) |
 | `local_tran_started` | ODBC DBC | The application executed work in a manual-commit transaction | Commit, rollback, disconnect, or pool reset |
 | `transaction_descriptor` | TDS execution context | SQL Server has an active transaction, including an empty driver-begun transaction | Commit, rollback, full reset, or reconnect |
-| `known_dead` | TDS transport | I/O, close, fatal server error, or reset failure proved the connection unusable | A new transport is created |
+| `known_dead` | TDS transport | I/O, close, fatal server error, or unacknowledged reset proved the connection unusable | A new transport is created |
 
 `local_tran_started` and `transaction_descriptor != 0` are deliberately not
 equivalent. Manual-commit setup may begin an empty transaction before the
@@ -58,7 +60,7 @@ sequenceDiagram
     Pool->>ODBC: SQL_ATTR_CONNECTION_DEAD
     ODBC-->>Pool: known-dead status (no network probe)
     Pool->>ODBC: SQL_ATTR_RESET_CONNECTION = YES
-    ODBC->>ODBC: Read local_tran_started before claiming client
+    ODBC->>ODBC: Mark cached isolation untrusted, read local_tran_started
     opt Known borrower work and live descriptor
         ODBC->>Server: Roll back transaction
     end
@@ -66,16 +68,16 @@ sequenceDiagram
     TDS->>TDS: Arm bit and invalidate session-bound state
     ODBC-->>Pool: SQL_SUCCESS (no reset I/O)
     Pool->>ODBC: SQL_ATTR_TXN_ISOLATION = READ_COMMITTED
-    ODBC->>ODBC: Suppress same-value short circuit
+    ODBC->>ODBC: Skip same-value short circuit (cached level untrusted)
     ODBC->>Server: SET isolation + RESETCONNECTION packet bit
     Server->>Server: Reset session before executing SET
-    Server-->>TDS: ResetConnection ENVCHANGE
-    TDS->>TDS: Clear reset_pending
-    ODBC->>ODBC: Verify reset_pending is false
     alt Acknowledged
+        Server-->>TDS: ResetConnection ENVCHANGE, then the response
+        TDS->>TDS: Clear reset_state
         ODBC-->>Pool: SQL_SUCCESS, connection may be reused
     else Not acknowledged
-        ODBC->>TDS: Mark connection known dead
+        Server-->>TDS: Response with no ResetConnection ENVCHANGE
+        TDS->>TDS: Mark connection known dead, fail the request
         ODBC-->>Pool: 08S01, discard connection
     end
 ```
@@ -108,6 +110,117 @@ reconciles the client with the confirmed server reset.
 
 Server-owned state such as temp tables and SET options is reset by SQL Server
 before it executes the carrying request.
+
+## Acknowledgement verification
+
+Verification lives in `TdsClient`, not in the ODBC layer, so it does not depend
+on what a consumer happens to send after arming.
+
+The packet writer — not the client — consumes the armed mode, so the client
+learns the bit truly reached the wire by taking the transport's
+`reset_dispatched` record. That is done only while the client still believes a
+reset is `Armed`, so a record left behind by a response that was never read can
+never be charged to an unrelated later request.
+
+SQL Server resets the session *before* it parses the carrying request, so the
+`ResetConnection` ENVCHANGE precedes everything that request produces. The
+first response token that is evidence the request actually ran — DONE,
+COLMETADATA, ROW, RETURNSTATUS — is therefore the last moment the
+acknowledgement could still have arrived. Reaching it while `AwaitingAck` means
+the session was never reset: the connection is marked known dead and the
+request fails with `Error::ConnectionResetNotAcknowledged`, which `mssql-odbc`
+reports as `08S01` from whatever entry point the request came through.
+
+Three cases are deliberately not treated as failures:
+
+- **ENVCHANGE / INFO / SESSIONSTATE tokens.** These can legitimately precede or
+  accompany the acknowledgement, so they never trigger the verdict.
+- **ERROR tokens.** The server's own diagnostic is more actionable and must
+  reach the caller unmasked. A reset still unacknowledged after it is caught on
+  the next token, so the connection is still condemned — just behind the
+  server's error.
+- **Transparent reconnect.** The armed bit dies with the old transport and no
+  ENVCHANGE can arrive. The new transport carries no dispatch record, and
+  adopting a recovered session clears `reset_state` outright, so a healthy new
+  connection is never discarded for an acknowledgement that can no longer come.
+
+A message the server is told to ignore (the attention/cancel path) is likewise
+never recorded as having delivered the bit.
+
+### Protocol basis and validated scope
+
+MS-TDS defines ENVCHANGE **type 18** as
+"RESETCONNECTION/RESETCONNECTIONSKIPTRAN Completion Acknowledgement", so the
+acknowledgement is specified for *both* reset modes, not only the full reset.
+What the spec does **not** state is an unconditional "the server MUST emit type
+18 whenever the bit is honoured" — the ENVCHANGE section carries explicit
+emission rules for types 4, 13, 15, 16, 20, and 21, but none for 18. So the
+guarantee this driver relies on is documented-by-definition rather than
+mandated-by-clause.
+
+That matters because this driver **exceeds** both reference implementations
+here. SqlClient clears `_fResetConnection` on send (`TdsParser.cs:1930`) and only
+reconciles session data when the ENVCHANGE arrives; msodbcsql calls
+`ResetConnection(FALSE)` immediately after the send (`TdsSend.cpp:1213`). Neither
+can fail a request for a missing acknowledgement — for them it is advisory.
+Failing the carrying request is therefore a deliberate exceed-parity decision
+and, per the repo's parity rules, one that needs product-owner sign-off recorded
+against the tracking work item.
+
+Validated topologies:
+
+| Topology | Covered |
+|---|---|
+| SQL Server 2022 (CI container, Linux/Windows/macOS legs) | yes |
+| Azure SQL Database (via gateway) | **not covered** |
+| Azure SQL Managed Instance | **not covered** |
+| Down-level SQL Server (2016/2017/2019) | **not covered** |
+| MARS | n/a — this driver does not implement MARS |
+
+The residual risk is scoped, not eliminated: if any of the uncovered topologies
+honours the bit without emitting type 18, the failure surfaces on whichever
+request carried the bit rather than on a pool checkout the pool could retry.
+Should that need mitigating before the matrix is filled in, the smallest change
+is to gate the verdict — verify by default, and let a consumer downgrade it to
+advisory (log and clear, matching SqlClient/msodbcsql) — which keeps the
+fail-at-checkout guarantee for the topologies it is proven on.
+
+### Abandoned carriers
+
+A verdict is only ever valid against the response of the request that carried
+the bit. When that response is abandoned before any token is read, the
+suspicion must not be carried forward.
+
+Cancellation and timeout are the reachable case. `NetworkTransport::receive_token`
+answers both by draining to the attention acknowledgement, and that drain
+discards every other token — the `ResetConnection` ENVCHANGE included. The
+carrying request therefore ends with the bit on the wire and nothing observed
+about it.
+
+`begin_command` and `check_and_reconnect` both settle this. Between them they
+cover every request path — the cursor RPCs never call `begin_command`, and the
+transaction ops deliberately skip recovery — and each runs *before* the current
+request has sent anything, so a dispatch record or outstanding acknowledgement
+seen there necessarily belongs to an earlier request. The settle is idempotent,
+so a path that reaches both costs nothing. Without this the next, unrelated
+request would be condemned on its first token — marking a healthy connection
+dead, which is a worse outcome than the gap the verification closes.
+
+The same boundary recovers a *lost* arm. `PacketWriter::new` consumes the armed
+mode before any bytes are written, so a message abandoned during serialization —
+a parameter-encoding or Always Encrypted failure, which propagates without
+condemning the transport — takes the arm with it and leaves no dispatch record.
+Left alone the connection would sit in `Armed` forever: nothing would carry the
+bit, so nothing could reach `AwaitingAck`, and the session would silently never
+be reset. The `Armed` state therefore carries its mode, and the boundary re-arms
+it when no dispatch was recorded.
+
+The settlement treats the session as reset rather than failed. That is what the
+protocol supports: SQL Server resets before it processes the carrying request,
+the bit demonstrably reached the wire, and `prepare_reset_connection` already
+reconciled every client-side cache at arm time. No pool guarantee is weakened,
+because an abandoned carrier fails its own request — the checkout that issued it
+reports failure and discards the connection.
 
 ## Open cursors at check-in
 
@@ -166,13 +279,14 @@ latency. Piggybacking preserves both properties the eager request provided:
 
 - **Cache safety:** session-bound client state is invalidated when reset is
   armed.
-- **Fail at checkout:** `pending_reset_ack` prevents the isolation SET from
-  short-circuiting, and the handler checks `reset_pending` after the request.
+- **Fail at checkout:** `TdsClient` verifies the acknowledgement on whichever
+  request carries the bit, so the reset fails on that request rather than
+  silently leaving a dirty session behind.
 
-A consumer that does not issue the checkout isolation SET remains safe: the
-reset bit rides its first eligible request and SQL Server resets before
-executing it. Such a consumer loses early failure detection, not state
-correctness.
+A consumer that does not issue the checkout isolation SET gets the same
+guarantee: the bit rides its first eligible request, SQL Server resets before
+executing it, and that request is where a missing acknowledgement surfaces.
+Only the isolation restore below is specific to a consumer that issues the SET.
 
 ## Isolation semantics
 
@@ -186,9 +300,27 @@ correctness.
 Raw T-SQL can make `SQLGetConnectAttr(SQL_ATTR_TXN_ISOLATION)` report a stale
 cached value. That reporting limitation remains.
 
-The cross-borrower leak does not remain. While a reset is pending, the
-same-value optimization is disabled, so the checkout SET reaches SQL Server
-even when the previous borrower changed isolation through raw T-SQL.
+The cross-borrower leak does not remain. Arming a reset sets
+`server_isolation_unknown`, which disables the same-value optimization, so the
+checkout SET reaches SQL Server even when the previous borrower changed
+isolation through raw T-SQL.
+
+The invalidation is raised before the client is claimed *and* re-asserted under
+the lock that records the completed arm, which also bumps `reset_generation`. An
+isolation SET captures that generation before it sends and only clears the
+invalidation if it is unchanged. Without the generation, a SET that reached the
+server just before a concurrent reset armed could clear an invalidation it never
+satisfied, and the next same-value checkout SET would short-circuit against a
+session the newer reset had made unknown again.
+
+The driver deliberately does **not** assign `txn_isolation = READ COMMITTED`
+when it arms a reset. The reset does not restore the isolation level, so after
+arming the server is still running at whatever the previous borrower left. The
+last level set through the attribute is the closest thing the driver knows, and
+claiming READ COMMITTED instead would be an assertion it cannot back — and,
+worse, would make the checkout SET of READ COMMITTED short-circuit and leave the
+server at the previous borrower's level. Marking the cache untrusted expresses
+what is actually true and forces the SET that makes it true again.
 
 ## Liveness semantics
 
@@ -230,9 +362,9 @@ physical connection.
 
 If session recovery reconnects while a reset is pending, the new login
 supersedes that reset. The old reset bit died with the old transport, but the new
-session is already clean, so successful reconnect clears `reset_pending`.
-Leaving it set would incorrectly discard a healthy new connection for lacking
-an acknowledgement that can no longer arrive.
+session is already clean, so adopting the recovered session clears the pending
+reset. Leaving it set would incorrectly discard a healthy new connection for
+lacking an acknowledgement that can no longer arrive.
 
 ## Verified parity decisions
 
@@ -252,7 +384,9 @@ sqlctokn.cpp, sqlcerr.cpp, dbcinfotoken.cpp}`.
   can surface native error 8179 after reset; this driver transparently
   re-prepares instead.
 - Explicit acknowledgement verification also exceeds msodbcsql by rejecting a
-  request that completed without the expected reset ENVCHANGE.
+  request that completed without the expected reset ENVCHANGE. It lives in
+  `TdsClient` rather than the ODBC layer so it does not depend on the consumer's
+  checkout sequence.
 - **msodbcsql does not piggyback.** After arming, it immediately sends a re-sync
   batch on its own driver statement (`sqlcmisc.cpp:2410-2446`), and
   `BuildServerSideConnectOptions` (`sqlcfunc.cpp:2007+`) re-emits
@@ -277,10 +411,14 @@ The implementation is covered at three levels:
 
 - TDS unit/live tests for reset acknowledgement, prepared-handle invalidation,
   login-default restoration, full-reset versus SKIPTRAN transaction behavior,
-  and reconnect handling.
+  reconnect handling, and the verification path itself — the missing-ENVCHANGE
+  verdict on both a no-row and a row-returning carrier, a server error not being
+  masked by it, an armed bit that never reached the wire condemning nothing, and
+  a recovered session clearing the pending reset.
 - ODBC unit tests for validation, busy/disconnected handling, rollback ordering,
-  no-I/O arming, forced carrier emission, missing acknowledgement, transaction
-  descriptor clearing, and cached liveness.
+  no-I/O arming, the untrusted isolation cache forcing the checkout SET, the
+  08S01 mapping of a missing acknowledgement, transaction descriptor clearing,
+  and cached liveness.
 - C++ live tests for same-SPID reuse, clean borrower state, isolation reset,
   liveness, and prepared-statement behavior against this driver and msodbcsql
   where behavior is shared.

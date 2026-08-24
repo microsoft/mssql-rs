@@ -27,6 +27,7 @@ use crate::api::odbc_types::{
     SqlGuid, SqlLen, SqlPointer, SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct,
     SqlTimeStruct, SqlTimestampStruct,
 };
+use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{NumericSource, narrow_i128, parse_decimal_literal};
@@ -47,22 +48,11 @@ pub(crate) fn sql_string_to_text(s: &SqlString) -> Option<String> {
 /// Returns `true` if `target_type` is one of the fixed-width integer C types
 /// handled by [`convert_integer_c`]. Lets a caller decide whether to route a
 /// request here before it has a value in hand.
+///
+/// Wider than [`is_integer_c_type`]: `convert_integer_c` also serves `SQL_C_BIT`,
+/// which is a routing decision rather than a claim that a bit is an integer.
 pub(crate) fn is_integer_c_target(target_type: SqlSmallInt) -> bool {
-    matches!(
-        target_type,
-        SQL_C_STINYINT
-            | SQL_C_TINYINT
-            | SQL_C_UTINYINT
-            | SQL_C_SSHORT
-            | SQL_C_SHORT
-            | SQL_C_USHORT
-            | SQL_C_SLONG
-            | SQL_C_LONG
-            | SQL_C_ULONG
-            | SQL_C_SBIGINT
-            | SQL_C_UBIGINT
-            | SQL_C_BIT
-    )
+    is_integer_c_type(target_type) || target_type == SQL_C_BIT
 }
 
 /// Writes a `Copy` value of type `T` to `ptr` (when non-null) and sets the
@@ -198,13 +188,26 @@ pub(crate) unsafe fn convert_integer_c(
     }
 
     match target_type {
-        // SQL_C_TINYINT maps to an unsigned SQLCHAR (SQL Server `tinyint` is
-        // 0-255 and mssql-python fetches it unsigned); only SQL_C_STINYINT is
-        // the signed form.
-        SQL_C_STINYINT => unsafe { write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr) },
-        SQL_C_TINYINT | SQL_C_UTINYINT => unsafe {
-            write_fixed(target_value_ptr, narrow!(u8), strlen_or_ind_ptr)
+        // One byte either way - signedness only decides the range check, not the
+        // storage. A `tinyint` source is already a byte, so there is nothing to
+        // check and it copies through, which is how a value above 127 survives.
+        // Any other source has to be narrowed to fit, and that narrowing is
+        // signed: -128..127.
+        //
+        // msodbcsql draws the same line. sqlext.h leaves the choice open
+        // (SQL_C_TINYINT carries neither sign offset); ConvertToFixed then skips
+        // its SCHAR range check when either side is a tinyint flavour, and
+        // sqlcdata.cpp bypasses the converter entirely for a `tinyint` column.
+        // SQL_C_STINYINT gets no such exemption, which is why 200 into it below
+        // is still 22003.
+        SQL_C_TINYINT => match value {
+            ColumnValues::TinyInt(b) => unsafe {
+                write_fixed(target_value_ptr, *b, strlen_or_ind_ptr)
+            },
+            _ => unsafe { write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr) },
         },
+        SQL_C_STINYINT => unsafe { write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr) },
+        SQL_C_UTINYINT => unsafe { write_fixed(target_value_ptr, narrow!(u8), strlen_or_ind_ptr) },
         SQL_C_SSHORT | SQL_C_SHORT => unsafe {
             write_fixed(target_value_ptr, narrow!(i16), strlen_or_ind_ptr)
         },
@@ -1682,20 +1685,62 @@ mod tests {
         assert_eq!(out, u128::MAX as f64);
     }
 
+    /// A `tinyint` source needs no range check, so the byte copies through and a
+    /// value above 127 survives. The application reads it back as whatever
+    /// signedness it declared its own storage to be.
     #[test]
-    fn tinyint_c_target_is_unsigned() {
-        // SQL_C_TINYINT is unsigned: 200 (> i8::MAX) must round-trip.
-        let mut out: u8 = 0;
+    fn tinyint_c_target_transfers_a_tinyint_byte_unchanged() {
+        let mut out: i8 = 0;
         let mut ind: SqlLen = 0;
         let ret = conv(
             &ColumnValues::TinyInt(200),
             SQL_C_TINYINT,
+            (&mut out as *mut i8).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ret, ConvOk::Exact);
+        assert_eq!(out as u8, 200);
+
+        // The unsigned spelling takes the same value.
+        let mut out: u8 = 0;
+        let ret = conv(
+            &ColumnValues::TinyInt(200),
+            SQL_C_UTINYINT,
             (&mut out as *mut u8).cast(),
             &mut ind,
         )
         .unwrap();
         assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out, 200);
+    }
+
+    /// The copy-through is scoped to a `tinyint` source. Any other source must be
+    /// narrowed, and that narrowing is signed - matching msodbcsql, whose
+    /// exemption requires the opposite side to be a tinyint flavour.
+    #[test]
+    fn tinyint_c_target_is_signed_for_other_sources() {
+        let mut out: i8 = 0;
+        let mut ind: SqlLen = 0;
+        let err = conv(
+            &ColumnValues::Int(200),
+            SQL_C_TINYINT,
+            (&mut out as *mut i8).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
+
+        // A negative value from a wider source still round-trips as signed.
+        let ret = conv(
+            &ColumnValues::Int(-1),
+            SQL_C_TINYINT,
+            (&mut out as *mut i8).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ret, ConvOk::Exact);
+        assert_eq!(out, -1);
     }
 
     #[test]

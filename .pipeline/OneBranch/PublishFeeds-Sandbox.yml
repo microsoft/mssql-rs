@@ -110,9 +110,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         steps:
@@ -144,9 +144,9 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-1ES-UBUSLIM
+            - imageOverride -equals RUST-UBUSLIM
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_x64'
@@ -195,7 +195,7 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: RUST-ARM64-WUS3
           demands:
             - imageOverride -equals RUST-UBUNTU-ARM64
         variables:
@@ -248,9 +248,9 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-1ES-UBUSLIM
+            - imageOverride -equals RUST-UBUSLIM
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_linux_musl_x64'
@@ -301,7 +301,7 @@ extends:
         pool:
           type: linux
           isCustom: true
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: RUST-ARM64-WUS3
           demands:
             - imageOverride -equals RUST-UBUNTU-ARM64
         variables:
@@ -353,9 +353,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_artifactSuffix: '_mock_windows_x64'
@@ -400,7 +400,7 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: RUST-ARM64-WUS3
           demands:
             - imageOverride -equals RUST-WINSRV-ARM
         variables:
@@ -522,9 +522,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
         steps:
@@ -576,9 +576,9 @@ extends:
         pool:
           type: windows
           isCustom: true
-          name: RUST-1ES-POOL-WUS3
+          name: RUST-X64-WUS3
           demands:
-            - imageOverride -equals RUST-Win22-Sql25-1P
+            - imageOverride -equals RUST-W22-SQL25
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           CARGO_TARGET_DIR: C:\cargo_target_dir

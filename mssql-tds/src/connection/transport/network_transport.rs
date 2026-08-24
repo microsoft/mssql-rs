@@ -516,6 +516,11 @@ pub(crate) struct NetworkTransport {
     /// Pending connection-reset request to apply to the next SQL Batch, RPC, or
     /// Transaction Manager request. Consumed by the packet writer.
     pending_reset: ResetConnectionMode,
+    /// Set once the packet writer has put a header carrying `pending_reset` on
+    /// the wire. `TdsClient` takes it to learn that the server now owes a
+    /// `ResetConnection` ENVCHANGE, which is what makes the acknowledgement
+    /// verifiable.
+    reset_dispatched: bool,
     /// Cached liveness status. Set to `true` once the connection is explicitly
     /// closed or an I/O operation observes it broken. Surfaced by
     /// `connection_known_dead()` as a cheap, socket-free liveness check.
@@ -590,10 +595,21 @@ impl NetworkWriter for NetworkTransport {
 
     fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
         self.pending_reset = mode;
+        // A newly armed reset supersedes any earlier one, so the record of a
+        // previous dispatch must not be attributed to it.
+        self.reset_dispatched = false;
     }
 
     fn take_reset_mode(&mut self) -> ResetConnectionMode {
         std::mem::replace(&mut self.pending_reset, ResetConnectionMode::None)
+    }
+
+    fn note_reset_dispatched(&mut self) {
+        self.reset_dispatched = true;
+    }
+
+    fn take_reset_dispatched(&mut self) -> bool {
+        std::mem::replace(&mut self.reset_dispatched, false)
     }
 
     fn channel_binding_token(&self) -> Option<Vec<u8>> {
@@ -623,6 +639,7 @@ impl NetworkTransport {
             use_tds74_tls_wrapping,
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
+            reset_dispatched: false,
             known_dead: false,
             nbc_bitmap_scratch: None,
         }
