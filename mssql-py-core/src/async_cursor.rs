@@ -231,9 +231,9 @@ fn map_claim_error(error: ClaimError) -> PyErr {
     map_claim_error_with_busy_message(error, "Connection is busy with another cursor operation")
 }
 
-/// Logs a TDS execution failure and exposes it as a Python runtime error.
+/// Exposes a TDS execution failure as a Python runtime error.
 fn map_execute_error(error: impl std::fmt::Display) -> PyErr {
-    tracing::error!("PyAsyncCursor::execute: failed: {error}");
+    tracing::debug!("PyAsyncCursor::execute: failed: {error}");
     PyRuntimeError::new_err(format!("Query execution failed: {error}"))
 }
 
@@ -358,6 +358,10 @@ impl CursorCleanup {
 /// Ensures abandoned finalizer tasks synchronously poison session ownership.
 struct FinalizerCleanup {
     cleanup: Option<CursorCleanup>,
+    completion_guard: FinalizerCompletionGuard,
+}
+
+struct FinalizerCompletionGuard {
     session_state: Arc<AsyncConnectionState>,
     cursor_id: CursorId,
     completed: bool,
@@ -366,18 +370,28 @@ struct FinalizerCleanup {
 impl FinalizerCleanup {
     async fn run(mut self, claim: CursorCloseClaim) {
         let cleanup = self.cleanup.take().expect("finalizer cleanup is available");
-        match cleanup.run(claim).await {
-            Ok(()) => self.completed = true,
-            Err(error) => {
-                tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
-                self.session_state.abandon_cursor(self.cursor_id);
-                self.completed = true;
-            }
+        if let Err(error) = cleanup.run(claim).await {
+            tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
         }
+        self.completion_guard.complete();
     }
 }
 
-impl Drop for FinalizerCleanup {
+impl FinalizerCompletionGuard {
+    fn new(session_state: Arc<AsyncConnectionState>, cursor_id: CursorId) -> Self {
+        Self {
+            session_state,
+            cursor_id,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for FinalizerCompletionGuard {
     fn drop(&mut self) {
         if !self.completed {
             self.session_state.abandon_cursor(self.cursor_id);
@@ -495,9 +509,7 @@ impl Drop for PyAsyncCursor {
         };
         let finalizer = FinalizerCleanup {
             cleanup: Some(cleanup),
-            session_state,
-            cursor_id: self.cursor_id,
-            completed: false,
+            completion_guard: FinalizerCompletionGuard::new(session_state, self.cursor_id),
         };
         pyo3_async_runtimes::tokio::get_runtime().spawn(finalizer.run(claim));
     }
@@ -508,7 +520,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::should_replace_prepared_statement;
-    use super::{ExecuteGuard, ParameterMetadata, PreparedState, PreparedStatement};
+    use super::{
+        ExecuteGuard, FinalizerCompletionGuard, ParameterMetadata, PreparedState, PreparedStatement,
+    };
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
 
     fn prepared_state(sql: &str, signature: Vec<ParameterMetadata>) -> PreparedState {
@@ -582,6 +596,32 @@ mod tests {
         let mut guard = ExecuteGuard::new(Arc::clone(&state), claim.operation_id);
 
         guard.settle(true);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Broken);
+    }
+
+    #[test]
+    fn completed_finalizer_preserves_settled_session() {
+        let state = Arc::new(AsyncConnectionState::new());
+        let claim = state.claim_cursor_close(1).unwrap();
+        let mut guard = FinalizerCompletionGuard::new(Arc::clone(&state), 1);
+
+        state.release_operation(claim.operation_id);
+        guard.complete();
+        drop(guard);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn interrupted_finalizer_breaks_session() {
+        let state = Arc::new(AsyncConnectionState::new());
+        let _claim = state.claim_cursor_close(1).unwrap();
+        let guard = FinalizerCompletionGuard::new(Arc::clone(&state), 1);
+
+        drop(guard);
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Broken);
