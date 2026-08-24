@@ -314,8 +314,11 @@ pub(crate) fn py_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
         return py_decimal_to_sql_type(py_obj);
     }
 
-    let value = py_to_column_value(py_obj, None)?;
-    Ok(match value {
+    Ok(column_value_to_sql_type(py_to_column_value(py_obj, None)?))
+}
+
+fn column_value_to_sql_type(value: ColumnValues) -> SqlType {
+    match value {
         ColumnValues::TinyInt(value) => SqlType::TinyInt(Some(value)),
         ColumnValues::SmallInt(value) => SqlType::SmallInt(Some(value)),
         ColumnValues::Int(value) => SqlType::Int(Some(value)),
@@ -353,7 +356,7 @@ pub(crate) fn py_to_sql_type(py_obj: &Bound<'_, PyAny>) -> TdsResult<SqlType> {
             let base_type = value.base_type();
             SqlType::Vector(Some(value), dimensions, base_type)
         }
-    })
+    }
 }
 
 /// Converts a Python value according to its validated `setinputsizes()` hint.
@@ -1470,6 +1473,454 @@ fn validate_type_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mssql_tds::datatypes::column_values::{SqlDate, SqlDateTime, SqlSmallDateTime};
+
+    #[test]
+    fn column_values_map_to_matching_scalar_sql_types() {
+        let decimal = DecimalParts::from_string("1.25", 3, 2).unwrap();
+
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::TinyInt(1)),
+            SqlType::TinyInt(Some(1))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::SmallInt(-2)),
+            SqlType::SmallInt(Some(-2))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Int(3)),
+            SqlType::Int(Some(3))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::BigInt(4)),
+            SqlType::BigInt(Some(4))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Real(1.5)),
+            SqlType::Real(Some(1.5))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Float(2.5)),
+            SqlType::Float(Some(2.5))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Decimal(decimal.clone())),
+            SqlType::Decimal(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Numeric(decimal)),
+            SqlType::Numeric(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Bit(true)),
+            SqlType::Bit(Some(true))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Null),
+            SqlType::NVarchar(None, 1)
+        ));
+    }
+
+    #[test]
+    fn column_values_map_to_matching_temporal_and_specialized_sql_types() {
+        let time = SqlTime {
+            time_nanoseconds: 1,
+            scale: 7,
+        };
+        let datetime2 = SqlDateTime2 {
+            days: 1,
+            time: time.clone(),
+        };
+
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::DateTime(SqlDateTime { days: 1, time: 2 })),
+            SqlType::DateTime(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Date(SqlDate::create(1).unwrap())),
+            SqlType::Date(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Time(time)),
+            SqlType::Time(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::DateTime2(datetime2.clone())),
+            SqlType::DateTime2(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                datetime2,
+                offset: 60,
+            })),
+            SqlType::DateTimeOffset(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::SmallDateTime(SqlSmallDateTime {
+                days: 1,
+                time: 2,
+            })),
+            SqlType::SmallDateTime(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::SmallMoney(SqlSmallMoney::from(1))),
+            SqlType::SmallMoney(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Money(SqlMoney::from(1))),
+            SqlType::Money(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Xml(SqlXml::from("<root />".to_string()))),
+            SqlType::Xml(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Uuid(uuid::Uuid::nil())),
+            SqlType::Uuid(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Json(SqlJson::from("{}".to_string()))),
+            SqlType::Json(Some(_))
+        ));
+
+        let vector = SqlVector::try_from_f32(vec![1.0, 2.0]).unwrap();
+        let expected_base_type = vector.base_type();
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Vector(vector)),
+            SqlType::Vector(Some(_), 2, base_type) if base_type == expected_base_type
+        ));
+    }
+
+    #[test]
+    fn column_value_lengths_select_bounded_or_max_sql_types() {
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::String(SqlString::from_utf8_string(
+                String::new()
+            ))),
+            SqlType::NVarchar(Some(_), 1)
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::String(SqlString::from_utf8_string(
+                "a".repeat(4_001)
+            ))),
+            SqlType::NVarcharMax(Some(_))
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Bytes(Vec::new())),
+            SqlType::VarBinary(Some(_), 1)
+        ));
+        assert!(matches!(
+            column_value_to_sql_type(ColumnValues::Bytes(vec![0; 8_001])),
+            SqlType::VarBinaryMax(Some(_))
+        ));
+    }
+
+    #[test]
+    fn length_helpers_enforce_fixed_limits_and_promote_varchar_to_max() {
+        assert_eq!(checked_length(8_000, 8_000, "CHAR").unwrap(), 8_000);
+        let error = checked_length(8_001, 8_000, "CHAR").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message == "CHAR size 8001 exceeds the maximum 8000"
+        ));
+
+        assert!(matches!(
+            sized_varchar(None, 8_000),
+            SqlType::Varchar(None, 8_000)
+        ));
+        assert!(matches!(
+            sized_varchar(None, 8_001),
+            SqlType::VarcharMax(None)
+        ));
+        assert!(matches!(
+            sized_varchar(None, u32::MAX),
+            SqlType::VarcharMax(None)
+        ));
+    }
+
+    #[test]
+    fn primitive_hints_convert_python_scalars() {
+        Python::attach(|py| {
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &true.into_pyobject(py).unwrap(),
+                    ParameterHint::new(-7, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::Bit(Some(true))
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &u8::MAX.into_pyobject(py).unwrap(),
+                    ParameterHint::new(-6, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::TinyInt(Some(u8::MAX))
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &i16::MIN.into_pyobject(py).unwrap(),
+                    ParameterHint::new(5, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::SmallInt(Some(i16::MIN))
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &i32::MIN.into_pyobject(py).unwrap(),
+                    ParameterHint::new(4, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::Int(Some(i32::MIN))
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &i64::MIN.into_pyobject(py).unwrap(),
+                    ParameterHint::new(-5, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::BigInt(Some(i64::MIN))
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &1.25_f32.into_pyobject(py).unwrap(),
+                    ParameterHint::new(7, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::Real(Some(1.25))
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &2.5_f64.into_pyobject(py).unwrap(),
+                    ParameterHint::new(8, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::Float(Some(2.5))
+            ));
+        });
+    }
+
+    #[test]
+    fn primitive_hints_report_python_conversion_errors() {
+        Python::attach(|py| {
+            let value = PyString::new(py, "not a scalar");
+
+            for (code, type_name) in [
+                (-7, "BIT"),
+                (-6, "TINYINT"),
+                (5, "SMALLINT"),
+                (4, "INT"),
+                (-5, "BIGINT"),
+                (7, "REAL"),
+                (8, "FLOAT"),
+            ] {
+                let error = py_to_sql_type_with_hint(
+                    value.as_any(),
+                    ParameterHint::new(code, 0, 0).unwrap(),
+                )
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    Error::UsageError(message)
+                        if message.starts_with(&format!("Failed to convert parameter to {type_name}:"))
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn binary_and_xml_hints_convert_values_and_report_errors() {
+        Python::attach(|py| {
+            let bytes = PyBytes::new(py, &[1, 2, 3]);
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    bytes.as_any(),
+                    ParameterHint::new(-3, 8, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::VarBinary(Some(value), 8) if value == [1, 2, 3]
+            ));
+
+            let invalid = 1_i32.into_pyobject(py).unwrap();
+            let error = py_to_sql_type_with_hint(&invalid, ParameterHint::new(-152, 0, 0).unwrap())
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UsageError(message)
+                    if message.starts_with("Failed to convert parameter to XML:")
+            ));
+        });
+    }
+
+    #[test]
+    fn string_hints_select_requested_sql_types() {
+        Python::attach(|py| {
+            let value = PyString::new(py, "hello");
+
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(1, 8, 0).unwrap())
+                    .unwrap(),
+                SqlType::Char(Some(_), 8)
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(12, 2, 0).unwrap())
+                    .unwrap(),
+                SqlType::Varchar(Some(_), 5)
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(-1, 0, 0).unwrap())
+                    .unwrap(),
+                SqlType::VarcharMax(Some(_))
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(-8, 8, 0).unwrap())
+                    .unwrap(),
+                SqlType::NChar(Some(_), 8)
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(-9, 2, 0).unwrap())
+                    .unwrap(),
+                SqlType::NVarchar(Some(_), 5)
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(-10, 0, 0).unwrap())
+                    .unwrap(),
+                SqlType::NText(Some(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn binary_hints_select_requested_sql_types_and_report_errors() {
+        Python::attach(|py| {
+            let value = PyBytes::new(py, &[1, 2, 3]);
+
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(-2, 8, 0).unwrap())
+                    .unwrap(),
+                SqlType::Binary(Some(bytes), 8) if bytes == [1, 2, 3]
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(-3, 2, 0).unwrap())
+                    .unwrap(),
+                SqlType::VarBinary(Some(bytes), 3) if bytes == [1, 2, 3]
+            ));
+            assert!(matches!(
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(-4, 0, 0).unwrap())
+                    .unwrap(),
+                SqlType::VarBinaryMax(Some(bytes)) if bytes == [1, 2, 3]
+            ));
+
+            let invalid = PyString::new(py, "not binary");
+            let error =
+                py_to_sql_type_with_hint(invalid.as_any(), ParameterHint::new(-2, 0, 0).unwrap())
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UsageError(message)
+                    if message.starts_with("Failed to convert parameter to binary:")
+            ));
+        });
+    }
+
+    #[test]
+    fn vector_hints_report_conversion_and_dimension_errors() {
+        Python::attach(|py| {
+            let invalid = PyString::new(py, "not a vector");
+            let error =
+                py_to_sql_type_with_hint(invalid.as_any(), ParameterHint::new(245, 0, 0).unwrap())
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UsageError(message)
+                    if message.starts_with("Failed to convert parameter to VECTOR:")
+            ));
+
+            let value = vec![1.0_f32, 2.0].into_pyobject(py).unwrap();
+            let error =
+                py_to_sql_type_with_hint(value.as_any(), ParameterHint::new(245, 3, 0).unwrap())
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UsageError(message)
+                    if message == "VECTOR input size 3 does not match value dimension count 2"
+            ));
+        });
+    }
+
+    #[test]
+    fn date_and_guid_hints_validate_python_types() {
+        Python::attach(|py| {
+            let datetime = PyModule::import(py, "datetime").unwrap();
+            let date = datetime
+                .getattr("date")
+                .unwrap()
+                .call1((2024, 1, 2))
+                .unwrap();
+            assert!(matches!(
+                py_to_sql_type_with_hint(&date, ParameterHint::new(91, 0, 0).unwrap()).unwrap(),
+                SqlType::Date(Some(_))
+            ));
+
+            let invalid = 1_i32.into_pyobject(py).unwrap();
+            let error = py_to_sql_type_with_hint(&invalid, ParameterHint::new(91, 0, 0).unwrap())
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UsageError(message) if message == "Expected a date parameter"
+            ));
+
+            let uuid = PyModule::import(py, "uuid")
+                .unwrap()
+                .getattr("UUID")
+                .unwrap()
+                .call1(("00000000-0000-0000-0000-000000000000",))
+                .unwrap();
+            assert!(matches!(
+                py_to_sql_type_with_hint(
+                    &uuid,
+                    ParameterHint::new(-11, 0, 0).unwrap()
+                )
+                .unwrap(),
+                SqlType::Uuid(Some(value)) if value == uuid::Uuid::nil()
+            ));
+
+            let error = py_to_sql_type_with_hint(&invalid, ParameterHint::new(-11, 0, 0).unwrap())
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UsageError(message) if message == "Expected a UUID parameter"
+            ));
+        });
+    }
+
+    #[test]
+    fn datetime_hints_handle_timezone_awareness() {
+        Python::attach(|py| {
+            let datetime = PyModule::import(py, "datetime").unwrap();
+            let datetime_type = datetime.getattr("datetime").unwrap();
+            let utc = datetime
+                .getattr("timezone")
+                .unwrap()
+                .getattr("utc")
+                .unwrap();
+            let aware = datetime_type.call1((2024, 1, 2, 3, 4, 5, 6, &utc)).unwrap();
+            assert!(matches!(
+                py_to_sql_type_with_hint(&aware, ParameterHint::new(93, 0, 7).unwrap()).unwrap(),
+                SqlType::DateTime2(Some(_))
+            ));
+
+            let naive = datetime_type.call1((2024, 1, 2, 3, 4, 5, 6)).unwrap();
+            let error = py_to_sql_type_with_hint(&naive, ParameterHint::new(-155, 0, 7).unwrap())
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UsageError(message)
+                    if message == "DATETIMEOFFSET requires a timezone-aware datetime"
+            ));
+        });
+    }
 
     #[test]
     fn numeric_hints_validate_effective_precision() {
@@ -1494,6 +1945,117 @@ mod tests {
             }
             assert!(ParameterHint::new(sql_type, 0, 8).is_err());
         }
+    }
+
+    #[test]
+    fn primitive_null_hints_map_to_typed_nulls() {
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-7, 0, 0).unwrap()).unwrap(),
+            SqlType::Bit(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-6, 0, 0).unwrap()).unwrap(),
+            SqlType::TinyInt(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(5, 0, 0).unwrap()).unwrap(),
+            SqlType::SmallInt(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(4, 0, 0).unwrap()).unwrap(),
+            SqlType::Int(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-5, 0, 0).unwrap()).unwrap(),
+            SqlType::BigInt(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(7, 0, 0).unwrap()).unwrap(),
+            SqlType::Real(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(8, 0, 0).unwrap()).unwrap(),
+            SqlType::Float(None)
+        ));
+    }
+
+    #[test]
+    fn character_binary_and_date_null_hints_map_to_typed_nulls() {
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(12, 20, 0).unwrap()).unwrap(),
+            SqlType::Varchar(None, 20)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-8, 30, 0).unwrap()).unwrap(),
+            SqlType::NChar(None, 30)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-10, 0, 0).unwrap()).unwrap(),
+            SqlType::NText(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-2, 40, 0).unwrap()).unwrap(),
+            SqlType::Binary(None, 40)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(91, 0, 0).unwrap()).unwrap(),
+            SqlType::Date(None)
+        ));
+    }
+
+    #[test]
+    fn specialized_null_hints_map_to_typed_nulls() {
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-11, 0, 0).unwrap()).unwrap(),
+            SqlType::Uuid(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-152, 0, 0).unwrap()).unwrap(),
+            SqlType::Xml(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(244, 0, 0).unwrap()).unwrap(),
+            SqlType::Json(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(60, 0, 0).unwrap()).unwrap(),
+            SqlType::Money(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(122, 0, 0).unwrap()).unwrap(),
+            SqlType::SmallMoney(None)
+        ));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-150, 0, 0).unwrap()).unwrap(),
+            SqlType::Variant(value)
+                if matches!(*value, SqlType::NVarchar(None, 1))
+        ));
+    }
+
+    #[test]
+    fn null_vector_requires_valid_dimensions() {
+        let error = null_sql_type(ParameterHint::new(245, 0, 0).unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message == "A NULL VECTOR parameter requires its dimension count as the input size"
+        ));
+
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(245, 1_998, 0).unwrap()).unwrap(),
+            SqlType::Vector(
+                None,
+                1_998,
+                mssql_tds::datatypes::sqldatatypes::VectorBaseType::Float32
+            )
+        ));
+
+        let error = null_sql_type(ParameterHint::new(245, 1_999, 0).unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message == "VECTOR size 1999 exceeds the maximum 1998"
+        ));
     }
 
     #[test]
