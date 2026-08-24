@@ -566,8 +566,8 @@ def test_execute_rejects_sub_minute_datetimeoffset(
                 20,
                 tzinfo=datetime.timezone(datetime.timedelta(seconds=offset_seconds)),
             )
-            with pytest.raises(RuntimeError, match="whole-minute UTC offset"):
-                await cursor.execute("SELECT ?", value, use_prepare=use_prepare)
+            with pytest.raises(TypeError, match="whole-minute UTC offset"):
+                cursor.execute("SELECT ?", value, use_prepare=use_prepare)
         finally:
             await conn.close()
 
