@@ -431,6 +431,7 @@ fn bind_positional<'py>(
             values.len()
         )));
     }
+    validate_hint_count(hints, names.len())?;
     let bound_parameters = names
         .into_iter()
         .zip(values)
@@ -461,6 +462,7 @@ fn bind_named(
             values.len()
         )));
     }
+    validate_hint_count(hints, names.len())?;
     let bound_parameters = names
         .into_iter()
         .enumerate()
@@ -480,6 +482,18 @@ fn bind_named(
         .collect::<PyResult<Vec<_>>>()?;
     let (parameters, parameter_signature) = bound_parameters.into_iter().unzip();
     Ok((operation, parameters, parameter_signature))
+}
+
+fn validate_hint_count(hints: Option<&[ParameterHint]>, parameter_count: usize) -> PyResult<()> {
+    if let Some(hints) = hints
+        && hints.len() != parameter_count
+    {
+        return Err(PyTypeError::new_err(format!(
+            "setinputsizes contains {} hints, but the SQL contains {parameter_count} parameter markers",
+            hints.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Converts one Python value into an RPC parameter and its declaration metadata.

@@ -274,8 +274,8 @@ impl ExecuteGuard {
         self.completed = true;
     }
 
-    /// Completes a handled error according to the remaining protocol state.
-    fn fail(&mut self, has_open_batch: bool) {
+    /// Settles ownership according to the remaining protocol state.
+    fn settle(&mut self, has_open_batch: bool) {
         if has_open_batch {
             self.break_connection();
         } else {
@@ -347,7 +347,7 @@ impl CursorCleanup {
             (result, has_open_batch)
         };
 
-        cleanup_guard.fail(has_open_batch);
+        cleanup_guard.settle(has_open_batch);
         // Cleanup consumes the close attempt even when draining or unprepare fails.
         self.closed.store(true, Ordering::Release);
         result?;
@@ -389,6 +389,8 @@ impl Drop for FinalizerCleanup {
 ///
 /// Create instances with `PyAsyncConnection.cursor()`. Cursors on one
 /// connection share a TDS session, so only one cursor may own an active batch.
+/// A row-producing execute retains ownership until the same cursor is
+/// re-executed or closed; other cursors and `commit()` or `rollback()` report busy.
 /// This API is a preview and may change between minor releases.
 #[pyclass]
 pub struct PyAsyncCursor {
@@ -479,6 +481,12 @@ impl Drop for PyAsyncCursor {
                 self.closed.store(true, Ordering::Release);
                 return;
             }
+            Err(ClaimError::Busy) => {
+                tracing::warn!(
+                    "PyAsyncCursor finalizer skipped: session busy; prepared handle deferred to connection close"
+                );
+                return;
+            }
             Err(error) => {
                 tracing::warn!("PyAsyncCursor finalizer could not claim cleanup: {error:?}");
                 session_state.abandon_cursor(self.cursor_id);
@@ -561,7 +569,7 @@ mod tests {
         let claim = state.claim_execute(1).unwrap();
         let mut guard = ExecuteGuard::new(Arc::clone(&state), claim.operation_id);
 
-        guard.fail(false);
+        guard.settle(false);
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
         assert!(state.claim_execute(2).is_ok());
@@ -573,7 +581,7 @@ mod tests {
         let claim = state.claim_execute(1).unwrap();
         let mut guard = ExecuteGuard::new(Arc::clone(&state), claim.operation_id);
 
-        guard.fail(true);
+        guard.settle(true);
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Broken);
@@ -691,7 +699,7 @@ impl PyAsyncCursor {
                     Ok(slf)
                 }
                 Err(error) => {
-                    execute_guard.fail(error.break_connection || has_open_batch);
+                    execute_guard.settle(error.break_connection || has_open_batch);
                     Err(map_execute_error(error.error))
                 }
             }

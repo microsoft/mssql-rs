@@ -95,6 +95,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_connection::PyAsyncConnection>()?;
     m.add_class::<async_cursor::PyAsyncCursor>()?;
     m.add_class::<async_parameters::PyTableValuedParameter>()?;
+    // SQL Server-specific TDS type tokens accepted by setinputsizes().
     m.add("SQL_MONEY", 60)?;
     m.add("SQL_SMALLMONEY", 122)?;
     m.add("SQL_XML", 241)?;

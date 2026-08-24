@@ -13,6 +13,27 @@ from decimal import Decimal
 import pytest
 import mssql_py_core
 
+try:
+    import mssql_mock_tds
+except ImportError:
+    mssql_mock_tds = None
+
+
+@pytest.fixture
+def mock_client_context():
+    if mssql_mock_tds is None:
+        pytest.skip("mssql_mock_tds is not installed")
+
+    server = mssql_mock_tds.PyMockTdsServer(port=0, tls=True)
+    with server:
+        yield {
+            "server": server.sql_address,
+            "database": "master",
+            "access_token": "async-cursor-test-token",
+            "encryption": "Optional",
+            "trust_server_certificate": True,
+        }
+
 
 async def connect(client_context, *, autocommit=True):
     with warnings.catch_warnings():
@@ -22,13 +43,12 @@ async def connect(client_context, *, autocommit=True):
         )
 
 
-@pytest.mark.integration
-def test_execute_returns_same_cursor(client_context):
+def test_execute_returns_same_cursor(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
-            result = await cursor.execute("SET NOCOUNT ON")
+            result = await cursor.execute("SET NOCOUNT ON", use_prepare=False)
             assert result is cursor
         finally:
             await conn.close()
@@ -36,31 +56,29 @@ def test_execute_returns_same_cursor(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_execute_drains_same_cursor_previous_results(client_context):
+def test_execute_drains_same_cursor_previous_results(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
-            await cursor.execute("SELECT 1")
-            assert await cursor.execute("SET NOCOUNT ON") is cursor
+            await cursor.execute("SELECT 1", use_prepare=False)
+            assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
         finally:
             await conn.close()
 
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_execute_rejects_another_cursor_while_results_are_pending(client_context):
+def test_execute_rejects_another_cursor_while_results_are_pending(mock_client_context):
     # TODO: Extend this to a multi-packet result, drain the first cursor to
     # exhaustion, and verify the second cursor can then execute. Closing the
     # first cursor is already covered by test_cursor_close_drains_results.
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             first = conn.cursor()
             second = conn.cursor()
-            await first.execute("SELECT 1")
+            await first.execute("SELECT 1", use_prepare=False)
             with pytest.raises(RuntimeError, match="busy with another cursor"):
                 await second.execute("SELECT 2")
         finally:
@@ -69,10 +87,9 @@ def test_execute_rejects_another_cursor_while_results_are_pending(client_context
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_execute_after_connection_close_raises(client_context):
+def test_execute_after_connection_close_raises(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         cursor = conn.cursor()
         await conn.close()
         with pytest.raises(RuntimeError, match="Connection is closed"):
@@ -188,7 +205,6 @@ def test_execute_ignores_markers_in_nested_block_comments(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize(
     ("operation", "parameters", "message"),
     [
@@ -201,10 +217,10 @@ def test_execute_ignores_markers_in_nested_block_comments(client_context):
     ],
 )
 def test_execute_rejects_parameter_style_and_arity_mismatches(
-    client_context, operation, parameters, message
+    mock_client_context, operation, parameters, message
 ):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
             with pytest.raises(TypeError, match=message):
@@ -215,7 +231,6 @@ def test_execute_rejects_parameter_style_and_arity_mismatches(
     asyncio.run(run())
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize(
     ("operation", "message"),
     [
@@ -223,9 +238,11 @@ def test_execute_rejects_parameter_style_and_arity_mismatches(
         ("SELECT %(value)s", "named placeholders"),
     ],
 )
-def test_execute_rejects_markers_without_arguments(client_context, operation, message):
+def test_execute_rejects_markers_without_arguments(
+    mock_client_context, operation, message
+):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
             with pytest.raises(TypeError, match=message):
@@ -236,22 +253,20 @@ def test_execute_rejects_markers_without_arguments(client_context, operation, me
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_execute_accepts_empty_mapping_without_markers(client_context):
+def test_execute_accepts_empty_mapping_without_markers(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
-            await conn.cursor().execute("SELECT 1", {})
+            await conn.cursor().execute("SELECT 1", {}, use_prepare=False)
         finally:
             await conn.close()
 
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_execute_rejects_missing_named_parameter(client_context):
+def test_execute_rejects_missing_named_parameter(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
             with pytest.raises(KeyError, match="name"):
@@ -280,10 +295,9 @@ def test_execute_ignores_extra_named_parameters(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_execute_rejects_unsupported_parameter_value(client_context):
+def test_execute_rejects_unsupported_parameter_value(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
             with pytest.raises(TypeError, match="Unsupported Python type"):
@@ -294,7 +308,6 @@ def test_execute_rejects_unsupported_parameter_value(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize(
     ("sizes", "message"),
     [
@@ -307,9 +320,9 @@ def test_execute_rejects_unsupported_parameter_value(client_context):
         ([(93, 0, 8)], "Invalid temporal scale"),  # SQL_TYPE_TIMESTAMP
     ],
 )
-def test_setinputsizes_rejects_invalid_hints(client_context, sizes, message):
+def test_setinputsizes_rejects_invalid_hints(mock_client_context, sizes, message):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             with pytest.raises(ValueError, match=message):
                 conn.cursor().setinputsizes(sizes)
@@ -319,23 +332,52 @@ def test_setinputsizes_rejects_invalid_hints(client_context, sizes, message):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_setinputsizes_survives_synchronous_binding_failure(client_context):
+@pytest.mark.parametrize(
+    ("operation", "parameters", "sizes", "message"),
+    [
+        ("SELECT ?, ?", (1, 2), [(4, 0, 0)], "1 hints, but.*2 parameter markers"),
+        ("SELECT ?", (1,), [(4, 0, 0), (4, 0, 0)], "2 hints, but.*1 parameter markers"),
+        (
+            "SELECT %(value)s, %(value)s",
+            {"value": 1},
+            [(4, 0, 0)],
+            "1 hints, but.*2 parameter markers",
+        ),
+        (
+            "SELECT %(value)s",
+            {"value": 1},
+            [(4, 0, 0), (4, 0, 0)],
+            "2 hints, but.*1 parameter markers",
+        ),
+    ],
+)
+def test_setinputsizes_rejects_hint_count_mismatch(
+    mock_client_context, operation, parameters, sizes, message
+):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
-            cursor.setinputsizes([(-9, 20, 0)])  # SQL_WVARCHAR
+            cursor.setinputsizes(sizes)
+            with pytest.raises(TypeError, match=message):
+                cursor.execute(operation, parameters)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_setinputsizes_survives_synchronous_binding_failure(mock_client_context):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([(-151, 0, 0)])  # SQL_SS_UDT
             with pytest.raises(TypeError, match="parameter markers"):
                 cursor.execute("SELECT ?, ?", "only one")
 
-            await cursor.execute(
-                """
-                IF SQL_VARIANT_PROPERTY(CAST(? AS sql_variant), 'BaseType') <> 'nvarchar'
-                    THROW 50000, 'Input size was consumed by failed binding', 1
-                """,
-                "ascii",
-            )
+            with pytest.raises(TypeError, match="require a server UDT type name"):
+                cursor.execute("SELECT ?", b"serialized-udt")
         finally:
             await conn.close()
 
@@ -550,14 +592,13 @@ def test_setinputsizes_preserves_temporal_scale(
     asyncio.run(run())
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize("use_prepare", [True, False])
 @pytest.mark.parametrize("offset_seconds", [30, -30])
 def test_execute_rejects_sub_minute_datetimeoffset(
-    client_context, use_prepare, offset_seconds
+    mock_client_context, use_prepare, offset_seconds
 ):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
             value = datetime.datetime(
@@ -618,7 +659,6 @@ def test_setinputsizes_uses_default_numeric_precision(client_context, use_prepar
     asyncio.run(run())
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize(
     ("hint", "message"),
     [
@@ -629,15 +669,30 @@ def test_setinputsizes_uses_default_numeric_precision(client_context, use_prepar
     ],
 )
 def test_setinputsizes_rejects_unrepresentable_typed_null_metadata(
-    client_context, hint, message
+    mock_client_context, hint, message
 ):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
             cursor.setinputsizes([hint])
             with pytest.raises(TypeError, match=message):
                 cursor.execute("SELECT ?", None)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("value", [None, b"serialized-udt"])
+def test_setinputsizes_rejects_udt_without_type_name(mock_client_context, value):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([(-151, 0, 0)])  # SQL_SS_UDT
+            with pytest.raises(TypeError, match="require a server UDT type name"):
+                cursor.execute("SELECT ?", value)
         finally:
             await conn.close()
 
@@ -910,10 +965,9 @@ def test_cursor_close_drains_results_and_rejects_further_use(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_cursor_close_after_connection_close_is_noop(client_context):
+def test_cursor_close_after_connection_close_is_noop(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         cursor = conn.cursor()
         await conn.close()
 
@@ -925,13 +979,52 @@ def test_cursor_close_after_connection_close_is_noop(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_dropped_cursor_with_unread_rows_does_not_leave_connection_busy(client_context):
+def test_cursor_close_without_execute_is_idempotent(mock_client_context):
     async def run():
-        conn = await connect(client_context)
+        conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
-            await cursor.execute("SELECT CAST(? AS int)", 1)
+            assert await cursor.close() is None
+            assert await cursor.close() is None
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                await cursor.execute("SELECT 1")
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_cursor_close_can_retry_after_another_cursor_releases_results(
+    mock_client_context,
+):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            owner = conn.cursor()
+            blocked = conn.cursor()
+            await owner.execute("SELECT 1", use_prepare=False)
+
+            with pytest.raises(RuntimeError, match="busy with another cursor"):
+                blocked.close()
+
+            await owner.close()
+            assert await blocked.close() is None
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                blocked.setinputsizes([(4, 0, 0)])
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_dropped_cursor_with_unread_rows_does_not_leave_connection_busy(
+    mock_client_context,
+):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT 1", use_prepare=False)
             del cursor
             gc.collect()
 
@@ -950,6 +1043,29 @@ def test_dropped_cursor_with_unread_rows_does_not_leave_connection_busy(client_c
                     break
             else:
                 pytest.fail("Dropped cursor left the connection permanently busy")
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_dropped_idle_cursor_does_not_break_another_cursor(mock_client_context):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            idle = conn.cursor()
+            await idle.execute("SET NOCOUNT ON", use_prepare=False)
+
+            owner = conn.cursor()
+            await owner.execute("SELECT 1", use_prepare=False)
+
+            del idle
+            gc.collect()
+
+            await owner.close()
+            probe = conn.cursor()
+            await probe.execute("SET NOCOUNT ON", use_prepare=False)
+            await probe.close()
         finally:
             await conn.close()
 
@@ -988,7 +1104,10 @@ def test_module_exposes_pyasynccursor():
 
 
 def test_async_api_exposes_user_facing_docstrings():
-    assert "only one cursor may own an active batch" in mssql_py_core.PyAsyncCursor.__doc__
+    cursor_doc = " ".join(mssql_py_core.PyAsyncCursor.__doc__.split())
+    assert "only one cursor may own an active batch" in cursor_doc
+    assert "row-producing execute retains ownership" in cursor_doc
+    assert "`commit()` or `rollback()` report busy" in cursor_doc
     assert "Positional parameters use `?` markers" in mssql_py_core.PyAsyncCursor.execute.__doc__
     assert "consumed only after" in mssql_py_core.PyAsyncCursor.setinputsizes.__doc__
     close_doc = " ".join(mssql_py_core.PyAsyncCursor.close.__doc__.split())
@@ -996,29 +1115,12 @@ def test_async_api_exposes_user_facing_docstrings():
     assert "table-valued parameter" in mssql_py_core.TableValuedParameter.__doc__
 
 
-@pytest.mark.integration
-def test_conn_cursor_returns_pyasynccursor(client_context):
-    """conn.cursor() is synchronous and returns a PyAsyncCursor instance."""
-    async def run():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
-            try:
-                cur = conn.cursor()
-                assert isinstance(cur, mssql_py_core.PyAsyncCursor)
-            finally:
-                await conn.close()
-
-    asyncio.run(run())
-
-
-@pytest.mark.integration
-def test_two_cursors_can_be_created(client_context):
+def test_two_cursors_can_be_created(mock_client_context):
     """A second cursor on the same connection is allowed (documented behavior)."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            conn = await mssql_py_core.PyAsyncConnection.connect(mock_client_context)
             try:
                 cur1 = conn.cursor()
                 cur2 = conn.cursor()
@@ -1031,12 +1133,11 @@ def test_two_cursors_can_be_created(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_cursor_snapshots_connection_timeout(client_context):
+def test_cursor_snapshots_connection_timeout(mock_client_context):
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            conn = await mssql_py_core.PyAsyncConnection.connect(mock_client_context)
             try:
                 conn.timeout = 30
                 first_cursor = conn.cursor()
@@ -1051,13 +1152,12 @@ def test_cursor_snapshots_connection_timeout(client_context):
     asyncio.run(run())
 
 
-@pytest.mark.integration
-def test_conn_cursor_after_close_raises_connection_closed(client_context):
+def test_conn_cursor_after_close_raises_connection_closed(mock_client_context):
     """cursor() on a closed connection raises RuntimeError."""
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
-            conn = await mssql_py_core.PyAsyncConnection.connect(client_context)
+            conn = await mssql_py_core.PyAsyncConnection.connect(mock_client_context)
             await conn.close()
             with pytest.raises(RuntimeError, match="Connection is closed"):
                 conn.cursor()

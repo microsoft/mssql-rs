@@ -370,9 +370,9 @@ pub(crate) fn py_to_sql_type_with_hint(
     }
 
     match hint.sql_type {
-        InputSqlType::Bit => Ok(SqlType::Bit(Some(py_obj.extract::<bool>().map_err(|error| {
-            Error::UsageError(format!("Failed to convert parameter to BIT: {error}"))
-        })?))),
+        InputSqlType::Bit => Ok(SqlType::Bit(Some(py_obj.extract::<bool>().map_err(
+            |error| Error::UsageError(format!("Failed to convert parameter to BIT: {error}")),
+        )?))),
         InputSqlType::TinyInt => Ok(SqlType::TinyInt(Some(py_obj.extract::<u8>().map_err(
             |error| Error::UsageError(format!("Failed to convert parameter to TINYINT: {error}")),
         )?))),
@@ -408,9 +408,9 @@ pub(crate) fn py_to_sql_type_with_hint(
         InputSqlType::Time => Ok(SqlType::Time(Some(py_time(py_obj, hint.scale)?))),
         InputSqlType::DateTime => match py_datetime_to_sql_type(py_obj, Some(hint.scale))? {
             SqlType::DateTime2(value) => Ok(SqlType::DateTime2(value)),
-            SqlType::DateTimeOffset(value) => Ok(SqlType::DateTime2(
-                value.map(|value| value.datetime2),
-            )),
+            SqlType::DateTimeOffset(value) => {
+                Ok(SqlType::DateTime2(value.map(|value| value.datetime2)))
+            }
             _ => unreachable!("datetime conversion returns a temporal SQL type"),
         },
         InputSqlType::DateTimeOffset => match py_datetime_to_sql_type(py_obj, Some(hint.scale))? {
@@ -435,11 +435,15 @@ pub(crate) fn py_to_sql_type_with_hint(
         InputSqlType::Variant => Ok(SqlType::Variant(Box::new(py_to_sql_type(py_obj)?))),
         // TODO(mssql-tds): Add a public SqlType::Udt input contract and RPC
         // serializer carrying database, schema, and server UDT type names.
-        InputSqlType::Udt => Err(Error::UsageError(
-            "SQL_SS_UDT parameters require a server UDT type name, which setinputsizes does not provide"
-                .to_string(),
-        )),
+        InputSqlType::Udt => Err(unsupported_udt_parameter()),
     }
+}
+
+fn unsupported_udt_parameter() -> Error {
+    Error::UsageError(
+        "SQL_SS_UDT parameters require a server UDT type name, which setinputsizes does not provide"
+            .to_string(),
+    )
 }
 
 /// Constructs the typed NULL required when inference has no Python value.
@@ -460,10 +464,11 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
         InputSqlType::Numeric | InputSqlType::Decimal => {
             // TODO(mssql-tds): Carry NULL precision and scale independently of
             // the optional value so py-core can preserve non-default metadata.
-            if hint.size != 18 || hint.scale != 10 {
+            let precision = ParameterHint::effective_numeric_precision(hint.size);
+            if precision != 18 || hint.scale != 10 {
                 return Err(Error::UsageError(format!(
                     "NULL numeric parameters currently require precision 18 and scale 10; requested precision {} and scale {}",
-                    hint.size, hint.scale
+                    precision, hint.scale
                 )));
             }
             if hint.sql_type == InputSqlType::Numeric {
@@ -480,7 +485,8 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
         InputSqlType::WLongVarChar => SqlType::NText(None),
         InputSqlType::Binary => SqlType::Binary(None, checked_length(size, 8_000, "BINARY")?),
         InputSqlType::VarBinary => sized_varbinary(None, size),
-        InputSqlType::LongVarBinary | InputSqlType::Udt => SqlType::VarBinaryMax(None),
+        InputSqlType::LongVarBinary => SqlType::VarBinaryMax(None),
+        InputSqlType::Udt => return Err(unsupported_udt_parameter()),
         InputSqlType::Date => SqlType::Date(None),
         InputSqlType::Time | InputSqlType::DateTime | InputSqlType::DateTimeOffset => {
             // TODO(mssql-tds): Carry NULL temporal scale independently of the
@@ -1494,6 +1500,7 @@ mod tests {
     fn null_numeric_accepts_only_core_default_metadata() {
         for sql_type in [2, 3] {
             assert!(null_sql_type(ParameterHint::new(sql_type, 18, 10).unwrap()).is_ok());
+            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 10).unwrap()).is_ok());
             assert!(null_sql_type(ParameterHint::new(sql_type, 9, 2).unwrap()).is_err());
             assert!(null_sql_type(ParameterHint::new(sql_type, 0, 0).unwrap()).is_err());
         }
@@ -1506,6 +1513,16 @@ mod tests {
             assert!(null_sql_type(ParameterHint::new(sql_type, 0, 3).unwrap()).is_err());
             assert!(null_sql_type(ParameterHint::new(sql_type, 0, 0).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn null_udt_is_rejected_without_changing_long_varbinary() {
+        let error = null_sql_type(ParameterHint::new(-151, 0, 0).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("require a server UDT type name"));
+        assert!(matches!(
+            null_sql_type(ParameterHint::new(-4, 0, 0).unwrap()).unwrap(),
+            SqlType::VarBinaryMax(None)
+        ));
     }
 
     #[test]
