@@ -264,8 +264,8 @@ TEST_F(PrepareExecuteLiveTest, IntegerParamOutOfRangeForTargetIs22003) {
 }
 
 // Integer -> character is quadrant C, still unimplemented, so the bind is
-// rejected up front rather than failing at execute. msodbcsql supports the
-// pairing, hence the skip; it goes away with P5.
+// rejected up front with HYC00 rather than failing at execute. msodbcsql
+// supports the pairing, hence the skip; it goes away with P5 (AB#47500).
 TEST_F(PrepareExecuteLiveTest, IntegerToCharacterConversionIsRejected) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -274,7 +274,7 @@ TEST_F(PrepareExecuteLiveTest, IntegerToCharacterConversionIsRejected) {
     SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
                                     SQL_VARCHAR, 0, 0, &value, 0, &ind);
     EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
 
 // SQL Server has no interval type, so a real-but-unsupported ParameterType is
@@ -371,9 +371,11 @@ TEST_F(PrepareExecuteLiveTest, UnalignedIntegerParamBufferIsRead) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// SQL_C_TINYINT is the ODBC 2.x spelling of the *signed* form, so 0xFF is -1.
-// Only SQL_C_UTINYINT reads it as 255. msodbcsql groups SQL_C_TINYINT with
-// SQL_C_STINYINT in ConvertToChar (sqlccnvt.cpp), so both drivers must agree.
+// SQL_C_TINYINT is sign-unknown, and reads signed against any SQL type other
+// than tinyint - here SQL_SMALLINT - so 0xFF is -1. Only SQL_C_UTINYINT reads it
+// as 255. The tinyint-to-tinyint exemption is pinned separately by
+// TinyintCTypeIsUnsignedAgainstTinyintParameter; this test is the case that does
+// *not* get it.
 //
 // Benefits-from-mock-tds: a mock TDS server could assert the smallint payload
 // on the wire, rather than inferring it from the rendered text.
@@ -399,6 +401,85 @@ TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsSignedButUtinyintIsNot) {
         EXPECT_EQ(c.expected, GetColumnChar(1)) << "C type " << c.c_type;
 
         EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// msodbcsql treats SQL_C_TINYINT as sign-unknown against a same-width tinyint:
+// ParamToSQLType rewrites the C type to unsigned when ParameterType is
+// SQL_TINYINT, so a raw 0xFF is 255 rather than -1. Any wider SQL type keeps the
+// signed reading, which TinyintCTypeIsSignedButUtinyintIsNot pins against
+// SQL_SMALLINT.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the declared tinyint
+// payload on the wire, rather than inferring it from the rendered text.
+TEST_F(PrepareExecuteLiveTest, TinyintCTypeIsUnsignedAgainstTinyintParameter) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    unsigned char raw = 0xFF;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_TINYINT,
+                                   SQL_TINYINT, 0, 0, &raw, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("255", GetColumnChar(1));
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The fetch half of the same rule: a tinyint column above 127 is bit-copied into
+// SQL_C_TINYINT rather than range-checked as signed. msodbcsql never even
+// reaches its converter here - sqlcdata.cpp maps the tinyint column to
+// SQL_C_UTINYINT and clears fConvNeeded - so the byte arrives intact.
+TEST_F(PrepareExecuteLiveTest, TinyintColumnAbove127FetchesIntoTinyintCType) {
+    ASSERT_SQL_OK(Prepare("SELECT CAST(200 AS tinyint) AS v"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    signed char out = 0;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_TINYINT, &out, sizeof(out), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(200, static_cast<unsigned char>(out));
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(out)), ind);
+
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// msodbcsql validates ColumnSize in SQLBindParameter (CheckSqlPrecScale, run
+// after the type and conversion checks). Its CheckSqlPrec rejects 0 because
+// SQL_PREC_UNLIMITED is 0, so a fixed-length declaration cannot use it - but the
+// variable-length types read 0 as the `max` spelling and accept it. The error is
+// HY104 at bind, not at execute, and it applies whether or not the value is NULL.
+TEST_F(PrepareExecuteLiveTest, ZeroColumnSizeIsRejectedForFixedLengthCharTypes) {
+    struct Case {
+        SQLSMALLINT c_type;
+        SQLSMALLINT sql_type;
+        bool ok;
+    };
+    const Case cases[] = {
+        {SQL_C_CHAR, SQL_CHAR, false},      {SQL_C_WCHAR, SQL_WCHAR, false},
+        {SQL_C_CHAR, SQL_VARCHAR, true},    {SQL_C_WCHAR, SQL_WVARCHAR, true},
+        {SQL_C_CHAR, SQL_LONGVARCHAR, false},
+    };
+    for (const Case& c : cases) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR buf[8] = {0};
+        SQLLEN ind = SQL_NULL_DATA;
+        SQLRETURN rc =
+            SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c.c_type, c.sql_type,
+                             /*ColumnSize*/ 0, 0, buf, sizeof(buf), &ind);
+        if (c.ok) {
+            EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        } else {
+            EXPECT_EQ(SQL_ERROR, rc) << "sql type " << c.sql_type;
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY104");
+        }
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT,
+                      stmt_);
     }
 }
 
@@ -464,10 +545,11 @@ TEST_F(PrepareExecuteLiveTest, NullIndicatorPointerMeansNullTerminated) {
 
 // A defaulted binding is checked against the conversion matrix like an explicit
 // one, so an application gets the same answer either way. SQL_GUID has no
-// conversion row yet, so the bind is rejected. msodbcsql accepts it (it resolves
-// to SQL_C_CHAR via rgbTRANSTYPE380 and can convert), hence the skip.
+// conversion row yet, so the bind is rejected with HYC00 - unbuilt, not illegal.
+// msodbcsql accepts it (it resolves to SQL_C_CHAR via rgbTRANSTYPE380 and can
+// convert), hence the skip.
 //
-// Re-enable as a round-trip test when SQL_C_GUID -> SQL_GUID lands.
+// Re-enable as a round-trip test when SQL_C_GUID -> SQL_GUID lands: AB#47500.
 TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidIsRejectedAtBind) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -478,7 +560,7 @@ TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidIsRejectedAtBind) {
     EXPECT_EQ(SQL_ERROR,
               SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
                                SQL_GUID, 0, 0, &value, sizeof(value), &ind));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07006");
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
 
 // A NULL-indicator parameter produces a SQL NULL result.

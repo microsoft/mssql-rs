@@ -13,7 +13,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
-    resolve_default_c_type,
+    parameter_column_size_is_valid, resolve_default_c_type,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -196,13 +196,24 @@ fn sql_bind_parameter_safe(
         value_type
     };
 
-    // The C type -> SQL type conversion must be one we support (07006).
+    // The C type -> SQL type conversion must be one this driver implements.
     if !is_supported_conversion(c_type, parameter_type) {
         error!(
             c_type,
             parameter_type, "SQLBindParameter: unsupported C/SQL type conversion"
         );
-        post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+        post_diag(&mut stmt_state, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED);
+        return SQL_ERROR;
+    }
+
+    // ColumnSize is validated last, after the type and conversion checks, the
+    // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
+    if !parameter_column_size_is_valid(parameter_type, column_size) {
+        error!(
+            parameter_type,
+            column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
+        );
+        post_diag(&mut stmt_state, ERR_INVALID_PARAM_PRECISION_OR_SCALE);
         return SQL_ERROR;
     }
 
@@ -443,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_conversion_returns_07006() {
+    fn unsupported_conversion_returns_hyc00() {
         // Both types are supported, but integer -> character is quadrant C (P5).
         let h = TestHandles::with_env_dbc_stmt();
         let mut val: i32 = 0;
@@ -465,11 +476,11 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]
-    fn real_but_unconvertible_c_type_returns_07006() {
+    fn real_but_unconvertible_c_type_returns_hyc00() {
         // SQL_C_FLOAT is a legal ODBC C type the driver cannot convert yet, so it
         // must fail the conversion check rather than the HY003 type check.
         let h = TestHandles::with_env_dbc_stmt();
@@ -492,7 +503,7 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]
@@ -522,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn default_c_type_resolved_but_unconvertible_returns_07006() {
+    fn default_c_type_resolved_but_unconvertible_returns_hyc00() {
         // `SQL_SS_UDT` needs the fully qualified server type name, which
         // `SQLDescribeParam` does not report and the driver cannot otherwise
         // obtain, so a defaulted bind of it is still rejected up front.
@@ -545,10 +556,10 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
-    #[ignore = "SQL_GUID has no conversion row yet; re-enable with GUID support"]
+    #[ignore = "SQL_GUID has no conversion row yet; re-enable with GUID support - AB#47500"]
     #[test]
     fn default_c_type_guid_is_accepted_and_stored() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -632,7 +643,7 @@ mod tests {
             assert_eq!(ret, SQL_ERROR, "sql_type {sql_type}");
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             let state = stmt.inner.lock().unwrap();
-            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
         }
         assert!(checked > 0, "no SQL type defaults to a character C type");
     }
@@ -686,7 +697,7 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]

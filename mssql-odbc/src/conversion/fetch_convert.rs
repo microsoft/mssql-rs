@@ -188,12 +188,25 @@ pub(crate) unsafe fn convert_integer_c(
     }
 
     match target_type {
-        // SQL_C_TINYINT is the ODBC 2.x spelling and is signed, so it groups with
-        // SQL_C_STINYINT; only SQL_C_UTINYINT is unsigned. msodbcsql's
-        // ConvertToChar (sqlccnvt.cpp:1660) splits them the same way.
-        SQL_C_STINYINT | SQL_C_TINYINT => unsafe {
-            write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr)
+        // One byte either way - signedness only decides the range check, not the
+        // storage. A `tinyint` source is already a byte, so there is nothing to
+        // check and it copies through, which is how a value above 127 survives.
+        // Any other source has to be narrowed to fit, and that narrowing is
+        // signed: -128..127.
+        //
+        // msodbcsql draws the same line. sqlext.h leaves the choice open
+        // (SQL_C_TINYINT carries neither sign offset); ConvertToFixed then skips
+        // its SCHAR range check when either side is a tinyint flavour, and
+        // sqlcdata.cpp bypasses the converter entirely for a `tinyint` column.
+        // SQL_C_STINYINT gets no such exemption, which is why 200 into it below
+        // is still 22003.
+        SQL_C_TINYINT => match value {
+            ColumnValues::TinyInt(b) => unsafe {
+                write_fixed(target_value_ptr, *b, strlen_or_ind_ptr)
+            },
+            _ => unsafe { write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr) },
         },
+        SQL_C_STINYINT => unsafe { write_fixed(target_value_ptr, narrow!(i8), strlen_or_ind_ptr) },
         SQL_C_UTINYINT => unsafe { write_fixed(target_value_ptr, narrow!(u8), strlen_or_ind_ptr) },
         SQL_C_SSHORT | SQL_C_SHORT => unsafe {
             write_fixed(target_value_ptr, narrow!(i16), strlen_or_ind_ptr)
@@ -1672,20 +1685,22 @@ mod tests {
         assert_eq!(out, u128::MAX as f64);
     }
 
-    /// `SQL_C_TINYINT` is the ODBC 2.x spelling of the signed form, so a
-    /// `tinyint` column above 127 does not fit it.
+    /// A `tinyint` source needs no range check, so the byte copies through and a
+    /// value above 127 survives. The application reads it back as whatever
+    /// signedness it declared its own storage to be.
     #[test]
-    fn tinyint_c_target_is_signed() {
+    fn tinyint_c_target_transfers_a_tinyint_byte_unchanged() {
         let mut out: i8 = 0;
         let mut ind: SqlLen = 0;
-        let err = conv(
+        let ret = conv(
             &ColumnValues::TinyInt(200),
             SQL_C_TINYINT,
             (&mut out as *mut i8).cast(),
             &mut ind,
         )
-        .unwrap_err();
-        assert_eq!(err, ConvError::OutOfRange);
+        .unwrap();
+        assert_eq!(ret, ConvOk::Exact);
+        assert_eq!(out as u8, 200);
 
         // The unsigned spelling takes the same value.
         let mut out: u8 = 0;
@@ -1698,6 +1713,34 @@ mod tests {
         .unwrap();
         assert_eq!(ret, ConvOk::Exact);
         assert_eq!(out, 200);
+    }
+
+    /// The copy-through is scoped to a `tinyint` source. Any other source must be
+    /// narrowed, and that narrowing is signed - matching msodbcsql, whose
+    /// exemption requires the opposite side to be a tinyint flavour.
+    #[test]
+    fn tinyint_c_target_is_signed_for_other_sources() {
+        let mut out: i8 = 0;
+        let mut ind: SqlLen = 0;
+        let err = conv(
+            &ColumnValues::Int(200),
+            SQL_C_TINYINT,
+            (&mut out as *mut i8).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
+
+        // A negative value from a wider source still round-trips as signed.
+        let ret = conv(
+            &ColumnValues::Int(-1),
+            SQL_C_TINYINT,
+            (&mut out as *mut i8).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ret, ConvOk::Exact);
+        assert_eq!(out, -1);
     }
 
     #[test]

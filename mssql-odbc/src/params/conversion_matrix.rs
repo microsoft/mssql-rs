@@ -11,9 +11,6 @@
 //! entries are added as each conversion lands, so a pairing accepted at bind
 //! time is always one the execute path can actually convert.
 //!
-//! Anything absent is rejected with `07006` at bind time rather than failing
-//! later at execute.
-//!
 //! Parameter-side only, matching msodbcsql: it consults `IsValidSQLConversion`
 //! where both types are known up front (`SQLBindParameter`, output-parameter
 //! retrieval, BCP), but `SQLBindCol` / `SQLGetData` cannot — a column's SQL type
@@ -39,6 +36,11 @@ const INTEGER_C_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEG
 
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
 /// for an input parameter.
+///
+/// TODO: once every row of msodbcsql's `fValidConversion` is covered here, this
+/// stops being a progress list and becomes a legality table — at which point the
+/// caller must report `07006` instead of `HYC00`, because a missing entry then
+/// means the conversion is genuinely illegal rather than merely unbuilt.
 pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt) -> bool {
     debug_assert_ne!(
         c_type, SQL_C_DEFAULT,

@@ -28,7 +28,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_IMPLEMENTED, ERR_INVALID_CHARACTER_VALUE,
-    ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_COLUMN_SIZE, ERR_INVALID_PARAM_DECIMAL_DIGITS,
+    ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
     ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_INVALID_USE_OF_DEFAULT_PARAM,
     ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
     ERR_RESTRICTED_DATA_TYPE,
@@ -78,8 +78,9 @@ impl ParamBuildError {
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
-            Self::InvalidParameterSize(_) => ERR_INVALID_PARAM_COLUMN_SIZE,
-            Self::InvalidDecimalDigits(_) => ERR_INVALID_PARAM_DECIMAL_DIGITS,
+            Self::InvalidParameterSize(_) | Self::InvalidDecimalDigits(_) => {
+                ERR_INVALID_PARAM_PRECISION_OR_SCALE
+            }
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
             Self::Value(ConvError::InvalidCharacterValue) => ERR_INVALID_CHARACTER_VALUE,
@@ -639,6 +640,82 @@ mod tests {
         p.sql_type = SQL_SS_UDT;
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
         assert_eq!(err, ParamBuildError::UnsupportedSqlType(SQL_SS_UDT));
+    }
+
+    /// A NULL is still declared with its SQL type, so a fixed-length one needs a
+    /// real length: `char(0)` is not legal T-SQL. `SQLBindParameter` rejects the
+    /// `ColumnSize` before this point, so reaching here means the two checks
+    /// disagree.
+    #[test]
+    fn explicit_char_null_with_zero_column_size_is_rejected() {
+        for (c_type, sql_type) in [(SQL_C_CHAR, SQL_CHAR), (SQL_C_WCHAR, SQL_WCHAR)] {
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let mut p = param(c_type, std::ptr::null_mut(), &mut ind);
+            p.sql_type = sql_type;
+            let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+            assert_eq!(
+                err,
+                ParamBuildError::InvalidParameterSize(0),
+                "sql_type {sql_type}"
+            );
+            assert_eq!(err.diag().state, *b"HY104");
+        }
+    }
+
+    /// The variable-length types read the same 0 as the `max` spelling.
+    #[test]
+    fn explicit_varchar_null_with_zero_column_size_is_max() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_VARCHAR;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::VarcharMax(None)));
+
+        let mut p = param(SQL_C_WCHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_WVARCHAR;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::NVarcharMax(None)));
+    }
+
+    /// `SQLBindParameter` screens `ColumnSize` with `parameter_column_size_is_valid`
+    /// and the declaration is built here from the same value, so the two encode
+    /// the same limits in two places. Anything the bind gate accepts must be
+    /// declarable, or the application gets `HY104` from a call it was told had
+    /// succeeded.
+    ///
+    /// Only that direction is asserted. The declaration is deliberately laxer:
+    /// an oversized variable-length `ColumnSize` widens to `max` here
+    /// (`variable_length`), which the bind gate rejects first, matching
+    /// msodbcsql's `CheckSqlPrec`.
+    #[test]
+    fn every_bind_accepted_column_size_is_declarable() {
+        use crate::api::type_rules::parameter_column_size_is_valid;
+
+        for sql_type in [
+            SQL_CHAR,
+            SQL_WCHAR,
+            SQL_BINARY,
+            SQL_VARCHAR,
+            SQL_WVARCHAR,
+            SQL_VARBINARY,
+            SQL_LONGVARCHAR,
+            SQL_WLONGVARCHAR,
+            SQL_LONGVARBINARY,
+            SQL_SS_XML,
+            SQL_DECIMAL,
+            SQL_NUMERIC,
+        ] {
+            for column_size in [0, 1, 37, 38, 39, 4000, 4001, 8000, 8001] {
+                if !parameter_column_size_is_valid(sql_type, column_size) {
+                    continue;
+                }
+                assert!(
+                    typed_null(sql_type, column_size, 0).is_ok(),
+                    "sql_type {sql_type}: bind accepts ColumnSize {column_size} \
+                     but the declaration cannot be built"
+                );
+            }
+        }
     }
 
     #[test]

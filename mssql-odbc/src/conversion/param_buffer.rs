@@ -16,6 +16,7 @@ use crate::api::odbc_types::{
     SQL_C_UTINYINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_LEN_DATA_AT_EXEC_OFFSET,
     SQL_NTS, SQL_NULL_DATA, SqlLen, SqlPointer, SqlSmallInt,
 };
+use crate::api::type_rules::effective_param_c_type;
 use crate::params::BoundParam;
 
 /// An application parameter value, copied out of the caller's buffer.
@@ -113,25 +114,30 @@ pub(crate) unsafe fn read_param_value(
         SQL_C_WCHAR => Ok(AppValue::WideText(unsafe {
             read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec)
         })),
-        other => unsafe { read_integer(param.parameter_value_ptr, other) }
-            .map(AppValue::Integer)
-            .ok_or(ParamBuildError::UnsupportedCType(other)),
+        other => {
+            let effective = effective_param_c_type(other, param.sql_type);
+            unsafe { read_integer(param.parameter_value_ptr, effective) }
+                .map(AppValue::Integer)
+                .ok_or(ParamBuildError::UnsupportedCType(other))
+        }
     }
 }
 
 /// Reads a fixed-width integer C buffer, widening to `i128`. `None` for a C
-/// type this driver does not read as an integer, or a null buffer.
+/// type this driver does not read as an integer.
 ///
-/// `SQL_C_TINYINT` is the ODBC 2.x spelling and is signed, so it groups with
-/// `SQL_C_STINYINT`; only `SQL_C_UTINYINT` is unsigned.
+/// `SQL_C_TINYINT` is sign-unknown, and reads signed here because that is the
+/// rule for every pairing except a same-width `tinyint` transfer. The caller
+/// resolves that one case by rewriting the C type to `SQL_C_UTINYINT` before
+/// arriving here, so this function never has to decide it - see
+/// `type_rules::effective_param_c_type`.
 ///
 /// # Safety
-/// `ptr`, if non-null, must be readable for the C type's width. Reads are
-/// unaligned: the ODBC contract does not promise an aligned application buffer.
+/// `ptr` must be non-null and readable for the C type's width; `read_param_value`
+/// has already rejected a null buffer. Reads are unaligned: the ODBC contract
+/// does not promise an aligned application buffer.
 unsafe fn read_integer(ptr: SqlPointer, c_type: SqlSmallInt) -> Option<i128> {
-    if ptr.is_null() {
-        return None;
-    }
+    debug_assert!(!ptr.is_null(), "read_param_value rejects a null buffer");
     Some(match c_type {
         SQL_C_STINYINT | SQL_C_TINYINT => {
             i128::from(unsafe { (ptr as *const i8).read_unaligned() })
@@ -151,22 +157,24 @@ unsafe fn read_integer(ptr: SqlPointer, c_type: SqlSmallInt) -> Option<i128> {
 /// for a NUL-terminated string.
 ///
 /// # Safety
-/// `ptr`, if non-null, must be readable for the resolved length (or up to the
-/// first NUL when `len_spec == SQL_NTS`).
+/// `ptr` must be non-null and readable for the resolved length (or up to the
+/// first NUL when `len_spec == SQL_NTS`); `read_param_value` has already
+/// rejected a null buffer, and `read_indicator` every negative `len_spec` other
+/// than `SQL_NTS`.
 unsafe fn read_char_bytes(ptr: *const u8, len_spec: SqlLen) -> Vec<u8> {
-    if ptr.is_null() {
-        return Vec::new();
-    }
+    debug_assert!(!ptr.is_null(), "read_param_value rejects a null buffer");
+    debug_assert!(
+        len_spec >= 0 || len_spec == SQL_NTS as SqlLen,
+        "read_indicator rejects a negative length that is not SQL_NTS"
+    );
     let len = if len_spec == SQL_NTS as SqlLen {
         let mut n = 0usize;
         while unsafe { *ptr.add(n) } != 0 {
             n += 1;
         }
         n
-    } else if len_spec < 0 {
-        0
     } else {
-        len_spec as usize
+        len_spec.max(0) as usize
     };
     unsafe { slice::from_raw_parts(ptr, len).to_vec() }
 }
@@ -175,22 +183,24 @@ unsafe fn read_char_bytes(ptr: *const u8, len_spec: SqlLen) -> Vec<u8> {
 /// count per the ODBC spec, or `SQL_NTS` for a NUL-terminated string.
 ///
 /// # Safety
-/// `ptr`, if non-null, must be readable for the resolved number of `u16` units
-/// (or up to the first NUL when `len_spec == SQL_NTS`).
+/// `ptr` must be non-null and readable for the resolved number of `u16` units
+/// (or up to the first NUL when `len_spec == SQL_NTS`); `read_param_value` has
+/// already rejected a null buffer, and `read_indicator` every negative
+/// `len_spec` other than `SQL_NTS`.
 unsafe fn read_wchar_bytes(ptr: *const u16, len_spec: SqlLen) -> Vec<u8> {
-    if ptr.is_null() {
-        return Vec::new();
-    }
+    debug_assert!(!ptr.is_null(), "read_param_value rejects a null buffer");
+    debug_assert!(
+        len_spec >= 0 || len_spec == SQL_NTS as SqlLen,
+        "read_indicator rejects a negative length that is not SQL_NTS"
+    );
     let units = if len_spec == SQL_NTS as SqlLen {
         let mut n = 0usize;
         while unsafe { ptr.add(n).read_unaligned() } != 0 {
             n += 1;
         }
         n
-    } else if len_spec < 0 {
-        0
     } else {
-        (len_spec as usize) / std::mem::size_of::<u16>()
+        (len_spec.max(0) as usize) / std::mem::size_of::<u16>()
     };
     // Read unit by unit rather than through a slice: a slice reference would
     // assert an alignment the application never promised.
@@ -204,7 +214,7 @@ unsafe fn read_wchar_bytes(ptr: *const u16, len_spec: SqlLen) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_NO_TOTAL, SQL_PARAM_INPUT};
+    use crate::api::odbc_types::{SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_TINYINT};
     use std::ffi::c_void;
 
     fn param(c_type: SqlSmallInt, ptr: *mut c_void, ind: *mut SqlLen) -> BoundParam {
@@ -218,6 +228,27 @@ mod tests {
             buffer_length: 0,
             strlen_or_ind_ptr: ind,
         }
+    }
+
+    /// msodbcsql's `ParamToSQLType` rewrites `SQL_C_TINYINT` to unsigned when the
+    /// SQL type is also `tinyint`, so `0xFF` is 255 rather than -1.
+    #[test]
+    fn tinyint_c_type_reads_unsigned_against_a_tinyint_parameter() {
+        let mut value: u8 = 0xFF;
+        let mut ind: SqlLen = 0;
+        let mut p = param(
+            SQL_C_TINYINT,
+            &mut value as *mut u8 as *mut c_void,
+            &mut ind,
+        );
+        p.sql_type = SQL_TINYINT;
+        let got = unsafe { read_param_value(&p, 0) }.unwrap();
+        assert_eq!(got, AppValue::Integer(255));
+
+        // A wider SQL type keeps the signed read.
+        p.sql_type = crate::api::odbc_types::SQL_SMALLINT;
+        let got = unsafe { read_param_value(&p, 0) }.unwrap();
+        assert_eq!(got, AppValue::Integer(-1));
     }
 
     /// The two-step read the converter performs: `None` is SQL NULL.
@@ -307,8 +338,11 @@ mod tests {
         }
     }
 
-    /// `SQL_C_TINYINT` is the ODBC 2.x spelling of the signed form, so 0xFF is
-    /// -1; only `SQL_C_UTINYINT` reads it as 255.
+    /// `SQL_C_TINYINT` is sign-unknown but reads signed here, because `param`
+    /// leaves `sql_type` at 0 and so misses the rewrite in
+    /// `effective_param_c_type`; 0xFF is -1. Only `SQL_C_UTINYINT` reads 255.
+    /// The rewritten case is
+    /// `tinyint_c_type_reads_unsigned_against_a_tinyint_parameter`.
     #[test]
     fn tinyint_is_signed_but_utinyint_is_unsigned() {
         let mut ind: SqlLen = 0;
@@ -334,13 +368,25 @@ mod tests {
     fn indicator_is_not_a_length_for_fixed_width_c_types() {
         let mut val: i32 = 42;
         let ptr = (&mut val as *mut i32).cast();
-        for stray in [-7, 0, 999] {
+        for stray in [-7, 0, 999, SQL_LEN_DATA_AT_EXEC_OFFSET + 1] {
             let mut ind: SqlLen = stray;
             let p = param(SQL_C_SLONG, ptr, &mut ind);
             assert_eq!(
                 read(&p).unwrap(),
                 Some(AppValue::Integer(42)),
                 "indicator {stray} should be ignored"
+            );
+        }
+
+        // The special values are still checked first, whatever the C type, so
+        // the boundary at SQL_LEN_DATA_AT_EXEC_OFFSET applies here too.
+        for at_exec in [SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LEN_DATA_AT_EXEC_OFFSET - 1] {
+            let mut ind: SqlLen = at_exec;
+            let p = param(SQL_C_SLONG, ptr, &mut ind);
+            assert_eq!(
+                read(&p).unwrap_err(),
+                ParamBuildError::DataAtExecUnsupported,
+                "indicator {at_exec}"
             );
         }
 
@@ -441,19 +487,20 @@ mod tests {
         assert_eq!(err.diag().state, *b"HY009");
     }
 
+    /// Pins the helpers' own length handling. The null-pointer and negative-length
+    /// cases are not covered because `read_param_value` and `read_indicator`
+    /// reject both before dispatch; the helpers `debug_assert` that contract.
     #[test]
     fn read_char_bytes_edge_cases() {
-        assert!(unsafe { read_char_bytes(std::ptr::null(), 5) }.is_empty());
         let buf = b"abc";
-        // Negative (non-NTS) length yields no bytes.
-        assert!(unsafe { read_char_bytes(buf.as_ptr(), -5) }.is_empty());
         // Explicit positive length reads exactly that many bytes.
         assert_eq!(unsafe { read_char_bytes(buf.as_ptr(), 3) }, b"abc");
+        // A shorter count stops early rather than running to the NUL.
+        assert_eq!(unsafe { read_char_bytes(buf.as_ptr(), 2) }, b"ab");
     }
 
     #[test]
     fn read_wchar_bytes_edge_cases() {
-        assert!(unsafe { read_wchar_bytes(std::ptr::null(), 5) }.is_empty());
         let units: Vec<u16> = "hi".encode_utf16().chain(std::iter::once(0)).collect();
         // SQL_NTS reads u16 units up to the NUL terminator.
         assert_eq!(

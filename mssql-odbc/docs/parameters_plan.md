@@ -62,8 +62,10 @@ transparent reconnects.
   `IsValidSqlType`: supported, real but with no SQL Server counterpart (`HYC00` -
   the interval types), or unknown (`HY004`). `params::conversion_matrix` owns the
   C -> SQL conversion table, shaped like msodbcsql's `fValidConversion` (one row
-  per C type). A C type that is real but not yet convertible returns `07006`, not
-  `HY003`.
+  per C type). The semantics differ: `fValidConversion` is a legality table,
+  this one is an implementation-progress list, so a pairing it does not carry
+  returns `HYC00` (unbuilt), not `07006` (illegal) or `HY003` (unknown type).
+  Tracked by AB#47500; the state becomes `07006` once the table is complete.
 - **`SQL_C_DEFAULT` resolution** - resolved at bind time to the C type implied
   by `ParameterType` and stored resolved in `BoundParam`, so the execute path
   never sees the placeholder. Version-aware, like msodbcsql's `Sql2CDefault`,
@@ -293,9 +295,33 @@ Rules it fixes:
 - Narrowing goes through `numeric::narrow_i128`, so parameters and fetch share
   one range check. Overflow is `22003`, including `SQL_C_UBIGINT` above
   `i64::MAX`, which no SQL Server type can hold.
-- `SQL_C_TINYINT` is the 2.x spelling of the signed form, so it groups with
-  `SQL_C_STINYINT`; only `SQL_C_UTINYINT` is unsigned. The fetch direction was
-  corrected to match.
+- `SQL_C_TINYINT` is sign-unknown: `sqlext.h` gives it neither
+  `SQL_SIGNED_OFFSET` nor `SQL_UNSIGNED_OFFSET`, unlike `SQL_C_STINYINT` and
+  `SQL_C_UTINYINT`. The rule is per pairing, not per type - a `tinyint`-to-
+  `tinyint` transfer moves the byte unchanged, every other pairing reads it
+  signed. `ConvertToFixed` range-checks against `SCHAR_MAX`/`SCHAR_MIN` and
+  stores through `(SCHAR *)`, but skips the check when the source is any tinyint
+  flavour (`sqlccnvt.cpp`). So `SQL_C_TINYINT` is not a synonym for
+  `SQL_C_STINYINT`: only the same-width case differs, and `SQL_C_STINYINT` never
+  gets it.
+- msodbcsql spells that one rule two ways, and so does this driver, because the
+  two directions have different representations available:
+  - Fetch copies the byte outright, so no sign is ever chosen. msodbcsql usually
+    does not even reach the converter - `sqlcdata.cpp` maps a `SQLINT1` column to
+    `SQL_C_UTINYINT` and clears `fConvNeeded` - and where it does convert,
+    `ConvertToFixed` forces a bit copy ("input or output is sign unknown and
+    opposite parameter is same size").
+  - Parameters cannot. `read_param_value` widens every integer C type to `i128`,
+    and widening forces an interpretation; signed would turn an application byte
+    of `0xC8` into `-56`, which a `tinyint` column cannot hold. Unsigned is the
+    reading that keeps the widening lossless, so `effective_param_c_type`
+    rewrites the C type instead - exactly as `ParamToSQLType` does ("If both are
+    tinyint, change C type to unsigned", `sqlcfunc.cpp`), and for the same
+    reason: that path also loads a widened `Temp` before converting.
+
+  Net: a `tinyint` above 127 round-trips in both directions instead of failing
+  `22003`, while `SQL_C_STINYINT` and every wider target keep the signed range
+  check.
 - Value failures travel as `ParamBuildError::Value(ConvError)`, so both
   directions map `OutOfRange` to the same `22003`.
 
