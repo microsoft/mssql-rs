@@ -14,7 +14,7 @@ parameters:
     default: 'Build_Linux_ARM'
   - name: poolName
     type: string
-    default: 'RUST-1ES-POOL-ARM-WUS3'
+    default: 'RUST-ARM64-WUS3'
   - name: poolImageOverride
     type: string
     default: 'imageOverride -equals RUST-UBUNTU-ARM64'

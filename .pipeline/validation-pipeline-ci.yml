@@ -54,5 +54,10 @@ stages:
     RunLongHaul: ${{ parameters.RunLongHaul }}
     sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
     sqlImageTag: ${{ parameters.sqlImageTag }}
+    # This pipeline only ever runs in the mssql-rs project, so it names the
+    # trusted pools outright rather than deriving them from System.TeamProject.
+    poolName: RUST-X64-WUS3
+    armPoolName: RUST-ARM64-WUS3
+    utilPoolName: RUST-UTIL-WUS3
     # Runs with internal resource access, so keep the infra stages.
     includeInfraStages: true
