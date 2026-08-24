@@ -32,12 +32,15 @@ the table can be reconstructed from it when quoting Windows results elsewhere.
 
 ## Triage
 
-- **Confirmed regression** (test script exits 1) — report the confirmed
-  benchmarks with their trip counts and worst ratios, plus the commit range since
-  the last green run on that platform. Do not retry: the quorum has already ruled
-  out noise.
-- **Infra failure** (the run fails before the test step — VM deploy, toolchain
-  bootstrap, SQL setup) — re-queue once. Escalate only if the retry also fails.
+- **Confirmed regression** (the completed summary verdict reports confirmed
+  regressions) — report the confirmed benchmarks with their trip counts and worst
+  ratios, plus the commit range since the last green run on that platform. Do not
+  retry: the quorum has already ruled out noise.
+- **Infra or harness failure** (no completed summary verdict, or the failing
+  phase is VM deploy, SQL setup, toolchain/critcmp install, baseline SHA
+  validation, missing bench binaries, or invalid `BENCH_*` settings) — re-queue
+  only if the phase looks transient; otherwise fix the code or config. Escalate
+  if a retry also fails.
 - **Green** — check for verified improvements and for sub-gate drift, then apply
   the lock-in rules below.
 
