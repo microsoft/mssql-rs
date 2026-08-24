@@ -829,12 +829,11 @@ def test_setinputsizes_binds_money(client_context, sql_type, expected_type):
             cursor = conn.cursor()
             cursor.setinputsizes([sql_type])
             await cursor.execute(
-                """
-                IF SQL_VARIANT_PROPERTY(CAST(? AS sql_variant), 'BaseType') <> ?
+                f"""
+                IF SQL_VARIANT_PROPERTY(CAST(? AS sql_variant), 'BaseType') <> '{expected_type}'
                     THROW 50000, 'Unexpected money type', 1
                 """,
                 Decimal("123.4500"),
-                expected_type,
             )
         finally:
             await conn.close()
