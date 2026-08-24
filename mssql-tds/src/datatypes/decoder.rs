@@ -1218,9 +1218,9 @@ impl GenericDecoder {
                 )));
             }
             let new_len = plp_buffer.len() + chunk_len;
-            // SAFETY: `read_bytes_uninit` returned `Ok(chunk_len)`, so it
-            // initialized the first `chunk_len` bytes of the spare capacity
-            // reserved above.
+            // SAFETY: `read_bytes_uninit` returned `Ok(chunk_len)`, so by its
+            // documented contract it initialized the first `chunk_len` bytes of
+            // the spare capacity reserved above.
             unsafe { plp_buffer.set_len(new_len) };
 
             chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;

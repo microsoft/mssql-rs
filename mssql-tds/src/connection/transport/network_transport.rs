@@ -745,17 +745,22 @@ impl NetworkTransport {
     /// Error for a bulk read that needed more bytes but got a packet carrying
     /// none.
     ///
-    /// The bulk-read loops (`read_bytes`, `read_bytes_uninit`, `skip_bytes`)
-    /// refill by calling [`read_tds_packet`](Self::read_tds_packet) and then
-    /// consume whatever became available. A payload-free end-of-message packet
-    /// is accepted by the framing layer (it legally terminates a message) but
-    /// contributes zero payload, so the loop would re-enter the refill with the
-    /// same unmet demand and block on the socket forever — the server has
-    /// finished its message and will not send more until the client issues a
-    /// new request. The same happens when a value claims more bytes than the
-    /// message actually contains.
+    /// Unreachable as the framing layer stands today, and deliberately kept.
+    /// [`get_new_tds_packet`](Self::get_new_tds_packet) rejects a payload-free
+    /// packet unless it is end-of-message, so every successful refill leaves
+    /// either payload in the buffer or `end_of_message` set. In all three bulk
+    /// loops `to_read == 0` means the buffer is empty, which means the refill
+    /// framed a payload-free packet, which therefore means the message ended —
+    /// and that case is handled by the two branches below this one.
     ///
-    /// Neither case can make progress, so fail loudly instead of hanging.
+    /// It stays as a guard on that invariant. If the framing layer ever
+    /// tolerates a payload-free non-EOM packet, the loop would re-enter the
+    /// refill with the same unmet demand and block on the socket forever, which
+    /// is the hang this whole rule exists to prevent. Failing loudly is the
+    /// right answer if that day comes; the alternative is a silent infinite
+    /// loop. It is also the one branch here with no scalar counterpart, so were
+    /// it reachable the two reader families would genuinely disagree — bulk
+    /// would error where scalar hangs.
     #[cold]
     fn no_progress_error(outstanding: usize) -> crate::error::Error {
         crate::error::Error::ProtocolError(format!(
@@ -814,7 +819,10 @@ impl NetworkTransport {
     ///
     /// The bulk loops apply the identical rule through
     /// [`Self::value_truncated_by_message_end`], so the two families agree on
-    /// every input.
+    /// every input. That agreement leans on the framing invariant described on
+    /// [`Self::no_progress_error`]: the extra branch the bulk loops carry, and
+    /// the scalar readers do not, cannot fire while framing rejects
+    /// payload-free non-EOM packets.
     ///
     /// Known gap: a read that begins exactly at a message boundary is still
     /// allowed through, so it can block if the server has nothing more to send.

@@ -2307,7 +2307,7 @@ impl TdsClient {
         rpc.serialize(&mut packet_writer).await?;
 
         // Drain to completion to get output parameters and any server errors.
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
 
         // We need to get the return value, and then extract the handle from it.
         // If the server reported errors during prepare, surface them instead of a
@@ -2437,7 +2437,7 @@ impl TdsClient {
         // Drain the result set. A successful unprepare returns no results,
         // but surface any server errors collected during the drain instead of
         // silently discarding them.
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
         }
@@ -3061,9 +3061,49 @@ impl TdsClient {
     /// the response are still unread and the next command would decode them as
     /// tokens. A TDS stream cannot be resynchronized from an unknown offset, so
     /// the connection must not go back to a pool.
+    ///
+    /// What this does and does not guarantee: it marks the transport dead and
+    /// clears session recovery, which is what a pool consults before handing a
+    /// connection out, so pooled consumers discard it. It does not close the
+    /// socket, and no execute path consults `is_connection_dead`, so a caller
+    /// reusing this `TdsClient` directly can still issue another command.
+    /// That command is not left parked mid-value — entry points call
+    /// `reset_reader`, which discards the client-side buffer — but stale bytes
+    /// may remain queued in the kernel receive buffer. Closing the socket here
+    /// is the wrong remedy: `close_transport` writes a TLS close_notify on a
+    /// socket we just failed to read from, and its `?` returns before
+    /// `self.stream = None`, so a swallowed error would leave the stream alive
+    /// in exactly the degraded case retirement exists for. Dropping the stream
+    /// with no I/O is the fix; it needs a new transport method and is left as
+    /// follow-up.
     fn retire_desynchronized_connection(&mut self) {
         self.transport.mark_known_dead();
         self.recovery_context.session_recovery_negotiated = false;
+    }
+
+    /// Drains the stream, retiring the connection if the drain gives up partway.
+    ///
+    /// Call sites that would otherwise propagate a drain failure with a bare `?`
+    /// use this instead, so the rule "a drain either reaches the terminal DONE
+    /// or the connection is retired where it gave up" lives in one place rather
+    /// than being re-derived at each site. A site added later that forgets the
+    /// rule is then a missing call here, not a silent hole.
+    ///
+    /// The open-batch flag is cleared on failure for the same reason
+    /// [`Self::close_query`] clears it: leaving it set masks the real error
+    /// behind `ALREADY_EXECUTING_ERROR` on every later call, which is what made
+    /// the original failure look like a permanent wedge.
+    pub(in crate::connection) async fn drain_stream_or_retire(
+        &mut self,
+    ) -> TdsResult<Vec<SqlErrorInfo>> {
+        match self.drain_stream().await {
+            Ok(errors) => Ok(errors),
+            Err(error) => {
+                self.execution_context.set_has_open_batch(false);
+                self.retire_desynchronized_connection();
+                Err(error)
+            }
+        }
     }
 
     /// Drains all remaining tokens from the stream until a terminal DONE token.
@@ -4970,8 +5010,10 @@ impl TdsClient {
     /// If the drain itself fails, the client state is reset regardless and the
     /// connection is retired: a drain that stops partway leaves the reader at an
     /// unknown offset in the response, and a TDS stream cannot be
-    /// resynchronized from there. The error is returned to the caller and later
-    /// commands fail against the dead connection rather than reading garbage.
+    /// resynchronized from there. The error is returned to the caller and
+    /// pooled consumers discard the connection rather than reusing it. See
+    /// [`Self::retire_desynchronized_connection`] for what retirement does not
+    /// cover.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
         if !self.execution_context.has_open_batch() {
@@ -5006,12 +5048,6 @@ impl TdsClient {
         self.execution_context.set_has_open_batch(false);
 
         if let Err(error) = drain_result {
-            // A drain that stops partway leaves the reader parked at an unknown
-            // offset — typically inside a value's payload, where the next bytes
-            // would be decoded as tokens. Nothing can resynchronize a TDS stream
-            // from there, so retire the connection rather than let the next
-            // command read garbage.
-            //
             // A server-reported error is different: the batch ran and failed,
             // and the reader is still on a token boundary, so retiring would
             // poison a healthy pooled connection every time a batch ends in
@@ -8617,6 +8653,76 @@ mod tests {
         assert!(
             !client.recovery_context.session_recovery_negotiated,
             "a desynchronized session must not be silently recovered"
+        );
+    }
+
+    /// A drain that gives up partway must retire the connection no matter which
+    /// call site issued it. `drain_stream_or_retire` is the one place that rule
+    /// lives, so pinning it here covers every site that routes through it
+    /// (`execute_sp_prepare`, `execute_sp_unprepare`, and the five cursor
+    /// operations) without duplicating this test seven times.
+    ///
+    /// Those sites previously used a bare `?`, which propagated the error while
+    /// leaving the connection reusable *and* the batch open — the same
+    /// `ALREADY_EXECUTING_ERROR` masking that made the original failure look
+    /// like a permanent wedge.
+    #[tokio::test]
+    async fn drain_stream_or_retire_failure_closes_batch_and_retires_connection() {
+        let mut stream = Vec::new();
+        stream.extend(colmetadata_single_int_bytes("n"));
+        stream.extend(row_int_bytes(1));
+        // Stream ends here: no terminal DONE, so the drain read fails.
+
+        let mut client = client_over_bytes(stream);
+        client.execution_context.set_has_open_batch(true);
+        client.current_result_set_has_been_read_till_end = true;
+
+        client
+            .drain_stream_or_retire()
+            .await
+            .expect_err("a truncated drain must surface an error");
+
+        assert!(
+            !client.has_open_batch(),
+            "a failed drain must still close the batch"
+        );
+        assert!(
+            !client.command_is_busy(),
+            "a failed drain must not leave the connection reporting ALREADY_EXECUTING_ERROR"
+        );
+        assert!(
+            client.transport.connection_known_dead(),
+            "a failed drain must retire the connection regardless of call site"
+        );
+        assert!(
+            !client.recovery_context.session_recovery_negotiated,
+            "a desynchronized session must not be silently recovered"
+        );
+    }
+
+    /// Control: the helper must stay quiet on a healthy stream. The drain
+    /// reaches the terminal DONE and merely reports a server-side error, so the
+    /// connection is still synchronized and must remain reusable — otherwise
+    /// every `RAISERROR` inside a prepare or cursor operation would poison a
+    /// pooled connection.
+    #[tokio::test]
+    async fn drain_stream_or_retire_sql_error_leaves_connection_alive() {
+        let mut stream = Vec::new();
+        stream.extend(error_token_bytes(1222, 16, "boom"));
+        stream.extend(done_bytes(DONE_ERROR_FINAL));
+
+        let mut client = client_over_bytes(stream);
+
+        let errors = client
+            .drain_stream_or_retire()
+            .await
+            .expect("a drain reaching the terminal DONE must succeed");
+
+        assert_eq!(errors.len(), 1, "the ERROR token must still be collected");
+        assert_eq!(errors[0].number, 1222);
+        assert!(
+            !client.transport.connection_known_dead(),
+            "a drain that reached the terminal DONE must not retire the connection"
         );
     }
 
