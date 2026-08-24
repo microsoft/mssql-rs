@@ -1047,12 +1047,13 @@ fn xml_to_text(bytes: &[u8]) -> Result<String, TextError> {
     String::from_utf16(&units).map_err(|_| TextError::Malformed)
 }
 
-/// Drops the leading zero from a decimal whose magnitude is below one.
+/// Drops the leading zero from a value whose magnitude is below one.
 ///
 /// msodbcsql renders these as `.5000` / `-.0001`, not `0.5000` / `-0.0001`, and
-/// applications that compare the rendered text see the difference. Applied here
-/// rather than in `mssql-tds`'s formatter because this is the ODBC parity
-/// contract, not a general property of decimal formatting.
+/// applications that compare the rendered text see the difference. It strips
+/// unconditionally, so an exact zero renders `.0000` too. Applied here rather
+/// than in `mssql-tds`'s formatters because this is the ODBC parity contract,
+/// not a general property of number formatting.
 fn strip_sub_one_leading_zero(s: String) -> String {
     if let Some(rest) = s.strip_prefix("0.") {
         format!(".{rest}")
@@ -1075,8 +1076,12 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
         ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
             Ok(strip_sub_one_leading_zero(d.to_decimal_string()))
         }
-        ColumnValues::Money(m) => Ok(money_scaled_to_string(money_scaled(m.lsb_part, m.msb_part))),
-        ColumnValues::SmallMoney(m) => Ok(money_scaled_to_string(i64::from(m.int_val))),
+        ColumnValues::Money(m) => Ok(strip_sub_one_leading_zero(money_scaled_to_string(
+            money_scaled(m.lsb_part, m.msb_part),
+        ))),
+        ColumnValues::SmallMoney(m) => Ok(strip_sub_one_leading_zero(money_scaled_to_string(
+            i64::from(m.int_val),
+        ))),
         // `SqlString::to_utf8_string` unwraps on its UTF-8 branch; decode fallibly.
         ColumnValues::String(s) => sql_string_to_text(s).ok_or(TextError::Malformed),
         ColumnValues::Xml(x) => xml_to_text(&x.bytes),
