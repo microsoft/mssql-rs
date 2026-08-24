@@ -6,12 +6,15 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
-    SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
+    SQL_DESC_ALLOC_USER, SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV,
+    SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn,
+    SqlSmallInt,
 };
 use crate::error::free_errors;
+use crate::handles::desc::DescKind;
 use crate::handles::{
-    DbcHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw, handle_to_raw,
+    DbcHandle, DescHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw,
+    handle_to_raw,
 };
 
 /// Implementation of [`SQLAllocHandle`](super::exports::SQLAllocHandle).
@@ -43,13 +46,7 @@ pub(crate) unsafe fn sql_alloc_handle(
             SQL_HANDLE_ENV => unsafe { alloc_env(input_handle, output_handle) },
             SQL_HANDLE_DBC => unsafe { alloc_dbc(input_handle, output_handle) },
             SQL_HANDLE_STMT => unsafe { alloc_stmt(input_handle, output_handle) },
-            SQL_HANDLE_DESC => {
-                error!(
-                    handle_type,
-                    "SQLAllocHandle: handle type not yet implemented"
-                );
-                SQL_ERROR
-            }
+            SQL_HANDLE_DESC => unsafe { alloc_desc(input_handle, output_handle) },
             _ => {
                 error!(handle_type, "SQLAllocHandle: unknown handle type");
                 SQL_INVALID_HANDLE
@@ -171,6 +168,56 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
     unsafe { output_handle.write(raw) };
 
     debug!(?raw, ?input_handle, "Allocated STMT handle");
+    SQL_SUCCESS
+}
+
+/// Allocates an explicit descriptor handle under a parent connection.
+///
+/// Mirrors msodbcsql's `AllocDesc` (`sqlcdesc.cpp:5841-5908`):
+/// 1. Validate that input_handle is a valid DBC handle.
+/// 2. Heap-allocate a `DescHandle` tagged `DescKind::Ad` /
+///    `SQL_DESC_ALLOC_USER` with a back-pointer to the parent DBC.
+/// 3. Acquire the DBC lock and register the descriptor in its descriptor list.
+/// 4. Write the opaque pointer to `*output_handle`.
+///
+/// Descriptors allocated this way are owned by the connection, not by any one
+/// statement: `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC)`
+/// associates one with any statement on the same connection, and it can
+/// outlive that association or be shared by more than one statement at once.
+///
+/// # Safety
+/// `output_handle` must be a valid, aligned, writable pointer (validated by caller).
+/// `input_handle` must be a live `DbcHandle` created by `alloc_dbc`.
+unsafe fn alloc_desc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> SqlReturn {
+    if input_handle.is_null() {
+        error!("SQLAllocHandle(DESC): input_handle (DBC) must not be null");
+        return SQL_INVALID_HANDLE;
+    }
+
+    let dbc = unsafe { handle_from_raw::<DbcHandle>(input_handle) };
+    debug_assert_eq!(
+        dbc.object_type,
+        HandleType::Dbc,
+        "SQLAllocHandle(DESC): input_handle is not a DBC handle"
+    );
+
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("SQLAllocHandle(DESC): dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    free_errors(&mut dbc_state);
+
+    let desc = Box::new(DescHandle::new(
+        DescKind::Ad,
+        SQL_DESC_ALLOC_USER,
+        input_handle,
+    ));
+    let raw = handle_to_raw(desc);
+    dbc_state.descriptors.push(raw);
+
+    unsafe { output_handle.write(raw) };
+
+    debug!(?raw, ?input_handle, "Allocated DESC handle");
     SQL_SUCCESS
 }
 
@@ -400,6 +447,81 @@ mod tests {
         drop(state);
 
         unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn alloc_desc_returns_success_with_valid_dbc() {
+        let (env, dbc) = alloc_env_dbc();
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(!desc.is_null());
+
+        let d = unsafe { &*(desc as *const DescHandle) };
+        assert_eq!(d.object_type, HandleType::Desc);
+        assert!(d.is_explicit());
+        assert_eq!(d.parent_dbc, dbc);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn alloc_desc_with_null_dbc_returns_invalid_handle() {
+        let mut desc: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, SQL_NULL_HANDLE, &mut desc) };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
+        assert!(desc.is_null());
+    }
+
+    #[test]
+    fn alloc_desc_registers_in_parent_dbc() {
+        let (env, dbc) = alloc_env_dbc();
+
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        assert!(dbc_ref.inner.lock().unwrap().descriptors.is_empty());
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+
+        let state = dbc_ref.inner.lock().unwrap();
+        assert_eq!(state.descriptors.len(), 1);
+        assert_eq!(state.descriptors[0], desc);
+        drop(state);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn alloc_multiple_descs_on_same_dbc() {
+        let (env, dbc) = alloc_env_dbc();
+
+        let mut desc1: SqlHandle = ptr::null_mut();
+        let mut desc2: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc1) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc2) },
+            SQL_SUCCESS
+        );
+        assert_ne!(desc1, desc2);
+
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        assert_eq!(dbc_ref.inner.lock().unwrap().descriptors.len(), 2);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc2) };
+        unsafe { sql_free_handle(SQL_HANDLE_DESC, desc1) };
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }

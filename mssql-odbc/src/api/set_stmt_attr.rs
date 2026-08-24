@@ -9,8 +9,10 @@
 //! fetch path. `SQL_ATTR_CURSOR_TYPE` and `SQL_ATTR_CONCURRENCY` accept only the
 //! supported forward-only / read-only values; any other request is substituted
 //! and reported with `01S02` (option value changed) rather than silently
-//! succeeding. Other recognized statement attributes (param / descriptor
-//! controls) are accepted without effect. `SQL_ATTR_PARAMSET_SIZE` accepts the
+//! succeeding. `SQL_ATTR_APP_ROW_DESC`/`SQL_ATTR_APP_PARAM_DESC` associate an
+//! explicitly-allocated descriptor as the statement's active ARD/APD
+//! (`associate_descriptor`); the remaining recognized param / descriptor
+//! controls are accepted without effect. `SQL_ATTR_PARAMSET_SIZE` accepts the
 //! ODBC default of 1 but rejects larger batches, since parameter arrays are not
 //! yet consumed and a silent success would execute only the first row.
 //! Unrecognized attribute identifiers fail with `HY092`.
@@ -30,11 +32,12 @@ use crate::api::odbc_types::{
     SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE,
-    SQLSTATE_01S02, SQLSTATE_HYC00, post_diag,
+    DiagMsg, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE,
+    ERR_INVALID_USE_OF_AUTO_DESC, SQLSTATE_01S02, SQLSTATE_HYC00, post_diag,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::desc::DescHandle;
 use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -212,14 +215,38 @@ fn sql_set_stmt_attr_w_safe(
             debug!("SQLSetStmtAttrW: SQL_ATTR_ROW_BIND_OFFSET_PTR set");
             SQL_SUCCESS
         }
-        // Recognized attributes accepted without tracking: these param /
-        // descriptor controls have no effect on the implemented forward-only,
+        SQL_ATTR_APP_ROW_DESC => match validate_descriptor_association(stmt, stmt.ard, value_ptr) {
+            Ok(new_active) => {
+                state.active_ard = new_active;
+                debug!(?new_active, "SQLSetStmtAttrW: SQL_ATTR_APP_ROW_DESC set");
+                SQL_SUCCESS
+            }
+            Err(diag) => {
+                error!(attribute, "SQLSetStmtAttrW: SQL_ATTR_APP_ROW_DESC rejected");
+                post_diag(&mut state, diag);
+                SQL_ERROR
+            }
+        },
+        SQL_ATTR_APP_PARAM_DESC => match validate_descriptor_association(stmt, stmt.apd, value_ptr)
+        {
+            Ok(new_active) => {
+                state.active_apd = new_active;
+                debug!(?new_active, "SQLSetStmtAttrW: SQL_ATTR_APP_PARAM_DESC set");
+                SQL_SUCCESS
+            }
+            Err(diag) => {
+                error!(
+                    attribute,
+                    "SQLSetStmtAttrW: SQL_ATTR_APP_PARAM_DESC rejected"
+                );
+                post_diag(&mut state, diag);
+                SQL_ERROR
+            }
+        },
+        // Recognized attributes accepted without tracking: these param
+        // controls have no effect on the implemented forward-only,
         // read-only behavior.
-        SQL_ATTR_PARAM_BIND_TYPE
-        | SQL_ATTR_PARAM_STATUS_PTR
-        | SQL_ATTR_PARAMS_PROCESSED_PTR
-        | SQL_ATTR_APP_ROW_DESC
-        | SQL_ATTR_APP_PARAM_DESC => {
+        SQL_ATTR_PARAM_BIND_TYPE | SQL_ATTR_PARAM_STATUS_PTR | SQL_ATTR_PARAMS_PROCESSED_PTR => {
             debug!(attribute, "SQLSetStmtAttrW: attribute accepted as no-op");
             SQL_SUCCESS
         }
@@ -232,6 +259,51 @@ fn sql_set_stmt_attr_w_safe(
             SQL_ERROR
         }
     }
+}
+
+/// Validates a new `SQL_ATTR_APP_ROW_DESC`/`SQL_ATTR_APP_PARAM_DESC` value and
+/// returns the slot to store in `StmtState::active_ard`/`active_apd`:
+/// `own_implicit` is the statement's own permanent implicit descriptor for
+/// this role (`stmt.ard` or `stmt.apd`).
+///
+/// Mirrors msodbcsql's `SQLSetStmtAttr` ARD/APD handling
+/// (`sqlcmisc.cpp:3599-3639`) and the ODBC reference's `SQL_ATTR_APP_ROW_DESC`/
+/// `SQL_ATTR_APP_PARAM_DESC` entries:
+/// - `value_ptr` null or equal to `own_implicit` (the handle originally
+///   returned for this statement's ARD/APD) resets to implicit (`Ok(None)`).
+/// - Otherwise `value_ptr` must be an explicitly-allocated descriptor
+///   (`SQL_DESC_ALLOC_USER`) on the *same connection* as `stmt`, or the call
+///   fails: `HY017` if it is some other implicit descriptor (another
+///   statement's ARD/APD, or this statement's own IRD/IPD — implicitly
+///   allocated descriptors can never be associated except as their own
+///   statement's ARD/APD, which is the reset case above), `HY024` if it is
+///   explicit but on a different connection.
+fn validate_descriptor_association(
+    stmt: &StmtHandle,
+    own_implicit: SqlHandle,
+    value_ptr: SqlPointer,
+) -> Result<Option<SqlHandle>, DiagMsg> {
+    let value = value_ptr as SqlHandle;
+    if value.is_null() || value == own_implicit {
+        return Ok(None);
+    }
+
+    // SAFETY: trusts the Driver Manager to pass a live descriptor handle, per
+    // this crate's FFI-boundary convention (see module docs / README.md).
+    let target = unsafe { handle_from_raw::<DescHandle>(value) };
+    debug_assert_eq!(
+        target.object_type,
+        HandleType::Desc,
+        "SQLSetStmtAttrW: SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC value is not a DESC handle"
+    );
+
+    if !target.is_explicit() {
+        return Err(ERR_INVALID_USE_OF_AUTO_DESC);
+    }
+    if target.parent_dbc != stmt.parent_dbc {
+        return Err(ERR_INVALID_ATTRIBUTE_VALUE);
+    }
+    Ok(Some(value))
 }
 
 /// Retrieves a statement attribute.
@@ -319,17 +391,22 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_PARAMSET_SIZE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, 1);
         },
-        // The four implicit descriptors (ARD/APD/IRD/IPD). They live on
-        // `StmtHandle` itself, not behind `inner` (set once in `new()`,
-        // never reassigned — see that field's doc comment), so nothing
-        // here needs the lock beyond the diagnostics reset above, which
-        // every attribute on this call shares regardless of which one was
-        // requested.
+        // ARD/APD report the active association (an explicit descriptor if
+        // one was set via SQLSetStmtAttrW, else the implicit default), so
+        // they need `state` — unlike IRD/IPD below, which are never
+        // swappable and live only on `StmtHandle` itself (set once in
+        // `new()`, never reassigned — see that field's doc comment).
         SQL_ATTR_APP_ROW_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
+            write_if_some(
+                value_ptr as *mut SqlHandle,
+                state.active_ard.unwrap_or(stmt.ard),
+            );
         },
         SQL_ATTR_APP_PARAM_DESC => unsafe {
-            write_if_some(value_ptr as *mut SqlHandle, stmt.apd);
+            write_if_some(
+                value_ptr as *mut SqlHandle,
+                state.active_apd.unwrap_or(stmt.apd),
+            );
         },
         SQL_ATTR_IMP_ROW_DESC => unsafe {
             write_if_some(value_ptr as *mut SqlHandle, stmt.ird);
@@ -774,6 +851,238 @@ mod tests {
         assert!(
             stmt.inner.lock().unwrap().diag_records.is_empty(),
             "stale diagnostic from the prior failure was not cleared"
+        );
+    }
+
+    fn set_desc(stmt: SqlHandle, attribute: SqlInteger, value: SqlHandle) -> SqlReturn {
+        unsafe { sql_set_stmt_attr_w(stmt, attribute, value as SqlPointer, 0) }
+    }
+
+    #[test]
+    fn set_app_row_desc_associates_explicit_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, desc), SQL_SUCCESS);
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, desc)
+        );
+        // APD is untouched.
+        assert_eq!(read_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC).1, h.apd());
+    }
+
+    #[test]
+    fn set_app_param_desc_associates_explicit_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, desc), SQL_SUCCESS);
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC),
+            (SQL_SUCCESS, desc)
+        );
+        // ARD is untouched.
+        assert_eq!(read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC).1, h.ard());
+    }
+
+    #[test]
+    fn reassociation_replaces_previous_explicit_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc_a = h.alloc_explicit_desc();
+        let desc_b = h.alloc_explicit_desc();
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, desc_a), SQL_SUCCESS);
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, desc_b), SQL_SUCCESS);
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, desc_b)
+        );
+    }
+
+    #[test]
+    fn reset_to_implicit_via_null() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        let implicit_ard = h.ard();
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, desc), SQL_SUCCESS);
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, SQL_NULL_HANDLE),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, implicit_ard)
+        );
+    }
+
+    #[test]
+    fn reset_to_implicit_via_own_handle() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        let implicit_apd = h.apd();
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, desc), SQL_SUCCESS);
+        // ODBC spec: passing back the handle originally allocated for this
+        // statement's APD is the other legal reset spelling, alongside null.
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC, implicit_apd),
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC),
+            (SQL_SUCCESS, implicit_apd)
+        );
+    }
+
+    /// An implicit descriptor can only ever be reassigned as its own
+    /// statement's ARD/APD (the reset case). Another statement's implicit
+    /// ARD, or this statement's own IRD/IPD, must be rejected — HY017 per the
+    /// ODBC reference ("was an implicitly allocated descriptor handle other
+    /// than the handle originally allocated for the ARD or APD").
+    #[test]
+    fn set_app_row_desc_rejects_another_statements_implicit_descriptor() {
+        use crate::api::sqlstate::SQLSTATE_HY017;
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other_stmt = h.alloc_extra_stmt();
+        let other_ard = read_desc(other_stmt, SQL_ATTR_APP_ROW_DESC).1;
+
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, other_ard),
+            SQL_ERROR
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            SQLSTATE_HY017
+        );
+        // Unchanged: still the implicit ARD.
+        assert_eq!(read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC).1, h.ard());
+    }
+
+    #[test]
+    fn set_app_row_desc_rejects_own_ird_as_ard() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let own_ird = h.ird();
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, own_ird), SQL_ERROR);
+        assert_eq!(read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC).1, h.ard());
+    }
+
+    /// `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC)` rejects an
+    /// explicit descriptor allocated on a different connection — HY024 per
+    /// the ODBC reference.
+    #[test]
+    fn set_app_row_desc_rejects_cross_connection_descriptor() {
+        use crate::api::sqlstate::SQLSTATE_HY024;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_other_connection();
+
+        assert_eq!(
+            set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, other.desc),
+            SQL_ERROR
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            SQLSTATE_HY024
+        );
+        assert_eq!(read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC).1, h.ard());
+    }
+
+    /// One explicit descriptor may be associated with more than one
+    /// statement at once (AB#47436 scope: "Preserve sound synchronization and
+    /// lifetime rules when one explicit descriptor is associated with
+    /// multiple statements").
+    #[test]
+    fn explicit_descriptor_can_be_shared_by_two_statements() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other_stmt = h.alloc_extra_stmt();
+        let desc = h.alloc_explicit_desc();
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, desc), SQL_SUCCESS);
+        assert_eq!(
+            set_desc(other_stmt, SQL_ATTR_APP_ROW_DESC, desc),
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, desc)
+        );
+        assert_eq!(
+            read_desc(other_stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, desc)
+        );
+    }
+
+    /// `SQLFreeHandle(SQL_HANDLE_DESC)` on an explicit descriptor currently
+    /// associated with one or more statements resets every one of them back
+    /// to their own implicit descriptor, rather than leaving a dangling
+    /// pointer — mirrors msodbcsql's `FreeDesc(pADesc, NULL, ...)`.
+    #[test]
+    fn freeing_associated_descriptor_resets_statements_to_implicit() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other_stmt = h.alloc_extra_stmt();
+        let desc = h.alloc_explicit_desc();
+        let implicit_ard = h.ard();
+        let other_implicit_ard = read_desc(other_stmt, SQL_ATTR_APP_ROW_DESC).1;
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, desc), SQL_SUCCESS);
+        assert_eq!(
+            set_desc(other_stmt, SQL_ATTR_APP_ROW_DESC, desc),
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            h.free_explicit_desc(desc),
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, implicit_ard)
+        );
+        assert_eq!(
+            read_desc(other_stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, other_implicit_ard)
+        );
+    }
+
+    /// Freeing a statement that currently has an explicit descriptor
+    /// associated does not touch the descriptor itself: it is DBC-owned, not
+    /// STMT-owned, so it stays valid and can be reused on another statement.
+    #[test]
+    fn association_survives_statement_free_and_can_be_reused() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        let stmt_to_free = h.alloc_extra_stmt();
+        assert_eq!(
+            set_desc(stmt_to_free, SQL_ATTR_APP_ROW_DESC, desc),
+            SQL_SUCCESS
+        );
+
+        assert_eq!(h.free_extra_stmt(stmt_to_free), SQL_SUCCESS);
+
+        assert_eq!(set_desc(h.stmt, SQL_ATTR_APP_ROW_DESC, desc), SQL_SUCCESS);
+        assert_eq!(
+            read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
+            (SQL_SUCCESS, desc)
         );
     }
 }

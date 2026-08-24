@@ -39,6 +39,7 @@ pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY016: [u8; 5] = *b"HY016";
+pub(crate) const SQLSTATE_HY017: [u8; 5] = *b"HY017";
 pub(crate) const SQLSTATE_HY020: [u8; 5] = *b"HY020";
 pub(crate) const SQLSTATE_HY021: [u8; 5] = *b"HY021";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
@@ -110,6 +111,17 @@ pub(crate) const ERR_INVALID_DESCRIPTOR_FIELD: DiagMsg = DiagMsg {
 pub(crate) const ERR_CANNOT_MODIFY_IRD: DiagMsg = DiagMsg {
     state: SQLSTATE_HY016,
     text: "Cannot modify an implementation row descriptor",
+};
+/// `SQLFreeHandle(SQL_HANDLE_DESC, ...)` on an implicitly-allocated
+/// descriptor, or `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC, ...)`
+/// given an implicitly-allocated descriptor other than the statement's own
+/// ARD/APD (i.e. another statement's ARD/APD, or this statement's own
+/// IRD/IPD). Matches the ODBC reference's HY017 entries for both functions —
+/// implicit descriptors are owned by their statement and can never be freed
+/// or reassigned as if they were explicit handles.
+pub(crate) const ERR_INVALID_USE_OF_AUTO_DESC: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY017,
+    text: "Invalid use of an automatically allocated descriptor handle",
 };
 /// `SQL_DESC_TYPE` set to the verbose `SQL_DATETIME` marker before a valid
 /// `SQL_DESC_DATETIME_INTERVAL_CODE` identifies which date/time member is
