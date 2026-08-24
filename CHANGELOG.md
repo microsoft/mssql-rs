@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-odbc`: input parameter binding (`SQLBindParameter` with
+  `SQL_PARAM_INPUT`) for the character and integer type families. Any other
+  `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
+  including when the bound value is `SQL_NULL_DATA`: a SQL type that cannot
+  carry a value cannot carry a typed NULL either, so an application never gets a
+  binding that works for `NULL` and fails on its first real value. `ColumnSize`
+  is validated against the `ParameterType` at bind time (`HY104`), matching
+  msodbcsql's `CheckSqlPrecScale`.
+
 - `mssql-tds`: `SqlType::Variant` for passing `sql_variant` values as RPC / `sp_executesql`
   parameters.
 

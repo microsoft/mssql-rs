@@ -139,13 +139,17 @@ pub(crate) const ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
     text: "Parameter SQL type not yet implemented",
 };
-pub(crate) const ERR_INVALID_PARAM_COLUMN_SIZE: DiagMsg = DiagMsg {
-    state: SQLSTATE_HY104,
-    text: "Invalid parameter ColumnSize for the SQL type",
+pub(crate) const ERR_PARAM_CONVERSION_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HYC00,
+    text: "Parameter conversion not yet implemented",
 };
-pub(crate) const ERR_INVALID_PARAM_DECIMAL_DIGITS: DiagMsg = DiagMsg {
+// Covers both `ColumnSize` and `DecimalDigits`, as the ODBC 3.x `HY104` entry
+// does. msodbcsql splits the text (IDS_S1_104 for precision, IDS_S1_094 for
+// scale) but reports the one state either way
+// (`Sql/Ntdbms/sqlncli/cli_common/src/clntcomn.cpp`). S1094 is ODBC 2.x and is not used here.
+pub(crate) const ERR_INVALID_PARAM_PRECISION_OR_SCALE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY104,
-    text: "Invalid parameter DecimalDigits for the SQL type",
+    text: "Invalid precision or scale value",
 };
 /// A bound column delivered NULL but the application supplied no indicator to
 /// receive it, so the value cannot be reported at all.

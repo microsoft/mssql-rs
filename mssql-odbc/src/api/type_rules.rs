@@ -44,6 +44,19 @@ use crate::handles::OdbcVersion;
 /// Offset between the ODBC 2.x (`9`..`11`) and 3.x (`91`..`93`) date/time ids.
 const ODBC2_DATETIME_OFFSET: SqlSmallInt = SQL_C_TYPE_DATE - SQL_C_DATE;
 
+// Maximum declarable precision per SQL type, in characters. Names and values
+// both match `Sql/Ntdbms/sqlncli/tds/tds.h`, so a cross-check against msodbcsql
+// is a direct comparison. Note that its `SQL_PREC_CHARBINARY` is a *different*
+// constant, 255 - the TDS 4.2 `SQLCHARACTER` limit that `SQLBIGCHAR` superseded
+// and that this driver never declares.
+pub(crate) const SQL_PREC_BIGCHARBINARY: usize = 8000;
+pub(crate) const SQL_PREC_NCHAR: usize = 4000;
+pub(crate) const SQL_PREC_TEXTIMAGE: usize = 2_147_483_647;
+pub(crate) const SQL_PREC_NTEXT: usize = 1_073_741_823;
+pub(crate) const SQL_PREC_NUMERIC: usize = 38;
+/// `ColumnSize` 0, which only the `max`-capable types accept.
+pub(crate) const SQL_PREC_UNLIMITED: usize = 0;
+
 /// Folds the deprecated 2.x date/time C spellings onto their `SQL_C_TYPE_*`
 /// equivalents so everything downstream sees one form per type.
 ///
@@ -58,6 +71,71 @@ pub(crate) fn canonical_c_type(c_type: SqlSmallInt) -> SqlSmallInt {
     }
 }
 
+/// The C type a parameter binding effectively names, once the SQL type is known.
+///
+/// `SQL_C_TINYINT` is sign-unknown: `sqlext.h` gives it neither
+/// `SQL_SIGNED_OFFSET` nor `SQL_UNSIGNED_OFFSET`. The rule in both directions is
+/// that a tinyint-to-tinyint transfer moves the byte unchanged, and every other
+/// pairing reads it signed.
+///
+/// The fetch direction expresses that by copying the byte outright, so no sign
+/// is ever chosen. A parameter cannot: `read_param_value` widens every integer
+/// C type to `i128`, and widening forces an interpretation. Signed would corrupt
+/// the transfer - an application byte of `0xC8` becomes `-56`, which the tinyint
+/// column cannot hold - so unsigned is the reading that keeps the widening
+/// lossless. The rewrite is how "move the byte unchanged" is spelled in a
+/// pipeline that has to widen.
+///
+/// msodbcsql needs the same rewrite for the same reason, since its parameter
+/// path also loads into a widened `Temp` before converting
+/// (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp`, `ParamToSQLType`: "If both are
+/// tinyint, change C type to unsigned").
+///
+/// `SQL_C_STINYINT` is excluded here exactly as it is excluded from the
+/// fetch-side byte copy, and any wider `ParameterType` keeps the signed reading.
+///
+/// No other integer needs this: `tinyint` is the only [unsigned SQL Server
+/// integer type](https://learn.microsoft.com/en-us/sql/t-sql/data-types/int-bigint-smallint-and-tinyint-transact-sql),
+/// so it is the only one whose same-width pairing reads differently signed.
+/// `SQL_C_SHORT` and `SQL_C_LONG` carry no sign offset either, but `smallint`
+/// and `int` are signed, so the signed reading is already right for them.
+pub(crate) fn effective_param_c_type(c_type: SqlSmallInt, sql_type: SqlSmallInt) -> SqlSmallInt {
+    if c_type == SQL_C_TINYINT && sql_type == SQL_TINYINT {
+        SQL_C_UTINYINT
+    } else {
+        c_type
+    }
+}
+
+/// Whether `ColumnSize` is legal for `sql_type` on a parameter binding.
+///
+/// Mirrors msodbcsql's `CheckSqlPrecScale<TRUE>`
+/// (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`), which `SQLBindParameter` runs after
+/// the type and conversion checks. Its `CheckSqlPrec` helper rejects both an
+/// over-long size and **zero** - `SQL_PREC_UNLIMITED` is 0, so a fixed-length
+/// declaration cannot use it. The variable-length types are the exception:
+/// against a Yukon-or-later server they only reject an over-long size, because
+/// there 0 *is* the `max` spelling.
+///
+/// msodbcsql clamps instead of failing for an ODBC 2.x application; this driver
+/// is 3.x only, so it always reports `HY104`.
+pub(crate) fn parameter_column_size_is_valid(sql_type: SqlSmallInt, column_size: usize) -> bool {
+    // The lower bound carries the `max` rule: the variable-length types start at
+    // `SQL_PREC_UNLIMITED`, the rest at 1 so that 0 reads as a zero-length
+    // declaration and is rejected.
+    let valid = match sql_type {
+        SQL_CHAR | SQL_BINARY => 1..=SQL_PREC_BIGCHARBINARY,
+        SQL_WCHAR => 1..=SQL_PREC_NCHAR,
+        SQL_VARCHAR | SQL_VARBINARY => SQL_PREC_UNLIMITED..=SQL_PREC_BIGCHARBINARY,
+        SQL_WVARCHAR | SQL_SS_XML => SQL_PREC_UNLIMITED..=SQL_PREC_NCHAR,
+        SQL_LONGVARCHAR | SQL_LONGVARBINARY => 1..=SQL_PREC_TEXTIMAGE,
+        SQL_WLONGVARCHAR => 1..=SQL_PREC_NTEXT,
+        SQL_DECIMAL | SQL_NUMERIC => 1..=SQL_PREC_NUMERIC,
+        _ => return true,
+    };
+    valid.contains(&column_size)
+}
+
 /// Known ODBC C type identifiers in canonical form, including the SQL Server
 /// extensions.
 ///
@@ -69,9 +147,7 @@ pub(crate) fn canonical_c_type(c_type: SqlSmallInt) -> SqlSmallInt {
 /// friends.
 ///
 /// This is the `HY003` gate only. A C type listed here that the driver cannot
-/// yet convert is rejected later with `07006`, matching msodbcsql, which treats
-/// an unconvertible-but-real C type as a restricted conversion rather than an
-/// out-of-range program type.
+/// yet convert is rejected later with by [`crate::params::conversion_matrix`].
 pub(crate) fn is_valid_c_type(c_type: SqlSmallInt) -> bool {
     debug_assert_eq!(
         c_type,
@@ -107,6 +183,27 @@ pub(crate) fn is_valid_c_type(c_type: SqlSmallInt) -> bool {
             | SQL_C_SS_VECTOR
             | SQL_C_DEFAULT
             | SQL_C_INTERVAL_YEAR..=SQL_C_INTERVAL_MINUTE_TO_SECOND
+    )
+}
+
+/// Whether `c_type` is one of the fixed-width integer C types.
+///
+/// `SQL_C_BIT` is deliberately excluded: it is a distinct ODBC type with its own
+/// 0/1 value model, not an integer.
+pub(crate) fn is_integer_c_type(c_type: SqlSmallInt) -> bool {
+    matches!(
+        c_type,
+        SQL_C_STINYINT
+            | SQL_C_TINYINT
+            | SQL_C_UTINYINT
+            | SQL_C_SSHORT
+            | SQL_C_SHORT
+            | SQL_C_USHORT
+            | SQL_C_SLONG
+            | SQL_C_LONG
+            | SQL_C_ULONG
+            | SQL_C_SBIGINT
+            | SQL_C_UBIGINT
     )
 }
 
@@ -223,7 +320,7 @@ mod tests {
     #[test]
     fn real_c_types_are_valid_even_when_unconvertible() {
         // These are legal ODBC C types the driver cannot convert yet; they must
-        // pass the HY003 gate so the conversion check can report 07006 instead.
+        // pass the HY003 gate so the conversion check can report error instead.
         for c_type in [
             SQL_C_SLONG,
             SQL_C_SBIGINT,
@@ -355,6 +452,74 @@ mod tests {
                 SqlTypeSupport::NotImplemented,
                 "{sql_type} should be HYC00, not a conversion failure"
             );
+        }
+    }
+
+    /// Only the variable-length types read `ColumnSize` 0 as the `max` spelling;
+    /// everywhere else msodbcsql's `CheckSqlPrec` rejects it, because
+    /// `SQL_PREC_UNLIMITED` is 0.
+    #[test]
+    fn zero_column_size_is_max_only_for_the_variable_length_types() {
+        for sql_type in [SQL_VARCHAR, SQL_WVARCHAR, SQL_VARBINARY, SQL_SS_XML] {
+            assert!(
+                parameter_column_size_is_valid(sql_type, 0),
+                "{sql_type} should read 0 as max"
+            );
+        }
+        for sql_type in [
+            SQL_CHAR,
+            SQL_WCHAR,
+            SQL_BINARY,
+            SQL_LONGVARCHAR,
+            SQL_WLONGVARCHAR,
+            SQL_DECIMAL,
+        ] {
+            assert!(
+                !parameter_column_size_is_valid(sql_type, 0),
+                "{sql_type} should reject 0"
+            );
+        }
+    }
+
+    #[test]
+    fn column_size_limits_follow_the_sql_type() {
+        assert!(parameter_column_size_is_valid(SQL_CHAR, 8000));
+        assert!(!parameter_column_size_is_valid(SQL_CHAR, 8001));
+        assert!(parameter_column_size_is_valid(SQL_WCHAR, 4000));
+        assert!(!parameter_column_size_is_valid(SQL_WCHAR, 4001));
+        assert!(parameter_column_size_is_valid(SQL_VARCHAR, 8000));
+        assert!(!parameter_column_size_is_valid(SQL_VARCHAR, 8001));
+        assert!(parameter_column_size_is_valid(SQL_SS_XML, 4000));
+        assert!(!parameter_column_size_is_valid(SQL_SS_XML, 4001));
+        assert!(parameter_column_size_is_valid(SQL_DECIMAL, 38));
+        assert!(!parameter_column_size_is_valid(SQL_DECIMAL, 39));
+        // The `long` variants bound at the `text`/`ntext` sizes, and `ntext` is
+        // half of `text` because its limit counts characters, not bytes.
+        assert!(parameter_column_size_is_valid(
+            SQL_LONGVARCHAR,
+            SQL_PREC_TEXTIMAGE
+        ));
+        assert!(!parameter_column_size_is_valid(
+            SQL_LONGVARCHAR,
+            SQL_PREC_TEXTIMAGE + 1
+        ));
+        assert!(parameter_column_size_is_valid(
+            SQL_LONGVARBINARY,
+            SQL_PREC_TEXTIMAGE
+        ));
+        assert!(parameter_column_size_is_valid(
+            SQL_WLONGVARCHAR,
+            SQL_PREC_NTEXT
+        ));
+        assert!(!parameter_column_size_is_valid(
+            SQL_WLONGVARCHAR,
+            SQL_PREC_NTEXT + 1
+        ));
+        // The integer, bit and guid types have a case in CheckSqlPrecScale that
+        // breaks without validating, so nothing is checked for them.
+        for sql_type in [SQL_INTEGER, SQL_SMALLINT, SQL_TINYINT, SQL_BIT, SQL_GUID] {
+            assert!(parameter_column_size_is_valid(sql_type, 0));
+            assert!(parameter_column_size_is_valid(sql_type, 999_999));
         }
     }
 }
