@@ -1097,12 +1097,6 @@ pub(crate) enum CurrentCommand {
     EndXact = 0xd5,
     BulkInsert = 0xf0,
     OpenCursor = 0x20,
-    /// `sp_cursorfetch` completion. Excluded from update counts, matching
-    /// msodbcsql (`Info != SQLFETCHCURSOR`, sqlctokn.cpp:2151).
-    FetchCursor = 0x21,
-    /// `DBCC` completion. Excluded from update counts, matching msodbcsql
-    /// (`Info != SQLDBCC`, sqlctokn.cpp:2152).
-    Dbcc = 0xe6,
     Merge = 0x117,
 }
 
@@ -1120,21 +1114,17 @@ impl TryFrom<u16> for CurrentCommand {
             0xd5 => Ok(CurrentCommand::EndXact),
             0xf0 => Ok(CurrentCommand::BulkInsert),
             0x20 => Ok(CurrentCommand::OpenCursor),
-            0x21 => Ok(CurrentCommand::FetchCursor),
-            0xe6 => Ok(CurrentCommand::Dbcc),
             0x117 => Ok(CurrentCommand::Merge),
             // All unknown values are treated as None, and considered valid.
             //
             // This catch-all carries correctness weight: `advance_to_result_boundary`
             // gates `SQLRowCount` semantics on `cur_cmd`, so an unrecognized value
             // lands in the "this DONE_COUNT is a real update count" branch. That is
-            // deliberate and matches msodbcsql, which uses a deny-list
-            // (`Info != SQLSELECT && != SQLFETCHCURSOR && != SQLDBCC`,
-            // sqlctokn.cpp:2149-2152) rather than an allow-list, so an unknown
-            // command with a valid count still yields RS_COUNT. Do not convert this
-            // to an allow-list without a matching change in the reference driver;
-            // instead add the specific variant that must be excluded, as was done
-            // for `FetchCursor` and `Dbcc`.
+            // deliberate: both reference drivers deny-list rather than allow-list
+            // (msodbcsql `Info != SQLSELECT && ...`, sqlctokn.cpp:2149-2152; .NET
+            // SqlClient `curCmd != TdsEnums.SELECT`), so an unknown command with a
+            // valid count still counts there too. Do not convert this to an
+            // allow-list; exclude a command by adding its specific variant.
             _ => Ok(CurrentCommand::None),
         }
     }
@@ -1523,8 +1513,6 @@ mod coverage_tests {
             (0xd5, CurrentCommand::EndXact),
             (0xf0, CurrentCommand::BulkInsert),
             (0x20, CurrentCommand::OpenCursor),
-            (0x21, CurrentCommand::FetchCursor),
-            (0xe6, CurrentCommand::Dbcc),
             (0x117, CurrentCommand::Merge),
         ];
         for &(val, expected) in cases {
