@@ -515,7 +515,6 @@ mod tests {
         BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
-            c_type_defaulted: false,
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
@@ -613,7 +612,6 @@ mod tests {
         state.bound_params.push(Some(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
-            c_type_defaulted: false,
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
@@ -649,7 +647,6 @@ mod tests {
         state.bound_params.push(Some(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
-            c_type_defaulted: false,
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
@@ -681,7 +678,6 @@ mod tests {
         state.bound_params.push(Some(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_CHAR,
-            c_type_defaulted: false,
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
@@ -710,7 +706,6 @@ mod tests {
         state.bound_params.push(Some(BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type: SQL_C_LONG,
-            c_type_defaulted: false,
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,

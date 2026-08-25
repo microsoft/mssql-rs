@@ -53,6 +53,7 @@ pub struct ScriptedToken(Tokens);
 struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     reset_mode: ResetConnectionMode,
+    reset_dispatched: bool,
     known_dead: bool,
 }
 
@@ -61,6 +62,7 @@ impl TokenReplayTransport {
         Self {
             pending_tokens: VecDeque::from(tokens),
             reset_mode: ResetConnectionMode::None,
+            reset_dispatched: false,
             known_dead: false,
         }
     }
@@ -157,9 +159,16 @@ impl NetworkWriter for TokenReplayTransport {
     }
     fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
         self.reset_mode = mode;
+        self.reset_dispatched = false;
     }
     fn take_reset_mode(&mut self) -> ResetConnectionMode {
         std::mem::replace(&mut self.reset_mode, ResetConnectionMode::None)
+    }
+    fn note_reset_dispatched(&mut self) {
+        self.reset_dispatched = true;
+    }
+    fn take_reset_dispatched(&mut self) -> bool {
+        std::mem::replace(&mut self.reset_dispatched, false)
     }
 }
 
@@ -347,6 +356,7 @@ pub(crate) mod byte_stream {
         reader: MockReader,
         registry: crate::io::token_stream::GenericTokenParserRegistry,
         nbc_bitmap_scratch: Option<std::sync::Arc<[u8]>>,
+        known_dead: bool,
     }
 
     impl ByteStreamTransport {
@@ -355,6 +365,7 @@ pub(crate) mod byte_stream {
                 reader: MockReader::new(bytes),
                 registry: crate::io::token_stream::GenericTokenParserRegistry::default(),
                 nbc_bitmap_scratch: None,
+                known_dead: false,
             }
         }
     }
@@ -465,6 +476,11 @@ pub(crate) mod byte_stream {
         fn take_reset_mode(&mut self) -> ResetConnectionMode {
             ResetConnectionMode::None
         }
+        // This transport never carries a reset, so there is nothing to record.
+        fn note_reset_dispatched(&mut self) {}
+        fn take_reset_dispatched(&mut self) -> bool {
+            false
+        }
     }
 
     #[async_trait]
@@ -491,6 +507,12 @@ pub(crate) mod byte_stream {
         }
         fn is_connection_dead(&self) -> bool {
             false
+        }
+        fn connection_known_dead(&self) -> bool {
+            self.known_dead
+        }
+        fn mark_known_dead(&mut self) {
+            self.known_dead = true;
         }
     }
 

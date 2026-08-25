@@ -482,7 +482,6 @@ mod tests {
                 state.bound_params.push(Some(crate::params::BoundParam {
                     input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
                     c_type: SQL_C_CHAR,
-                    c_type_defaulted: false,
                     sql_type: crate::api::odbc_types::SQL_VARCHAR,
                     column_size: 0,
                     decimal_digits: 0,
@@ -520,7 +519,6 @@ mod tests {
                 state.bound_params.push(Some(crate::params::BoundParam {
                     input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
                     c_type: crate::api::odbc_types::SQL_C_WCHAR,
-                    c_type_defaulted: false,
                     sql_type: crate::api::odbc_types::SQL_WVARCHAR,
                     column_size: 0,
                     decimal_digits: 0,

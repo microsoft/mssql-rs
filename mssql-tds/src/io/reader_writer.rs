@@ -28,6 +28,23 @@ pub(crate) trait NetworkWriter: Send + Sync + TransportSslHandler {
         ResetConnectionMode::None
     }
 
+    /// Records that a packet header carrying the reset request taken by
+    /// [`take_reset_mode`](Self::take_reset_mode) reached the wire, so the
+    /// server now owes a `ResetConnection` ENVCHANGE for it.
+    ///
+    /// The packet writer, not the client, consumes the armed mode, so this is
+    /// how `TdsClient` learns that the bit was actually sent and that the
+    /// acknowledgement is now verifiable.
+    ///
+    /// Deliberately has no default body, unlike the reset-mode accessors above:
+    /// this pair backs a safety check, and a transport that silently forgot it
+    /// would disable acknowledgement verification with no compile error.
+    fn note_reset_dispatched(&mut self);
+
+    /// Atomically reads and clears the record left by
+    /// [`note_reset_dispatched`](Self::note_reset_dispatched).
+    fn take_reset_dispatched(&mut self) -> bool;
+
     /// Returns the TLS channel binding token (`tls-unique`, RFC 5929 §3) for
     /// the active connection, if one is available.
     ///

@@ -10,12 +10,8 @@
 //! Data-at-execution is rejected with `HYC00`, `SQL_DEFAULT_PARAM` with
 //! `07S01`, and an invalid negative `StrLen_or_Ind` with `HY090`.
 //!
-//! A `SQL_NULL_DATA` parameter that was bound with `SQL_C_DEFAULT` is
-//! materialised as a typed TDS NULL from `sql_type`, because a defaulted
-//! binding describes its value through the SQL type rather than through the
-//! resolved C type.
-
-use std::slice;
+//! A `SQL_NULL_DATA` parameter is materialised as a typed TDS NULL from
+//! `sql_type` -- see [`typed_null`].
 
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
@@ -26,28 +22,32 @@ use mssql_tds::message::parameters::rpc_parameters::{
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
-    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DEFAULT_PARAM, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
-    SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NTS, SQL_NULL_DATA,
-    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
-    SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
-    SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
-    SQL_WVARCHAR, SqlLen, SqlSmallInt, SqlSsVectorLayout,
+    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
+    SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL,
+    SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_VECTOR,
+    SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME,
+    SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
+    SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
-    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_INVALID_PARAM_COLUMN_SIZE,
-    ERR_INVALID_PARAM_DECIMAL_DIGITS, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
-    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
-    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
+    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_NULL_POINTER,
+    ERR_INVALID_PARAM_PRECISION_OR_SCALE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED, ERR_RESTRICTED_DATA_TYPE,
 };
+use crate::conversion::error::ConvError;
+use crate::conversion::numeric::narrow_i128;
+use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
 use crate::params::BoundParam;
 
 /// Why a bound parameter could not be turned into an RPC parameter.
 ///
-/// Each variant carries its own SQLSTATE through [`diag`]; none of these are
-/// value-conversion failures, which arrive from
-/// [`crate::conversion::error::ConvError`] instead.
+/// Each variant carries its own SQLSTATE through [`diag`]. All but [`Value`]
+/// describe the binding rather than the data; [`Value`] wraps a
+/// [`crate::conversion::error::ConvError`] from the shared value model.
 ///
 /// [`diag`]: ParamBuildError::diag
+/// [`Value`]: ParamBuildError::Value
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParamBuildError {
     /// Backstop only: bind time rejects any C type the conversion matrix does
@@ -64,12 +64,16 @@ pub(crate) enum ParamBuildError {
     InvalidUseOfDefaultParam,
     /// `StrLen_or_Ind` is a negative value that is not a valid input length.
     InvalidLength(SqlLen),
+    /// The parameter carries a value but `ParameterValuePtr` is null.
+    NullValuePointer,
     /// `ColumnSize` cannot be expressed as a T-SQL declaration for `SqlType`.
     InvalidParameterSize(usize),
     /// `DecimalDigits` cannot be expressed as a T-SQL scale for `SqlType`.
     InvalidDecimalDigits(SqlSmallInt),
     /// The SQL type cannot be materialised as a typed NULL.
     UnsupportedSqlType(SqlSmallInt),
+    /// The value could not be represented in the target SQL type.
+    Value(ConvError),
 }
 
 impl ParamBuildError {
@@ -79,9 +83,19 @@ impl ParamBuildError {
             Self::DataAtExecNotStaged => ERR_DATA_AT_EXEC_NOT_STAGED,
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
-            Self::InvalidParameterSize(_) => ERR_INVALID_PARAM_COLUMN_SIZE,
-            Self::InvalidDecimalDigits(_) => ERR_INVALID_PARAM_DECIMAL_DIGITS,
+            Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
+            Self::InvalidParameterSize(_) | Self::InvalidDecimalDigits(_) => {
+                ERR_INVALID_PARAM_PRECISION_OR_SCALE
+            }
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
+            Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
+            Self::Value(ConvError::InvalidCharacterValue) => ERR_INVALID_CHARACTER_VALUE,
+            // Backstop only: parameter legality is settled by the bind-time
+            // matrix, and `NotHandledHere` is an internal routing signal that is
+            // never meant to reach an application.
+            Self::Value(ConvError::Restricted | ConvError::NotHandledHere) => {
+                ERR_RESTRICTED_DATA_TYPE
+            }
         }
     }
 }
@@ -112,71 +126,31 @@ pub(crate) unsafe fn bound_param_to_rpc(
 pub(crate) unsafe fn bound_param_to_value(
     param: &BoundParam,
 ) -> Result<TypedValue, ParamBuildError> {
-    let indicator = if param.strlen_or_ind_ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { *param.strlen_or_ind_ptr })
+    // NULL is settled from the indicator alone, so a typed NULL never reads the
+    // value buffer.
+    let len_spec = match unsafe { read_indicator(param) }? {
+        Indicator::Null => {
+            return typed_null(param.sql_type, param.column_size, param.decimal_digits);
+        }
+        Indicator::Length(len) => len,
     };
 
-    if let Some(ind) = indicator {
-        if ind == SQL_NULL_DATA {
-            return null_value(param);
+    let value = match unsafe { read_param_value(param, len_spec) }? {
+        AppValue::Integer(v) => integer_value(param.sql_type, v)?,
+        AppValue::NarrowText(bytes) => {
+            // `SqlString`'s UTF-8 decode unwraps, so only hand it bytes already
+            // checked. Valid input keeps its allocation all the way to the wire.
+            let bytes = match String::from_utf8(bytes) {
+                Ok(text) => text.into_bytes(),
+                Err(e) => String::from_utf8_lossy(e.as_bytes())
+                    .into_owned()
+                    .into_bytes(),
+            };
+            SqlType::VarcharMax(Some(SqlString::new(bytes, EncodingType::Utf8)))
         }
-        if ind == SQL_DEFAULT_PARAM {
-            return Err(ParamBuildError::InvalidUseOfDefaultParam);
-        }
-        // Never reached through SQLExecute / SQLExecDirect, which stage these
-        // as streaming placeholders. Refusing here keeps the application's
-        // dummy token from being read as a value if that routing ever breaks,
-        // and reports the staging bug instead of the misleading "invalid
-        // length" the negative indicator would otherwise draw below.
-        if is_data_at_exec_indicator(ind) {
-            return Err(ParamBuildError::DataAtExecNotStaged);
-        }
-        // Any remaining negative indicator  is invalid for an input parameter
-        if ind < 0 && ind != SQL_NTS as SqlLen {
-            return Err(ParamBuildError::InvalidLength(ind));
-        }
-    }
-
-    // For string C types a null indicator pointer means "null-terminated".
-    let len_spec = indicator.unwrap_or(SQL_NTS as SqlLen);
-
-    // A defaulted binding describes its value through `sql_type`, but the match
-    // below reads only `c_type`. `resolve_default_c_type` maps `decimal`,
-    // `numeric`, `sql_variant` and `xml` onto a character C type, so without
-    // this guard those would be read as text and sent as `varchar(max)` /
-    // `nvarchar(max)` -- a type the application never asked for, and one the
-    // server cannot assign to a `sql_variant` at all. Only the character SQL
-    // types genuinely describe a character buffer.
-    if param.c_type_defaulted
-        && !matches!(
-            param.sql_type,
-            SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR | SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR
-        )
-    {
-        return Err(ParamBuildError::UnsupportedCType(param.c_type));
-    }
-
-    let value = match param.c_type {
-        SQL_C_CHAR => {
-            let bytes =
-                unsafe { read_char_bytes(param.parameter_value_ptr as *const u8, len_spec) };
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            SqlType::VarcharMax(Some(SqlString::from_utf8_string(text)))
-        }
-        SQL_C_WCHAR => {
-            let bytes =
-                unsafe { read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec) };
+        AppValue::WideText(bytes) => {
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
-        SQL_C_BINARY => {
-            let bytes = unsafe { read_binary_bytes(param, len_spec)? };
-            SqlType::VarBinaryMax(Some(bytes))
-        }
-        // Non-character default C types reach here only through an explicit
-        // binding; this driver does not yet convert their buffers.
-        other => return Err(ParamBuildError::UnsupportedCType(other)),
     };
 
     Ok((value, None))
@@ -200,6 +174,22 @@ pub(crate) fn dae_placeholder_type(
         other => Err(ParamBuildError::UnsupportedCType(other)),
     }
 }
+/// Emits the integer `SqlType` named by `ParameterType`, not by the C type, so
+/// `@P1` is declared as the application asked. A value outside the target's
+/// range is `22003` rather than a silently wrapped wire value.
+fn integer_value(sql_type: SqlSmallInt, v: i128) -> Result<SqlType, ParamBuildError> {
+    Ok(match sql_type {
+        SQL_TINYINT => {
+            SqlType::TinyInt(Some(narrow_i128::<u8>(v).map_err(ParamBuildError::Value)?))
+        }
+        SQL_SMALLINT => {
+            SqlType::SmallInt(Some(narrow_i128::<i16>(v).map_err(ParamBuildError::Value)?))
+        }
+        SQL_INTEGER => SqlType::Int(Some(narrow_i128::<i32>(v).map_err(ParamBuildError::Value)?)),
+        SQL_BIGINT => SqlType::BigInt(Some(narrow_i128::<i64>(v).map_err(ParamBuildError::Value)?)),
+        other => return Err(ParamBuildError::UnsupportedSqlType(other)),
+    })
+}
 /// A TDS value plus the precision/scale the RPC layer must use for both the
 /// `@P1 <type>` declaration and the wire `TYPE_INFO`.
 type TypedValue = (SqlType, Option<RpcTypeMetadata>);
@@ -215,24 +205,11 @@ const MAX_DATETIME_SCALE: u8 = 7;
 
 /// Typed NULL for a bound parameter.
 ///
-/// A binding made with `SQL_C_DEFAULT` carries its type in `sql_type`, so the
-/// NULL is built from that: `SQL_DECIMAL` resolves to a `SQL_C_CHAR` buffer, and
-/// declaring that parameter `varchar` would send the server the wrong type.
-/// An explicit character binding keeps its C type, which the conversion matrix
-/// has already paired with a character SQL type.
-fn null_value(param: &BoundParam) -> Result<TypedValue, ParamBuildError> {
-    if param.c_type_defaulted {
-        return default_typed_null(param.sql_type, param.column_size, param.decimal_digits);
-    }
-    match param.c_type {
-        SQL_C_CHAR => Ok((SqlType::VarcharMax(None), None)),
-        SQL_C_WCHAR => Ok((SqlType::NVarcharMax(None), None)),
-        SQL_C_BINARY => Ok((SqlType::VarBinaryMax(None), None)),
-        other => Err(ParamBuildError::UnsupportedCType(other)),
-    }
-}
-
-/// Builds the typed NULL a `SQL_C_DEFAULT` binding describes.
+/// The type comes from `sql_type` whether or not the binding was defaulted: the
+/// C type only says how the value buffer would have been read, and a NULL has no
+/// buffer to read. msodbcsql does the same - `CRPCSQLSender::SendParamList`
+/// (`Sql/Ntdbms/sqlncli/odbc/sqlccmd.cpp`) builds the `@Pn <type>` declaration
+/// from `lpparam->fSqlType` and never consults the bound C type.
 ///
 /// `column_size` and `decimal_digits` come straight from the application, so
 /// every value that participates in the `@P1 <type>` declaration is validated
@@ -242,7 +219,7 @@ fn null_value(param: &BoundParam) -> Result<TypedValue, ParamBuildError> {
 /// The returned [`RpcTypeMetadata`] is the *only* place precision and scale are
 /// carried. [`RpcParameter`] uses it to render the declaration and to write the
 /// wire `TYPE_INFO`, so the two cannot drift apart.
-fn default_typed_null(
+fn typed_null(
     sql_type: SqlSmallInt,
     column_size: usize,
     decimal_digits: SqlSmallInt,
@@ -402,91 +379,15 @@ fn vector_metadata(
     Ok((dimensions, base_type))
 }
 
-/// Reads narrow (`SQL_C_CHAR`) bytes. `len_spec` is a byte count, or `SQL_NTS`
-/// for a NUL-terminated string.
-///
-/// # Safety
-/// `ptr`, if non-null, must be readable for the resolved length (or up to the
-/// first NUL when `len_spec == SQL_NTS`).
-unsafe fn read_char_bytes(ptr: *const u8, len_spec: SqlLen) -> Vec<u8> {
-    if ptr.is_null() {
-        return Vec::new();
-    }
-    let len = if len_spec == SQL_NTS as SqlLen {
-        let mut n = 0usize;
-        while unsafe { *ptr.add(n) } != 0 {
-            n += 1;
-        }
-        n
-    } else if len_spec < 0 {
-        0
-    } else {
-        len_spec as usize
-    };
-    unsafe { slice::from_raw_parts(ptr, len).to_vec() }
-}
-
-/// Reads raw (`SQL_C_BINARY`) bytes.
-///
-/// Binary buffers have no terminator, so the length must be stated. `len_spec`
-/// is the indicator value when the application supplied an indicator pointer;
-/// `SQL_NTS` here means it did not, and the ODBC contract falls back to
-/// `BufferLength`. A binding that states neither has no readable extent, so it
-/// is rejected rather than guessed at.
-///
-/// # Safety
-/// `param.parameter_value_ptr`, if non-null, must be readable for the resolved
-/// byte count.
-unsafe fn read_binary_bytes(
-    param: &BoundParam,
-    len_spec: SqlLen,
-) -> Result<Vec<u8>, ParamBuildError> {
-    let len = if len_spec == SQL_NTS as SqlLen {
-        if param.buffer_length < 0 {
-            return Err(ParamBuildError::InvalidLength(param.buffer_length));
-        }
-        param.buffer_length
-    } else {
-        len_spec
-    };
-    if param.parameter_value_ptr.is_null() || len == 0 {
-        return Ok(Vec::new());
-    }
-    Ok(
-        unsafe { slice::from_raw_parts(param.parameter_value_ptr as *const u8, len as usize) }
-            .to_vec(),
-    )
-}
-
-/// Reads wide (`SQL_C_WCHAR`) data as UTF-16LE bytes. `len_spec` is a **byte**
-/// count per the ODBC spec, or `SQL_NTS` for a NUL-terminated string.
-///
-/// # Safety
-/// `ptr`, if non-null, must be readable for the resolved number of `u16` units
-/// (or up to the first NUL when `len_spec == SQL_NTS`).
-unsafe fn read_wchar_bytes(ptr: *const u16, len_spec: SqlLen) -> Vec<u8> {
-    if ptr.is_null() {
-        return Vec::new();
-    }
-    let units = if len_spec == SQL_NTS as SqlLen {
-        let mut n = 0usize;
-        while unsafe { *ptr.add(n) } != 0 {
-            n += 1;
-        }
-        n
-    } else if len_spec < 0 {
-        0
-    } else {
-        (len_spec as usize) / std::mem::size_of::<u16>()
-    };
-    let slice = unsafe { slice::from_raw_parts(ptr, units) };
-    slice.iter().flat_map(|u| u.to_le_bytes()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_LONG, SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen};
+    use crate::api::odbc_types::{
+        SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_FLOAT, SQL_C_LONG, SQL_C_SLONG, SQL_C_STINYINT, SQL_C_UBIGINT,
+        SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS, SQL_NULL_DATA,
+        SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
+    };
+    use crate::params::conversion_matrix::is_supported_conversion;
     use std::ffi::c_void;
 
     /// A `ColumnSize` past every non-`max` limit, as an application binding an
@@ -498,7 +399,6 @@ mod tests {
         BoundParam {
             input_output_type: SQL_PARAM_INPUT,
             c_type,
-            c_type_defaulted: false,
             sql_type: 0,
             column_size: 0,
             decimal_digits: 0,
@@ -508,14 +408,156 @@ mod tests {
         }
     }
 
-    /// A parameter bound with `SQL_C_DEFAULT`. `SQLBindParameter` has already
-    /// resolved `c_type` to the SQL type's default C type, so only the flag
-    /// distinguishes it from an explicit bind of that same C type.
+    /// A parameter bound with `SQL_C_DEFAULT`, whose `c_type` `SQLBindParameter`
+    /// has already resolved - nothing then distinguishes it from an explicit
+    /// bind of that same C type.
     fn default_param(sql_type: SqlSmallInt, ind: *mut SqlLen) -> BoundParam {
         let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), ind);
-        p.c_type_defaulted = true;
         p.sql_type = sql_type;
         p
+    }
+
+    fn int_param(
+        c_type: SqlSmallInt,
+        sql_type: SqlSmallInt,
+        ptr: *mut c_void,
+        ind: *mut SqlLen,
+    ) -> BoundParam {
+        let mut p = param(c_type, ptr, ind);
+        p.sql_type = sql_type;
+        p
+    }
+
+    /// One buffer, four declarations: the wire type follows `ParameterType`, so
+    /// the server sees the type the application asked for rather than the width
+    /// of the C buffer it happened to bind.
+    #[test]
+    fn parameter_type_names_the_wire_type_not_the_c_type() {
+        let cases: &[(SqlSmallInt, SqlType)] = &[
+            (SQL_TINYINT, SqlType::TinyInt(Some(7))),
+            (SQL_SMALLINT, SqlType::SmallInt(Some(7))),
+            (SQL_INTEGER, SqlType::Int(Some(7))),
+            (SQL_BIGINT, SqlType::BigInt(Some(7))),
+        ];
+        for (sql_type, expected) in cases {
+            let mut v: i32 = 7;
+            let mut ind: SqlLen = 4;
+            let p = int_param(
+                SQL_C_SLONG,
+                *sql_type,
+                &mut v as *mut i32 as *mut c_void,
+                &mut ind,
+            );
+            let (value, metadata) = unsafe { bound_param_to_value(&p) }.unwrap();
+            assert_eq!(&value, expected, "case: sql_type {sql_type}");
+            assert_eq!(metadata, None, "case: sql_type {sql_type}");
+        }
+    }
+
+    /// A value the target cannot hold is 22003, not a silently wrapped value.
+    #[test]
+    fn value_outside_the_target_range_is_22003() {
+        let mut v: i32 = 300;
+        let mut ind: SqlLen = 4;
+        let p = int_param(
+            SQL_C_SLONG,
+            SQL_TINYINT,
+            &mut v as *mut i32 as *mut c_void,
+            &mut ind,
+        );
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::Value(ConvError::OutOfRange));
+        assert_eq!(err.diag().state, *b"22003");
+    }
+
+    /// `SQL_C_UBIGINT` is the one C type whose range exceeds every SQL target.
+    #[test]
+    fn ubigint_above_i64_max_is_22003() {
+        let mut v: u64 = i64::MAX as u64 + 1;
+        let mut ind: SqlLen = 8;
+        let p = int_param(
+            SQL_C_UBIGINT,
+            SQL_BIGINT,
+            &mut v as *mut u64 as *mut c_void,
+            &mut ind,
+        );
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::Value(ConvError::OutOfRange));
+    }
+
+    #[test]
+    fn integer_null_is_typed_by_parameter_type() {
+        for c_type in [SQL_C_SLONG, SQL_C_UBIGINT, SQL_C_STINYINT] {
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let mut p = int_param(c_type, SQL_INTEGER, std::ptr::null_mut(), &mut ind);
+            p.column_size = 10;
+            let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+            assert!(matches!(value, SqlType::Int(None)), "c_type {c_type}");
+        }
+    }
+
+    /// Every SQL type bind time calls `Supported` must have a NULL spelling, so
+    /// a parameter that binds can never fail at execute with "SQL type not
+    /// implemented". `SQL_SS_UDT` / `SQL_SS_TABLE` are the documented exception:
+    /// they need a server type name no describe call reports, and are rejected
+    /// at bind instead. Metadata validity is a separate concern, so only the
+    /// missing-arm error is checked.
+    #[test]
+    fn every_supported_sql_type_has_a_typed_null() {
+        use crate::api::odbc_types::SQL_SS_TABLE;
+        use crate::api::type_rules::{SqlTypeSupport, classify_parameter_sql_type};
+
+        let mut checked = 0;
+        for sql_type in -160..=120 {
+            if classify_parameter_sql_type(sql_type) != SqlTypeSupport::Supported
+                || matches!(sql_type, SQL_SS_UDT | SQL_SS_TABLE)
+            {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                !matches!(
+                    typed_null(sql_type, 10, 0),
+                    Err(ParamBuildError::UnsupportedSqlType(_))
+                ),
+                "no typed NULL for supported SQL type {sql_type}"
+            );
+        }
+        assert!(checked > 0, "no supported SQL types found");
+    }
+
+    /// The matrix promises at bind time that execute can convert the pairing, so
+    /// no pairing it accepts may come back "not implemented" from here.
+    #[test]
+    fn every_accepted_pairing_is_convertible() {
+        let mut buf = [0u8; 32];
+        let mut checked = 0;
+        for c_type in -160..=120 {
+            // Resolved at bind, so it never reaches the matrix.
+            if c_type == SQL_C_DEFAULT {
+                continue;
+            }
+            for sql_type in -160..=120 {
+                if !is_supported_conversion(c_type, sql_type) {
+                    continue;
+                }
+                let mut ind: SqlLen = 0;
+                let mut p = param(c_type, buf.as_mut_ptr() as *mut c_void, &mut ind);
+                p.sql_type = sql_type;
+                p.column_size = 10;
+                if let Err(
+                    e @ (ParamBuildError::UnsupportedCType(_)
+                    | ParamBuildError::UnsupportedSqlType(_)),
+                ) = unsafe { bound_param_to_value(&p) }
+                {
+                    panic!(
+                        "matrix accepts {c_type} -> {sql_type} but the converter returned {e:?}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "matrix iteration found no supported pairings");
     }
 
     #[test]
@@ -526,6 +568,23 @@ mod tests {
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::VarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hello"),
+            other => panic!("expected VarcharMax(Some), got {other:?}"),
+        }
+    }
+
+    /// Non-ASCII must survive the narrow path. `SqlString`'s UTF-8 decode
+    /// carries a TODO claiming UTF-16 decode "works better"; this pins that the
+    /// UTF-8 tag round-trips so the claim cannot silently become true.
+    #[test]
+    fn char_round_trips_non_ascii_utf8() {
+        let mut buf: Vec<u8> = "caf\u{e9} \u{2615}\0".as_bytes().to_vec();
+        let mut ind: SqlLen = SQL_NTS as SqlLen;
+        let p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarcharMax(Some(s)) => {
+                assert_eq!(s.to_utf8_string(), "caf\u{e9} \u{2615}")
+            }
             other => panic!("expected VarcharMax(Some), got {other:?}"),
         }
     }
@@ -644,7 +703,8 @@ mod tests {
     #[test]
     fn null_indicator_yields_typed_null() {
         let mut ind: SqlLen = SQL_NULL_DATA;
-        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_VARCHAR;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::VarcharMax(None)));
     }
@@ -652,10 +712,10 @@ mod tests {
     #[test]
     fn unsupported_c_type_is_rejected() {
         let mut ind: SqlLen = 4;
-        let mut val: i32 = 7;
-        let p = param(SQL_C_LONG, &mut val as *mut i32 as *mut c_void, &mut ind);
+        let mut val: f32 = 1.5;
+        let p = param(SQL_C_FLOAT, &mut val as *mut f32 as *mut c_void, &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_LONG));
+        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_FLOAT));
     }
 
     #[test]
@@ -700,17 +760,95 @@ mod tests {
     #[test]
     fn null_indicator_wchar_yields_typed_null() {
         let mut ind: SqlLen = SQL_NULL_DATA;
-        let p = param(SQL_C_WCHAR, std::ptr::null_mut(), &mut ind);
+        let mut p = param(SQL_C_WCHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_WVARCHAR;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::NVarcharMax(None)));
     }
 
     #[test]
-    fn null_indicator_unsupported_c_type_is_rejected() {
+    fn null_indicator_unsupported_sql_type_is_rejected() {
         let mut ind: SqlLen = SQL_NULL_DATA;
-        let p = param(SQL_C_LONG, std::ptr::null_mut(), &mut ind);
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_SS_UDT;
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_LONG));
+        assert_eq!(err, ParamBuildError::UnsupportedSqlType(SQL_SS_UDT));
+    }
+
+    /// A NULL is still declared with its SQL type, so a fixed-length one needs a
+    /// real length: `char(0)` is not legal T-SQL. `SQLBindParameter` rejects the
+    /// `ColumnSize` before this point, so reaching here means the two checks
+    /// disagree.
+    #[test]
+    fn explicit_char_null_with_zero_column_size_is_rejected() {
+        for (c_type, sql_type) in [(SQL_C_CHAR, SQL_CHAR), (SQL_C_WCHAR, SQL_WCHAR)] {
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let mut p = param(c_type, std::ptr::null_mut(), &mut ind);
+            p.sql_type = sql_type;
+            let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+            assert_eq!(
+                err,
+                ParamBuildError::InvalidParameterSize(0),
+                "sql_type {sql_type}"
+            );
+            assert_eq!(err.diag().state, *b"HY104");
+        }
+    }
+
+    /// The variable-length types read the same 0 as the `max` spelling.
+    #[test]
+    fn explicit_varchar_null_with_zero_column_size_is_max() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_VARCHAR;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::VarcharMax(None)));
+
+        let mut p = param(SQL_C_WCHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_WVARCHAR;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::NVarcharMax(None)));
+    }
+
+    /// `SQLBindParameter` screens `ColumnSize` with `parameter_column_size_is_valid`
+    /// and the declaration is built here from the same value, so the two encode
+    /// the same limits in two places. Anything the bind gate accepts must be
+    /// declarable, or the application gets `HY104` from a call it was told had
+    /// succeeded.
+    ///
+    /// Only that direction is asserted. The declaration is deliberately laxer:
+    /// an oversized variable-length `ColumnSize` widens to `max` here
+    /// (`variable_length`), which the bind gate rejects first, matching
+    /// msodbcsql's `CheckSqlPrec`.
+    #[test]
+    fn every_bind_accepted_column_size_is_declarable() {
+        use crate::api::type_rules::parameter_column_size_is_valid;
+
+        for sql_type in [
+            SQL_CHAR,
+            SQL_WCHAR,
+            SQL_BINARY,
+            SQL_VARCHAR,
+            SQL_WVARCHAR,
+            SQL_VARBINARY,
+            SQL_LONGVARCHAR,
+            SQL_WLONGVARCHAR,
+            SQL_LONGVARBINARY,
+            SQL_SS_XML,
+            SQL_DECIMAL,
+            SQL_NUMERIC,
+        ] {
+            for column_size in [0, 1, 37, 38, 39, 4000, 4001, 8000, 8001] {
+                if !parameter_column_size_is_valid(sql_type, column_size) {
+                    continue;
+                }
+                assert!(
+                    typed_null(sql_type, column_size, 0).is_ok(),
+                    "sql_type {sql_type}: bind accepts ColumnSize {column_size} \
+                     but the declaration cannot be built"
+                );
+            }
+        }
     }
 
     #[test]
@@ -727,39 +865,13 @@ mod tests {
         assert!(matches!(value, SqlType::NVarchar(None, 40)));
     }
 
-    /// Non-NULL defaulted binds are only readable for the character SQL types.
+    /// A defaulted bind of a character SQL type really can describe its buffer
+    /// with a character C type, so it reads normally.
     ///
-    /// `resolve_default_c_type` maps `decimal`, `numeric`, `sql_variant` and
-    /// `xml` onto `SQL_C_CHAR`/`SQL_C_WCHAR`, so without an explicit guard the
-    /// `c_type` match would read their buffers as text and send `varchar(max)`
-    /// or `nvarchar(max)`. `sql_variant` is the sharp edge: the server cannot
-    /// assign `varchar(max)` to it, so the application would see an opaque
-    /// server error instead of `HYC00`.
-    #[test]
-    fn default_non_null_rejects_sql_types_that_borrow_a_character_c_type() {
-        let mut buf: Vec<u8> = b"1.5\0".to_vec();
-        for (sql_type, c_type) in [
-            (SQL_DECIMAL, SQL_C_CHAR),
-            (SQL_NUMERIC, SQL_C_CHAR),
-            (SQL_SS_VARIANT, SQL_C_CHAR),
-            (SQL_SS_XML, SQL_C_WCHAR),
-        ] {
-            let mut ind: SqlLen = SQL_NTS as SqlLen;
-            let mut p = default_param(sql_type, &mut ind);
-            p.c_type = c_type;
-            p.parameter_value_ptr = buf.as_mut_ptr() as *mut c_void;
-            assert!(
-                matches!(
-                    unsafe { bound_param_to_value(&p) },
-                    Err(ParamBuildError::UnsupportedCType(_))
-                ),
-                "sql_type {sql_type} should not be read as a character buffer"
-            );
-        }
-    }
-
-    /// The guard above must not reject the character SQL types, which are the
-    /// ones a defaulted bind really can describe with a character buffer.
+    /// The converse - `decimal`, `numeric`, `sql_variant` and `xml` borrowing
+    /// `SQL_C_CHAR`/`SQL_C_WCHAR` and being read as text - is now rejected at
+    /// bind by the conversion matrix, and is covered by
+    /// `default_bind_rejects_sql_types_whose_default_c_type_is_character`.
     #[test]
     fn default_non_null_reads_character_sql_types() {
         let mut buf: Vec<u8> = b"hello\0".to_vec();
@@ -926,28 +1038,5 @@ mod tests {
             vector_metadata(header, 2).unwrap_err(),
             ParamBuildError::InvalidDecimalDigits(2)
         );
-    }
-
-    #[test]
-    fn read_char_bytes_edge_cases() {
-        assert!(unsafe { read_char_bytes(std::ptr::null(), 5) }.is_empty());
-        let buf = b"abc";
-        // Negative (non-NTS) length yields no bytes.
-        assert!(unsafe { read_char_bytes(buf.as_ptr(), -5) }.is_empty());
-        // Explicit positive length reads exactly that many bytes.
-        assert_eq!(unsafe { read_char_bytes(buf.as_ptr(), 3) }, b"abc");
-    }
-
-    #[test]
-    fn read_wchar_bytes_edge_cases() {
-        assert!(unsafe { read_wchar_bytes(std::ptr::null(), 5) }.is_empty());
-        let units: Vec<u16> = "hi".encode_utf16().chain(std::iter::once(0)).collect();
-        // SQL_NTS reads u16 units up to the NUL terminator.
-        assert_eq!(
-            unsafe { read_wchar_bytes(units.as_ptr(), SQL_NTS as SqlLen) },
-            vec![b'h', 0, b'i', 0]
-        );
-        // Negative (non-NTS) length yields no bytes.
-        assert!(unsafe { read_wchar_bytes(units.as_ptr(), -5) }.is_empty());
     }
 }

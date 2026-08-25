@@ -8,12 +8,12 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SS_TABLE, SQL_SS_UDT,
-    SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
+    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SqlHandle, SqlLen,
+    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::type_rules::{
     SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
-    resolve_default_c_type,
+    parameter_column_size_is_valid, resolve_default_c_type,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -176,8 +176,7 @@ fn sql_bind_parameter_safe(
 
     // Resolve SQL_C_DEFAULT here so the execute path never sees the placeholder,
     // matching msodbcsql, which stores the resolved type in the APD.
-    let c_type_defaulted = value_type == SQL_C_DEFAULT;
-    let c_type = if c_type_defaulted {
+    let c_type = if value_type == SQL_C_DEFAULT {
         let Some(resolved) = resolve_default_c_type(parameter_type, odbc_version) else {
             // Unreachable: every Supported type has a default C type, pinned by
             // every_supported_sql_type_has_a_default_c_type.
@@ -197,27 +196,24 @@ fn sql_bind_parameter_safe(
         value_type
     };
 
-    // The C type → SQL type conversion must be one we support (07006). A
-    // resolved `SQL_C_DEFAULT` is exempt: `resolve_default_c_type` returns the C
-    // type ODBC defines as that SQL type's default, so the pairing is supported
-    // by construction. The conversion matrix only enumerates the explicit
-    // character pairings implemented so far, and would otherwise reject the
-    // describe-then-bind flow `SQLDescribeParam` callers use.
-    //
-    // `SQL_SS_UDT` and `SQL_SS_TABLE` are the exception: they need the fully
-    // qualified server type name, which `SQLDescribeParam` does not report and
-    // this driver cannot otherwise obtain, so they are rejected on the bind call
-    // rather than at execute time.
-    let unsupported_default =
-        c_type_defaulted && matches!(parameter_type, SQL_SS_UDT | SQL_SS_TABLE);
-    if unsupported_default
-        || (!c_type_defaulted && !is_supported_conversion(c_type, parameter_type))
-    {
+    // The C type -> SQL type conversion must be one this driver implements.
+    if !is_supported_conversion(c_type, parameter_type) {
         error!(
             c_type,
             parameter_type, "SQLBindParameter: unsupported C/SQL type conversion"
         );
-        post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+        post_diag(&mut stmt_state, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED);
+        return SQL_ERROR;
+    }
+
+    // ColumnSize is validated last, after the type and conversion checks, the
+    // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
+    if !parameter_column_size_is_valid(parameter_type, column_size) {
+        error!(
+            parameter_type,
+            column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
+        );
+        post_diag(&mut stmt_state, ERR_INVALID_PARAM_PRECISION_OR_SCALE);
         return SQL_ERROR;
     }
 
@@ -244,7 +240,6 @@ fn sql_bind_parameter_safe(
     stmt_state.bound_params[idx] = Some(BoundParam {
         input_output_type,
         c_type,
-        c_type_defaulted,
         sql_type: parameter_type,
         column_size,
         decimal_digits,
@@ -302,8 +297,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA, SQL_NULL_HANDLE,
-        SQL_PARAM_OUTPUT, SQL_VARCHAR,
+        SQL_C_CHAR, SQL_C_FLOAT, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA,
+        SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -459,34 +454,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_conversion_returns_07006() {
-        let h = TestHandles::with_env_dbc_stmt();
-        let mut val: i32 = 0;
-        let mut ind: SqlLen = 0;
-        let ret = unsafe {
-            sql_bind_parameter(
-                h.stmt,
-                1,
-                SQL_PARAM_INPUT,
-                SQL_INTEGER,
-                SQL_INTEGER,
-                0,
-                0,
-                &mut val as *mut i32 as SqlPointer,
-                0,
-                &mut ind,
-            )
-        };
-        assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
-    }
-
-    #[test]
-    fn real_but_unconvertible_c_type_returns_07006() {
-        // SQL_C_SLONG is a legal ODBC C type the driver cannot convert yet, so it
-        // must fail the conversion check rather than the HY003 type check.
+    fn unsupported_conversion_returns_hyc00() {
+        // Both types are supported, but integer -> character is quadrant C (P5).
         let h = TestHandles::with_env_dbc_stmt();
         let mut val: i32 = 0;
         let mut ind: SqlLen = 0;
@@ -496,7 +465,7 @@ mod tests {
                 1,
                 SQL_PARAM_INPUT,
                 SQL_C_SLONG,
-                SQL_INTEGER,
+                SQL_VARCHAR,
                 0,
                 0,
                 &mut val as *mut i32 as SqlPointer,
@@ -507,7 +476,34 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+    }
+
+    #[test]
+    fn real_but_unconvertible_c_type_returns_hyc00() {
+        // SQL_C_FLOAT is a legal ODBC C type the driver cannot convert yet, so it
+        // must fail the conversion check rather than the HY003 type check.
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut val: f32 = 0.0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_FLOAT,
+                SQL_INTEGER,
+                0,
+                0,
+                &mut val as *mut f32 as SqlPointer,
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]
@@ -537,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn default_c_type_resolved_but_unconvertible_returns_07006() {
+    fn default_c_type_resolved_but_unconvertible_returns_hyc00() {
         // `SQL_SS_UDT` needs the fully qualified server type name, which
         // `SQLDescribeParam` does not report and the driver cannot otherwise
         // obtain, so a defaulted bind of it is still rejected up front.
@@ -560,16 +556,12 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
-    /// `SQL_C_DEFAULT` resolves to the C type ODBC defines as the SQL type's
-    /// default, so the pairing is supported by construction and must not be
-    /// re-checked against the character conversion matrix. Rejecting it here
-    /// would break the describe-then-bind flow `SQLDescribeParam` callers use,
-    /// where the value is frequently just a typed NULL.
+    #[ignore = "SQL_GUID has no conversion row yet; re-enable with GUID support - AB#47500"]
     #[test]
-    fn default_c_type_is_accepted_outside_the_character_matrix() {
+    fn default_c_type_guid_is_accepted_and_stored() {
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = SQL_NULL_DATA;
         let ret = unsafe {
@@ -590,8 +582,70 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         let bound = state.bound_params[0].expect("parameter 1 should be bound");
-        assert!(bound.c_type_defaulted);
+        assert_eq!(bound.c_type, crate::api::odbc_types::SQL_C_GUID);
         assert_eq!(bound.sql_type, SQL_GUID);
+    }
+
+    /// `resolve_default_c_type` maps some non-character SQL types onto a
+    /// character C type - ODBC says their default application representation is
+    /// a string. Those are the ones a widened `SQL_C_CHAR` / `SQL_C_WCHAR`
+    /// matrix row could start admitting by accident, and a defaulted
+    /// `SQL_DECIMAL` admitted that way would have its buffer read as text and
+    /// sent as `varchar(max)` rather than `decimal(p,s)`. The set is derived
+    /// rather than listed so it cannot drift as types are added.
+    #[test]
+    fn default_bind_rejects_sql_types_whose_default_c_type_is_character() {
+        use crate::api::type_rules::classify_parameter_sql_type;
+        use crate::handles::OdbcVersion;
+
+        let character_sql_types = [
+            crate::api::odbc_types::SQL_CHAR,
+            SQL_VARCHAR,
+            crate::api::odbc_types::SQL_LONGVARCHAR,
+            crate::api::odbc_types::SQL_WCHAR,
+            crate::api::odbc_types::SQL_WVARCHAR,
+            crate::api::odbc_types::SQL_WLONGVARCHAR,
+        ];
+
+        let mut checked = 0;
+        for sql_type in -160..=120 {
+            if !matches!(
+                classify_parameter_sql_type(sql_type),
+                SqlTypeSupport::Supported
+            ) || character_sql_types.contains(&sql_type)
+            {
+                continue;
+            }
+            let Some(default_c) = resolve_default_c_type(sql_type, OdbcVersion::Odbc3_80) else {
+                continue;
+            };
+            if !matches!(default_c, SQL_C_CHAR | crate::api::odbc_types::SQL_C_WCHAR) {
+                continue;
+            }
+
+            checked += 1;
+            let h = TestHandles::with_env_dbc_stmt();
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let ret = unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_DEFAULT,
+                    sql_type,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut ind,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "sql_type {sql_type}");
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        }
+        assert!(checked > 0, "no SQL type defaults to a character C type");
     }
 
     #[test]
@@ -643,7 +697,7 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07006);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]

@@ -4,6 +4,9 @@
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 
+use crate::core::TdsResult;
+use crate::error::Error;
+
 pub(crate) struct TdsReadBuffer {
     pub(crate) buffer_position: usize,
     pub(crate) buffer_length: usize,
@@ -14,6 +17,13 @@ pub(crate) struct TdsReadBuffer {
     pub(crate) pending_bytes: usize,
     /// The offset where pending bytes are located in working_buffer.
     pub(crate) pending_bytes_offset: usize,
+    /// Whether the most recently framed packet carried the end-of-message flag.
+    ///
+    /// Once the terminating packet of a message has been framed, the server
+    /// sends nothing further until the client issues a new request. Readers use
+    /// this to fail a short read instead of blocking on a socket that will stay
+    /// silent.
+    pub(crate) end_of_message: bool,
 }
 
 impl TdsReadBuffer {
@@ -26,6 +36,7 @@ impl TdsReadBuffer {
             working_buffer: vec![0; packet_storage],
             pending_bytes: 0,
             pending_bytes_offset: 0,
+            end_of_message: false,
         }
     }
 
@@ -37,16 +48,20 @@ impl TdsReadBuffer {
             self.buffer_length = 0;
             self.pending_bytes = 0;
             self.pending_bytes_offset = 0;
+            self.end_of_message = false;
         }
     }
 
     pub(crate) fn do_we_have_enough_data(&self, byte_count: usize) -> bool {
-        let remaining_bytes = self.buffer_length - self.buffer_position;
-        remaining_bytes >= byte_count
+        self.get_remaining_byte_count() >= byte_count
     }
 
     pub(crate) fn get_remaining_byte_count(&self) -> usize {
-        self.buffer_length - self.buffer_position
+        // Saturating: `buffer_position` must never pass `buffer_length`, but a
+        // plain subtraction wraps to a huge value in release builds if it ever
+        // does, which would make every "do we have enough data" check pass and
+        // send callers slicing past the end of the buffer.
+        self.buffer_length.saturating_sub(self.buffer_position)
     }
 
     #[inline(always)]
@@ -59,7 +74,13 @@ impl TdsReadBuffer {
         let bytes = self.working_buffer[position..position + N]
             .try_into()
             .expect("slice length is fixed by N");
-        self.consume_bytes(N);
+        // The capacity check above already proves this succeeds. Were it ever to
+        // fail, `None` would report "need more data" for what is really a
+        // protocol error, sending the caller back to wait for bytes that will
+        // never arrive.
+        let consumed = self.consume_bytes(N);
+        debug_assert!(consumed.is_ok(), "capacity is checked at the top");
+        consumed.ok()?;
         Some(bytes)
     }
 
@@ -115,9 +136,12 @@ impl TdsReadBuffer {
         self.try_read_array().map(f64::from_le_bytes)
     }
 
-    pub(crate) fn consume_bytes(&mut self, byte_count: usize) {
-        if byte_count > (self.buffer_length - self.buffer_position) {
-            panic!("Not enough data to consume");
+    pub(crate) fn consume_bytes(&mut self, byte_count: usize) -> TdsResult<()> {
+        let remaining = self.get_remaining_byte_count();
+        if byte_count > remaining {
+            return Err(Error::ProtocolError(format!(
+                "Cannot consume {byte_count} byte(s) from the packet buffer: only {remaining} remain"
+            )));
         }
 
         self.buffer_position += byte_count;
@@ -125,12 +149,18 @@ impl TdsReadBuffer {
             self.buffer_length = 0;
             self.buffer_position = 0;
         }
+        Ok(())
     }
 
     /// Sets the position to 0 and the length to the specified length.
+    ///
+    /// Also clears the end-of-message flag: the buffer no longer holds a framed
+    /// packet, so the previous message's terminator says nothing about what
+    /// comes next.
     pub(crate) fn reset_to_length(&mut self, length: usize) {
         self.buffer_position = 0;
         self.buffer_length = length;
+        self.end_of_message = false;
     }
 
     pub(crate) fn shift_data_to_front(&mut self) {
@@ -453,7 +483,8 @@ mod tests {
         buf.buffer_length = 500;
         buf.buffer_position = 0;
 
-        buf.consume_bytes(200);
+        buf.consume_bytes(200)
+            .expect("200 of 500 bytes must consume");
 
         assert_eq!(buf.buffer_position, 200);
         assert_eq!(buf.buffer_length, 500);
@@ -465,20 +496,46 @@ mod tests {
         buf.buffer_length = 500;
         buf.buffer_position = 100;
 
-        buf.consume_bytes(400);
+        buf.consume_bytes(400)
+            .expect("the exact remaining count must consume");
 
         assert_eq!(buf.buffer_position, 0);
         assert_eq!(buf.buffer_length, 0);
     }
 
     #[test]
-    #[should_panic(expected = "Not enough data to consume")]
-    fn test_consume_bytes_over_panics() {
+    fn test_consume_bytes_over_errors() {
         let mut buf = TdsReadBuffer::new(4096);
         buf.buffer_length = 500;
         buf.buffer_position = 100;
 
-        buf.consume_bytes(401);
+        // Consuming past the end used to `panic!`. In a driver loaded into a
+        // host process (ODBC, Node, Python) that turns a recoverable protocol
+        // fault into a crash, so it reports an error instead.
+        let error = buf
+            .consume_bytes(401)
+            .expect_err("consuming past the end must be an error");
+
+        assert!(
+            matches!(error, Error::ProtocolError(ref message) if message.contains("only 400 remain")),
+            "expected a protocol error naming the shortfall, got {error:?}"
+        );
+        assert_eq!(buf.buffer_position, 100, "a rejected consume must not move");
+        assert_eq!(buf.buffer_length, 500);
+    }
+
+    /// `buffer_position` must never pass `buffer_length`, but if it ever did a
+    /// plain subtraction would wrap to a huge value in release builds and make
+    /// every capacity check pass.
+    #[test]
+    fn remaining_byte_count_saturates_when_position_leads_length() {
+        let mut buf = TdsReadBuffer::new(4096);
+        buf.buffer_length = 100;
+        buf.buffer_position = 250;
+
+        assert_eq!(buf.get_remaining_byte_count(), 0);
+        assert!(!buf.do_we_have_enough_data(1));
+        assert!(buf.consume_bytes(1).is_err());
     }
 
     #[test]
@@ -568,7 +625,8 @@ mod tests {
 
         assert_eq!(buf.get_remaining_byte_count(), 400);
 
-        buf.consume_bytes(200);
+        buf.consume_bytes(200)
+            .expect("200 of 400 bytes must consume");
         assert_eq!(buf.get_remaining_byte_count(), 200);
     }
 

@@ -139,6 +139,18 @@ authoritative parity reference for this crate. Its source lives in the
   null check guards expensive work that should be elided on null
   (e.g., looking up a value before writing it).
 - Never dereference a pointer received from C without validating it.
+- **Never assume an application buffer is aligned.** ODBC does not require the
+  application to align `ParameterValuePtr`, `TargetValuePtr`, or
+  `StrLen_or_IndPtr` for the type being transferred — an app may point at an
+  offset inside a packed struct or a byte array. Read and write them with
+  `read_unaligned` / `write_unaligned` (or `copy_*` helpers) rather than `*ptr`,
+  `ptr::read`, or a reference. This is not defensive: in Rust a misaligned plain
+  read is undefined behavior on *every* target, not just the ones that fault, and
+  the optimizer is entitled to exploit it. msodbcsql reaches the same conclusion
+  in C++ by qualifying every one of these accesses `UNALIGNED` (MSVC's
+  `__unaligned`) — see `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp:1677-1714`, where
+  each integer source read from an application buffer is
+  `*(UNALIGNED SCHAR *)` / `SHORT` / `LONG` and so on.
 - Use `#[unsafe(no_mangle)]` only in `exports.rs` — keep implementations
   in separate modules as `pub(crate)` safe functions.
 

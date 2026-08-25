@@ -16,7 +16,7 @@ use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 use crate::connection::client_context::ClientContext;
 use crate::connection::transport::network_transport::NetworkTransport;
 use crate::connection::transport::ssl_handler::SslHandler;
-use crate::message::messages::PacketType;
+use crate::message::messages::{PacketStatusFlags, PacketType};
 
 macro_rules! append_method {
     ($name:ident, $type:ty, $size:expr_2021, $write_fn:ident) => {
@@ -52,6 +52,17 @@ impl TestPacketBuilder {
 
     pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> &mut TestPacketBuilder {
         self.data.extend_from_slice(bytes);
+        self
+    }
+
+    /// Clears the end-of-message flag so this packet is framed as a
+    /// continuation of a multi-packet message.
+    ///
+    /// [`new`](Self::new) sets EOM by default, which is right for a
+    /// single-packet message but wrong for every packet of a message except the
+    /// last one.
+    pub(crate) fn continuation(&mut self) -> &mut TestPacketBuilder {
+        self.data[1] &= !(PacketStatusFlags::Eom as u8);
         self
     }
 
@@ -128,6 +139,27 @@ pub(crate) fn create_network_transport_with_chunked_data(
                 return;
             }
         }
+    });
+
+    build_duplex_transport(client_side)
+}
+
+/// Builds a `NetworkTransport` fed `data` whose peer stays **connected** after
+/// the data is drained.
+///
+/// [`create_network_transport_with_data`] drops its writer, so a starved reader
+/// observes EOF and errors out. That masks no-progress bugs: a loop that fails
+/// to advance is rescued by the EOF rather than spinning. Holding the peer open
+/// reproduces real server behavior — the socket simply goes quiet — so a reader
+/// that cannot make progress blocks forever instead of erroring. Tests using
+/// this helper must therefore bound themselves with `tokio::time::timeout`.
+pub(crate) fn create_network_transport_with_live_peer(data: &[u8]) -> NetworkTransport {
+    let (client_side, mut server_side) = duplex(data.len().max(1));
+    let owned = data.to_vec();
+    tokio::spawn(async move {
+        let _ = server_side.write_all(&owned).await;
+        // Parks forever, keeping `server_side` alive so the reader never sees EOF.
+        std::future::pending::<()>().await;
     });
 
     build_duplex_transport(client_side)

@@ -189,11 +189,13 @@ pub const SQL_API_SQLCLOSECURSOR: SqlUSmallInt = 1003;
 pub const SQL_API_SQLENDTRAN: SqlUSmallInt = 1005;
 pub const SQL_API_SQLFREEHANDLE: SqlUSmallInt = 1006;
 pub const SQL_API_SQLGETCONNECTATTR: SqlUSmallInt = 1007;
+pub const SQL_API_SQLGETDESCFIELD: SqlUSmallInt = 1008;
 pub const SQL_API_SQLGETDIAGFIELD: SqlUSmallInt = 1010;
 pub const SQL_API_SQLGETDIAGREC: SqlUSmallInt = 1011;
 pub const SQL_API_SQLGETENVATTR: SqlUSmallInt = 1012;
 pub const SQL_API_SQLGETSTMTATTR: SqlUSmallInt = 1014;
 pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
+pub const SQL_API_SQLSETDESCFIELD: SqlUSmallInt = 1017;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
 pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
 
@@ -442,13 +444,33 @@ pub const SQL_DESC_NUM_PREC_RADIX: SqlUSmallInt = 32;
 pub const SQL_DESC_COUNT: SqlUSmallInt = 1001;
 pub const SQL_DESC_TYPE: SqlUSmallInt = 1002;
 pub const SQL_DESC_LENGTH: SqlUSmallInt = 1003;
+pub const SQL_DESC_OCTET_LENGTH_PTR: SqlUSmallInt = 1004;
 pub const SQL_DESC_PRECISION: SqlUSmallInt = 1005;
 pub const SQL_DESC_SCALE: SqlUSmallInt = 1006;
 pub const SQL_DESC_NULLABLE: SqlUSmallInt = 1008;
 pub const SQL_DESC_DATETIME_INTERVAL_CODE: SqlUSmallInt = 1007;
+pub const SQL_DESC_INDICATOR_PTR: SqlUSmallInt = 1009;
+pub const SQL_DESC_DATA_PTR: SqlUSmallInt = 1010;
 pub const SQL_DESC_NAME: SqlUSmallInt = 1011;
 pub const SQL_DESC_UNNAMED: SqlUSmallInt = 1012;
 pub const SQL_DESC_OCTET_LENGTH: SqlUSmallInt = 1013;
+/// Read-only: `SQL_DESC_ALLOC_AUTO` for every descriptor until explicit
+/// descriptor allocation (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`) lands.
+pub const SQL_DESC_ALLOC_TYPE: SqlUSmallInt = 1099;
+
+// ---- Descriptor header field identifiers (SQLGetDescField / SQLSetDescField,
+// RecNumber == 0) — the low-numbered block, distinct from the SQLColAttribute
+// ids above despite sharing the same numeric range in the ODBC header.
+pub const SQL_DESC_ARRAY_SIZE: SqlUSmallInt = 20;
+pub const SQL_DESC_ARRAY_STATUS_PTR: SqlUSmallInt = 21;
+pub const SQL_DESC_BIND_OFFSET_PTR: SqlUSmallInt = 24;
+pub const SQL_DESC_BIND_TYPE: SqlUSmallInt = 25;
+pub const SQL_DESC_PARAMETER_TYPE: SqlUSmallInt = 33;
+pub const SQL_DESC_ROWS_PROCESSED_PTR: SqlUSmallInt = 34;
+
+// ---- SQL_DESC_ALLOC_TYPE values ---------------------------------------------
+pub const SQL_DESC_ALLOC_AUTO: SqlSmallInt = 1;
+pub const SQL_DESC_ALLOC_USER: SqlSmallInt = 2;
 
 // ---- SQLColAttribute value constants ----------------------------------------
 pub const SQL_NULLABLE_UNKNOWN: SqlLen = 2;
@@ -483,6 +505,9 @@ pub const SQL_ATTR_ROW_ARRAY_SIZE: SqlInteger = 27;
 /// `SQL_ATTR_ROW_BIND_TYPE` value selecting column-wise (array-of-columns)
 /// binding — the mode mssql-python uses.
 pub const SQL_BIND_BY_COLUMN: SqlULen = 0;
+/// Default `SQL_DESC_ARRAY_SIZE` / `SQL_DESC_ROWSET_SIZE` for a freshly
+/// allocated ARD/APD.
+pub const SQL_ROWSET_SIZE_DEFAULT: SqlULen = 1;
 /// `SQL_ATTR_CURSOR_TYPE` value: forward-only (the only mode this driver
 /// supports).
 pub const SQL_CURSOR_FORWARD_ONLY: SqlULen = 0;
@@ -575,6 +600,11 @@ pub struct SqlGuid {
     pub data3: SqlUSmallInt,
     pub data4: [u8; 8],
 }
+
+/// SQL Server's maximum `NUMERIC`/`DECIMAL` precision (`tds.h`'s
+/// `SQL_PREC_NUMERIC`), the upper bound `SQL_DESC_PRECISION` accepts when the
+/// concise type is `SQL_C_NUMERIC` / `SQL_NUMERIC`.
+pub const SQL_PREC_NUMERIC: SqlSmallInt = 38;
 
 /// ODBC `SQL_NUMERIC_STRUCT`. `val` holds a little-endian unsigned mantissa;
 /// `sign` is 1 for positive, 0 for negative.
