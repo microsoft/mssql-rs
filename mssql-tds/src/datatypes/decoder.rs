@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use core::fmt;
+use std::borrow::Cow;
 use std::future::Future;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -1478,11 +1479,11 @@ impl GenericDecoder {
                         )));
                     }
                     if let Some(bytes) = reader.try_read_slice(length as usize) {
-                        writer.write_bytes_ref(col, bytes);
+                        writer.write_bytes(col, Cow::Borrowed(bytes));
                     } else {
                         let mut bytes = vec![0u8; length as usize];
                         reader.read_bytes(&mut bytes).await?;
-                        writer.write_bytes(col, bytes);
+                        writer.write_bytes(col, Cow::Owned(bytes));
                     }
                 }
             }
@@ -1500,13 +1501,15 @@ impl GenericDecoder {
                                     reader, dest, length,
                                 )
                                 .await,
-                                |bytes| writer.write_bytes(col, bytes),
+                                |bytes| writer.write_bytes(col, Cow::Owned(bytes)),
                             );
                         }
                         PlpFraming::Unknown => {
                             writer.write_bytes(
                                 col,
-                                GenericDecoder::read_plp_chunks_unknown_len(reader).await?,
+                                Cow::Owned(
+                                    GenericDecoder::read_plp_chunks_unknown_len(reader).await?,
+                                ),
                             );
                         }
                     }
@@ -1522,11 +1525,11 @@ impl GenericDecoder {
                             )));
                         }
                         if let Some(bytes) = reader.try_read_slice(length as usize) {
-                            writer.write_bytes_ref(col, bytes);
+                            writer.write_bytes(col, Cow::Borrowed(bytes));
                         } else {
                             let mut bytes = vec![0u8; length as usize];
                             reader.read_bytes(&mut bytes).await?;
-                            writer.write_bytes(col, bytes);
+                            writer.write_bytes(col, Cow::Owned(bytes));
                         }
                     }
                 }
@@ -2033,12 +2036,12 @@ impl StringDecoder {
                         length,
                         |dest| GenericDecoder::read_plp_chunks_into_slice(reader, dest, length)
                             .await,
-                        |bytes| writer.write_string(col, SqlString::new(bytes, encoding_type)),
+                        |bytes| writer.write_string(col, Cow::Owned(bytes), encoding_type),
                     );
                 }
                 PlpFraming::Unknown => {
                     let bytes = GenericDecoder::read_plp_chunks_unknown_len(reader).await?;
-                    writer.write_string(col, SqlString::new(bytes, encoding_type));
+                    writer.write_string(col, Cow::Owned(bytes), encoding_type);
                 }
             }
         } else if Self::is_long_len_type(metadata.data_type) {
@@ -2060,24 +2063,24 @@ impl StringDecoder {
                 )));
             }
 
-            let sql_string = if length == 0 {
-                SqlString::new(Vec::new(), encoding_type)
+            let bytes = if length == 0 {
+                Vec::new()
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
-                SqlString::new(buffer, encoding_type)
+                buffer
             };
-            writer.write_string(col, sql_string);
+            writer.write_string(col, Cow::Owned(bytes), encoding_type);
         } else {
             let length = read_sync_first!(reader, try_read_uint16, read_uint16) as usize;
             if length == 0xFFFF {
                 writer.write_null(col);
             } else if let Some(bytes) = reader.try_read_slice(length) {
-                writer.write_string_ref(col, bytes, encoding_type);
+                writer.write_string(col, Cow::Borrowed(bytes), encoding_type);
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
-                writer.write_string(col, SqlString::new(buffer, encoding_type));
+                writer.write_string(col, Cow::Owned(buffer), encoding_type);
             }
         }
         Ok(())
@@ -5457,11 +5460,12 @@ mod test {
         use crate::datatypes::decoder::{DecimalParts, GenericDecoder};
         use crate::datatypes::row_writer::{RowWriter, ValueKind};
         use crate::datatypes::sql_json::SqlJson;
-        use crate::datatypes::sql_string::{EncodingType, SqlString};
+        use crate::datatypes::sql_string::EncodingType;
         use crate::datatypes::sql_vector::SqlVector;
         use crate::datatypes::sqldatatypes::{PartialLengthType, TdsDataType};
         use crate::query::metadata::ColumnMetadata;
         use crate::token::tokens::SqlCollation;
+        use std::borrow::Cow;
         use uuid::Uuid;
 
         /// What a [`RecordingSink`] observed for one column.
@@ -5530,7 +5534,7 @@ mod test {
                 self.storage.resize(start + length, 0xAA);
                 let encoding = match kind {
                     ValueKind::Bytes => None,
-                    ValueKind::String(encoding) => Some(encoding.clone()),
+                    ValueKind::String(encoding) => Some(*encoding),
                 };
                 self.pending = Some((start, encoding));
                 let storage = &mut self.storage[start..];
@@ -5556,11 +5560,16 @@ mod test {
             fn write_null(&mut self, _col: usize) {
                 self.events.push(Event::Null);
             }
-            fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-                self.events.push(Event::OwnedBytes(val));
+            fn write_bytes(&mut self, _col: usize, bytes: Cow<'_, [u8]>) {
+                self.events.push(Event::OwnedBytes(bytes.into_owned()));
             }
-            fn write_string(&mut self, _col: usize, val: SqlString) {
-                self.events.push(Event::OwnedString(val.bytes));
+            fn write_string(
+                &mut self,
+                _col: usize,
+                bytes: Cow<'_, [u8]>,
+                _encoding_type: EncodingType,
+            ) {
+                self.events.push(Event::OwnedString(bytes.into_owned()));
             }
 
             fn write_bool(&mut self, _col: usize, _val: bool) {}

@@ -12,7 +12,7 @@ use super::{
 };
 
 /// Character encoding used by a [`SqlString`].
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum EncodingType {
     /// UTF-8 encoding.
     Utf8,
@@ -56,7 +56,7 @@ impl EncodingType {
     /// known ([`EncodingType::DelayedSet`]).
     ///
     /// Exists so a writer handed borrowed wire bytes by
-    /// [`RowWriter::write_string_ref`](crate::datatypes::row_writer::RowWriter::write_string_ref)
+    /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
     /// can transcode straight into its own buffer instead of building an owned
     /// [`SqlString`] first.
     ///
@@ -83,6 +83,11 @@ impl SqlString {
         }
     }
 
+    /// Splits into the raw encoded bytes and their encoding.
+    pub fn into_parts(self) -> (Vec<u8>, EncodingType) {
+        (self.bytes, self.encoding_type)
+    }
+
     /// Creates a UTF-16LE–encoded `SqlString` from a Rust `String`.
     pub fn from_utf8_string(string: String) -> Self {
         let utf16_bytes = string
@@ -94,13 +99,22 @@ impl SqlString {
 
     /// Decodes the stored bytes into a Rust `String` according to the encoding type.
     pub fn to_utf8_string(&self) -> String {
-        match self.encoding_type {
+        Self::decode(&self.bytes, self.encoding_type)
+    }
+
+    /// Decodes wire bytes in `encoding_type` into a Rust `String`.
+    ///
+    /// Lets a writer handed borrowed bytes by
+    /// [`RowWriter::write_string`](crate::datatypes::row_writer::RowWriter::write_string)
+    /// decode them without first copying into an owned [`SqlString`].
+    pub fn decode(bytes: &[u8], encoding_type: EncodingType) -> String {
+        match encoding_type {
             // TODO: Investigation needed. When creating a Utf8 strings from the vector, the string is weirdly encoded.
             // UTF16 decode works better.
-            EncodingType::Utf8 => String::from_utf8(self.bytes.clone()).unwrap(),
+            EncodingType::Utf8 => String::from_utf8(bytes.to_vec()).unwrap(),
             EncodingType::Utf16 => {
                 // Use encoding_rs for efficient UTF-16LE decoding without intermediate Vec<u16> allocation
-                let (decoded, _, _) = encoding_rs::UTF_16LE.decode(&self.bytes);
+                let (decoded, _, _) = encoding_rs::UTF_16LE.decode(bytes);
                 decoded.into_owned()
             }
             EncodingType::LcidBased(collation) => {
@@ -109,7 +123,7 @@ impl SqlString {
                 let encoding = lcid_encoding_or_fallback(collation);
 
                 // Decode bytes using the determined encoding
-                let (decoded, _used_encoding, had_errors) = encoding.decode(&self.bytes);
+                let (decoded, _used_encoding, had_errors) = encoding.decode(bytes);
 
                 if had_errors {
                     warn!(
@@ -297,6 +311,28 @@ mod tests {
             via_accessor,
             SqlString::new(bytes, encoding_type).to_utf8_string()
         );
+    }
+
+    #[test]
+    fn decode_matches_to_utf8_string_across_encodings() {
+        // A writer decoding borrowed bytes must land on exactly the text the
+        // owned path produces, or the two row-write paths silently diverge.
+        let cases = [
+            (b"h\0i\0".to_vec(), EncodingType::Utf16),
+            (b"hi".to_vec(), EncodingType::Utf8),
+            (
+                vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2],
+                EncodingType::LcidBased(collation(0x0419)),
+            ),
+        ];
+
+        for (bytes, encoding_type) in cases {
+            assert_eq!(
+                SqlString::decode(&bytes, encoding_type),
+                SqlString::new(bytes.clone(), encoding_type).to_utf8_string(),
+                "mismatch for {encoding_type:?}"
+            );
+        }
     }
 
     #[test]

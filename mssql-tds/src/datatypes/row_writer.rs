@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Cow;
 use std::mem::MaybeUninit;
 
 use crate::datatypes::column_values::{
@@ -36,10 +37,16 @@ pub trait RowWriter {
     fn write_f32(&mut self, col: usize, val: f32);
     /// Writes a `float` value.
     fn write_f64(&mut self, col: usize, val: f64);
-    /// Writes a character string value.
-    fn write_string(&mut self, col: usize, val: SqlString);
-    /// Writes a binary value.
-    fn write_bytes(&mut self, col: usize, val: Vec<u8>);
+    /// Writes a character string value in its wire encoding.
+    ///
+    /// `bytes` borrows the read buffer when the value was already resident in
+    /// it, so it must not be retained past the call. Use
+    /// [`EncodingType::encoding`] to transcode it in place, or `into_owned` to
+    /// take it — which is free when the decoder already owned the bytes.
+    fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType);
+    /// Writes a binary value. Borrows on the same terms as
+    /// [`RowWriter::write_string`].
+    fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>);
     /// Writes a `decimal` value.
     fn write_decimal(&mut self, col: usize, val: DecimalParts);
     /// Writes a `numeric` value.
@@ -74,25 +81,6 @@ pub trait RowWriter {
     fn write_variant_base_type(&mut self, _col: usize, _base: TdsDataType) {}
     /// Signals the end of the current row.
     fn end_row(&mut self);
-
-    /// Writes packet-backed encoded string bytes before the packet buffer is
-    /// reused.
-    ///
-    /// `bytes` is the value in its wire encoding; use
-    /// [`EncodingType::encoding`] to transcode it in place. The default copies
-    /// and forwards to [`RowWriter::write_string`], so a writer that does not
-    /// override this keeps whatever behaviour its `write_string` has — it only
-    /// gives up the saved allocation.
-    fn write_string_ref(&mut self, col: usize, bytes: &[u8], encoding_type: EncodingType) {
-        self.write_string(col, SqlString::new(bytes.to_vec(), encoding_type));
-    }
-
-    /// Writes packet-backed binary bytes before the packet buffer is reused.
-    ///
-    /// Defaults the same way as [`RowWriter::write_string_ref`].
-    fn write_bytes_ref(&mut self, col: usize, bytes: &[u8]) {
-        self.write_bytes(col, bytes.to_vec());
-    }
 
     /// Offers the writer the chance to supply the final storage for a
     /// known-length PLP string or binary value, so the decoder reads the
@@ -252,12 +240,15 @@ impl RowWriter for DefaultRowWriter {
         self.row.push(ColumnValues::Float(val));
     }
 
-    fn write_string(&mut self, _col: usize, val: SqlString) {
-        self.row.push(ColumnValues::String(val));
+    fn write_string(&mut self, _col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType) {
+        self.row.push(ColumnValues::String(SqlString::new(
+            bytes.into_owned(),
+            encoding_type,
+        )));
     }
 
-    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-        self.row.push(ColumnValues::Bytes(val));
+    fn write_bytes(&mut self, _col: usize, bytes: Cow<'_, [u8]>) {
+        self.row.push(ColumnValues::Bytes(bytes.into_owned()));
     }
 
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
@@ -339,11 +330,10 @@ impl RowWriter for DiscardRowWriter {
     fn write_i64(&mut self, _col: usize, _val: i64) {}
     fn write_f32(&mut self, _col: usize, _val: f32) {}
     fn write_f64(&mut self, _col: usize, _val: f64) {}
-    fn write_string(&mut self, _col: usize, _val: SqlString) {}
-    fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
-    // Overridden so a borrow hit does not build a `SqlString` purely to drop it.
-    fn write_string_ref(&mut self, _col: usize, _bytes: &[u8], _encoding_type: EncodingType) {}
-    fn write_bytes_ref(&mut self, _col: usize, _bytes: &[u8]) {}
+    // Takes the `Cow` unexamined, so a borrow is never promoted to an owned
+    // buffer purely to drop it.
+    fn write_string(&mut self, _col: usize, _bytes: Cow<'_, [u8]>, _encoding_type: EncodingType) {}
+    fn write_bytes(&mut self, _col: usize, _bytes: Cow<'_, [u8]>) {}
     fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_date(&mut self, _col: usize, _val: SqlDate) {}
@@ -374,8 +364,11 @@ pub fn write_column_value<W: RowWriter + ?Sized>(writer: &mut W, col: usize, val
         ColumnValues::BigInt(v) => writer.write_i64(col, v),
         ColumnValues::Real(v) => writer.write_f32(col, v),
         ColumnValues::Float(v) => writer.write_f64(col, v),
-        ColumnValues::String(v) => writer.write_string(col, v),
-        ColumnValues::Bytes(v) => writer.write_bytes(col, v),
+        ColumnValues::String(v) => {
+            let (bytes, encoding_type) = v.into_parts();
+            writer.write_string(col, Cow::Owned(bytes), encoding_type)
+        }
+        ColumnValues::Bytes(v) => writer.write_bytes(col, Cow::Owned(v)),
         ColumnValues::Decimal(v) => writer.write_decimal(col, v),
         ColumnValues::Numeric(v) => writer.write_numeric(col, v),
         ColumnValues::Date(v) => writer.write_date(col, v),
@@ -398,63 +391,11 @@ mod tests {
     use super::*;
     use crate::datatypes::sql_string::EncodingType;
 
-    /// Overrides only `write_string`/`write_bytes`, never the `_ref` pair, and
-    /// tags every value it sees. Proves the defaulted `_ref` methods route
-    /// through the override rather than around it.
-    #[derive(Default)]
-    struct TaggingWriter {
-        seen: Vec<String>,
-    }
-
-    impl RowWriter for TaggingWriter {
-        fn write_null(&mut self, _col: usize) {}
-        fn write_bool(&mut self, _col: usize, _val: bool) {}
-        fn write_u8(&mut self, _col: usize, _val: u8) {}
-        fn write_i16(&mut self, _col: usize, _val: i16) {}
-        fn write_i32(&mut self, _col: usize, _val: i32) {}
-        fn write_i64(&mut self, _col: usize, _val: i64) {}
-        fn write_f32(&mut self, _col: usize, _val: f32) {}
-        fn write_f64(&mut self, _col: usize, _val: f64) {}
-        fn write_string(&mut self, _col: usize, val: SqlString) {
-            self.seen.push(format!("string:{}", val.to_utf8_string()));
-        }
-        fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-            self.seen.push(format!("bytes:{val:?}"));
-        }
-        fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
-        fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
-        fn write_date(&mut self, _col: usize, _val: SqlDate) {}
-        fn write_time(&mut self, _col: usize, _val: SqlTime) {}
-        fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
-        fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
-        fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
-        fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
-        fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
-        fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
-        fn write_uuid(&mut self, _col: usize, _val: Uuid) {}
-        fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
-        fn write_json(&mut self, _col: usize, _val: SqlJson) {}
-        fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
-        fn end_row(&mut self) {}
-    }
-
-    #[test]
-    fn defaulted_ref_methods_route_through_the_writers_override() {
-        let mut writer = TaggingWriter::default();
-
-        writer.write_string_ref(0, b"h\0i\0", EncodingType::Utf16);
-        writer.write_bytes_ref(1, &[1, 2, 3]);
-
-        // Had the defaults bypassed the override, `seen` would be empty and the
-        // borrowed path would silently behave differently from the owned one.
-        assert_eq!(writer.seen, vec!["string:hi", "bytes:[1, 2, 3]"]);
-    }
-
     #[test]
     fn discard_row_writer_drops_borrowed_values() {
         let mut writer = DiscardRowWriter;
-        writer.write_string_ref(0, b"h\0i\0", EncodingType::Utf16);
-        writer.write_bytes_ref(1, &[1, 2, 3]);
+        writer.write_string(0, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
+        writer.write_bytes(1, Cow::Borrowed(&[1, 2, 3]));
         writer.end_row();
     }
 
@@ -463,10 +404,10 @@ mod tests {
         let bytes = b"h\0i\0";
 
         let mut borrowed = DefaultRowWriter::new(1);
-        borrowed.write_string_ref(0, bytes, EncodingType::Utf16);
+        borrowed.write_string(0, Cow::Borrowed(bytes), EncodingType::Utf16);
 
         let mut owned = DefaultRowWriter::new(1);
-        owned.write_string(0, SqlString::new(bytes.to_vec(), EncodingType::Utf16));
+        owned.write_string(0, Cow::Owned(bytes.to_vec()), EncodingType::Utf16);
 
         assert_eq!(borrowed.take_row(), owned.take_row());
     }
@@ -474,10 +415,10 @@ mod tests {
     #[test]
     fn default_row_writer_borrowed_bytes_matches_owned() {
         let mut borrowed = DefaultRowWriter::new(1);
-        borrowed.write_bytes_ref(0, &[9, 8, 7]);
+        borrowed.write_bytes(0, Cow::Borrowed(&[9, 8, 7]));
 
         let mut owned = DefaultRowWriter::new(1);
-        owned.write_bytes(0, vec![9, 8, 7]);
+        owned.write_bytes(0, Cow::Owned(vec![9, 8, 7]));
 
         assert_eq!(borrowed.take_row(), owned.take_row());
     }
@@ -490,7 +431,7 @@ mod tests {
         writer.write_null(1);
         writer.write_bool(2, true);
         writer.write_f64(3, 99.5);
-        writer.write_string(4, SqlString::new(b"hello".to_vec(), EncodingType::Utf16));
+        writer.write_string(4, Cow::Borrowed(b"hello"), EncodingType::Utf16);
         writer.end_row();
 
         let row = writer.take_row();
@@ -627,7 +568,7 @@ mod tests {
 
         writer.write_i32(0, 1);
         writer.write_variant_base_type(1, TdsDataType::NVarChar);
-        writer.write_string(1, SqlString::new(vec![0x41, 0x00], EncodingType::Utf16));
+        writer.write_string(1, Cow::Borrowed(&[0x41, 0x00]), EncodingType::Utf16);
         writer.write_variant_base_type(2, TdsDataType::Int4);
         writer.write_i32(2, 7);
         writer.end_row();
