@@ -3595,26 +3595,28 @@ impl TdsClient {
 
                     let is_last = !done.has_more();
 
-                    // Capture update counts for `SQLRowCount`. DONE_COUNT on a
-                    // SQLSELECT command is not an update-count result.
+                    // Capture update counts for `SQLRowCount`.
                     let has_count = done.status.contains(DoneStatus::COUNT);
                     // SQL Server compiles variable assignment (`DECLARE @x int = 1`,
                     // `SET @x = 1`, `SELECT @x = col FROM t`) as a SQLSELECT command
                     // and still sets DONE_COUNT. msodbcsql does not expose those as
                     // update-count results, so neither do we.
                     //
-                    // msodbcsql also excludes SQLFETCHCURSOR (0x21) and SQLDBCC
-                    // (0xe6) here (sqlctokn.cpp:2149-2156). We do not, because
-                    // `CurrentCommand` folds every unrecognized value into `None`,
-                    // and `None` is what a genuine `SELECT ... INTO` count reports —
-                    // so those two cannot be told apart without dedicated variants.
-                    // Neither is reachable today: no DBCC command was observed to
-                    // set DONE_COUNT, and SQLFETCHCURSOR belongs to the server-side
-                    // cursor path this driver does not implement yet. Add
-                    // `CurrentCommand::{FetchCursor, Dbcc}` and exclude them here
-                    // when server-side cursors land, or if a DBCC is found to
-                    // report a count.
-                    let has_update_count = has_count && done.cur_cmd != CurrentCommand::Select;
+                    // The same three exclusions msodbcsql applies
+                    // (sqlctokn.cpp:2149-2152): SQLSELECT (0xc1), SQLFETCHCURSOR
+                    // (0x21) and SQLDBCC (0xe6). `sp_cursorfetch` reaches here via
+                    // `cursor_ops::cursor_fetch` -> `next_rowset`, so the cursor
+                    // exclusion is not hypothetical; a live SQL Server 2022 tags that
+                    // DONEINPROC `status: MORE|COUNT, cur_cmd: 0xc1` (already covered
+                    // by the SQLSELECT arm), but 0x21 is excluded explicitly so the
+                    // fetch buffer size can never be mistaken for an update count.
+                    let has_update_count = has_count
+                        && !matches!(
+                            done.cur_cmd,
+                            CurrentCommand::Select
+                                | CurrentCommand::FetchCursor
+                                | CurrentCommand::Dbcc
+                        );
                     if has_update_count {
                         let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
                         self.last_rows_affected = count;
@@ -6760,6 +6762,44 @@ mod tests {
             }
         );
         assert_eq!(client.last_rows_affected(), 1);
+    }
+
+    /// `sp_cursorfetch` reaches `advance_to_result_boundary` via
+    /// `cursor_ops::cursor_fetch` -> `next_rowset`. Its DONE reports the fetch
+    /// buffer size, which is not an update count; msodbcsql excludes it with
+    /// `Info != SQLFETCHCURSOR` (sqlctokn.cpp:2151).
+    #[tokio::test]
+    async fn execute_skips_fetch_cursor_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::FetchCursor, 2, true),
+            int_col_metadata(1),
+        ]);
+
+        let result = client
+            .execute("sp_cursorfetch".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::Rows);
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+    }
+
+    /// msodbcsql excludes DBCC from update counts with `Info != SQLDBCC`
+    /// (sqlctokn.cpp:2152).
+    #[tokio::test]
+    async fn execute_skips_dbcc_count() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Dbcc, 3, false)]);
+
+        let result = client
+            .execute("DBCC CHECKIDENT('t')".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::End);
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
     }
 
     #[tokio::test]
