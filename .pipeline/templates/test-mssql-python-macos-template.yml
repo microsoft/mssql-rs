@@ -97,42 +97,16 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 # ── 4. Start Docker via Colima ───────────────────────────────────────────────
-- script: |
-    brew update
-    brew install docker colima
-
-    colima start --cpu 4 --memory 4 --disk 50
-    docker context use colima >/dev/null || true
-
-    docker version
-    docker ps
+# timeoutInMinutes backstops the scripts' own wall-clock budgets: the macOS job
+# caps at 60 minutes and SQL setup must not be what exhausts it.
+- script: bash .pipeline/scripts/start-colima-macos.sh
   displayName: 'Install and start Colima-based Docker'
+  timeoutInMinutes: 12
 
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
-- script: |
-    set -euo pipefail
-
-    docker pull mcr.microsoft.com/mssql/server:2025-latest
-
-    docker run \
-      --name sqlserver \
-      -e ACCEPT_EULA=Y \
-      -e "MSSQL_SA_PASSWORD=${SQL_PASSWORD}" \
-      -p 1433:1433 \
-      -d mcr.microsoft.com/mssql/server:2025-latest
-
-    echo "Waiting for SQL Server to start..."
-    for i in $(seq 1 30); do
-      docker exec sqlserver \
-        /opt/mssql-tools18/bin/sqlcmd \
-        -S localhost \
-        -U SA \
-        -P "$SQL_PASSWORD" \
-        -C -Q "SELECT 1" && break
-      echo "  attempt $i/30..."
-      sleep 2
-    done
+- script: bash .pipeline/scripts/start-sql-server-macos.sh
   displayName: 'Start SQL Server (Docker, no TLS certs)'
+  timeoutInMinutes: 17
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
 
