@@ -11,7 +11,8 @@
 //! token parser tests all pull from here instead.
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::connection::client_context::ClientContext;
 use crate::connection::transport::network_transport::NetworkTransport;
@@ -163,6 +164,41 @@ pub(crate) fn create_network_transport_with_live_peer(data: &[u8]) -> NetworkTra
     });
 
     build_duplex_transport(client_side)
+}
+
+/// Builds a `NetworkTransport` fed `data` whose peer stays connected **and**
+/// reads everything the client sends, handing those bytes back on the returned
+/// channel.
+///
+/// [`create_network_transport_with_live_peer`] never reads, and sizes its
+/// duplex buffer to `data` alone, so a client that writes anything fills that
+/// buffer and blocks. Cancellation writes before it reads — it sends an
+/// ATTENTION packet and then drains for the acknowledgement — so testing it
+/// needs a peer that keeps the write direction moving. The captured bytes let a
+/// test confirm the ATTENTION really went out.
+///
+/// The peer never closes, so a client that cannot make progress blocks forever
+/// rather than being rescued by EOF. Tests using this helper must bound
+/// themselves with `tokio::time::timeout`.
+pub(crate) fn create_network_transport_with_live_peer_capturing_writes(
+    data: &[u8],
+) -> (NetworkTransport, UnboundedReceiver<Vec<u8>>) {
+    let (client_side, mut server_side) = duplex(data.len().max(4096));
+    let (sender, receiver) = unbounded_channel();
+    let owned = data.to_vec();
+    tokio::spawn(async move {
+        let _ = server_side.write_all(&owned).await;
+        let mut buffer = [0u8; 512];
+        while let Ok(read) = server_side.read(&mut buffer).await {
+            if read == 0 || sender.send(buffer[..read].to_vec()).is_err() {
+                break;
+            }
+        }
+        // Parks forever, keeping `server_side` alive so the client never sees EOF.
+        std::future::pending::<()>().await;
+    });
+
+    (build_duplex_transport(client_side), receiver)
 }
 
 #[cfg(test)]
