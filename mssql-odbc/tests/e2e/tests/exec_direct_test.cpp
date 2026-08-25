@@ -354,7 +354,11 @@ TEST_F(ExecDirectLiveTest, UpdateCountStillPrecedesRowSetAfterAssignment) {
         ODBCTestUtils::ToSqlTStr("CREATE TABLE #upd(v int); INSERT INTO #upd VALUES (1),(2);");
     SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
-    while (SQLMoreResults(stmt_) != SQL_NO_DATA) {
+    // Bounded drain: stop on SQL_ERROR instead of spinning, so a driver bug
+    // fails the test rather than hanging the CI leg.
+    for (SQLRETURN more = SQLMoreResults(stmt_); more != SQL_NO_DATA;
+         more = SQLMoreResults(stmt_)) {
+        ASSERT_SQL_OK(more, SQL_HANDLE_STMT, stmt_);
     }
 
     SqlTString sql = ODBCTestUtils::ToSqlTStr(

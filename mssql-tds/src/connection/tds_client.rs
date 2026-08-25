@@ -6478,6 +6478,17 @@ mod tests {
         Tokens::ColMetadata(ColMetadataToken::default())
     }
 
+    /// A COLMETADATA token for `n` nullable `int` columns, so tests can assert
+    /// the client is positioned on a real row set rather than a 0-column one.
+    fn int_col_metadata(n: usize) -> Tokens {
+        let columns = crate::test_client_support::int_columns(n);
+        Tokens::ColMetadata(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap_or(u16::MAX),
+            columns,
+            cek_table: Vec::new(),
+        })
+    }
+
     fn stale_metadata() -> Arc<ColMetadataToken> {
         Arc::new(ColMetadataToken::default())
     }
@@ -6614,7 +6625,7 @@ mod tests {
     async fn execute_skips_select_count_before_rowset() {
         let mut client = create_test_client_with_tokens(vec![
             done_count(CurrentCommand::Select, 1, true),
-            empty_col_metadata(),
+            int_col_metadata(1),
         ]);
 
         let result = client
@@ -6623,6 +6634,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1,
+            "must be positioned on the procedure's row set"
+        );
         assert_eq!(client.last_rows_affected(), -1);
         assert!(client.take_dml_result_counts().is_empty());
     }

@@ -1116,6 +1116,16 @@ impl TryFrom<u16> for CurrentCommand {
             0x20 => Ok(CurrentCommand::OpenCursor),
             0x117 => Ok(CurrentCommand::Merge),
             // All unknown values are treated as None, and considered valid.
+            //
+            // This catch-all carries correctness weight: `advance_to_result_boundary`
+            // gates `SQLRowCount` semantics on `cur_cmd`, so an unrecognized value
+            // lands in the "this DONE_COUNT is a real update count" branch. That is
+            // deliberate and matches msodbcsql, which uses a deny-list
+            // (`Info != SQLSELECT && != SQLFETCHCURSOR && != SQLDBCC`,
+            // sqlctokn.cpp:2149-2152) rather than an allow-list, so an unknown
+            // command with a valid count still yields RS_COUNT. Do not convert this
+            // to an allow-list without a matching change in the reference driver;
+            // instead add the specific variant that must be excluded.
             _ => Ok(CurrentCommand::None),
         }
     }
