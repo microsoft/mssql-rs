@@ -48,6 +48,38 @@ pub(crate) struct DbcHandle {
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
+/// Pre-connect values from the `SQL_COPT_SS_*` attributes that duplicate a
+/// connection-string keyword.
+///
+/// mssql-python applies `attrs_before` unfiltered at connect, so a caller can
+/// configure the same setting through either path. Measured against msodbcsql
+/// 18, the two paths do not rank the same way:
+///
+/// - The vendor attributes here **override** the keyword. `Encrypt=no` in the
+///   string plus `SQL_COPT_SS_ENCRYPT=1` connects encrypted, and the reverse
+///   pairing connects unencrypted; `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE=0`
+///   overrides `TrustServerCertificate=yes` hard enough to fail the handshake.
+/// - `SQL_ATTR_CURRENT_CATALOG` is the opposite: the `Database=` keyword wins
+///   and the attribute is only a fallback (see `driver_connect`).
+///
+/// So this is deliberately not a general "attributes beat keywords" rule -- it
+/// is per attribute, and each field here was confirmed by observing the
+/// resulting session in `sys.dm_exec_connections` rather than by reading a
+/// header.
+///
+/// Values are normalized on the way in, matching msodbcsql: setting any of
+/// these to an out-of-range `7` and reading it back post-connect returns `1`,
+/// so the driver stores the effective value rather than the caller's input.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct VendorConnOverrides {
+    /// `SQL_COPT_SS_ENCRYPT` (1223): `0` no, `1` yes, `2` strict.
+    pub(crate) encrypt: Option<u32>,
+    /// `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE` (1228): `0` or `1`.
+    pub(crate) trust_server_certificate: Option<u32>,
+    /// `SQL_COPT_SS_INTEGRATED_SECURITY` (1203): `0` or `1`.
+    pub(crate) integrated_security: Option<u32>,
+}
+
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
     pub(crate) diag_records: Vec<DiagRecord>,
@@ -67,6 +99,10 @@ pub(crate) struct DbcState {
     /// Login timeout in seconds set via `SQL_ATTR_LOGIN_TIMEOUT`. Applied to the
     /// TDS login deadline at connect time. `Some(0)` means wait indefinitely.
     pub(crate) login_timeout: Option<u32>,
+    /// Pre-connect overrides from the `SQL_COPT_SS_*` attribute forms of
+    /// connection-string keywords. `None` means "the caller did not set this
+    /// attribute", which is what lets the keyword stand.
+    pub(crate) vendor_overrides: VendorConnOverrides,
     /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
     /// does not yet vary its behaviour on it.
     pub(crate) access_mode: u32,
@@ -176,6 +212,7 @@ impl DbcHandle {
                 active_stmt: None,
                 client: None,
                 access_token: None,
+                vendor_overrides: VendorConnOverrides::default(),
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
                 connection_timeout: 0,

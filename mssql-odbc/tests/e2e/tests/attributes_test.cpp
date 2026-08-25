@@ -81,6 +81,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <vector>
@@ -1687,4 +1688,230 @@ TEST_F(AttributesTest, MaxRowsTruncatesARowsetRatherThanRoundingIt) {
     SQLFreeStmt(stmt_, SQL_UNBIND);
     EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 0));
     EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE, 1));
+}
+
+// ===========================================================================
+// Vendor connection attributes (spec 4.2.2 / 4.10)
+//
+// mssql-python applies `attrs_before` unfiltered at connect, so the attribute
+// forms of Encrypt / TrustServerCertificate / Trusted_Connection can arrive
+// alongside -- or instead of -- the keywords that mean the same thing. That
+// makes two things part of the contract: which one wins when they disagree,
+// and what a later get reports.
+//
+// Both were measured against msodbcsql rather than read off a header, because
+// the ranking is not uniform: these attributes beat their keyword, while
+// SQL_ATTR_CURRENT_CATALOG loses to `Database=` (variation 22).
+// ===========================================================================
+
+#define SQL_COPT_SS_INTEGRATED_SECURITY 1203
+#define SQL_COPT_SS_ENCRYPT 1223
+#define SQL_COPT_SS_TRUST_SERVER_CERTIFICATE 1228
+
+namespace {
+
+// A connection string with `extra` appended. Reuses the shared builder so the
+// credential handling stays in one place.
+SqlTString ConnStrWith(const std::string& extra) {
+    return ODBCTestUtils::ToSqlTStr(
+        ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString()) + extra);
+}
+
+SQLRETURN ConnectWith(SQLHDBC dbc, const std::string& extra) {
+    SqlTString conn = ConnStrWith(extra);
+    SQLTCHAR out[1024] = {};
+    SQLSMALLINT out_len = 0;
+    return SQLDriverConnect(dbc, nullptr, const_cast<SQLTCHAR*>(conn.c_str()),
+                            static_cast<SQLSMALLINT>(conn.size()), out, 1024,
+                            &out_len, SQL_DRIVER_NOPROMPT);
+}
+
+// What the server says about this session, which is the only witness that an
+// attribute actually reached the wire rather than merely being stored.
+std::string EncryptOption(SQLHDBC dbc) {
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt))) {
+        return "(no statement)";
+    }
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SELECT CONVERT(varchar(10), encrypt_option) "
+        "FROM sys.dm_exec_connections WHERE session_id = @@SPID");
+    std::string result = "(no row)";
+    if (SQL_SUCCEEDED(SQLExecDirect(stmt, const_cast<SQLTCHAR*>(sql.c_str()),
+                                    SQL_NTS)) &&
+        SQL_SUCCEEDED(SQLFetch(stmt))) {
+        SQLTCHAR buf[32] = {};
+        SQLLEN ind = 0;
+        if (SQL_SUCCEEDED(SQLGetData(stmt, 1, SQL_C_TCHAR, buf, sizeof(buf),
+                                     &ind))) {
+            result = ODBCTestUtils::ToNarrow(SqlTString(buf));
+        }
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    return result;
+}
+
+SQLUINTEGER GetVendorAttr(SQLHDBC dbc, SQLINTEGER attribute, SQLRETURN* rc) {
+    SQLUINTEGER value = 0xDEAD;
+    *rc = SQLGetConnectAttr(dbc, attribute, &value, SQL_IS_UINTEGER, nullptr);
+    return value;
+}
+
+SQLRETURN SetVendorAttr(SQLHDBC dbc, SQLINTEGER attribute, SQLUINTEGER value) {
+    return SQLSetConnectAttr(
+        dbc, attribute, reinterpret_cast<SQLPOINTER>(
+                            static_cast<std::uintptr_t>(value)),
+        SQL_IS_UINTEGER);
+}
+
+}  // namespace
+
+// -------------------------------------------------------------------
+// Variation 59 - SQL_COPT_SS_ENCRYPT outranks the Encrypt keyword, in both
+// directions. Asserted against sys.dm_exec_connections rather than against a
+// get, so a driver that stored the attribute but never applied it fails here.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, EncryptAttributeOutranksTheKeyword) {
+    const auto& cfg = ODBCTestConfig::Instance();
+    if (!cfg.Encrypt().empty()) {
+        GTEST_SKIP() << "ODBC_TEST_ENCRYPT would add a competing keyword";
+    }
+
+    struct Case {
+        const char* keyword;
+        SQLUINTEGER attr;
+        const char* expected;
+    };
+    // The keyword and the attribute always disagree, so whichever wins is
+    // unambiguous.
+    const Case cases[] = {
+        {"Encrypt=no;", 1, "TRUE"},
+        {"Encrypt=yes;", 0, "FALSE"},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(std::string(c.keyword) + " attr=" + std::to_string(c.attr));
+
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+        EXPECT_TRUE(SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, c.attr)));
+
+        ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, c.keyword)))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+        EXPECT_EQ(c.expected, EncryptOption(dbc));
+
+        SQLDisconnect(dbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 60 - an out-of-range SQL_COPT_SS_ENCRYPT value is normalized, not
+// rejected. msodbcsql connects encrypted for 3, 7 and -1, and reading the
+// attribute back afterwards returns 1 rather than the value that was set, so
+// the driver reports the effective setting.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, OutOfRangeEncryptValueNormalizesToOn) {
+    const auto& cfg = ODBCTestConfig::Instance();
+    if (!cfg.Encrypt().empty()) {
+        GTEST_SKIP() << "ODBC_TEST_ENCRYPT would add a competing keyword";
+    }
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+    EXPECT_TRUE(SQL_SUCCEEDED(SetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, 7)))
+        << "an out-of-range value is accepted, not HY024";
+
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "")))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+    EXPECT_EQ("TRUE", EncryptOption(dbc));
+
+    SQLRETURN rc = SQL_ERROR;
+    EXPECT_EQ(1u, GetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+    SQLDisconnect(dbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+}
+
+// -------------------------------------------------------------------
+// Variation 61 - all three select something the handshake fixes: the
+// transport, the certificate policy, and the credential. A late set could
+// never apply, and both drivers reject it with HY011 rather than accepting it
+// and silently doing nothing.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, VendorConnectionAttributesAreRejectedAfterConnect) {
+    for (SQLINTEGER attribute : {SQL_COPT_SS_ENCRYPT,
+                                 SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+                                 SQL_COPT_SS_INTEGRATED_SECURITY}) {
+        SCOPED_TRACE(attribute);
+
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+        ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "")))
+            << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+
+        EXPECT_FALSE(SQL_SUCCEEDED(SetVendorAttr(dbc, attribute, 1)));
+        EXPECT_NE(std::string::npos,
+                  ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc)
+                      .find("HY011"));
+
+        SQLDisconnect(dbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+    }
+}
+
+// -------------------------------------------------------------------
+// Variation 62 - with no attribute set at all, a get still reports the
+// connection's effective setting, sourced from the keyword. Measured:
+// `Encrypt=no` reads back 0 on msodbcsql even though nothing ever set the
+// attribute, so this is not an echo of a stored value.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
+    const auto& cfg = ODBCTestConfig::Instance();
+    if (!cfg.Encrypt().empty()) {
+        GTEST_SKIP() << "ODBC_TEST_ENCRYPT would add a competing keyword";
+    }
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "Encrypt=no;")))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
+
+    SQLRETURN rc = SQL_ERROR;
+    EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ("FALSE", EncryptOption(dbc));
+
+    // The other two follow the same rule. Encryption is off here, so there is
+    // no server certificate to trust and the flag reads 0 whatever the
+    // TrustServerCertificate keyword said.
+    EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+    const SQLUINTEGER expected_integrated = cfg.HasCredentials() ? 0u : 1u;
+    EXPECT_EQ(expected_integrated,
+              GetVendorAttr(dbc, SQL_COPT_SS_INTEGRATED_SECURITY, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+    SQLDisconnect(dbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+
+    // The discriminating half: with encryption on, the same keyword does read
+    // back as trusted, so the 0 above is the encryption state talking and not
+    // the driver simply ignoring TrustServerCertificate.
+    if (cfg.TrustCert() != "Yes" && cfg.TrustCert() != "yes") {
+        return;
+    }
+    SQLHDBC encrypted = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &encrypted)));
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(encrypted, "Encrypt=yes;")))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, encrypted);
+
+    EXPECT_EQ(1u, GetVendorAttr(encrypted, SQL_COPT_SS_ENCRYPT, &rc));
+    EXPECT_EQ(1u,
+              GetVendorAttr(encrypted, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, &rc));
+
+    SQLDisconnect(encrypted);
+    SQLFreeHandle(SQL_HANDLE_DBC, encrypted);
 }

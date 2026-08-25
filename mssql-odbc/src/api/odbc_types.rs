@@ -59,6 +59,20 @@ pub const SQL_OV_ODBC3_80: u32 = 380;
 // of the UTF-16-LE-encoded token.
 pub const SQL_COPT_SS_ACCESS_TOKEN: SqlInteger = 1256;
 
+// msodbcsql-specific attribute forms of connection-string keywords. These are
+// applied pre-connect and, unlike SQL_ATTR_CURRENT_CATALOG, override the
+// matching keyword (see `handles::dbc::VendorConnOverrides`).
+pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
+pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
+pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
+
+// SQL_COPT_SS_ENCRYPT values. 0/1 are the historical off/on pair; 2 selects the
+// TDS 8.0 "strict" mode Driver 18 added. Measured: any other value is treated
+// as "on" rather than rejected.
+pub const SQL_EN_OFF: u64 = 0;
+pub const SQL_EN_ON: u64 = 1;
+pub const SQL_EN_STRICT: u64 = 2;
+
 // Standard ODBC connection attributes the Driver Manager commonly sets before
 // connecting. Accepted (currently ignored) so the DM handshake is not broken.
 pub const SQL_ATTR_ACCESS_MODE: SqlInteger = 101;

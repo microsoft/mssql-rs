@@ -20,8 +20,9 @@ use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
     SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
     SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
-    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE,
-    SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_EN_ON, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
 use crate::error::free_errors;
@@ -157,6 +158,39 @@ fn sql_get_connect_attr_w_safe(
             };
             unsafe { write_if_some(value_ptr as *mut u32, value) };
             debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
+            SQL_SUCCESS
+        }
+        // The `SQL_COPT_SS_*` forms of Encrypt / TrustServerCertificate /
+        // Trusted_Connection. `do_connect` rewrites the stored values to what the
+        // connection actually resolved to, so this reports the effective setting
+        // whether it came from the attribute or from the keyword -- measured:
+        // with no attribute set, `Encrypt=no` reads back 0.
+        //
+        // Before connect there is nothing to resolve, so an unset attribute falls
+        // back to the driver defaults (encryption on, no trust, no integrated
+        // auth). That pre-connect case is inferred from the defaults, not
+        // measured, unlike the post-connect behaviour above.
+        SQL_COPT_SS_ENCRYPT
+        | SQL_COPT_SS_TRUST_SERVER_CERTIFICATE
+        | SQL_COPT_SS_INTEGRATED_SECURITY => {
+            if value_ptr.is_null() {
+                error!(attribute, "SQLGetConnectAttrW: value pointer is null");
+                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
+                return SQL_ERROR;
+            }
+            let overrides = &state.vendor_overrides;
+            let value = match attribute {
+                SQL_COPT_SS_ENCRYPT => overrides.encrypt.unwrap_or(SQL_EN_ON as u32),
+                SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => {
+                    overrides.trust_server_certificate.unwrap_or(0)
+                }
+                _ => overrides.integrated_security.unwrap_or(0),
+            };
+            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            debug!(
+                attribute,
+                value, "SQLGetConnectAttrW: vendor attribute returned"
+            );
             SQL_SUCCESS
         }
         SQL_ATTR_CONNECTION_DEAD => {

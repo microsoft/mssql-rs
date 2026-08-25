@@ -446,27 +446,76 @@ hardcodes "never TRUE" — wiring it into catalog-function matching is S5 work.
 
 ---
 
-### S5 — Connection attributes: vendor + remaining standard, and `attrs_before` parity
+### S5a — Vendor connection attributes that route to a keyword — **shipped**
 
-> `mssql-odbc | Vendor connection attributes & attrs_before parity`
+> `mssql-odbc | Vendor connection attributes & attrs_before parity` (AB#47457)
+
+**Scope:** the three vendor connection attributes whose behaviour was measured
+end to end against msodbcsql, routed to the same setting the equivalent
+connection-string keyword drives.
+
+| id | attribute | keyword it duplicates |
+|---|---|---|
+| 1203 | `SQL_COPT_SS_INTEGRATED_SECURITY` | `Trusted_Connection` |
+| 1223 | `SQL_COPT_SS_ENCRYPT` | `Encrypt` |
+| 1228 | `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE` | `TrustServerCertificate` |
+
+**Measured contract** (probes + e2e variations 59–62, both drivers):
+
+- **Precedence is per-attribute, not one global rule.** For all three of the
+  above the *attribute wins* over the keyword — `1228 = 0` overrides
+  `TrustServerCertificate=yes` hard enough to fail the handshake with `08001`.
+  This is the opposite of `SQL_ATTR_CURRENT_CATALOG` (109), where the `Database=`
+  keyword wins and the attribute is only a fallback (S3). So the rule has to be
+  established per id, not inherited.
+- **Values are normalized, not range-checked.** `SQL_COPT_SS_ENCRYPT` takes
+  `0` off / `1` on / `2` TDS 8.0 strict, but out-of-range input is *folded*
+  rather than rejected: set `7` and the connection comes up encrypted and a
+  later get returns `1`. No `HY024`. Strict is identifiable because it stops
+  honoring `TrustServerCertificate`, so `2` fails a self-signed handshake that
+  `1` accepts.
+- **Post-connect set is rejected** with `HY011`.
+- **The get reports the effective connection setting, not the stored input.**
+  With no attribute ever set, `Encrypt=no` reads back `0` and an encrypted
+  connection reads back `1` — the value is sourced from the keyword when the
+  attribute was never used. And `Encrypt=no;TrustServerCertificate=Yes` reads
+  the trust flag back as **`0`**: with encryption off there is no certificate in
+  play, so the flag reports the resolved state rather than echoing the keyword.
+  That last one was found by the parity e2e failing, not by a probe.
+
+**Implementation note:** `encryption_setting()` in `driver_connect.rs` is the
+single source of truth shared by the mssql-tds `EncryptionOptions` builder and
+the value reported back through `SQLGetConnectAttr`, pinned by a unit test, so
+the two cannot drift.
+
+**Deliberately not routed:** `APPLICATION_INTENT`, `MULTISUBNET_FAILOVER`,
+`CONNECT_RETRY_COUNT`/`_INTERVAL`, `SERVER_SPN`, `AUTHENTICATION` and the rest of
+the vendor band have S1 sweep return codes but no *confirmed routing*. They are
+left to S5b rather than wired up on the assumption that they behave like the
+three above — which the `CURRENT_CATALOG` contrast shows is not safe.
+
+**Size:** M. **Depends on:** S1, S3.
+
+---
+
+### S5b — Connection attributes: remaining routing, fan-out, and diagnostics
+
+> follow-up to AB#47457
 
 **Scope**
-- **Route to existing keyword settings (F5)** so the keyword path and the
-  attribute path land on the same place: `SQL_COPT_SS_ENCRYPT`,
-  `TRUST_SERVER_CERTIFICATE`, `AUTHENTICATION`, `APPLICATION_INTENT`,
-  `MULTISUBNET_FAILOVER`, `TNIR`, `CONNECT_RETRY_COUNT`, `CONNECT_RETRY_INTERVAL`,
-  `SERVER_SPN`, `FAILOVER_PARTNER`, `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`,
-  `INTEGRATED_SECURITY`, `OLDPWD`.
-- **Precedence rule**: decide and test what wins when both the connection string
-  and a pre-connect attribute set the same thing. Verify against msodbcsql — do
-  not assume.
+- **Route the remaining keyword-equivalent attributes (F5)**, each one measured
+  first: `AUTHENTICATION`, `APPLICATION_INTENT`, `MULTISUBNET_FAILOVER`, `TNIR`,
+  `CONNECT_RETRY_COUNT`, `CONNECT_RETRY_INTERVAL`, `SERVER_SPN`,
+  `FAILOVER_PARTNER`, `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`.
 - **Read-only/diagnostic:** `SQL_COPT_SS_CLIENT_CONNECTION_ID`, `SQL_COPT_SS_SPID`,
   `SQL_COPT_SS_USER_DATA`.
-- **Standard leftovers:** `SQL_ATTR_METADATA_ID`, `SQL_ATTR_ASYNC_ENABLE`,
-  `SQL_ATTR_AUTO_IPD`, `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.
+- **Standard leftovers:** `SQL_ATTR_METADATA_ID` (stored today, but `catalog.rs`
+  still hardcodes "never TRUE"), `SQL_ATTR_ASYNC_ENABLE`, `SQL_ATTR_AUTO_IPD`,
+  `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.
 - **Implement the statement-option fan-out (F3)** so an unrecognized connection
   attribute that is a valid statement option propagates to the connection's
-  statements, as msodbcsql does at `sqlcmisc.cpp:2879`.
+  statements, as msodbcsql does at `sqlcmisc.cpp:2879` — generalizing the
+  `set_query_timeout` walk that already exists.
 - **Deferred, but cleanly rejected** with the SQLSTATE msodbcsql uses (not a
   generic `HYC00` if msodbcsql differs): MARS (`SQL_COPT_SS_MARS_ENABLED`),
   Always Encrypted (`COLUMN_ENCRYPTION`, `CEKEYSTOREPROVIDER`, `CEKEYSTOREDATA`,
@@ -478,8 +527,7 @@ returns the same `(SQLRETURN, SQLSTATE)` as msodbcsql under the S1 parity sweep;
 an `attrs_before` dict mixing supported, deferred, and garbage keys behaves
 identically to msodbcsql.
 
-**Size:** L — split further if the routing and the fan-out both grow.
-**Depends on:** S1, S3 (string I/O for the character-typed ones).
+**Size:** L. **Depends on:** S5a.
 
 ---
 
