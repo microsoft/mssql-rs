@@ -92,8 +92,10 @@ CPU pinning (used by `perf-lab/run-benchmarks.sh` when SQL Server is colocated):
 ## Fixed-baseline comparison on the perf lab
 
 `perf-lab/run-benchmarks.sh` (Linux) and `perf-lab/run-benchmarks.ps1` (Windows)
-are the testScripts run by the shared `PerfTest` lab template
-(`.pipeline/perf-baseline-pipeline.yml`). They run on a dedicated perf-lab VM and:
+are the testScripts run by the shared `PerfTest` lab template, one ADO definition
+per platform (`.pipeline/perf-baseline-linux-pipeline.yml` and
+`.pipeline/perf-baseline-windows-pipeline.yml`). They run on a dedicated perf-lab
+VM and:
 
 1. Build and run the candidate (`mssql-tds` = working tree) with `--save-baseline candidate`.
 2. Replace the `mssql-tds` source at `../mssql-tds` in place with a local
@@ -105,4 +107,5 @@ The harness is always built from the candidate tree (it does not exist at the
 baseline commit); only the `mssql-tds` *source* is swapped, so the harness, Criterion
 version, and toolchain stay constant. `SQL_SERVER` and `SQL_PASSWORD` are injected
 by the lab template. The baseline commit is advanced via a pull request that edits
-`perf-lab/baseline-commit.txt`.
+`perf-lab/baseline-commit.txt`; see [`perf-lab/MONITORING.md`](perf-lab/MONITORING.md)
+for how the weekly runs are triaged and when the baseline may be advanced.
