@@ -21,8 +21,10 @@ use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_ANSI_APP, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_TIMEOUT,
     SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
     SQL_ATTR_RESET_CONNECTION, SQL_ATTR_TXN_ISOLATION, SQL_COPT_SS_ACCESS_TOKEN,
-    SQL_COPT_SS_RESET_CONNECTION, SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
+    SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY, SQL_COPT_SS_RESET_CONNECTION,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_EN_OFF, SQL_EN_ON,
+    SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
+    SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
@@ -159,6 +161,41 @@ unsafe fn sql_set_connect_attr_w_impl(
                 }
             }
         }
+        // The attribute forms of Encrypt / TrustServerCertificate /
+        // Trusted_Connection. All three are pre-connect only (measured: HY011
+        // afterwards, like the access token) and all three override the keyword
+        // rather than yielding to it -- see `VendorConnOverrides`.
+        SQL_COPT_SS_ENCRYPT
+        | SQL_COPT_SS_TRUST_SERVER_CERTIFICATE
+        | SQL_COPT_SS_INTEGRATED_SECURITY => {
+            if state.connection_state != ConnectionState::Disconnected {
+                error!(
+                    attribute,
+                    "SQLSetConnectAttrW: vendor attribute set after connect"
+                );
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY011,
+                    0,
+                    "Attribute must be set before connecting",
+                );
+                return SQL_ERROR;
+            }
+            let value = value_ptr as usize as u64;
+            let overrides = &mut state.vendor_overrides;
+            match attribute {
+                SQL_COPT_SS_ENCRYPT => overrides.encrypt = Some(normalize_encrypt(value)),
+                SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => {
+                    overrides.trust_server_certificate = Some(u32::from(value != 0));
+                }
+                _ => overrides.integrated_security = Some(u32::from(value != 0)),
+            }
+            debug!(
+                attribute,
+                value, "SQLSetConnectAttrW: vendor override stored"
+            );
+            SQL_SUCCESS
+        }
         SQL_ATTR_LOGIN_TIMEOUT => {
             // Integer attribute: the SQLUINTEGER value is passed by value in the
             // pointer slot (not a pointer to it). Store it so SQLDriverConnect
@@ -236,6 +273,25 @@ unsafe fn sql_set_connect_attr_w_impl(
             );
             SQL_ERROR
         }
+    }
+}
+
+/// Normalizes a `SQL_COPT_SS_ENCRYPT` value.
+///
+/// Measured against msodbcsql 18 by reading `encrypt_option` back from
+/// `sys.dm_exec_connections`: `0` connects unencrypted, `1` encrypted, and `2`
+/// selects TDS 8.0 strict mode -- which is distinguishable because strict stops
+/// honoring `TrustServerCertificate`, so it fails a self-signed handshake that
+/// `1` accepts.
+///
+/// Out-of-range values are **not** rejected. `3`, `7` and `-1` all connected
+/// encrypted, and setting `7` then reading the attribute back returns `1`, so
+/// they normalize to "on" rather than earning an `HY024`.
+fn normalize_encrypt(value: u64) -> u32 {
+    match value {
+        SQL_EN_OFF => SQL_EN_OFF as u32,
+        SQL_EN_STRICT => SQL_EN_STRICT as u32,
+        _ => SQL_EN_ON as u32,
     }
 }
 
@@ -354,6 +410,7 @@ mod tests {
         SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT,
     };
     use crate::error::HasDiagnostics;
+    use crate::handles::dbc::VendorConnOverrides;
     use crate::test_support::TestHandles;
 
     /// Build a `SQL_COPT_SS_ACCESS_TOKEN` struct the way msodbcsql apps do:
@@ -935,5 +992,75 @@ mod tests {
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY011);
         assert_eq!(state.txn_isolation, SQL_TXN_READ_COMMITTED);
         state.local_tran_started = false;
+    }
+
+    #[test]
+    fn vendor_attributes_store_normalized_values() {
+        let h = TestHandles::with_env_dbc();
+        for (attribute, raw, expected) in [
+            (SQL_COPT_SS_ENCRYPT, 0usize, 0u32),
+            (SQL_COPT_SS_ENCRYPT, 1, 1),
+            (SQL_COPT_SS_ENCRYPT, 2, 2),
+            // Out of range folds to "on" rather than erroring: msodbcsql
+            // connects encrypted for 3, 7 and -1, and a get after setting 7
+            // reads back 1.
+            (SQL_COPT_SS_ENCRYPT, 7, 1),
+            (SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, 0, 0),
+            (SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, 7, 1),
+            (SQL_COPT_SS_INTEGRATED_SECURITY, 0, 0),
+            (SQL_COPT_SS_INTEGRATED_SECURITY, 1, 1),
+        ] {
+            let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, raw as SqlPointer, 0) };
+            assert_eq!(ret, SQL_SUCCESS, "attribute {attribute} value {raw}");
+
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let overrides = dbc.inner.lock().unwrap().vendor_overrides.clone();
+            let stored = match attribute {
+                SQL_COPT_SS_ENCRYPT => overrides.encrypt,
+                SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => overrides.trust_server_certificate,
+                _ => overrides.integrated_security,
+            };
+            assert_eq!(stored, Some(expected), "attribute {attribute} value {raw}");
+        }
+    }
+
+    #[test]
+    fn vendor_attributes_after_connect_are_rejected() {
+        // These select the transport and the credential, both fixed by the
+        // handshake, so a late set could never apply. Measured against
+        // msodbcsql: post-connect sets in the vendor band return HY011.
+        for attribute in [
+            SQL_COPT_SS_ENCRYPT,
+            SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+            SQL_COPT_SS_INTEGRATED_SECURITY,
+        ] {
+            let h = TestHandles::with_env_dbc();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            dbc.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+            let ret = unsafe { sql_set_connect_attr_w(h.dbc, attribute, 1usize as SqlPointer, 0) };
+            assert_eq!(ret, SQL_ERROR, "attribute {attribute}");
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY011);
+            assert_eq!(
+                state.vendor_overrides,
+                VendorConnOverrides::default(),
+                "a rejected set must not change the stored value"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypt_normalization_covers_the_whole_range() {
+        assert_eq!(normalize_encrypt(0), 0);
+        assert_eq!(normalize_encrypt(1), 1);
+        assert_eq!(normalize_encrypt(2), 2);
+        for out_of_range in [3u64, 7, u64::MAX] {
+            assert_eq!(
+                normalize_encrypt(out_of_range),
+                1,
+                "out-of-range {out_of_range} must fold to on, not error"
+            );
+        }
     }
 }

@@ -6,8 +6,9 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_DRIVER_NOPROMPT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_DRIVER_NOPROMPT, SQL_EN_OFF, SQL_EN_ON, SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE,
+    SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHWnd, SqlHandle, SqlReturn, SqlSmallInt,
+    SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
@@ -18,7 +19,7 @@ use crate::api::txn::apply_post_connect_txn_settings;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
-use crate::handles::dbc::{ConnectionState, DbcState};
+use crate::handles::dbc::{ConnectionState, DbcState, VendorConnOverrides};
 use crate::handles::{HandleType, handle_from_raw};
 
 use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
@@ -198,6 +199,71 @@ pub(crate) fn sql_driver_connect_w_safe(
     result
 }
 
+/// Lets the `SQL_COPT_SS_*` attribute forms win over the connection-string
+/// keywords they duplicate.
+///
+/// Only a caller-set attribute (`Some`) displaces anything, so a connection
+/// string on its own still behaves exactly as it did before.
+fn apply_vendor_overrides(params: &mut ConnectionParams, overrides: &VendorConnOverrides) {
+    if let Some(encrypt) = overrides.encrypt {
+        params.encrypt = Some(
+            match u64::from(encrypt) {
+                SQL_EN_OFF => "no",
+                SQL_EN_STRICT => "strict",
+                _ => "yes",
+            }
+            .to_string(),
+        );
+    }
+    if let Some(trust) = overrides.trust_server_certificate {
+        params.trust_server_certificate = trust != 0;
+    }
+    if let Some(integrated) = overrides.integrated_security {
+        params.trusted_connection = Some(integrated != 0);
+    }
+}
+
+/// Resolves the `Encrypt=` keyword vocabulary onto an mssql-tds setting.
+///
+/// `ENCRYPT_VALUES` accepts five spellings; `mandatory`/`optional` are the
+/// aliases of `yes`/`no`. An unspecified keyword means encryption on, which is
+/// the ODBC Driver 18 default.
+fn encryption_setting(encrypt: Option<&str>) -> EncryptionSetting {
+    match encrypt {
+        Some(e) if e.eq_ignore_ascii_case("no") || e.eq_ignore_ascii_case("optional") => {
+            EncryptionSetting::PreferOff
+        }
+        Some(e) if e.eq_ignore_ascii_case("strict") => EncryptionSetting::Strict,
+        _ => EncryptionSetting::On,
+    }
+}
+
+/// The settings a post-connect get should report, taken from the connection as
+/// it actually resolved.
+///
+/// Measured against msodbcsql: a get returns the effective value regardless of
+/// which path produced it. `Encrypt=no` with no attribute set reads back `0`,
+/// and an out-of-range attribute value of `7` reads back `1`, so neither the
+/// caller's raw input nor a fixed default would match.
+fn effective_vendor_settings(params: &ConnectionParams) -> VendorConnOverrides {
+    let mode = encryption_setting(params.encrypt.as_deref());
+    let encrypt = match mode {
+        EncryptionSetting::PreferOff => SQL_EN_OFF,
+        EncryptionSetting::Strict => SQL_EN_STRICT,
+        _ => SQL_EN_ON,
+    };
+    // With encryption off there is no server certificate, so nothing is being
+    // trusted. Measured: `Encrypt=no;TrustServerCertificate=Yes` reports the
+    // trust flag as 0 on msodbcsql, so this tracks the effective policy rather
+    // than echoing the keyword.
+    let trust = !matches!(mode, EncryptionSetting::PreferOff) && params.trust_server_certificate;
+    VendorConnOverrides {
+        encrypt: Some(encrypt as u32),
+        trust_server_certificate: Some(u32::from(trust)),
+        integrated_security: Some(u32::from(params.trusted_connection.unwrap_or(false))),
+    }
+}
+
 /// Inner connect logic, separated so the caller can reset state on failure.
 fn do_connect(
     dbc: &DbcHandle,
@@ -223,6 +289,20 @@ fn do_connect(
             return SQL_ERROR;
         }
     };
+
+    // Pre-connect vendor attributes override the matching keyword, which is the
+    // reverse of the `Database=` / `SQL_ATTR_CURRENT_CATALOG` ranking applied
+    // below. Both directions were measured, not assumed.
+    let mut params = params;
+    apply_vendor_overrides(&mut params, &state.vendor_overrides);
+    let params = params;
+
+    // Record what the connection actually resolved to, so a later get reports
+    // the effective setting rather than only what an attribute happened to set.
+    // Measured: with no attribute set at all, `Encrypt=no` reads back 0 and an
+    // absent `TrustServerCertificate` reads back 0, so msodbcsql sources the
+    // get from the keyword when the attribute was never used.
+    state.vendor_overrides = effective_vendor_settings(&params);
 
     // Validate required fields. Let mssql-tds validate based on auth method.
     if params.server.is_empty() {
@@ -311,16 +391,7 @@ fn do_connect(
 
     context.encryption_options = EncryptionOptions {
         trust_server_certificate: params.trust_server_certificate,
-        mode: match params.encrypt.as_deref() {
-            Some(e) if e.eq_ignore_ascii_case("yes") || e.eq_ignore_ascii_case("mandatory") => {
-                EncryptionSetting::On
-            }
-            Some(e) if e.eq_ignore_ascii_case("no") || e.eq_ignore_ascii_case("optional") => {
-                EncryptionSetting::PreferOff
-            }
-            Some(e) if e.eq_ignore_ascii_case("strict") => EncryptionSetting::Strict,
-            _ => EncryptionSetting::On, // ODBC default
-        },
+        mode: encryption_setting(params.encrypt.as_deref()),
         host_name_in_cert: None,
         server_certificate: None,
     };
@@ -444,6 +515,102 @@ mod tests {
         SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE,
     };
     use crate::test_support::{TestHandles, cs};
+
+    /// The value a get reports must match the encryption the connection
+    /// actually uses. These are two separate mappings over the same keyword
+    /// vocabulary, so pin them together rather than trusting them to stay in
+    /// step.
+    #[test]
+    fn reported_encrypt_matches_the_negotiated_setting() {
+        for (keyword, setting, code) in [
+            (Some("yes"), EncryptionSetting::On, 1u32),
+            (Some("mandatory"), EncryptionSetting::On, 1),
+            (Some("no"), EncryptionSetting::PreferOff, 0),
+            (Some("optional"), EncryptionSetting::PreferOff, 0),
+            (Some("strict"), EncryptionSetting::Strict, 2),
+            (Some("STRICT"), EncryptionSetting::Strict, 2),
+            (None, EncryptionSetting::On, 1),
+        ] {
+            assert_eq!(encryption_setting(keyword), setting, "keyword {keyword:?}");
+
+            let (mut params, _) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
+            params.encrypt = keyword.map(str::to_string);
+            assert_eq!(
+                effective_vendor_settings(&params).encrypt,
+                Some(code),
+                "keyword {keyword:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_overrides_displace_the_matching_keyword() {
+        let base = cs("Server=h;UID=u;<PW>=p;Encrypt=no;TrustServerCertificate=yes");
+        let (params, _) = parse_connection_string(&base).unwrap();
+
+        // Nothing set: the connection string is left exactly as parsed.
+        let mut untouched = params.clone();
+        apply_vendor_overrides(&mut untouched, &VendorConnOverrides::default());
+        assert_eq!(untouched.encrypt, params.encrypt);
+        assert_eq!(
+            untouched.trust_server_certificate,
+            params.trust_server_certificate
+        );
+        assert_eq!(untouched.trusted_connection, params.trusted_connection);
+
+        // Each attribute wins over the keyword it duplicates.
+        let mut overridden = params.clone();
+        apply_vendor_overrides(
+            &mut overridden,
+            &VendorConnOverrides {
+                encrypt: Some(2),
+                trust_server_certificate: Some(0),
+                integrated_security: Some(1),
+            },
+        );
+        assert_eq!(overridden.encrypt.as_deref(), Some("strict"));
+        assert!(!overridden.trust_server_certificate);
+        assert_eq!(overridden.trusted_connection, Some(true));
+    }
+
+    #[test]
+    fn effective_settings_report_the_resolved_connection() {
+        // A get reads back what the connection resolved to, from whichever path
+        // set it -- measured: `Encrypt=no` with no attribute reads back 0.
+        let (params, _) =
+            parse_connection_string(&cs("Server=h;Trusted_Connection=yes;Encrypt=no")).unwrap();
+        assert_eq!(
+            effective_vendor_settings(&params),
+            VendorConnOverrides {
+                encrypt: Some(0),
+                trust_server_certificate: Some(0),
+                integrated_security: Some(1),
+            }
+        );
+    }
+
+    /// The trust flag reports the effective certificate policy, not the
+    /// keyword. Encryption off means there is no certificate in play, and
+    /// msodbcsql reports 0 for it even when `TrustServerCertificate=Yes` was
+    /// asked for -- found by running the e2e parity variation against the
+    /// vendor driver.
+    #[test]
+    fn trust_is_only_reported_when_something_is_encrypted() {
+        for (keywords, expected) in [
+            ("Encrypt=yes;TrustServerCertificate=yes", 1),
+            ("Encrypt=yes;TrustServerCertificate=no", 0),
+            ("Encrypt=no;TrustServerCertificate=yes", 0),
+            ("Encrypt=no;TrustServerCertificate=no", 0),
+        ] {
+            let (params, _) =
+                parse_connection_string(&cs(&format!("Server=h;UID=u;<PW>=p;{keywords}"))).unwrap();
+            assert_eq!(
+                effective_vendor_settings(&params).trust_server_certificate,
+                Some(expected),
+                "{keywords}"
+            );
+        }
+    }
 
     /// Read SQLSTATE for record `rec_number` on a DBC handle by calling the
     /// driver's own `SQLGetDiagRecW` entry point. Tests use this to verify
