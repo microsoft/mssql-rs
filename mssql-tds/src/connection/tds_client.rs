@@ -3255,31 +3255,60 @@ impl TdsClient {
         Ok(())
     }
 
-    /// Retires the connection after the reader has lost track of the stream.
+    /// True when a drain failed because the transport went away, rather than
+    /// because the token stream lost sync.
     ///
-    /// Every way a drain can fail — a dead socket, a protocol error, an elapsed
-    /// timeout, a cancellation — stops it before the terminal DONE, so bytes of
-    /// the response are still unread and the next command would decode them as
-    /// tokens. A TDS stream cannot be resynchronized from an unknown offset, so
-    /// the connection must not go back to a pool.
+    /// The distinction decides the remedy, so the two must not be collapsed. A
+    /// desynchronized stream is unrecoverable: the reader is parked at an
+    /// unknown offset in a response that is otherwise fine, and nothing can
+    /// resynchronize it. A socket that dropped mid-drain has no offset left to
+    /// recover — there is nothing to read from — and that is exactly the case
+    /// connection resiliency was built to handle transparently.
+    fn drain_failure_lost_the_transport(error: &crate::error::Error) -> bool {
+        matches!(
+            error,
+            crate::error::Error::Io(_)
+                | crate::error::Error::ConnectionClosed(_)
+                | crate::error::Error::ConnectionError(_)
+                | crate::error::Error::TlsError(_)
+                | crate::error::Error::TlsHandshakeError { .. }
+        )
+    }
+
+    /// Retires the connection after a drain failed, picking the remedy that
+    /// fits the cause.
     ///
-    /// What this does and does not guarantee: it marks the transport dead and
-    /// clears session recovery, which is what a pool consults before handing a
-    /// connection out, so pooled consumers discard it. It does not close the
-    /// socket, and no execute path consults `is_connection_dead`, so a caller
-    /// reusing this `TdsClient` directly can still issue another command.
-    /// That command is not left parked mid-value — entry points call
-    /// `reset_reader`, which discards the client-side buffer — but stale bytes
-    /// may remain queued in the kernel receive buffer. Closing the socket here
-    /// is the wrong remedy: `close_transport` writes a TLS close_notify on a
-    /// socket we just failed to read from, and its `?` returns before
-    /// `self.stream = None`, so a swallowed error would leave the stream alive
-    /// in exactly the degraded case retirement exists for. Dropping the stream
-    /// with no I/O is the fix; it needs a new transport method and is left as
-    /// follow-up.
-    fn retire_desynchronized_connection(&mut self) {
+    /// Both cases mark the transport dead, which is what a pool consults, so a
+    /// pooled consumer discards the connection either way. They differ in
+    /// whether session recovery stays armed:
+    ///
+    /// * **Stream desync** (protocol error, timeout, cancellation) — recovery
+    ///   is disarmed. The socket may be perfectly healthy, so leaving it armed
+    ///   would let the next command silently reconnect and paper over a decoder
+    ///   bug instead of surfacing it.
+    /// * **Transport loss** (I/O, TLS, connection closed) — recovery is left
+    ///   armed. Disarming it would turn a network blip that resiliency handles
+    ///   transparently into a hard failure, and these run on routine cursor
+    ///   open/close/fetch paths, not just exceptional ones.
+    ///
+    /// See [`Self::drain_failure_lost_the_transport`] for the split.
+    ///
+    /// What this does not do: it does not close the socket, and no execute path
+    /// consults `is_connection_dead`, so a caller reusing this `TdsClient`
+    /// directly can still issue another command. That command is not left
+    /// parked mid-value — entry points call `reset_reader`, which discards the
+    /// client-side buffer — but stale bytes may remain queued in the kernel
+    /// receive buffer. Closing the socket here is the wrong remedy:
+    /// `close_transport` writes a TLS close_notify on a socket we just failed to
+    /// read from, and its `?` returns before `self.stream = None`, so a
+    /// swallowed error would leave the stream alive in exactly the degraded case
+    /// retirement exists for. Dropping the stream with no I/O is the fix; it
+    /// needs a new transport method and is left as follow-up.
+    fn retire_after_failed_drain(&mut self, error: &crate::error::Error) {
         self.transport.mark_known_dead();
-        self.recovery_context.session_recovery_negotiated = false;
+        if !Self::drain_failure_lost_the_transport(error) {
+            self.recovery_context.session_recovery_negotiated = false;
+        }
     }
 
     /// Drains the stream, retiring the connection if the drain gives up partway.
@@ -3301,7 +3330,7 @@ impl TdsClient {
             Ok(errors) => Ok(errors),
             Err(error) => {
                 self.execution_context.set_has_open_batch(false);
-                self.retire_desynchronized_connection();
+                self.retire_after_failed_drain(&error);
                 Err(error)
             }
         }
@@ -3666,7 +3695,7 @@ impl TdsClient {
                             // stream is now desynchronized. Without this the error
                             // returns as `SqlServerError`, which callers treat as a
                             // healthy connection reporting a failed statement.
-                            self.retire_desynchronized_connection();
+                            self.retire_after_failed_drain(&e);
                         }
                     }
                     return Err(crate::error::Error::from_sql_errors(all_errors));
@@ -5087,7 +5116,7 @@ impl TdsClient {
                         // Mirrors the ERROR arm in `advance_to_result_boundary`:
                         // the SQL error still surfaces, but a stream we gave up on
                         // must not be handed back to a pool as `SqlServerError`.
-                        self.retire_desynchronized_connection();
+                        self.retire_after_failed_drain(&e);
                     }
                 }
                 Err(crate::error::Error::from_sql_errors(all_errors))
@@ -5259,7 +5288,7 @@ impl TdsClient {
             //
             // `SqlServerError` alone does not prove the stream is intact — the
             // ERROR-token handlers build one even when their own drain fails.
-            // Those arms call `retire_desynchronized_connection` themselves, so
+            // Those arms call `retire_after_failed_drain` themselves, so
             // by the time such an error reaches here the transport is already
             // marked dead and this exemption cannot revive it.
             //
@@ -5268,7 +5297,7 @@ impl TdsClient {
             // later call, which is what made the original failure look like a
             // permanent wedge.
             if !matches!(error, crate::error::Error::SqlServerError { .. }) {
-                self.retire_desynchronized_connection();
+                self.retire_after_failed_drain(&error);
             }
             return Err(error);
         }
@@ -8884,6 +8913,9 @@ mod tests {
     /// leaving the connection reusable *and* the batch open — the same
     /// `ALREADY_EXECUTING_ERROR` masking that made the original failure look
     /// like a permanent wedge.
+    ///
+    /// The stream here is truncated, i.e. the transport went away, so session
+    /// recovery must stay armed: reconnecting is exactly the remedy for that.
     #[tokio::test]
     async fn drain_stream_or_retire_failure_closes_batch_and_retires_connection() {
         let mut stream = Vec::new();
@@ -8894,8 +8926,9 @@ mod tests {
         let mut client = client_over_bytes(stream);
         client.execution_context.set_has_open_batch(true);
         client.current_result_set_has_been_read_till_end = true;
+        client.recovery_context.session_recovery_negotiated = true;
 
-        client
+        let error = client
             .drain_stream_or_retire()
             .await
             .expect_err("a truncated drain must surface an error");
@@ -8913,8 +8946,36 @@ mod tests {
             "a failed drain must retire the connection regardless of call site"
         );
         assert!(
+            TdsClient::drain_failure_lost_the_transport(&error),
+            "a truncated stream must classify as transport loss, got {error:?}"
+        );
+        assert!(
+            client.recovery_context.session_recovery_negotiated,
+            "losing the transport mid-drain is what resiliency exists for; \
+             disarming it turns a recoverable blip into a hard failure"
+        );
+    }
+
+    /// The other half of the split: when the drain failed because the *token
+    /// stream* lost sync, the socket may still be perfectly healthy. Recovery
+    /// must be disarmed there, otherwise the next command silently reconnects
+    /// and papers over a decoder bug instead of surfacing it.
+    #[tokio::test]
+    async fn retire_after_failed_drain_disarms_recovery_only_for_desync() {
+        let desync = crate::error::Error::ProtocolError("unexpected token".to_string());
+        assert!(!TdsClient::drain_failure_lost_the_transport(&desync));
+
+        let mut client = client_over_bytes(Vec::new());
+        client.recovery_context.session_recovery_negotiated = true;
+        client.retire_after_failed_drain(&desync);
+
+        assert!(
+            client.transport.connection_known_dead(),
+            "a desynchronized stream must not go back to a pool"
+        );
+        assert!(
             !client.recovery_context.session_recovery_negotiated,
-            "a desynchronized session must not be silently recovered"
+            "a desynchronized stream cannot be fixed by reconnecting"
         );
     }
 

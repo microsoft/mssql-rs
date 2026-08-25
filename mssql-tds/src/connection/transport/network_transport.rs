@@ -759,6 +759,27 @@ impl NetworkTransport {
         Ok(())
     }
 
+    /// How many consecutive payload-free end-of-message packets a bulk read
+    /// tolerates before giving up.
+    ///
+    /// One is legitimate: a read that begins exactly at a message boundary
+    /// consumes the empty packet terminating the *previous* message before its
+    /// own data arrives. A second in a row means the peer emitted two empty
+    /// messages back to back, so nothing advanced between iterations and the
+    /// loop would spin until the command timeout.
+    const MAX_CONSECUTIVE_EMPTY_MESSAGES: u32 = 1;
+
+    /// Error for a bulk read that kept receiving empty messages without
+    /// advancing.
+    #[cold]
+    fn stalled_on_empty_messages_error(outstanding: usize) -> crate::error::Error {
+        crate::error::Error::ProtocolError(format!(
+            "TDS read stalled: {outstanding} more byte(s) required but the peer sent {} \
+             consecutive payload-free end-of-message packets without advancing.",
+            Self::MAX_CONSECUTIVE_EMPTY_MESSAGES + 1
+        ))
+    }
+
     /// Error for a bulk read that needed more bytes but got a packet carrying
     /// none.
     ///
@@ -1407,6 +1428,7 @@ impl TdsPacketReader for NetworkTransport {
         let mut total_read = 0;
         let mut length_to_read = buffer.len();
         let mut offset = 0;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
             if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
                 return Err(Self::past_end_of_message_error(
@@ -1438,7 +1460,12 @@ impl TdsPacketReader for NetworkTransport {
                 // Nothing of this value has been read yet, so the empty
                 // end-of-message packet belongs to the previous message rather
                 // than truncating this read. Refill and carry on, matching what
-                // the scalar readers do at the same boundary.
+                // the scalar readers do at the same boundary. Only so many in a
+                // row can be legitimate; past that nothing is advancing.
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
+                }
                 continue;
             }
 
@@ -1463,6 +1490,7 @@ impl TdsPacketReader for NetworkTransport {
         let mut total_read = 0;
         let mut length_to_read = buffer.len();
         let mut offset = 0;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
             if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
                 return Err(Self::past_end_of_message_error(
@@ -1488,6 +1516,10 @@ impl TdsPacketReader for NetworkTransport {
                 }
                 if total_read > 0 {
                     return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
                 }
                 continue;
             }
@@ -1569,6 +1601,7 @@ impl TdsPacketReader for NetworkTransport {
 
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
         let mut length_to_read = skip_count;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
             let skipped_any = length_to_read < skip_count;
             if self.value_truncated_by_message_end(skipped_any, length_to_read) {
@@ -1597,6 +1630,10 @@ impl TdsPacketReader for NetworkTransport {
                 }
                 if skipped_any {
                     return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
                 }
                 continue;
             }
@@ -3358,6 +3395,107 @@ pub(crate) mod tests {
 
         assert_eq!(read, 4);
         assert_eq!(destination, [0xA1, 0xA2, 0xA3, 0xA4]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Consecutive payload-free messages.
+    //
+    // A bulk read that has not yet consumed a byte tolerates an empty EOM
+    // packet, because a read starting exactly at a message boundary consumes
+    // the packet terminating the *previous* message. That `continue` re-enters
+    // the loop with nothing changed, so a peer that keeps sending empty
+    // messages spins the loop with no state advancing and no bytes delivered —
+    // bounded only by the command timeout.
+    //
+    // One in a row is legitimate; two is not. No server sends two empty
+    // messages back to back, and the attention acknowledgement carries a DONE
+    // token, so it is not payload-free either.
+    // ---------------------------------------------------------------------
+
+    /// Two empty messages in a row, then a peer that stays open and silent.
+    /// Without the cap this spins until the caller's timeout.
+    #[tokio::test]
+    async fn read_bytes_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let result = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("read_bytes spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// `read_bytes_uninit` carries its own copy of the loop and needs the same
+    /// cap.
+    #[tokio::test]
+    async fn read_bytes_uninit_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        let result = timeout(
+            Duration::from_secs(5),
+            reader.read_bytes_uninit(&mut destination),
+        )
+        .await
+        .expect("read_bytes_uninit spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// `skip_bytes` spins the same way, and it runs on the discard path that
+    /// large-value reads use, so a stall there is just as unbounded.
+    #[tokio::test]
+    async fn skip_bytes_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.skip_bytes(2))
+            .await
+            .expect("skip_bytes spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Control: the cap must stay quiet on the legitimate case it tolerates —
+    /// a read that begins exactly at a message boundary, so the first packet it
+    /// sees is the empty one terminating the previous message.
+    #[tokio::test]
+    async fn bulk_reads_tolerate_a_single_leading_empty_message() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&[0xB1, 0xB2])
+                .build(),
+        );
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let read = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("a read starting at a message boundary must not hang")
+            .expect("a leading empty message must be consumed, not rejected");
+
+        assert_eq!(read, 2);
+        assert_eq!(destination, [0xB1, 0xB2]);
     }
 
     // ---------------------------------------------------------------------
