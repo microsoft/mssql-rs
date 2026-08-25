@@ -161,7 +161,7 @@ build.
 ### Regression gate
 
 The run **fails only when a *candidate* benchmark is slower than its baseline by at least
-the threshold** (`BENCH_REGRESSION_RATIO`, default `1.10` = 10%). A baseline-slower
+the threshold** (`BENCH_REGRESSION_RATIO`, default `1.05` = 5%). A baseline-slower
 result never fails the gate — it can only mean the comparison lost sensitivity, which is
 exactly what the interleaving + pinning + warm-up work keeps in check. Any benchmark that
 trips is re-measured by **auto-confirm** `BENCH_CONFIRM_RUNS` times (default 4) and only
@@ -170,6 +170,19 @@ verdict and the full `critcmp` table are written to `results/summary.md`, which 
 attaches to the run's **Summary** tab (`task.uploadsummary`) so the comparison renders
 inline on the pipeline run page. The summary is also echoed into the log, since the
 Summary tab is not visible when triaging from the log alone.
+
+The threshold is set at the level worth *verifying*, not the level worth tolerating. These
+pipelines are weekly and scheduled (`trigger: none`, `pr: none`), so a trip never blocks a
+PR — it costs one investigation. Best-of-N absorbs the resulting noise: every false trip
+observed so far cleared **0 of 4** re-runs, nowhere near the 3-of-4 quorum, because lab
+noise is spiky rather than sustained and interleaving cancels host-wide slowdowns across
+both sides. A 5% gate also makes a passing run a much stronger certificate that the
+baseline can safely be advanced, which is what makes automating that ratchet practical: a
+5-10% regression that is never challenged would otherwise be silently absorbed into the
+next baseline and become invisible. Expect Windows to re-measure more than Linux — its
+first-pass noise reaches 8-10%. **If a false positive ever survives the quorum, raise
+`BENCH_CONFIRM_RUNS`/`BENCH_CONFIRM_QUORUM` rather than the threshold**; reverting the
+threshold would discard the signal this buys.
 
 `summary.md` leads with a **diverging bar table** (🟩 faster / 🟥 slower, one square ≈ 1%,
 drawn only for |Δ| ≥ 1%) so a run's shape is readable at a glance; the raw `critcmp`
@@ -323,7 +336,7 @@ binaries keep the per-binary interleaving effective (see §2).
 - Perf-lab pipeline runs on a **dedicated host VM** via the shared `PerfTest` lab
   `extends` template; the build happens on the VM (the lab's documented model).
 - Comparison is **interleaved per bench binary** (not two full passes), and the run
-  **fails only on a candidate-slower regression ≥ threshold** (default 10%), with
+  **fails only on a candidate-slower regression ≥ threshold** (default 5%), with
   **best-of-N auto-confirm** (re-measure a tripped benchmark 4× and fail only on a
   majority) rejecting transient outliers before failing.
 - Runs on **both Linux and Windows** as two separate pipeline definitions (numbers are
