@@ -1256,6 +1256,17 @@ impl NetworkTransport {
     /// Reads and discards tokens until the DONE carrying ATTN arrives.
     ///
     /// Unbounded on its own — every caller wraps it in a timeout.
+    ///
+    /// Tokens are read with a dummy context, so a ROW/NBCROW still in flight
+    /// ends this drain with a parse error rather than being skipped: those
+    /// tokens carry no length prefix and are parseable only with the preceding
+    /// COLMETADATA in the context. The caller treats that error like any other
+    /// failed drain and retires the connection, which is the safe outcome —
+    /// the alternative is handing back a connection with unparsed row bytes
+    /// still in the transport. Consuming those rows instead needs the
+    /// COLMETADATA-aware loop that `TdsClient::drain_stream` has, since a new
+    /// COLMETADATA can arrive mid-drain and a caller's context alone would not
+    /// cover it.
     async fn drain_to_attention_ack(&mut self) -> TdsResult<()> {
         let dummy_context = ParserContext::None(());
 
@@ -3962,6 +3973,48 @@ pub(crate) mod tests {
         assert!(
             !is_known_dead(&transport),
             "the acknowledgement arrived, so the connection stays usable"
+        );
+    }
+
+    /// A ROW queued behind the ATTENTION cannot be skipped. ROW/NBCROW tokens
+    /// carry no length prefix, so they are parseable only with the preceding
+    /// COLMETADATA in the parser context, and the drain reads with a dummy one.
+    /// The drain therefore ends on the parse error and the connection is
+    /// retired instead of being handed back desynchronized — the
+    /// acknowledgement sitting behind the ROW is never reached.
+    ///
+    /// This is the common shape for a cancelled row-returning query, so the
+    /// bound is doing its job here at the cost of the connection. Teaching the
+    /// drain to consume rows needs the COLMETADATA-aware loop that
+    /// `TdsClient::drain_stream` already has; this test pins today's outcome so
+    /// that change is a deliberate one rather than a silent behaviour flip.
+    ///
+    /// The ROW body is deliberately absent: the parser rejects on the context
+    /// before it reads a single value byte, so no body would ever be consumed.
+    #[tokio::test(start_paused = true)]
+    async fn a_row_in_flight_ends_the_drain_and_retires_the_connection() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(crate::token::tokens::TokenType::Row as u8)
+            .build();
+        stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&stream);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("the drain hung instead of ending on the unparseable ROW");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must see its cancellation, not the drain's parse error, got {result:?}"
+        );
+        assert!(
+            is_known_dead(&transport),
+            "the acknowledgement was never reached, so the connection must not be reused"
         );
     }
 }
