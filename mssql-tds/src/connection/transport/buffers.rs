@@ -89,9 +89,13 @@ impl TdsReadBuffer {
         self.try_read_array().map(|[value]| value)
     }
 
-    // consume_bytes only moves buffer_position, so the bytes stay readable until
-    // the next packet read overwrites working_buffer. That read needs &mut self,
-    // which is what bounds the returned borrow.
+    // `consume_bytes` only moves the position indices — on an exact drain it
+    // resets both `buffer_position` and `buffer_length` to 0 — and never
+    // touches `working_buffer` itself. That reset is why `start` is captured
+    // before the call: afterwards it is an absolute index into
+    // `working_buffer`, not an offset from any live field. The bytes stay
+    // readable until the next packet read overwrites `working_buffer`, and that
+    // read needs `&mut self`, which is what bounds the returned borrow.
     #[inline(always)]
     pub(crate) fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
         if !self.do_we_have_enough_data(length) {

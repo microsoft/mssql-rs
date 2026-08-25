@@ -285,6 +285,12 @@ macro_rules! forward_row_values {
     };
 }
 
+// Lets test writers in other modules reuse the boilerplate. Any user must be a
+// tuple struct whose `.0` is the inner `RowWriter`.
+#[cfg(any(test, feature = "test-util", fuzzing))]
+#[allow(unused_imports)]
+pub(crate) use forward_row_values;
+
 #[cfg(any(test, feature = "test-util", fuzzing))]
 impl<W: RowWriter + Send + ?Sized> RowWriter for DynamicRowWriter<'_, W> {
     fn write_null(&mut self, col: usize) {

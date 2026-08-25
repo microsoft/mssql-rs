@@ -40,9 +40,17 @@ pub trait RowWriter {
     /// Writes a character string value in its wire encoding.
     ///
     /// `bytes` borrows the read buffer when the value was already resident in
-    /// it, so it must not be retained past the call. Use
-    /// [`EncodingType::encoding`] to transcode it in place, or `into_owned` to
-    /// take it — which is free when the decoder already owned the bytes.
+    /// it, so it must not be retained past the call. Whether a given value
+    /// arrives borrowed depends on where the packet boundary fell, not on the
+    /// value, so an implementation must treat both arms identically.
+    ///
+    /// [`SqlString::decode`] decodes either arm without copying the borrowed
+    /// one and is the consistent choice. [`EncodingType::encoding`] is
+    /// available for transcoding straight into a caller-owned buffer, but note
+    /// it substitutes U+FFFD where `decode` and [`SqlString::to_utf8_string`]
+    /// panic on malformed [`EncodingType::Utf8`] input (#310) — picking it for
+    /// the borrowed arm alone makes the same logical row behave differently
+    /// depending on packet alignment.
     fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType);
     /// Writes a binary value. Borrows on the same terms as
     /// [`RowWriter::write_string`].

@@ -3652,14 +3652,16 @@ mod test {
     mod decode_into_tests {
 
         use byteorder::{ByteOrder, LittleEndian};
+        use std::borrow::Cow;
 
         use crate::core::TdsResult;
         use crate::datatypes::column_values::{ColumnValues, SqlDateTime, SqlSmallDateTime};
         use crate::datatypes::decoder::{
-            GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
+            DecimalParts, GenericDecoder, MAX_PLP_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
             PlpColumnStream, SqlTypeDecode,
         };
-        use crate::datatypes::row_writer::DefaultRowWriter;
+        use crate::datatypes::row_writer::{DefaultRowWriter, RowWriter};
+        use crate::datatypes::sql_string::EncodingType;
         use crate::datatypes::sqldatatypes::{
             PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, VariableLengthTypes,
         };
@@ -4036,29 +4038,100 @@ mod test {
             );
         }
 
+        /// Wraps a `DefaultRowWriter` and records, per string/binary write,
+        /// whether the value arrived still borrowed.
+        struct BorrowSpy(DefaultRowWriter, Vec<bool>);
+
+        impl RowWriter for BorrowSpy {
+            fn write_null(&mut self, col: usize) {
+                self.0.write_null(col);
+            }
+
+            crate::connection::transport::any_transport::forward_row_values!(
+                write_bool: bool,
+                write_u8: u8,
+                write_i16: i16,
+                write_i32: i32,
+                write_i64: i64,
+                write_f32: f32,
+                write_f64: f64,
+                write_decimal: DecimalParts,
+                write_numeric: DecimalParts,
+                write_date: crate::datatypes::column_values::SqlDate,
+                write_time: crate::datatypes::column_values::SqlTime,
+                write_datetime: crate::datatypes::column_values::SqlDateTime,
+                write_smalldatetime: crate::datatypes::column_values::SqlSmallDateTime,
+                write_datetime2: crate::datatypes::column_values::SqlDateTime2,
+                write_datetimeoffset: crate::datatypes::column_values::SqlDateTimeOffset,
+                write_money: crate::datatypes::column_values::SqlMoney,
+                write_smallmoney: crate::datatypes::column_values::SqlSmallMoney,
+                write_uuid: uuid::Uuid,
+                write_xml: crate::datatypes::column_values::SqlXml,
+                write_json: crate::datatypes::sql_json::SqlJson,
+                write_vector: crate::datatypes::sql_vector::SqlVector,
+            );
+
+            fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding: EncodingType) {
+                self.1.push(matches!(&bytes, Cow::Borrowed(_)));
+                self.0.write_string(col, bytes, encoding);
+            }
+
+            fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>) {
+                self.1.push(matches!(&bytes, Cow::Borrowed(_)));
+                self.0.write_bytes(col, bytes);
+            }
+
+            fn end_row(&mut self) {
+                self.0.end_row();
+            }
+        }
+
         /// Decodes `wire` twice, once through a reader that hands out borrows and
         /// once through one that never does, and asserts both produce the same
-        /// value. Returns it so a caller can assert on the content too.
+        /// value. Also pins that the first arm actually *took* the borrowed path
+        /// and the second did not, so a change that silently stops borrowing
+        /// fails here rather than passing on value equality alone. Returns the
+        /// value so a caller can assert on the content too.
         async fn borrowed_and_owned_agree(wire: Vec<u8>, md: &ColumnMetadata) -> ColumnValues {
             let decoder = GenericDecoder::default();
 
-            let mut borrowed_writer = DefaultRowWriter::new(1);
+            let mut borrowed_writer = BorrowSpy(DefaultRowWriter::new(1), Vec::new());
             let mut borrowed_reader = ByteReader::new(wire.clone());
             decoder
                 .decode_into(&mut borrowed_reader, md, 0, &mut borrowed_writer)
                 .await
                 .unwrap();
-            let borrowed = borrowed_writer.take_row()[0].clone();
+            let borrowed_flags = std::mem::take(&mut borrowed_writer.1);
+            let borrowed = borrowed_writer.0.take_row()[0].clone();
 
-            let mut owned_writer = DefaultRowWriter::new(1);
+            let mut owned_writer = BorrowSpy(DefaultRowWriter::new(1), Vec::new());
             let mut owned_reader = ByteReader::new_unbuffered(wire);
             decoder
                 .decode_into(&mut owned_reader, md, 0, &mut owned_writer)
                 .await
                 .unwrap();
-            let owned = owned_writer.take_row()[0].clone();
+            let owned_flags = std::mem::take(&mut owned_writer.1);
+            let owned = owned_writer.0.take_row()[0].clone();
 
             assert_eq!(borrowed, owned, "borrowed arm disagreed with the owned arm");
+
+            // A NULL writes no string or binary value at all, so both arms are
+            // empty and there is no borrow to assert on.
+            assert_eq!(
+                borrowed_flags.len(),
+                owned_flags.len(),
+                "the two arms took different numbers of string/binary writes"
+            );
+            assert!(
+                borrowed_flags.iter().all(|borrowed| *borrowed),
+                "a slice-offering reader still produced an owned value, so the \
+                 zero-copy path this PR exists for did not run: {borrowed_flags:?}"
+            );
+            assert!(
+                owned_flags.iter().all(|borrowed| !*borrowed),
+                "a reader that never hands out slices somehow produced a borrow: {owned_flags:?}"
+            );
+
             borrowed
         }
 
