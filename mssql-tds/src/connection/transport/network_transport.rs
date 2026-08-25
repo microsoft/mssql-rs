@@ -1149,27 +1149,25 @@ impl NetworkTransport {
     /// reusable. Unacknowledged — the send failed or stalled, the drain
     /// errored, or the bound elapsed — the stream is parked at an unknown
     /// point, so the connection is marked known-dead and pools will not hand
-    /// it out again.
+    /// it out again. Once that verdict is in, a later cancelled read returns
+    /// straight away rather than spending the bound over again.
     ///
     /// This reports nothing to the caller on purpose. It runs on a path that
     /// already has an error to deliver (the cancellation or the timeout), and
     /// replacing that with a cleanup failure would hide why the read stopped.
     /// The known-dead flag is how a failed cleanup is observed.
     async fn cancel_read_stream_and_wait(&mut self) {
+        if self.known_dead {
+            // An earlier cancellation already spent the bound and gave up on
+            // this connection. There is nothing left to acknowledge, so
+            // re-entering would just charge this caller the bound again.
+            debug!("Skipping attention: the connection is already known dead");
+            return;
+        }
+
         let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
-        match self.send_attention_and_wait(attention_timeout).await {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    timeout = ?attention_timeout,
-                    "Attention went unacknowledged within the bound; marking the connection dead"
-                );
-                self.known_dead = true;
-            }
-            Err(e) => {
-                debug!("Failed to cancel the read stream: {e:?}");
-                self.known_dead = true;
-            }
+        if let Err(e) = self.send_attention_and_wait(attention_timeout).await {
+            debug!("Failed to cancel the read stream: {e:?}");
         }
     }
 
@@ -1181,6 +1179,11 @@ impl NetworkTransport {
     /// acknowledgement deadline would never be armed. The drain gets whatever
     /// the send left of the deadline.
     ///
+    /// Anything other than an acknowledgement leaves the stream parked at an
+    /// unknown point, so every such outcome marks the connection known-dead
+    /// here. Callers can then ignore the return value and still not reuse a
+    /// connection with an ATTENTION outstanding on it.
+    ///
     /// # Returns
     ///
     /// * `Ok(true)` - Attention acknowledged by server
@@ -1190,7 +1193,11 @@ impl NetworkTransport {
         let deadline = Instant::now() + attention_timeout;
 
         match timeout_at(deadline, self.cancel_read_stream()).await {
-            Ok(result) => result?,
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.known_dead = true;
+                return Err(e);
+            }
             Err(_elapsed) => {
                 // A stalled write leaves a partial packet on the wire, so the
                 // stream can never be resynchronised.
@@ -1203,7 +1210,21 @@ impl NetworkTransport {
             }
         }
 
-        self.wait_for_attention_ack(deadline).await
+        match self.wait_for_attention_ack(deadline).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                warn!(
+                    timeout = ?attention_timeout,
+                    "Attention went unacknowledged within the bound; marking the connection dead"
+                );
+                self.known_dead = true;
+                Ok(false)
+            }
+            Err(e) => {
+                self.known_dead = true;
+                Err(e)
+            }
+        }
     }
 
     /// Wait for attention acknowledgment from server until `deadline`.
@@ -2008,7 +2029,7 @@ pub(crate) mod tests {
     use crate::core::EncryptionOptions;
     use crate::message::messages::PacketType;
     use crate::test_packet_support::{
-        TestPacketBuilder, create_network_transport_with_chunked_data,
+        TestPacketBuilder, build_duplex_transport, create_network_transport_with_chunked_data,
         create_network_transport_with_data, create_network_transport_with_live_peer,
         create_network_transport_with_live_peer_capturing_writes, encode_utf16_le,
     };
@@ -3709,6 +3730,24 @@ pub(crate) mod tests {
         TdsTransport::connection_known_dead(transport)
     }
 
+    /// Runs one cancelled read under the outer guard and reports how long the
+    /// cancellation cleanup took.
+    async fn time_one_cancelled_read(transport: &mut NetworkTransport) -> Duration {
+        let started = Instant::now();
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("cancellation hung waiting for a DONE_ATTN the server never sent");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must still see its cancellation, got {result:?}"
+        );
+        started.elapsed()
+    }
+
     /// The bug: cancellation waits for a `DONE_ATTN` that never comes.
     ///
     /// The peer acknowledges nothing, so before the bound the drain parked on
@@ -3744,14 +3783,24 @@ pub(crate) mod tests {
     /// The bound has to cover the ATTENTION write, not just the drain that
     /// follows it.
     ///
-    /// `create_network_transport_with_live_peer` never reads and sizes its
-    /// duplex buffer to the scripted data alone, so with no data the client's
-    /// 8-byte ATTENTION fills a 1-byte buffer and the write parks — a peer
-    /// whose receive window has closed, in miniature. Timing only the drain
-    /// leaves the caller stuck here, before any deadline is armed.
+    /// The duplex is one byte wide and the peer end is held without ever being
+    /// read, so the client's ATTENTION packet fills that byte and the write
+    /// parks — a peer whose receive window has closed, in miniature. Timing
+    /// only the drain leaves the caller stuck here, before any deadline is
+    /// armed.
+    ///
+    /// The sizing lives in the test rather than in a shared helper: borrowed,
+    /// it could be widened for some other test's benefit, the write would then
+    /// succeed, the drain would time out instead, and both assertions below
+    /// would still hold — leaving a passing test that no longer covers the
+    /// send. The last assertion pins the mechanism for the same reason.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_attention_write_does_not_park_cancellation() {
-        let mut transport = create_network_transport_with_live_peer(&[]);
+        /// A TDS header with no payload, which is all an ATTENTION packet is.
+        const ATTENTION_PACKET_LEN: usize = 8;
+
+        let (client_side, mut peer) = duplex(1);
+        let mut transport = build_duplex_transport(client_side);
 
         let result = timeout(
             Duration::from_secs(600),
@@ -3767,6 +3816,51 @@ pub(crate) mod tests {
         assert!(
             is_known_dead(&transport),
             "a half-written attention leaves the stream unresynchronisable"
+        );
+
+        let mut buffer = [0u8; ATTENTION_PACKET_LEN];
+        let delivered = timeout(Duration::from_secs(600), peer.read(&mut buffer))
+            .await
+            .expect("the write left nothing with the peer, so nothing stalled")
+            .expect("reading the peer end must not fail");
+        assert!(
+            delivered < ATTENTION_PACKET_LEN,
+            "the write must have stalled part-way; a completed one would have \
+             delivered all {ATTENTION_PACKET_LEN} bytes, so this test would be \
+             measuring the drain instead"
+        );
+    }
+
+    /// The bound belongs to the connection, not to each call.
+    ///
+    /// Nothing consulted the known-dead flag on the way in, so a caller that
+    /// re-entered `receive_token` after a cancellation — closing a cursor,
+    /// draining what is left of a batch — paid the full bound again every
+    /// time, and the advertised ceiling multiplied by however many reads
+    /// followed.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_cancellation_does_not_spend_the_bound_again() {
+        let bound = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+        let (mut transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&[]);
+
+        let first = time_one_cancelled_read(&mut transport).await;
+        assert!(
+            first >= bound,
+            "the first cancellation waits out the whole bound for an \
+             acknowledgement that never comes, took {first:?}"
+        );
+        assert!(
+            is_known_dead(&transport),
+            "an unacknowledged attention must leave the connection dead"
+        );
+
+        let second = time_one_cancelled_read(&mut transport).await;
+        assert_eq!(
+            second,
+            Duration::ZERO,
+            "a connection already given up on has nothing left to acknowledge, \
+             so a later cancellation must return without waiting at all"
         );
     }
 

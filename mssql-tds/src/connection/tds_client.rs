@@ -2102,6 +2102,9 @@ impl TdsClient {
             // TDS protocol state so the connection can be reused.
             // The stream is always in a clean state here because writes are never
             // dropped mid-flight (issue #513).
+            // If the attention is never acknowledged the transport marks itself
+            // dead, so clearing the batch flag below cannot hand out a connection
+            // with an ATTENTION still outstanding.
             let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
             let _ = self.send_attention_with_timeout(attention_timeout).await;
             // Clear the open batch flag since we've cancelled the operation

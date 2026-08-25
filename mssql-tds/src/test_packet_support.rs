@@ -94,7 +94,7 @@ pub(crate) fn encode_utf16_le(value: &str) -> Vec<u8> {
         .collect()
 }
 
-fn build_duplex_transport(client_side: DuplexStream) -> NetworkTransport {
+pub(crate) fn build_duplex_transport(client_side: DuplexStream) -> NetworkTransport {
     let context = ClientContext::default();
     NetworkTransport::new(
         Box::new(client_side),

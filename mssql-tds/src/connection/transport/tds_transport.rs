@@ -51,9 +51,15 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     ///
     /// * `Ok(true)` - Attention acknowledged by server
     /// * `Ok(false)` - Timeout expired before the acknowledgement, either while
-    ///   sending the attention or while waiting for the ACK. The connection is
-    ///   left unusable either way.
+    ///   sending the attention or while waiting for the ACK
     /// * `Err(_)` - Error sending attention or reading response
+    ///
+    /// Only `Ok(true)` leaves the connection at a message boundary. On either
+    /// other outcome an ATTENTION is outstanding with no acknowledgement to
+    /// pair it with, so a later read could pick up a stray DONE_ATTN and treat
+    /// it as the answer to a different request. Implementations must mark such
+    /// a connection dead rather than let it be reused, which is why callers may
+    /// ignore the return value.
     async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
 
     /// Probe whether the underlying connection is dead via a non-blocking socket
