@@ -3598,9 +3598,10 @@ impl TdsClient {
                     // Capture update counts for `SQLRowCount`. DONE_COUNT on a
                     // SQLSELECT command is not an update-count result.
                     let has_count = done.status.contains(DoneStatus::COUNT);
-                    // SQL Server can tag non-row-producing statements such as
-                    // DECLARE with SQLSELECT and DONE_COUNT. msodbcsql does not
-                    // expose those as update-count results.
+                    // SQL Server compiles variable assignment (`DECLARE @x int = 1`,
+                    // `SET @x = 1`, `SELECT @x = col FROM t`) as a SQLSELECT command
+                    // and still sets DONE_COUNT. msodbcsql does not expose those as
+                    // update-count results, so neither do we.
                     let has_update_count = has_count && done.cur_cmd != CurrentCommand::Select;
                     if has_update_count {
                         let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
@@ -6593,21 +6594,141 @@ mod tests {
         assert_eq!(r2, StatementResult::End);
     }
 
+    /// SQL Server compiles variable assignment as a SQLSELECT command and still
+    /// sets DONE_COUNT. Such a DONE must collapse into the following row set
+    /// rather than surface as a leading update-count result.
+    /// Observed token sequence for `DECLARE @out int = 1; EXEC dbo.p;`.
     #[tokio::test]
     async fn execute_skips_select_count_before_rowset() {
         let mut client = create_test_client_with_tokens(vec![
-            done_count(CurrentCommand::Select, 0, true),
+            done_count(CurrentCommand::Select, 1, true),
             empty_col_metadata(),
         ]);
 
         let result = client
-            .execute("DECLARE @value int; EXEC dbo.p;".to_string(), ())
+            .execute("DECLARE @out int = 1; EXEC dbo.p;".to_string(), ())
             .await
             .unwrap();
 
         assert_eq!(result, StatementResult::Rows);
         assert_eq!(client.last_rows_affected(), -1);
         assert!(client.take_dml_result_counts().is_empty());
+    }
+
+    /// `DECLARE @x int = 1;` on its own must not report a phantom result.
+    #[tokio::test]
+    async fn execute_select_count_only_batch_ends_immediately() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Select, 1, false)]);
+
+        let result = client
+            .execute("DECLARE @x int = 1;".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::End);
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+    }
+
+    /// Several assignments in a row all collapse.
+    #[tokio::test]
+    async fn execute_skips_consecutive_select_counts() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 2, true),
+            empty_col_metadata(),
+        ]);
+
+        let result = client
+            .execute(
+                "DECLARE @a int = 1; SET @a = 2; SELECT @a = v FROM t; SELECT * FROM t;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::Rows);
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    /// A PRINT before the assignment must still surface as its own message-only
+    /// result; only the assignment's count is suppressed.
+    #[tokio::test]
+    async fn execute_surfaces_message_but_skips_select_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "hi"),
+            done_more(),
+            done_count(CurrentCommand::Select, 1, true),
+            empty_col_metadata(),
+        ]);
+
+        let first = client
+            .execute("PRINT 'hi'; DECLARE @x int = 1; SELECT 1;".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(second, StatementResult::Rows);
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    /// A genuine DML count following an assignment is still reported.
+    #[tokio::test]
+    async fn execute_keeps_update_count_after_select_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Update, 2, true),
+            empty_col_metadata(),
+        ]);
+
+        let first = client
+            .execute(
+                "DECLARE @x int = 1; UPDATE t SET v = v; SELECT * FROM t;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(2)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 2);
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(second, StatementResult::Rows);
+    }
+
+    /// `SELECT ... INTO` reports DONE_COUNT with no CurCmd, which is a genuine
+    /// update count and must survive the SQLSELECT filter.
+    #[tokio::test]
+    async fn execute_keeps_select_into_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::None, 1, true),
+            empty_col_metadata(),
+        ]);
+
+        let first = client
+            .execute("SELECT 1 AS a INTO #t; SELECT * FROM #t;".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(1)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 1);
     }
 
     #[tokio::test]

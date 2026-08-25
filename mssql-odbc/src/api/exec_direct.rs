@@ -324,8 +324,11 @@ mod tests {
         assert!(ds.client.is_some());
     }
 
+    /// SQL Server compiles variable assignment as a SQLSELECT command carrying
+    /// DONE_COUNT. `SQLExecDirect` must skip past it and open the following row
+    /// set, so an immediate `SQLFetch` succeeds instead of failing with 24000.
     #[test]
-    fn exec_direct_skips_declare_count_and_opens_rowset() {
+    fn exec_direct_skips_assignment_count_and_opens_rowset() {
         use crate::api::odbc_types::SQL_SUCCESS;
         use crate::handles::dbc::DbcHandle;
         use mssql_tds::test_client_support::{
@@ -337,15 +340,18 @@ mod tests {
         h.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let client = tds_client_from_tokens(vec![
-            done_more_select_with_count(0),
+            done_more_select_with_count(1),
             col_metadata(int_columns(1)),
             done_no_more(),
         ]);
         dbc.inner.lock().unwrap().client = Some(client);
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let ret =
-            sql_exec_direct_w_safe(h.stmt, stmt, "DECLARE @value int; EXEC dbo.p;".to_string());
+        let ret = sql_exec_direct_w_safe(
+            h.stmt,
+            stmt,
+            "DECLARE @out int = 1; EXEC dbo.p;".to_string(),
+        );
 
         assert_eq!(ret, SQL_SUCCESS);
         let state = stmt.inner.lock().unwrap();
