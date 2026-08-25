@@ -6673,7 +6673,7 @@ mod tests {
             done_count(CurrentCommand::Select, 1, true),
             done_count(CurrentCommand::Select, 1, true),
             done_count(CurrentCommand::Select, 2, true),
-            empty_col_metadata(),
+            int_col_metadata(1),
         ]);
 
         let result = client
@@ -6686,18 +6686,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
         assert_eq!(client.last_rows_affected(), -1);
     }
 
-    /// A PRINT before the assignment must still surface as its own message-only
-    /// result; only the assignment's count is suppressed.
+    /// A PRINT on its own statement surfaces as a message-only result (its DONE
+    /// carries no count); the following assignment's count is still suppressed.
     #[tokio::test]
     async fn execute_surfaces_message_but_skips_select_count() {
         let mut client = create_test_client_with_tokens(vec![
             info_token(0, 0, "hi"),
             done_more(),
             done_count(CurrentCommand::Select, 1, true),
-            empty_col_metadata(),
+            int_col_metadata(1),
         ]);
 
         let first = client
@@ -6710,10 +6717,71 @@ mod tests {
                 rows_affected: None
             }
         );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
 
         let second = client.advance().await.unwrap();
         assert_eq!(second, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    /// The only path where `saw_message` and `has_count` land on the *same* DONE:
+    /// a warning raised by the assignment itself. The result must still surface
+    /// so the message is visible, but must carry no row count — this PR changed
+    /// `rows_affected` here from `Some(1)` to `None`.
+    ///
+    /// Live capture for
+    /// `DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;`
+    /// where `#t.v` contains a NULL:
+    /// ```text
+    /// INFO 8153 "Warning: Null value is eliminated by an aggregate or other SET operation."
+    /// DONE status=MORE|COUNT cur_cmd=Select row_count=1
+    /// COLMETADATA(1) + row
+    /// ```
+    /// msodbcsql reports `cols=0 rowcount=-1` then `cols=1 rowcount=-1`.
+    #[tokio::test]
+    async fn execute_surfaces_assignment_warning_without_rowcount() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(
+                8153,
+                0,
+                "Warning: Null value is eliminated by an aggregate or other SET operation.",
+            ),
+            done_count(CurrentCommand::Select, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute(
+                "DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
         assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(second, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
     }
 
     /// A genuine DML count following an assignment is still reported.
@@ -6722,7 +6790,7 @@ mod tests {
         let mut client = create_test_client_with_tokens(vec![
             done_count(CurrentCommand::Select, 1, true),
             done_count(CurrentCommand::Update, 2, true),
-            empty_col_metadata(),
+            int_col_metadata(1),
         ]);
 
         let first = client
@@ -6739,6 +6807,7 @@ mod tests {
             }
         );
         assert_eq!(client.last_rows_affected(), 2);
+        assert_eq!(client.take_dml_result_counts(), vec![2]);
 
         let second = client.advance().await.unwrap();
         assert_eq!(second, StatementResult::Rows);
@@ -6750,7 +6819,7 @@ mod tests {
     async fn execute_keeps_select_into_count() {
         let mut client = create_test_client_with_tokens(vec![
             done_count(CurrentCommand::None, 1, true),
-            empty_col_metadata(),
+            int_col_metadata(1),
         ]);
 
         let first = client
@@ -6764,6 +6833,7 @@ mod tests {
             }
         );
         assert_eq!(client.last_rows_affected(), 1);
+        assert_eq!(client.take_dml_result_counts(), vec![1]);
     }
 
     #[tokio::test]

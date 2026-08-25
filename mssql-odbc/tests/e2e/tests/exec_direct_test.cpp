@@ -382,6 +382,41 @@ TEST_F(ExecDirectLiveTest, UpdateCountStillPrecedesRowSetAfterAssignment) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// A warning raised by the assignment itself puts a message and a SQLSELECT
+// count on the same DONE. The message-only result still surfaces, but must
+// report SQLRowCount -1 rather than the assignment's count.
+TEST_F(ExecDirectLiveTest, AssignmentWarningResultReportsNoRowCount) {
+    SqlTString setup =
+        ODBCTestUtils::ToSqlTStr("CREATE TABLE #agg(v int); INSERT INTO #agg VALUES (1),(NULL);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    for (SQLRETURN more = SQLMoreResults(stmt_); more != SQL_NO_DATA;
+         more = SQLMoreResults(stmt_)) {
+        ASSERT_SQL_OK(more, SQL_HANDLE_STMT, stmt_);
+    }
+
+    // SELECT @x = MAX(v) over a NULL emits "Null value is eliminated by an
+    // aggregate or other SET operation" (msg 8153) on the assignment's DONE.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "DECLARE @x int; SELECT @x = MAX(v) FROM #agg; SELECT 5 AS a;");
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT cols = -1;
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, cols);
+
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count) << "the warning result must not carry the assignment's count";
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, cols);
+    EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // SELECT ... INTO reports DONE_COUNT with no CurCmd, which is a genuine update
 // count and must survive the SQLSELECT filter.
 TEST_F(ExecDirectLiveTest, SelectIntoCountStillReported) {
