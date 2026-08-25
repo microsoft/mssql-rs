@@ -3515,8 +3515,9 @@ impl TdsClient {
     /// With `true` (ODBC statement-wise navigation, matching msodbcsql), a
     /// no-row statement's DONE token can be its own result boundary, returned
     /// as [`ResultBoundaryKind::NoRows`] instead of always being skipped. It is
-    /// surfaced only when the statement carries a row count (DONE `COUNT` flag)
-    /// or produced an informational message (PRINT / low-severity RAISERROR);
+    /// surfaced only when the statement carries an update count (DONE `COUNT`
+    /// on a non-`SQLSELECT` command) or produced an informational message
+    /// (PRINT / low-severity RAISERROR);
     /// a pure no-op statement with neither — e.g. a bare `CREATE TABLE` — is
     /// still collapsed into the following result, exactly as in result-set
     /// navigation. This mirrors msodbcsql, which exposes a statement as its own
@@ -3594,30 +3595,31 @@ impl TdsClient {
 
                     let is_last = !done.has_more();
 
-                    // Capture the affected-row count for `SQLRowCount`, but only
-                    // when the DONE_COUNT flag is set — otherwise `row_count` is
-                    // not meaningful (DDL, SET NOCOUNT ON) and must stay -1. Each
-                    // counted DONE is also appended in order so a pure-DML batch
-                    // surfaces one count per statement.
+                    // Capture update counts for `SQLRowCount`. DONE_COUNT on a
+                    // SQLSELECT command is not an update-count result.
                     let has_count = done.status.contains(DoneStatus::COUNT);
-                    if has_count {
+                    // SQL Server can tag non-row-producing statements such as
+                    // DECLARE with SQLSELECT and DONE_COUNT. msodbcsql does not
+                    // expose those as update-count results.
+                    let has_update_count = has_count && done.cur_cmd != CurrentCommand::Select;
+                    if has_update_count {
                         let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
                         self.last_rows_affected = count;
                         self.dml_result_counts.push(count);
                     }
 
                     // Statement-wise navigation (msodbcsql parity): this DONE is
-                    // a navigable result only if the statement returned a row
-                    // count (COUNT flag) or produced messages. Pure DDL / no-op
+                    // a navigable result only if the statement returned an update
+                    // count or produced messages. Pure DDL / no-op
                     // statements (no count, no messages) are collapsed, exactly
                     // like result-set navigation, so a batch such as
                     // `CREATE; INSERT; SELECT` exposes the INSERT's row count and
                     // the SELECT, not the bare CREATE. `rows_affected` is
-                    // `Some(n)` only when the DONE carried a COUNT.
-                    if has_count || saw_message {
+                    // `Some(n)` only for an update-count result.
+                    if has_update_count || saw_message {
                         self.execution_context.set_has_open_batch(!is_last);
                         return Ok(ResultBoundaryKind::NoRows {
-                            rows_affected: if has_count {
+                            rows_affected: if has_update_count {
                                 Some(done.row_count)
                             } else {
                                 None
@@ -5786,7 +5788,7 @@ impl From<()> for ExecuteOptions<'_> {
 /// [`advance()`](TdsClient::advance).
 ///
 /// This is the lossless, statement-wise view of a batch: every statement that
-/// returns rows, carries a row count, or produced a message is surfaced as its
+/// returns rows, carries an update count, or produced a message is surfaced as its
 /// own result (matching msodbcsql's `SQLMoreResults` and JDBC's
 /// `getMoreResults`/`getUpdateCount`). Consumers that only care about
 /// row-returning result sets can collapse no-row statements with
@@ -6589,6 +6591,23 @@ mod tests {
 
         let r2 = client.advance().await.unwrap();
         assert_eq!(r2, StatementResult::End);
+    }
+
+    #[tokio::test]
+    async fn execute_skips_select_count_before_rowset() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 0, true),
+            empty_col_metadata(),
+        ]);
+
+        let result = client
+            .execute("DECLARE @value int; EXEC dbo.p;".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::Rows);
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
     }
 
     #[tokio::test]

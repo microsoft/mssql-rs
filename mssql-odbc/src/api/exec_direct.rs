@@ -324,6 +324,36 @@ mod tests {
         assert!(ds.client.is_some());
     }
 
+    #[test]
+    fn exec_direct_skips_declare_count_and_opens_rowset() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_more_select_with_count, done_no_more, int_columns,
+            tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![
+            done_more_select_with_count(0),
+            col_metadata(int_columns(1)),
+            done_no_more(),
+        ]);
+        dbc.inner.lock().unwrap().client = Some(client);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ret =
+            sql_exec_direct_w_safe(h.stmt, stmt, "DECLARE @value int; EXEC dbo.p;".to_string());
+
+        assert_eq!(ret, SQL_SUCCESS);
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+        assert_eq!(state.column_metadata.len(), 1);
+        assert_eq!(state.row_count, -1);
+    }
+
     /// A no-row statement that also produced a message surfaces its diagnostics
     /// with SQL_SUCCESS_WITH_INFO from the `finish_execute` no-row branch.
     #[test]

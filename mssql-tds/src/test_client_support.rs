@@ -258,6 +258,15 @@ pub fn col_metadata_empty() -> ScriptedToken {
     ScriptedToken(Tokens::ColMetadata(ColMetadataToken::default()))
 }
 
+/// A COLMETADATA token for the supplied columns.
+pub fn col_metadata(columns: Vec<ColumnMetadata>) -> ScriptedToken {
+    ScriptedToken(Tokens::ColMetadata(ColMetadataToken {
+        column_count: u16::try_from(columns.len()).unwrap_or(u16::MAX),
+        columns,
+        cek_table: Vec::new(),
+    }))
+}
+
 /// A `Vec<ColumnMetadata>` of `n` nullable `int` columns named `c1..=cn`.
 ///
 /// For consumer-side tests (e.g. the ODBC `SQLGetData` column-range and
@@ -322,6 +331,16 @@ pub fn done_more_with_count(row_count: u64) -> ScriptedToken {
     ScriptedToken(Tokens::Done(DoneToken {
         status: DoneStatus::MORE | DoneStatus::COUNT,
         cur_cmd: CurrentCommand::Insert,
+        row_count,
+    }))
+}
+
+/// A SQLSELECT DONE token carrying COUNT and MORE, as emitted for a DECLARE
+/// before a later statement result.
+pub fn done_more_select_with_count(row_count: u64) -> ScriptedToken {
+    ScriptedToken(Tokens::Done(DoneToken {
+        status: DoneStatus::MORE | DoneStatus::COUNT,
+        cur_cmd: CurrentCommand::Select,
         row_count,
     }))
 }
