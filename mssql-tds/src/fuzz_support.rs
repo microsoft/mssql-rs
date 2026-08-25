@@ -478,6 +478,13 @@ impl NetworkWriter for MockWriter {
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
         NegotiatedEncryptionSetting::NoEncryption
     }
+
+    // The fuzz harness never carries a reset, so there is nothing to record.
+    fn note_reset_dispatched(&mut self) {}
+
+    fn take_reset_dispatched(&mut self) -> bool {
+        false
+    }
 }
 
 /// Concrete packet-reader used by the fuzz harness.
@@ -799,6 +806,13 @@ impl NetworkWriter for MockTransport {
     fn get_encryption_setting(&self) -> NegotiatedEncryptionSetting {
         self.encryption_setting
     }
+
+    // The fuzz harness never carries a reset, so there is nothing to record.
+    fn note_reset_dispatched(&mut self) {}
+
+    fn take_reset_dispatched(&mut self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -1111,5 +1125,6 @@ pub fn create_fuzz_tds_client(packet_reader: FuzzPacketReader, packet_size: u32)
         negotiated_settings,
         execution_context,
         client_context,
+        Vec::new(),
     )
 }

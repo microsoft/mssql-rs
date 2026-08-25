@@ -11,9 +11,6 @@
 //! entries are added as each conversion lands, so a pairing accepted at bind
 //! time is always one the execute path can actually convert.
 //!
-//! Anything absent is rejected with `07006` at bind time rather than failing
-//! later at execute.
-//!
 //! Parameter-side only, matching msodbcsql: it consults `IsValidSQLConversion`
 //! where both types are known up front (`SQLBindParameter`, output-parameter
 //! retrieval, BCP), but `SQLBindCol` / `SQLGetData` cannot — a column's SQL type
@@ -21,9 +18,10 @@
 //! `07006` from inside its converters (`ConvError::Restricted`) instead.
 
 use crate::api::odbc_types::{
-    SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_WCHAR, SQL_CHAR, SQL_LONGVARCHAR, SQL_VARCHAR, SQL_WCHAR,
-    SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
+    SQL_BIGINT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_WCHAR, SQL_CHAR, SQL_INTEGER, SQL_LONGVARCHAR,
+    SQL_SMALLINT, SQL_TINYINT, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
 };
+use crate::api::type_rules::is_integer_c_type;
 
 /// SQL types a `SQL_C_CHAR` buffer can be converted to.
 const CHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_CHAR, SQL_VARCHAR, SQL_LONGVARCHAR];
@@ -31,8 +29,18 @@ const CHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_CHAR, SQL_VARCHAR, SQL_LONGVARCHAR]
 /// SQL types a `SQL_C_WCHAR` buffer can be converted to.
 const WCHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_WCHAR, SQL_WVARCHAR, SQL_WLONGVARCHAR];
 
+/// SQL types any integer C buffer can be converted to. Width is not part of
+/// legality: a value that does not fit the target is a runtime `22003`, not a
+/// rejected binding.
+const INTEGER_C_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT];
+
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
 /// for an input parameter.
+///
+/// TODO: once every row of msodbcsql's `fValidConversion` is covered here, this
+/// stops being a progress list and becomes a legality table — at which point the
+/// caller must report `07006` instead of `HYC00`, because a missing entry then
+/// means the conversion is genuinely illegal rather than merely unbuilt.
 pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt) -> bool {
     debug_assert_ne!(
         c_type, SQL_C_DEFAULT,
@@ -41,6 +49,7 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
     let targets: &[SqlSmallInt] = match c_type {
         SQL_C_CHAR => CHAR_C_TARGETS,
         SQL_C_WCHAR => WCHAR_C_TARGETS,
+        _ if is_integer_c_type(c_type) => INTEGER_C_TARGETS,
         _ => return false,
     };
     targets.contains(&sql_type)
@@ -49,7 +58,10 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_SLONG, SQL_GUID, SQL_INTEGER};
+    use crate::api::odbc_types::{
+        SQL_C_LONG, SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG, SQL_C_SSHORT, SQL_C_STINYINT,
+        SQL_C_TINYINT, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_GUID,
+    };
 
     #[test]
     fn narrow_character_conversions_are_supported() {
@@ -74,7 +86,38 @@ mod tests {
     #[test]
     fn numeric_conversions_are_unsupported() {
         assert!(!is_supported_conversion(SQL_C_CHAR, SQL_INTEGER));
-        assert!(!is_supported_conversion(SQL_C_SLONG, SQL_INTEGER));
+    }
+
+    #[test]
+    fn every_integer_c_type_reaches_every_integer_sql_type() {
+        for c_type in [
+            SQL_C_STINYINT,
+            SQL_C_TINYINT,
+            SQL_C_UTINYINT,
+            SQL_C_SSHORT,
+            SQL_C_SHORT,
+            SQL_C_USHORT,
+            SQL_C_SLONG,
+            SQL_C_LONG,
+            SQL_C_ULONG,
+            SQL_C_SBIGINT,
+            SQL_C_UBIGINT,
+        ] {
+            for sql_type in [SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT] {
+                assert!(
+                    is_supported_conversion(c_type, sql_type),
+                    "{c_type} -> {sql_type} should be supported"
+                );
+            }
+        }
+    }
+
+    /// Quadrants C and D (integer <-> character) are P5, so they stay rejected.
+    #[test]
+    fn integer_to_character_conversions_are_unsupported() {
+        assert!(!is_supported_conversion(SQL_C_SLONG, SQL_VARCHAR));
+        assert!(!is_supported_conversion(SQL_C_SLONG, SQL_WVARCHAR));
+        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_BIGINT));
     }
 
     #[test]

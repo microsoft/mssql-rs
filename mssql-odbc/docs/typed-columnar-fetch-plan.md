@@ -89,6 +89,8 @@ ODBC Appendix D requires a driver to support conversions to **all** ODBC C types
 
 A source with no interpretation for the requested target (binary, guid) is `07006`, since that pairing is illegal rather than unimplemented.
 
+`tinyint` → `SQL_C_TINYINT` moves the byte, so a column value above 127 arrives intact rather than as `22003`. `sqlext.h` gives `SQL_C_TINYINT` no sign offset, and a same-width transfer has no narrowing to range-check; msodbcsql usually does not reach its converter at all here, since `sqlcdata.cpp` maps `SQLINT1` to `SQL_C_UTINYINT` and clears `fConvNeeded`. Every other source narrows against the `SCHAR` bounds, so a character or decimal value above 127 is still `22003`, as is any source into `SQL_C_STINYINT`. Pinned by `TinyintColumnAbove127FetchesIntoTinyintCType`, which compares on both legs of the parity run. The parameter direction reaches the same rule by a different route and is described in `parameters_plan.md`.
+
 Max-length character sources (`varchar(max)` / `nvarchar(max)`) into the numeric and date/time targets are **excluded** from P1a and tracked as Task [47238](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47238). They arrive as PLP, so parsing needs the ODBC layer to accumulate chunks, which inverts the "never buffer the full PLP payload" invariant that `stream_active_plp_chunk` documents. That work is sequenced after #204 and #215, which are both rewriting the same read path, and needs a bounded-prefix policy agreed first so a 2 GB column cannot be drained to produce a `SQL_C_SLONG`.
 
 #### Known divergences from msodbcsql
@@ -98,7 +100,6 @@ These were found by reading `Sql/Ntdbms/sqlncli/odbc/sqlccnvt.cpp` while reviewi
 | Case | msodbcsql | mssql-odbc | Status |
 | --- | --- | --- | --- |
 | A UTC offset in a literal, for any target other than `SQL_C_SS_TIMESTAMPOFFSET` | shifts the value into the client's local zone (`ConvertOffsetToLocal`) | validates the offset, then delivers the wall-clock fields as written | **Deliberate.** Matching would make the returned value depend on the client machine's time zone. Locked in by `offset_is_ignored_for_non_offset_targets`. |
-| Character or decimal source into `SQL_C_TINYINT` above 127 | `22003` — the signed limit applies whenever the input type is not itself a tinyint C type | `Ok(200)` — the target is `u8`, matching a real `tinyint` column (0-255) and what mssql-python fetches | **Deliberate**, but P1a is what first opens these sources into that target, so the divergence starts here. |
 | `YYYY/MM/DD` and the ODBC escape literals `{d '...'}` / `{t '...'}` / `{ts '...'}` | accepted (`rgbECODE_DATE_SLASH` retry, and the `FindECode` branch) | `22018` | Gap — Task [47246](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47246). |
 | `T` separator, `HH:MM` without seconds, unpadded fields such as `2023-6-5` | rejected (fixed-length token grammar) | accepted | Permissive. Low risk, same task. |
 | A time-only value into `SQL_C_TYPE_TIMESTAMP` | fills in the current date and succeeds, per Appendix D | `22018` from a character source, `07006` from a `time` column | Gap — Task [47247](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47247). Needs a platform-specific local-date helper, so it is not a one-line fix. |
@@ -134,7 +135,27 @@ The underlying type is a property of the **value**, not the column — a variant
 - `SQLBindCol`: store per-column binding (col, target C type, buffer ptr, buffer len, indicator ptr); support unbind (null ptr) and `SQLFreeStmt(SQL_UNBIND)`.
 - `SQLFetchScroll(SQL_FETCH_NEXT)`: fetch up to `row_array_size` rows into a rowset; fill each bound-column array + indicator array (default column-wise); set `*rows_fetched_ptr`; return `SQL_NO_DATA` at end with partial-rowset handling. Forward-only.
 - Reuse the P1 conversion core. Ensure `SQLGetData` still works after a bound fetch (mixed access).
-- Export `SQLBindCol` and `SQLFetchScroll`.
+- Export `SQLBindCol` and `SQLFetchScroll`, and advertise both in `SQLGetFunctions` — the Windows DM returns `IM001` for an entry point it has not been told about even when the export exists, which cost P2 a CI cycle.
+
+`SQLFreeStmt(SQL_UNBIND)` is part of this, not an extra: `mssql-python` calls it before every fetch, so the columnar path does not work without it.
+
+#### Deliberate limits
+
+Each of these is an error rather than a guess, because a wrong value delivered silently into an application buffer is worse than a reported failure.
+
+| Case | Behaviour | Why |
+| --- | --- | --- |
+| A scrolling `FetchOrientation` | `HY106` | The cursor is forward-only; treating `SQL_FETCH_PRIOR` as `NEXT` would return the wrong rows |
+| Row-wise binding (`SQL_ATTR_ROW_BIND_TYPE` ≠ `SQL_BIND_BY_COLUMN`) | `HYC00` | Filling a struct array as if it were column-wise would corrupt application memory |
+| A bound PLP / LOB column | `SQL_ROW_ERROR` | Draining a LOB into a fixed buffer needs machinery `SQLGetData` owns — Task [47361](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47361) |
+| NULL at a column bound with no indicator | `22002`, `SQL_ROW_ERROR` | There is nowhere to report the NULL, and the slot would read back as the previous row's value |
+| `SQLGetData` after a rowset wider than one row | cursor left unpositioned | ODBC expects `SQLSetPos` to nominate the current row, and that is not implemented; mixed access still works at `row_array_size` 1 |
+| `SQL_C_DEFAULT` at bind time | `HY003` | **Divergence from msodbcsql**, which accepts it and resolves it at fetch time from the IRD (`sqlcfunc.cpp` `BindOffset` → `Sql2CDefault`). Deferring needs the column's SQL type threaded into the fill loop, which `ColumnBinding` does not carry. No known consumer binds `SQL_C_DEFAULT` on the fetch path — mssql-python uses it only for parameters — so this is deferred rather than blocking |
+
+Two details worth keeping in mind when extending this:
+
+- **`BufferLength` is ignored for fixed-width C targets.** The stride comes from the C type; only the character and binary targets are sized by the application. Honouring a caller's `sizeof(array)` would place later rows outside it.
+- **`SQL_ATTR_ROW_BIND_OFFSET_PTR` is read per fetch, not per bind,** and displaces the data *and* indicator bases by the same byte count — so the offset has to keep both naturally aligned.
 
 ### P4 — Exports & driver-load compatibility — Task [46581](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46581)
 
@@ -153,7 +174,7 @@ The underlying type is a property of the **value**, not the column — a variant
 
 ## Scope boundary — descriptors (`SQL_ATTR_APP_PARAM_DESC` / `SQL_C_NUMERIC` input binding)
 
-Descriptor handles are not implemented in the crate yet, so `SQLGetStmtAttrW(SQL_ATTR_APP_PARAM_DESC)` currently returns `HY092`. `mssql-python`'s `ddbc_bindings.cpp` calls this (then `SQLSetDescField` on the returned handle) only when binding a `SQL_C_NUMERIC` **input parameter**, and aborts the bind if it fails — so numeric input-parameter binding will not work until a descriptor subsystem exists. There is no correct minimal shim (a non-null fake handle would crash `SQLSetDescField`). This is deferred to the Descriptors work item [46374](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46374) (APD handle alloc/free, `SQLGetStmtAttr` returning it, and `SQLSetDescField` support for `SQL_DESC_TYPE`/`SQL_DESC_CONCISE_TYPE`/precision/scale), rather than expanding this P0 plumbing PR.
+`SQLGetStmtAttrW(SQL_ATTR_APP_PARAM_DESC)` returns the statement's implicit APD, and `SQLSetDescFieldW` now supports the exact field sequence `mssql-python`'s `ddbc_bindings.cpp` runs for a `SQL_C_NUMERIC` **input parameter** (`SQL_DESC_TYPE`, `SQL_DESC_PRECISION`, `SQL_DESC_SCALE`, `SQL_DESC_DATA_PTR` on record 1) — implemented under the Descriptors work item [46374](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46374) (AB#47297/AB#47435: descriptor header/record model + `SQLGetDescFieldW`/`SQLSetDescFieldW`). Numeric input-parameter binding is therefore no longer blocked by a missing descriptor subsystem. Remaining descriptor work — explicit descriptor allocation/association (AB#47436) and making `SQLBindCol`/`SQLBindParameter` write through descriptor records as the single source of truth (AB#47437) — continues separately and does not block this story.
 
 ## Scope boundary — chunked retrieval and incremental PLP (LOB) streaming
 
@@ -169,6 +190,6 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | P1 — Typed SQLGetData | 46578 | Implemented (int/float/guid/date-time C targets + char/wchar rendering; 491 tests pass). Chunked retrieval and incremental PLP streaming are owned by #153 (merged), on top of which the typed targets are dispatched; missing source-type conversions tracked as P1a; `SQL_C_BINARY` and binary→char hex are **not** implemented (see the P1 section); `sql_variant` underlying-type resolution deferred to P2. |
 | P1a — Mandatory source-type conversions | 47107 | Implemented (decimal, money and character sources into the numeric and date/time C targets; `01S07` on lossy numeric conversion, `22018` on an invalid character literal). |
 | P2 — SQLColAttributeW | 46579 | Implemented (common descriptor fields + `SQL_CA_SS_VARIANT_TYPE`, plus the `SQL_SS_VARIANT` type mapping and the zero-length `SQL_C_BINARY` probe the variant path depends on). Binary *delivery* remains unimplemented (Task 47239). |
-| P3 — SQLBindCol + SQLFetchScroll | 46580 | Not started |
-| P4 — Exports & driver-load compat | 46581 | Not started |
+| P3 — SQLBindCol + SQLFetchScroll | 46580, 47359 | Implemented ([#322](https://github.com/microsoft/mssql-rs/pull/322)). Column-wise binding and forward-only block fetch, sharing P1's conversion core. 47359 was briefly split out to be worked in parallel and folded back in, since the fill loop cannot be exercised end to end without `SQLBindCol`. Bound PLP columns remain unimplemented (Task 47361). |
+| P4 — Exports & driver-load compat | 46581 | Partly done — `SQLColAttributeW` exported and advertised in P2; `SQLBindCol` and `SQLFetchScroll` in P3. Remaining: confirm the full symbol set loads under `mssql-python`. |
 | P5 — Testing & end-to-end | 46582 | Not started |

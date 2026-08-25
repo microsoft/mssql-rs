@@ -38,7 +38,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{self, TcpStream};
 use tokio::time::timeout;
-use tracing::{debug, error, event, info, trace};
+use tracing::{debug, error, event, info, trace, warn};
 
 #[cfg(windows)]
 use crate::connection::transport::localdb::resolve_localdb_instance;
@@ -516,6 +516,11 @@ pub(crate) struct NetworkTransport {
     /// Pending connection-reset request to apply to the next SQL Batch, RPC, or
     /// Transaction Manager request. Consumed by the packet writer.
     pending_reset: ResetConnectionMode,
+    /// Set once the packet writer has put a header carrying `pending_reset` on
+    /// the wire. `TdsClient` takes it to learn that the server now owes a
+    /// `ResetConnection` ENVCHANGE, which is what makes the acknowledgement
+    /// verifiable.
+    reset_dispatched: bool,
     /// Cached liveness status. Set to `true` once the connection is explicitly
     /// closed or an I/O operation observes it broken. Surfaced by
     /// `connection_known_dead()` as a cheap, socket-free liveness check.
@@ -590,10 +595,21 @@ impl NetworkWriter for NetworkTransport {
 
     fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
         self.pending_reset = mode;
+        // A newly armed reset supersedes any earlier one, so the record of a
+        // previous dispatch must not be attributed to it.
+        self.reset_dispatched = false;
     }
 
     fn take_reset_mode(&mut self) -> ResetConnectionMode {
         std::mem::replace(&mut self.pending_reset, ResetConnectionMode::None)
+    }
+
+    fn note_reset_dispatched(&mut self) {
+        self.reset_dispatched = true;
+    }
+
+    fn take_reset_dispatched(&mut self) -> bool {
+        std::mem::replace(&mut self.reset_dispatched, false)
     }
 
     fn channel_binding_token(&self) -> Option<Vec<u8>> {
@@ -623,6 +639,7 @@ impl NetworkTransport {
             use_tds74_tls_wrapping,
             extractable_stream_handle: None,
             pending_reset: ResetConnectionMode::None,
+            reset_dispatched: false,
             known_dead: false,
             nbc_bitmap_scratch: None,
         }
@@ -742,8 +759,125 @@ impl NetworkTransport {
         Ok(())
     }
 
+    /// How many consecutive payload-free end-of-message packets a bulk read
+    /// tolerates before giving up.
+    ///
+    /// One is legitimate: a read that begins exactly at a message boundary
+    /// consumes the empty packet terminating the *previous* message before its
+    /// own data arrives. A second in a row means the peer emitted two empty
+    /// messages back to back, so nothing advanced between iterations and the
+    /// loop would spin until the command timeout.
+    const MAX_CONSECUTIVE_EMPTY_MESSAGES: u32 = 1;
+
+    /// Error for a bulk read that kept receiving empty messages without
+    /// advancing.
+    #[cold]
+    fn stalled_on_empty_messages_error(outstanding: usize) -> crate::error::Error {
+        crate::error::Error::ProtocolError(format!(
+            "TDS read stalled: {outstanding} more byte(s) required but the peer sent {} \
+             consecutive payload-free end-of-message packets without advancing.",
+            Self::MAX_CONSECUTIVE_EMPTY_MESSAGES + 1
+        ))
+    }
+
+    /// Error for a bulk read that needed more bytes but got a packet carrying
+    /// none.
+    ///
+    /// Unreachable as the framing layer stands today, and deliberately kept.
+    /// [`get_new_tds_packet`](Self::get_new_tds_packet) rejects a payload-free
+    /// packet unless it is end-of-message, so every successful refill leaves
+    /// either payload in the buffer or `end_of_message` set. In all three bulk
+    /// loops `to_read == 0` means the buffer is empty, which means the refill
+    /// framed a payload-free packet, which therefore means the message ended —
+    /// and that case is handled by the two branches below this one.
+    ///
+    /// It stays as a guard on that invariant. If the framing layer ever
+    /// tolerates a payload-free non-EOM packet, the loop would re-enter the
+    /// refill with the same unmet demand and block on the socket forever, which
+    /// is the hang this whole rule exists to prevent. Failing loudly is the
+    /// right answer if that day comes; the alternative is a silent infinite
+    /// loop. It is also the one branch here with no scalar counterpart, so were
+    /// it reachable the two reader families would genuinely disagree — bulk
+    /// would error where scalar hangs.
+    #[cold]
+    fn no_progress_error(outstanding: usize) -> crate::error::Error {
+        crate::error::Error::ProtocolError(format!(
+            "TDS read made no progress: {outstanding} more byte(s) required but the packet \
+             carried no payload. The value extends past the end of the message."
+        ))
+    }
+
+    /// True when the request for `needed` bytes cannot possibly be satisfied.
+    ///
+    /// The terminating packet of the current message has already been framed,
+    /// so the buffer holds every byte the server is going to send until the
+    /// client issues a new request. If the caller wants more than what remains,
+    /// waiting is futile — the refill would block on a socket that stays silent.
+    fn message_cannot_satisfy(&self, needed: usize) -> bool {
+        self.tds_read_buffer.end_of_message
+            && needed > self.tds_read_buffer.get_remaining_byte_count()
+    }
+
+    /// True when a read that is already partway through a value cannot be
+    /// completed, because the message it is being read from has ended.
+    ///
+    /// `consumed_any` reports whether the caller has already copied bytes of
+    /// this value out of the buffer; bytes still sitting in the buffer count
+    /// too. Either way the value has started, so the remainder can only arrive
+    /// in the current message — and that message is over.
+    ///
+    /// A read that begins *exactly* at a boundary is deliberately not caught.
+    /// The transport cannot tell a caller starting the next message apart from
+    /// one over-reading the last, and both handshake and attention paths
+    /// legitimately do the former: the login exchange is multi-leg, and the
+    /// DONE carrying ATTN arrives in a message of its own. Distinguishing them
+    /// needs a layer that knows whether another message is expected, which the
+    /// transport is not. See the note in `refill_for`.
+    fn value_truncated_by_message_end(&self, consumed_any: bool, needed: usize) -> bool {
+        (consumed_any || self.tds_read_buffer.get_remaining_byte_count() > 0)
+            && self.message_cannot_satisfy(needed)
+    }
+
+    /// Error for a read that extends past the end of the current message.
+    #[cold]
+    fn past_end_of_message_error(outstanding: usize, available: usize) -> crate::error::Error {
+        crate::error::Error::ProtocolError(format!(
+            "TDS read extends past the end of the message: {outstanding} more byte(s) required \
+             but only {available} remain in the final packet of the message."
+        ))
+    }
+
+    /// Refills the read buffer for a scalar read that still needs `needed`
+    /// bytes, failing if the value is truncated by the end of the message.
+    ///
+    /// Every reader loops until the buffer holds enough bytes. When part of a
+    /// value sits in the final packet of a message the rest can never arrive —
+    /// the server sends nothing further until the client issues a new request —
+    /// so the loop would go back to the socket forever instead of failing.
+    ///
+    /// The bulk loops apply the identical rule through
+    /// [`Self::value_truncated_by_message_end`], so the two families agree on
+    /// every input. That agreement leans on the framing invariant described on
+    /// [`Self::no_progress_error`]: the extra branch the bulk loops carry, and
+    /// the scalar readers do not, cannot fire while framing rejects
+    /// payload-free non-EOM packets.
+    ///
+    /// Known gap: a read that begins exactly at a message boundary is still
+    /// allowed through, so it can block if the server has nothing more to send.
+    /// Catching that needs the caller to say whether another message is
+    /// expected — the handshake and attention paths cross boundaries here on
+    /// purpose — which is a layer above this one.
+    async fn refill_for(&mut self, needed: usize) -> TdsResult<()> {
+        if self.value_truncated_by_message_end(false, needed) {
+            return Err(Self::past_end_of_message_error(
+                needed,
+                self.tds_read_buffer.get_remaining_byte_count(),
+            ));
+        }
+        self.read_tds_packet().await
+    }
+
     async fn read_tds_packet(&mut self) -> TdsResult<()> {
-        // let remaining_bytes = self.buffer_length - self.buffer_position;
         let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
         if remaining_bytes > 0 {
             // Move the remaining bytes to the beginning of the buffer.
@@ -924,6 +1058,7 @@ impl NetworkTransport {
         let is_end_of_message = self.tds_read_buffer.working_buffer[base_offset + 1]
             & PacketStatusFlags::Eom as u8
             != 0;
+        self.tds_read_buffer.end_of_message = is_end_of_message;
         if packet_size_from_header == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
             return Err(crate::error::Error::ProtocolError(
                 "Received a payload-free TDS packet that is not end-of-message".to_string(),
@@ -1108,8 +1243,22 @@ impl TransportSslHandler for NetworkTransport {
 
 impl TdsPacketReader for NetworkTransport {
     fn reset_reader(&mut self) {
-        // Make sure that we have read all the data from the buffer.
-        assert!(self.tds_read_buffer.buffer_length == self.tds_read_buffer.buffer_position);
+        // Callers reset before starting a new message, so the buffer is
+        // expected to be fully consumed. Log a violation instead of asserting:
+        // `buffer_length` comes from the packet header the peer sent, so a
+        // malformed or truncated response must not be able to abort the
+        // process. Discarding the leftover bytes is what a reset means, so the
+        // outcome is the same either way.
+        let unread = self
+            .tds_read_buffer
+            .buffer_length
+            .saturating_sub(self.tds_read_buffer.buffer_position);
+        if unread > 0 {
+            warn!(
+                unread_bytes = unread,
+                "Discarding unread bytes while resetting the packet reader"
+            );
+        }
         self.tds_read_buffer
             .change_packet_size(NetworkReader::packet_size(self));
         self.tds_read_buffer.reset_to_length(0);
@@ -1175,24 +1324,24 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_byte() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(1).await?;
         }
     }
 
     async fn read_int16_big_endian(&mut self) -> TdsResult<i16> {
         while !self.tds_read_buffer.do_we_have_enough_data(2) {
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
         let result = BigEndian::read_i16(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(2);
+        self.tds_read_buffer.consume_bytes(2)?;
         Ok(result)
     }
     async fn read_int32_big_endian(&mut self) -> TdsResult<i32> {
         while !self.tds_read_buffer.do_we_have_enough_data(4) {
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
         let result = BigEndian::read_i32(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(4);
+        self.tds_read_buffer.consume_bytes(4)?;
         Ok(result)
     }
 
@@ -1201,7 +1350,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint40() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(5).await?;
         }
     }
 
@@ -1210,7 +1359,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_float32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
     async fn read_float64(&mut self) -> TdsResult<f64> {
@@ -1218,7 +1367,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_float64() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
     }
     async fn read_int16(&mut self) -> TdsResult<i16> {
@@ -1226,7 +1375,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int16() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
     }
     async fn read_uint16(&mut self) -> TdsResult<u16> {
@@ -1234,7 +1383,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint16() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(2).await?;
         }
     }
     async fn read_uint24(&mut self) -> TdsResult<u32> {
@@ -1242,7 +1391,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint24() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(3).await?;
         }
     }
 
@@ -1251,7 +1400,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
 
@@ -1260,7 +1409,7 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_uint32() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(4).await?;
         }
     }
     async fn read_int64(&mut self) -> TdsResult<i64> {
@@ -1268,15 +1417,15 @@ impl TdsPacketReader for NetworkTransport {
             if let Some(value) = self.try_read_int64() {
                 return Ok(value);
             }
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
     }
     async fn read_uint64(&mut self) -> TdsResult<u64> {
         while !self.tds_read_buffer.do_we_have_enough_data(8) {
-            self.read_tds_packet().await?;
+            self.refill_for(8).await?;
         }
         let result = LittleEndian::read_u64(self.tds_read_buffer.get_slice());
-        self.tds_read_buffer.consume_bytes(8);
+        self.tds_read_buffer.consume_bytes(8)?;
         Ok(result)
     }
 
@@ -1284,7 +1433,14 @@ impl TdsPacketReader for NetworkTransport {
         let mut total_read = 0;
         let mut length_to_read = buffer.len();
         let mut offset = 0;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
+            if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
+                return Err(Self::past_end_of_message_error(
+                    length_to_read,
+                    self.tds_read_buffer.get_remaining_byte_count(),
+                ));
+            }
             if !self
                 .tds_read_buffer
                 .do_we_have_enough_data(min(self.tds_read_buffer.max_packet_size, length_to_read))
@@ -1299,18 +1455,35 @@ impl TdsPacketReader for NetworkTransport {
                 min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
             );
 
-            if to_read > 0 {
-                // Copy from self.working_buffer to buffer from self.buffer_position to offset.
-                buffer[offset..offset + to_read].copy_from_slice(
-                    &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
-                        ..self.tds_read_buffer.buffer_position + to_read],
-                );
-                offset += to_read;
-                length_to_read -= to_read;
-                total_read += to_read;
-
-                self.tds_read_buffer.consume_bytes(to_read);
+            if to_read == 0 {
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
+                }
+                if total_read > 0 {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                // Nothing of this value has been read yet, so the empty
+                // end-of-message packet belongs to the previous message rather
+                // than truncating this read. Refill and carry on, matching what
+                // the scalar readers do at the same boundary. Only so many in a
+                // row can be legitimate; past that nothing is advancing.
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
+                }
+                continue;
             }
+
+            // Copy from self.working_buffer to buffer from self.buffer_position to offset.
+            buffer[offset..offset + to_read].copy_from_slice(
+                &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
+                    ..self.tds_read_buffer.buffer_position + to_read],
+            );
+            offset += to_read;
+            length_to_read -= to_read;
+            total_read += to_read;
+
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(total_read)
     }
@@ -1322,7 +1495,14 @@ impl TdsPacketReader for NetworkTransport {
         let mut total_read = 0;
         let mut length_to_read = buffer.len();
         let mut offset = 0;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
+            if self.value_truncated_by_message_end(total_read > 0, length_to_read) {
+                return Err(Self::past_end_of_message_error(
+                    length_to_read,
+                    self.tds_read_buffer.get_remaining_byte_count(),
+                ));
+            }
             if !self
                 .tds_read_buffer
                 .do_we_have_enough_data(min(self.tds_read_buffer.max_packet_size, length_to_read))
@@ -1335,24 +1515,35 @@ impl TdsPacketReader for NetworkTransport {
                 min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
             );
 
-            if to_read > 0 {
-                let source =
-                    &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
-                        ..self.tds_read_buffer.buffer_position + to_read];
-                // SAFETY: `source` and the destination are valid for `to_read`
-                // non-overlapping bytes. Writing initializes those destination elements.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        source.as_ptr(),
-                        buffer.as_mut_ptr().cast::<u8>().add(offset),
-                        to_read,
-                    );
+            if to_read == 0 {
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
                 }
-                offset += to_read;
-                length_to_read -= to_read;
-                total_read += to_read;
-                self.tds_read_buffer.consume_bytes(to_read);
+                if total_read > 0 {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
+                }
+                continue;
             }
+
+            let source = &self.tds_read_buffer.working_buffer[self.tds_read_buffer.buffer_position
+                ..self.tds_read_buffer.buffer_position + to_read];
+            // SAFETY: `source` and the destination are valid for `to_read`
+            // non-overlapping bytes. Writing initializes those destination elements.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    buffer.as_mut_ptr().cast::<u8>().add(offset),
+                    to_read,
+                );
+            }
+            offset += to_read;
+            length_to_read -= to_read;
+            total_read += to_read;
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(total_read)
     }
@@ -1415,7 +1606,15 @@ impl TdsPacketReader for NetworkTransport {
 
     async fn skip_bytes(&mut self, skip_count: usize) -> TdsResult<()> {
         let mut length_to_read = skip_count;
+        let mut empty_messages = 0u32;
         while length_to_read > 0 {
+            let skipped_any = length_to_read < skip_count;
+            if self.value_truncated_by_message_end(skipped_any, length_to_read) {
+                return Err(Self::past_end_of_message_error(
+                    length_to_read,
+                    self.tds_read_buffer.get_remaining_byte_count(),
+                ));
+            }
             if !self.tds_read_buffer.do_we_have_enough_data(min(
                 self.tds_read_buffer.max_packet_size - 8,
                 length_to_read,
@@ -1430,10 +1629,22 @@ impl TdsPacketReader for NetworkTransport {
                 min(length_to_read, self.tds_read_buffer.max_packet_size - 8),
             );
 
-            if to_read > 0 {
-                length_to_read -= to_read;
-                self.tds_read_buffer.consume_bytes(to_read);
+            if to_read == 0 {
+                if !self.tds_read_buffer.end_of_message {
+                    return Err(Self::no_progress_error(length_to_read));
+                }
+                if skipped_any {
+                    return Err(Self::past_end_of_message_error(length_to_read, available));
+                }
+                empty_messages += 1;
+                if empty_messages > Self::MAX_CONSECUTIVE_EMPTY_MESSAGES {
+                    return Err(Self::stalled_on_empty_messages_error(length_to_read));
+                }
+                continue;
             }
+
+            length_to_read -= to_read;
+            self.tds_read_buffer.consume_bytes(to_read)?;
         }
         Ok(())
     }
@@ -1775,7 +1986,8 @@ pub(crate) mod tests {
     use crate::message::messages::PacketType;
     use crate::test_packet_support::{
         TestPacketBuilder, create_network_transport_with_chunked_data,
-        create_network_transport_with_data, encode_utf16_le,
+        create_network_transport_with_data, create_network_transport_with_live_peer,
+        encode_utf16_le,
     };
     use bytes::Bytes;
     use futures::SinkExt;
@@ -2886,7 +3098,7 @@ pub(crate) mod tests {
     async fn test_read_value_spanning_packet_boundary() {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        let mut stream = first.continuation().append_bytes(&[0x11, 0x22]).build();
         stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
 
         let mut reader = create_network_transport_with_data(&stream);
@@ -2898,7 +3110,7 @@ pub(crate) mod tests {
     async fn test_read_value_spanning_packet_boundary_fragmented() {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[0x11, 0x22]).build();
+        let mut stream = first.continuation().append_bytes(&[0x11, 0x22]).build();
         stream.extend_from_slice(&second.append_bytes(&[0x33, 0x44]).build());
 
         let mut reader = create_network_transport_with_chunked_data(&stream, 3);
@@ -2947,9 +3159,15 @@ pub(crate) mod tests {
         ];
 
         let mut stream = Vec::new();
-        for payload in payloads {
+        let last_index = payloads.len() - 1;
+        for (index, payload) in payloads.iter().enumerate() {
             let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
-            stream.extend_from_slice(&packet.append_bytes(&payload).build());
+            // Every value below spans a packet boundary *inside one message*,
+            // so only the final packet carries EOM.
+            if index != last_index {
+                packet.continuation();
+            }
+            stream.extend_from_slice(&packet.append_bytes(payload).build());
         }
 
         let mut reader = create_network_transport_with_data(&stream);
@@ -3013,11 +3231,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_slice_probe_falls_back_across_a_packet_boundary() {
-        // Ten bytes split five and five, so a value crossing the split is never
-        // resident in one packet. That is the case the borrowed path declines.
+        // Ten bytes split five and five across two packets of one message, so a
+        // value crossing the split is never resident in one packet. That is the
+        // case the borrowed path declines.
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[0, 1, 2, 3, 4]).build();
+        let mut stream = first.append_bytes(&[0, 1, 2, 3, 4]).continuation().build();
         stream.extend_from_slice(&second.append_bytes(&[5, 6, 7, 8, 9]).build());
 
         let mut reader = create_network_transport_with_data(&stream);
@@ -3052,6 +3271,10 @@ pub(crate) mod tests {
     /// The same packet *with* EOM set is legal — an empty end-of-message packet
     /// terminates a message — so it is consumed and the reader carries on to
     /// the payload of the next packet.
+    ///
+    /// The bulk loops must reach the same verdict on the same bytes: a read
+    /// that has not yet consumed anything is starting a new message, not
+    /// over-reading the last one.
     #[tokio::test]
     async fn test_payload_free_eom_packet_is_accepted() {
         let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
@@ -3059,7 +3282,397 @@ pub(crate) mod tests {
         stream.extend_from_slice(&next.append_byte(0x7F).build());
 
         let mut reader = create_network_transport_with_data(&stream);
-
         assert_eq!(reader.read_byte().await.unwrap(), 0x7F);
+
+        let mut reader = create_network_transport_with_data(&stream);
+        let mut one = [0u8; 1];
+        assert_eq!(reader.read_bytes(&mut one).await.unwrap(), 1);
+        assert_eq!(one[0], 0x7F, "read_bytes must agree with read_byte");
+
+        let mut reader = create_network_transport_with_data(&stream);
+        reader
+            .skip_bytes(1)
+            .await
+            .expect("skip_bytes must agree with read_byte");
+    }
+
+    // ---------------------------------------------------------------------
+    // No-progress edge cases in the bulk read loops
+    //
+    // An empty end-of-message packet is legal framing but carries no payload.
+    // A bulk read still short of its target treats it as a refill that yielded
+    // nothing, and — before the no-progress check — went straight back to the
+    // socket. A real server has finished its message at that point and sends
+    // nothing more until the client issues a new request, so the read blocked
+    // forever.
+    //
+    // These use `create_network_transport_with_live_peer` so the connection
+    // stays open after the data is drained: with a dropped writer the reader
+    // would hit EOF and error out no matter how broken the loop is, which is
+    // exactly the masking these tests exist to avoid. Each is bounded by an
+    // outer timeout, so a regression shows up as an elapsed timeout.
+    // ---------------------------------------------------------------------
+
+    /// One payload byte, then an empty EOM packet, against a request for two
+    /// bytes. The second byte can never arrive.
+    #[tokio::test]
+    async fn read_bytes_past_end_of_message_errors_instead_of_hanging() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x11)
+            .build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let result = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("read_bytes hung: the refill loop consumed an empty EOM packet forever");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// `read_bytes_uninit` carries its own copy of the loop and needs the same
+    /// check.
+    #[tokio::test]
+    async fn read_bytes_uninit_past_end_of_message_errors_instead_of_hanging() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x22)
+            .build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        let result = timeout(
+            Duration::from_secs(5),
+            reader.read_bytes_uninit(&mut destination),
+        )
+        .await
+        .expect("read_bytes_uninit hung: the refill loop consumed an empty EOM packet forever");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// The scalar readers carry their own copies of the refill loop. A value
+    /// that is *partially* delivered at the end of a message can never be
+    /// completed, so it must error rather than park on a socket that will stay
+    /// silent until the client sends a new request. `read_uint32` stands in for
+    /// the whole family.
+    ///
+    /// This is the shape a drain hits after a mid-value error: the token-stream
+    /// reader is parked partway through a value, and before this check the
+    /// drain blocked here forever instead of surfacing the error.
+    #[tokio::test]
+    async fn read_uint32_spanning_end_of_message_errors_instead_of_hanging() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x01)
+            .append_byte(0x02)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.read_uint32())
+            .await
+            .expect("read_uint32 hung on a value truncated by the end of the message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Skipping a value that runs past the end of the message must terminate
+    /// too — this is the path taken when a column is discarded rather than
+    /// decoded.
+    #[tokio::test]
+    async fn skip_bytes_past_end_of_message_errors_instead_of_hanging() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x33)
+            .build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.skip_bytes(2))
+            .await
+            .expect("skip_bytes hung: the refill loop consumed an empty EOM packet forever");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Neither check must fire on legitimate traffic: a value split across
+    /// packets still reads through, and an empty EOM packet that arrives when
+    /// nothing is outstanding is simply consumed.
+    ///
+    /// The first packet is framed as a continuation — a multi-packet message
+    /// sets EOM only on its final packet — so this exercises the real shape of
+    /// a value that spans packets.
+    #[tokio::test]
+    async fn bulk_reads_still_span_packets_and_tolerate_a_trailing_empty_eom() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_bytes(&[0xA1, 0xA2])
+            .build();
+        stream.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&[0xA3, 0xA4])
+                .build(),
+        );
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 4];
+        let read = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("a value spanning two packets must not hang")
+            .expect("a value spanning two packets must read successfully");
+
+        assert_eq!(read, 4);
+        assert_eq!(destination, [0xA1, 0xA2, 0xA3, 0xA4]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Consecutive payload-free messages.
+    //
+    // A bulk read that has not yet consumed a byte tolerates an empty EOM
+    // packet, because a read starting exactly at a message boundary consumes
+    // the packet terminating the *previous* message. That `continue` re-enters
+    // the loop with nothing changed, so a peer that keeps sending empty
+    // messages spins the loop with no state advancing and no bytes delivered —
+    // bounded only by the command timeout.
+    //
+    // One in a row is legitimate; two is not. No server sends two empty
+    // messages back to back, and the attention acknowledgement carries a DONE
+    // token, so it is not payload-free either.
+    // ---------------------------------------------------------------------
+
+    /// Two empty messages in a row, then a peer that stays open and silent.
+    /// Without the cap this spins until the caller's timeout.
+    #[tokio::test]
+    async fn read_bytes_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let result = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("read_bytes spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// `read_bytes_uninit` carries its own copy of the loop and needs the same
+    /// cap.
+    #[tokio::test]
+    async fn read_bytes_uninit_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        let result = timeout(
+            Duration::from_secs(5),
+            reader.read_bytes_uninit(&mut destination),
+        )
+        .await
+        .expect("read_bytes_uninit spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// `skip_bytes` spins the same way, and it runs on the discard path that
+    /// large-value reads use, so a stall there is just as unbounded.
+    #[tokio::test]
+    async fn skip_bytes_errors_on_consecutive_empty_messages_instead_of_spinning() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(&TestPacketBuilder::new(PacketType::TabularResult).build());
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.skip_bytes(2))
+            .await
+            .expect("skip_bytes spun: consecutive empty messages advanced nothing");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Control: the cap must stay quiet on the legitimate case it tolerates —
+    /// a read that begins exactly at a message boundary, so the first packet it
+    /// sees is the empty one terminating the previous message.
+    #[tokio::test]
+    async fn bulk_reads_tolerate_a_single_leading_empty_message() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult).build();
+        stream.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&[0xB1, 0xB2])
+                .build(),
+        );
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let read = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("a read starting at a message boundary must not hang")
+            .expect("a leading empty message must be consumed, not rejected");
+
+        assert_eq!(read, 2);
+        assert_eq!(destination, [0xB1, 0xB2]);
+    }
+
+    // ---------------------------------------------------------------------
+    // End-of-message tracking.
+    //
+    // The tests above all append an explicit empty EOM packet after the short
+    // value, which is what lets a purely reactive `to_read == 0` check notice
+    // the problem. Real servers never send that packet: they finish the message
+    // on the packet that carries the last payload byte and then go quiet.
+    //
+    // Without recording the EOM flag, a reader still short of its target walks
+    // back into the socket and blocks there forever, so the reactive check is
+    // never reached. These tests pin the realistic shape — a complete message
+    // with payload and no trailing packet.
+    // ---------------------------------------------------------------------
+
+    /// A single EOM packet carrying one byte, against a request for two. No
+    /// trailing packet follows, exactly as a real server would leave it.
+    #[tokio::test]
+    async fn read_bytes_past_end_of_message_without_a_trailing_packet_errors_instead_of_hanging() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x11)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 2];
+        let result = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("read_bytes hung: the reader re-entered the socket after end-of-message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Same shape through the uninitialised-buffer loop.
+    #[tokio::test]
+    async fn read_bytes_uninit_past_end_of_message_without_a_trailing_packet_errors() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x22)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [std::mem::MaybeUninit::<u8>::uninit(); 2];
+        let result = timeout(
+            Duration::from_secs(5),
+            reader.read_bytes_uninit(&mut destination),
+        )
+        .await
+        .expect("read_bytes_uninit hung: the reader re-entered the socket after end-of-message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// Same shape through the skip loop, taken when a column is discarded.
+    #[tokio::test]
+    async fn skip_bytes_past_end_of_message_without_a_trailing_packet_errors() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0x33)
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let result = timeout(Duration::from_secs(5), reader.skip_bytes(2))
+            .await
+            .expect("skip_bytes hung: the reader re-entered the socket after end-of-message");
+
+        assert!(
+            matches!(result, Err(crate::error::Error::ProtocolError(_))),
+            "expected a protocol error, got {result:?}"
+        );
+    }
+
+    /// A value that ends exactly on the message boundary must still succeed —
+    /// the check fires on demand exceeding what remains, not on EOM alone.
+    #[tokio::test]
+    async fn a_value_ending_exactly_at_end_of_message_reads_successfully() {
+        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_bytes(&[0xB1, 0xB2])
+            .build();
+        stream.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&[0xB3])
+                .build(),
+        );
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut destination = [0u8; 3];
+        let read = timeout(Duration::from_secs(5), reader.read_bytes(&mut destination))
+            .await
+            .expect("a value ending at the message boundary must not hang")
+            .expect("a value ending at the message boundary must read successfully");
+
+        assert_eq!(read, 3);
+        assert_eq!(destination, [0xB1, 0xB2, 0xB3]);
+    }
+
+    /// `reset_reader` used to `assert!` that the buffer was fully consumed.
+    /// `buffer_length` is taken from the packet header the peer sent, so that
+    /// assertion put a peer-controlled value behind a process abort that stays
+    /// active in release builds. Resetting with bytes still unread now just
+    /// discards them, which is what a reset means.
+    #[tokio::test]
+    async fn reset_reader_discards_unread_bytes_instead_of_aborting() {
+        let stream = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&[0xC1, 0xC2, 0xC3, 0xC4])
+            .build();
+
+        let mut reader = create_network_transport_with_live_peer(&stream);
+
+        let mut first = [0u8; 1];
+        reader
+            .read_bytes(&mut first)
+            .await
+            .expect("the first byte must read");
+        assert_eq!(first, [0xC1]);
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 3);
+
+        TdsPacketReader::reset_reader(&mut reader);
+
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            0,
+            "reset_reader must leave an empty buffer"
+        );
     }
 }

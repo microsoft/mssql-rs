@@ -3,7 +3,7 @@
 # Runs the mssql-odbc C++ gtest e2e suite on a Windows agent that has no local
 # SQL Server, against the cross-pool x64 SQL host booted by sql-host-template.yml.
 #
-# The Windows ARM agent image ships no SQL Server (unlike RUST-Win22-Sql25-1P used
+# The Windows ARM agent image ships no SQL Server (unlike RUST-W22-SQL25 used
 # by Build_Windows), so the ARM job joins the same artifact-sentinel rendezvous the
 # Linux ARM jobs use: derive the shared SA password, poll for the sql-ready
 # endpoint sentinel, run the suite, then publish a teardown sentinel to release

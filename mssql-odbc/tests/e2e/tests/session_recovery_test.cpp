@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // session_recovery_test.cpp  –  E2E test for the SQLExecute recovery/epoch gate.
 //
-// STATUS: currently GTEST_SKIP-ped (see SetUp) pending an mssql-tds fix — the
-// reconnection LOGIN7 is still rejected by the server, so it never fails CI.
-// Remove the skip once transparent reconnect works end-to-end.
+// STATUS: enabled. Exercises SQLExecute-after-KILL recovery against a live
+// server that negotiates Idle Connection Resiliency (SESSIONRECOVERY).
 //
 // Requires a configured connection (ODBC_TEST_SERVER / ODBC_TEST_CONNSTR) to a
 // server that negotiates Idle Connection Resiliency (SESSIONRECOVERY) — any
@@ -22,11 +21,6 @@
 class SessionRecoveryLiveTest : public ODBCTest {
 protected:
     void SetUp() override {
-        GTEST_SKIP() << "Disabled pending mssql-tds transparent-reconnect fix: "
-                        "the reconnection LOGIN7 is rejected by the server, so "
-                        "SQLExecute-after-KILL cannot recover yet. Re-enable when "
-                        "transparent reconnect succeeds end-to-end.";
-
         ODBCTest::SetUp();
         ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection())
             << "No connection configured – set ODBC_TEST_SERVER or "
@@ -105,6 +99,10 @@ protected:
 // Prepare + execute (caches a handle), kill the owning session, then execute
 // again: the driver must transparently reconnect, invalidate the stale handle,
 // re-prepare, and return the fresh result.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the stale prepared
+// handle is not executed and a fresh sp_prepexec fires, which the returned
+// result alone cannot verify.
 TEST_F(SessionRecoveryLiveTest, StaleHandleAfterReconnectIsInvalidatedAndReprepared) {
     // 1. Record the owning session's SPID (the KILL target) and its physical
     //    connect time. A transparent reconnect performs a fresh login with a

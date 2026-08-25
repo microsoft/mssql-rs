@@ -30,11 +30,12 @@ use crate::api::odbc_types::{
     SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
-    ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE, SQLSTATE_01S02, SQLSTATE_HYC00,
-    post_diag,
+    ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_IDENTIFIER, ERR_INVALID_ATTRIBUTE_VALUE,
+    SQLSTATE_01S02, SQLSTATE_HYC00, post_diag,
 };
 use crate::api::util::write_if_some;
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::stmt::STMT_STATE_FETCH_IN_PROGRESS;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Sets a statement attribute.
@@ -92,6 +93,22 @@ fn sql_set_stmt_attr_w_safe(
     free_errors(&mut state);
 
     match attribute {
+        // The rowset controls are read into a fetch's snapshot, so moving them
+        // mid-fetch would point it at buffers of the wrong size or shape.
+        SQL_ATTR_ROW_ARRAY_SIZE
+        | SQL_ATTR_ROWS_FETCHED_PTR
+        | SQL_ATTR_ROW_STATUS_PTR
+        | SQL_ATTR_ROW_BIND_OFFSET_PTR
+        | SQL_ATTR_ROW_BIND_TYPE
+            if state.has_state(STMT_STATE_FETCH_IN_PROGRESS) =>
+        {
+            error!(
+                attribute,
+                "SQLSetStmtAttrW: a fetch is in progress on this statement"
+            );
+            post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+            SQL_ERROR
+        }
         SQL_ATTR_ROW_ARRAY_SIZE => {
             // The value is a `SQLULEN` passed by value in the pointer slot. Zero
             // is an invalid rowset size (HY024) — reject rather than paper over.
@@ -190,13 +207,17 @@ fn sql_set_stmt_attr_w_safe(
                 SQL_SUCCESS_WITH_INFO
             }
         }
+        SQL_ATTR_ROW_BIND_OFFSET_PTR => {
+            state.row_bind_offset_ptr = value_ptr as *mut SqlULen;
+            debug!("SQLSetStmtAttrW: SQL_ATTR_ROW_BIND_OFFSET_PTR set");
+            SQL_SUCCESS
+        }
         // Recognized attributes accepted without tracking: these param /
         // descriptor controls have no effect on the implemented forward-only,
         // read-only behavior.
         SQL_ATTR_PARAM_BIND_TYPE
         | SQL_ATTR_PARAM_STATUS_PTR
         | SQL_ATTR_PARAMS_PROCESSED_PTR
-        | SQL_ATTR_ROW_BIND_OFFSET_PTR
         | SQL_ATTR_APP_ROW_DESC
         | SQL_ATTR_APP_PARAM_DESC => {
             debug!(attribute, "SQLSetStmtAttrW: attribute accepted as no-op");
@@ -284,6 +305,9 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_ROW_BIND_TYPE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, state.row_bind_type);
         },
+        SQL_ATTR_ROW_BIND_OFFSET_PTR => unsafe {
+            write_if_some(value_ptr as *mut *mut SqlULen, state.row_bind_offset_ptr);
+        },
         // Recognized attributes we don't store: report their effective ODBC
         // defaults for this forward-only, read-only, single-paramset driver.
         SQL_ATTR_CURSOR_TYPE => unsafe {
@@ -295,10 +319,12 @@ fn sql_get_stmt_attr_w_safe(
         SQL_ATTR_PARAMSET_SIZE => unsafe {
             write_if_some(value_ptr as *mut SqlULen, 1);
         },
-        // The four implicit descriptors (ARD/APD/IRD/IPD). The Driver Manager
-        // queries these while allocating a statement to obtain the driver's
-        // descriptor handles; returning them avoids a null descriptor
-        // dereference inside the DM's `SQLExecDirectW`.
+        // The four implicit descriptors (ARD/APD/IRD/IPD). They live on
+        // `StmtHandle` itself, not behind `inner` (set once in `new()`,
+        // never reassigned — see that field's doc comment), so nothing
+        // here needs the lock beyond the diagnostics reset above, which
+        // every attribute on this call shares regardless of which one was
+        // requested.
         SQL_ATTR_APP_ROW_DESC => unsafe {
             write_if_some(value_ptr as *mut SqlHandle, stmt.ard);
         },
@@ -388,6 +414,35 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert_eq!(stmt.inner.lock().unwrap().rows_fetched_ptr, ptr);
+    }
+
+    /// Previously accepted as a no-op, which silently misplaced every bound
+    /// column once a nonzero offset was in play.
+    #[test]
+    fn set_row_bind_offset_ptr_stored() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut offset: SqlULen = 64;
+        let ptr: *mut SqlULen = &mut offset;
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_ROW_BIND_OFFSET_PTR, ptr.cast(), 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(stmt.inner.lock().unwrap().row_bind_offset_ptr, ptr);
+
+        // An attribute that can be set has to be readable back: reading the
+        // stored field alone would not have caught a missing getter arm.
+        let mut read_back: *mut SqlULen = std::ptr::null_mut();
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_ROW_BIND_OFFSET_PTR,
+                (&mut read_back as *mut *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(read_back, ptr);
     }
 
     #[test]
@@ -687,5 +742,38 @@ mod tests {
                 assert_ne!(all[i], all[j], "descriptors {i} and {j} alias");
             }
         }
+    }
+
+    /// Regression: querying one of the four implicit descriptor attributes
+    /// must clear stale diagnostics from an earlier failed call on this
+    /// statement, same as every other `SQLGetStmtAttrW` attribute — ODBC
+    /// resets a handle's diagnostic records at the start of every call
+    /// except `SQLGetDiagRec`/`SQLGetDiagField`. An earlier implementation
+    /// answered these four attributes before the lock (and `free_errors`)
+    /// were reached, so a stale diagnostic from a prior failure survived a
+    /// subsequent `SQLGetStmtAttrW(SQL_ATTR_APP_PARAM_DESC)` call.
+    #[test]
+    fn get_descriptor_attribute_clears_stale_diagnostics() {
+        let h = TestHandles::with_env_dbc_stmt();
+        // Any unrecognized attribute posts a diagnostic on this statement.
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                0x7FFF,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(!stmt.inner.lock().unwrap().diag_records.is_empty());
+
+        let (rc, _) = read_desc(h.stmt, SQL_ATTR_APP_PARAM_DESC);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert!(
+            stmt.inner.lock().unwrap().diag_records.is_empty(),
+            "stale diagnostic from the prior failure was not cleared"
+        );
     }
 }

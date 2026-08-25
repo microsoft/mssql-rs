@@ -20,7 +20,7 @@ use crate::message::prelogin::{
     EncryptionType, PreloginRequest, PreloginRequestModel, PreloginResponse,
 };
 use crate::token::login_ack::LoginAckToken;
-use crate::token::tokens::SqlCollation;
+use crate::token::tokens::{SessionStateToken, SqlCollation};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -149,6 +149,16 @@ impl NegotiatedSettings {
             .any(|f| f.feature_identifier() == FeatureExtension::SRecovery && f.is_acknowledged())
     }
 
+    /// Raw FEATUREEXTACK session-recovery baseline the server sent at login,
+    /// which must be echoed back in the reconnect LOGIN7's initial state block.
+    pub(crate) fn session_recovery_initial_state(&self) -> Option<&[u8]> {
+        self.session_settings
+            .supported_features
+            .iter()
+            .find(|f| f.feature_identifier() == FeatureExtension::SRecovery && f.is_acknowledged())
+            .and_then(|f| f.session_recovery_initial_state())
+    }
+
     /// Check if Always Encrypted (column encryption) was acknowledged by the
     /// server in FEATUREEXTACK.
     pub(crate) fn is_column_encryption_supported(&self) -> bool {
@@ -236,7 +246,11 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
     pub(crate) async fn execute<T: NetworkReaderWriter + TdsTokenStreamReader + TdsPacketReader>(
         &mut self,
         reader_writer: &mut T,
-    ) -> TdsResult<(NegotiatedSettings, Vec<SqlInfoMessage>)> {
+    ) -> TdsResult<(
+        NegotiatedSettings,
+        Vec<SqlInfoMessage>,
+        Vec<SessionStateToken>,
+    )> {
         let pre_login_result = self.get_pre_login_result(reader_writer).await?;
         self.validate_prelogin_result(&pre_login_result)?;
 
@@ -252,8 +266,9 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
         let negotiated_settings =
             self.infer_negotiated_settings(&pre_login_result, &mut login_result)?;
         let info_messages = std::mem::take(&mut login_result.diagnostics.info_messages);
+        let session_state_tokens = std::mem::take(&mut login_result.session_state_tokens);
         reader_writer.notify_session_setting_change(&negotiated_settings.session_settings);
-        Ok((negotiated_settings, info_messages))
+        Ok((negotiated_settings, info_messages, session_state_tokens))
     }
 
     async fn get_pre_login_result<T: NetworkReaderWriter + TdsPacketReader>(
@@ -329,10 +344,12 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             None => (None, None),
         };
 
+        let language = change_props.language.clone().unwrap_or_default();
+
         Ok(NegotiatedSettings::new(
             session_settings,
             database_collation,
-            "".to_string(),
+            language,
             database,
             change_props.char_set.clone(),
             login_ack_tds_version,
@@ -453,6 +470,9 @@ struct LoginResult {
     /// ERROR tokens plus any INFO/warning messages. On success only the
     /// informational messages are populated; on failure the errors explain why.
     diagnostics: SqlServerDiagnostics,
+    /// SESSIONSTATE tokens received during login — the baseline snapshot a
+    /// reconnect's LOGIN7 session-recovery block must replay.
+    session_state_tokens: Vec<SessionStateToken>,
 }
 
 pub struct LoginHandler<'a> {
@@ -594,12 +614,15 @@ impl LoginHandler<'_> {
             .map(|f| f.clone_box())
             .collect();
 
+        let session_state_tokens = std::mem::take(&mut login_response.session_state_tokens);
+
         Ok(LoginResult {
             supported_features,
             change_properties: login_response.change_properties,
             status: response_status,
             login_ack: login_response.success_token,
             diagnostics: SqlServerDiagnostics::new(errors, info_messages),
+            session_state_tokens,
         })
     }
 
@@ -759,5 +782,28 @@ mod tests {
     fn is_session_recovery_acknowledged_false_when_feature_absent() {
         let settings = create_test_negotiated_settings_internal();
         assert!(!settings.is_session_recovery_acknowledged());
+    }
+
+    #[test]
+    fn session_recovery_initial_state_returns_ack_payload() {
+        let mut settings = create_test_negotiated_settings_internal();
+        let mut feature = SessionRecoveryFeature::new(1);
+        feature.set_acknowledged(true);
+        feature.deserialize(&[0x07, 0x02, 0x01, 0x02]).unwrap();
+        settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+
+        assert_eq!(
+            settings.session_recovery_initial_state(),
+            Some([0x07, 0x02, 0x01, 0x02].as_slice())
+        );
+    }
+
+    #[test]
+    fn session_recovery_initial_state_none_without_feature() {
+        let settings = create_test_negotiated_settings_internal();
+        assert!(settings.session_recovery_initial_state().is_none());
     }
 }

@@ -11,8 +11,8 @@
 //! Windows `.def` file or a C header listing the public API surface.
 
 use super::odbc_types::{
-    SQL_CLOSE, SQL_RESET_PARAMS, SQL_SUCCESS, SqlHWnd, SqlHandle, SqlInteger, SqlLen, SqlPointer,
-    SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_CLOSE, SQL_RESET_PARAMS, SQL_SUCCESS, SQL_UNBIND, SqlHWnd, SqlHandle, SqlInteger, SqlLen,
+    SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 
 // ---- Handle allocation and management ---------------------------------------
@@ -377,8 +377,8 @@ pub unsafe extern "C" fn SQLCloseCursor(statement_handle: SqlHandle) -> SqlRetur
 /// Frees resources associated with a statement handle.
 ///
 /// `SQL_CLOSE` closes the open cursor (no-op if none); `SQL_RESET_PARAMS`
-/// releases all parameter bindings. `SQL_DROP` and `SQL_UNBIND` are not yet
-/// implemented.
+/// releases all parameter bindings; `SQL_UNBIND` releases all column bindings.
+/// `SQL_DROP` is not yet implemented.
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
@@ -393,8 +393,9 @@ pub unsafe extern "C" fn SQLFreeStmt(
         SQL_RESET_PARAMS => unsafe {
             super::bind_param::sql_free_stmt_reset_params(statement_handle)
         },
+        SQL_UNBIND => unsafe { super::bind_col::sql_free_stmt_unbind(statement_handle) },
         _ => {
-            // TODO: SQL_DROP, SQL_UNBIND
+            // TODO: SQL_DROP
             SQL_SUCCESS
         }
     }
@@ -542,6 +543,56 @@ pub unsafe extern "C" fn SQLExecute(statement_handle: SqlHandle) -> SqlReturn {
 pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
     unsafe { super::fetch::sql_fetch(statement_handle) }
+}
+
+/// Binds an application buffer to a result-set column.
+///
+/// Passing null for both `target_value_ptr` and `strlen_or_ind_ptr` unbinds the
+/// column; a null data pointer with a live indicator keeps it bound for lengths
+/// only.
+///
+/// # Safety
+/// `statement_handle` must be a valid statement handle or null. The buffers must
+/// stay valid until the column is unbound or the statement is freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLBindCol(
+    statement_handle: SqlHandle,
+    column_number: SqlUSmallInt,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::bind_col::sql_bind_col(
+            statement_handle,
+            column_number,
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        )
+    }
+}
+
+/// Fetches a rowset of rows into the columns bound by `SQLBindCol`.
+///
+/// The cursor is forward-only, so `SQL_FETCH_NEXT` is the only orientation
+/// served; anything else returns `HY106`.
+///
+/// # Safety
+/// `statement_handle` must be a valid statement handle or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLFetchScroll(
+    statement_handle: SqlHandle,
+    fetch_orientation: SqlSmallInt,
+    fetch_offset: SqlLen,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::fetch_scroll::sql_fetch_scroll(statement_handle, fetch_orientation, fetch_offset)
+    }
 }
 
 /// Returns the number of columns in the result set.
@@ -977,7 +1028,7 @@ pub unsafe extern "C" fn SQLSetStmtAttrW(
     }
 }
 
-// ---- Descriptor and parameter management (TO-BE-IMPLEMENTED) -----------------
+// ---- Descriptor and parameter management ------------------------------------
 
 /// Gets a descriptor field.
 ///
@@ -996,16 +1047,47 @@ pub unsafe extern "C" fn SQLGetDescFieldW(
     string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
     crate::init_tracing();
-    tracing::debug!(
-        ?descriptor_handle,
-        record_number,
-        field_identifier,
-        ?value_ptr,
-        buffer_length,
-        ?string_length_ptr,
-        "SQLGetDescFieldW called (stub)",
-    );
-    super::odbc_types::SQL_ERROR
+    unsafe {
+        super::get_desc_field::sql_get_desc_field_w(
+            descriptor_handle,
+            record_number,
+            field_identifier,
+            value_ptr,
+            buffer_length,
+            string_length_ptr,
+        )
+    }
+}
+
+/// Sets a descriptor field.
+///
+/// # Safety
+/// - `descriptor_handle` must be a valid descriptor handle.
+/// - `record_number` must be valid for the descriptor.
+/// - `field_identifier` must be a valid field identifier.
+/// - `value_ptr`, when the field is a pointer field, is stored verbatim and
+///   not dereferenced by this call; the caller must keep it valid for as
+///   long as it remains bound. When the field is a character field,
+///   `value_ptr` must be readable for `buffer_length` bytes (or
+///   NUL-terminated when `buffer_length == SQL_NTS`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetDescFieldW(
+    descriptor_handle: SqlHandle,
+    record_number: SqlSmallInt,
+    field_identifier: SqlSmallInt,
+    value_ptr: SqlPointer,
+    buffer_length: SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::set_desc_field::sql_set_desc_field_w(
+            descriptor_handle,
+            record_number,
+            field_identifier,
+            value_ptr,
+            buffer_length,
+        )
+    }
 }
 
 /// Cancels the processing of the statement.

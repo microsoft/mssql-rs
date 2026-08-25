@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use winapi::shared::winerror::ERROR_PIPE_BUSY;
-use winapi::um::namedpipeapi::SetNamedPipeHandleState;
+use winapi::shared::winerror::{ERROR_BROKEN_PIPE, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED};
+use winapi::um::namedpipeapi::{PeekNamedPipe, SetNamedPipeHandleState};
 use winapi::um::winbase::{PIPE_READMODE_BYTE, PIPE_WAIT};
 
 /// Timeout for Named Pipe connection attempts (matching ODBC's NP_OPEN_TIMEOUT)
@@ -222,6 +222,32 @@ impl Stream for NamedPipeClient {
         } else {
             info!("Named Pipe switched to Byte mode for streaming reads");
         }
+    }
+
+    fn is_connection_dead(&self) -> bool {
+        // Non-destructive liveness probe: PeekNamedPipe reports pipe status
+        // without consuming buffered data (unlike a try_read), so it is safe on
+        // an idle connection before issuing a command. A broken or disconnected
+        // pipe surfaces as ERROR_BROKEN_PIPE / ERROR_PIPE_NOT_CONNECTED; success
+        // (with or without buffered bytes) means the pipe is still open.
+        let handle = self.as_raw_handle();
+        let ok = unsafe {
+            PeekNamedPipe(
+                handle as *mut _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            return false;
+        }
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code) if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_PIPE_NOT_CONNECTED as i32
+        )
     }
 }
 #[cfg(test)]

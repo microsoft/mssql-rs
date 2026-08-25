@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-odbc`: input parameter binding (`SQLBindParameter` with
+  `SQL_PARAM_INPUT`) for the character and integer type families. Any other
+  `ValueType` → `ParameterType` pairing is rejected at bind time with `HYC00`,
+  including when the bound value is `SQL_NULL_DATA`: a SQL type that cannot
+  carry a value cannot carry a typed NULL either, so an application never gets a
+  binding that works for `NULL` and fails on its first real value. `ColumnSize`
+  is validated against the `ParameterType` at bind time (`HY104`), matching
+  msodbcsql's `CheckSqlPrecScale`.
+
 - `mssql-tds`: `SqlType::Variant` for passing `sql_variant` values as RPC / `sp_executesql`
   parameters.
 
@@ -46,6 +55,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- `mssql-tds`: `TdsClient::language()` now returns the language negotiated at
+  login (from the server's `ENVCHANGE`) instead of always returning an empty
+  string, matching its documentation.
+
 - `mssql-tds`: `TdsClient::read_row_column` now returns `CursorColumn::Value` as a
   struct variant, `CursorColumn::Value { value, variant_base }`, where
   `variant_base` is the underlying `TdsDataType` a `sql_variant` value carried
@@ -74,6 +87,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   server's `DONE_COUNT`. Fixes a doubled count on distributed engines that
   acknowledge one load with multiple `DONE_COUNT` tokens (issue #209).
 
+- `mssql-odbc`: Entra ID credentials for service-principal and managed-identity
+  authentication are now cached process-wide (keyed by tenant/authority,
+  client id, and a digest of the secret, or by client id alone for managed
+  identity) instead of being rebuilt for every connection. A burst of new
+  connections for the same identity now triggers a single token acquisition,
+  reused until near expiry, instead of one AAD/IMDS round-trip per connection —
+  avoiding Managed Identity (IMDS) throttling and added login latency during
+  connection-pool warm-up. A cached credential retains the secret it was built
+  from for the life of the process; a rotated secret creates a new cache entry
+  rather than replacing the old one.
+
 ### Removed
 
 - `mssql-tds`: the public `connection::odbc_authentication_transformer`,
@@ -85,6 +109,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   federated-auth flows.
 
 ### Fixed
+
+- `mssql-tds`: idle connection resiliency (transparent session recovery) now
+  works end to end. The client-side gate that authorizes a reconnect is now set
+  from the server's `FEATUREEXTACK` acknowledgment — previously it was only ever
+  set in tests, so reconnect never ran in production despite being negotiated on
+  the wire. The recoverable session-state baseline the server sends in that
+  acknowledgment is now parsed and replayed in the reconnect `LOGIN7`, which the
+  server previously rejected as incomplete (error 17897, state 81).
 
 - `mssql-tds`: reading a fixed-width value that straddles a TDS packet boundary
   could return bytes from the wrong place or panic. The readers checked for

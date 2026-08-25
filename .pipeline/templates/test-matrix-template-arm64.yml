@@ -48,6 +48,9 @@ parameters:
     # this template then only emits the test job, which consumes sql-ready-shared.
     type: boolean
     default: true
+  - name: poolName
+    type: string
+    default: 'RUST-ARM64-WUS3'
 
 jobs:
   # ------------------------------------------------------------------
@@ -75,7 +78,7 @@ jobs:
               entry: ${{ target.entry }}
               sentinelName: ${{ target.name }}
       pool:
-        name: RUST-1ES-POOL-ARM-WUS3
+        name: ${{ parameters.poolName }}
         demands:
           - imageOverride -equals RUST-UBUNTU-ARM64
       steps:
@@ -190,7 +193,7 @@ jobs:
         displayName: 'Linux arm64 ${{ target.name }}'
         # Intentionally no `dependsOn`: see sql-host-template.yml header.
         pool:
-          name: RUST-1ES-POOL-ARM-WUS3
+          name: ${{ parameters.poolName }}
           demands:
             - imageOverride -equals RUST-UBUNTU-ARM64
         steps:

@@ -562,7 +562,7 @@ impl CursorClient for TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut pw).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -644,7 +644,7 @@ impl CursorClient for TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut pw).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -720,7 +720,7 @@ impl CursorClient for TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut pw).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -1048,7 +1048,7 @@ impl CursorClient for TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         rpc.serialize(&mut pw).await?;
 
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         if !server_errors.is_empty() {
             return Err(crate::error::Error::from_sql_errors(server_errors));
@@ -1132,7 +1132,7 @@ impl TdsClient {
         self.last_return_status = ReturnStatus::NotReceived;
         let metadata = self.next_rowset().await?;
         self.current_metadata = metadata;
-        let server_errors = self.drain_stream().await?;
+        let server_errors = self.drain_stream_or_retire().await?;
         self.execution_context.set_has_open_batch(false);
         self.current_result_set_has_been_read_till_end = true;
 

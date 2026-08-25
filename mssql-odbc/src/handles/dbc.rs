@@ -84,17 +84,30 @@ pub(crate) struct DbcState {
     /// (`sqlcmisc.cpp:3426`). Applied as a `SET TRANSACTION ISOLATION LEVEL`
     /// batch when connected, otherwise deferred to connect time.
     pub(crate) txn_isolation: u32,
-    /// ODBC-side checkout state for a reset that still needs a carrying request.
+    /// The server's transaction isolation level is no longer known to match
+    /// [`txn_isolation`](Self::txn_isolation).
     ///
-    /// This is distinct from `TdsClient::reset_pending()`: this flag forces the
-    /// checkout isolation SET to execute, while the TDS flag records whether the
-    /// server has acknowledged the reset. It is cleared after the isolation
-    /// handler verifies that acknowledgement.
+    /// Set when a pool reset is armed: SQL Server's connection reset does not
+    /// restore the isolation level, and the previous borrower may have changed
+    /// it through raw T-SQL that this cache never saw. While set,
+    /// `SQL_ATTR_TXN_ISOLATION` must not take its same-value short circuit, or
+    /// the checkout SET would be skipped and the next borrower would silently
+    /// inherit the previous one's level. Cleared once an isolation SET reaches
+    /// the server, or at connect time when the session starts from a known
+    /// state.
     ///
-    /// While set, `SQL_ATTR_TXN_ISOLATION` must not take its same-value short
-    /// circuit: that checkout SET is the request the armed bit rides, so
-    /// short-circuiting would lose fail-at-checkout.
-    pub(crate) pending_reset_ack: bool,
+    /// This is not reset *acknowledgement* state: `TdsClient` verifies that
+    /// itself on the request that carries the RESETCONNECTION bit.
+    pub(crate) server_isolation_unknown: bool,
+    /// Monotonic count of pool resets armed on this connection.
+    ///
+    /// `set_txn_isolation` captures it before it sends and only clears
+    /// [`server_isolation_unknown`](Self::server_isolation_unknown) afterwards
+    /// if the count is unchanged. Without it a checkout SET already in flight
+    /// could clear an invalidation armed *after* it reached the server, and the
+    /// next same-value SET would short-circuit against a session the newer reset
+    /// had made unknown again.
+    pub(crate) reset_generation: u64,
     /// The application executed a statement in manual-commit mode, so the open
     /// transaction may hold uncommitted user work. Mirrors msodbcsql's
     /// `CONN_ST_LOCALTRANS_STARTED` (`sqlcprot.h:2298`) and is deliberately
@@ -155,7 +168,8 @@ impl DbcHandle {
                 autocommit: true,
                 txn_isolation: SQL_TXN_READ_COMMITTED,
                 local_tran_started: false,
-                pending_reset_ack: false,
+                server_isolation_unknown: false,
+                reset_generation: 0,
             }),
         }
     }

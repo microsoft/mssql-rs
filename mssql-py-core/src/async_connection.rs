@@ -22,7 +22,7 @@ use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 
 use crate::async_cursor::PyAsyncCursor;
-use crate::async_session::AsyncConnectionState;
+use crate::async_session::{AsyncConnectionState, ClaimError, OperationId};
 use crate::connection::PyCoreConnection;
 use crate::python_logger_adapter::python_logger_dispatch;
 
@@ -53,6 +53,57 @@ fn emit_preview_warning(py: Python<'_>) -> PyResult<()> {
 fn map_tds_error(op: &str, user_msg: &str, e: impl std::fmt::Display) -> PyErr {
     tracing::error!("PyAsyncConnection::{op}: failed: {e}");
     PyRuntimeError::new_err(format!("{user_msg}: {e}"))
+}
+
+/// Maps a connection lifecycle or session-ownership rejection to `RuntimeError`.
+///
+/// A busy connection may be owned by either a cursor or another connection-level
+/// operation. DB-API-specific exception mapping is tracked separately.
+fn map_claim_error(error: ClaimError) -> PyErr {
+    match error {
+        ClaimError::Closing => PyRuntimeError::new_err("Connection is closing"),
+        ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
+        ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
+        ClaimError::Busy => PyRuntimeError::new_err("Connection is busy with another operation"),
+    }
+}
+
+/// Owns the session claim for an in-flight commit or rollback.
+///
+/// `complete()` releases the claim after success or a handled TDS error. Dropping
+/// before completion indicates cancellation or an interrupted protocol exchange,
+/// so the connection is marked broken before the claim is released.
+struct ConnectionOperationGuard {
+    session_state: Arc<AsyncConnectionState>,
+    operation_id: OperationId,
+    completed: bool,
+}
+
+impl ConnectionOperationGuard {
+    /// Creates a guard for an already-acquired connection-operation claim.
+    fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
+        Self {
+            session_state,
+            operation_id,
+            completed: false,
+        }
+    }
+
+    /// Releases the claim and prevents drop-time connection poisoning.
+    fn complete(&mut self) {
+        self.session_state.release_operation(self.operation_id);
+        self.completed = true;
+    }
+}
+
+impl Drop for ConnectionOperationGuard {
+    /// Marks the connection broken when an operation is cancelled or interrupted.
+    fn drop(&mut self) {
+        if !self.completed {
+            self.session_state.mark_broken();
+            self.session_state.release_operation(self.operation_id);
+        }
+    }
 }
 
 async fn with_optional_dispatch<F>(future: F, dispatch: Option<tracing::Dispatch>) -> F::Output
@@ -90,13 +141,9 @@ async fn close_client(client: Arc<Mutex<TdsClient>>, autocommit: bool) -> bool {
 
 /// Asynchronous Python connection backed by the Core TDS client.
 ///
-/// Preview API — unstable.
-///
-/// TODO(User Story 47180 [mssql-python] Cancel API and Cancellation Bridge):
-/// cancellation of a suspended `commit`, `rollback`, or `close` future can
-/// desync the TDS byte stream. Callers must not cancel these awaitables
-/// against a connection they intend to keep using.
-/// <https://sqlclientdrivers.visualstudio.com/mssql-python/_workitems/edit/47180>
+/// This API is a preview and may change between minor releases. Do not cancel
+/// an in-progress `commit()`, `rollback()`, or `close()` if the connection will
+/// be reused.
 #[pyclass]
 pub struct PyAsyncConnection {
     /// `Option` so `close()` can `take()`; `Arc<Mutex<>>` for cursor sharing.
@@ -113,8 +160,10 @@ pub struct PyAsyncConnection {
 
 #[pymethods]
 impl PyAsyncConnection {
-    /// Establish a TDS connection. Dict parsing is synchronous; the network
-    /// handshake runs on the shared Tokio runtime.
+    /// Establish a connection and return an awaitable resolving to it.
+    ///
+    /// `client_context_dict` supplies the SQL Server connection options.
+    /// `autocommit` defaults to `False`.
     #[classmethod]
     #[pyo3(signature = (client_context_dict, python_logger=None, autocommit=false))]
     fn connect<'py>(
@@ -217,6 +266,9 @@ impl PyAsyncConnection {
 
     /// Whether statements use SQL Server autocommit mode. The mode is fixed at
     /// connection time until async transition semantics are implemented.
+    // TODO: Add an awaitable mode-change API. Enabling autocommit must commit
+    // active work before changing mode and preserve the old mode on failure;
+    // disabling it must defer begin until the next execute.
     #[getter]
     fn autocommit(&self) -> bool {
         self.autocommit.load(Ordering::Relaxed)
@@ -382,26 +434,40 @@ impl PyAsyncConnection {
             .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
             .clone();
         let dispatch = self.tracing_dispatch.clone();
+        let session_state = self.session_state.clone();
+        let operation_id = session_state
+            .claim_connection_operation()
+            .map_err(map_claim_error)?;
 
-        pyo3_async_runtimes::tokio::future_into_py(
+        let result = pyo3_async_runtimes::tokio::future_into_py(
             py,
             with_optional_dispatch(
                 async move {
-                    let mut guard = client.lock().await;
-                    if !guard.has_active_transaction() {
-                        return Python::attach(|py| Ok(py.None()));
+                    let mut operation_guard =
+                        ConnectionOperationGuard::new(session_state, operation_id);
+                    let result = async {
+                        let mut client = client.lock().await;
+                        if client.has_active_transaction() {
+                            tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
+                            client
+                                .commit_transaction(None, None)
+                                .await
+                                .map_err(|error| map_tds_error("commit", "Commit failed", error))?;
+                            tracing::info!("PyAsyncConnection::commit: transaction committed");
+                        }
+                        Python::attach(|py| Ok(py.None()))
                     }
-                    tracing::info!("PyAsyncConnection::commit: sending TM_COMMIT");
-                    guard
-                        .commit_transaction(None, None)
-                        .await
-                        .map_err(|e| map_tds_error("commit", "Commit failed", e))?;
-                    tracing::info!("PyAsyncConnection::commit: transaction committed");
-                    Python::attach(|py| Ok(py.None()))
+                    .await;
+                    operation_guard.complete();
+                    result
                 },
                 dispatch,
             ),
-        )
+        );
+        if result.is_err() {
+            self.session_state.release_operation(operation_id);
+        }
+        result
     }
 
     /// Roll back the current transaction. No-op if none is active.
@@ -414,26 +480,42 @@ impl PyAsyncConnection {
             .ok_or_else(|| PyRuntimeError::new_err("Connection is closed"))?
             .clone();
         let dispatch = self.tracing_dispatch.clone();
+        let session_state = self.session_state.clone();
+        let operation_id = session_state
+            .claim_connection_operation()
+            .map_err(map_claim_error)?;
 
-        pyo3_async_runtimes::tokio::future_into_py(
+        let result = pyo3_async_runtimes::tokio::future_into_py(
             py,
             with_optional_dispatch(
                 async move {
-                    let mut guard = client.lock().await;
-                    if !guard.has_active_transaction() {
-                        return Python::attach(|py| Ok(py.None()));
+                    let mut operation_guard =
+                        ConnectionOperationGuard::new(session_state, operation_id);
+                    let result = async {
+                        let mut client = client.lock().await;
+                        if client.has_active_transaction() {
+                            tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
+                            client
+                                .rollback_transaction(None, None)
+                                .await
+                                .map_err(|error| {
+                                    map_tds_error("rollback", "Rollback failed", error)
+                                })?;
+                            tracing::info!("PyAsyncConnection::rollback: transaction rolled back");
+                        }
+                        Python::attach(|py| Ok(py.None()))
                     }
-                    tracing::info!("PyAsyncConnection::rollback: sending TM_ROLLBACK");
-                    guard
-                        .rollback_transaction(None, None)
-                        .await
-                        .map_err(|e| map_tds_error("rollback", "Rollback failed", e))?;
-                    tracing::info!("PyAsyncConnection::rollback: transaction rolled back");
-                    Python::attach(|py| Ok(py.None()))
+                    .await;
+                    operation_guard.complete();
+                    result
                 },
                 dispatch,
             ),
-        )
+        );
+        if result.is_err() {
+            self.session_state.release_operation(operation_id);
+        }
+        result
     }
 
     /// Create an async cursor. Sync per DB-API 2.0. Raises `RuntimeError` if the
@@ -447,6 +529,7 @@ impl PyAsyncConnection {
             .clone();
         Ok(PyAsyncCursor::new(
             client,
+            self.tracing_dispatch.clone(),
             self.autocommit.clone(),
             self.session_state.clone(),
             self.session_state.allocate_cursor_id(),

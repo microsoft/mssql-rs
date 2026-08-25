@@ -93,14 +93,13 @@ mssql-python describes unresolved `None` values and then binds them with
 (`type_rules::resolve_default_c_type`) before storing the binding, so conversion
 never sees `SQL_C_DEFAULT` itself. Keying the typed NULL off the resolved C type
 would be wrong - a `decimal` resolves to `SQL_C_CHAR`, and would go out as a NULL
-`varchar`. `BoundParam` therefore records a `c_type_defaulted` flag, and the NULL
-path builds the value from `sql_type` whenever it is set.
+`varchar`. The NULL path therefore builds the value from `sql_type` for every
+binding, defaulted or not, matching msodbcsql's `CRPCSQLSender::SendParamList`.
 
-The same flag exempts defaulted bindings from the character conversion matrix.
-`resolve_default_c_type` returns the C type ODBC *defines* as that SQL type's
-default, so the pairing is supported by construction; the matrix only enumerates
-the explicit character pairings implemented so far and would otherwise reject the
-describe-then-bind flow outright. `SQL_SS_UDT` and `SQL_SS_TABLE` stay rejected at
+Defaulted bindings are *not* exempted from the conversion matrix: the same
+pairing must be accepted or rejected whether the application named the C type or
+let the driver pick it. The cost is that describe-then-bind can only bind the
+types the matrix already lists. `SQL_SS_UDT` and `SQL_SS_TABLE` stay rejected at
 bind time because they need a fully qualified server type name that
 `SQLDescribeParam` does not report.
 

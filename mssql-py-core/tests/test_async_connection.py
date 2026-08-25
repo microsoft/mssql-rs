@@ -22,6 +22,12 @@ class RecordingLogger:
         self.messages.append(message)
 
 
+def test_async_connection_exposes_user_facing_docstrings():
+    assert "Do not cancel" in mssql_py_core.PyAsyncConnection.__doc__
+    assert "autocommit" in mssql_py_core.PyAsyncConnection.connect.__doc__
+    assert "Idempotent" in mssql_py_core.PyAsyncConnection.close.__doc__
+
+
 # ---------------------------------------------------------------------------
 # Preview warning
 # ---------------------------------------------------------------------------
@@ -147,6 +153,9 @@ def test_connection_operations_reuse_connect_logger(client_context):
 
 @pytest.mark.integration
 def test_autocommit_defaults_false_and_can_be_enabled(client_context):
+    # TODO: When mode changes are supported, cover lazy begin, restart after
+    # commit/rollback, both mode transitions, context finalization, and
+    # cleanup-error precedence.
     async def run():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
