@@ -43,12 +43,16 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for acknowledgment
+    /// * `timeout` - Maximum time for the whole flow, covering the send as well
+    ///   as the wait. Writing the packet can itself stall on a peer that has
+    ///   stopped reading, so implementations must not leave the send unbounded.
     ///
     /// # Returns
     ///
     /// * `Ok(true)` - Attention acknowledged by server
-    /// * `Ok(false)` - Attention sent but timeout expired waiting for ACK
+    /// * `Ok(false)` - Timeout expired before the acknowledgement, either while
+    ///   sending the attention or while waiting for the ACK. The connection is
+    ///   left unusable either way.
     /// * `Err(_)` - Error sending attention or reading response
     async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
 

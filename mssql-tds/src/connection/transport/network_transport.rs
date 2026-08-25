@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{self, TcpStream};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, error, event, info, trace, warn};
 
 #[cfg(windows)]
@@ -1138,47 +1138,75 @@ impl NetworkTransport {
     ///
     /// # Contract
     ///
-    /// Cancelling a read is itself bounded: ATTENTION goes out and the response
-    /// is drained for at most [`ATTENTION_TIMEOUT_SECONDS`], matching
-    /// `Microsoft.Data.SqlClient`'s `AttentionTimeoutSeconds`. Callers get their
-    /// cancellation or timeout back within that bound whatever the server does,
-    /// so no separate cancellation-cleanup deadline is needed.
+    /// Cancelling a read is bounded end to end: the ATTENTION write and the
+    /// drain that follows it share a single [`ATTENTION_TIMEOUT_SECONDS`]
+    /// deadline, matching `Microsoft.Data.SqlClient`'s
+    /// `AttentionTimeoutSeconds`. Callers get their cancellation or timeout
+    /// back within that bound whatever the server does, so no separate
+    /// cancellation-cleanup deadline is needed.
     ///
     /// Acknowledged, the connection is left at a message boundary and stays
-    /// reusable. Unacknowledged — the send failed, the drain errored, or the
-    /// bound elapsed — the stream is parked at an unknown point, so the
-    /// connection is marked known-dead and pools will not hand it out again.
+    /// reusable. Unacknowledged — the send failed or stalled, the drain
+    /// errored, or the bound elapsed — the stream is parked at an unknown
+    /// point, so the connection is marked known-dead and pools will not hand
+    /// it out again.
     ///
     /// This reports nothing to the caller on purpose. It runs on a path that
     /// already has an error to deliver (the cancellation or the timeout), and
     /// replacing that with a cleanup failure would hide why the read stopped.
     /// The known-dead flag is how a failed cleanup is observed.
     async fn cancel_read_stream_and_wait(&mut self) {
-        if let Err(e) = self.cancel_read_stream().await {
-            debug!("Failed to send attention while cancelling the read stream: {e:?}");
-            self.known_dead = true;
-            return;
-        }
-
         let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
-        match self.wait_for_attention_ack(attention_timeout).await {
+        match self.send_attention_and_wait(attention_timeout).await {
             Ok(true) => {}
             Ok(false) => {
                 warn!(
                     timeout = ?attention_timeout,
-                    "No attention acknowledgement within the bound; marking the connection dead"
+                    "Attention went unacknowledged within the bound; marking the connection dead"
                 );
                 self.known_dead = true;
             }
             Err(e) => {
-                debug!("Error draining to the attention acknowledgement: {e:?}");
+                debug!("Failed to cancel the read stream: {e:?}");
                 self.known_dead = true;
             }
         }
     }
 
-    /// Wait for attention acknowledgment from server, bounded by
-    /// `attention_timeout`.
+    /// Sends ATTENTION and drains to the acknowledgement, both under a single
+    /// `attention_timeout` deadline.
+    ///
+    /// The send is bounded too. Writing the packet parks until the socket
+    /// accepts it, so a peer that has stopped reading stalls the send and the
+    /// acknowledgement deadline would never be armed. The drain gets whatever
+    /// the send left of the deadline.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - Attention acknowledged by server
+    /// * `Ok(false)` - The bound elapsed, sending or waiting
+    /// * `Err(_)` - Error sending attention or reading the response
+    async fn send_attention_and_wait(&mut self, attention_timeout: Duration) -> TdsResult<bool> {
+        let deadline = Instant::now() + attention_timeout;
+
+        match timeout_at(deadline, self.cancel_read_stream()).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                // A stalled write leaves a partial packet on the wire, so the
+                // stream can never be resynchronised.
+                warn!(
+                    timeout = ?attention_timeout,
+                    "Timed out sending the attention packet; marking the connection dead"
+                );
+                self.known_dead = true;
+                return Ok(false);
+            }
+        }
+
+        self.wait_for_attention_ack(deadline).await
+    }
+
+    /// Wait for attention acknowledgment from server until `deadline`.
     ///
     /// Reads tokens until a DONE token with the ATTN flag arrives, discarding
     /// everything else the server was still sending.
@@ -1186,12 +1214,12 @@ impl NetworkTransport {
     /// # Returns
     ///
     /// * `Ok(true)` - Attention acknowledged by server
-    /// * `Ok(false)` - `attention_timeout` elapsed before the acknowledgement
+    /// * `Ok(false)` - `deadline` passed before the acknowledgement
     /// * `Err(_)` - Error reading response
-    async fn wait_for_attention_ack(&mut self, attention_timeout: Duration) -> TdsResult<bool> {
-        let start = tokio::time::Instant::now();
+    async fn wait_for_attention_ack(&mut self, deadline: Instant) -> TdsResult<bool> {
+        let start = Instant::now();
 
-        match timeout(attention_timeout, self.drain_to_attention_ack()).await {
+        match timeout_at(deadline, self.drain_to_attention_ack()).await {
             Ok(Ok(())) => {
                 debug!("Attention ACK received after {:?}", start.elapsed());
                 Ok(true)
@@ -1940,17 +1968,19 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
     /// 2. Wait for DONE token with ATTN (0x0020) status flag
     /// 3. If no acknowledgment within timeout, return false
     ///
+    /// `attention_timeout` covers the whole flow, not just step 2. Writing the
+    /// packet parks until the socket accepts it, so a peer that has stopped
+    /// reading stalls the send and the acknowledgement deadline would never be
+    /// armed. Both steps therefore share one deadline, and the drain gets
+    /// whatever the send left of it.
+    ///
     /// This is used by bulk copy timeout handling to implement the 5-second
     /// attention ACK timeout per SqlClient behavior.
     async fn send_attention_with_timeout(
         &mut self,
         attention_timeout: Duration,
     ) -> TdsResult<bool> {
-        // Send attention packet
-        self.cancel_read_stream().await?;
-
-        // Wait for ACK with timeout using the shared helper
-        self.wait_for_attention_ack(attention_timeout).await
+        self.send_attention_and_wait(attention_timeout).await
     }
 
     fn is_connection_dead(&self) -> bool {
@@ -3633,21 +3663,23 @@ pub(crate) mod tests {
     // Attention acknowledgement (DONE_ATTN) after cancellation or timeout.
     //
     // Cancelling or timing out a read sends TDS ATTENTION and then drains the
-    // response until the server answers with a DONE carrying ATTN. That drain
-    // used to be unbounded, so a server that never answers — or a network that
-    // drops the answer — parked the caller inside its own cancellation
-    // forever, past any deadline the caller had set.
+    // response until the server answers with a DONE carrying ATTN. Neither half
+    // used to be bounded, so a server that never answers — or one that has
+    // stopped reading, stalling the send — parked the caller inside its own
+    // cancellation forever, past any deadline the caller had set.
     //
-    // These use `create_network_transport_with_live_peer_capturing_writes` so
-    // the socket stays open and silent after the scripted bytes are drained.
+    // Most of these use `create_network_transport_with_live_peer_capturing_writes`
+    // so the socket stays open and silent after the scripted bytes are drained.
     // A helper that drops its writer would hand the drain an EOF and end it no
     // matter how unbounded it is, which is exactly the masking these tests
-    // exist to avoid. The peer also reads, so the ATTENTION write itself never
-    // blocks on a full duplex buffer.
+    // exist to avoid. The peer also reads, so the ATTENTION write only blocks
+    // in the one test that wants it to.
     //
     // Time is paused, so the bound elapses the moment the runtime goes idle: a
     // regression that arms no timer leaves only the outer guard, which then
-    // fires and fails the test instead of running for real minutes.
+    // fires and fails the test instead of running for real minutes. Every wait
+    // here is under such a guard, including the channel receives — an
+    // unguarded one would hang on the very regressions these tests target.
     // ---------------------------------------------------------------------
 
     /// A DONE token with `status`, framed as a message of its own — the shape
@@ -3698,11 +3730,43 @@ pub(crate) mod tests {
             "the caller must still see its cancellation, got {result:?}"
         );
 
-        let sent = written.recv().await.expect("the peer must observe a write");
+        let sent = timeout(Duration::from_secs(600), written.recv())
+            .await
+            .expect("cancellation returned without ever putting ATTENTION on the wire")
+            .expect("the peer must observe a write");
         assert_eq!(
             sent[0],
             PacketType::Attention as u8,
             "cancellation must put an ATTENTION packet on the wire"
+        );
+    }
+
+    /// The bound has to cover the ATTENTION write, not just the drain that
+    /// follows it.
+    ///
+    /// `create_network_transport_with_live_peer` never reads and sizes its
+    /// duplex buffer to the scripted data alone, so with no data the client's
+    /// 8-byte ATTENTION fills a 1-byte buffer and the write parks — a peer
+    /// whose receive window has closed, in miniature. Timing only the drain
+    /// leaves the caller stuck here, before any deadline is armed.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_attention_write_does_not_park_cancellation() {
+        let mut transport = create_network_transport_with_live_peer(&[]);
+
+        let result = timeout(
+            Duration::from_secs(600),
+            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+        )
+        .await
+        .expect("cancellation hung writing ATTENTION to a peer that had stopped reading");
+
+        assert!(
+            matches!(result, Err(OperationCancelledError(_))),
+            "the caller must still see its cancellation, got {result:?}"
+        );
+        assert!(
+            is_known_dead(&transport),
+            "a half-written attention leaves the stream unresynchronisable"
         );
     }
 
