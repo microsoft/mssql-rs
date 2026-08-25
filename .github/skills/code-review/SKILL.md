@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review a pull request, diff, or set of proposed changes in microsoft/mssql-rs — from a GitHub or Azure DevOps PR link, a PR number, or local staged/unstaged changes. Use whenever the user asks to review a PR, asks for feedback on a diff, or asks whether changes are ready to merge. Covers correctness, security, tests, readability, performance, API/breaking changes, and mssql-rs repo conventions.
+description: Review a pull request, diff, or set of proposed changes in microsoft/mssql-rs — from a GitHub PR link, a PR number, or local staged/unstaged changes. Use whenever the user asks to review a PR, asks for feedback on a diff, or asks whether changes are ready to merge. Covers correctness, security, tests, readability, performance, API/breaking changes, and mssql-rs repo conventions.
 ---
 
 # Pull Request Review
@@ -36,28 +36,17 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    git diff --stat $BASE..HEAD
    ```
 
-   For Azure DevOps repos, use the `repo_pull_request` tool with `action: get`.
 3. **Read what has already been said before writing anything.** PRs here routinely go
    through several rounds of author self-review plus a Copilot bot review, and many
    obvious findings are already raised, verified, and answered. Re-filing an answered
    thread as a new finding — especially at a higher severity — wastes the author's
    time and misranks the review.
 
-   **Establish the provider first.** GitHub and Azure DevOps number pull requests
-   independently, so running the GitHub recipe against an ADO PR number silently
-   reads an unrelated PR that happens to share the number. Branch on where the PR
-   actually lives.
-
-   *Azure DevOps:* read discussion with the `repo_pull_request_thread` tool
-   (`action: list`, then `list_comments` for a thread), and build results with the
-   `pipelines_build` tool. The rest of this step's reasoning applies unchanged; only
-   the transport differs.
-
-   *GitHub:* prior discussion is split across three endpoints and you need all three.
-   Listing reviewer *names* is not reading the reviews — a PR reporting nine reviews
-   tells you nothing about what any of them said, and treating that silence as
-   novelty is how an answered finding gets re-filed as blocking. Save the responses;
-   the symbol search below needs something to search.
+   Prior discussion is split across three endpoints and you need all three. Listing
+   reviewer *names* is not reading the reviews — a PR reporting nine reviews tells
+   you nothing about what any of them said, and treating that silence as novelty is
+   how an answered finding gets re-filed as blocking. Save the responses; the symbol
+   search below needs something to search.
 
    ```bash
    R=repos/microsoft/mssql-rs
@@ -103,7 +92,7 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    failures have been `certificate_validator` tests looking for
    `tests/test_certificates/*.pem`. Confirm rather than assume.)
 6. **Present the review in chat and wait for explicit human confirmation before
-   posting anything to GitHub or ADO.** Inline comments are drafted against
+   posting anything to GitHub.** Inline comments are drafted against
    `file:line`, not submitted, until they say so. Having the review fully written and
    the posting mechanics ready is not permission to post.
 
