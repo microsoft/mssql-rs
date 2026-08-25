@@ -214,11 +214,23 @@ unsafe fn sql_put_data_safe(
             return SQL_ERROR;
         }
         let c_type = {
-            let Ok(stmt_state) = stmt.inner.lock() else {
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLPutData: stmt mutex poisoned resolving current C type");
                 return SQL_ERROR;
             };
-            stmt_state.dae_current_c_type().unwrap_or_default()
+            // Sizing an SQL_NTS chunk needs the parameter's bound C type, and
+            // there is no safe default: 0 is not "unknown" but a value that
+            // scans the buffer for a single terminating byte, so a lost
+            // SQL_C_WCHAR binding would silently stream one byte of a wide
+            // string. A binding can vanish under SQLFreeStmt(SQL_RESET_PARAMS);
+            // a driver manager rejects that in the Need Data state, but this
+            // driver is also loaded directly, so refuse rather than guess.
+            let Some(c_type) = stmt_state.dae_current_c_type() else {
+                error!("SQLPutData: open data-at-execution parameter has no binding");
+                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            };
+            c_type
         };
         unsafe { nts_byte_count(data_ptr, c_type) }
     } else if strlen_or_ind < 0 {
@@ -407,6 +419,55 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+    }
+
+    /// The hazard the missing-binding guard exists to prevent: a defaulted C
+    /// type of 0 is not "unknown", it takes the narrow branch. On a UTF-16
+    /// buffer the scan stops at the first zero byte, so `"AB"` measures 1 byte
+    /// instead of 4 and the rest of the string is dropped with no diagnostic.
+    /// `SQLPutData` must refuse the call rather than default the C type.
+    #[test]
+    fn nts_byte_count_narrows_a_wide_buffer_when_the_c_type_defaults() {
+        let wide: [u16; 3] = [0x0041, 0x0042, 0x0000];
+        let ptr = wide.as_ptr() as *mut std::ffi::c_void;
+        assert_eq!(unsafe { nts_byte_count(ptr, SQL_C_WCHAR) }, 4);
+        assert_eq!(unsafe { nts_byte_count(ptr, 0) }, 1);
+    }
+
+    /// A binding can disappear under an open sequence via
+    /// `SQLFreeStmt(SQL_RESET_PARAMS)`, leaving no C type to size `SQL_NTS`
+    /// with. The call is rejected instead of guessing.
+    ///
+    /// This asserts the outcome, not the branch: `for_test` parks no client, so
+    /// a sequence that got past the guard would post the same `HY010` when it
+    /// failed to check one out. The truncation the guard prevents is pinned by
+    /// `nts_byte_count_narrows_a_wide_buffer_when_the_c_type_defaults`.
+    #[test]
+    fn nts_without_a_binding_returns_hy010() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            // `open_dae` points at bound index 0, which was never bound.
+            state.dae = Some(open_dae(None));
+            assert!(state.dae_current_c_type().is_none());
+        }
+        let wide: [u16; 3] = [0x0041, 0x0042, 0x0000];
+        let ret = unsafe {
+            sql_put_data(
+                h.stmt,
+                wide.as_ptr() as *mut std::ffi::c_void,
+                SQL_NTS as SqlLen,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        assert_eq!(
+            state.dae.as_ref().unwrap().progress.bytes_sent,
+            0,
+            "a rejected call must not advance the parameter's byte total"
+        );
     }
 
     #[test]

@@ -376,8 +376,6 @@ mod tests {
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
-    /// Freeing a statement mid data-at-execution must hand the parked client
-    /// back to the connection. Dropping the handle with the client still
     /// Freeing a statement mid data-at-execution must drain the parked
     /// sequence rather than drop the handle with it intact. A dropped
     /// `DaeState` takes the connection's client with it, leaving the DBC with
@@ -386,7 +384,9 @@ mod tests {
     /// A unit test can only observe that the sequence is drained: returning the
     /// client to the DBC needs a real parked `TdsClient`, which `for_test`
     /// deliberately does not build. The connection-survives-free half is
-    /// covered live by `FreeStatementMidDataAtExecutionLeavesConnectionUsable`.
+    /// covered live by
+    /// `FreeStatementMidDataAtExecutionIsRejectedUntilCancelled`, which also
+    /// pins the driver-manager rejection this path only sees without a DM.
     #[test]
     fn free_stmt_mid_dae_drains_the_parked_sequence() {
         use crate::handles::stmt::DaeState;

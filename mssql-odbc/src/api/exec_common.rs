@@ -273,11 +273,22 @@ pub(super) struct ParamsWithDae {
     pub(super) dae_params: Vec<DaeParam>,
 }
 
+/// The byte total an application declared with `SQL_LEN_DATA_AT_EXEC(n)`, or
+/// `None` when it declared no total and the length is whatever gets streamed.
+///
+/// `SQL_LEN_DATA_AT_EXEC(0)` is "unspecified", not "must be empty": msodbcsql
+/// guards both of its length checks with `cbDAEDataTotal > 0`
+/// (`sqlccmd.cpp:4548` per-put, `sqlccmd.cpp:6010` at close) and treats a zero
+/// total the same as `NO_PARAM_LENGTH` (`sqlccmd.cpp:4160`). Folding it into
+/// `None` here keeps that behaviour instead of rejecting the first byte with
+/// `22026`.
 fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
     if indicator == SQL_DATA_AT_EXEC {
-        None
-    } else {
-        Some((SQL_LEN_DATA_AT_EXEC_OFFSET - indicator) as usize)
+        return None;
+    }
+    match (SQL_LEN_DATA_AT_EXEC_OFFSET - indicator) as usize {
+        0 => None,
+        n => Some(n),
     }
 }
 
@@ -487,6 +498,17 @@ mod tests {
     // The success path of `try_claim_idle_client` needs a real `TdsClient`,
     // which unit tests can't construct; these cover the guard branches (each
     // returns `None` without claiming `active_stmt`).
+
+    /// `SQL_LEN_DATA_AT_EXEC(0)` declares no total rather than an empty value,
+    /// matching msodbcsql's `cbDAEDataTotal > 0` guards. Treating it as
+    /// `Some(0)` would reject the first byte with `22026`.
+    #[test]
+    fn dae_expected_length_treats_zero_as_unspecified() {
+        assert_eq!(dae_expected_length(SQL_DATA_AT_EXEC), None);
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
 
     #[test]
     fn try_claim_idle_client_none_when_disconnected() {
