@@ -93,6 +93,10 @@ macro_rules! define_tds_packet_reader {
                 buffer: &mut [u8],
             ) -> impl Future<Output = TdsResult<usize>> + Send;
             /// Fills a possibly-uninitialized byte buffer.
+            ///
+            /// On `Ok(n)`, the first `n` elements of `buffer` are initialized.
+            /// Callers rely on this to `set_len` an owned buffer, so an
+            /// implementation must not report bytes it did not write.
             fn read_bytes_uninit(
                 &mut self,
                 buffer: &mut [MaybeUninit<u8>],
