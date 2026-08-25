@@ -213,6 +213,18 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
         super::close_cursor::drain_and_release(stmt, handle);
     }
 
+    // A statement freed mid data-at-execution still owns the connection's
+    // client, parked inside `DaeState`. Dropping the handle with it parked
+    // would strand the client and leave the DBC recording the freed statement
+    // as busy, so the connection could never be used again. `unwind_dae`
+    // discards the half-written request, returns the client to the DBC, and
+    // restores `prepared` / `pending_unprepare` — so the unprepare below then
+    // releases the plan exactly as it would for any other statement.
+    let needs_data = stmt.inner.lock().map(|s| s.needs_data()).unwrap_or(false);
+    if needs_data {
+        super::exec_common::unwind_dae(dbc, stmt, handle, None);
+    }
+
     let (prepared, pending) = match stmt.inner.lock() {
         Ok(mut stmt_state) => (
             stmt_state.prepared.take().map(|p| p.stmt),
@@ -360,6 +372,46 @@ mod tests {
         let ret = unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
         assert_eq!(ret, SQL_SUCCESS);
 
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    /// Freeing a statement mid data-at-execution must hand the parked client
+    /// back to the connection. Dropping the handle with the client still
+    /// Freeing a statement mid data-at-execution must drain the parked
+    /// sequence rather than drop the handle with it intact. A dropped
+    /// `DaeState` takes the connection's client with it, leaving the DBC with
+    /// no client and `active_stmt` pointing at freed memory.
+    ///
+    /// A unit test can only observe that the sequence is drained: returning the
+    /// client to the DBC needs a real parked `TdsClient`, which `for_test`
+    /// deliberately does not build. The connection-survives-free half is
+    /// covered live by `FreeStatementMidDataAtExecutionLeavesConnectionUsable`.
+    #[test]
+    fn free_stmt_mid_dae_drains_the_parked_sequence() {
+        use crate::handles::stmt::DaeState;
+
+        let (env, dbc) = alloc_env_dbc();
+        let mut stmt: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
+            SQL_SUCCESS
+        );
+
+        let stmt_ref = unsafe { &*(stmt as *const StmtHandle) };
+        stmt_ref.inner.lock().unwrap().dae = Some(DaeState::for_test(Vec::new(), None));
+
+        best_effort_unprepare_on_free(stmt, stmt_ref, unsafe { &*(dbc as *const DbcHandle) });
+
+        assert!(
+            !stmt_ref.inner.lock().unwrap().needs_data(),
+            "the parked sequence must be unwound before the handle is dropped"
+        );
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) },
+            SQL_SUCCESS
+        );
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }

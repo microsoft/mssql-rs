@@ -10426,8 +10426,18 @@ mod tests {
     #[tokio::test]
     async fn cancel_streamed_write_rearms_an_unsent_connection_reset() {
         use crate::message::messages::PacketStatusFlags;
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
 
-        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        // The request that ends up carrying the re-armed bit must see the
+        // server acknowledge it, or the client declares the session dirty and
+        // fails it - see `observe_response_token`.
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
         let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
         let mut orphaned = None;
 

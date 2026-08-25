@@ -151,6 +151,7 @@ pub(crate) unsafe fn bound_param_to_value(
         AppValue::WideText(bytes) => {
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
+        AppValue::Binary(bytes) => SqlType::VarBinaryMax(Some(bytes)),
     };
 
     Ok((value, None))
@@ -174,6 +175,7 @@ pub(crate) fn dae_placeholder_type(
         other => Err(ParamBuildError::UnsupportedCType(other)),
     }
 }
+
 /// Emits the integer `SqlType` named by `ParameterType`, not by the C type, so
 /// `@P1` is declared as the application asked. A value outside the target's
 /// range is `22003` rather than a silently wrapped wire value.
@@ -383,9 +385,9 @@ fn vector_metadata(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_FLOAT, SQL_C_LONG, SQL_C_SLONG, SQL_C_STINYINT, SQL_C_UBIGINT,
-        SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS, SQL_NULL_DATA,
-        SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
+        SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_FLOAT, SQL_C_LONG, SQL_C_SLONG, SQL_C_STINYINT,
+        SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS,
+        SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
     };
     use crate::params::conversion_matrix::is_supported_conversion;
     use std::ffi::c_void;
@@ -414,6 +416,15 @@ mod tests {
     fn default_param(sql_type: SqlSmallInt, ind: *mut SqlLen) -> BoundParam {
         let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), ind);
         p.sql_type = sql_type;
+        p
+    }
+
+    /// A `SQL_C_BINARY` binding. `ParameterType` is carried because a NULL is
+    /// typed from it alone - the C type says only how a value buffer would have
+    /// been read, and a NULL has no buffer.
+    fn binary_param(ptr: *mut c_void, ind: *mut SqlLen) -> BoundParam {
+        let mut p = param(SQL_C_BINARY, ptr, ind);
+        p.sql_type = SQL_VARBINARY;
         p
     }
 
@@ -593,7 +604,7 @@ mod tests {
     fn binary_with_indicator_length_becomes_varbinary() {
         let mut buf: Vec<u8> = vec![0x01, 0x00, 0xFF, 0x7E];
         let mut ind: SqlLen = 4;
-        let p = param(SQL_C_BINARY, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let p = binary_param(buf.as_mut_ptr() as *mut c_void, &mut ind);
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::VarBinaryMax(Some(b)) => assert_eq!(b, vec![0x01, 0x00, 0xFF, 0x7E]),
@@ -606,11 +617,7 @@ mod tests {
     #[test]
     fn binary_without_indicator_uses_buffer_length() {
         let mut buf: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let mut p = param(
-            SQL_C_BINARY,
-            buf.as_mut_ptr() as *mut c_void,
-            std::ptr::null_mut(),
-        );
+        let mut p = binary_param(buf.as_mut_ptr() as *mut c_void, std::ptr::null_mut());
         p.buffer_length = 2;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
@@ -622,7 +629,7 @@ mod tests {
     #[test]
     fn binary_null_indicator_becomes_typed_null() {
         let mut ind: SqlLen = SQL_NULL_DATA;
-        let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut ind);
+        let p = binary_param(std::ptr::null_mut(), &mut ind);
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::VarBinaryMax(None)));
     }
@@ -633,7 +640,7 @@ mod tests {
     fn binary_zero_length_becomes_empty_varbinary() {
         let mut buf: Vec<u8> = vec![0xDE, 0xAD];
         let mut ind: SqlLen = 0;
-        let p = param(SQL_C_BINARY, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let p = binary_param(buf.as_mut_ptr() as *mut c_void, &mut ind);
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::VarBinaryMax(Some(b)) => assert!(b.is_empty()),
@@ -647,7 +654,7 @@ mod tests {
     fn binary_nts_with_negative_buffer_length_is_rejected() {
         let mut buf: Vec<u8> = vec![0x01, 0x02];
         let mut ind: SqlLen = SQL_NTS as SqlLen;
-        let mut p = param(SQL_C_BINARY, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let mut p = binary_param(buf.as_mut_ptr() as *mut c_void, &mut ind);
         p.buffer_length = -1;
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
         assert!(matches!(err, ParamBuildError::InvalidLength(-1)));

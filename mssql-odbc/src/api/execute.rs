@@ -253,6 +253,19 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     };
     free_errors(&mut stmt_state);
 
+    // A statement awaiting data-at-execution input is in the ODBC "Need Data"
+    // state, where every function other than SQLPutData/SQLParamData/SQLCancel
+    // and the diagnostic calls is a sequence error rather than a cursor error.
+    //
+    // Checked before the prepared-plan guard below: parking a DAE sequence
+    // moves the plan into `DaeState`, so a statement in Need Data has
+    // `prepared == None` and would otherwise be reported as never prepared.
+    if stmt_state.needs_data() {
+        error!("SQLExecute: statement is awaiting data-at-execution input");
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return Err(SQL_ERROR);
+    }
+
     // SQLExecute on an unprepared statement is HY010 — a DM-enforced
     // precondition (the spec marks it "(DM)"), so assert rather than post.
     // The release-path fallback still returns SQL_ERROR since we have no SQL
@@ -263,15 +276,6 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     );
     if stmt_state.prepared.is_none() {
         error!("SQLExecute: statement has not been prepared");
-        return Err(SQL_ERROR);
-    }
-
-    // A statement awaiting data-at-execution input is in the ODBC "Need Data"
-    // state, where every function other than SQLPutData/SQLParamData/SQLCancel
-    // and the diagnostic calls is a sequence error rather than a cursor error.
-    if stmt_state.needs_data() {
-        error!("SQLExecute: statement is awaiting data-at-execution input");
-        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
         return Err(SQL_ERROR);
     }
 
@@ -402,12 +406,15 @@ mod tests {
         // In the Need Data state the spec requires HY010, not the 24000 that a
         // merely-busy statement gets.
         let h = TestHandles::with_env_dbc_stmt();
-        set_prepared(h.stmt, "SELECT ?");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
+            // Exactly what `park_dae_client` leaves behind: the prepared plan
+            // moves into `DaeState`, so the statement is Need Data *and*
+            // `prepared == None`.
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_EXEC_STARTED);
             state.dae = Some(crate::handles::stmt::DaeState::for_test(Vec::new(), None));
+            assert!(state.prepared.is_none());
         }
         let ret = unsafe { sql_execute(h.stmt) };
         assert_eq!(ret, SQL_ERROR);

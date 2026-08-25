@@ -33,6 +33,8 @@ pub(crate) enum AppValue {
     NarrowText(Vec<u8>),
     /// `SQL_C_WCHAR` data, as UTF-16LE bytes.
     WideText(Vec<u8>),
+    /// `SQL_C_BINARY` bytes, as supplied.
+    Binary(Vec<u8>),
 }
 
 /// Whether `StrLen_or_Ind` carries a length for this C type.
@@ -114,6 +116,7 @@ pub(crate) unsafe fn read_param_value(
         SQL_C_WCHAR => Ok(AppValue::WideText(unsafe {
             read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec)
         })),
+        SQL_C_BINARY => unsafe { read_binary_bytes(param, len_spec) }.map(AppValue::Binary),
         other => {
             let effective = effective_param_c_type(other, param.sql_type);
             unsafe { read_integer(param.parameter_value_ptr, effective) }
@@ -177,6 +180,42 @@ unsafe fn read_char_bytes(ptr: *const u8, len_spec: SqlLen) -> Vec<u8> {
         len_spec.max(0) as usize
     };
     unsafe { slice::from_raw_parts(ptr, len).to_vec() }
+}
+
+/// Reads raw (`SQL_C_BINARY`) bytes.
+///
+/// Binary buffers have no terminator, so the length must be stated. `len_spec`
+/// is the indicator value when the application supplied an indicator pointer;
+/// `SQL_NTS` here means it did not, and the ODBC contract falls back to
+/// `BufferLength`. A binding that states neither has no readable extent, so it
+/// is rejected rather than guessed at.
+///
+/// # Safety
+/// `param.parameter_value_ptr` must be readable for the resolved byte count;
+/// `read_param_value` has already rejected a null buffer.
+unsafe fn read_binary_bytes(
+    param: &BoundParam,
+    len_spec: SqlLen,
+) -> Result<Vec<u8>, ParamBuildError> {
+    debug_assert!(
+        !param.parameter_value_ptr.is_null(),
+        "read_param_value rejects a null buffer"
+    );
+    let len = if len_spec == SQL_NTS as SqlLen {
+        if param.buffer_length < 0 {
+            return Err(ParamBuildError::InvalidLength(param.buffer_length));
+        }
+        param.buffer_length
+    } else {
+        len_spec
+    };
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(
+        unsafe { slice::from_raw_parts(param.parameter_value_ptr as *const u8, len as usize) }
+            .to_vec(),
+    )
 }
 
 /// Reads wide (`SQL_C_WCHAR`) data as UTF-16LE bytes. `len_spec` is a **byte**

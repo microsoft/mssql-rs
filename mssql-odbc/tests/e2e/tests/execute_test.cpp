@@ -301,6 +301,63 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionKeepsStatementPreparedAcrossExecut
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Streamed parameters are reordered on the wire -- bound values are
+// materialized first and the streamed one goes last -- so the server must still
+// resolve each `@Pn` to the position the application bound it at.
+//
+// This is the sp_execute route specifically. The sp_prepexec route carries an
+// `@params` declaration string on every call, so the names are re-stated with
+// the request; a cached plan carries no declaration at all, and name binding
+// runs against what the server recorded at prepare time. Streaming @P2 of three
+// parameters puts a value the application bound in the middle at the end of the
+// wire order, and an asymmetric expression makes any misresolution change the
+// result rather than cancel out.
+//
+// Executed twice: the first call prepares (sp_prepexec), only the second runs
+// against the cached handle, which is the case under test.
+TEST_F(PrepareExecuteLiveTest, DataAtExecutionKeepsParamOrderOnCachedPlan) {
+    ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    char first[] = "A";
+    char third[] = "C";
+    SQLLEN first_ind = SQL_NTS;
+    SQLLEN third_ind = SQL_NTS;
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    std::vector<SQLCHAR> streamed(16, 0);
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, first, sizeof(first),
+                                   &first_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, streamed.data(),
+                                   static_cast<SQLLEN>(streamed.size()),
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, third, sizeof(third),
+                                   &third_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    for (int pass = 0; pass < 2; ++pass) {
+        SCOPED_TRACE(pass == 0 ? "sp_prepexec" : "sp_execute (cached plan)");
+        streamed_ind = SQL_DATA_AT_EXEC;
+
+        SQLPOINTER value_ptr = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+        ASSERT_EQ(streamed.data(), static_cast<SQLCHAR*>(value_ptr));
+        const char middle[] = "B";
+        ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(middle), 1),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("ABC", GetColumnChar(1));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
 // Binary data-at-execution streams raw bytes as varbinary(max), including NUL
 // bytes, matching msodbcsql SQLPutData behavior for SQL_C_BINARY.
 // Benefits-from-mock-tds: the hex round trip proves only the reassembled value.
@@ -1240,6 +1297,63 @@ TEST_F(PrepareExecuteLiveTest, FreeWithOpenCursorReleasesHandleAndKeepsConnectio
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("8", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SQLFreeHandle is illegal while a statement sits in the Need Data state: the
+// Driver Manager rejects it with HY010 and the handle stays valid, so an
+// application cannot abandon a statement mid-sequence. SQLCancel is the
+// sanctioned way out -- it discards the half-written request and hands the
+// connection's TDS client back -- after which the free succeeds and the
+// connection is reusable. Uses a private statement so the fixture's stmt_
+// teardown is unaffected.
+//
+// The driver-side teardown this exercises is also wired into SQLFreeHandle
+// itself, for the case where the driver is linked directly with no Driver
+// Manager in front of it to enforce the rule; that path is covered by the
+// free_stmt_mid_dae_drains_the_parked_sequence unit test.
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the half-written RPC
+// was retracted (attention or IGNORE) rather than left dangling, which the
+// healthy-connection outcome only implies.
+TEST_F(PrepareExecuteLiveTest,
+       FreeStatementMidDataAtExecutionIsRejectedUntilCancelled) {
+    SQLHSTMT s = SQL_NULL_HSTMT;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &s));
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT ? AS v");
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLPrepare(s, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+
+    std::vector<SQLCHAR> buffer(16, 0);
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLBindParameter(s, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+                               0, 0, buffer.data(),
+                               static_cast<SQLLEN>(buffer.size()), &ind));
+
+    // Suspend the statement mid-sequence: the client is parked and the first
+    // chunk is already on the wire, so the request is half-written.
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(s));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(s, &value_ptr));
+    const char chunk[] = "partial";
+    ASSERT_EQ(SQL_SUCCESS, SQLPutData(s, const_cast<char*>(chunk), 7));
+
+    // Free without ever completing the sequence: rejected, handle still valid.
+    EXPECT_EQ(SQL_ERROR, SQLFreeHandle(SQL_HANDLE_STMT, s));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, s, "HY010");
+
+    // SQLCancel unwinds the parked sequence and returns the client, so the
+    // statement is now an ordinary idle handle that frees cleanly.
+    ASSERT_SQL_OK(SQLCancel(s), SQL_HANDLE_STMT, s);
+    ASSERT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, s));
+
+    // The connection is still healthy: a fresh statement executes normally.
+    ASSERT_SQL_OK(Prepare("SELECT 9 AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("9", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
