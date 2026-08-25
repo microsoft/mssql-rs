@@ -276,11 +276,11 @@ fn fill_rowset(
             debug!("SQLFetchScroll: SQL_ATTR_MAX_ROWS reached; returning SQL_NO_DATA");
             return SQL_NO_DATA;
         }
-        if stmt_state.max_rows == 0 {
-            row_array_size
-        } else {
-            row_array_size.min(stmt_state.max_rows - stmt_state.rows_returned)
-        }
+        row_budget(
+            stmt_state.max_rows,
+            stmt_state.rows_returned,
+            row_array_size,
+        )
     };
 
     let dbc = stmt.parent_dbc();
@@ -499,6 +499,19 @@ fn fill_rowset(
         return SQL_SUCCESS_WITH_INFO;
     }
     SQL_SUCCESS
+}
+
+/// How many rows this fetch may deliver.
+///
+/// `SQL_ATTR_MAX_ROWS = 0` is the ODBC default and means unlimited, so the whole
+/// rowset is available. Otherwise the cap is a row budget rather than a rowset
+/// boundary: measured against msodbcsql, a cap of 5 under a rowset of 4 yields
+/// 4 rows and then a *partial* rowset of 1, not two full rowsets or one.
+fn row_budget(max_rows: SqlULen, rows_returned: SqlULen, row_array_size: SqlULen) -> SqlULen {
+    if max_rows == 0 {
+        return row_array_size;
+    }
+    row_array_size.min(max_rows.saturating_sub(rows_returned))
 }
 
 /// Writes `SQL_ROW_NOROW` into the unused tail of the row status array.
@@ -808,6 +821,27 @@ mod tests {
             dbc_state.active_stmt, None,
             "the fetch reached the client rather than being cut off"
         );
+    }
+
+    /// The cap truncates a rowset rather than rounding to a rowset boundary.
+    /// Measured against msodbcsql: a cap of 5 with `SQL_ATTR_ROW_ARRAY_SIZE = 4`
+    /// over a 20-row result yields 4 rows, then 1, then SQL_NO_DATA.
+    #[test]
+    fn the_cap_truncates_a_rowset_rather_than_rounding_it() {
+        // Unlimited leaves the whole rowset available however many rows have
+        // already gone out.
+        assert_eq!(row_budget(0, 1000, 4), 4);
+        // Well inside the cap the rowset is untouched.
+        assert_eq!(row_budget(20, 0, 4), 4);
+        assert_eq!(row_budget(8, 4, 4), 4);
+        // The cap lands inside the rowset, so the fetch is cut short.
+        assert_eq!(row_budget(5, 4, 4), 1);
+        assert_eq!(row_budget(6, 4, 4), 2);
+        assert_eq!(row_budget(3, 0, 4), 3);
+        // A cap already spent yields nothing; `max_rows_reached` short-circuits
+        // before this, so the budget only has to stay total, not underflow.
+        assert_eq!(row_budget(5, 5, 4), 0);
+        assert_eq!(row_budget(5, 9, 4), 0);
     }
 
     /// The cap is per result set, so advancing onto a new one must restart the
