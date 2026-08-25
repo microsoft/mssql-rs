@@ -10,8 +10,9 @@ affected code — do not critique pre-existing code outside the PR's scope.
 
 Every concrete number, constant, and known-failure list below is a dated observation,
 not a standing truth. Prefer the command that re-derives a fact over the value written
-here. If what you observe contradicts this file, trust the observation and say so in
-your summary so the file gets corrected.
+here. If what you observe contradicts this file, trust the observation and report the
+drift separately — an issue or PR against this skill, not the summary of whatever PR
+you happen to be reviewing. Skill maintenance is not that author's problem.
 
 ## Process
 
@@ -27,6 +28,7 @@ your summary so the file gets corrected.
 
    ```bash
    gh pr view <url-or-number> --json title,body,author,state,isDraft,baseRefName,headRefName,additions,deletions,changedFiles,commits
+   git fetch origin main                       # `origin/main` below must be current
    git fetch origin pull/<N>/head:pr<N>-review
    git worktree add ../mssql-rs-pr<N>-review pr<N>-review
    cd ../mssql-rs-pr<N>-review
@@ -41,19 +43,30 @@ your summary so the file gets corrected.
    thread as a new finding — especially at a higher severity — wastes the author's
    time and misranks the review.
 
-   Prior discussion is split across three endpoints and you need all three. Listing
-   reviewer *names* is not reading the reviews — a PR reporting nine reviews tells you
-   nothing about what any of them said, and treating that silence as novelty is how an
-   answered finding gets re-filed as blocking.
+   **Establish the provider first.** GitHub and Azure DevOps number pull requests
+   independently, so running the GitHub recipe against an ADO PR number silently
+   reads an unrelated PR that happens to share the number. Branch on where the PR
+   actually lives.
+
+   *Azure DevOps:* read discussion with the `repo_pull_request_thread` tool
+   (`action: list`, then `list_comments` for a thread), and build results with the
+   `pipelines_build` tool. The rest of this step's reasoning applies unchanged; only
+   the transport differs.
+
+   *GitHub:* prior discussion is split across three endpoints and you need all three.
+   Listing reviewer *names* is not reading the reviews — a PR reporting nine reviews
+   tells you nothing about what any of them said, and treating that silence as
+   novelty is how an answered finding gets re-filed as blocking. Save the responses;
+   the symbol search below needs something to search.
 
    ```bash
    R=repos/microsoft/mssql-rs
    gh api --paginate $R/pulls/<N>/comments \
-     -q '.[] | "--- \(.user.login) \(.path):\(.line)\n\(.body)"'   # inline threads
+     -q '.[] | "--- \(.user.login) \(.path):\(.line)\n\(.body)"' > /tmp/pr<N>-inline.txt
    gh api --paginate $R/pulls/<N>/reviews \
-     -q '.[] | "--- \(.user.login) \(.state)\n\(.body)"'           # review bodies
+     -q '.[] | "--- \(.user.login) \(.state)\n\(.body)"'          > /tmp/pr<N>-reviews.txt
    gh api --paginate $R/issues/<N>/comments \
-     -q '.[] | "--- \(.user.login)\n\(.body)"'                     # PR-level replies
+     -q '.[] | "--- \(.user.login)\n\(.body)"'                    > /tmp/pr<N>-toplevel.txt
    gh pr checks <N>
    ```
 
@@ -63,20 +76,23 @@ your summary so the file gets corrected.
    one is usually a PR-level comment. Read only the inline threads and both halves of
    that exchange are invisible.
 
-   Then, before drafting each finding, grep what you pulled for the symbol it
-   concerns. One search for a name like `mark_known_dead` surfaces the thread that
-   already settled it, far cheaper than re-reading the whole history.
+   Then, before drafting each finding, grep those files for the symbol it concerns.
+   One search for a name like `mark_known_dead` surfaces the thread that already
+   settled it, far cheaper than re-reading the whole history.
 
-   The issue comments include the automated **Code Coverage Report** — read it before
-   writing any coverage finding (see "Verify Before You Claim").
+   *If* an automated **Code Coverage Report** comment is present, read it before
+   writing any coverage finding (see "Verify Before You Claim"). Its absence is
+   usually expected rather than a CI failure — see the same section.
 4. Verify claims against the actual code — do not assume. Read surrounding code when
    a change's correctness depends on context: callers of changed functions,
    implementers of changed traits, and the layer above and below the change.
 5. Run the suite yourself rather than trusting the checklist. The runner is
-   `cargo nextest` / `cargo btest`, never `cargo test`.
+   `cargo nextest` / `cargo btest`, never `cargo test`. Pick the crate and targets the
+   diff actually touches — a `-p mssql-tds --lib` run validates nothing in a PR
+   confined to `mssql-odbc`, the JS or Python bindings, or the e2e suites.
 
    ```bash
-   cargo nextest run -p mssql-tds --lib --no-fail-fast
+   cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
    ```
 
    Some tests fail on a clean tree because their fixtures aren't generated locally, so
@@ -117,9 +133,8 @@ Evaluate each area. Skip areas that don't apply rather than padding the review.
   boundaries. Unsafe defaults.
 - **Tests**: New/changed behavior has tests. Tests assert real behavior (not
   tautologies). Edge cases and failure paths covered. Flag untested risky changes.
-  CI reports a diff-coverage number on the PR — read that comment for the current
-  target and whether it is enforced, rather than computing one locally (see "Verify
-  Before You Claim").
+  When CI posts a diff-coverage comment, read it for the current target and whether
+  it is enforced rather than computing one locally (see "Verify Before You Claim").
 - **Readability & maintainability**: Clear naming, reasonable function size, no
   needless complexity or duplication, comments explain *why* not *what*.
 - **Performance**: N+1 queries, lock contention and lock scope, memory copies,
@@ -184,9 +199,10 @@ the rule exists and do not need re-deriving. Last reviewed 2026-08.
   - Cite the msodbcsql file and line, or ask as a question. Never assert parity from
     the spec.
   - **Read the caller, not just the table or validator.** msodbcsql normalizes on
-    entry, so a validator read in isolation misleads — one finding claimed a dead
-    `HYC00` arm was reachable because `SQLBindParameter` folds `SQL_DOUBLE` to
-    `SQL_FLOAT` *before* calling it. That one was retracted by its own author.
+    entry, so a validator read in isolation misleads. One finding called an `HYC00`
+    arm reachable after reading the validator alone; `SQLBindParameter` folds
+    `SQL_DOUBLE` to `SQL_FLOAT` *before* calling it, which is what makes that arm
+    dead. Retracted by its own author.
 - **A test that still passes when you break the thing it names guards nothing.** The
   most common defect in this repo's *tests*, and the cheapest to check: mutate the
   constant, operator or condition the change is about and confirm the test fails.
@@ -198,10 +214,16 @@ the rule exists and do not need re-deriving. Last reviewed 2026-08.
   redaction test whose secret rendered as `[171, 171, 171, 171]` and was never
   asserted against. Also check whether it passes on `$BASE` — a cursor the fix was
   meant to sweep had already been swept by the setup.
-- **Coverage**: read the automated "Code Coverage Report" comment on the PR. A local
-  `cargo llvm-cov --lib` badly understates the CI number for `mssql-odbc`, because CI
-  merges the cross-repo `mssql-python` suite into it — one PR measured 83.9% locally
-  and 97% in CI. The report also says diff coverage is *reported, not enforced*.
+- **Coverage**: when the automated "Code Coverage Report" comment is present, read it
+  rather than computing your own. A local `cargo llvm-cov --lib` badly understates the
+  CI number for `mssql-odbc`, because CI merges the cross-repo `mssql-python` suite
+  into it — one PR measured 83.9% locally and 97% in CI. The report also says diff
+  coverage is *reported, not enforced*.
+  - **Its absence is usually expected, not a CI failure.** `pr-code-coverage.yml`
+    mirrors the ADO path excludes, so a PR touching only `.github/**`, `docs/**`,
+    `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` or
+    `es-metadata.yml` never generates one; fork PRs need a maintainer to comment
+    `/coverage`. Read the workflow's `paths-ignore` before reporting a missing report.
 - **Coverage gaps**: don't assert one, prove it. Introduce the bug the missing test
   would catch, run `cargo nextest run -p mssql-tds --lib --no-fail-fast`, show the
   suite still passes, then restore. Costs about two minutes and converts a concern
@@ -274,7 +296,7 @@ When handed findings from a bot or another agent, adjudicate rather than forward
 Only after explicit confirmation, or under the automation carve-out in step 6.
 The mechanics that otherwise fail silently — inline comments needing the API rather
 than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
-[posting.md](posting.md).
+[posting.md](./posting.md).
 
 ## Output Format
 

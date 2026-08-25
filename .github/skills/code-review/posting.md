@@ -22,10 +22,11 @@ only once posting has been authorized.
   ```
 
 - Inline comments must land on lines present in the diff or the API returns 422.
-  A hunk header `@@ -115,21 +143,206 @@` means the new-side range starts at 143;
-  lines before it are not in the diff even if they look adjacent in the file. Check
-  with `git diff $BASE..HEAD -- <file> | grep -n '^@@'`. Findings on unchanged lines
-  belong in the top-level body.
+  A hunk header `@@ -115,21 +143,206 @@` means that hunk covers new-side lines
+  143-348; a line outside it is only anchorable if some *other* hunk covers it. Check
+  the full set with `git diff $BASE..HEAD -- <file> | grep -n '^@@'` rather than
+  reasoning from the nearest one. Findings on lines no hunk covers belong in the
+  top-level body.
 - On your own PR, `COMMENT` reviews with inline comments are allowed — only `APPROVE`
   and `REQUEST_CHANGES` are blocked. Don't downgrade to a single top-level comment.
 - Verify what landed; the comments endpoint pages at 30, so a fresh review looks
