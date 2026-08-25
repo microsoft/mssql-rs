@@ -800,10 +800,9 @@ where
                     2 => reader.read_uint16().await? as usize,
                     4 => reader.read_int32().await? as usize,
                     _ => {
-                        unreachable!(
-                            "Invalid tds length {:?} for type: {:?}",
-                            len_byte_count, data_type
-                        )
+                        return Err(Error::ProtocolError(format!(
+                            "Invalid TDS length byte count {len_byte_count} for type: {data_type:?}"
+                        )));
                     }
                 };
                 let precision = reader.read_byte().await?;
@@ -883,44 +882,37 @@ where
         };
 
         // At this point, it is possible that we have a data type which could be PLP
-        // Check if the data type matches the PLP types, and if so, convert it to PLP
+        // Check if the data type matches the PLP types, and if so, convert it to PLP.
+        // Only an unknown length from the earlier metadata (0xFFFF) makes it PLP.
         match data_type {
-            TdsDataType::BigVarChar | TdsDataType::BigVarBinary | TdsDataType::NVarChar => {
-                let plp_type = PartialLengthType::try_from(data_type);
-                // Only if the length from earlier metadata is unknown (0xFFFF), then
-                // we can convert it to a PLP type.
-                if type_info.length == 0xFFFF {
-                    let info = match type_info.type_info_variant {
-                        TypeInfoVariant::VarLenString(_, _, collation) => Ok(TypeInfo {
-                            tds_type: data_type,
-                            length: type_info.length,
-                            type_info_variant: TypeInfoVariant::PartialLen(
-                                plp_type.unwrap(),
-                                Some(type_info.length),
-                                collation,
-                                None,
-                                None,
-                            ),
-                        }),
-                        TypeInfoVariant::VarLen(_, _) => Ok(TypeInfo {
-                            tds_type: data_type,
-                            length: type_info.length,
-                            type_info_variant: TypeInfoVariant::PartialLen(
-                                plp_type.unwrap(),
-                                Some(type_info.length),
-                                None,
-                                None,
-                                None,
-                            ),
-                        }),
-                        _ => {
-                            unreachable!("Other PLP types apart from strings are not handled.");
-                        }
-                    };
-                    return info;
-                } else {
-                    return Ok(type_info);
-                }
+            TdsDataType::BigVarChar | TdsDataType::BigVarBinary | TdsDataType::NVarChar
+                if type_info.length == 0xFFFF =>
+            {
+                let plp_type = PartialLengthType::try_from(data_type).map_err(|_| {
+                    Error::ProtocolError(format!(
+                        "Data type {data_type:?} reported an unknown length (0xFFFF) but has no partial-length form"
+                    ))
+                })?;
+                let collation = match type_info.type_info_variant {
+                    TypeInfoVariant::VarLenString(_, _, collation) => collation,
+                    TypeInfoVariant::VarLen(_, _) => None,
+                    other => {
+                        return Err(Error::ProtocolError(format!(
+                            "Data type {data_type:?} reported an unknown length (0xFFFF) with unsupported type info {other:?}"
+                        )));
+                    }
+                };
+                return Ok(TypeInfo {
+                    tds_type: data_type,
+                    length: type_info.length,
+                    type_info_variant: TypeInfoVariant::PartialLen(
+                        plp_type,
+                        Some(type_info.length),
+                        collation,
+                        None,
+                        None,
+                    ),
+                });
             }
             _ => return Ok(type_info),
         }

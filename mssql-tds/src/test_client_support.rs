@@ -356,6 +356,7 @@ pub(crate) mod byte_stream {
         reader: MockReader,
         registry: crate::io::token_stream::GenericTokenParserRegistry,
         nbc_bitmap_scratch: Option<std::sync::Arc<[u8]>>,
+        known_dead: bool,
     }
 
     impl ByteStreamTransport {
@@ -364,6 +365,7 @@ pub(crate) mod byte_stream {
                 reader: MockReader::new(bytes),
                 registry: crate::io::token_stream::GenericTokenParserRegistry::default(),
                 nbc_bitmap_scratch: None,
+                known_dead: false,
             }
         }
     }
@@ -505,6 +507,12 @@ pub(crate) mod byte_stream {
         }
         fn is_connection_dead(&self) -> bool {
             false
+        }
+        fn connection_known_dead(&self) -> bool {
+            self.known_dead
+        }
+        fn mark_known_dead(&mut self) {
+            self.known_dead = true;
         }
     }
 
