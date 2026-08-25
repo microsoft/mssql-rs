@@ -69,6 +69,7 @@
 
 #include <cstring>
 #include <functional>
+#include <vector>
 #include <string>
 
 #ifndef SQL_ATTR_CURRENT_CATALOG
@@ -1198,4 +1199,68 @@ TEST_F(AttributesTest, ParamBindOffsetShiftsTheBoundBuffers) {
         SQLCloseCursor(stmt_);
         SQLFreeStmt(stmt_, SQL_RESET_PARAMS);
     }
+}
+
+// -------------------------------------------------------------------
+// 47. MAX_ROWS truncates a rowset rather than rounding it.
+//
+// SQL_ATTR_MAX_ROWS was measured against single-row fetches, which leaves
+// open whether the cap is a row budget or a rowset boundary. Measured on
+// msodbcsql it is a budget: a cap of 5 under SQL_ATTR_ROW_ARRAY_SIZE = 4
+// returns 4 rows and then a partial rowset of 1. A driver that stopped on
+// the boundary instead would hand back either 8 rows or 4.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MaxRowsTruncatesARowsetRatherThanRoundingIt) {
+    constexpr SQLULEN kArraySize = 4;
+    SQLINTEGER values[kArraySize] = {};
+    SQLLEN indicators[kArraySize] = {};
+    SQLULEN fetched = 0;
+
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE, kArraySize));
+    EXPECT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(values[0]),
+                             indicators),
+                  SQL_HANDLE_STMT, stmt_);
+
+    const SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "SELECT TOP 20 ROW_NUMBER() OVER (ORDER BY object_id) AS n "
+        "FROM sys.objects");
+
+    struct Case {
+        SQLULEN cap;
+        std::vector<SQLULEN> rowsets;
+    };
+    const Case cases[] = {
+        {5, {4, 1}},   // the cap lands inside the second rowset
+        {6, {4, 2}},   //
+        {8, {4, 4}},   // and on a boundary it is simply two full rowsets
+        {3, {3}},      // a cap below one rowset truncates the first
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.cap);
+        EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, c.cap));
+        ASSERT_SQL_OK(
+            SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS),
+            SQL_HANDLE_STMT, stmt_);
+
+        SQLINTEGER next = 1;
+        for (SQLULEN expected : c.rowsets) {
+            fetched = 0;
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(expected, fetched);
+            // The rows are the next ones in order, so a short rowset is a
+            // truncation and not a skip.
+            for (SQLULEN i = 0; i < expected; ++i) {
+                EXPECT_EQ(next++, values[i]);
+            }
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+        SQLCloseCursor(stmt_);
+    }
+
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_MAX_ROWS, 0));
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE, 1));
 }
