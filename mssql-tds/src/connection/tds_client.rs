@@ -293,9 +293,11 @@ pub struct TdsClient {
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
     /// Per-statement affected-row counts captured (in order) from every counted
-    /// DONE token seen since the last COLMETADATA or command start. For a
-    /// pure-DML batch (`UPDATE; DELETE; INSERT`) this holds one entry per
-    /// statement so the ODBC layer can surface each as its own result set via
+    /// DONE token seen since the last COLMETADATA or command start, excluding
+    /// `SQLSELECT`-tagged counts (see
+    /// [`last_rows_affected`](Self::last_rows_affected)). For a pure-DML batch
+    /// (`UPDATE; DELETE; INSERT`) this holds one entry per statement so the ODBC
+    /// layer can surface each as its own result set via
     /// [`take_dml_result_counts`](Self::take_dml_result_counts).
     dml_result_counts: Vec<i64>,
 
@@ -945,10 +947,17 @@ impl TdsClient {
     /// Rows affected by the most recently executed statement.
     ///
     /// Returns the row count from the last DONE token that carried the
-    /// `DONE_COUNT` flag, or `-1` when no count is available (DDL,
-    /// `SET NOCOUNT ON`, a forward-only SELECT whose trailing DONE has not been
-    /// read, or before any statement has executed). This maps directly to the
-    /// value ODBC `SQLRowCount` reports.
+    /// `DONE_COUNT` flag **and** was not tagged with the `SQLSELECT` command,
+    /// or `-1` when no such count is available (DDL, `SET NOCOUNT ON`, a
+    /// forward-only SELECT whose trailing DONE has not been read, or before any
+    /// statement has executed). This maps directly to the value ODBC
+    /// `SQLRowCount` reports.
+    ///
+    /// The `SQLSELECT` exclusion exists because SQL Server sets `DONE_COUNT` on
+    /// variable assignment (`DECLARE @x int = 1`, `SET @x = 1`,
+    /// `SELECT @x = col FROM t`) while tagging it `SQLSELECT`; that count is not
+    /// an update count and neither msodbcsql nor .NET SqlClient reports it. See
+    /// the comment in `advance_to_result_boundary`.
     pub fn last_rows_affected(&self) -> i64 {
         self.last_rows_affected
     }
@@ -956,8 +965,10 @@ impl TdsClient {
     /// Drains the per-statement affected-row counts captured since the last
     /// COLMETADATA (or command start), in statement order. Used by the ODBC
     /// layer to surface each DML statement in a pure-DML batch as its own
-    /// result set. Returns an empty vec when the batch produced no counted DONE
-    /// (e.g. DDL, `SET NOCOUNT ON`).
+    /// result set. `SQLSELECT`-tagged counts are excluded, as for
+    /// [`last_rows_affected`](Self::last_rows_affected). Returns an empty vec
+    /// when the batch produced no qualifying counted DONE (e.g. DDL,
+    /// `SET NOCOUNT ON`, or only variable assignments).
     pub fn take_dml_result_counts(&mut self) -> Vec<i64> {
         std::mem::take(&mut self.dml_result_counts)
     }
@@ -5819,11 +5830,15 @@ pub enum StatementResult {
     Rows,
     /// A statement that produced no result set but is still individually
     /// navigable. `rows_affected` is `Some(n)` when the statement's DONE token
-    /// carried a row count (DML), or `None` for a message-only statement
+    /// carried an update count (DML), or `None` for a message-only statement
     /// (`PRINT` / low-severity `RAISERROR`) or plain DDL. Messages are drained
     /// separately via [`take_info_messages`](TdsClient::take_info_messages).
     NoRows {
-        /// Rows affected, when the DONE token carried a COUNT; otherwise `None`.
+        /// Rows affected, when the DONE token carried a COUNT that was not
+        /// tagged `SQLSELECT` — see
+        /// [`TdsClient::last_rows_affected`] for why assignment counts are
+        /// excluded. `None` otherwise, including for a `SQLSELECT` count that
+        /// only surfaces because the statement also raised a message.
         rows_affected: Option<u64>,
     },
     /// No more statements remain in the batch; the connection is idle.
