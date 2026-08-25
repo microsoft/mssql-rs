@@ -78,13 +78,18 @@ pub trait RowWriter {
     /// Writes packet-backed encoded string bytes before the packet buffer is
     /// reused.
     ///
-    /// `bytes` is the value in its wire encoding. The default copies, so a
-    /// writer that does not override this behaves exactly as before.
-    fn write_string_ref(&mut self, col: usize, bytes: &[u8], encoding_type: &EncodingType) {
-        self.write_string(col, SqlString::new(bytes.to_vec(), encoding_type.clone()));
+    /// `bytes` is the value in its wire encoding; use
+    /// [`EncodingType::encoding`] to transcode it in place. The default copies
+    /// and forwards to [`RowWriter::write_string`], so a writer that does not
+    /// override this keeps whatever behaviour its `write_string` has — it only
+    /// gives up the saved allocation.
+    fn write_string_ref(&mut self, col: usize, bytes: &[u8], encoding_type: EncodingType) {
+        self.write_string(col, SqlString::new(bytes.to_vec(), encoding_type));
     }
 
     /// Writes packet-backed binary bytes before the packet buffer is reused.
+    ///
+    /// Defaults the same way as [`RowWriter::write_string_ref`].
     fn write_bytes_ref(&mut self, col: usize, bytes: &[u8]) {
         self.write_bytes(col, bytes.to_vec());
     }
@@ -336,6 +341,9 @@ impl RowWriter for DiscardRowWriter {
     fn write_f64(&mut self, _col: usize, _val: f64) {}
     fn write_string(&mut self, _col: usize, _val: SqlString) {}
     fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
+    // Overridden so a borrow hit does not build a `SqlString` purely to drop it.
+    fn write_string_ref(&mut self, _col: usize, _bytes: &[u8], _encoding_type: EncodingType) {}
+    fn write_bytes_ref(&mut self, _col: usize, _bytes: &[u8]) {}
     fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_date(&mut self, _col: usize, _val: SqlDate) {}
@@ -389,6 +397,90 @@ pub fn write_column_value<W: RowWriter + ?Sized>(writer: &mut W, col: usize, val
 mod tests {
     use super::*;
     use crate::datatypes::sql_string::EncodingType;
+
+    /// Overrides only `write_string`/`write_bytes`, never the `_ref` pair, and
+    /// tags every value it sees. Proves the defaulted `_ref` methods route
+    /// through the override rather than around it.
+    #[derive(Default)]
+    struct TaggingWriter {
+        seen: Vec<String>,
+    }
+
+    impl RowWriter for TaggingWriter {
+        fn write_null(&mut self, _col: usize) {}
+        fn write_bool(&mut self, _col: usize, _val: bool) {}
+        fn write_u8(&mut self, _col: usize, _val: u8) {}
+        fn write_i16(&mut self, _col: usize, _val: i16) {}
+        fn write_i32(&mut self, _col: usize, _val: i32) {}
+        fn write_i64(&mut self, _col: usize, _val: i64) {}
+        fn write_f32(&mut self, _col: usize, _val: f32) {}
+        fn write_f64(&mut self, _col: usize, _val: f64) {}
+        fn write_string(&mut self, _col: usize, val: SqlString) {
+            self.seen.push(format!("string:{}", val.to_utf8_string()));
+        }
+        fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
+            self.seen.push(format!("bytes:{val:?}"));
+        }
+        fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
+        fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
+        fn write_date(&mut self, _col: usize, _val: SqlDate) {}
+        fn write_time(&mut self, _col: usize, _val: SqlTime) {}
+        fn write_datetime(&mut self, _col: usize, _val: SqlDateTime) {}
+        fn write_smalldatetime(&mut self, _col: usize, _val: SqlSmallDateTime) {}
+        fn write_datetime2(&mut self, _col: usize, _val: SqlDateTime2) {}
+        fn write_datetimeoffset(&mut self, _col: usize, _val: SqlDateTimeOffset) {}
+        fn write_money(&mut self, _col: usize, _val: SqlMoney) {}
+        fn write_smallmoney(&mut self, _col: usize, _val: SqlSmallMoney) {}
+        fn write_uuid(&mut self, _col: usize, _val: Uuid) {}
+        fn write_xml(&mut self, _col: usize, _val: SqlXml) {}
+        fn write_json(&mut self, _col: usize, _val: SqlJson) {}
+        fn write_vector(&mut self, _col: usize, _val: SqlVector) {}
+        fn end_row(&mut self) {}
+    }
+
+    #[test]
+    fn defaulted_ref_methods_route_through_the_writers_override() {
+        let mut writer = TaggingWriter::default();
+
+        writer.write_string_ref(0, b"h\0i\0", EncodingType::Utf16);
+        writer.write_bytes_ref(1, &[1, 2, 3]);
+
+        // Had the defaults bypassed the override, `seen` would be empty and the
+        // borrowed path would silently behave differently from the owned one.
+        assert_eq!(writer.seen, vec!["string:hi", "bytes:[1, 2, 3]"]);
+    }
+
+    #[test]
+    fn discard_row_writer_drops_borrowed_values() {
+        let mut writer = DiscardRowWriter;
+        writer.write_string_ref(0, b"h\0i\0", EncodingType::Utf16);
+        writer.write_bytes_ref(1, &[1, 2, 3]);
+        writer.end_row();
+    }
+
+    #[test]
+    fn default_row_writer_borrowed_string_matches_owned() {
+        let bytes = b"h\0i\0";
+
+        let mut borrowed = DefaultRowWriter::new(1);
+        borrowed.write_string_ref(0, bytes, EncodingType::Utf16);
+
+        let mut owned = DefaultRowWriter::new(1);
+        owned.write_string(0, SqlString::new(bytes.to_vec(), EncodingType::Utf16));
+
+        assert_eq!(borrowed.take_row(), owned.take_row());
+    }
+
+    #[test]
+    fn default_row_writer_borrowed_bytes_matches_owned() {
+        let mut borrowed = DefaultRowWriter::new(1);
+        borrowed.write_bytes_ref(0, &[9, 8, 7]);
+
+        let mut owned = DefaultRowWriter::new(1);
+        owned.write_bytes(0, vec![9, 8, 7]);
+
+        assert_eq!(borrowed.take_row(), owned.take_row());
+    }
 
     #[test]
     fn default_row_writer_assembles_column_values() {

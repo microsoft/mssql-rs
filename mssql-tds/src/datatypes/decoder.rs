@@ -2073,7 +2073,7 @@ impl StringDecoder {
             if length == 0xFFFF {
                 writer.write_null(col);
             } else if let Some(bytes) = reader.try_read_slice(length) {
-                writer.write_string_ref(col, bytes, &encoding_type);
+                writer.write_string_ref(col, bytes, encoding_type);
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;

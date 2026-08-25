@@ -34,6 +34,46 @@ pub struct SqlString {
     encoding_type: EncodingType,
 }
 
+/// Maps a collation's LCID to an encoding, falling back to Windows-1252 with a
+/// warning when the LCID is not one we map.
+fn lcid_encoding_or_fallback(collation: SqlCollation) -> &'static encoding_rs::Encoding {
+    // LCID lives in the lower 20 bits of collation.info.
+    let lcid = collation.info & 0x000F_FFFF;
+    match lcid_to_encoding(lcid) {
+        Ok(encoding) => encoding,
+        Err(e) => {
+            warn!(
+                "Unsupported LCID 0x{:04X} ({}), falling back to Windows-1252. Error: {}",
+                lcid, lcid, e
+            );
+            encoding_rs::WINDOWS_1252
+        }
+    }
+}
+
+impl EncodingType {
+    /// The encoding these bytes are in, or `None` when the collation is not yet
+    /// known ([`EncodingType::DelayedSet`]).
+    ///
+    /// Exists so a writer handed borrowed wire bytes by
+    /// [`RowWriter::write_string_ref`](crate::datatypes::row_writer::RowWriter::write_string_ref)
+    /// can transcode straight into its own buffer instead of building an owned
+    /// [`SqlString`] first.
+    ///
+    /// Decoding through this substitutes U+FFFD on malformed input, whereas
+    /// [`SqlString::to_utf8_string`] panics on invalid UTF-8 under
+    /// [`EncodingType::Utf8`]. Use this when replacement is the wanted
+    /// behaviour, not as a drop-in for `to_utf8_string`.
+    pub fn encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        match self {
+            EncodingType::Utf8 => Some(encoding_rs::UTF_8),
+            EncodingType::Utf16 => Some(encoding_rs::UTF_16LE),
+            EncodingType::LcidBased(collation) => Some(lcid_encoding_or_fallback(*collation)),
+            EncodingType::DelayedSet => None,
+        }
+    }
+}
+
 impl SqlString {
     /// Creates a `SqlString` from raw bytes and an encoding type.
     pub fn new(bytes: Vec<u8>, encoding_type: EncodingType) -> Self {
@@ -66,19 +106,7 @@ impl SqlString {
             EncodingType::LcidBased(collation) => {
                 // Extract LCID from the lower 20 bits of collation.info
                 let lcid = collation.info & 0x000F_FFFF;
-
-                // Map LCID to encoding
-                let encoding = match lcid_to_encoding(lcid) {
-                    Ok(enc) => enc,
-                    Err(e) => {
-                        warn!(
-                            "Unsupported LCID 0x{:04X} ({}), falling back to Windows-1252. Error: {}",
-                            lcid, lcid, e
-                        );
-                        // Fall back to Windows-1252 for unsupported LCIDs
-                        encoding_rs::WINDOWS_1252
-                    }
-                };
+                let encoding = lcid_encoding_or_fallback(collation);
 
                 // Decode bytes using the determined encoding
                 let (decoded, _used_encoding, had_errors) = encoding.decode(&self.bytes);
@@ -209,6 +237,66 @@ mod tests {
         let sql_str = SqlString::from_utf8_string("Clone test".to_string());
         let cloned = sql_str.clone();
         assert_eq!(sql_str.bytes, cloned.bytes);
+    }
+
+    fn collation(lcid: u32) -> SqlCollation {
+        SqlCollation {
+            info: lcid,
+            lcid_language_id: lcid as i32,
+            col_flags: 0,
+            sort_id: 0,
+        }
+    }
+
+    #[test]
+    fn encoding_maps_the_unicode_variants() {
+        assert_eq!(EncodingType::Utf8.encoding(), Some(encoding_rs::UTF_8));
+        assert_eq!(EncodingType::Utf16.encoding(), Some(encoding_rs::UTF_16LE));
+    }
+
+    #[test]
+    fn encoding_is_none_until_the_collation_is_known() {
+        assert_eq!(EncodingType::DelayedSet.encoding(), None);
+    }
+
+    #[test]
+    fn encoding_resolves_a_known_lcid() {
+        // 0x0409 (en-US) maps to Windows-1252, and the fallback would also
+        // produce Windows-1252, so pin an LCID whose encoding is distinct from
+        // the fallback to prove the lookup actually ran.
+        let encoding = EncodingType::LcidBased(collation(0x0419)).encoding();
+        assert_eq!(encoding, Some(lcid_to_encoding(0x0419).unwrap()));
+        assert_ne!(encoding, Some(encoding_rs::WINDOWS_1252));
+    }
+
+    #[test]
+    fn encoding_falls_back_for_an_unmapped_lcid() {
+        let unmapped = 0x000F_FFFF;
+        assert!(lcid_to_encoding(unmapped).is_err(), "LCID must be unmapped");
+        assert_eq!(
+            EncodingType::LcidBased(collation(unmapped)).encoding(),
+            Some(encoding_rs::WINDOWS_1252)
+        );
+    }
+
+    #[test]
+    fn encoding_agrees_with_to_utf8_string_for_lcid_bytes() {
+        // The accessor has to decode to the same text `to_utf8_string` would,
+        // otherwise a writer using it would silently diverge from the owned path.
+        let encoding_type = EncodingType::LcidBased(collation(0x0419));
+        let bytes = vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
+
+        let via_accessor = encoding_type
+            .encoding()
+            .expect("LCID encoding is known")
+            .decode(&bytes)
+            .0
+            .into_owned();
+
+        assert_eq!(
+            via_accessor,
+            SqlString::new(bytes, encoding_type).to_utf8_string()
+        );
     }
 
     #[test]

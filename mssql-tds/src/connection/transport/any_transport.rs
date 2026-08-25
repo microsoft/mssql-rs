@@ -320,6 +320,22 @@ impl<W: RowWriter + Send + ?Sized> RowWriter for DynamicRowWriter<'_, W> {
     fn end_row(&mut self) {
         self.0.end_row();
     }
+
+    // Not covered by `forward_row_values!`, which only handles the single-value
+    // shape. Without these the default would copy and call `write_string`, so
+    // the wrapped writer's own borrow handling would never be reached.
+    fn write_string_ref(
+        &mut self,
+        col: usize,
+        bytes: &[u8],
+        encoding_type: crate::datatypes::sql_string::EncodingType,
+    ) {
+        self.0.write_string_ref(col, bytes, encoding_type);
+    }
+
+    fn write_bytes_ref(&mut self, col: usize, bytes: &[u8]) {
+        self.0.write_bytes_ref(col, bytes);
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +350,81 @@ mod tests {
     use crate::query::metadata::ColumnMetadata;
     use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_data};
     use crate::token::tokens::{ColMetadataToken, TokenType};
+
+    /// Forwards ordinary writes to an inner `DefaultRowWriter` but records the
+    /// borrowed ones, so a test can tell whether they arrived as borrows.
+    struct RefSpy(DefaultRowWriter, Vec<String>);
+
+    impl RowWriter for RefSpy {
+        fn write_null(&mut self, col: usize) {
+            self.0.write_null(col);
+        }
+
+        forward_row_values!(
+            write_bool: bool,
+            write_u8: u8,
+            write_i16: i16,
+            write_i32: i32,
+            write_i64: i64,
+            write_f32: f32,
+            write_f64: f64,
+            write_string: crate::datatypes::sql_string::SqlString,
+            write_bytes: Vec<u8>,
+            write_decimal: crate::datatypes::decoder::DecimalParts,
+            write_numeric: crate::datatypes::decoder::DecimalParts,
+            write_date: crate::datatypes::column_values::SqlDate,
+            write_time: crate::datatypes::column_values::SqlTime,
+            write_datetime: crate::datatypes::column_values::SqlDateTime,
+            write_smalldatetime: crate::datatypes::column_values::SqlSmallDateTime,
+            write_datetime2: crate::datatypes::column_values::SqlDateTime2,
+            write_datetimeoffset: crate::datatypes::column_values::SqlDateTimeOffset,
+            write_money: crate::datatypes::column_values::SqlMoney,
+            write_smallmoney: crate::datatypes::column_values::SqlSmallMoney,
+            write_uuid: uuid::Uuid,
+            write_xml: crate::datatypes::column_values::SqlXml,
+            write_json: crate::datatypes::sql_json::SqlJson,
+            write_vector: crate::datatypes::sql_vector::SqlVector,
+        );
+
+        fn write_string_ref(
+            &mut self,
+            _col: usize,
+            bytes: &[u8],
+            encoding_type: crate::datatypes::sql_string::EncodingType,
+        ) {
+            let text = crate::datatypes::sql_string::SqlString::new(bytes.to_vec(), encoding_type)
+                .to_utf8_string();
+            self.1.push(format!("string_ref:{text}"));
+        }
+
+        fn write_bytes_ref(&mut self, _col: usize, bytes: &[u8]) {
+            self.1.push(format!("bytes_ref:{bytes:?}"));
+        }
+
+        fn end_row(&mut self) {
+            self.0.end_row();
+        }
+    }
+
+    #[test]
+    fn dynamic_row_writer_forwards_borrowed_writes() {
+        let mut spy = RefSpy(DefaultRowWriter::new(2), Vec::new());
+
+        {
+            let mut wrapper = DynamicRowWriter(&mut spy);
+            wrapper.write_string_ref(
+                0,
+                b"h\0i\0",
+                crate::datatypes::sql_string::EncodingType::Utf16,
+            );
+            wrapper.write_bytes_ref(1, &[1, 2, 3]);
+        }
+
+        // Without the forwarding overrides the defaults would copy and call
+        // `write_string`/`write_bytes`, so the wrapped writer's borrow handling
+        // would never run and this would be empty.
+        assert_eq!(spy.1, vec!["string_ref:hi", "bytes_ref:[1, 2, 3]"]);
+    }
 
     fn int_row_packet(value: i32) -> Vec<u8> {
         TestPacketBuilder::new(PacketType::TabularResult)
