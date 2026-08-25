@@ -3602,6 +3602,18 @@ impl TdsClient {
                     // `SET @x = 1`, `SELECT @x = col FROM t`) as a SQLSELECT command
                     // and still sets DONE_COUNT. msodbcsql does not expose those as
                     // update-count results, so neither do we.
+                    //
+                    // msodbcsql also excludes SQLFETCHCURSOR (0x21) and SQLDBCC
+                    // (0xe6) here (sqlctokn.cpp:2149-2156). We do not, because
+                    // `CurrentCommand` folds every unrecognized value into `None`,
+                    // and `None` is what a genuine `SELECT ... INTO` count reports —
+                    // so those two cannot be told apart without dedicated variants.
+                    // Neither is reachable today: no DBCC command was observed to
+                    // set DONE_COUNT, and SQLFETCHCURSOR belongs to the server-side
+                    // cursor path this driver does not implement yet. Add
+                    // `CurrentCommand::{FetchCursor, Dbcc}` and exclude them here
+                    // when server-side cursors land, or if a DBCC is found to
+                    // report a count.
                     let has_update_count = has_count && done.cur_cmd != CurrentCommand::Select;
                     if has_update_count {
                         let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
