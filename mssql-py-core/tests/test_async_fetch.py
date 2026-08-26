@@ -4,7 +4,10 @@
 """Tests for asynchronous cursor row fetching."""
 
 import asyncio
+import datetime
+import uuid
 import warnings
+from decimal import Decimal
 
 import mssql_py_core
 import pytest
@@ -143,6 +146,437 @@ def test_fetchone_preserves_later_result_sets(client_context):
 
             await owner.close()
             await other.execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_decodes_wide_sql_type_matrix(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST(1 AS bit),
+                    CAST(255 AS tinyint),
+                    CAST(-32768 AS smallint),
+                    CAST(-2147483648 AS int),
+                    CAST(9223372036854775807 AS bigint),
+                    CAST(12.5 AS real),
+                    CAST(-123.25 AS float),
+                    CAST('ascii' AS varchar(10)),
+                    CAST(N'東京' AS nvarchar(10)),
+                    CAST(0x010203 AS varbinary(3)),
+                    CAST(123.4500 AS decimal(10, 4)),
+                    CAST(-987.65 AS numeric(10, 2)),
+                    CAST('2026-08-20' AS date),
+                    CAST('12:34:56.123456' AS time(6)),
+                    CAST('2026-08-20T12:34:56' AS datetime),
+                    CAST('2026-08-20T12:34:00' AS smalldatetime),
+                    CAST('2026-08-20T12:34:56.123456' AS datetime2(6)),
+                    CAST('2026-08-20T12:34:56.123456+05:30' AS datetimeoffset(6)),
+                    CAST(12345.6789 AS money),
+                    CAST(-1234.5678 AS smallmoney),
+                    CAST('12345678-1234-5678-9abc-123456789abc' AS uniqueidentifier),
+                    CAST('<root answer="42" />' AS xml),
+                    CAST(N'{"answer":42}' AS json),
+                    CAST('[1,2,3]' AS vector(3))
+                """,
+                use_prepare=False,
+            )
+
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[:23] == (
+                True,
+                255,
+                -32768,
+                -2147483648,
+                9223372036854775807,
+                12.5,
+                -123.25,
+                "ascii",
+                "東京",
+                b"\x01\x02\x03",
+                Decimal("123.4500"),
+                Decimal("-987.65"),
+                datetime.date(2026, 8, 20),
+                datetime.time(12, 34, 56, 123456),
+                datetime.datetime(2026, 8, 20, 12, 34, 56),
+                datetime.datetime(2026, 8, 20, 12, 34),
+                datetime.datetime(2026, 8, 20, 12, 34, 56, 123456),
+                datetime.datetime(
+                    2026,
+                    8,
+                    20,
+                    12,
+                    34,
+                    56,
+                    123456,
+                    tzinfo=datetime.timezone(datetime.timedelta(hours=5, minutes=30)),
+                ),
+                Decimal("12345.6789"),
+                Decimal("-1234.5678"),
+                uuid.UUID("12345678-1234-5678-9abc-123456789abc"),
+                '<root answer="42"/>',
+                '{"answer":42}',
+            )
+            assert row[23] == pytest.approx([1.0, 2.0, 3.0])
+            assert await cursor.fetchone() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_decodes_null_for_every_supported_type(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST(NULL AS bit), CAST(NULL AS tinyint),
+                    CAST(NULL AS smallint), CAST(NULL AS int),
+                    CAST(NULL AS bigint), CAST(NULL AS real),
+                    CAST(NULL AS float), CAST(NULL AS varchar(10)),
+                    CAST(NULL AS nvarchar(10)), CAST(NULL AS varbinary(10)),
+                    CAST(NULL AS decimal(10, 4)), CAST(NULL AS numeric(10, 2)),
+                    CAST(NULL AS date), CAST(NULL AS time(7)),
+                    CAST(NULL AS datetime), CAST(NULL AS smalldatetime),
+                    CAST(NULL AS datetime2(7)), CAST(NULL AS datetimeoffset(7)),
+                    CAST(NULL AS money), CAST(NULL AS smallmoney),
+                    CAST(NULL AS uniqueidentifier), CAST(NULL AS xml),
+                    CAST(NULL AS json), CAST(NULL AS vector(3)),
+                    CAST(NULL AS sql_variant), CAST(NULL AS geography),
+                    CAST(NULL AS geometry), CAST(NULL AS hierarchyid)
+                """,
+                use_prepare=False,
+            )
+
+            row = await cursor.fetchone()
+            assert row == (None,) * 28
+            assert await cursor.fetchone() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_preserves_temporal_boundaries(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST('0001-01-01' AS date),
+                    CAST('9999-12-31' AS date),
+                    CAST('23:59:59' AS time(0)),
+                    CAST('12:34:56.123' AS time(3)),
+                    CAST('12:34:56.1234567' AS time(7)),
+                    CAST('0001-01-01T00:00:00' AS datetime2(7)),
+                    CAST('9999-12-31T23:59:59.9999999' AS datetime2(7)),
+                    CAST('2026-08-20T00:15:00+14:00' AS datetimeoffset(7)),
+                    CAST('2026-08-20T23:45:00-14:00' AS datetimeoffset(7))
+                """,
+                use_prepare=False,
+            )
+
+            assert await cursor.fetchone() == (
+                datetime.date(1, 1, 1),
+                datetime.date(9999, 12, 31),
+                datetime.time(23, 59, 59),
+                datetime.time(12, 34, 56, 123000),
+                datetime.time(12, 34, 56, 123456),
+                datetime.datetime(1, 1, 1),
+                datetime.datetime(9999, 12, 31, 23, 59, 59, 999999),
+                datetime.datetime(
+                    2026,
+                    8,
+                    20,
+                    0,
+                    15,
+                    tzinfo=datetime.timezone(datetime.timedelta(hours=14)),
+                ),
+                datetime.datetime(
+                    2026,
+                    8,
+                    20,
+                    23,
+                    45,
+                    tzinfo=datetime.timezone(datetime.timedelta(hours=-14)),
+                ),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_preserves_decimal_and_money_boundaries(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST(99999999999999999999999999999999999999 AS decimal(38, 0)),
+                    CAST(-0.0000001 AS numeric(38, 7)),
+                    CAST(922337203685477.5807 AS money),
+                    CAST(-922337203685477.5808 AS money),
+                    CAST(-0.0001 AS money),
+                    CAST(214748.3647 AS smallmoney),
+                    CAST(-214748.3648 AS smallmoney),
+                    CAST(-0.0001 AS smallmoney)
+                """,
+                use_prepare=False,
+            )
+
+            assert await cursor.fetchone() == (
+                Decimal("99999999999999999999999999999999999999"),
+                Decimal("-0.0000001"),
+                Decimal("922337203685477.5807"),
+                Decimal("-922337203685477.5808"),
+                Decimal("-0.0001"),
+                Decimal("214748.3647"),
+                Decimal("-214748.3648"),
+                Decimal("-0.0001"),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_decodes_empty_fixed_and_large_lob_values(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST('' AS varchar(max)),
+                    CAST(N'' AS nvarchar(max)),
+                    CAST(0x AS varbinary(max)),
+                    CAST('x' AS char(4)),
+                    CAST(N'東' AS nchar(3)),
+                    CAST(0x0102 AS binary(4)),
+                    REPLICATE(CAST('ab' AS varchar(max)), 50000),
+                    REPLICATE(CAST(N'東京' AS nvarchar(max)), 25000),
+                    CONVERT(varbinary(max), REPLICATE(CAST('ab' AS varchar(max)), 50000)),
+                    CAST('<root>' + REPLICATE(CAST('x' AS varchar(max)), 100000)
+                        + '</root>' AS xml)
+                """,
+                use_prepare=False,
+            )
+
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[:6] == ("", "", b"", "x   ", "東  ", b"\x01\x02\x00\x00")
+            assert row[6] == "ab" * 50000
+            assert row[7] == "東京" * 25000
+            assert row[8] == b"ab" * 50000
+            assert row[9] == f"<root>{'x' * 100000}</root>"
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_decodes_sql_variant_base_type_matrix(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST(CAST(123 AS int) AS sql_variant),
+                    CAST(CAST(255 AS tinyint) AS sql_variant),
+                    CAST(CAST(-32000 AS smallint) AS sql_variant),
+                    CAST(CAST(9223372036854775807 AS bigint) AS sql_variant),
+                    CAST(CAST(12.5 AS real) AS sql_variant),
+                    CAST(CAST(-123.25 AS float) AS sql_variant),
+                    CAST(CAST(999.99 AS decimal(10, 2)) AS sql_variant),
+                    CAST(CAST(1 AS bit) AS sql_variant),
+                    CAST(CAST('Hello' AS varchar(10)) AS sql_variant),
+                    CAST(CAST(N'東京' AS nvarchar(10)) AS sql_variant),
+                    CAST(CAST('2026-08-20' AS date) AS sql_variant),
+                    CAST(CAST('12:34:56.1234567' AS time(7)) AS sql_variant),
+                    CAST(CAST('2026-08-20T12:34:56' AS datetime2) AS sql_variant),
+                    CAST(CAST(0x48656C6C6F AS varbinary(5)) AS sql_variant),
+                    CAST(CAST('12345678-1234-5678-9abc-123456789abc'
+                        AS uniqueidentifier) AS sql_variant),
+                    CAST(NULL AS sql_variant)
+                """,
+                use_prepare=False,
+            )
+
+            assert await cursor.fetchone() == (
+                123,
+                255,
+                -32000,
+                9223372036854775807,
+                12.5,
+                -123.25,
+                Decimal("999.99"),
+                True,
+                "Hello",
+                "東京",
+                datetime.date(2026, 8, 20),
+                datetime.time(12, 34, 56, 123456),
+                datetime.datetime(2026, 8, 20, 12, 34, 56),
+                b"Hello",
+                uuid.UUID("12345678-1234-5678-9abc-123456789abc"),
+                None,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_decodes_spatial_and_hierarchyid_as_bytes(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    geography::Point(47.651, -122.349, 4326),
+                    geometry::STGeomFromText('POINT (10 20)', 0),
+                    hierarchyid::Parse('/1/2/'),
+                    CAST(NULL AS geography),
+                    CAST(NULL AS geometry),
+                    CAST(NULL AS hierarchyid)
+                """,
+                use_prepare=False,
+            )
+
+            row = await cursor.fetchone()
+            assert row is not None
+            assert all(isinstance(value, bytes) and value for value in row[:3])
+            assert row[3:] == (None, None, None)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_fetchone_after_connection_close_raises(mock_client_context):
+    async def run():
+        conn = await connect(mock_client_context)
+        cursor = conn.cursor()
+        await conn.close()
+
+        with pytest.raises(RuntimeError, match="Connection is closed"):
+            await cursor.fetchone()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_rejects_concurrent_read_on_same_cursor(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT REPLICATE(CAST('x' AS varchar(max)), 8000000)",
+                use_prepare=False,
+            )
+
+            first = cursor.fetchone()
+            with pytest.raises(RuntimeError, match="busy with another cursor operation"):
+                cursor.fetchone()
+            assert len((await first)[0]) == 8000000
+            assert await cursor.fetchone() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_cancelling_blocked_fetchone_breaks_session(client_context):
+    async def run():
+        conn = await connect(client_context)
+        cursor = conn.cursor()
+        try:
+            await cursor.execute(
+                "SELECT REPLICATE(CAST('x' AS varchar(max)), 32000000)",
+                use_prepare=False,
+            )
+            task = asyncio.ensure_future(cursor.fetchone())
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            probe = conn.cursor()
+            for _ in range(100):
+                try:
+                    await probe.execute("SELECT 1", use_prepare=False)
+                except RuntimeError as error:
+                    if "busy" in str(error).lower():
+                        await asyncio.sleep(0.01)
+                        continue
+                    assert "broken" in str(error).lower()
+                    break
+                else:
+                    pytest.fail("Cancelled FetchOne left the connection reusable")
+            else:
+                pytest.fail("Cancelled FetchOne left the connection permanently busy")
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_bounded_loop_preserves_order_values_and_reuse(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                WITH numbers AS (
+                    SELECT 0 AS value
+                    UNION ALL
+                    SELECT value + 1 FROM numbers WHERE value < 255
+                )
+                SELECT value, CONCAT('V_', value), value * 3
+                FROM numbers ORDER BY value
+                OPTION (MAXRECURSION 256)
+                """,
+                use_prepare=False,
+            )
+
+            for value in range(256):
+                assert await cursor.fetchone() == (value, f"V_{value}", value * 3)
+            assert await cursor.fetchone() is None
+            assert await cursor.fetchone() is None
+
+            await cursor.execute("SELECT 42", use_prepare=False)
+            assert await cursor.fetchone() == (42,)
+            assert await cursor.fetchone() is None
         finally:
             await conn.close()
 

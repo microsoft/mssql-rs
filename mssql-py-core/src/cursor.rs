@@ -895,9 +895,9 @@ impl PyCoreCursor {
                 let money_val = lsb_in_i64 | ((m.msb_part as i64) << 32);
 
                 // Format as decimal string with 4 decimal places
-                let integer_part = money_val / 10000;
-                let fractional_part = (money_val % 10000).abs();
-                let decimal_str = format!("{}.{:04}", integer_part, fractional_part);
+                let sign = if money_val < 0 { "-" } else { "" };
+                let magnitude = money_val.unsigned_abs();
+                let decimal_str = format!("{sign}{}.{:04}", magnitude / 10000, magnitude % 10000);
 
                 if let Ok(decimal_module) = PyModule::import(py, "decimal")
                     && let Ok(decimal_class) = decimal_module.getattr("Decimal")
@@ -914,9 +914,9 @@ impl PyCoreCursor {
                 let money_val = m.int_val as i64;
 
                 // Format as decimal string with 4 decimal places
-                let integer_part = money_val / 10000;
-                let fractional_part = (money_val % 10000).abs();
-                let decimal_str = format!("{}.{:04}", integer_part, fractional_part);
+                let sign = if money_val < 0 { "-" } else { "" };
+                let magnitude = money_val.unsigned_abs();
+                let decimal_str = format!("{sign}{}.{:04}", magnitude / 10000, magnitude % 10000);
 
                 if let Ok(decimal_module) = PyModule::import(py, "decimal")
                     && let Ok(decimal_class) = decimal_module.getattr("Decimal")
@@ -1083,7 +1083,8 @@ impl PyCoreCursor {
                             if let Ok(td_obj) =
                                 timedelta_class.call1((0, dto.offset as i32 * 60, 0))
                                 && let Ok(tz_obj) = timezone_class.call1((td_obj,))
-                                && let Ok(datetime_obj) = datetime_class.call1((
+                                && let Ok(utc) = timezone_class.getattr("utc")
+                                && let Ok(utc_datetime) = datetime_class.call1((
                                     year,
                                     month,
                                     day,
@@ -1091,8 +1092,10 @@ impl PyCoreCursor {
                                     minute,
                                     second,
                                     microsecond,
-                                    tz_obj,
+                                    utc,
                                 ))
+                                && let Ok(datetime_obj) =
+                                    utc_datetime.call_method1("astimezone", (tz_obj,))
                             {
                                 return datetime_obj.into_any();
                             }

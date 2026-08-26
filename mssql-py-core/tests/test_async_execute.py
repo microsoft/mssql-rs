@@ -921,3 +921,44 @@ def test_execute_reprepares_when_parameter_metadata_changes(client_context, rese
             await conn.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_execute_replaces_unread_results_after_partial_fetch(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT value FROM (VALUES (1), (2)) AS rows(value) ORDER BY value",
+                use_prepare=False,
+            )
+            assert await cursor.fetchone() == (1,)
+
+            await cursor.execute("SELECT 3", use_prepare=False)
+            assert await cursor.fetchone() == (3,)
+            assert await cursor.fetchone() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_execute_reuses_prepared_statement_after_partial_fetch(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            sql = "SELECT value FROM (VALUES (?), (?)) AS rows(value) ORDER BY value"
+            await cursor.execute(sql, 1, 2)
+            assert await cursor.fetchone() == (1,)
+
+            await cursor.execute(sql, 3, 4, reset_cursor=False)
+            assert await cursor.fetchone() == (3,)
+            assert await cursor.fetchone() == (4,)
+            assert await cursor.fetchone() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
