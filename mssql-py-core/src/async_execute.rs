@@ -375,8 +375,11 @@ mod tests {
     use std::sync::Arc;
 
     use mssql_tds::connection::tds_client::PreparedStatement;
+    use mssql_tds::error::Error;
 
-    use super::{ParameterMetadata, PreparedState, should_replace_prepared_statement};
+    use super::{
+        ExecuteFailure, ParameterMetadata, PreparedState, should_replace_prepared_statement,
+    };
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
     };
@@ -387,6 +390,14 @@ mod tests {
             parameter_signature: signature,
             orphaned: None,
         }
+    }
+
+    #[test]
+    fn broken_execute_failure_marks_connection_for_breakage() {
+        let failure = ExecuteFailure::broken(Error::ProtocolError("BEGIN failed".to_string()));
+
+        assert!(failure.break_connection);
+        assert_eq!(failure.error.to_string(), "Protocol Error: BEGIN failed");
     }
 
     #[test]

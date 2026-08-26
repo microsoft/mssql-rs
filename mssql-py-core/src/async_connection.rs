@@ -69,6 +69,19 @@ fn map_claim_error(error: ClaimError) -> PyErr {
     }
 }
 
+#[cfg(test)]
+mod claim_error_tests {
+    use super::map_claim_error;
+    use crate::async_session::ClaimError;
+
+    #[test]
+    fn maps_no_result_set_claim_error() {
+        let error = map_claim_error(ClaimError::NoResultSet);
+
+        assert!(error.to_string().contains("No active result set"));
+    }
+}
+
 /// Owns the session claim for an in-flight commit or rollback.
 ///
 /// `complete()` releases the claim after success or a handled TDS error. Dropping

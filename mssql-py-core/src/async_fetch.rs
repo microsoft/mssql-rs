@@ -214,3 +214,54 @@ pub(crate) fn fetchone<'py>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mssql_tds::error::Error;
+
+    use super::{FetchGuard, map_fetch_error};
+    use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+
+    fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64) {
+        let state = Arc::new(AsyncConnectionState::new());
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+        (state, fetch.operation_id)
+    }
+
+    #[test]
+    fn failed_fetch_releases_reusable_session_without_open_batch() {
+        let (state, operation_id) = claimed_fetch();
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id);
+
+        guard.fail(false);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn failed_fetch_breaks_session_with_open_batch() {
+        let (state, operation_id) = claimed_fetch();
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id);
+
+        guard.fail(true);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Broken);
+    }
+
+    #[test]
+    fn maps_fetch_error_to_python_runtime_error() {
+        let error = map_fetch_error(Error::ProtocolError("invalid row token".to_string()));
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to fetch row: Protocol Error: invalid row token")
+        );
+    }
+}

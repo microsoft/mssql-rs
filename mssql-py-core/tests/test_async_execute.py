@@ -76,6 +76,34 @@ def test_execute_after_connection_close_raises(mock_client_context):
     asyncio.run(run())
 
 
+def test_execute_restores_state_when_awaitable_creation_fails(mock_client_context):
+    async def create_exhausted_cursor():
+        conn = await connect(mock_client_context)
+        cursor = conn.cursor()
+        await cursor.execute("SELECT 1", use_prepare=False)
+        assert await cursor.fetchone() == (1,)
+        assert await cursor.fetchone() is None
+        return conn, cursor
+
+    conn, cursor = asyncio.run(create_exhausted_cursor())
+    try:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            cursor.execute("SELECT 2", use_prepare=False)
+
+        async def verify_restored_state():
+            assert await cursor.fetchone() is None
+            await cursor.execute("SELECT 1", use_prepare=False)
+            assert await cursor.fetchone() == (1,)
+            assert await cursor.fetchone() is None
+
+        asyncio.run(verify_restored_state())
+    finally:
+        async def close_connection():
+            await conn.close()
+
+        asyncio.run(close_connection())
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("use_prepare", [True, False])
 def test_execute_binds_positional_parameters(client_context, use_prepare):
