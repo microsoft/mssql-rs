@@ -69,10 +69,26 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         return SQL_ERROR;
     }
 
+    // A prior fetch's read-ahead peek can have discovered this cursor's
+    // batch ends in a SQL Server error and deferred it here (see AB#47508's
+    // release_busy_if_row_exhausted / StmtState::pending_fetch_error) rather
+    // than losing it under that fetch's own SQL_SUCCESS return. The peek
+    // already closed the batch on the wire, so the drain below can no
+    // longer discover it there — take it now and surface it below instead
+    // of silently closing as if the batch had never errored.
+    let pending_fetch_error = stmt_state.pending_fetch_error.take();
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    match drain_and_release(stmt, statement_handle) {
+    let outcome = drain_and_release(stmt, statement_handle);
+    if let Some(e) = pending_fetch_error {
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+        }
+        return SQL_ERROR;
+    }
+
+    match outcome {
         DrainOutcome::Failed => {
             error!("SQLCloseCursor: failed to drain TDS stream on close");
             SQL_ERROR
@@ -109,10 +125,20 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
         return SQL_SUCCESS;
     }
 
+    // See the identical comment in sql_close_cursor_safe.
+    let pending_fetch_error = stmt_state.pending_fetch_error.take();
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    match drain_and_release(stmt, statement_handle) {
+    let outcome = drain_and_release(stmt, statement_handle);
+    if let Some(e) = pending_fetch_error {
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+        }
+        return SQL_ERROR;
+    }
+
+    match outcome {
         DrainOutcome::Failed => {
             error!("SQLFreeStmt(SQL_CLOSE): failed to drain TDS stream on close");
             SQL_ERROR
@@ -142,8 +168,16 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 /// Kept separate from the public `SQLFreeStmt(SQL_CLOSE)` path only for cost:
 /// statements with no open cursor return straight after the diagnostics reset,
 /// with no FFI entry and no drain.
+///
+/// A pending fetch error (see the comment in `sql_close_cursor_safe`) is
+/// still posted to the statement's own diagnostics here, but — unlike the
+/// direct `SQLCloseCursor`/`SQLFreeStmt(SQL_CLOSE)` paths — does not fail
+/// this function's own return: `SQL_ERROR` here specifically tells the
+/// caller the stream failed to drain, so sending a transaction-manager
+/// request next is unsafe, which an already-closed batch's stale diagnostic
+/// does not make true.
 pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
-    {
+    let pending_fetch_error = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");
             return SQL_ERROR;
@@ -152,10 +186,19 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
         if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {
             return SQL_SUCCESS;
         }
+        let pending_fetch_error = stmt_state.pending_fetch_error.take();
         reset_cursor_state(&mut stmt_state);
+        pending_fetch_error
+    };
+
+    let outcome = drain_and_release(stmt, handle);
+    if let Some(e) = pending_fetch_error
+        && let Ok(mut stmt_state) = stmt.inner.lock()
+    {
+        post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
     }
 
-    match drain_and_release(stmt, handle) {
+    match outcome {
         DrainOutcome::Failed => {
             error!("close_cursor_for_connection_op: failed to drain TDS stream");
             SQL_ERROR
@@ -308,6 +351,113 @@ mod tests {
         // No execute has been called — cursor_open is false; SQL_CLOSE is a no-op.
         let ret = unsafe { sql_free_stmt_close(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    /// A prior fetch's read-ahead peek can have discovered a trailing SQL
+    /// Server error (see AB#47508's `release_busy_if_row_exhausted`), stashed
+    /// as `pending_fetch_error` because that fetch had already committed to
+    /// `SQL_SUCCESS`. Before this deferral existed, a direct `SQLCloseCursor`
+    /// on that same statement would still see the error from its own drain —
+    /// the peek's read-ahead is what stops the drain from finding it there —
+    /// so `SQLCloseCursor` must surface it itself instead of silently
+    /// reporting a clean close.
+    #[test]
+    fn close_cursor_surfaces_a_pending_fetch_error() {
+        use mssql_tds::error::Error as TdsError;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+            ss.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+        }
+
+        let ret = unsafe { sql_close_cursor(h.stmt) };
+
+        assert_eq!(ret, SQL_ERROR);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the deferred error must be posted, not silently dropped by the close"
+        );
+        assert!(ss.pending_fetch_error.is_none());
+    }
+
+    /// Same requirement as `close_cursor_surfaces_a_pending_fetch_error`, for
+    /// the `SQLFreeStmt(SQL_CLOSE)` entry point.
+    #[test]
+    fn free_stmt_close_surfaces_a_pending_fetch_error() {
+        use mssql_tds::error::Error as TdsError;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+            ss.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+        }
+
+        let ret = unsafe { sql_free_stmt_close(h.stmt) };
+
+        assert_eq!(ret, SQL_ERROR);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the deferred error must be posted, not silently dropped by the close"
+        );
+        assert!(ss.pending_fetch_error.is_none());
+    }
+
+    /// The connection-scoped sweep (`SQLEndTran`/autocommit/isolation change)
+    /// must NOT fail its own return over a pending fetch error on one
+    /// statement: `SQL_ERROR` from this function specifically means "the
+    /// stream failed to drain, unsafe to send a TM request next" — a stale
+    /// diagnostic on an already-closed batch does not make that true. The
+    /// diagnostic still posts to the statement's own records so it remains
+    /// visible if the application inspects that handle later.
+    #[test]
+    fn close_cursor_for_connection_op_posts_but_does_not_fail_on_a_pending_fetch_error() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::error::Error as TdsError;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+            ss.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+        }
+        h.mark_dbc_connected();
+        // A fresh, never-executed client: has_open_batch() is false, so
+        // drain_and_release's own close_query() is a real no-op — isolating
+        // the assertion to "does a pending fetch error alone force
+        // SQL_ERROR", independent of drain success/failure.
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
+
+        let ret = close_cursor_for_connection_op(stmt, h.stmt);
+
+        assert_eq!(ret, SQL_SUCCESS);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the pending error must still be posted to this statement's diagnostics"
+        );
+        assert!(ss.pending_fetch_error.is_none());
     }
 
     /// Statement A's cursor stays `STMT_STATE_CURSOR_OPEN` after its own fetch

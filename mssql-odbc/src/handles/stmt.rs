@@ -119,10 +119,18 @@ pub(crate) struct StmtState {
     /// found it has already committed to a success return for the row it
     /// delivered, so posting the diagnostic there would be silently lost —
     /// no return code tells the caller to look. Stashed here instead, for
-    /// the next call that would otherwise short-circuit past the wire
-    /// (`SQLFetch`'s `result_set_exhausted` fast path, or `SQLMoreResults`)
-    /// to drain and fail on. Cleared wherever `result_set_exhausted` is,
-    /// since both describe facts about the same now-superseded result set.
+    /// the next call that would otherwise short-circuit past the wire —
+    /// `SQLFetch`'s `result_set_exhausted` fast path, `SQLMoreResults`, or a
+    /// cursor close (`SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`, whose own
+    /// drain can no longer discover it on the wire because the peek already
+    /// consumed the terminating ERROR token) — to drain and fail on. The
+    /// connection-scoped close sweep (`SQLEndTran`/autocommit/isolation
+    /// change, `close_cursor_for_connection_op`) is the one exception: it
+    /// still posts this to the statement's diagnostics but does not fail its
+    /// own return, since that return code specifically means "the stream
+    /// failed to drain," which a stale diagnostic on an already-closed batch
+    /// does not make true. Cleared wherever `result_set_exhausted` is, since
+    /// both describe facts about the same now-superseded result set.
     pub(crate) pending_fetch_error: Option<TdsError>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
