@@ -794,6 +794,11 @@ where
         }
     }
 
+    /// The fuzzing counterpart of `NetworkTransport::cancel_read_stream_and_wait`.
+    ///
+    /// No bound is needed here, unlike the network path: `FuzzReader` serves a
+    /// fixed in-memory buffer and returns EOF past its end, so this loop always
+    /// terminates. There is no socket for it to park on.
     async fn cancel_read_stream_and_wait(&mut self) -> TdsResult<()> {
         self.packet_reader.cancel_read_stream().await?;
         let dummy_context = ParserContext::None(());

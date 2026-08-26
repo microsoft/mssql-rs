@@ -43,13 +43,23 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for acknowledgment
+    /// * `timeout` - Maximum time for the whole flow, covering the send as well
+    ///   as the wait. Writing the packet can itself stall on a peer that has
+    ///   stopped reading, so implementations must not leave the send unbounded.
     ///
     /// # Returns
     ///
     /// * `Ok(true)` - Attention acknowledged by server
-    /// * `Ok(false)` - Attention sent but timeout expired waiting for ACK
+    /// * `Ok(false)` - Timeout expired before the acknowledgement, either while
+    ///   sending the attention or while waiting for the ACK
     /// * `Err(_)` - Error sending attention or reading response
+    ///
+    /// Only `Ok(true)` leaves the connection at a message boundary. On either
+    /// other outcome an ATTENTION is outstanding with no acknowledgement to
+    /// pair it with, so a later read could pick up a stray DONE_ATTN and treat
+    /// it as the answer to a different request. Implementations must mark such
+    /// a connection dead rather than let it be reused, which is why callers may
+    /// ignore the return value.
     async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
 
     /// Probe whether the underlying connection is dead via a non-blocking socket
