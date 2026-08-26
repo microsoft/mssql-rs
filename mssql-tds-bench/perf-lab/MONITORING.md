@@ -23,11 +23,14 @@ artifact and rendered on the run's Summary tab.
 The gate is already noise-hardened: a benchmark slower than the threshold
 (`BENCH_REGRESSION_RATIO`, default `1.05` = 5%) trips it, is then re-measured 4×
 interleaved, and is only confirmed when it trips in ≥3 of those 4 re-runs.
-Apparent *improvements* get the same treatment at the same magnitude
-(`BENCH_IMPROVEMENT_VERIFY_RATIO` defaults to the regression threshold), so an
-unreproduced win is reported as an artifact rather than a gain. Take the verdict
-line at face value; do not re-litigate a cleared benchmark from the first-pass
-numbers.
+Apparent *improvements* qualify for the same treatment at the same magnitude
+(`BENCH_IMPROVEMENT_VERIFY_RATIO` defaults to the regression threshold), but only
+the largest `BENCH_IMPROVEMENT_VERIFY_MAX` of them (default 3) are actually
+re-measured; any beyond that cap keep unverified first-pass numbers, and the
+summary reports how many it skipped. Treat only a *reproduced* win as real: one
+that was re-measured and did not reproduce is an artifact, and one that fell
+outside the cap is simply unverified. Take the verdict line at face value; do not
+re-litigate a cleared benchmark from the first-pass numbers.
 
 The Windows step log mangles the summary's UTF-8 (emoji, `±`, `µ`). The raw
 critcmp block is still readable, and the emoji bars are a pure function of Δ%, so
