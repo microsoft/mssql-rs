@@ -103,7 +103,6 @@ TEST_F(AllocFreeDescLiveTest, AllocAndFreeExplicitDescriptor) {
 
 TEST_F(AllocFreeDescLiveTest, AssociatesAsActiveRowDescriptor) {
     SQLHDESC hdesc = AllocDesc();
-    SQLHDESC implicit_apd = AppParamDesc();
 
     EXPECT_SQL_OK(SQLSetStmtAttrW(stmt_, SQL_ATTR_APP_ROW_DESC, hdesc, 0), SQL_HANDLE_STMT, stmt_);
     // hdesc is an application-owned handle from SQLAllocHandle, not one
@@ -111,8 +110,10 @@ TEST_F(AllocFreeDescLiveTest, AssociatesAsActiveRowDescriptor) {
     // Driver Manager must preserve its identity -- comparing it directly is
     // reliable (see the file-level comment for the distinction).
     EXPECT_EQ(hdesc, AppRowDesc());
-    // APD is untouched by an ARD association.
-    EXPECT_EQ(implicit_apd, AppParamDesc());
+    // APD is untouched by an ARD association -- checked by allocation type,
+    // not by comparing two separate AppParamDesc() calls for raw identity
+    // (see the file-level comment).
+    EXPECT_TRUE(IsImplicitAlloc(AppParamDesc()));
 
     SQLFreeHandle(SQL_HANDLE_DESC, hdesc);
 }
