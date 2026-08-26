@@ -93,7 +93,10 @@ extends:
     # Python versions (unlike mssql-py-core).
     #
     # SANDBOX matrix: Linux x64/ARM64 (manylinux_2_34), musllinux x64/ARM64
-    # (Alpine, vendored OpenSSL), Windows x64/ARM64, and macOS universal2.
+    # (Alpine, vendored OpenSSL), Windows x64/ARM64, and macOS universal2 —
+    # seven wheels from five build jobs. Each Linux job builds both libc
+    # flavours for its architecture on one agent, so this stage asks for five
+    # concurrent agents rather than seven.
     ###########################################################################
     - stage: PublishMockPython
       displayName: 'Publish Mock Python (sandbox)'
@@ -136,11 +139,22 @@ extends:
             displayName: 'Preflight skipped'
 
       #####################################################################
-      # Linux x64 — manylinux_2_34 container build
+      # Linux x64 — manylinux_2_34 + musllinux_1_2 container builds.
+      # Both libc flavours share one agent: they want the same pool, the same
+      # demands and the same setup, and the build script is parameterized by
+      # container image. Merging them halves the RUST-X64-WUS3 agents this
+      # stage asks for at once, which is what the queue was starving on.
+      #
+      # musllinux is built with vendored (static) OpenSSL so the wheel is
+      # self-contained and does not depend on Alpine's libssl at the consumer
+      # side. manylinux leaves MATURIN_FEATURES unset and links the OS libssl.
+      #
+      # Each flavour writes to its own output subdirectory so the two builds
+      # cannot see each other's wheels.
       #####################################################################
       - job: BuildLinux_x64
         dependsOn: PreflightVersionCheck
-        displayName: 'Build mock wheel (Linux x64)'
+        displayName: 'Build mock wheels (Linux x64: manylinux + musllinux)'
         pool:
           type: linux
           isCustom: true
@@ -172,26 +186,44 @@ extends:
             BUILD_BUILDID: $(Build.BuildId)
             RELEASE_VERSION: ${{ parameters.releaseVersion }}
         - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
-          displayName: 'Build mock abi3 wheel (manylinux_2_34)'
+          displayName: 'Build mock abi3 wheel (manylinux_2_34 x86_64)'
           env:
             CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest
-            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
+            EXPECTED_PLATFORM_TAG: manylinux
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/manylinux
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
+          displayName: 'Build mock abi3 wheel (musllinux_1_2 x86_64)'
+          env:
+            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest
+            EXPECTED_PLATFORM_TAG: musllinux
+            MATURIN_FEATURES: vendored-openssl
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/musllinux
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - task: PublishPipelineArtifact@1
           displayName: 'Publish Linux x64 mock wheel'
           inputs:
-            targetPath: '$(ob_outputDirectory)/wheels'
+            targetPath: '$(ob_outputDirectory)/manylinux/wheels'
             artifact: 'drop_PublishMockPython_BuildLinux_x64_mock_linux_x64'
+            publishLocation: 'pipeline'
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish musllinux x64 mock wheel'
+          inputs:
+            targetPath: '$(ob_outputDirectory)/musllinux/wheels'
+            artifact: 'drop_PublishMockPython_BuildLinuxMusl_x64_mock_linux_musl_x64'
             publishLocation: 'pipeline'
 
       #####################################################################
-      # Linux ARM64 — manylinux_2_34 aarch64 container build
+      # Linux ARM64 — manylinux_2_34 + musllinux_1_2 aarch64 container builds.
+      # Same merge rationale as Linux x64 above, on RUST-ARM64-WUS3.
       #####################################################################
       - job: BuildLinux_arm64
         dependsOn: PreflightVersionCheck
-        displayName: 'Build mock wheel (Linux ARM64)'
+        displayName: 'Build mock wheels (Linux ARM64: manylinux + musllinux)'
         pool:
           type: linux
           isCustom: true
@@ -226,121 +258,31 @@ extends:
           displayName: 'Build mock abi3 wheel (manylinux_2_34 aarch64)'
           env:
             CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest
-            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
+            EXPECTED_PLATFORM_TAG: manylinux
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/manylinux
+            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
+          displayName: 'Build mock abi3 wheel (musllinux_1_2 aarch64)'
+          env:
+            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest
+            EXPECTED_PLATFORM_TAG: musllinux
+            MATURIN_FEATURES: vendored-openssl
+            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/musllinux
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - task: PublishPipelineArtifact@1
           displayName: 'Publish Linux ARM64 mock wheel'
           inputs:
-            targetPath: '$(ob_outputDirectory)/wheels'
+            targetPath: '$(ob_outputDirectory)/manylinux/wheels'
             artifact: 'drop_PublishMockPython_BuildLinux_arm64_mock_linux_arm64'
             publishLocation: 'pipeline'
-
-      #####################################################################
-      # musllinux x64 — musllinux_1_2 (Alpine) container build.
-      # Built with vendored (static) OpenSSL so the wheel is self-contained
-      # and does not depend on Alpine's libssl at the consumer side.
-      #####################################################################
-      - job: BuildLinuxMusl_x64
-        dependsOn: PreflightVersionCheck
-        displayName: 'Build mock wheel (musllinux x64)'
-        pool:
-          type: linux
-          isCustom: true
-          name: RUST-X64-WUS3
-          demands:
-            - imageOverride -equals RUST-UBUSLIM
-        variables:
-          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-          ob_artifactSuffix: '_mock_linux_musl_x64'
-          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
-          CARGO_TARGET_DIR: $(Build.SourcesDirectory)
-        steps:
-        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
-          parameters:
-            osType: Linux
-        - script: .pipeline/scripts/install-rustup.sh
-          displayName: 'Install Rustup'
-        - task: DockerInstaller@0
-          inputs:
-            dockerVersion: '29.0.0'
-          displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
-          parameters:
-            installDocker: true
-        - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
-          displayName: 'Stamp sandbox wheel version'
-          env:
-            WHEEL_VERSION: $(mockWheelVersion)
-            BUILD_BUILDID: $(Build.BuildId)
-            RELEASE_VERSION: ${{ parameters.releaseVersion }}
-        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
-          displayName: 'Build mock abi3 wheel (musllinux_1_2 x86_64)'
-          env:
-            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest
-            MATURIN_FEATURES: vendored-openssl
-            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
-            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
-            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
-        - task: PublishPipelineArtifact@1
-          displayName: 'Publish musllinux x64 mock wheel'
-          inputs:
-            targetPath: '$(ob_outputDirectory)/wheels'
-            artifact: 'drop_PublishMockPython_BuildLinuxMusl_x64_mock_linux_musl_x64'
-            publishLocation: 'pipeline'
-
-      #####################################################################
-      # musllinux ARM64 — musllinux_1_2 aarch64 (Alpine) container build.
-      # Vendored (static) OpenSSL, same rationale as musllinux x64.
-      #####################################################################
-      - job: BuildLinuxMusl_arm64
-        dependsOn: PreflightVersionCheck
-        displayName: 'Build mock wheel (musllinux ARM64)'
-        pool:
-          type: linux
-          isCustom: true
-          name: RUST-ARM64-WUS3
-          demands:
-            - imageOverride -equals RUST-UBUNTU-ARM64
-        variables:
-          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-          ob_artifactSuffix: '_mock_linux_musl_arm64'
-          mockWheelVersion: $[ dependencies.PreflightVersionCheck.outputs['computeVersion.mockWheelVersion'] ]
-          CARGO_TARGET_DIR: $(Build.SourcesDirectory)
-        steps:
-        - template: /.pipeline/templates/cargo-authenticate-template.yml@self
-          parameters:
-            osType: Linux
-        - script: .pipeline/scripts/install-rustup.sh
-          displayName: 'Install Rustup'
-        - task: DockerInstaller@0
-          inputs:
-            dockerVersion: '29.0.0'
-          displayName: 'Install Docker'
-        - template: /.pipeline/templates/install-ubuntu-dependency.yaml@self
-          parameters:
-            installDocker: true
-        - script: bash .pipeline/scripts/stamp-mock-wheel-version.sh
-          displayName: 'Stamp sandbox wheel version'
-          env:
-            WHEEL_VERSION: $(mockWheelVersion)
-            BUILD_BUILDID: $(Build.BuildId)
-            RELEASE_VERSION: ${{ parameters.releaseVersion }}
-        - script: bash .pipeline/scripts/build-mock-wheel-linux-host.sh
-          displayName: 'Build mock abi3 wheel (musllinux_1_2 aarch64)'
-          env:
-            CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest
-            MATURIN_FEATURES: vendored-openssl
-            OB_OUTPUTDIRECTORY: $(ob_outputDirectory)
-            BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
-            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - task: PublishPipelineArtifact@1
           displayName: 'Publish musllinux ARM64 mock wheel'
           inputs:
-            targetPath: '$(ob_outputDirectory)/wheels'
+            targetPath: '$(ob_outputDirectory)/musllinux/wheels'
             artifact: 'drop_PublishMockPython_BuildLinuxMusl_arm64_mock_linux_musl_arm64'
             publishLocation: 'pipeline'
 
@@ -512,8 +454,6 @@ extends:
         dependsOn:
         - BuildLinux_x64
         - BuildLinux_arm64
-        - BuildLinuxMusl_x64
-        - BuildLinuxMusl_arm64
         - BuildWindows_x64
         - BuildWindows_arm64
         - BuildMacOS_universal2
