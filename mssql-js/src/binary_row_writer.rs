@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use mssql_tds::datatypes::column_values::{
@@ -10,7 +11,7 @@ use mssql_tds::datatypes::column_values::{
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::row_writer::RowWriter;
 use mssql_tds::datatypes::sql_json::SqlJson;
-use mssql_tds::datatypes::sql_string::SqlString;
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use uuid::Uuid;
 
@@ -203,18 +204,18 @@ impl RowWriter for BinaryRowWriter {
         self.row_data.extend_from_slice(&val.to_le_bytes());
     }
 
-    fn write_string(&mut self, _col: usize, val: SqlString) {
-        let utf8 = val.to_utf8_string();
+    fn write_string(&mut self, _col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType) {
+        let utf8 = SqlString::decode(&bytes, encoding_type);
         let idx = self.intern_string(utf8);
         self.row_data.push(TAG_STRING_REF);
         self.row_data.extend_from_slice(&idx.to_le_bytes());
     }
 
-    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
+    fn write_bytes(&mut self, _col: usize, bytes: Cow<'_, [u8]>) {
         self.row_data.push(TAG_BYTES);
         self.row_data
-            .extend_from_slice(&(val.len() as u32).to_le_bytes());
-        self.row_data.extend_from_slice(&val);
+            .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.row_data.extend_from_slice(&bytes);
     }
 
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {

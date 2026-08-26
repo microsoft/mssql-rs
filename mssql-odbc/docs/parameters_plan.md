@@ -30,7 +30,11 @@ transparent reconnects.
   as that call's in/out `@handle`, so the server drops the old plan and prepares
   the new one in one round trip. `SQLExecDirect` supersede and
   `SQLFreeHandle(STMT)` use standalone `sp_unprepare` because they have no
-  `sp_prepexec` on which to piggyback.
+  `sp_prepexec` on which to piggyback. A data-at-execution execute also declines
+  to piggyback even though it does run `sp_prepexec`: the request stays open for
+  the whole `SQLPutData` sequence and may be cancelled before it reaches the
+  server, so evicting the superseded handle at build time could leak the plan
+  until disconnect. It rides along with the parked state instead.
 - **`sp_prepexec` failure ownership** - the pending handle remains in ODBC
   through reconnect, validation, parameter construction, and Always Encrypted
   setup. `mssql-tds` consumes it only when the prepexec RPC is ready to
@@ -71,12 +75,21 @@ transparent reconnects.
   never sees the placeholder. Version-aware, like msodbcsql's `Sql2CDefault`,
   which reads `rgbTRANSTYPE` for a 3.51-or-earlier application and
   `rgbTRANSTYPE380` otherwise: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET`
-  default to `SQL_C_BINARY` below ODBC 3.8. `SQL_SS_UDT` and `SQL_SS_TABLE` are
-  still rejected at bind time, since they need a server type name no describe
-  call reports.
-- **Value conversion** - `SQL_C_CHAR` maps to varchar and `SQL_C_WCHAR` to
-  nvarchar. Indicators support `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte
-  length.
+  default to `SQL_C_BINARY` below ODBC 3.8. `BoundParam` also records that the
+  binding was defaulted, because a resolved C type alone loses information the
+  execute path still needs - `SQL_DECIMAL` resolves to `SQL_C_CHAR`, and a NULL
+  built from that would go out as a `varchar`. A defaulted binding therefore
+  skips the conversion matrix (the resolved pairing is the SQL type's own
+  default, so it is supported by construction) and builds NULLs from
+  `ParameterType`. `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
+  time, since they need a server type name no describe call reports.
+- **Value conversion** - `SQL_C_CHAR` maps to varchar, `SQL_C_WCHAR` to
+  nvarchar, and `SQL_C_BINARY` to varbinary. Character indicators support
+  `SQL_NULL_DATA`, `SQL_NTS`, and explicit byte length; binary values use
+  explicit byte length or `BufferLength` when no indicator pointer is supplied.
+- **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
+  `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` as PLP
+  `(n)varchar(max)` / `varbinary(max)`, matching msodbcsql sequencing.
 
 ## `mssql-tds` prepared API
 
@@ -226,7 +239,8 @@ SQLSTATE constant or a never-constructed enum variant fails the lint gate:
 - [`params/conversion_matrix.rs`](../src/params/conversion_matrix.rs) - one row
   per C type listing the SQL types it converts to. Rows today: `SQL_C_CHAR` ->
   `CHAR` / `VARCHAR` / `LONGVARCHAR`, `SQL_C_WCHAR` -> `WCHAR` / `WVARCHAR` /
-  `WLONGVARCHAR`.
+  `WLONGVARCHAR`, and `SQL_C_BINARY` -> `BINARY` / `VARBINARY` /
+  `LONGVARBINARY`.
 - [`api/bind_param.rs`](../src/api/bind_param.rs) - runs both checks and stores
   the resolved C type on the binding.
 
@@ -422,11 +436,17 @@ accepting a pairing inbound that is rejected outbound for no principled reason.
   the wire type from `ParameterType` instead. Beyond this milestone the same
   work is needed for binary, `uniqueidentifier`, money, decimal, and date/time
   values.
-- **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`), data-at-exec
-  (`SQLParamData` / `SQLPutData`), parameter arrays
-  (`SQL_ATTR_PARAMSET_SIZE`), and TVPs. Data-at-exec requires an
-  `sp_prepare` + `sp_execute` branch because `sp_prepexec` cannot carry streamed
-  values.
+- **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
+  parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
+- **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
+  both `SQLPrepare` + `SQLExecute` and `SQLExecDirect` (see the
+  delivered-features list above and `data-at-execution-streaming.md`), and a
+  streamed execute keeps the statement prepared rather than falling back to
+  ad-hoc `sp_executesql`. A sequence that fails on the wire loses the request
+  and the socket, since a request interrupted mid-send cannot be retracted with
+  `EOM | IGNORE` the way a cancelled or driver-rejected one is; the session is
+  recovered lazily by the next execute via `check_and_reconnect`, matching
+  msodbcsql's `GetBatchCtxOrRecover`.
 - **Canonical procedure calls / `sp_prepexecrpc`:** support ODBC canonical
   calls (`{call proc(?)}`) with the appropriate parameter-count and single-row
   parameter-set guards. Ad-hoc T-SQL currently uses `sp_prepexec`.

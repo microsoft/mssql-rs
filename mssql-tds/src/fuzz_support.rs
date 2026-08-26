@@ -117,6 +117,19 @@ impl TdsPacketReader for FuzzReader {
         self.try_read_array().map(f64::from_le_bytes)
     }
 
+    // Without this the corpus never reaches the decoder's borrowed arm, so the
+    // length arithmetic behind it would go unfuzzed. Position moves before the
+    // borrow is taken, matching `BufferState::try_read_slice`.
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        let end = self.position.checked_add(length)?;
+        if end > self.data.len() {
+            return None;
+        }
+        let start = self.position;
+        self.position = end;
+        Some(&self.data[start..end])
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         if self.position >= self.data.len() {
             return Err(mssql_tds_error_eof());
@@ -582,6 +595,13 @@ impl TdsPacketReader for FuzzPacketReader {
         }
     }
 
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        match self {
+            Self::Fuzz(r) => r.try_read_slice(length),
+            Self::Empty(r) => r.try_read_slice(length),
+        }
+    }
+
     async fn read_byte(&mut self) -> TdsResult<u8> {
         match self {
             Self::Fuzz(r) => r.read_byte().await,
@@ -972,6 +992,12 @@ impl TdsPacketReader for MockTransport {
 
     fn try_read_float64(&mut self) -> Option<f64> {
         self.token_stream_reader.packet_reader.try_read_float64()
+    }
+
+    fn try_read_slice(&mut self, length: usize) -> Option<&[u8]> {
+        self.token_stream_reader
+            .packet_reader
+            .try_read_slice(length)
     }
 
     async fn read_byte(&mut self) -> TdsResult<u8> {

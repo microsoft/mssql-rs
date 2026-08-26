@@ -285,6 +285,12 @@ macro_rules! forward_row_values {
     };
 }
 
+// Lets test writers in other modules reuse the boilerplate. Any user must be a
+// tuple struct whose `.0` is the inner `RowWriter`.
+#[cfg(any(test, feature = "test-util", fuzzing))]
+#[allow(unused_imports)]
+pub(crate) use forward_row_values;
+
 #[cfg(any(test, feature = "test-util", fuzzing))]
 impl<W: RowWriter + Send + ?Sized> RowWriter for DynamicRowWriter<'_, W> {
     fn write_null(&mut self, col: usize) {
@@ -299,8 +305,7 @@ impl<W: RowWriter + Send + ?Sized> RowWriter for DynamicRowWriter<'_, W> {
         write_i64: i64,
         write_f32: f32,
         write_f64: f64,
-        write_string: crate::datatypes::sql_string::SqlString,
-        write_bytes: Vec<u8>,
+        write_bytes: std::borrow::Cow<'_, [u8]>,
         write_decimal: crate::datatypes::decoder::DecimalParts,
         write_numeric: crate::datatypes::decoder::DecimalParts,
         write_date: crate::datatypes::column_values::SqlDate,
@@ -320,10 +325,21 @@ impl<W: RowWriter + Send + ?Sized> RowWriter for DynamicRowWriter<'_, W> {
     fn end_row(&mut self) {
         self.0.end_row();
     }
+
+    // Carries two value arguments, so it does not fit `forward_row_values!`.
+    fn write_string(
+        &mut self,
+        col: usize,
+        bytes: std::borrow::Cow<'_, [u8]>,
+        encoding_type: crate::datatypes::sql_string::EncodingType,
+    ) {
+        self.0.write_string(col, bytes, encoding_type);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::Arc;
 
     use super::*;
@@ -334,6 +350,89 @@ mod tests {
     use crate::query::metadata::ColumnMetadata;
     use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_data};
     use crate::token::tokens::{ColMetadataToken, TokenType};
+
+    /// Forwards every write to an inner `DefaultRowWriter` and records whether
+    /// the string and binary values arrived still borrowed.
+    struct RefSpy(DefaultRowWriter, Vec<String>);
+
+    impl RowWriter for RefSpy {
+        fn write_null(&mut self, col: usize) {
+            self.0.write_null(col);
+        }
+
+        forward_row_values!(
+            write_bool: bool,
+            write_u8: u8,
+            write_i16: i16,
+            write_i32: i32,
+            write_i64: i64,
+            write_f32: f32,
+            write_f64: f64,
+            write_decimal: crate::datatypes::decoder::DecimalParts,
+            write_numeric: crate::datatypes::decoder::DecimalParts,
+            write_date: crate::datatypes::column_values::SqlDate,
+            write_time: crate::datatypes::column_values::SqlTime,
+            write_datetime: crate::datatypes::column_values::SqlDateTime,
+            write_smalldatetime: crate::datatypes::column_values::SqlSmallDateTime,
+            write_datetime2: crate::datatypes::column_values::SqlDateTime2,
+            write_datetimeoffset: crate::datatypes::column_values::SqlDateTimeOffset,
+            write_money: crate::datatypes::column_values::SqlMoney,
+            write_smallmoney: crate::datatypes::column_values::SqlSmallMoney,
+            write_uuid: uuid::Uuid,
+            write_xml: crate::datatypes::column_values::SqlXml,
+            write_json: crate::datatypes::sql_json::SqlJson,
+            write_vector: crate::datatypes::sql_vector::SqlVector,
+        );
+
+        fn write_string(
+            &mut self,
+            col: usize,
+            bytes: Cow<'_, [u8]>,
+            encoding_type: crate::datatypes::sql_string::EncodingType,
+        ) {
+            self.1.push(format!(
+                "string borrowed={}",
+                matches!(&bytes, Cow::Borrowed(_))
+            ));
+            self.0.write_string(col, bytes, encoding_type);
+        }
+
+        fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>) {
+            self.1.push(format!(
+                "bytes borrowed={}",
+                matches!(&bytes, Cow::Borrowed(_))
+            ));
+            self.0.write_bytes(col, bytes);
+        }
+
+        fn end_row(&mut self) {
+            self.0.end_row();
+        }
+    }
+
+    #[test]
+    fn dynamic_row_writer_forwards_borrows_intact() {
+        use crate::datatypes::sql_string::{EncodingType, SqlString};
+
+        let mut spy = RefSpy(DefaultRowWriter::new(2), Vec::new());
+
+        {
+            let mut wrapper = DynamicRowWriter(&mut spy);
+            wrapper.write_string(0, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
+            wrapper.write_bytes(1, Cow::Borrowed(&[1, 2, 3]));
+        }
+
+        // A wrapper that copied on the way through would deliver `Cow::Owned`,
+        // silently losing the zero-copy path for every writer behind it.
+        assert_eq!(spy.1, vec!["string borrowed=true", "bytes borrowed=true"]);
+        assert_eq!(
+            spy.0.take_row(),
+            vec![
+                ColumnValues::String(SqlString::new(b"h\0i\0".to_vec(), EncodingType::Utf16)),
+                ColumnValues::Bytes(vec![1, 2, 3]),
+            ]
+        );
+    }
 
     fn int_row_packet(value: i32) -> Vec<u8> {
         TestPacketBuilder::new(PacketType::TabularResult)

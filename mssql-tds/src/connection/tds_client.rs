@@ -1304,9 +1304,8 @@ impl TdsClient {
         // server acknowledged the feature, ask the server which parameters need
         // encryption and encrypt them in place before sending the real RPC.
         self.ensure_force_column_encryption_supported(named_params.iter())?;
-        let (timeout_sec, request_timeout, database_collation) = self
-            .prepare_sp_executesql_command(timeout_sec, cancel_handle)
-            .await?;
+        let (timeout_sec, request_timeout, database_collation) =
+            self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
 
         if self.should_encrypt_parameters() && !named_params.is_empty() {
             self.encrypt_parameters(
@@ -1414,9 +1413,8 @@ impl TdsClient {
         let mut params_list_as_string = String::new();
         build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
 
-        let (timeout_sec, _request_timeout, database_collation) = self
-            .prepare_sp_executesql_command(timeout_sec, cancel_handle)
-            .await?;
+        let (timeout_sec, _request_timeout, database_collation) =
+            self.prepare_rpc_command(timeout_sec, cancel_handle).await?;
         let rpc = self.build_sp_executesql_rpc(
             sql,
             materialized_params,
@@ -1424,7 +1422,7 @@ impl TdsClient {
             &database_collation,
         );
 
-        self.start_sp_executesql_streamed(
+        self.start_streamed_rpc(
             rpc,
             streamed_params,
             timeout_sec,
@@ -1434,7 +1432,11 @@ impl TdsClient {
         .await
     }
 
-    async fn prepare_sp_executesql_command(
+    /// Opens the command boundary, recovers a dead connection, and resolves the
+    /// per-command timeout/cancel state for an RPC the caller is about to build.
+    /// Shared by the `sp_executesql`, `sp_prepexec` and `sp_execute` streamed and
+    /// materialized entry points.
+    async fn prepare_rpc_command(
         &mut self,
         timeout_sec: Option<u32>,
         cancel_handle: Option<&CancelHandle>,
@@ -1503,7 +1505,9 @@ impl TdsClient {
         Ok((streamed_params, materialized_params))
     }
 
-    async fn start_sp_executesql_streamed(
+    /// Sends the RPC prefix plus the first streamed parameter's header, then
+    /// parks the half-written message so the caller can supply chunks.
+    async fn start_streamed_rpc(
         &mut self,
         rpc: SqlRpc<'_>,
         streamed_params: Vec<RpcParameter>,
@@ -1695,12 +1699,19 @@ impl TdsClient {
     /// stream) instead of appending to a corrupt message. The transport is closed
     /// because RESETCONNECTION applies only to a subsequent request and cannot
     /// terminate this incomplete RPC.
+    ///
+    /// The request is lost, but the session need not be: the open-batch flag is
+    /// cleared here, so a caller that keeps the client alive will pass
+    /// `is_recovery_possible` and reconnect on its next
+    /// [`check_and_reconnect`](Self::check_and_reconnect).
     async fn abort_streamed_write(&mut self) {
         self.streamed_write_state = StreamedWriteState::Idle;
         self.execution_context.set_has_open_batch(false);
+        // A streamed `sp_prepexec` armed a capture for the `@handle` RETURNVALUE
+        // that will now never arrive; leaving it armed would divert an unrelated
+        // RPC's first return value into the handle map.
+        self.abort_pending_prepare_capture();
         self.transport.mark_known_dead();
-        // TODO: Match msodbcsql's state-aware cancellation: discard an unsent
-        // request locally, or send EOM | IGNORE and drain DONE after a partial send.
         if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after streamed write abort");
         }
@@ -1708,21 +1719,69 @@ impl TdsClient {
 
     /// Cancels an in-progress streamed PLP write while the client is parked in
     /// [`StreamedParamStatus::NeedData`](StreamedParamStatus::NeedData),
-    /// discarding the half-written RPC and closing the transport.
+    /// discarding the half-written RPC.
     ///
     /// This is the supported way for a caller to bail out of a streamed
     /// parameter sequence once [`begin_sp_executesql`](Self::begin_sp_executesql)
     /// has parked a message (for example, to service `SQLCancel` while an ODBC
-    /// driver is between `SQLPutData` calls). After this returns, no streamed
-    /// write is active, so a subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
+    /// driver is between `SQLPutData` calls, or to unwind after the driver
+    /// rejects a chunk). After this returns, no streamed write is active, so a
+    /// subsequent [`write_streamed_chunk`](Self::write_streamed_chunk),
     /// [`write_streamed_null`](Self::write_streamed_null), or
     /// [`end_streamed_param`](Self::end_streamed_param) fails with a usage
     /// error. Calling this with no streamed write active is a no-op.
+    ///
+    /// The connection normally survives, which is what lets an application keep
+    /// using a statement after a cancelled or rejected data-at-execution
+    /// sequence. How that is achieved depends on how much of the request has
+    /// escaped, mirroring msodbcsql's state-aware cancel:
+    ///
+    /// - nothing sent yet: the parked message is dropped locally and no bytes
+    ///   go to the server at all;
+    /// - partially sent: the message is closed with an EOM | IGNORE packet so
+    ///   the server discards it, and the DONE it answers with is consumed.
+    ///
+    /// Only if that handshake fails does the transport close, since the request
+    /// is then neither complete nor retractable.
     pub async fn cancel_streamed_write(&mut self) {
-        if matches!(self.streamed_write_state, StreamedWriteState::Idle) {
+        let StreamedWriteState::Active(context) =
+            std::mem::replace(&mut self.streamed_write_state, StreamedWriteState::Idle)
+        else {
+            return;
+        };
+        // Same reasoning as `abort_streamed_write`: a cancelled `sp_prepexec`
+        // never yields its `@handle`, so the capture must not stay armed.
+        self.abort_pending_prepare_capture();
+
+        if context.message.nothing_sent() {
+            // Not a plain drop: the message consumed the connection's pending
+            // RESETCONNECTION bit when it was opened, and it never reached the
+            // network to carry it. `abandon` puts it back so the next request
+            // does, keeping the pool's one-shot reset honest.
+            context.message.abandon(self.transport.as_writer());
+            self.execution_context.set_has_open_batch(false);
             return;
         }
-        self.abort_streamed_write().await;
+
+        let mut packet_writer = PacketWriter::resume(context.message, self.transport.as_writer());
+        let ignored = packet_writer.cancel_current_message().await;
+        drop(packet_writer);
+
+        if let Err(error) = ignored {
+            warn!(%error, "Failed to send ignore packet for cancelled streamed write");
+            self.abort_streamed_write().await;
+            return;
+        }
+
+        // The server acknowledges an ignored message with a DONE. Leaving it
+        // unread would desynchronize the next command on this connection.
+        if let Err(error) = self.drain_stream().await {
+            warn!(%error, "Failed to drain response to cancelled streamed write");
+            self.abort_streamed_write().await;
+            return;
+        }
+
+        self.execution_context.set_has_open_batch(false);
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -2102,6 +2161,9 @@ impl TdsClient {
             // TDS protocol state so the connection can be reused.
             // The stream is always in a clean state here because writes are never
             // dropped mid-flight (issue #513).
+            // If the attention is never acknowledged the transport marks itself
+            // dead, so clearing the batch flag below cannot hand out a connection
+            // with an ATTENTION still outstanding.
             let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
             let _ = self.send_attention_with_timeout(attention_timeout).await;
             // Clear the open batch flag since we've cancelled the operation
@@ -2726,6 +2788,162 @@ impl TdsClient {
                 result
             }
         }
+    }
+
+    /// Streaming counterpart to [`execute_prepared`](Self::execute_prepared) for
+    /// statements carrying [`RpcParameter::data_at_exec`] parameters.
+    ///
+    /// Data-at-execution does not change which procedure runs the statement: the
+    /// streamed values are written into the same `sp_prepexec` / `sp_execute`
+    /// RPC the statement would have used with materialized values, so a prepared
+    /// statement stays prepared and keeps reusing its handle. This mirrors
+    /// msodbcsql, which discovers data-at-execution while building the RPC and
+    /// parks the half-written request rather than switching procedures.
+    ///
+    /// Routing matches [`execute_prepared`](Self::execute_prepared): a handle
+    /// belonging to the live session is reused via `sp_execute`, otherwise the
+    /// statement is prepared and executed in one round trip via `sp_prepexec`.
+    /// With no streamed parameters this defers to
+    /// [`execute_prepared`](Self::execute_prepared) and reports
+    /// [`StreamedParamStatus::Complete`].
+    ///
+    /// On the `sp_prepexec` route `statement` receives its issued
+    /// [`StatementId`] as soon as the request is parked, because the server's
+    /// `@handle` trails the result set and is only captured during the drain —
+    /// long after this returns. The id resolves through the client's handle map,
+    /// so a sequence that never reaches the server (a
+    /// [`cancel_streamed_write`](Self::cancel_streamed_write), a mid-stream
+    /// failure) leaves it inert and the next execute re-prepares.
+    ///
+    /// Unlike [`execute_prepared`](Self::execute_prepared), `orphaned` is never
+    /// consumed here: its drop is not piggybacked onto the `@handle` argument.
+    /// The request stays open for the whole application-driven chunk sequence
+    /// and may be discarded server-side, which would evict the orphan from the
+    /// client's map while the server still held the plan. The caller keeps it
+    /// and releases it with [`unprepare`](Self::unprepare).
+    ///
+    /// # Errors
+    /// Returns a usage error for invalid streamed parameters, for an already
+    /// executing command, or when Always Encrypted is active for this command,
+    /// plus transport/serialization errors from the parked request.
+    pub async fn begin_execute_prepared<'a>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        named_params: Vec<RpcParameter>,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<StreamedParamStatus> {
+        if self.command_is_busy() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let opts = options.into();
+        self.current_command_ce_setting = opts.column_encryption;
+        self.ensure_force_column_encryption_supported(named_params.iter())?;
+
+        let (streamed_params, materialized_params) =
+            Self::split_and_validate_streamed_params(named_params)?;
+
+        if streamed_params.is_empty() {
+            let result = self
+                .execute_prepared(statement, materialized_params, orphaned, opts)
+                .await?;
+            return Ok(StreamedParamStatus::Complete(result));
+        }
+
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Streamed PLP parameter writes are not supported with Always Encrypted."
+                    .to_string(),
+            ));
+        }
+
+        let (timeout_sec, _request_timeout, database_collation) =
+            self.prepare_rpc_command(opts.timeout, opts.cancel).await?;
+
+        // Reuse the statement's handle when the client still holds one; a
+        // reconnect clears the map, so an id from a dead session re-prepares.
+        let live_handle = statement
+            .id
+            .and_then(|id| self.prepared_handles.get(&id).copied());
+
+        let (rpc, issued_id) = match live_handle {
+            Some(handle) => {
+                // `sp_execute` carries the handle plus the parameter values; the
+                // prepared plan already declares their types, so there is no
+                // `@params` string the streamed entries have to appear in.
+                let handle_parameter =
+                    RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
+                let rpc = SqlRpc::new(
+                    RpcType::ProcId(RpcProcs::Execute),
+                    Some(vec![handle_parameter]),
+                    Some(materialized_params),
+                    &database_collation,
+                    &self.execution_context,
+                );
+                (rpc, None)
+            }
+            None => {
+                // The `@params` declaration covers the streamed parameters too,
+                // even though their values arrive later.
+                let mut declaration_params = materialized_params.clone();
+                declaration_params.extend(streamed_params.iter().cloned());
+                let mut params_list_as_string = String::new();
+                build_parameter_list_string(&declaration_params, &mut params_list_as_string)?;
+
+                let statement_parameter = RpcParameter::new(
+                    None,
+                    StatusFlags::NONE,
+                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(statement.sql.clone()))),
+                );
+                let params_parameter = RpcParameter::new(
+                    None,
+                    StatusFlags::NONE,
+                    SqlType::NVarcharMax(Some(SqlString::from_utf8_string(params_list_as_string))),
+                );
+                // NULL by-reference `@handle`: prepare fresh, with no piggybacked
+                // drop — see this method's docs on `orphaned`.
+                let handle_parameter =
+                    RpcParameter::new(None, StatusFlags::BY_REF_VALUE, SqlType::Int(None));
+
+                let rpc = SqlRpc::new(
+                    RpcType::ProcId(RpcProcs::PrepExec),
+                    Some(vec![
+                        handle_parameter,
+                        params_parameter,
+                        statement_parameter,
+                    ]),
+                    Some(materialized_params),
+                    &database_collation,
+                    &self.execution_context,
+                );
+
+                // Armed after the RPC is built, so a build failure cannot leave a
+                // stale target: the `@handle` RETURNVALUE trailing the result set
+                // is recorded under this id during the drain.
+                self.pending_prepared_param_encryption = None;
+                let issued_id = self.issue_statement_id();
+                self.pending_capture = Some(issued_id);
+                (rpc, Some(issued_id))
+            }
+        };
+
+        // A serialization failure in here aborts the streamed write, which also
+        // disarms the capture armed above.
+        let status = self
+            .start_streamed_rpc(
+                rpc,
+                streamed_params,
+                timeout_sec,
+                opts.cancel,
+                database_collation,
+            )
+            .await?;
+
+        if let Some(issued_id) = issued_id {
+            statement.id = Some(issued_id);
+        }
+        Ok(status)
     }
 
     /// Issues the next unique [`StatementId`] for a managed prepared statement.
@@ -10014,6 +10232,248 @@ mod tests {
         assert!(matches!(err, UsageError(_)));
     }
 
+    // ── begin_execute_prepared: data-at-execution keeps the prepared path ──
+    //
+    // Data-at-execution must not downgrade a prepared statement to ad-hoc
+    // `sp_executesql`, so these pin the proc id that actually reaches the wire:
+    // sp_prepexec (13) is `FF FF 0D 00`, sp_execute (12) is `FF FF 0C 00`.
+
+    #[tokio::test]
+    async fn begin_execute_prepared_streams_into_sp_prepexec_when_unmaterialized() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        let status = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+
+        let statement_id = statement
+            .id()
+            .expect("the parked prepexec must claim an identity for its @handle");
+
+        client.write_streamed_chunk(&[0xAA, 0xBB]).await.unwrap();
+        let status = client
+            .end_streamed_param()
+            .await
+            .expect("closing the only streamed parameter completes the RPC");
+        assert!(matches!(status, StreamedParamStatus::Complete(_)));
+
+        // Asserted after finalize: the parked prefix stays buffered until the
+        // last parameter closes, so nothing is on the wire before that.
+        assert!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]),
+            "a data-at-execution prepare must go out as sp_prepexec"
+        );
+        assert_eq!(
+            client.prepared_handles.get(&statement_id).copied(),
+            Some(9),
+            "the trailing @handle must materialize under the claimed identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_execute_prepared_streams_into_sp_execute_when_handle_is_live() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let statement_id = sid(1);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t(v) VALUES (@v)", statement_id);
+        client.prepared_handles.insert(statement_id, 55);
+        let mut orphaned = None;
+
+        let status = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(matches!(status, StreamedParamStatus::NeedData { .. }));
+        assert_eq!(
+            statement.id(),
+            Some(statement_id),
+            "reuse must keep the statement's identity"
+        );
+        assert!(
+            client.pending_capture.is_none(),
+            "sp_execute returns no @handle, so no capture may be armed"
+        );
+
+        client.write_streamed_chunk(&[0xAA]).await.unwrap();
+        let status = client.end_streamed_param().await.unwrap();
+        assert!(matches!(status, StreamedParamStatus::Complete(_)));
+
+        let bytes = sent.lock().unwrap().clone();
+        assert!(
+            bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0x0C, 0x00]),
+            "a live handle must be reused via sp_execute, not re-prepared"
+        );
+        // The @handle positional addressing plan 55 — see
+        // `execute_prepared_reuses_a_live_handle_via_sp_execute` for the layout.
+        let expected = [0x00, 0x00, 0x26, 0x04, 0x04, 0x37, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(expected.len()).any(|w| w == expected),
+            "the streamed sp_execute must address the cached handle"
+        );
+    }
+
+    /// With no streamed parameters the call is an ordinary prepared execute and
+    /// reports its result directly rather than parking.
+    #[tokio::test]
+    async fn begin_execute_prepared_without_streamed_params_completes() {
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("SELECT 1");
+        let mut orphaned = None;
+
+        let status = client
+            .begin_execute_prepared(&mut statement, Vec::new(), &mut orphaned, ())
+            .await
+            .expect("a materialized-only execute must not park");
+        assert!(matches!(status, StreamedParamStatus::Complete(_)));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(
+            sent.lock()
+                .unwrap()
+                .windows(4)
+                .any(|w| w == [0xFF, 0xFF, 0x0D, 0x00])
+        );
+    }
+
+    /// The orphan's drop is not piggybacked onto a streamed prepexec: the
+    /// request stays open for the whole chunk sequence and may never reach the
+    /// server, so releasing it here could lose a live server-side plan.
+    #[tokio::test]
+    async fn begin_execute_prepared_keeps_the_orphan_for_the_caller() {
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        let orphan_id = sid(1);
+        client.prepared_handles.insert(orphan_id, 77);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = Some(orphan_id);
+
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+
+        assert_eq!(
+            orphaned,
+            Some(orphan_id),
+            "the caller keeps ownership of the orphan's release"
+        );
+        assert_eq!(
+            client.prepared_handles.get(&orphan_id).copied(),
+            Some(77),
+            "the orphan's handle must stay live and releasable via unprepare"
+        );
+    }
+
+    /// Cancelling a parked `sp_prepexec` disarms the `@handle` capture. Leaving
+    /// it armed would divert the next unrelated RPC's first RETURNVALUE into the
+    /// handle map, aliasing a plan the statement never prepared.
+    #[tokio::test]
+    async fn cancel_streamed_write_disarms_the_prepexec_handle_capture() {
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(client.pending_capture.is_some());
+
+        client.cancel_streamed_write().await;
+
+        assert!(client.pending_capture.is_none());
+        let statement_id = statement.id().expect("the parked prepexec claimed an id");
+        assert!(
+            !client.prepared_handles.contains_key(&statement_id),
+            "a cancelled prepare leaves the identity inert so the next execute re-prepares"
+        );
+    }
+
+    /// Opening a streamed RPC consumes the connection's pending RESETCONNECTION
+    /// bit. Cancelling before the first packet goes out must return it, or the
+    /// pool's one-shot reset is silently swallowed.
+    #[tokio::test]
+    async fn cancel_streamed_write_rearms_an_unsent_connection_reset() {
+        use crate::message::messages::PacketStatusFlags;
+        use crate::token::tokens::{EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType};
+
+        // The request that ends up carrying the re-armed bit must see the
+        // server acknowledge it, or the client declares the session dirty and
+        // fails it - see `observe_response_token`.
+        let (mut client, sent) = create_capturing_client(vec![
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            done_no_more(),
+        ]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        client.prepare_reset_connection(false);
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the parked message must not have reached the network yet"
+        );
+
+        client.cancel_streamed_write().await;
+
+        client
+            .execute("SELECT 1".to_string(), ())
+            .await
+            .expect("the next request should succeed");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent[1] & PacketStatusFlags::ResetConnection as u8,
+            PacketStatusFlags::ResetConnection as u8,
+            "the reset the cancelled message consumed must ride the next request"
+        );
+    }
+
     /// Cancelling while idle must be a no-op that keeps the connection reusable.
     #[tokio::test]
     async fn cancel_streamed_write_on_idle_client_is_noop() {
@@ -10029,11 +10489,11 @@ mod tests {
         ));
     }
 
-    /// Cancelling an active streamed write must discard parked state and mark
-    /// the connection dead so it cannot be reused by a pool checkout.
+    /// Cancelling before any packet has left the client discards the request
+    /// locally: nothing is written to the wire and the connection stays usable.
     #[tokio::test]
-    async fn cancel_streamed_write_aborts_active_stream_and_marks_connection_dead() {
-        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+    async fn cancel_streamed_write_before_first_packet_discards_locally() {
+        let (mut client, sent) = create_capturing_client(vec![]);
         let status = client
             .begin_sp_executesql(
                 "INSERT INTO t(v) VALUES (@v)".to_string(),
@@ -10046,17 +10506,217 @@ mod tests {
             status,
             StreamedParamStatus::NeedData { param_name: _ }
         ));
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the RPC header must still be buffered, not on the wire"
+        );
+
+        client.cancel_streamed_write().await;
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a request the server never saw must not be cancelled over the wire"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "abandoning an unsent request must leave the connection reusable"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(matches!(
+            client.write_streamed_chunk(&[0x01]).await,
+            Err(UsageError(_))
+        ));
+    }
+
+    /// Cancelling after part of the request is on the wire closes the message
+    /// with EOM | IGNORE so the server discards it, consumes the DONE it
+    /// answers with, and keeps the connection reusable.
+    #[tokio::test]
+    async fn cancel_streamed_write_after_partial_send_ignores_and_drains() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+
+        // Overflow the payload buffer so at least one packet is flushed.
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
+        let sent_before_cancel = sent.lock().unwrap().len();
+        assert!(
+            sent_before_cancel > 0,
+            "a large chunk must have flushed at least one packet"
+        );
+
+        client.cancel_streamed_write().await;
+
+        // The trailing packet must carry EOM | IGNORE and no payload.
+        let wire = sent.lock().unwrap().clone();
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "the cancelled message must be terminated with an ignore packet"
+        );
+        assert_eq!(
+            u16::from_be_bytes([last[2], last[3]]) as usize,
+            PacketWriter::PACKET_HEADER_SIZE
+        );
+
+        assert!(
+            !client.is_connection_dead(),
+            "an ignored request leaves the connection clean for reuse"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+        assert!(matches!(
+            client.write_streamed_chunk(&[0x01]).await,
+            Err(UsageError(_))
+        ));
+    }
+
+    /// If the ignore packet cannot be sent, the request is neither complete nor
+    /// retracted, so the connection must be closed rather than handed back.
+    #[tokio::test]
+    async fn cancel_streamed_write_falls_back_to_close_when_ignore_fails() {
+        let (mut client, fail) = create_failing_capturing_client(vec![done_no_more()]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        client.cancel_streamed_write().await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a request that could not be retracted must not be reused"
+        );
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    /// The retraction is only complete once the DONE the server answers the
+    /// ignore packet with has been consumed. If that read fails the next
+    /// command on this connection would pick the DONE up as its own, so the
+    /// connection is closed instead of pooled.
+    #[tokio::test]
+    async fn cancel_streamed_write_falls_back_to_close_when_the_drain_fails() {
+        // No DONE queued: the ignore packet goes out but is never acknowledged.
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        client
+            .begin_sp_executesql(
+                "INSERT INTO t(v) VALUES (@v)".to_string(),
+                vec![streamed_varbinary("@v")],
+                (),
+            )
+            .await
+            .expect("begin must park for streamed value");
+        client
+            .write_streamed_chunk(&vec![0xABu8; 10_000])
+            .await
+            .unwrap();
 
         client.cancel_streamed_write().await;
 
         assert!(
             client.is_connection_dead(),
-            "an aborted streamed write must not hand a live-looking connection back to the pool"
+            "an unacknowledged retraction leaves the stream desynchronized"
         );
         assert!(matches!(
-            client.write_streamed_chunk(&[0x01]).await,
-            Err(UsageError(_))
+            client.streamed_write_state,
+            StreamedWriteState::Idle
         ));
+    }
+
+    /// A parked streamed write owns the connection until it closes. A second
+    /// execute would interleave its RPC into the half-written request.
+    #[tokio::test]
+    async fn begin_execute_prepared_rejects_a_second_call_while_streaming() {
+        let (mut client, _sent) = create_capturing_client(vec![]);
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+
+        client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                (),
+            )
+            .await
+            .expect("begin must park for the streamed value");
+
+        let mut second = PreparedStatement::new("SELECT 1");
+        let err = client
+            .begin_execute_prepared(&mut second, Vec::new(), &mut orphaned, ())
+            .await
+            .expect_err("the connection is busy with a parked streamed write");
+        assert!(matches!(err, UsageError(_)));
+    }
+
+    /// Always Encrypted resolves parameter ciphertext from the complete value
+    /// set before the request is built, which a value that only arrives in later
+    /// chunks cannot satisfy. The combination is refused rather than silently
+    /// sent as plaintext.
+    #[tokio::test]
+    async fn begin_execute_prepared_rejects_streamed_params_under_always_encrypted() {
+        use crate::connection::client_context::ExecutionColumnEncryptionSetting;
+        use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
+        use crate::message::login::Feature;
+
+        let mut negotiated_settings =
+            crate::handler::handler_factory::create_test_negotiated_settings_internal();
+        let mut feature = AlwaysEncryptedFeature::default();
+        feature.set_acknowledged(true);
+        negotiated_settings
+            .session_settings
+            .supported_features
+            .push(Box::new(feature));
+
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            negotiated_settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            ClientContext::with_data_source("tcp:localhost,1433"),
+            Vec::new(),
+        );
+
+        let mut statement = PreparedStatement::new("INSERT INTO t(v) VALUES (@v)");
+        let mut orphaned = None;
+        let err = client
+            .begin_execute_prepared(
+                &mut statement,
+                vec![streamed_varbinary("@v")],
+                &mut orphaned,
+                ExecuteOptions::new().column_encryption(ExecutionColumnEncryptionSetting::Enabled),
+            )
+            .await
+            .expect_err("a streamed value cannot be encrypted");
+        assert!(matches!(err, UsageError(_)));
     }
 
     /// `write_streamed_chunk` with no active streamed parameter is a usage error.

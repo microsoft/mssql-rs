@@ -73,6 +73,16 @@ macro_rules! define_tds_packet_reader {
                 None
             }
 
+            /// Borrows and consumes `length` buffered bytes, or returns `None`
+            /// without consuming when the whole run is not already resident.
+            ///
+            /// The borrow ends at the next use of the reader, so a caller must
+            /// copy or hand the bytes off before reading again.
+            #[inline]
+            fn try_read_slice(&mut self, _length: usize) -> Option<&[u8]> {
+                None
+            }
+
             fn read_byte(&mut self) -> impl Future<Output = TdsResult<u8>> + Send;
             fn read_int16_big_endian(&mut self) -> impl Future<Output = TdsResult<i16>> + Send;
             fn read_int32_big_endian(&mut self) -> impl Future<Output = TdsResult<i32>> + Send;
