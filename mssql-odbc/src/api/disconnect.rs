@@ -180,8 +180,7 @@ mod tests {
     /// that SQLDisconnect automatically drops any statements and descriptors
     /// open on the connection"), leaving `DbcState::descriptors` empty so a
     /// later `SQLFreeHandle(SQL_HANDLE_DBC)` doesn't trip its
-    /// "DM should have freed all explicit DESCs" debug_assert, and so the
-    /// `DescHandle` doesn't outlive the connection it points back to.
+    /// "DM should have freed all explicit DESCs" debug_assert.
     #[test]
     fn disconnect_frees_outstanding_explicit_descriptors() {
         use crate::api::odbc_types::SQL_HANDLE_DESC;
@@ -224,10 +223,14 @@ mod tests {
 
         assert_eq!(unsafe { sql_disconnect(dbc) }, SQL_SUCCESS);
         assert!(dbc_ref.inner.lock().unwrap().descriptors.is_empty());
-
-        // The freed descriptor is stamped Invalid, not left dangling.
-        let desc_ref = unsafe { &*(desc as *const DescHandle) };
-        assert_eq!(desc_ref.object_type, HandleType::Invalid);
+        // Deliberately not asserting on `desc`'s memory here: `free_handle`
+        // stamps `object_type = Invalid` before dropping the box, but reading
+        // it back through the now-dangling `desc` pointer is a use-after-free
+        // read — technically UB regardless of platform. It happened to read
+        // back correctly on Windows/Linux (the freed block wasn't reused
+        // before the read) but not on macOS, whose allocator reused it
+        // sooner. The connection no longer tracking the descriptor (checked
+        // above) is the real, safely-observable contract.
 
         unsafe {
             sql_free_handle(SQL_HANDLE_DBC, dbc);
