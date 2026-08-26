@@ -70,27 +70,37 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    settled it, far cheaper than re-reading the whole history.
 
    *If* an automated **Code Coverage Report** comment is present, read it before
-   writing any coverage finding (see "Verify Before You Claim"). Its absence is
-   usually expected rather than a CI failure — see the same section.
+   writing any coverage finding; its absence is usually expected rather than a CI
+   failure. Both under "Verify Before You Claim".
 4. Verify claims against the actual code — do not assume. Read surrounding code when
    a change's correctness depends on context: callers of changed functions,
    implementers of changed traits, and the layer above and below the change.
-5. Run the suite yourself rather than trusting the checklist. The runner is
-   `cargo nextest` / `cargo btest`, never `cargo test`. Pick the crate and targets the
-   diff actually touches — a `-p mssql-tds --lib` run validates nothing in a PR
-   confined to `mssql-odbc`, the JS or Python bindings, or the e2e suites.
+5. **Run tests to answer a question, not to re-collect a verdict.** CI runs the suite
+   and the merge is gated on it, so `gh pr checks` from step 3 already tells you pass
+   or fail — across platforms and cross-repo suites you cannot reproduce locally.
+   Rebuilding the workspace to learn the same thing costs minutes and returns less.
+
+   Build and run when you need something the CI result cannot give you:
+
+   - **Does this new test actually guard the change?** Mutate the constant, operator
+     or condition the PR changed and confirm the test fails. This is what catches
+     vacuous tests and is the highest-value reason to build locally.
+   - **Is this failure the PR's, or pre-existing?** Run the *same invocation* on
+     `$BASE` and compare failure sets; only the difference belongs in the review.
+   - **Is this coverage gap real?** Introduce the bug the missing test would catch and
+     show the suite still passes.
 
    ```bash
    cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
    ```
 
-   Some tests fail on a clean tree because their fixtures aren't generated locally, so
-   never attribute a failure to the PR without a baseline — run the *same invocation*
-   on `$BASE` and compare failure sets. Only the difference belongs in the review.
-   Feature selection changes both the test count and which tests fail, so don't
-   compare a `--all-features` run against a default one. (Historically the pre-existing
-   failures have been `certificate_validator` tests looking for
-   `tests/test_certificates/*.pem`. Confirm rather than assume.)
+   The runner is `cargo nextest` / `cargo btest`, never `cargo test`. Pick the crate
+   and targets the diff touches — `-p mssql-tds --lib` validates nothing in a PR
+   confined to `mssql-odbc`, the JS or Python bindings, or the e2e suites. Feature
+   selection changes both the test count and which tests fail, so never compare a
+   `--all-features` run against a default one. Some tests fail on a clean tree because
+   their fixtures aren't generated locally (historically `certificate_validator`
+   looking for `tests/test_certificates/*.pem`) — which is why the baseline matters.
 6. **Present the review in chat and wait for explicit human confirmation before
    posting anything to GitHub.** Inline comments are drafted against
    `file:line`, not submitted, until they say so. Having the review fully written and
@@ -113,28 +123,20 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
 
 ## What to Check
 
-Evaluate each area. Skip areas that don't apply rather than padding the review.
+Correctness, security, tests, readability, performance and API surface all apply as
+usual — skip areas that don't apply rather than padding the review. What is worth
+stating here is only what is specific to this repo, or easy to get wrong in it:
 
-- **Correctness**: Logic bugs, off-by-one, null/empty/boundary cases, error handling,
-  race conditions, incorrect assumptions.
-- **Security**: OWASP Top 10 — injection, broken auth/access control, SSRF,
-  deserialization. Hardcoded secrets/credentials. Unvalidated input at trust
-  boundaries. Unsafe defaults.
-- **Tests**: New/changed behavior has tests. Tests assert real behavior (not
-  tautologies). Edge cases and failure paths covered. Flag untested risky changes.
-  When CI posts a diff-coverage comment, read it for the current target and whether
-  it is enforced rather than computing one locally (see "Verify Before You Claim").
-- **Readability & maintainability**: Clear naming, reasonable function size, no
-  needless complexity or duplication, comments explain *why* not *what*.
-- **Performance**: N+1 queries, lock contention and lock scope, memory copies,
-  unnecessary allocations in hot paths, blocking I/O on async paths, O(n²) where
-  avoidable, network round trips. Only raise when impact is plausible — and on the
-  row-decode path, only with a timing (see "Verify Before You Claim").
-- **API & breaking changes**: Public signatures, serialization formats, config, and
-  the FFI surface (`#[napi]`, `#[pyclass]`, `extern "C"`). Flag breaking changes and
-  whether they're versioned/documented.
-- **Repo conventions**: Match existing patterns, style, and structure in the
-  codebase. Respect `.github/copilot-instructions.md` and any `AGENTS.md`.
+- **Tests** are the highest-yield area. "Has a test" is not the question; "does the
+  test fail when the change is reverted" is.
+- **Performance** on the row-decode path needs a timing, never a byte table.
+- **API & breaking changes** include the FFI surface — `#[napi]`, `#[pyclass]`,
+  `extern "C"` — not just Rust signatures, and "breaking" needs a publication check.
+- **Repo conventions** live in `.github/copilot-instructions.md`,
+  `.github/instructions/*.md` and any `AGENTS.md`. Cite one before flagging a
+  convention.
+
+All four are expanded under "Verify Before You Claim", which is where the evidence is.
 
 ## mssql-rs Specifics
 
@@ -214,9 +216,8 @@ the rule exists and do not need re-deriving. Last reviewed 2026-08.
     `es-metadata.yml` never generates one; fork PRs need a maintainer to comment
     `/coverage`. Read the workflow's `paths-ignore` before reporting a missing report.
 - **Coverage gaps**: don't assert one, prove it. Introduce the bug the missing test
-  would catch, run `cargo nextest run -p mssql-tds --lib --no-fail-fast`, show the
-  suite still passes, then restore. Costs about two minutes and converts a concern
-  into a fact.
+  would catch, run the affected crate's suite, show it still passes, then restore.
+  One incremental build and a suite run converts a concern into a fact.
 - **"This is a breaking API change"**: check that anything outside the workspace could
   observe it. `mssql-tds` is unpublished and pre-1.0, and the sibling crates build
   `ClientContext` through `Default`/`From` rather than struct literals, so a field
@@ -301,17 +302,14 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
 
 ## Principles
 
-- Be specific and actionable; avoid vague praise or vague criticism.
 - **Question a departure from the reference drivers before auditing inside it.** When
-  a change diverges from `msodbcsql` / `SqlClient` / `mssql-jdbc` behavior, the divergence
-  is the first thing to examine — hardening a path that shouldn't exist is wasted review.
-  If a PR's own design doc reaches opposite conclusions in two places, that contradiction
-  *is* the finding.
-- If a change is correct, don't invent problems. An empty severity group means "none
-  found" — say so briefly.
+  a change diverges from `msodbcsql` / `SqlClient` / `mssql-jdbc` behavior, the
+  divergence is the first thing to examine — hardening a path that shouldn't exist is
+  wasted review. If a PR's own design doc reaches opposite conclusions in two places,
+  that contradiction *is* the finding.
 - Distinguish facts (verified in code) from concerns (worth checking). Don't state
   guesses as defects. Say what you ran and what you read.
-- Prefer the smallest correct fix over large refactors unless the PR's goal requires
-  more.
+- If a change is correct, don't invent problems. An empty severity group means "none
+  found" — say so briefly.
 - Reviewing is not merging. The PR author owns the merge — never merge someone
   else's PR.
