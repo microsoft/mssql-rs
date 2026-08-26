@@ -1550,16 +1550,9 @@ mod tests {
         assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
     }
 
-    /// AB#47507 — SQLGetData must return SQLSTATE 22002 ("Indicator variable
-    /// required but not supplied") when the value is NULL and the caller
-    /// supplied no indicator, matching msodbcsql and the bound-column path
-    /// (fetch_scroll.rs::deliver_bound). Before this check existed,
-    /// SQLGetData silently returned SQL_SUCCESS and left the caller's output
-    /// buffer untouched. mssql-python's SQLGetData_wrap relies on the
-    /// ODBC-mandated error to detect NULL for fixed-width C types — it fetches
-    /// SQL_INTEGER et al. with a null indicator and falls back to `None` only
-    /// when SQLGetData fails — so the missing check meant callers read back
-    /// whatever was already on their stack as if it were the column's value.
+    /// AB#47507 regression: a NULL value with no indicator must be SQLSTATE
+    /// 22002, not a silent SQL_SUCCESS that leaves the caller's buffer
+    /// untouched.
     #[test]
     fn get_data_typed_null_without_indicator_reports_22002() {
         let h = TestHandles::with_env_dbc_stmt();
