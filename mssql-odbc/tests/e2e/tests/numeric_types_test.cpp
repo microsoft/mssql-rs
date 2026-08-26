@@ -248,4 +248,3 @@ TEST_F(NumericTypesLiveTest, NegativeDecimalToCharViaGetData) {
     EXPECT_STREQ("-.0001", buf);
     SQLCloseCursor(stmt_);
 }
-
