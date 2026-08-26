@@ -255,12 +255,32 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         // Already dropped by SQLDisconnect - early return.
         return SQL_SUCCESS;
     };
-    dbc_state.descriptors.swap_remove(i);
 
     for &stmt_raw in &dbc_state.statements {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_raw) };
         let Ok(mut stmt_state) = stmt.inner.lock() else {
-            continue;
+            // A poisoned STMT mutex means we can't safely confirm or clear
+            // its active_ard/active_apd. Freeing the descriptor anyway would
+            // leave that statement's association dangling — a later
+            // SQLGetStmtAttrW would hand the application a stale handle, and
+            // the binding work in AB#47437 would dereference it — so refuse
+            // the free instead: the descriptor stays intact and tracked in
+            // `dbc_state.descriptors` for a retry, matching how every other
+            // lock failure in this function is handled.
+            error!(
+                ?stmt_raw,
+                "SQLFreeHandle(DESC): stmt mutex poisoned; refusing to free"
+            );
+            drop(dbc_state);
+            if let Ok(mut state) = desc.inner.lock() {
+                post_sql_error(
+                    &mut state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error while freeing descriptor",
+                );
+            }
+            return SQL_ERROR;
         };
         if stmt_state.active_ard == Some(handle) {
             stmt_state.active_ard = None;
@@ -270,6 +290,7 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         }
     }
 
+    dbc_state.descriptors.swap_remove(i);
     drop(dbc_state);
 
     unsafe { free_handle::<DescHandle>(handle) };
@@ -636,6 +657,63 @@ mod tests {
         // The guard above stopped `free_desc` from dropping the box, so this
         // test must clean it up itself to avoid leaking.
         unsafe { free_handle::<DescHandle>(desc) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    /// A poisoned STMT mutex mid-reset must refuse the free rather than
+    /// silently skip that statement and free the descriptor anyway: doing so
+    /// would leave the statement's `active_ard`/`active_apd` pointing at
+    /// freed memory, which a later `SQLGetStmtAttrW` would hand straight to
+    /// the application. Refusing keeps the descriptor intact and tracked in
+    /// `dbc_state.descriptors`, so it stays freeable once the poisoned
+    /// statement is itself removed (via its own `SQLFreeHandle`, exercised
+    /// below) — a real recovery path, not just "fails safely and stays
+    /// stuck."
+    #[test]
+    fn free_desc_with_poisoned_stmt_mutex_refuses_to_free() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let mut stmt: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
+            SQL_SUCCESS
+        );
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+
+        // Associate the descriptor as the statement's active ARD directly
+        // (bypassing SQLSetStmtAttrW's validation, which is not what's under
+        // test here) and poison the statement's mutex by panicking while it
+        // is held — the same technique used by
+        // `catalog::tests::apply_catalog_metadata_poisoned_mutex_returns_error`.
+        let stmt_ref = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        stmt_ref.inner.lock().unwrap().active_ard = Some(desc);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stmt_ref.inner.lock().unwrap();
+            panic!("poison the stmt lock");
+        }));
+
+        let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        assert_eq!(ret, SQL_ERROR);
+
+        // The descriptor was not freed and is still tracked, not leaked into
+        // an untracked, unreachable state.
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        assert_eq!(dbc_ref.inner.lock().unwrap().descriptors, vec![desc]);
+
+        // Freeing the poisoned statement itself tolerates its own poisoning
+        // (matching `free_stmt`'s existing behavior) and removes it from the
+        // DBC, after which the descriptor has nothing poisoned left to check
+        // and frees normally.
+        unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
+        let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        assert_eq!(ret, SQL_SUCCESS);
+
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
