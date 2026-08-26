@@ -273,6 +273,17 @@ fn write_captured_column(
     };
 
     if matches!(value, ColumnValues::Null) {
+        // ODBC spec: "If [StrLen_or_IndPtr] is a null pointer, no length or
+        // indicator value is returned. This returns an error when the data
+        // being fetched is NULL" (SQLSTATE 22002). There is nowhere to report
+        // the NULL, and leaving the target buffer untouched would hand the
+        // caller whatever was already there. Mirrors the identical check in
+        // fetch_scroll.rs::deliver_bound for bound columns. Leave the value
+        // resident so a retry with a real indicator can still succeed.
+        if strlen_or_ind_ptr.is_null() {
+            post_diag(stmt_state, ERR_INDICATOR_REQUIRED);
+            return SQL_ERROR;
+        }
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         // Only character targets get a terminator; a fixed-width target's
         // buffer is left untouched on NULL.
