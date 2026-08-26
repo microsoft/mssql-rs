@@ -250,3 +250,232 @@ TEST_F(ExecDirectLiveTest, GetDataBasicChar) {
     rc = SQLCloseCursor(stmt_);
     EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 }
+
+// --- Regression: variable assignment must not be exposed as a leading result ---
+//
+// SQL Server compiles variable assignment (DECLARE with an initializer, SET, or
+// SELECT @var = col) as a SQLSELECT command that still carries DONE_COUNT. The
+// driver must not turn that into an update-count result, otherwise SQLExecDirect
+// stops on a phantom 0-column result and an immediate SQLFetch fails with 24000.
+// msodbcsql behaves the same way, so these run unguarded against both drivers.
+
+namespace {
+
+// Executes `sql`, asserting it opens a row set directly, and returns the first
+// column of the first row as text.
+std::string ExecAndReadFirstCell(SQLHSTMT stmt, const char* sql) {
+    SqlTString text = ODBCTestUtils::ToSqlTStr(sql);
+    SQLRETURN rc = SQLExecDirect(stmt, const_cast<SQLTCHAR*>(text.c_str()), SQL_NTS);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt);
+
+    SQLSMALLINT cols = -1;
+    rc = SQLNumResultCols(stmt, &cols);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt);
+    EXPECT_EQ(1, cols) << "expected to be positioned on the row set, not a count";
+
+    SQLLEN row_count = 0;
+    rc = SQLRowCount(stmt, &row_count);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt);
+    EXPECT_EQ(-1, row_count) << "a row set must report SQLRowCount -1";
+
+    rc = SQLFetch(stmt);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt);
+
+    SQLCHAR buf[32] = {0};
+    SQLLEN ind = 0;
+    rc = SQLGetData(stmt, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    EXPECT_SQL_OK(rc, SQL_HANDLE_STMT, stmt);
+
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt), SQL_HANDLE_STMT, stmt);
+    return std::string(reinterpret_cast<const char*>(buf));
+}
+
+}  // namespace
+
+// DECLARE with an initializer, followed by a SELECT.
+TEST_F(ExecDirectLiveTest, DeclareWithInitializerDoesNotPrecedeRowSet) {
+    EXPECT_EQ("7", ExecAndReadFirstCell(stmt_, "DECLARE @x int = 1; SELECT 7 AS a;"));
+}
+
+// SET assignment is compiled the same way as an initialized DECLARE.
+TEST_F(ExecDirectLiveTest, SetAssignmentDoesNotPrecedeRowSet) {
+    EXPECT_EQ("8", ExecAndReadFirstCell(stmt_, "DECLARE @x int; SET @x = 1; SELECT 8 AS a;"));
+}
+
+// Assignment-SELECT reports the source row count on its DONE token.
+TEST_F(ExecDirectLiveTest, AssignmentSelectDoesNotPrecedeRowSet) {
+    EXPECT_EQ("9", ExecAndReadFirstCell(stmt_, "DECLARE @x int; SELECT @x = 1; SELECT 9 AS a;"));
+}
+
+// Several assignments in a row all collapse into the following row set.
+TEST_F(ExecDirectLiveTest, ConsecutiveAssignmentsDoNotPrecedeRowSet) {
+    EXPECT_EQ("10",
+              ExecAndReadFirstCell(
+                  stmt_, "DECLARE @a int = 1; DECLARE @b int = 2; SET @a = 3; SELECT 10 AS a;"));
+}
+
+// The reported scenario: DECLARE then EXEC of a stored procedure. An immediate
+// SQLFetch must return the procedure's rows without an intervening
+// SQLMoreResults.
+TEST_F(ExecDirectLiveTest, DeclareThenExecProcOpensProcRowSet) {
+    SqlTString create = ODBCTestUtils::ToSqlTStr(
+        "CREATE PROCEDURE #decl_proc AS BEGIN SELECT 42 AS answer; END");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(create.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ("42", ExecAndReadFirstCell(stmt_, "DECLARE @out int = 1; EXEC #decl_proc;"));
+}
+
+// A batch that is only an assignment must not report a phantom row count.
+// msodbcsql reports SQLRowCount -1 here, not 1.
+TEST_F(ExecDirectLiveTest, AssignmentOnlyBatchReportsNoRowCount) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("DECLARE @x int = 1;");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT cols = -1;
+    rc = SQLNumResultCols(stmt_, &cols);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, cols);
+
+    SQLLEN row_count = 0;
+    rc = SQLRowCount(stmt_, &row_count);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count);
+
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
+// Genuine DML counts are unaffected: the UPDATE count is still reported before
+// the trailing row set, even when preceded by an assignment.
+TEST_F(ExecDirectLiveTest, UpdateCountStillPrecedesRowSetAfterAssignment) {
+    SqlTString setup =
+        ODBCTestUtils::ToSqlTStr("CREATE TABLE #upd(v int); INSERT INTO #upd VALUES (1),(2);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    // Bounded drain: stop on SQL_ERROR instead of spinning, so a driver bug
+    // fails the test rather than hanging the CI leg.
+    for (SQLRETURN more = SQLMoreResults(stmt_); more != SQL_NO_DATA;
+         more = SQLMoreResults(stmt_)) {
+        ASSERT_SQL_OK(more, SQL_HANDLE_STMT, stmt_);
+    }
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "DECLARE @x int = 1; UPDATE #upd SET v = v; SELECT * FROM #upd;");
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    // Positioned on the UPDATE count, not on the assignment and not on the rows.
+    SQLSMALLINT cols = -1;
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, cols);
+
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, row_count);
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, cols);
+    EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A warning raised by the assignment itself puts a message and a SQLSELECT
+// count on the same DONE. The message-only result still surfaces, but must
+// report SQLRowCount -1 rather than the assignment's count -- or the preceding
+// UPDATE's. The UPDATE is what makes the -1 assertion meaningful: without it
+// SQLRowCount is still -1 from execution start and the test would pass even if
+// a prior count leaked.
+TEST_F(ExecDirectLiveTest, AssignmentWarningResultReportsNoRowCount) {
+    SqlTString setup =
+        ODBCTestUtils::ToSqlTStr("CREATE TABLE #agg(v int); INSERT INTO #agg VALUES (1),(NULL);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    for (SQLRETURN more = SQLMoreResults(stmt_); more != SQL_NO_DATA;
+         more = SQLMoreResults(stmt_)) {
+        ASSERT_SQL_OK(more, SQL_HANDLE_STMT, stmt_);
+    }
+
+    // SELECT @x = MAX(v) over a NULL emits "Null value is eliminated by an
+    // aggregate or other SET operation" (msg 8153) on the assignment's DONE.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "UPDATE #agg SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #agg; SELECT 5 AS a;");
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    // The UPDATE's genuine count.
+    SQLSMALLINT cols = -1;
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, cols);
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, row_count);
+
+    // The warning result: no count of its own, and the UPDATE's must not leak.
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, cols);
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count);
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, cols);
+    EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A message-only statement (PRINT) after a DML count reports SQLRowCount -1,
+// not the preceding statement's count. Pre-existing shape, pinned here because
+// the assignment fix routes a new case onto the same branch.
+TEST_F(ExecDirectLiveTest, MessageOnlyResultAfterDmlReportsNoRowCount) {
+    SqlTString setup =
+        ODBCTestUtils::ToSqlTStr("CREATE TABLE #pr(v int); INSERT INTO #pr VALUES (1),(2);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    for (SQLRETURN more = SQLMoreResults(stmt_); more != SQL_NO_DATA;
+         more = SQLMoreResults(stmt_)) {
+        ASSERT_SQL_OK(more, SQL_HANDLE_STMT, stmt_);
+    }
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "UPDATE #pr SET v = v; PRINT 'hello'; SELECT 5 AS a;");
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, row_count);
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count) << "PRINT must not inherit the UPDATE's count";
+
+    SQLSMALLINT cols = -1;
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, cols);
+    EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// SELECT ... INTO reports DONE_COUNT with no CurCmd, which is a genuine update
+// count and must survive the SQLSELECT filter.
+TEST_F(ExecDirectLiveTest, SelectIntoCountStillReported) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT 1 AS a INTO #si; SELECT * FROM #si;");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, row_count);
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLSMALLINT cols = -1;
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, cols);
+    EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}

@@ -1116,6 +1116,15 @@ impl TryFrom<u16> for CurrentCommand {
             0x20 => Ok(CurrentCommand::OpenCursor),
             0x117 => Ok(CurrentCommand::Merge),
             // All unknown values are treated as None, and considered valid.
+            //
+            // This catch-all carries correctness weight: `advance_to_result_boundary`
+            // gates `SQLRowCount` semantics on `cur_cmd`, so an unrecognized value
+            // lands in the "this DONE_COUNT is a real update count" branch. That is
+            // deliberate: both reference drivers deny-list rather than allow-list
+            // (msodbcsql `Info != SQLSELECT && ...`, sqlctokn.cpp:2149-2152; .NET
+            // SqlClient `curCmd != TdsEnums.SELECT`), so an unknown command with a
+            // valid count still counts there too. Do not convert this to an
+            // allow-list; exclude a command by adding its specific variant.
             _ => Ok(CurrentCommand::None),
         }
     }
@@ -1509,6 +1518,24 @@ mod coverage_tests {
         for &(val, expected) in cases {
             assert_eq!(CurrentCommand::try_from(val).unwrap(), expected);
         }
+    }
+
+    /// Divergence pin: msodbcsql also excludes `SQLFETCHCURSOR` (0x21) and
+    /// `SQLDBCC` (0xe6) from update counts (sqlctokn.cpp:2151-2152). This driver
+    /// follows .NET SqlClient, which models neither, so both fall through the
+    /// catch-all to `None` and their counts are reported. Adding either variant
+    /// silently changes `SQLRowCount` semantics — see
+    /// `done_count_for_msodbcsql_only_exclusions_is_an_update_count`.
+    #[test]
+    fn msodbcsql_only_exclusions_are_not_modelled() {
+        assert_eq!(
+            CurrentCommand::try_from(0x21).unwrap(),
+            CurrentCommand::None
+        );
+        assert_eq!(
+            CurrentCommand::try_from(0xe6).unwrap(),
+            CurrentCommand::None
+        );
     }
 
     #[test]

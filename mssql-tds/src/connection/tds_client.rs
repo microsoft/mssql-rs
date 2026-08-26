@@ -293,9 +293,11 @@ pub struct TdsClient {
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
     /// Per-statement affected-row counts captured (in order) from every counted
-    /// DONE token seen since the last COLMETADATA or command start. For a
-    /// pure-DML batch (`UPDATE; DELETE; INSERT`) this holds one entry per
-    /// statement so the ODBC layer can surface each as its own result set via
+    /// DONE token seen since the last COLMETADATA or command start, excluding
+    /// `SQLSELECT`-tagged counts (see
+    /// [`last_rows_affected`](Self::last_rows_affected)). For a pure-DML batch
+    /// (`UPDATE; DELETE; INSERT`) this holds one entry per statement so the ODBC
+    /// layer can surface each as its own result set via
     /// [`take_dml_result_counts`](Self::take_dml_result_counts).
     dml_result_counts: Vec<i64>,
 
@@ -945,10 +947,17 @@ impl TdsClient {
     /// Rows affected by the most recently executed statement.
     ///
     /// Returns the row count from the last DONE token that carried the
-    /// `DONE_COUNT` flag, or `-1` when no count is available (DDL,
-    /// `SET NOCOUNT ON`, a forward-only SELECT whose trailing DONE has not been
-    /// read, or before any statement has executed). This maps directly to the
-    /// value ODBC `SQLRowCount` reports.
+    /// `DONE_COUNT` flag **and** was not tagged with the `SQLSELECT` command,
+    /// or `-1` when no such count is available (DDL, `SET NOCOUNT ON`, a
+    /// forward-only SELECT whose trailing DONE has not been read, or before any
+    /// statement has executed). This maps directly to the value ODBC
+    /// `SQLRowCount` reports.
+    ///
+    /// The `SQLSELECT` exclusion exists because SQL Server sets `DONE_COUNT` on
+    /// variable assignment (`DECLARE @x int = 1`, `SET @x = 1`,
+    /// `SELECT @x = col FROM t`) while tagging it `SQLSELECT`; that count is not
+    /// an update count and neither msodbcsql nor .NET SqlClient reports it. See
+    /// the comment in `advance_to_result_boundary`.
     pub fn last_rows_affected(&self) -> i64 {
         self.last_rows_affected
     }
@@ -956,8 +965,10 @@ impl TdsClient {
     /// Drains the per-statement affected-row counts captured since the last
     /// COLMETADATA (or command start), in statement order. Used by the ODBC
     /// layer to surface each DML statement in a pure-DML batch as its own
-    /// result set. Returns an empty vec when the batch produced no counted DONE
-    /// (e.g. DDL, `SET NOCOUNT ON`).
+    /// result set. `SQLSELECT`-tagged counts are excluded, as for
+    /// [`last_rows_affected`](Self::last_rows_affected). Returns an empty vec
+    /// when the batch produced no qualifying counted DONE (e.g. DDL,
+    /// `SET NOCOUNT ON`, or only variable assignments).
     pub fn take_dml_result_counts(&mut self) -> Vec<i64> {
         std::mem::take(&mut self.dml_result_counts)
     }
@@ -3733,8 +3744,9 @@ impl TdsClient {
     /// With `true` (ODBC statement-wise navigation, matching msodbcsql), a
     /// no-row statement's DONE token can be its own result boundary, returned
     /// as [`ResultBoundaryKind::NoRows`] instead of always being skipped. It is
-    /// surfaced only when the statement carries a row count (DONE `COUNT` flag)
-    /// or produced an informational message (PRINT / low-severity RAISERROR);
+    /// surfaced only when the statement carries an update count (DONE `COUNT`
+    /// on a non-`SQLSELECT` command) or produced an informational message
+    /// (PRINT / low-severity RAISERROR);
     /// a pure no-op statement with neither — e.g. a bare `CREATE TABLE` — is
     /// still collapsed into the following result, exactly as in result-set
     /// navigation. This mirrors msodbcsql, which exposes a statement as its own
@@ -3812,30 +3824,58 @@ impl TdsClient {
 
                     let is_last = !done.has_more();
 
-                    // Capture the affected-row count for `SQLRowCount`, but only
-                    // when the DONE_COUNT flag is set — otherwise `row_count` is
-                    // not meaningful (DDL, SET NOCOUNT ON) and must stay -1. Each
-                    // counted DONE is also appended in order so a pure-DML batch
-                    // surfaces one count per statement.
+                    // Capture update counts for `SQLRowCount`. DONE_COUNT on a
+                    // SQLSELECT command is not an update-count result.
                     let has_count = done.status.contains(DoneStatus::COUNT);
-                    if has_count {
+                    // SQL Server compiles variable assignment (`DECLARE @x int = 1`,
+                    // `SET @x = 1`, `SELECT @x = col FROM t`) as a SQLSELECT command
+                    // and still sets DONE_COUNT. Neither reference driver exposes
+                    // those as update-count results, so neither do we:
+                    //   - msodbcsql: `Info != SQLSELECT` (sqlctokn.cpp:2150)
+                    //   - .NET SqlClient: `if (curCmd != TdsEnums.SELECT)`
+                    //     (TdsParser.cs `TryProcessDone`, "Skip the bogus DONE
+                    //     counts sent by the server")
+                    //
+                    // msodbcsql additionally excludes SQLFETCHCURSOR (0x21) and
+                    // SQLDBCC (0xe6) (sqlctokn.cpp:2151-2152); SqlClient does not,
+                    // and does not even define those constants. We follow SqlClient
+                    // because neither is observable here: no DBCC was found to set
+                    // DONE_COUNT, and although `cursor_ops::cursor_fetch` does route
+                    // `sp_cursorfetch` through `next_rowset` into this function, a
+                    // live SQL Server 2022 tags that DONEINPROC
+                    // `status: MORE|COUNT, cur_cmd: 0xc1` — SQLSELECT, already
+                    // handled below. `last_rows_affected` measured -1 across block
+                    // fetches with and without this guard. Add the variants only if
+                    // a capture ever shows 0x21 or 0xe6 arriving with DONE_COUNT.
+                    let has_update_count = has_count && done.cur_cmd != CurrentCommand::Select;
+                    if has_update_count {
                         let count = i64::try_from(done.row_count).unwrap_or(i64::MAX);
                         self.last_rows_affected = count;
                         self.dml_result_counts.push(count);
                     }
 
                     // Statement-wise navigation (msodbcsql parity): this DONE is
-                    // a navigable result only if the statement returned a row
-                    // count (COUNT flag) or produced messages. Pure DDL / no-op
+                    // a navigable result only if the statement returned an update
+                    // count or produced messages. Pure DDL / no-op
                     // statements (no count, no messages) are collapsed, exactly
                     // like result-set navigation, so a batch such as
                     // `CREATE; INSERT; SELECT` exposes the INSERT's row count and
                     // the SELECT, not the bare CREATE. `rows_affected` is
-                    // `Some(n)` only when the DONE carried a COUNT.
-                    if has_count || saw_message {
+                    // `Some(n)` only for an update-count result.
+                    if has_update_count || saw_message {
+                        if !has_update_count {
+                            // A message-only result carries no count. Clear any
+                            // count captured from a preceding statement in the
+                            // same batch so it is not re-reported as this
+                            // result's `SQLRowCount` — msodbcsql reports -1
+                            // here (verified for `UPDATE; PRINT`,
+                            // `UPDATE; RAISERROR` and `UPDATE;` followed by a
+                            // warning-raising assignment).
+                            self.last_rows_affected = -1;
+                        }
                         self.execution_context.set_has_open_batch(!is_last);
                         return Ok(ResultBoundaryKind::NoRows {
-                            rows_affected: if has_count {
+                            rows_affected: if has_update_count {
                                 Some(done.row_count)
                             } else {
                                 None
@@ -6004,7 +6044,7 @@ impl From<()> for ExecuteOptions<'_> {
 /// [`advance()`](TdsClient::advance).
 ///
 /// This is the lossless, statement-wise view of a batch: every statement that
-/// returns rows, carries a row count, or produced a message is surfaced as its
+/// returns rows, carries an update count, or produced a message is surfaced as its
 /// own result (matching msodbcsql's `SQLMoreResults` and JDBC's
 /// `getMoreResults`/`getUpdateCount`). Consumers that only care about
 /// row-returning result sets can collapse no-row statements with
@@ -6018,11 +6058,15 @@ pub enum StatementResult {
     Rows,
     /// A statement that produced no result set but is still individually
     /// navigable. `rows_affected` is `Some(n)` when the statement's DONE token
-    /// carried a row count (DML), or `None` for a message-only statement
+    /// carried an update count (DML), or `None` for a message-only statement
     /// (`PRINT` / low-severity `RAISERROR`) or plain DDL. Messages are drained
     /// separately via [`take_info_messages`](TdsClient::take_info_messages).
     NoRows {
-        /// Rows affected, when the DONE token carried a COUNT; otherwise `None`.
+        /// Rows affected, when the DONE token carried a COUNT that was not
+        /// tagged `SQLSELECT` — see
+        /// [`TdsClient::last_rows_affected`] for why assignment counts are
+        /// excluded. `None` otherwise, including for a `SQLSELECT` count that
+        /// only surfaces because the statement also raised a message.
         rows_affected: Option<u64>,
     },
     /// No more statements remain in the batch; the connection is idle.
@@ -6681,6 +6725,17 @@ mod tests {
         Tokens::ColMetadata(ColMetadataToken::default())
     }
 
+    /// A COLMETADATA token for `n` nullable `int` columns, so tests can assert
+    /// the client is positioned on a real row set rather than a 0-column one.
+    fn int_col_metadata(n: usize) -> Tokens {
+        let columns = crate::test_client_support::int_columns(n);
+        Tokens::ColMetadata(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap_or(u16::MAX),
+            columns,
+            cek_table: Vec::new(),
+        })
+    }
+
     fn stale_metadata() -> Arc<ColMetadataToken> {
         Arc::new(ColMetadataToken::default())
     }
@@ -6807,6 +6862,273 @@ mod tests {
 
         let r2 = client.advance().await.unwrap();
         assert_eq!(r2, StatementResult::End);
+    }
+
+    /// SQL Server compiles variable assignment as a SQLSELECT command and still
+    /// sets DONE_COUNT. Such a DONE must collapse into the following row set
+    /// rather than surface as a leading update-count result.
+    /// Observed token sequence for `DECLARE @out int = 1; EXEC dbo.p;`.
+    #[tokio::test]
+    async fn execute_skips_select_count_before_rowset() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let result = client
+            .execute("DECLARE @out int = 1; EXEC dbo.p;".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1,
+            "must be positioned on the procedure's row set"
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+    }
+
+    /// `DECLARE @x int = 1;` on its own must not report a phantom result.
+    #[tokio::test]
+    async fn execute_select_count_only_batch_ends_immediately() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Select, 1, false)]);
+
+        let result = client
+            .execute("DECLARE @x int = 1;".to_string(), ())
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::End);
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+    }
+
+    /// Several assignments in a row all collapse.
+    #[tokio::test]
+    async fn execute_skips_consecutive_select_counts() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 2, true),
+            int_col_metadata(1),
+        ]);
+
+        let result = client
+            .execute(
+                "DECLARE @a int = 1; SET @a = 2; SELECT @a = v FROM t; SELECT * FROM t;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    /// A PRINT on its own statement surfaces as a message-only result (its DONE
+    /// carries no count); the following assignment's count is still suppressed.
+    #[tokio::test]
+    async fn execute_surfaces_message_but_skips_select_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "hi"),
+            done_more(),
+            done_count(CurrentCommand::Select, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute("PRINT 'hi'; DECLARE @x int = 1; SELECT 1;".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(second, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    /// Divergence pin: msodbcsql excludes `SQLFETCHCURSOR` (0x21) and `SQLDBCC`
+    /// (0xe6) alongside `SQLSELECT`; this driver excludes only `SQLSELECT`,
+    /// matching .NET SqlClient. Neither value is modelled, so a `DONE_COUNT`
+    /// carrying one parses as `None` and *is* reported as an update count.
+    /// Fails the moment someone adopts the msodbcsql-only exclusions, forcing
+    /// that `SQLRowCount` change to be deliberate rather than incidental.
+    #[tokio::test]
+    async fn done_count_for_msodbcsql_only_exclusions_is_an_update_count() {
+        for raw in [0x21u16, 0xe6] {
+            let cmd = CurrentCommand::try_from(raw).unwrap();
+            let mut client = create_test_client_with_tokens(vec![done_count(cmd, 3, false)]);
+
+            let result = client
+                .execute("EXEC sp_cursorfetch @handle".to_string(), ())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result,
+                StatementResult::NoRows {
+                    rows_affected: Some(3)
+                },
+                "raw cur_cmd {raw:#x}"
+            );
+            assert_eq!(client.last_rows_affected(), 3, "raw cur_cmd {raw:#x}");
+            assert_eq!(
+                client.take_dml_result_counts(),
+                vec![3],
+                "raw cur_cmd {raw:#x}"
+            );
+        }
+    }
+
+    /// The only path where `saw_message` and `has_count` land on the *same* DONE:
+    /// a warning raised by the assignment itself. The result must still surface
+    /// so the message is visible, but must carry no row count — this PR changed
+    /// `rows_affected` here from `Some(1)` to `None`.
+    ///
+    /// A genuine `UPDATE` precedes the assignment so the assertion is real: with
+    /// a bare assignment `last_rows_affected` is still `-1` from `begin_command`
+    /// and would pass even if the message-only branch leaked a prior count.
+    ///
+    /// Live capture for
+    /// `UPDATE #t SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;`
+    /// where `#t.v` contains a NULL:
+    /// ```text
+    /// DONE status=MORE|COUNT cur_cmd=Update row_count=2
+    /// INFO 8153 "Warning: Null value is eliminated by an aggregate or other SET operation."
+    /// DONE status=MORE|COUNT cur_cmd=Select row_count=1
+    /// COLMETADATA(1) + row
+    /// ```
+    /// msodbcsql reports `rowcount=2`, then `rowcount=-1`, then `rowcount=-1`.
+    #[tokio::test]
+    async fn execute_surfaces_assignment_warning_without_rowcount() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 2, true),
+            info_token(
+                8153,
+                0,
+                "Warning: Null value is eliminated by an aggregate or other SET operation.",
+            ),
+            done_count(CurrentCommand::Select, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute(
+                "UPDATE #t SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(2)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 2);
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(
+            second,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(
+            client.last_rows_affected(),
+            -1,
+            "the UPDATE's count must not leak into the message-only result"
+        );
+
+        let third = client.advance().await.unwrap();
+        assert_eq!(third, StatementResult::Rows);
+        assert_eq!(
+            client
+                .get_current_metadata()
+                .map(|m| m.columns.len())
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    /// A genuine DML count following an assignment is still reported.
+    #[tokio::test]
+    async fn execute_keeps_update_count_after_select_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Update, 2, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute(
+                "DECLARE @x int = 1; UPDATE t SET v = v; SELECT * FROM t;".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(2)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 2);
+        assert_eq!(client.take_dml_result_counts(), vec![2]);
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(second, StatementResult::Rows);
+    }
+
+    /// `SELECT ... INTO` reports DONE_COUNT with no CurCmd, which is a genuine
+    /// update count and must survive the SQLSELECT filter.
+    #[tokio::test]
+    async fn execute_keeps_select_into_count() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::None, 1, true),
+            int_col_metadata(1),
+        ]);
+
+        let first = client
+            .execute("SELECT 1 AS a INTO #t; SELECT * FROM #t;".to_string(), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            StatementResult::NoRows {
+                rows_affected: Some(1)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 1);
+        assert_eq!(client.take_dml_result_counts(), vec![1]);
     }
 
     #[tokio::test]
