@@ -384,7 +384,12 @@ Verified against msodbcsql source:
 - `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` declare `text` / `ntext`, matching
   msodbcsql's default - it sends `varchar(max)` only under
   `SQL_COPT_SS_LONGASMAX` (`sqlcprot.h:1838`), which defaults off
-  (`sqlcconn.cpp:84`, `:4686`). `LongAsMax` is unimplemented here.
+  (`sqlcconn.cpp:84`, `:4686`). `LongAsMax` is unimplemented here. **Executing a
+  non-NULL `text` parameter currently fails** with SQL Server error 4002:
+  `mssql-tds` serializes `TEXT` / `NTEXT` / `IMAGE` in bulk-copy ROW format, so
+  an RPC parameter carries a textptr/timestamp header and a stray table-name
+  byte that the server does not expect (AB#47591). `TextParamIsBoundedByColumnSize`
+  is `GTEST_SKIP`-ed at the point it would reach the wire.
 - **`ColumnSize` is a character count and msodbcsql agrees** - no divergence.
   `SQLBindParameter` converts it to an internal byte count for the wide types
   (`sqlcdesc.cpp:3311`, `cbColDef *= sizeof(WCHAR)`); every `/ sizeof(WCHAR)`
