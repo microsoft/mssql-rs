@@ -112,6 +112,9 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 error!("SQLMoreResults: stmt mutex poisoned advancing result set");
                 if let Ok(mut ds) = dbc.inner.lock() {
                     ds.client = Some(client);
+                    if ds.active_stmt == Some(statement_handle) {
+                        ds.active_stmt = None;
+                    }
                 }
                 return SQL_ERROR;
             };
@@ -126,7 +129,11 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             drop(stmt_state);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
-                // active_stmt remains set — cursor still open on this statement.
+                // Explicitly (re-)claim: AB#47508's early release can have left
+                // this `None` if the previous result set was fetched to
+                // exhaustion without an explicit close, so this cannot just
+                // assume it is still `Some(statement_handle)`.
+                dbc_state.active_stmt = Some(statement_handle);
             }
             debug!("SQLMoreResults: advanced to next result set");
             if has_server_info {
@@ -145,6 +152,9 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 error!("SQLMoreResults: stmt mutex poisoned on no-row result");
                 if let Ok(mut ds) = dbc.inner.lock() {
                     ds.client = Some(client);
+                    if ds.active_stmt == Some(statement_handle) {
+                        ds.active_stmt = None;
+                    }
                 }
                 return SQL_ERROR;
             };
@@ -164,7 +174,8 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             drop(stmt_state);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
-                // active_stmt remains set — still positioned on this statement.
+                // Explicitly (re-)claim — see the `Rows` arm above.
+                dbc_state.active_stmt = Some(statement_handle);
             }
             debug!("SQLMoreResults: advanced to a no-row statement result");
             if has_server_info {
@@ -281,6 +292,41 @@ mod tests {
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
     }
 
+    /// The first result set was fetched to exhaustion, which releases
+    /// `active_stmt` early (AB#47508) *without* closing the cursor. Advancing
+    /// past it with `SQLMoreResults` must (re-)claim `active_stmt` for this
+    /// statement rather than assume it is already set — otherwise the freshly
+    /// positioned second rowset is unreachable: the next `SQLFetch` hits
+    /// `fill_rowset`'s "already drained" guard (which only checks
+    /// `active_stmt`) and wrongly reports `SQL_NO_DATA` despite a real row
+    /// waiting on the wire.
+    #[test]
+    fn more_results_reclaims_active_stmt_after_an_early_release() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(), // stmt1 row set
+                done_more(),          // terminates stmt1, more to come
+                col_metadata_empty(), // stmt2 row set
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Simulate stmt1 having been fetched to exhaustion: active_stmt was
+        // already released, but the cursor (and client) are still there.
+        dbc.inner.lock().unwrap().active_stmt = None;
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(
+            dbc.inner.lock().unwrap().active_stmt,
+            Some(h.stmt),
+            "must explicitly reclaim active_stmt, not just leave the released None"
+        );
+    }
+
     /// A statement whose first result set was fetched to exhaustion (marked
     /// via a prior fetch's peek, AB#47508) must not have that stale flag leak
     /// into the next result set `SQLMoreResults` positions on — otherwise a
@@ -338,6 +384,36 @@ mod tests {
         assert_eq!(ret, SQL_NO_DATA);
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+    }
+
+    /// Same re-claim requirement as
+    /// `more_results_reclaims_active_stmt_after_an_early_release`, for the
+    /// no-row-result arm: it also only "left `active_stmt` as is" before this
+    /// fix, which broke the moment an earlier fetch had already released it.
+    #[test]
+    fn more_results_reclaims_active_stmt_advancing_to_a_norow_result() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),        // stmt1 row set
+                done_more(),                 // terminates stmt1
+                info(50000, 10, "raise me"), // stmt2 message
+                done_no_more(),              // stmt2 no-row result, last in batch
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = None;
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(
+            dbc.inner.lock().unwrap().active_stmt,
+            Some(h.stmt),
+            "must explicitly reclaim active_stmt for the still-navigable batch"
+        );
     }
 
     /// SQLMoreResults on an open cursor whose connection has no active client

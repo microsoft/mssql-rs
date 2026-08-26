@@ -243,6 +243,13 @@ pub(super) fn release_busy_if_row_exhausted(
         }
     };
 
+    // The peek can read past an INFO token (a PRINT/RAISERROR between the last
+    // row and the batch's next boundary) before this statement's client is
+    // possibly handed to a different statement below — drain and attribute it
+    // here so it is never posted onto whichever statement happens to touch
+    // the client next.
+    let info_messages = client.take_info_messages();
+
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
         dbc_state.active_stmt = if has_more == Some(false) {
@@ -252,10 +259,11 @@ pub(super) fn release_busy_if_row_exhausted(
         };
     }
 
-    if has_more == Some(false)
-        && let Ok(mut stmt_state) = stmt.inner.lock()
-    {
-        stmt_state.result_set_exhausted = true;
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        post_tds_info_messages(&mut stmt_state, &info_messages);
+        if has_more == Some(false) {
+            stmt_state.result_set_exhausted = true;
+        }
     }
 }
 
@@ -635,6 +643,39 @@ mod tests {
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         assert!(dbc.inner.lock().unwrap().client.is_some());
         assert!(stmt.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    /// An INFO token the peek reads on its way to the terminating DONE must be
+    /// attributed to the statement that produced it, not left to leak onto
+    /// whichever statement next touches the client (e.g. a different one that
+    /// claims the now-idle connection).
+    #[test]
+    fn release_busy_if_row_exhausted_attributes_a_peeked_info_message_to_this_statement() {
+        use mssql_tds::test_client_support::info;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                info(50000, 10, "trailing message"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client);
+
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("trailing message")),
+            "the peeked INFO message must land on this statement's own diagnostics"
+        );
     }
 
     // The "peek finds another row and keeps the connection busy" branch is
