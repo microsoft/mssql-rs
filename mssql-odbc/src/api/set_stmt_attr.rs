@@ -1049,10 +1049,7 @@ mod tests {
             SQL_SUCCESS
         );
 
-        assert_eq!(
-            h.free_explicit_desc(desc),
-            SQL_SUCCESS
-        );
+        assert_eq!(h.free_explicit_desc(desc), SQL_SUCCESS);
 
         assert_eq!(
             read_desc(h.stmt, SQL_ATTR_APP_ROW_DESC),
