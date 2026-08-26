@@ -10,7 +10,9 @@ use crate::api::odbc_types::{
     SQL_HANDLE_STMT, SQL_INVALID_HANDLE, SQL_NULL_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn,
     SqlSmallInt,
 };
+use crate::api::sqlstate::{ERR_CONNECTION_DOES_NOT_EXIST, post_diag};
 use crate::error::free_errors;
+use crate::handles::dbc::ConnectionState;
 use crate::handles::desc::DescKind;
 use crate::handles::{
     DbcHandle, DescHandle, EnvHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw,
@@ -185,6 +187,16 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
 /// associates one with any statement on the same connection, and it can
 /// outlive that association or be shared by more than one statement at once.
 ///
+/// Requires the connection to be connected (`08003` otherwise): the ODBC
+/// connection state-transition table for `SQLAllocHandle` gates
+/// `SQL_HANDLE_DESC` the same as `SQL_HANDLE_STMT` — allowed from C4/C5/C6,
+/// `08003` from C2 (allocated but not connected, which is also the state a
+/// connection returns to after `SQLDisconnect`). Unlike STMT allocation, whose
+/// equivalent gate is enforced structurally (the DM does not dispatch to this
+/// driver at all until the first successful connect), a DBC that has
+/// connected once and since disconnected keeps dispatching directly to this
+/// function, so the check has to be explicit here.
+///
 /// # Safety
 /// `output_handle` must be a valid, aligned, writable pointer (validated by caller).
 /// `input_handle` must be a live `DbcHandle` created by `alloc_dbc`.
@@ -206,6 +218,12 @@ unsafe fn alloc_desc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
         return SQL_ERROR;
     };
     free_errors(&mut dbc_state);
+
+    if dbc_state.connection_state != ConnectionState::Connected {
+        error!("SQLAllocHandle(DESC): DBC is not connected");
+        post_diag(&mut dbc_state, ERR_CONNECTION_DOES_NOT_EXIST);
+        return SQL_ERROR;
+    }
 
     let desc = Box::new(DescHandle::new(
         DescKind::Ad,
@@ -374,6 +392,20 @@ mod tests {
         (env, dbc)
     }
 
+    // --- Helper: alloc ENV + DBC, marked connected, for DESC tests ---
+    // (`SQLAllocHandle(SQL_HANDLE_DESC, ...)` requires a connected DBC — see
+    // `alloc_desc`'s doc comment — so DESC tests can't reuse `alloc_env_dbc`
+    // as-is; this establishes a Connected state without a real TDS client,
+    // same technique as `test_support::TestHandles::mark_dbc_connected`.)
+    fn alloc_env_dbc_connected() -> (SqlHandle, SqlHandle) {
+        use crate::handles::dbc::ConnectionState;
+
+        let (env, dbc) = alloc_env_dbc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+        (env, dbc)
+    }
+
     #[test]
     fn alloc_stmt_returns_success_with_valid_dbc() {
         let (env, dbc) = alloc_env_dbc();
@@ -453,7 +485,7 @@ mod tests {
 
     #[test]
     fn alloc_desc_returns_success_with_valid_dbc() {
-        let (env, dbc) = alloc_env_dbc();
+        let (env, dbc) = alloc_env_dbc_connected();
 
         let mut desc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) };
@@ -478,9 +510,33 @@ mod tests {
         assert!(desc.is_null());
     }
 
+    /// `SQLAllocHandle(SQL_HANDLE_DESC, ...)` on a disconnected DBC must fail
+    /// with `08003`, matching the ODBC connection state-transition table
+    /// (C2 -> 08003, same row as `SQL_HANDLE_STMT`).
+    #[test]
+    fn alloc_desc_on_disconnected_dbc_returns_error() {
+        use crate::api::sqlstate::SQLSTATE_08003;
+
+        let (env, dbc) = alloc_env_dbc();
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) };
+        assert_eq!(ret, SQL_ERROR);
+        assert!(desc.is_null());
+
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        let state = dbc_ref.inner.lock().unwrap();
+        assert_eq!(state.diag_records.last().unwrap().sql_state, SQLSTATE_08003);
+        assert!(state.descriptors.is_empty());
+        drop(state);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
     #[test]
     fn alloc_desc_registers_in_parent_dbc() {
-        let (env, dbc) = alloc_env_dbc();
+        let (env, dbc) = alloc_env_dbc_connected();
 
         let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         assert!(dbc_ref.inner.lock().unwrap().descriptors.is_empty());
@@ -503,7 +559,7 @@ mod tests {
 
     #[test]
     fn alloc_multiple_descs_on_same_dbc() {
-        let (env, dbc) = alloc_env_dbc();
+        let (env, dbc) = alloc_env_dbc_connected();
 
         let mut desc1: SqlHandle = ptr::null_mut();
         let mut desc2: SqlHandle = ptr::null_mut();

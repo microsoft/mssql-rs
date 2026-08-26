@@ -87,7 +87,9 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
 ///
 /// No DBC mutex is acquired — the DM guarantees the DBC is disconnected
 /// before calling `SQLFreeConnect`, and `SQLDisconnect` drops all child
-/// handles. msodbcsql's `SQLFreeConnect` doesn't lock the connection mutex either.
+/// handles (statements, and their implicit descriptors, plus any explicit
+/// descriptors — `sql_disconnect_safe`). msodbcsql's `SQLFreeConnect` doesn't
+/// lock the connection mutex either.
 ///
 /// # Safety
 /// `handle` must be a live `DbcHandle` created by `alloc_dbc`.
@@ -110,6 +112,10 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
             .unwrap_or(true),
         "SQLFreeHandle(DBC): DM should have freed all STMTs before calling SQLFreeConnect"
     );
+    // Holds because `alloc_desc` requires a connected DBC and
+    // `sql_disconnect_safe` frees every explicit descriptor — same pattern as
+    // msodbcsql's own `assert(CItemsPl(lpdbc->lpplDAN) == 0)`
+    // (`sqlcconn.cpp:727`), an assert rather than a defensive free loop here.
     debug_assert!(
         dbc.inner
             .lock()
@@ -439,6 +445,17 @@ mod tests {
         (env, dbc)
     }
 
+    // --- Helper: alloc ENV + DBC, marked connected, for DESC tests ---
+    // (`SQLAllocHandle(SQL_HANDLE_DESC, ...)` requires a connected DBC.)
+    fn alloc_env_dbc_connected() -> (SqlHandle, SqlHandle) {
+        use crate::handles::dbc::ConnectionState;
+
+        let (env, dbc) = alloc_env_dbc();
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+        (env, dbc)
+    }
+
     #[test]
     fn free_stmt_returns_success() {
         let (env, dbc) = alloc_env_dbc();
@@ -542,7 +559,7 @@ mod tests {
 
     #[test]
     fn free_desc_returns_success() {
-        let (env, dbc) = alloc_env_dbc();
+        let (env, dbc) = alloc_env_dbc_connected();
 
         let mut desc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) };
@@ -557,7 +574,7 @@ mod tests {
 
     #[test]
     fn free_desc_unregisters_from_parent_dbc() {
-        let (env, dbc) = alloc_env_dbc();
+        let (env, dbc) = alloc_env_dbc_connected();
 
         let mut desc: SqlHandle = ptr::null_mut();
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) };
@@ -607,13 +624,21 @@ mod tests {
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
+    /// `free_dbc`'s `debug_assert!` documents a genuine invariant, not a
+    /// hypothetical one: `SQLAllocHandle(SQL_HANDLE_DESC, ...)` requires a
+    /// connected DBC (`alloc_desc`), and `SQLDisconnect` — which the DM
+    /// requires before `SQLFreeHandle(SQL_HANDLE_DBC)` on a connection that
+    /// *is* connected — frees every outstanding explicit descriptor
+    /// (`sql_disconnect_safe`). So reaching `free_dbc` with a non-empty
+    /// `descriptors` list, as this test forces directly, means the DM's own
+    /// contract was violated (skipped `SQLDisconnect`), exactly like this
+    /// test's STMT twin above. This driver does not independently re-check
+    /// that at `free_dbc` and trusts the DM instead, matching msodbcsql's own
+    /// `assert(CItemsPl(lpdbc->lpplDAN) == 0)` (`sqlcconn.cpp:727`) — an
+    /// assert, not a defensive free loop, at the exact same point.
     #[test]
     fn free_dbc_with_outstanding_desc_fails_in_debug() {
-        // The DM guarantees all explicit DESCs are freed before calling
-        // SQLFreeConnect. The driver trusts this and frees unconditionally
-        // (matching msodbcsql). In debug builds, debug_assert! fires and
-        // catch_unwind converts the panic to SQL_ERROR.
-        let (env, dbc) = alloc_env_dbc();
+        let (env, dbc) = alloc_env_dbc_connected();
 
         let mut desc: SqlHandle = ptr::null_mut();
         assert_eq!(

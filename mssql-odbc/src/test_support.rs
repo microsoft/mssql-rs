@@ -116,8 +116,10 @@ impl TestHandles {
 
     /// Allocate an explicit descriptor (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`)
     /// under the same DBC. The returned handle is tracked and freed on drop,
-    /// before the DBC.
+    /// before the DBC. Marks the DBC connected first (idempotent) since
+    /// descriptor allocation requires it (`alloc_desc`'s `08003` gate).
     pub(crate) fn alloc_explicit_desc(&mut self) -> SqlHandle {
+        self.mark_dbc_connected();
         let mut desc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_DESC, self.dbc, &mut desc) },
@@ -155,6 +157,13 @@ impl TestHandles {
             unsafe { sql_alloc_handle(SQL_HANDLE_DBC, self.env, &mut dbc) },
             SQL_SUCCESS
         );
+        // Descriptor allocation requires a connected DBC (`alloc_desc`'s
+        // `08003` gate) — same technique as `mark_dbc_connected`.
+        unsafe { handle_from_raw::<DbcHandle>(dbc) }
+            .inner
+            .lock()
+            .unwrap()
+            .connection_state = ConnectionState::Connected;
         let mut desc: SqlHandle = SQL_NULL_HANDLE;
         assert_eq!(
             unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
