@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use mssql_tds::core::CancelHandle;
 
@@ -80,6 +80,46 @@ pub(crate) struct AsyncConnectionState {
     next_cursor_id: AtomicU64,
     next_operation_id: AtomicU64,
     inner: Mutex<AsyncSessionState>,
+}
+
+/// Releases an operation claim and poisons the session if interrupted.
+pub(crate) struct SessionOperationGuard {
+    session_state: Arc<AsyncConnectionState>,
+    operation_id: OperationId,
+    completed: bool,
+}
+
+impl SessionOperationGuard {
+    pub(crate) fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
+        Self {
+            session_state,
+            operation_id,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn finish_execute(&mut self, has_open_batch: bool) {
+        self.session_state
+            .finish_execute(self.operation_id, has_open_batch);
+        self.completed = true;
+    }
+
+    pub(crate) fn settle(&mut self, has_open_batch: bool) {
+        if has_open_batch {
+            self.session_state.mark_broken();
+        }
+        self.session_state.release_operation(self.operation_id);
+        self.completed = true;
+    }
+}
+
+impl Drop for SessionOperationGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.session_state.mark_broken();
+            self.session_state.release_operation(self.operation_id);
+        }
+    }
 }
 
 impl AsyncConnectionState {
