@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Cow;
 use std::mem::MaybeUninit;
 
 use crate::datatypes::column_values::{
@@ -36,10 +37,24 @@ pub trait RowWriter {
     fn write_f32(&mut self, col: usize, val: f32);
     /// Writes a `float` value.
     fn write_f64(&mut self, col: usize, val: f64);
-    /// Writes a character string value.
-    fn write_string(&mut self, col: usize, val: SqlString);
-    /// Writes a binary value.
-    fn write_bytes(&mut self, col: usize, val: Vec<u8>);
+    /// Writes a character string value in its wire encoding.
+    ///
+    /// `bytes` borrows the read buffer when the value was already resident in
+    /// it, so it must not be retained past the call. Whether a given value
+    /// arrives borrowed depends on where the packet boundary fell, not on the
+    /// value, so an implementation must treat both arms identically.
+    ///
+    /// [`SqlString::decode`] decodes either arm without copying the borrowed
+    /// one and is the consistent choice. [`EncodingType::encoding`] is
+    /// available for transcoding straight into a caller-owned buffer, but note
+    /// it substitutes U+FFFD where `decode` and [`SqlString::to_utf8_string`]
+    /// panic on malformed [`EncodingType::Utf8`] input (#310) — picking it for
+    /// the borrowed arm alone makes the same logical row behave differently
+    /// depending on packet alignment.
+    fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType);
+    /// Writes a binary value. Borrows on the same terms as
+    /// [`RowWriter::write_string`].
+    fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>);
     /// Writes a `decimal` value.
     fn write_decimal(&mut self, col: usize, val: DecimalParts);
     /// Writes a `numeric` value.
@@ -233,12 +248,15 @@ impl RowWriter for DefaultRowWriter {
         self.row.push(ColumnValues::Float(val));
     }
 
-    fn write_string(&mut self, _col: usize, val: SqlString) {
-        self.row.push(ColumnValues::String(val));
+    fn write_string(&mut self, _col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType) {
+        self.row.push(ColumnValues::String(SqlString::new(
+            bytes.into_owned(),
+            encoding_type,
+        )));
     }
 
-    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-        self.row.push(ColumnValues::Bytes(val));
+    fn write_bytes(&mut self, _col: usize, bytes: Cow<'_, [u8]>) {
+        self.row.push(ColumnValues::Bytes(bytes.into_owned()));
     }
 
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
@@ -320,8 +338,10 @@ impl RowWriter for DiscardRowWriter {
     fn write_i64(&mut self, _col: usize, _val: i64) {}
     fn write_f32(&mut self, _col: usize, _val: f32) {}
     fn write_f64(&mut self, _col: usize, _val: f64) {}
-    fn write_string(&mut self, _col: usize, _val: SqlString) {}
-    fn write_bytes(&mut self, _col: usize, _val: Vec<u8>) {}
+    // Takes the `Cow` unexamined, so a borrow is never promoted to an owned
+    // buffer purely to drop it.
+    fn write_string(&mut self, _col: usize, _bytes: Cow<'_, [u8]>, _encoding_type: EncodingType) {}
+    fn write_bytes(&mut self, _col: usize, _bytes: Cow<'_, [u8]>) {}
     fn write_decimal(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_numeric(&mut self, _col: usize, _val: DecimalParts) {}
     fn write_date(&mut self, _col: usize, _val: SqlDate) {}
@@ -352,8 +372,11 @@ pub fn write_column_value<W: RowWriter + ?Sized>(writer: &mut W, col: usize, val
         ColumnValues::BigInt(v) => writer.write_i64(col, v),
         ColumnValues::Real(v) => writer.write_f32(col, v),
         ColumnValues::Float(v) => writer.write_f64(col, v),
-        ColumnValues::String(v) => writer.write_string(col, v),
-        ColumnValues::Bytes(v) => writer.write_bytes(col, v),
+        ColumnValues::String(v) => {
+            let (bytes, encoding_type) = v.into_parts();
+            writer.write_string(col, Cow::Owned(bytes), encoding_type)
+        }
+        ColumnValues::Bytes(v) => writer.write_bytes(col, Cow::Owned(v)),
         ColumnValues::Decimal(v) => writer.write_decimal(col, v),
         ColumnValues::Numeric(v) => writer.write_numeric(col, v),
         ColumnValues::Date(v) => writer.write_date(col, v),
@@ -377,6 +400,38 @@ mod tests {
     use crate::datatypes::sql_string::EncodingType;
 
     #[test]
+    fn discard_row_writer_drops_borrowed_values() {
+        let mut writer = DiscardRowWriter;
+        writer.write_string(0, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
+        writer.write_bytes(1, Cow::Borrowed(&[1, 2, 3]));
+        writer.end_row();
+    }
+
+    #[test]
+    fn default_row_writer_borrowed_string_matches_owned() {
+        let bytes = b"h\0i\0";
+
+        let mut borrowed = DefaultRowWriter::new(1);
+        borrowed.write_string(0, Cow::Borrowed(bytes), EncodingType::Utf16);
+
+        let mut owned = DefaultRowWriter::new(1);
+        owned.write_string(0, Cow::Owned(bytes.to_vec()), EncodingType::Utf16);
+
+        assert_eq!(borrowed.take_row(), owned.take_row());
+    }
+
+    #[test]
+    fn default_row_writer_borrowed_bytes_matches_owned() {
+        let mut borrowed = DefaultRowWriter::new(1);
+        borrowed.write_bytes(0, Cow::Borrowed(&[9, 8, 7]));
+
+        let mut owned = DefaultRowWriter::new(1);
+        owned.write_bytes(0, Cow::Owned(vec![9, 8, 7]));
+
+        assert_eq!(borrowed.take_row(), owned.take_row());
+    }
+
+    #[test]
     fn default_row_writer_assembles_column_values() {
         let mut writer = DefaultRowWriter::new(5);
 
@@ -384,7 +439,7 @@ mod tests {
         writer.write_null(1);
         writer.write_bool(2, true);
         writer.write_f64(3, 99.5);
-        writer.write_string(4, SqlString::new(b"hello".to_vec(), EncodingType::Utf16));
+        writer.write_string(4, Cow::Borrowed(b"hello"), EncodingType::Utf16);
         writer.end_row();
 
         let row = writer.take_row();
@@ -521,7 +576,7 @@ mod tests {
 
         writer.write_i32(0, 1);
         writer.write_variant_base_type(1, TdsDataType::NVarChar);
-        writer.write_string(1, SqlString::new(vec![0x41, 0x00], EncodingType::Utf16));
+        writer.write_string(1, Cow::Borrowed(&[0x41, 0x00]), EncodingType::Utf16);
         writer.write_variant_base_type(2, TdsDataType::Int4);
         writer.write_i32(2, 7);
         writer.end_row();

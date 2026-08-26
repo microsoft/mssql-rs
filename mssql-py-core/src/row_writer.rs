@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Cow;
+
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -8,7 +10,7 @@ use mssql_tds::datatypes::column_values::{
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::row_writer::RowWriter;
 use mssql_tds::datatypes::sql_json::SqlJson;
-use mssql_tds::datatypes::sql_string::SqlString;
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -76,12 +78,15 @@ impl RowWriter for PyRowWriter {
         self.row.push(ColumnValues::Float(val));
     }
 
-    fn write_string(&mut self, _col: usize, val: SqlString) {
-        self.row.push(ColumnValues::String(val));
+    fn write_string(&mut self, _col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType) {
+        self.row.push(ColumnValues::String(SqlString::new(
+            bytes.into_owned(),
+            encoding_type,
+        )));
     }
 
-    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
-        self.row.push(ColumnValues::Bytes(val));
+    fn write_bytes(&mut self, _col: usize, bytes: Cow<'_, [u8]>) {
+        self.row.push(ColumnValues::Bytes(bytes.into_owned()));
     }
 
     fn write_decimal(&mut self, _col: usize, val: DecimalParts) {

@@ -79,6 +79,12 @@ pub mod connection;
 pub mod connection_provider;
 /// Shared types: result aliases, encryption settings, and cancellation.
 pub mod core;
+
+// `EncodingType::encoding` and `lcid_to_encoding` hand out `&'static
+// encoding_rs::Encoding`, so a consumer needs the exact same `encoding_rs` build
+// to name the type. Re-exported so they inherit ours instead of guessing a
+// matching version.
+pub use encoding_rs;
 /// Cursor types and response structures for TDS cursor RPCs.
 pub mod cursor;
 pub mod datatypes;
