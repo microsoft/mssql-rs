@@ -150,7 +150,9 @@ extends:
       # side. manylinux leaves MATURIN_FEATURES unset and links the OS libssl.
       #
       # Each flavour writes to its own output subdirectory so the two builds
-      # cannot see each other's wheels.
+      # cannot see each other's wheels. The governed Linux job template allows
+      # exactly one published artifact per job, named from ob_artifactSuffix,
+      # so both flavours are gathered into one artifact directory at the end.
       #####################################################################
       - job: BuildLinux_x64
         dependsOn: PreflightVersionCheck
@@ -204,17 +206,18 @@ extends:
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - script: |
+            set -euo pipefail
+            mkdir -p "$(ob_outputDirectory)/wheels"
+            cp "$(ob_outputDirectory)"/manylinux/wheels/*.whl "$(ob_outputDirectory)/wheels/"
+            cp "$(ob_outputDirectory)"/musllinux/wheels/*.whl "$(ob_outputDirectory)/wheels/"
+            ls -lh "$(ob_outputDirectory)/wheels"
+          displayName: 'Gather both libc flavours into one artifact directory'
         - task: PublishPipelineArtifact@1
-          displayName: 'Publish Linux x64 mock wheel'
+          displayName: 'Publish Linux x64 mock wheels'
           inputs:
-            targetPath: '$(ob_outputDirectory)/manylinux/wheels'
+            targetPath: '$(ob_outputDirectory)/wheels'
             artifact: 'drop_PublishMockPython_BuildLinux_x64_mock_linux_x64'
-            publishLocation: 'pipeline'
-        - task: PublishPipelineArtifact@1
-          displayName: 'Publish musllinux x64 mock wheel'
-          inputs:
-            targetPath: '$(ob_outputDirectory)/musllinux/wheels'
-            artifact: 'drop_PublishMockPython_BuildLinuxMusl_x64_mock_linux_musl_x64'
             publishLocation: 'pipeline'
 
       #####################################################################
@@ -273,17 +276,18 @@ extends:
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
             CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
+        - script: |
+            set -euo pipefail
+            mkdir -p "$(ob_outputDirectory)/wheels"
+            cp "$(ob_outputDirectory)"/manylinux/wheels/*.whl "$(ob_outputDirectory)/wheels/"
+            cp "$(ob_outputDirectory)"/musllinux/wheels/*.whl "$(ob_outputDirectory)/wheels/"
+            ls -lh "$(ob_outputDirectory)/wheels"
+          displayName: 'Gather both libc flavours into one artifact directory'
         - task: PublishPipelineArtifact@1
-          displayName: 'Publish Linux ARM64 mock wheel'
+          displayName: 'Publish Linux ARM64 mock wheels'
           inputs:
-            targetPath: '$(ob_outputDirectory)/manylinux/wheels'
+            targetPath: '$(ob_outputDirectory)/wheels'
             artifact: 'drop_PublishMockPython_BuildLinux_arm64_mock_linux_arm64'
-            publishLocation: 'pipeline'
-        - task: PublishPipelineArtifact@1
-          displayName: 'Publish musllinux ARM64 mock wheel'
-          inputs:
-            targetPath: '$(ob_outputDirectory)/musllinux/wheels'
-            artifact: 'drop_PublishMockPython_BuildLinuxMusl_arm64_mock_linux_musl_arm64'
             publishLocation: 'pipeline'
 
       #####################################################################
