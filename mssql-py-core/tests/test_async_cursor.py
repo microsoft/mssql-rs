@@ -13,27 +13,6 @@ from decimal import Decimal
 import pytest
 import mssql_py_core
 
-try:
-    import mssql_mock_tds
-except ImportError:
-    mssql_mock_tds = None
-
-
-@pytest.fixture
-def mock_client_context():
-    if mssql_mock_tds is None:
-        pytest.skip("mssql_mock_tds is not installed")
-
-    server = mssql_mock_tds.PyMockTdsServer(port=0, tls=True)
-    with server:
-        yield {
-            "server": server.sql_address,
-            "database": "master",
-            "access_token": "async-cursor-test-token",
-            "encryption": "Optional",
-            "trust_server_certificate": True,
-        }
-
 
 async def connect(client_context, *, autocommit=True):
     with warnings.catch_warnings():

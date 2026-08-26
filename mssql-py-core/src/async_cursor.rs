@@ -39,6 +39,7 @@ use tracing::instrument::WithSubscriber;
 
 use mssql_tds::connection::tds_client::TdsClient;
 
+use crate::async_fetch::{FetchState, FetchStatus};
 use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, ExecuteClaim, OperationId,
@@ -91,6 +92,7 @@ struct ExecuteSnapshot {
     cursor_id: CursorId,
     input_sizes_generation: u64,
     cleanup_required: Arc<AtomicBool>,
+    fetch_state: Arc<FetchState>,
 }
 
 /// Ownership state left by a successful command dispatch.
@@ -223,11 +225,12 @@ fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static s
         ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
         ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
         ClaimError::Busy => PyRuntimeError::new_err(busy_message),
+        ClaimError::NoResultSet => PyRuntimeError::new_err("No active result set"),
     }
 }
 
 /// Converts a failed cursor operation claim into a Python error.
-fn map_claim_error(error: ClaimError) -> PyErr {
+pub(crate) fn map_claim_error(error: ClaimError) -> PyErr {
     map_claim_error_with_busy_message(error, "Connection is busy with another cursor operation")
 }
 
@@ -433,6 +436,7 @@ pub struct PyAsyncCursor {
     cleanup_required: Arc<AtomicBool>,
     cleanup_started: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    fetch_state: Arc<FetchState>,
 }
 
 impl PyAsyncCursor {
@@ -460,6 +464,7 @@ impl PyAsyncCursor {
             cleanup_required: Arc::new(AtomicBool::new(false)),
             cleanup_started: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
+            fetch_state: Arc::new(FetchState::new()),
         }
     }
 
@@ -472,6 +477,19 @@ impl PyAsyncCursor {
             timeout: self.default_query_timeout,
             closed: self.closed.clone(),
         }
+    }
+
+    pub(crate) fn fetch_resources(&self) -> PyResult<crate::async_fetch::FetchResources> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("Cursor is closed"));
+        }
+        Ok(crate::async_fetch::FetchResources::new(
+            self.tds_client.clone(),
+            self.tracing_dispatch.clone(),
+            self.session_state.clone(),
+            self.cursor_id,
+            self.fetch_state.clone(),
+        ))
     }
 }
 
@@ -691,6 +709,7 @@ impl PyAsyncCursor {
                 cursor_id: cursor.cursor_id,
                 input_sizes_generation: cursor.input_sizes_generation,
                 cleanup_required: cursor.cleanup_required.clone(),
+                fetch_state: cursor.fetch_state.clone(),
             }
         };
         let ExecuteSnapshot {
@@ -702,12 +721,15 @@ impl PyAsyncCursor {
             cursor_id,
             input_sizes_generation,
             cleanup_required,
+            fetch_state,
         } = snapshot;
         let claim = session_state
             .claim_execute(cursor_id)
             .map_err(map_claim_error)?;
         let operation_id = claim.operation_id;
         let future_state = session_state.clone();
+        let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
+        let future_fetch_state = fetch_state.clone();
 
         let future = async move {
             let mut execute_guard = ExecuteGuard::new(future_state, operation_id);
@@ -729,6 +751,11 @@ impl PyAsyncCursor {
             match result {
                 Ok(outcome) => {
                     execute_guard.complete(&outcome);
+                    future_fetch_state.set(if outcome.has_open_batch() {
+                        FetchStatus::Ready
+                    } else {
+                        FetchStatus::NoResultSet
+                    });
                     Python::attach(|py| {
                         let mut cursor = slf.borrow_mut(py);
                         if cursor.input_sizes_generation == input_sizes_generation {
@@ -755,9 +782,15 @@ impl PyAsyncCursor {
             Ok(awaitable) => Ok(awaitable),
             Err(error) => {
                 session_state.release_operation(operation_id);
+                fetch_state.set(previous_fetch_status);
                 Err(error)
             }
         }
+    }
+
+    /// Fetch the next row and return an awaitable resolving to a tuple or `None`.
+    fn fetchone<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_fetch::fetchone(slf, py)
     }
 
     /// Drain pending results, release prepared handles, and close this cursor.
