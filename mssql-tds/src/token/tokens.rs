@@ -1520,6 +1520,24 @@ mod coverage_tests {
         }
     }
 
+    /// Divergence pin: msodbcsql also excludes `SQLFETCHCURSOR` (0x21) and
+    /// `SQLDBCC` (0xe6) from update counts (sqlctokn.cpp:2151-2152). This driver
+    /// follows .NET SqlClient, which models neither, so both fall through the
+    /// catch-all to `None` and their counts are reported. Adding either variant
+    /// silently changes `SQLRowCount` semantics — see
+    /// `done_count_for_msodbcsql_only_exclusions_is_an_update_count`.
+    #[test]
+    fn msodbcsql_only_exclusions_are_not_modelled() {
+        assert_eq!(
+            CurrentCommand::try_from(0x21).unwrap(),
+            CurrentCommand::None
+        );
+        assert_eq!(
+            CurrentCommand::try_from(0xe6).unwrap(),
+            CurrentCommand::None
+        );
+    }
+
     #[test]
     fn current_command_try_from_unknown_maps_to_none() {
         assert_eq!(

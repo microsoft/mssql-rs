@@ -3645,6 +3645,16 @@ impl TdsClient {
                     // the SELECT, not the bare CREATE. `rows_affected` is
                     // `Some(n)` only for an update-count result.
                     if has_update_count || saw_message {
+                        if !has_update_count {
+                            // A message-only result carries no count. Clear any
+                            // count captured from a preceding statement in the
+                            // same batch so it is not re-reported as this
+                            // result's `SQLRowCount` — msodbcsql reports -1
+                            // here (verified for `UPDATE; PRINT`,
+                            // `UPDATE; RAISERROR` and `UPDATE;` followed by a
+                            // warning-raising assignment).
+                            self.last_rows_affected = -1;
+                        }
                         self.execution_context.set_has_open_batch(!is_last);
                         return Ok(ResultBoundaryKind::NoRows {
                             rows_affected: if has_update_count {
@@ -6746,23 +6756,62 @@ mod tests {
         );
     }
 
+    /// Divergence pin: msodbcsql excludes `SQLFETCHCURSOR` (0x21) and `SQLDBCC`
+    /// (0xe6) alongside `SQLSELECT`; this driver excludes only `SQLSELECT`,
+    /// matching .NET SqlClient. Neither value is modelled, so a `DONE_COUNT`
+    /// carrying one parses as `None` and *is* reported as an update count.
+    /// Fails the moment someone adopts the msodbcsql-only exclusions, forcing
+    /// that `SQLRowCount` change to be deliberate rather than incidental.
+    #[tokio::test]
+    async fn done_count_for_msodbcsql_only_exclusions_is_an_update_count() {
+        for raw in [0x21u16, 0xe6] {
+            let cmd = CurrentCommand::try_from(raw).unwrap();
+            let mut client = create_test_client_with_tokens(vec![done_count(cmd, 3, false)]);
+
+            let result = client
+                .execute("EXEC sp_cursorfetch @handle".to_string(), ())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result,
+                StatementResult::NoRows {
+                    rows_affected: Some(3)
+                },
+                "raw cur_cmd {raw:#x}"
+            );
+            assert_eq!(client.last_rows_affected(), 3, "raw cur_cmd {raw:#x}");
+            assert_eq!(
+                client.take_dml_result_counts(),
+                vec![3],
+                "raw cur_cmd {raw:#x}"
+            );
+        }
+    }
+
     /// The only path where `saw_message` and `has_count` land on the *same* DONE:
     /// a warning raised by the assignment itself. The result must still surface
     /// so the message is visible, but must carry no row count — this PR changed
     /// `rows_affected` here from `Some(1)` to `None`.
     ///
+    /// A genuine `UPDATE` precedes the assignment so the assertion is real: with
+    /// a bare assignment `last_rows_affected` is still `-1` from `begin_command`
+    /// and would pass even if the message-only branch leaked a prior count.
+    ///
     /// Live capture for
-    /// `DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;`
+    /// `UPDATE #t SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;`
     /// where `#t.v` contains a NULL:
     /// ```text
+    /// DONE status=MORE|COUNT cur_cmd=Update row_count=2
     /// INFO 8153 "Warning: Null value is eliminated by an aggregate or other SET operation."
     /// DONE status=MORE|COUNT cur_cmd=Select row_count=1
     /// COLMETADATA(1) + row
     /// ```
-    /// msodbcsql reports `cols=0 rowcount=-1` then `cols=1 rowcount=-1`.
+    /// msodbcsql reports `rowcount=2`, then `rowcount=-1`, then `rowcount=-1`.
     #[tokio::test]
     async fn execute_surfaces_assignment_warning_without_rowcount() {
         let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Update, 2, true),
             info_token(
                 8153,
                 0,
@@ -6774,7 +6823,8 @@ mod tests {
 
         let first = client
             .execute(
-                "DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;".to_string(),
+                "UPDATE #t SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #t; SELECT 5 AS a;"
+                    .to_string(),
                 (),
             )
             .await
@@ -6782,14 +6832,26 @@ mod tests {
         assert_eq!(
             first,
             StatementResult::NoRows {
+                rows_affected: Some(2)
+            }
+        );
+        assert_eq!(client.last_rows_affected(), 2);
+
+        let second = client.advance().await.unwrap();
+        assert_eq!(
+            second,
+            StatementResult::NoRows {
                 rows_affected: None
             }
         );
-        assert_eq!(client.last_rows_affected(), -1);
-        assert!(client.take_dml_result_counts().is_empty());
+        assert_eq!(
+            client.last_rows_affected(),
+            -1,
+            "the UPDATE's count must not leak into the message-only result"
+        );
 
-        let second = client.advance().await.unwrap();
-        assert_eq!(second, StatementResult::Rows);
+        let third = client.advance().await.unwrap();
+        assert_eq!(third, StatementResult::Rows);
         assert_eq!(
             client
                 .get_current_metadata()

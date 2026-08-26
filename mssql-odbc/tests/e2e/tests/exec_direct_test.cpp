@@ -384,7 +384,10 @@ TEST_F(ExecDirectLiveTest, UpdateCountStillPrecedesRowSetAfterAssignment) {
 
 // A warning raised by the assignment itself puts a message and a SQLSELECT
 // count on the same DONE. The message-only result still surfaces, but must
-// report SQLRowCount -1 rather than the assignment's count.
+// report SQLRowCount -1 rather than the assignment's count -- or the preceding
+// UPDATE's. The UPDATE is what makes the -1 assertion meaningful: without it
+// SQLRowCount is still -1 from execution start and the test would pass even if
+// a prior count leaked.
 TEST_F(ExecDirectLiveTest, AssignmentWarningResultReportsNoRowCount) {
     SqlTString setup =
         ODBCTestUtils::ToSqlTStr("CREATE TABLE #agg(v int); INSERT INTO #agg VALUES (1),(NULL);");
@@ -398,18 +401,59 @@ TEST_F(ExecDirectLiveTest, AssignmentWarningResultReportsNoRowCount) {
     // SELECT @x = MAX(v) over a NULL emits "Null value is eliminated by an
     // aggregate or other SET operation" (msg 8153) on the assignment's DONE.
     SqlTString sql = ODBCTestUtils::ToSqlTStr(
-        "DECLARE @x int; SELECT @x = MAX(v) FROM #agg; SELECT 5 AS a;");
+        "UPDATE #agg SET v = v; DECLARE @x int; SELECT @x = MAX(v) FROM #agg; SELECT 5 AS a;");
     rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
     ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
+    // The UPDATE's genuine count.
     SQLSMALLINT cols = -1;
     ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(0, cols);
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, row_count);
+
+    // The warning result: no count of its own, and the UPDATE's must not leak.
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0, cols);
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count);
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, cols);
+    EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A message-only statement (PRINT) after a DML count reports SQLRowCount -1,
+// not the preceding statement's count. Pre-existing shape, pinned here because
+// the assignment fix routes a new case onto the same branch.
+TEST_F(ExecDirectLiveTest, MessageOnlyResultAfterDmlReportsNoRowCount) {
+    SqlTString setup =
+        ODBCTestUtils::ToSqlTStr("CREATE TABLE #pr(v int); INSERT INTO #pr VALUES (1),(2);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    for (SQLRETURN more = SQLMoreResults(stmt_); more != SQL_NO_DATA;
+         more = SQLMoreResults(stmt_)) {
+        ASSERT_SQL_OK(more, SQL_HANDLE_STMT, stmt_);
+    }
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "UPDATE #pr SET v = v; PRINT 'hello'; SELECT 5 AS a;");
+    rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
 
     SQLLEN row_count = 0;
     ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ(-1, row_count) << "the warning result must not carry the assignment's count";
+    EXPECT_EQ(2, row_count);
 
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count) << "PRINT must not inherit the UPDATE's count";
+
+    SQLSMALLINT cols = -1;
     ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLNumResultCols(stmt_, &cols), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(1, cols);
