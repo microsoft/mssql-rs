@@ -5,16 +5,19 @@
 
 use tracing::{debug, error};
 
+use std::sync::MutexGuard;
+
 use super::odbc_types::{
     SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA,
     SQL_NO_TOTAL, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer,
     SqlReturn, SqlSmallInt, SqlUSmallInt,
 };
 use super::sqlstate::*;
+use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
+use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
 
@@ -178,7 +181,7 @@ fn sql_get_data_safe(
         .is_some_and(|(c, _)| *c == col_index);
 
     if already_captured {
-        return write_captured_column(
+        let rc = write_captured_column(
             &mut stmt_state,
             col_index,
             target_type,
@@ -186,6 +189,7 @@ fn sql_get_data_safe(
             buffer_length,
             strlen_or_ind_ptr,
         );
+        return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
     }
 
     // Resume the decoder to the requested column then write output.
@@ -212,14 +216,62 @@ fn sql_get_data_safe(
             true,
         );
     }
-    write_captured_column(
+    let rc = write_captured_column(
         &mut reopened_stmt_state,
         col_index,
         target_type,
         target_value_ptr,
         buffer_length,
         strlen_or_ind_ptr,
-    )
+    );
+    finish_get_data(stmt, statement_handle, reopened_stmt_state, col_index, rc)
+}
+
+/// After `SQLGetData` finishes delivering `col_index`, peeks one token past
+/// the current row if that was the result set's last column — mirroring
+/// `fetch_scroll.rs`'s bound-column fetch path. Safe here because every
+/// column has now been read (whether via `SQLBindCol` earlier or
+/// `SQLGetData` just now), so nothing remains on the wire for this row that
+/// a later `SQLGetData` call could still legitimately retrieve. Releases the
+/// connection's busy claim immediately if the peek confirms no more rows
+/// follow, instead of waiting for this cursor to be explicitly closed
+/// (matches msodbcsql's wire-state busy gate; see AB#47508).
+///
+/// Out of scope for now: a column still mid-PLP-stream (`active_plp` set) is
+/// excluded even when `col_index` is the last column, since the stream may
+/// not have reached the wire's end yet; the peek only runs once it completes
+/// naturally on a later `SQLGetData` call.
+fn finish_get_data(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    stmt_state: MutexGuard<'_, StmtState>,
+    col_index: usize,
+    rc: SqlReturn,
+) -> SqlReturn {
+    if rc == SQL_ERROR {
+        return rc;
+    }
+    let ready = stmt_state.current_row_last_col == col_index
+        && col_index == stmt_state.column_metadata.len()
+        && stmt_state.active_plp.is_none();
+    drop(stmt_state);
+    if !ready {
+        return rc;
+    }
+
+    let dbc = stmt.parent_dbc();
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        return rc;
+    };
+    if dbc_state.active_stmt != Some(statement_handle) {
+        return rc;
+    }
+    let Some(client) = dbc_state.client.take() else {
+        return rc;
+    };
+    drop(dbc_state);
+    release_busy_if_row_exhausted(dbc, stmt, statement_handle, client);
+    rc
 }
 
 fn write_captured_column(
@@ -1100,6 +1152,7 @@ mod tests {
     use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP};
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NULL_HANDLE};
     use crate::error::diag::DiagRecord;
+    use crate::handles::DbcHandle;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::int_columns;
 
@@ -1904,5 +1957,85 @@ mod tests {
             .unwrap();
         let last = s.diag_records.last().unwrap();
         assert_eq!(&last.sql_state, b"22018");
+    }
+
+    /// Delivering the sole column of a single-column result must release the
+    /// connection's busy claim right away — the statement's cursor stays
+    /// open, but nothing on the wire remains for a later `SQLGetData` on this
+    /// row to protect, so the peek is safe. This is the point of AB#47508's
+    /// fix: msodbcsql's busy gate tracks the wire, not the statement's cursor
+    /// lifetime.
+    #[test]
+    fn get_data_releases_busy_after_delivering_the_lone_column() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt_handle.inner.lock().unwrap().column_metadata = int_columns(1);
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            mssql_tds::test_client_support::col_metadata_empty(),
+            mssql_tds::test_client_support::done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    /// The mirror image: column 1 of a *two*-column result is not the last
+    /// column, so a trailing `SQLGetData` call could still legitimately
+    /// retrieve column 2. The busy claim must stay exactly as it was — and
+    /// since no DBC client is configured at all here, a peek attempt would
+    /// fail loudly rather than silently succeed, so `SQL_SUCCESS` below is
+    /// itself proof the peek was correctly skipped.
+    #[test]
+    fn get_data_keeps_busy_when_a_trailing_column_remains() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null); // int_columns(2) by default
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 }

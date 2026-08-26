@@ -205,6 +205,60 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
     }
 }
 
+/// Peeks whether another row follows the one just fully consumed — every
+/// column read, whether via bound columns (`SQLFetch`/`SQLFetchScroll`) or
+/// `SQLGetData` through the last column — and returns `client` to the DBC
+/// accordingly: idle (busy claim released) if the wire is now provably done
+/// with this statement, still busy if another row is pending. A row the peek
+/// finds is not lost; it is parked at the `TdsClient` layer (see
+/// [`TdsClient::peek_past_current_row`]) for the next fetch to consume
+/// without re-reading the wire.
+///
+/// This is what lets the connection stop being busy as soon as msodbcsql's
+/// wire-state gate would, instead of only when this statement's cursor is
+/// explicitly closed (see AB#47508): a cursor can stay open — a later
+/// `SQLFetch` on it still works, reporting `SQL_NO_DATA` from
+/// `result_set_exhausted` alone — while no longer blocking a different
+/// statement on the same connection.
+///
+/// Best-effort: a peek failure is logged and otherwise swallowed, leaving the
+/// connection claimed exactly as it already was — the failure surfaces
+/// normally on the caller's next real call instead of here.
+///
+/// # Caller obligation
+/// Only call this once every column of the row positioned when `client` was
+/// claimed has been read — like `next_row_cursor`, the peek discards
+/// anything left unread on that row.
+pub(super) fn release_busy_if_row_exhausted(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut client: TdsClient,
+) {
+    let has_more = match dbc.runtime.block_on(client.peek_past_current_row()) {
+        Ok(has_more) => Some(has_more),
+        Err(e) => {
+            error!(%e, "release_busy_if_row_exhausted: peek past current row failed");
+            None
+        }
+    };
+
+    if let Ok(mut dbc_state) = dbc.inner.lock() {
+        dbc_state.client = Some(client);
+        dbc_state.active_stmt = if has_more == Some(false) {
+            None
+        } else {
+            Some(statement_handle)
+        };
+    }
+
+    if has_more == Some(false)
+        && let Ok(mut stmt_state) = stmt.inner.lock()
+    {
+        stmt_state.result_set_exhausted = true;
+    }
+}
+
 /// Restores the client to idle, posts a TDS error to `stmt`, clears
 /// `EXEC_STARTED`, and returns `SQL_ERROR`. The common failure tail for an
 /// execution I/O error.
@@ -424,6 +478,7 @@ pub(super) fn finish_execute(
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
         stmt_state.row_count = client.last_rows_affected();
+        stmt_state.result_set_exhausted = false;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -480,6 +535,7 @@ pub(super) fn finish_execute(
     stmt_state.begin_batch(metadata);
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
+    stmt_state.result_set_exhausted = false;
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -502,6 +558,9 @@ mod tests {
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::{
+        ScriptedToken, col_metadata_empty, done_no_more, tds_client_from_tokens,
+    };
     use std::ffi::c_void;
 
     // The success path of `try_claim_idle_client` needs a real `TdsClient`,
@@ -539,6 +598,71 @@ mod tests {
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         // The existing claim must be left untouched.
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+    }
+
+    /// Builds a scripted client positioned on a row-returning result (empty
+    /// metadata; column data is irrelevant to `release_busy_if_row_exhausted`,
+    /// which only peeks past it), then injects it as the busy client owning
+    /// `h.stmt` — mirroring the state left by a fetch that has just consumed a
+    /// row's last column.
+    fn position_and_inject(h: &TestHandles, tokens: Vec<ScriptedToken>) {
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_tokens(tokens);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        let mut ds = dbc.inner.lock().unwrap();
+        ds.client = Some(client);
+        ds.active_stmt = Some(h.stmt);
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_releases_when_wire_is_done() {
+        // The peek finds the terminating DONE: the wire is provably idle for
+        // this statement even though its cursor stays open, so the busy claim
+        // is released immediately (AB#47508) and the statement is marked so a
+        // later SQLFetch can report SQL_NO_DATA without touching the
+        // connection at all.
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_no_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client);
+
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(stmt.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    // The "peek finds another row and keeps the connection busy" branch is
+    // covered in `mssql_tds::connection::tds_client::tests` instead: it needs
+    // `TdsClient::row_already_positioned`, a private field the scripted
+    // transport in `test_client_support` cannot reach from outside the crate
+    // (see its module docs — there are no real row bytes to manufacture one
+    // through a fresh read either).
+
+    #[test]
+    fn release_busy_if_row_exhausted_swallows_peek_failure_and_stays_busy() {
+        // A transport failure during the peek must not be silently reported
+        // as "exhausted" — that would tell a later SQLFetch there is nothing
+        // left when the connection may in fact be broken. Leaving the
+        // connection claimed defers the failure to the caller's next real
+        // call, unchanged from before this fix.
+        let h = TestHandles::with_env_dbc_stmt();
+        // No tokens queued: the peek's `next_row_cursor` read fails immediately.
+        position_and_inject(&h, vec![col_metadata_empty()]);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client);
+
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
     /// Builds a `BoundParam` over the given char buffer and NTS indicator.

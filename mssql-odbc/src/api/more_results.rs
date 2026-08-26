@@ -117,6 +117,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             };
             stmt_state.begin_result_set(metadata);
             stmt_state.reset_row_stream();
+            stmt_state.result_set_exhausted = false;
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();
             // Drain INFO only after the lock is held.
@@ -152,6 +153,12 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // SQLRowCount now that we are positioned on it.
             stmt_state.row_count = client.last_rows_affected();
             stmt_state.reset_row_stream();
+            // A stale `true` here (inherited from a previous result set this
+            // statement fetched to exhaustion) would make SQLFetch report
+            // SQL_NO_DATA instead of the 24000 this zero-column result must
+            // give — so this arm needs the same reset as the `Rows` arm even
+            // though there is nothing to fetch on this result itself.
+            stmt_state.result_set_exhausted = false;
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
@@ -272,6 +279,35 @@ mod tests {
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+    }
+
+    /// A statement whose first result set was fetched to exhaustion (marked
+    /// via a prior fetch's peek, AB#47508) must not have that stale flag leak
+    /// into the next result set `SQLMoreResults` positions on — otherwise a
+    /// perfectly fetchable second rowset would report `SQL_NO_DATA` on the
+    /// very first `SQLFetch`.
+    #[test]
+    fn more_results_clears_a_stale_exhausted_flag_on_the_next_rowset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let first = position_first_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(), // stmt1 row set
+                done_more(),          // terminates stmt1, more to come
+                col_metadata_empty(), // stmt2 row set
+            ],
+        );
+        assert_eq!(first, StatementResult::Rows);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt.inner.lock().unwrap().result_set_exhausted = true;
+        }
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
     /// SQLMoreResults surfaces a no-row statement result (message-bearing, zero

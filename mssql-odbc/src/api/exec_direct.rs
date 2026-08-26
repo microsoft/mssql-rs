@@ -461,4 +461,31 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert!(stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN));
     }
+
+    /// A statement handle reused for a new execute after its previous cursor
+    /// was fetched to exhaustion (AB#47508's `result_set_exhausted` flag) must
+    /// not carry that flag into the new result set — otherwise the very first
+    /// `SQLFetch` on the fresh cursor would wrongly report `SQL_NO_DATA`.
+    #[test]
+    fn exec_direct_row_returning_clears_a_stale_exhausted_flag() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![col_metadata_empty()]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().result_set_exhausted = true;
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".to_string());
+
+        assert_eq!(ret, SQL_SUCCESS);
+        assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
+    }
 }

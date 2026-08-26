@@ -102,6 +102,16 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// Set once a fetch has confirmed — possibly by peeking one token past
+    /// the row it just delivered — that no further rows exist for the
+    /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
+    /// set until an explicit close: this only means a later
+    /// `SQLFetch`/`SQLFetchScroll` can report `SQL_NO_DATA` without needing
+    /// the connection (another statement may have claimed it in the
+    /// meantime — the answer is already known and needs no more wire access).
+    /// Reset whenever a fresh row-returning result is positioned (a new
+    /// execute, or `SQLMoreResults` landing on the next result set).
+    pub(crate) result_set_exhausted: bool,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
@@ -887,6 +897,7 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                result_set_exhausted: false,
                 prepared: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
