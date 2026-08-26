@@ -16,22 +16,24 @@
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
-use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, RpcTypeMetadata, StatusFlags};
+use mssql_tds::message::parameters::rpc_parameters::{
+    RpcParameter, RpcTypeMetadata, StatusFlags, StreamedSqlType,
+};
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID,
-    SQL_INTEGER, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT,
-    SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_VECTOR,
+    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
+    SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
+    SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL,
+    SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_VECTOR,
     SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME,
     SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
     SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
-    DiagMsg, ERR_DATA_AT_EXEC_NOT_IMPLEMENTED, ERR_INVALID_CHARACTER_VALUE,
-    ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
-    ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_INVALID_USE_OF_DEFAULT_PARAM,
-    ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
-    ERR_RESTRICTED_DATA_TYPE,
+    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_NULL_POINTER,
+    ERR_INVALID_PARAM_PRECISION_OR_SCALE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED, ERR_RESTRICTED_DATA_TYPE,
 };
 use crate::conversion::error::ConvError;
 use crate::conversion::numeric::narrow_i128;
@@ -51,8 +53,12 @@ pub(crate) enum ParamBuildError {
     /// Backstop only: bind time rejects any C type the conversion matrix does
     /// not list, so reaching this means the matrix and this module disagree.
     UnsupportedCType(SqlSmallInt),
-    /// The parameter uses data-at-execution (`SQLPutData`).
-    DataAtExecUnsupported,
+    /// Backstop only: data-at-execution is supported, but `SQLExecute` and
+    /// `SQLExecDirect` stage those parameters as streaming placeholders before
+    /// reaching this module. An indicator that survives to here means staging
+    /// missed the parameter, so the value buffer holds the application's token
+    /// rather than data. Reported as a driver error, not "not implemented".
+    DataAtExecNotStaged,
     /// `StrLen_or_Ind` was `SQL_DEFAULT_PARAM` on a statement that is not a
     /// canonical procedure call.
     InvalidUseOfDefaultParam,
@@ -74,7 +80,7 @@ impl ParamBuildError {
     pub(crate) fn diag(self) -> DiagMsg {
         match self {
             Self::UnsupportedCType(_) => ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
-            Self::DataAtExecUnsupported => ERR_DATA_AT_EXEC_NOT_IMPLEMENTED,
+            Self::DataAtExecNotStaged => ERR_DATA_AT_EXEC_NOT_STAGED,
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
@@ -145,9 +151,29 @@ pub(crate) unsafe fn bound_param_to_value(
         AppValue::WideText(bytes) => {
             SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
         }
+        AppValue::Binary(bytes) => SqlType::VarBinaryMax(Some(bytes)),
     };
 
     Ok((value, None))
+}
+
+/// Returns `true` when `indicator` is a data-at-execution value
+/// (`SQL_DATA_AT_EXEC` or any value at or below `SQL_LEN_DATA_AT_EXEC_OFFSET`).
+pub(crate) fn is_data_at_exec_indicator(indicator: SqlLen) -> bool {
+    indicator == SQL_DATA_AT_EXEC || indicator <= SQL_LEN_DATA_AT_EXEC_OFFSET
+}
+
+/// Builds the streaming placeholder type for a data-at-execution bound
+/// parameter. The actual bytes arrive later via `SQLPutData`.
+pub(crate) fn dae_placeholder_type(
+    c_type: SqlSmallInt,
+) -> Result<StreamedSqlType, ParamBuildError> {
+    match c_type {
+        SQL_C_CHAR => Ok(StreamedSqlType::VarcharMax),
+        SQL_C_WCHAR => Ok(StreamedSqlType::NVarcharMax),
+        SQL_C_BINARY => Ok(StreamedSqlType::VarBinaryMax),
+        other => Err(ParamBuildError::UnsupportedCType(other)),
+    }
 }
 
 /// Emits the integer `SqlType` named by `ParameterType`, not by the C type, so
@@ -166,7 +192,6 @@ fn integer_value(sql_type: SqlSmallInt, v: i128) -> Result<SqlType, ParamBuildEr
         other => return Err(ParamBuildError::UnsupportedSqlType(other)),
     })
 }
-
 /// A TDS value plus the precision/scale the RPC layer must use for both the
 /// `@P1 <type>` declaration and the wire `TYPE_INFO`.
 type TypedValue = (SqlType, Option<RpcTypeMetadata>);
@@ -360,9 +385,9 @@ fn vector_metadata(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_FLOAT, SQL_C_SLONG, SQL_C_STINYINT, SQL_C_UBIGINT,
-        SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS, SQL_NULL_DATA,
-        SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
+        SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_FLOAT, SQL_C_LONG, SQL_C_SLONG, SQL_C_STINYINT,
+        SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS,
+        SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
     };
     use crate::params::conversion_matrix::is_supported_conversion;
     use std::ffi::c_void;
@@ -391,6 +416,15 @@ mod tests {
     fn default_param(sql_type: SqlSmallInt, ind: *mut SqlLen) -> BoundParam {
         let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), ind);
         p.sql_type = sql_type;
+        p
+    }
+
+    /// A `SQL_C_BINARY` binding. `ParameterType` is carried because a NULL is
+    /// typed from it alone - the C type says only how a value buffer would have
+    /// been read, and a NULL has no buffer.
+    fn binary_param(ptr: *mut c_void, ind: *mut SqlLen) -> BoundParam {
+        let mut p = param(SQL_C_BINARY, ptr, ind);
+        p.sql_type = SQL_VARBINARY;
         p
     }
 
@@ -567,6 +601,101 @@ mod tests {
     }
 
     #[test]
+    fn binary_with_indicator_length_becomes_varbinary() {
+        let mut buf: Vec<u8> = vec![0x01, 0x00, 0xFF, 0x7E];
+        let mut ind: SqlLen = 4;
+        let p = binary_param(buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarBinaryMax(Some(b)) => assert_eq!(b, vec![0x01, 0x00, 0xFF, 0x7E]),
+            other => panic!("expected VarBinaryMax(Some), got {other:?}"),
+        }
+    }
+
+    /// Without an indicator pointer a binary buffer has no stated length, so
+    /// the binding's `BufferLength` supplies it.
+    #[test]
+    fn binary_without_indicator_uses_buffer_length() {
+        let mut buf: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut p = binary_param(buf.as_mut_ptr() as *mut c_void, std::ptr::null_mut());
+        p.buffer_length = 2;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarBinaryMax(Some(b)) => assert_eq!(b, vec![0xDE, 0xAD]),
+            other => panic!("expected VarBinaryMax(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_null_indicator_becomes_typed_null() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let p = binary_param(std::ptr::null_mut(), &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::VarBinaryMax(None)));
+    }
+
+    /// A zero-length binary value is empty, not NULL — `SQL_NULL_DATA` is the
+    /// only way to bind a NULL.
+    #[test]
+    fn binary_zero_length_becomes_empty_varbinary() {
+        let mut buf: Vec<u8> = vec![0xDE, 0xAD];
+        let mut ind: SqlLen = 0;
+        let p = binary_param(buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarBinaryMax(Some(b)) => assert!(b.is_empty()),
+            other => panic!("expected VarBinaryMax(Some), got {other:?}"),
+        }
+    }
+
+    /// `SQL_NTS` on a binary parameter falls back to `BufferLength`, which has
+    /// no NUL to stop at and so must be a real length.
+    #[test]
+    fn binary_nts_with_negative_buffer_length_is_rejected() {
+        let mut buf: Vec<u8> = vec![0x01, 0x02];
+        let mut ind: SqlLen = SQL_NTS as SqlLen;
+        let mut p = binary_param(buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.buffer_length = -1;
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert!(matches!(err, ParamBuildError::InvalidLength(-1)));
+        assert_eq!(err.diag().state, ERR_INVALID_STRING_OR_BUFFER_LENGTH.state);
+    }
+
+    /// The three C types `SQLPutData` can stream, and the rejection every other
+    /// binding gets. `SQLBindParameter` accepts data-at-execution for any C
+    /// type, so the refusal lands at execute time.
+    #[test]
+    fn dae_placeholder_type_covers_the_streamable_c_types() {
+        assert!(matches!(
+            dae_placeholder_type(SQL_C_CHAR),
+            Ok(StreamedSqlType::VarcharMax)
+        ));
+        assert!(matches!(
+            dae_placeholder_type(SQL_C_WCHAR),
+            Ok(StreamedSqlType::NVarcharMax)
+        ));
+        assert!(matches!(
+            dae_placeholder_type(SQL_C_BINARY),
+            Ok(StreamedSqlType::VarBinaryMax)
+        ));
+
+        let err = dae_placeholder_type(SQL_C_LONG).unwrap_err();
+        assert!(matches!(err, ParamBuildError::UnsupportedCType(SQL_C_LONG)));
+        assert_eq!(err.diag().state, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state);
+    }
+
+    /// A parameter that reaches value conversion still carrying a
+    /// data-at-execution indicator was never staged for streaming. That is a
+    /// driver bug, so it maps to a driver error rather than "not implemented".
+    #[test]
+    fn data_at_exec_not_staged_maps_to_a_driver_error() {
+        assert_eq!(
+            ParamBuildError::DataAtExecNotStaged.diag().state,
+            ERR_DATA_AT_EXEC_NOT_STAGED.state
+        );
+    }
+
+    #[test]
     fn wchar_explicit_length_becomes_nvarchar() {
         let mut buf: Vec<u16> = "hi".encode_utf16().collect();
         let mut ind: SqlLen = (buf.len() * 2) as SqlLen;
@@ -601,7 +730,18 @@ mod tests {
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
         let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamBuildError::DataAtExecUnsupported);
+        assert_eq!(err, ParamBuildError::DataAtExecNotStaged);
+    }
+
+    /// `SQL_LEN_DATA_AT_EXEC(n)` encodes as a large negative indicator, which
+    /// would otherwise be caught by the invalid-length check below it and
+    /// misreported as a bad buffer length.
+    #[test]
+    fn data_at_exec_with_declared_length_is_rejected() {
+        let mut ind: SqlLen = SQL_LEN_DATA_AT_EXEC_OFFSET - 16;
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::DataAtExecNotStaged);
     }
 
     #[test]

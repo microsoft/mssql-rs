@@ -27,6 +27,7 @@ pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
 pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
+pub(crate) const SQLSTATE_22026: [u8; 5] = *b"22026";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_25000: [u8; 5] = *b"25000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
@@ -38,6 +39,7 @@ pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY016: [u8; 5] = *b"HY016";
+pub(crate) const SQLSTATE_HY020: [u8; 5] = *b"HY020";
 pub(crate) const SQLSTATE_HY021: [u8; 5] = *b"HY021";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
 pub(crate) const SQLSTATE_HY094: [u8; 5] = *b"HY094";
@@ -160,9 +162,9 @@ pub(crate) const ERR_INVALID_USE_OF_DEFAULT_PARAM: DiagMsg = DiagMsg {
     state: SQLSTATE_07S01,
     text: "Invalid use of default parameter",
 };
-pub(crate) const ERR_DATA_AT_EXEC_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
-    state: SQLSTATE_HYC00,
-    text: "Data-at-execution parameters not yet implemented",
+pub(crate) const ERR_DATA_AT_EXEC_NOT_STAGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "Data-at-execution parameter reached the materializing conversion path",
 };
 pub(crate) const ERR_PARAM_C_TYPE_NOT_IMPLEMENTED: DiagMsg = DiagMsg {
     state: SQLSTATE_HYC00,
@@ -197,6 +199,17 @@ pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
     state: SQLSTATE_22018,
     text: "Invalid character value for cast specification",
+};
+pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
+    state: SQLSTATE_22026,
+    text: "String data, length mismatch",
+};
+// A streamed parameter is either NULL or a sequence of value chunks; mixing the
+// two in one `SQL_NEED_DATA` window has no representation on the wire
+// (msodbcsql `sqlccmd.cpp` -> IDS_HY_020).
+pub(crate) const ERR_ATTEMPT_TO_CONCATENATE_NULL: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY020,
+    text: "Attempt to concatenate a null value",
 };
 pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01S07,
