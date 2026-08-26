@@ -375,7 +375,10 @@ under a single-byte collation "cafe" with an acute accent is four collation
 bytes, not five. The inverse - a collation whose bytes outnumber the units we
 counted, so an over-long value passes - is reachable on any `_UTF8` collation,
 not just a DBCS one: `serialize_char_varchar_direct` then rejects it as a
-`UsageError`, surfacing `HY000` rather than `22001`.
+`UsageError`, surfacing `HY000` rather than the `22001` the application should
+see. Routing it to `ERR_PARAM_STRING_TRUNCATION` needs a typed error out of
+`mssql-tds` - matching on the message text would be guesswork - so it belongs
+with AB#47584 rather than as a local patch.
 through - is the untested direction.
 
 Verified against msodbcsql source:
@@ -393,6 +396,15 @@ Verified against msodbcsql source:
   an RPC parameter currently carries a textptr/timestamp header and a stray
   table-name byte, and the server answers 4002 (AB#47591). Restoring the true
   declaration, with `SQL_COPT_SS_LONGASMAX` as the opt-in fallback, is AB#47592.
+  The attribute itself is unimplemented, so the long types currently get its
+  *result* unconditionally with no way to ask for either behaviour.
+- **Blank padding is left to the server.** msodbcsql pads client-side when
+  `SQL_COPT_SS_ANSI_NPW` is on and the value is shorter than the declared length
+  (`sqlcmisc.cpp:7472`, gated on `SQLBIGCHAR` / `SQLBIGBINARY` / `SQLNCHAR`).
+  This driver sends the actual length and lets the server pad, which
+  `DeclaredLengthReachesTheServer` shows is observationally equivalent -
+  `DATALENGTH` is 8 for a `char(8)` carrying three characters on both drivers.
+  The attribute is unimplemented.
 - **`ColumnSize` is a character count and msodbcsql agrees** - no divergence.
   `SQLBindParameter` converts it to an internal byte count for the wide types
   (`sqlcdesc.cpp:3311`, `cbColDef *= sizeof(WCHAR)`); every `/ sizeof(WCHAR)`

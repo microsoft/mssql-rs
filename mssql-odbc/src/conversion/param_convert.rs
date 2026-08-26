@@ -308,11 +308,13 @@ impl AppText {
 /// already floors the length to whole units, so this only guards a caller that
 /// bypasses it.
 fn decode_utf16le(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
+    char::decode_utf16(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    )
+    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect()
 }
 
 /// Emits the character `SqlType` named by `ParameterType`, transcoding when the
