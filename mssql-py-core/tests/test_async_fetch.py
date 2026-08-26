@@ -10,11 +10,19 @@ import mssql_py_core
 import pytest
 
 
-async def connect(client_context):
+class RecordingLogger:
+    def __init__(self):
+        self.messages = []
+
+    def py_core_log(self, _level, message, _module_name, _line):
+        self.messages.append(message)
+
+
+async def connect(client_context, python_logger=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         return await mssql_py_core.PyAsyncConnection.connect(
-            client_context, autocommit=True
+            client_context, python_logger, autocommit=True
         )
 
 
@@ -69,6 +77,33 @@ def test_fetchone_returns_rows_and_releases_final_exhaustion(client_context):
             assert await owner.fetchone() is None
 
             await other.execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_logs_success_and_exhaustion(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT 1", use_prepare=False)
+            logger.messages.clear()
+
+            assert await cursor.fetchone() == (1,)
+            assert await cursor.fetchone() is None
+
+            assert any(
+                "PyAsyncCursor::fetchone: row fetched successfully" in message
+                for message in logger.messages
+            )
+            assert any(
+                "PyAsyncCursor::fetchone: result set exhausted" in message
+                for message in logger.messages
+            )
         finally:
             await conn.close()
 

@@ -184,6 +184,11 @@ pub(crate) fn fetchone<'py>(
                 } else {
                     FetchStatus::Exhausted
                 });
+                if writer.is_some() {
+                    tracing::info!("PyAsyncCursor::fetchone: row fetched successfully");
+                } else {
+                    tracing::info!("PyAsyncCursor::fetchone: result set exhausted");
+                }
                 Python::attach(|py| match writer {
                     Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
                     None => Ok(py.None()),
