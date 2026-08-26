@@ -104,7 +104,12 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     // Mirrors msodbcsql's `SQLDisconnect`, which frees the connection's
     // descriptor-allocation-node list the same way, after its own statement
     // loop (`sqlcconn.cpp:1313-1448`).
-    for &desc_ptr in &state.descriptors {
+    //
+    // Pops (rather than iterating then clearing) so a poisoned DESC mutex
+    // leaves only the not-yet-freed remainder in `state.descriptors`: a
+    // retried `SQLDisconnect` picks up where this one stopped instead of
+    // re-freeing entries this pass already dropped.
+    while let Some(desc_ptr) = state.descriptors.pop() {
         // SAFETY: `desc_ptr` came from `handle_to_raw::<DescHandle>` and is
         // still live (the DBC owns it). Acquire the DESC lock to serialize
         // with any op still holding it, then drop the box.
@@ -116,7 +121,6 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         drop(guard);
         unsafe { free_handle::<DescHandle>(desc_ptr) };
     }
-    state.descriptors.clear();
 
     // Drop the TDS client (closes the connection) and clear connection-level cursor claim.
     state.client = None;

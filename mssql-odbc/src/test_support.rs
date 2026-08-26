@@ -157,8 +157,9 @@ impl TestHandles {
             unsafe { sql_alloc_handle(SQL_HANDLE_DBC, self.env, &mut dbc) },
             SQL_SUCCESS
         );
-        // Descriptor allocation requires a connected DBC (`alloc_desc`'s
-        // `08003` gate) — same technique as `mark_dbc_connected`.
+        // Connects the DBC (though `alloc_desc` no longer requires it — see
+        // its doc comment) so this mirrors a realistic connected-session
+        // cross-connection scenario; same technique as `mark_dbc_connected`.
         unsafe { handle_from_raw::<DbcHandle>(dbc) }
             .inner
             .lock()

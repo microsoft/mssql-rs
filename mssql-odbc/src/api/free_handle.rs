@@ -112,10 +112,12 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
             .unwrap_or(true),
         "SQLFreeHandle(DBC): DM should have freed all STMTs before calling SQLFreeConnect"
     );
-    // Holds because `alloc_desc` requires a connected DBC and
-    // `sql_disconnect_safe` frees every explicit descriptor — same pattern as
-    // msodbcsql's own `assert(CItemsPl(lpdbc->lpplDAN) == 0)`
-    // (`sqlcconn.cpp:727`), an assert rather than a defensive free loop here.
+    // Holds because every explicit descriptor must be freed (directly, or by
+    // `sql_disconnect_safe` on disconnect) before its parent DBC — the
+    // ordinary "free children before the parent" contract, not something
+    // that depends on connection state — same pattern as msodbcsql's own
+    // `assert(CItemsPl(lpdbc->lpplDAN) == 0)` (`sqlcconn.cpp:727`), an assert
+    // rather than a defensive free loop here.
     debug_assert!(
         dbc.inner
             .lock()
@@ -211,6 +213,10 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 /// several statements at once is a supported case, not an error: every one of
 /// them is reset, not just the first found.
 ///
+/// If the descriptor is not found in the parent DBC's descriptor list, it was
+/// already dropped by `SQLDisconnect` — returns `SQL_SUCCESS` without calling
+/// `free_handle` a second time, mirroring `free_stmt`'s identical guard.
+///
 /// # Safety
 /// `handle` must be a live `DescHandle` created by `alloc_desc`.
 unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
@@ -223,14 +229,12 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
 
     if let Ok(mut state) = desc.inner.lock() {
         free_errors(&mut state);
-    }
 
-    if !desc.is_explicit() {
-        error!("SQLFreeHandle(DESC): cannot free an implicitly allocated descriptor");
-        if let Ok(mut state) = desc.inner.lock() {
+        if !desc.is_explicit() {
+            error!("SQLFreeHandle(DESC): cannot free an implicitly allocated descriptor");
             post_diag(&mut state, ERR_INVALID_USE_OF_AUTO_DESC);
+            return SQL_ERROR;
         }
-        return SQL_ERROR;
     }
 
     let dbc = unsafe { handle_from_raw::<DbcHandle>(desc.parent_dbc) };
@@ -247,6 +251,12 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         return SQL_ERROR;
     };
 
+    let Some(i) = dbc_state.descriptors.iter().position(|&p| p == handle) else {
+        // Already dropped by SQLDisconnect - early return.
+        return SQL_SUCCESS;
+    };
+    dbc_state.descriptors.swap_remove(i);
+
     for &stmt_raw in &dbc_state.statements {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_raw) };
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -260,9 +270,6 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         }
     }
 
-    if let Some(i) = dbc_state.descriptors.iter().position(|&p| p == handle) {
-        dbc_state.descriptors.swap_remove(i);
-    }
     drop(dbc_state);
 
     unsafe { free_handle::<DescHandle>(handle) };
@@ -445,8 +452,10 @@ mod tests {
         (env, dbc)
     }
 
-    // --- Helper: alloc ENV + DBC, marked connected, for DESC tests ---
-    // (`SQLAllocHandle(SQL_HANDLE_DESC, ...)` requires a connected DBC.)
+    // --- Helper: alloc ENV + DBC, marked connected ---
+    // Establishes a Connected state without a real TDS client, for tests
+    // that want a realistic connected-session baseline (not required for
+    // DESC allocation itself — see `alloc_desc`'s doc comment).
     fn alloc_env_dbc_connected() -> (SqlHandle, SqlHandle) {
         use crate::handles::dbc::ConnectionState;
 
@@ -591,6 +600,46 @@ mod tests {
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
+    /// Reproduces the double-free the AB#47436 review identified: after
+    /// `SQLDisconnect` has already freed every outstanding explicit
+    /// descriptor (`sql_disconnect_safe`), an application retrying
+    /// `SQLFreeHandle` on the same, now-stale handle must get `SQL_SUCCESS`
+    /// without freeing anything a second time — mirrors `free_stmt`'s
+    /// identical "already dropped by SQLDisconnect" guard.
+    ///
+    /// Simulates "already removed" by taking the descriptor out of
+    /// `dbc_state.descriptors` directly, without freeing its box, so the
+    /// test itself never dereferences already-freed memory. (That residual
+    /// risk — reading `desc.object_type`/`is_explicit()` before this guard is
+    /// reached, if the box itself were already dropped — is the same one
+    /// `free_stmt` already accepts and is unaffected by this fix; it's
+    /// tracked by the crate's existing refcounted-handle-lifetimes TODO in
+    /// `disconnect.rs`, not something this test exercises.)
+    #[test]
+    fn free_desc_already_removed_from_parent_is_a_no_op() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+
+        // Simulate SQLDisconnect having already unregistered (but not yet
+        // dropped) the descriptor.
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        dbc_ref.inner.lock().unwrap().descriptors.clear();
+
+        let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        // The guard above stopped `free_desc` from dropping the box, so this
+        // test must clean it up itself to avoid leaking.
+        unsafe { free_handle::<DescHandle>(desc) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
     /// Implicit descriptors are owned by their statement and can never be
     /// freed as explicit handles (AB#47436 acceptance criteria) — matches the
     /// ODBC reference's HY017 for `SQLFreeHandle`. The diagnostic must land on
@@ -625,14 +674,12 @@ mod tests {
     }
 
     /// `free_dbc`'s `debug_assert!` documents a genuine invariant, not a
-    /// hypothetical one: `SQLAllocHandle(SQL_HANDLE_DESC, ...)` requires a
-    /// connected DBC (`alloc_desc`), and `SQLDisconnect` — which the DM
-    /// requires before `SQLFreeHandle(SQL_HANDLE_DBC)` on a connection that
-    /// *is* connected — frees every outstanding explicit descriptor
-    /// (`sql_disconnect_safe`). So reaching `free_dbc` with a non-empty
-    /// `descriptors` list, as this test forces directly, means the DM's own
-    /// contract was violated (skipped `SQLDisconnect`), exactly like this
-    /// test's STMT twin above. This driver does not independently re-check
+    /// hypothetical one: reaching it with a non-empty `descriptors` list, as
+    /// this test forces directly, means the app freed the DBC without first
+    /// freeing (or disconnecting to free) every descriptor it allocated on
+    /// it — an ordinary "free children before the parent" contract violation,
+    /// exactly like this test's STMT twin above, which needs no connection
+    /// state of its own to hold. This driver does not independently re-check
     /// that at `free_dbc` and trusts the DM instead, matching msodbcsql's own
     /// `assert(CItemsPl(lpdbc->lpplDAN) == 0)` (`sqlcconn.cpp:727`) — an
     /// assert, not a defensive free loop, at the exact same point.
@@ -649,9 +696,21 @@ mod tests {
         let ret = unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         if cfg!(debug_assertions) {
             assert_eq!(ret, SQL_ERROR);
-            unsafe { free_handle::<DescHandle>(desc) };
+            // The failed free left `dbc` alive with `desc` still registered
+            // on it (the assert fires before any actual cleanup runs) — free
+            // the descriptor through the real entry point so it unregisters
+            // from `dbc_state.descriptors` before the retry, instead of
+            // dropping its box directly and leaving a dangling entry that
+            // would trip the same assert again.
+            unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
             unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         } else {
+            // In release, the assert is a no-op and `free_dbc` already
+            // dropped `dbc` (and its parent-ENV registration) despite the
+            // outstanding descriptor, so `desc.parent_dbc` is now dangling —
+            // the only safe cleanup left for `desc` itself is dropping its
+            // own box directly, not routing through `sql_free_handle`, which
+            // would dereference the freed `dbc`.
             assert_eq!(ret, SQL_SUCCESS);
             unsafe { free_handle::<DescHandle>(desc) };
         }
