@@ -1619,6 +1619,88 @@ mod tests {
         assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
     }
 
+    /// PR review follow-up: the 22002 early return must not disturb the
+    /// forward-only row cursor, or a later column in the same row becomes
+    /// unreachable. Drives `SELECT 1, NULL, 2` purely through `StmtState`
+    /// bookkeeping (manually re-seeding `last_captured` between calls the way
+    /// `resume_row_to_column` would), so it pins the accounting invariant
+    /// without needing a live decoder: column 2's 22002 must leave
+    /// `current_row_last_col` at column 1, so the forward-only gate still
+    /// admits column 3 afterward, and column 3 is not mistaken for an
+    /// already-consumed re-request of column 2.
+    #[test]
+    fn get_data_null_without_indicator_does_not_block_later_columns_in_the_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(3);
+            s.row_positioned = true;
+            s.last_captured = Some((1, ColumnValues::Int(1)));
+        }
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 1);
+
+        // Column 2 is NULL with no indicator: 22002, and must not advance the
+        // forward-only cursor past column 1.
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.last_captured = Some((2, ColumnValues::Null));
+        }
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                2,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        {
+            let s = stmt_handle.inner.lock().unwrap();
+            assert_eq!(
+                s.current_row_last_col, 1,
+                "a failed NULL column must not advance the forward-only cursor"
+            );
+        }
+
+        // Column 3 is still reachable: the forward-only gate admits it
+        // (current_row_last_col is still 1), and it is not treated as an
+        // already-captured re-request of column 2.
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.last_captured = Some((3, ColumnValues::Int(2)));
+        }
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                3,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 2);
+    }
+
     #[test]
     fn get_data_typed_timestamp_target() {
         use crate::api::odbc_types::SqlTimestampStruct;
