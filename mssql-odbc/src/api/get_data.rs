@@ -1539,6 +1539,82 @@ mod tests {
         assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
     }
 
+    /// AB#47507 — SQLGetData must return SQLSTATE 22002 ("Indicator variable
+    /// required but not supplied") when the value is NULL and the caller
+    /// supplied no indicator, matching msodbcsql and the bound-column path
+    /// (fetch_scroll.rs::deliver_bound). Before this check existed,
+    /// SQLGetData silently returned SQL_SUCCESS and left the caller's output
+    /// buffer untouched. mssql-python's SQLGetData_wrap relies on the
+    /// ODBC-mandated error to detect NULL for fixed-width C types — it fetches
+    /// SQL_INTEGER et al. with a null indicator and falls back to `None` only
+    /// when SQLGetData fails — so the missing check meant callers read back
+    /// whatever was already on their stack as if it were the column's value.
+    #[test]
+    fn get_data_typed_null_without_indicator_reports_22002() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null);
+
+        let mut out: i32 = -1_066_579_696; // poisoned sentinel, must survive untouched
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(out, -1_066_579_696, "NULL must not disturb the data slot");
+        {
+            let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = sh.inner.lock().unwrap();
+            assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
+        }
+
+        // The value was not consumed: a retry with a real indicator still
+        // reports the NULL correctly.
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+    }
+
+    /// The same rule applies to character targets: a NULL with no indicator is
+    /// still 22002, even though a terminator could otherwise be written.
+    #[test]
+    fn get_data_char_null_without_indicator_reports_22002() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null);
+
+        let mut buf = [b'X'; 8];
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(buf, [b'X'; 8], "NULL must not disturb the data slot");
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
+    }
+
     #[test]
     fn get_data_typed_timestamp_target() {
         use crate::api::odbc_types::SqlTimestampStruct;
