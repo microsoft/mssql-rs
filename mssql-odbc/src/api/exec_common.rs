@@ -494,8 +494,8 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT,
-        SQL_VARCHAR, SqlLen, sql_len_data_at_exec,
+        SQL_ATTR_PARAM_BIND_OFFSET_PTR, SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER,
+        SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, SqlULen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -748,6 +748,88 @@ mod tests {
         assert_eq!(
             state.diag_records[0].sql_state,
             ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
+        );
+    }
+
+    /// The bind offset displaces the indicator pointer as well as the value
+    /// pointer, so a data-at-execution marker can sit in a slot only the
+    /// offset reaches. The offset therefore has to be applied before the
+    /// marker is read, not just before the value is converted.
+    ///
+    /// Applying it later makes the two reads of the indicator disagree: the
+    /// check sees row 0 and routes the parameter down the ordinary path, then
+    /// the conversion sees row 1's marker and rejects it as unstaged with
+    /// `HY000`. Confirmed by reproducing that ordering, which turns the
+    /// `HYC00` below into `HY000`.
+    ///
+    /// Discriminating because row 0 holds an ordinary length: with no offset
+    /// this same binding converts cleanly, as its companion test shows.
+    #[test]
+    fn build_named_params_reads_the_dae_indicator_through_the_bind_offset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Two rows of a parameter array. Row 0 is an ordinary bound value;
+        // only row 1 carries the data-at-execution marker.
+        let mut values: [i32; 4] = [7; 4];
+        let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
+        let mut offset: SqlLen = size_of::<SqlLen>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .inert_attrs
+            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: inds.as_mut_ptr(),
+        }));
+
+        // `SQL_C_LONG` is not streamable, so reaching the DAE branch is
+        // reported as `HYC00`. That rejection is the observable proof the
+        // offset indicator was the one consulted.
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        assert!(ret.is_err(), "the offset indicator marks this param as DAE");
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
+        );
+    }
+
+    /// The companion to the test above: with no offset set, the same binding
+    /// reads row 0's ordinary length and converts normally. Without this, a
+    /// driver that treated *every* parameter as data-at-execution would still
+    /// pass the offset test.
+    #[test]
+    fn build_named_params_without_a_bind_offset_reads_the_unshifted_indicator() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut values: [i32; 4] = [7; 4];
+        let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: inds.as_mut_ptr(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, "test") }
+            .expect("row 0 is an ordinary length, not a DAE marker");
+        assert!(
+            built.dae_params.is_empty(),
+            "nothing should be staged for streaming"
         );
     }
 }
