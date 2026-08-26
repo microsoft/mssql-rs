@@ -114,9 +114,14 @@ as well as by attempt count: `SETUP_BUDGET_SECONDS` covers the whole step,
 starve the retries, and `READY_TIMEOUT_SECONDS` bounds each container attempt.
 The pipeline step adds a `timeoutInMinutes` backstop over the top.
 
+Every bound is sized above the measured worst case of the *successful* runs, so
+it only ever catches a hang: pulls run p50 292s / p95 478s / max 724s over 112
+runs, and a healthy readiness wait maxes out at 157s over 97 runs. An earlier
+480s pull budget would have killed 4.5% of runs outright.
+
 **Environment:** requires `SQL_PASSWORD`. Overrides: `SQL_IMAGE`,
-`SQL_CONTAINER`, `SETUP_BUDGET_SECONDS` (900), `PULL_BUDGET_SECONDS` (480),
-`READY_TIMEOUT_SECONDS` (180), `MAX_START_ATTEMPTS` (3),
+`SQL_CONTAINER`, `SETUP_BUDGET_SECONDS` (1200), `PULL_BUDGET_SECONDS` (900),
+`READY_TIMEOUT_SECONDS` (240), `MAX_START_ATTEMPTS` (3),
 `PROBE_LOGIN_TIMEOUT_SECONDS` (5), `PROBE_INTERVAL_SECONDS` (3).
 
 ## Pipeline Integration

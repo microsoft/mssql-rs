@@ -106,7 +106,7 @@ steps:
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
 - script: bash .pipeline/scripts/start-sql-server-macos.sh
   displayName: 'Start SQL Server (Docker, no TLS certs)'
-  timeoutInMinutes: 17
+  timeoutInMinutes: 22
   env:
     SQL_PASSWORD: $(SQL_PASSWORD)
 

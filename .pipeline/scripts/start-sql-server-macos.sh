@@ -19,9 +19,10 @@
 #
 # Retries are bounded by wall-clock deadlines rather than attempt counts,
 # because the macOS job only gets 60 minutes in total. A failed sqlcmd probe
-# costs ~11s by default and `docker pull` of the SQL image has taken up to 7
-# minutes here, so counting attempts hides very large amounts of time. Retrying
-# stops as soon as there is not enough budget left to complete another attempt.
+# costs ~11s by default and `docker pull` of the SQL image runs p50 292s / max
+# 724s here, so counting attempts hides very large amounts of time. Every bound
+# is sized above the worst case of the *successful* runs so it only catches a
+# hang; retrying stops once there is not enough budget left for another attempt.
 set -euo pipefail
 
 # shellcheck source=.pipeline/scripts/run-bounded.sh
@@ -33,11 +34,13 @@ SQL_IMAGE=${SQL_IMAGE:-mcr.microsoft.com/mssql/server:2025-latest}
 SQL_CONTAINER=${SQL_CONTAINER:-sqlserver}
 
 # Total wall-clock budget for the step (pull plus every container attempt).
-SETUP_BUDGET_SECONDS=${SETUP_BUDGET_SECONDS:-900}
+SETUP_BUDGET_SECONDS=${SETUP_BUDGET_SECONDS:-1200}
 # Sub-budget for the pull phase, so a slow registry cannot starve the retries.
-PULL_BUDGET_SECONDS=${PULL_BUDGET_SECONDS:-480}
-# Per-container-attempt allowance. Healthy startups answer within ~60s.
-READY_TIMEOUT_SECONDS=${READY_TIMEOUT_SECONDS:-180}
+# Sized above the slowest pull seen in 112 runs (724s; p95 478s) — pulls are slow
+# here, not flaky, so a tighter bound just kills healthy runs.
+PULL_BUDGET_SECONDS=${PULL_BUDGET_SECONDS:-900}
+# Per-container-attempt allowance. Slowest healthy startup over 97 runs was 157s.
+READY_TIMEOUT_SECONDS=${READY_TIMEOUT_SECONDS:-240}
 # A container that exits immediately is abandoned in seconds, so cap the
 # attempts too — otherwise the budget alone would allow dozens of restarts.
 MAX_START_ATTEMPTS=${MAX_START_ATTEMPTS:-3}
