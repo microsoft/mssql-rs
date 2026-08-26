@@ -597,7 +597,7 @@ extends:
             enableJsDeps: false
         - pwsh: .pipeline/scripts/stamp-crate-versions-sandbox.ps1 -ReleaseVersion '${{ parameters.releaseVersion }}' -BuildId '$(Build.BuildId)'
           displayName: 'Stamp crate versions (sandbox, package-only)'
-        - pwsh: .pipeline/scripts/pin-mssql-tds-dep-version.ps1 -Version '$(crateVersion)'
+        - pwsh: .pipeline/scripts/pin-mssql-tds-dep-version.ps1 -Version '$(crateVersion)' -IndexUrl '$(cargoSparseIndex)'
           displayName: 'Pin mssql-tds dependency version'
         - ${{ if eq(parameters.publishCrate, true) }}:
           - pwsh: .pipeline/scripts/cargo-publish-mock.ps1 -Registry '$(cargoRegistry)' -SparseIndexBaseUrl '$(cargoSparseIndex)' -TdsVersion '$(crateVersion)'
