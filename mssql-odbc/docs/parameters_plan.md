@@ -379,7 +379,6 @@ not just a DBCS one: `serialize_char_varchar_direct` then rejects it as a
 see. Routing it to `ERR_PARAM_STRING_TRUNCATION` needs a typed error out of
 `mssql-tds` - matching on the message text would be guesswork - so it belongs
 with AB#47584 rather than as a local patch.
-through - is the untested direction.
 
 Verified against msodbcsql source:
 
