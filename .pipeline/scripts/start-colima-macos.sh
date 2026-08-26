@@ -8,10 +8,11 @@ set -euo pipefail
 
 COLIMA_CPU=${COLIMA_CPU:-4}
 COLIMA_DISK=${COLIMA_DISK:-50}
-# GiB to request per attempt. 6 gives SQL Server headroom over the historical 4;
-# the last entry falls back to the known-good size in case a future agent SKU
-# cannot satisfy the larger request.
-COLIMA_MEMORY_ATTEMPTS=${COLIMA_MEMORY_ATTEMPTS:-"6 6 4"}
+# Stays at the long-standing 4GiB. The startup crashes this script retries are
+# not memory-related (every captured one reports oom=false and dies at LSA load,
+# before the buffer pool is committed), and a larger VM measurably slows boot.
+COLIMA_MEMORY=${COLIMA_MEMORY:-4}
+COLIMA_START_ATTEMPTS=${COLIMA_START_ATTEMPTS:-3}
 # The macOS job only gets 60 minutes, so cap the retries by wall clock rather
 # than letting three boots of an unhealthy agent eat the test budget.
 COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-480}
@@ -20,15 +21,13 @@ brew update
 brew install docker colima
 
 start_time=$(date +%s)
-attempt=0
-for memory in $COLIMA_MEMORY_ATTEMPTS; do
-  attempt=$((attempt + 1))
+for attempt in $(seq 1 "$COLIMA_START_ATTEMPTS"); do
   if [ "$attempt" -gt 1 ] && [ $(($(date +%s) - start_time)) -ge "$COLIMA_BUDGET_SECONDS" ]; then
     echo "##[warning]colima retry budget (${COLIMA_BUDGET_SECONDS}s) exhausted"
     break
   fi
-  echo "##[group]colima start (attempt $attempt, ${memory}GiB)"
-  if colima start --cpu "$COLIMA_CPU" --memory "$memory" --disk "$COLIMA_DISK"; then
+  echo "##[group]colima start (attempt $attempt/$COLIMA_START_ATTEMPTS)"
+  if colima start --cpu "$COLIMA_CPU" --memory "$COLIMA_MEMORY" --disk "$COLIMA_DISK"; then
     echo "##[endgroup]"
     docker context use colima >/dev/null || true
     docker version
@@ -36,11 +35,11 @@ for memory in $COLIMA_MEMORY_ATTEMPTS; do
     exit 0
   fi
   echo "##[endgroup]"
-  echo "##[warning]colima failed to start (attempt $attempt, ${memory}GiB)"
+  echo "##[warning]colima failed to start (attempt $attempt/$COLIMA_START_ATTEMPTS)"
   tail -50 "$HOME/.colima/_lima/colima/ha.stderr.log" 2>/dev/null || true
   colima delete --force >/dev/null 2>&1 || true
   sleep 5
 done
 
-echo "##[error]colima did not start after $attempt attempts"
+echo "##[error]colima did not start after $COLIMA_START_ATTEMPTS attempts"
 exit 1

@@ -83,12 +83,12 @@ Enables Named Pipes and Shared Memory protocols for SQL Server via registry modi
 
 ### start-colima-macos.sh
 Installs Docker + Colima on a hosted macOS agent and boots the VM, retrying on
-the transient lima hostagent boot failures seen in ~3% of runs. Falls back to a
-smaller VM if the larger memory request cannot be satisfied. Retries stop once
-`COLIMA_BUDGET_SECONDS` has elapsed.
+the transient lima hostagent boot failures seen in ~3% of runs. Retries stop
+once `COLIMA_BUDGET_SECONDS` has elapsed. VM size stays at the long-standing
+4 GiB / 4 CPU.
 
-**Environment overrides:** `COLIMA_CPU`, `COLIMA_DISK`, `COLIMA_MEMORY_ATTEMPTS`
-(space-separated GiB sizes, one per attempt), `COLIMA_BUDGET_SECONDS`.
+**Environment overrides:** `COLIMA_CPU`, `COLIMA_MEMORY`, `COLIMA_DISK`,
+`COLIMA_START_ATTEMPTS`, `COLIMA_BUDGET_SECONDS`.
 
 ### start-sql-server-macos.sh
 Starts the SQL Server test container inside the Colima VM. Retries the image
@@ -103,10 +103,9 @@ starve the retries, and `READY_TIMEOUT_SECONDS` bounds each container attempt.
 The pipeline step adds a `timeoutInMinutes` backstop over the top.
 
 **Environment:** requires `SQL_PASSWORD`. Overrides: `SQL_IMAGE`,
-`SQL_CONTAINER`, `SQL_MEMORY_LIMIT_MB`, `SETUP_BUDGET_SECONDS` (900),
-`PULL_BUDGET_SECONDS` (480), `READY_TIMEOUT_SECONDS` (180),
-`MAX_START_ATTEMPTS` (3), `PROBE_LOGIN_TIMEOUT_SECONDS` (5),
-`PROBE_INTERVAL_SECONDS` (3).
+`SQL_CONTAINER`, `SETUP_BUDGET_SECONDS` (900), `PULL_BUDGET_SECONDS` (480),
+`READY_TIMEOUT_SECONDS` (180), `MAX_START_ATTEMPTS` (3),
+`PROBE_LOGIN_TIMEOUT_SECONDS` (5), `PROBE_INTERVAL_SECONDS` (3).
 
 ## Pipeline Integration
 

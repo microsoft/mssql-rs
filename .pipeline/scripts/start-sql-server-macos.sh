@@ -28,9 +28,6 @@ set -euo pipefail
 
 SQL_IMAGE=${SQL_IMAGE:-mcr.microsoft.com/mssql/server:2025-latest}
 SQL_CONTAINER=${SQL_CONTAINER:-sqlserver}
-# SQL Server defaults to 80% of the VM's memory; cap it so the guest kernel and
-# dockerd keep breathing room.
-SQL_MEMORY_LIMIT_MB=${SQL_MEMORY_LIMIT_MB:-2048}
 
 # Total wall-clock budget for the step (pull plus every container attempt).
 SETUP_BUDGET_SECONDS=${SETUP_BUDGET_SECONDS:-900}
@@ -145,7 +142,6 @@ while :; do
     --name "$SQL_CONTAINER" \
     -e ACCEPT_EULA=Y \
     -e "MSSQL_SA_PASSWORD=$SQL_PASSWORD" \
-    -e "MSSQL_MEMORY_LIMIT_MB=$SQL_MEMORY_LIMIT_MB" \
     -p 1433:1433 \
     -d "$SQL_IMAGE"
 
