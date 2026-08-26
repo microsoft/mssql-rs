@@ -73,6 +73,18 @@ authoritative parity reference for this crate. Its source lives in the
     — an ANSI-transfer default this driver has no equivalent for, since its
     `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
     type would silently corrupt data. Tracked in AB#47365.
+  - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
+    writes the client code page. msodbcsql uses the client code page -
+    `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
+    (`odbc/sqlcprot.h:2830`), which is `GetACP()` on Windows
+    (`Common/include/Localization.hpp:742`) and `nl_langinfo(CODESET)` elsewhere
+    (`LocalizationImpl.hpp:386`); the parameter path reads it directly at
+    `sqlcfunc.cpp:2913`. The two therefore agree under a UTF-8 locale and differ
+    on a default Windows one. Taken because mssql-python, the only supported
+    consumer, is UTF-8 native; the ODBC "C Data Types" appendix fixes no encoding
+    for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
+    consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
+    AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
 
 ## No panics
 

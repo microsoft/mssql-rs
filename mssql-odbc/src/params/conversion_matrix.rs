@@ -24,11 +24,19 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::is_integer_c_type;
 
-/// SQL types a `SQL_C_CHAR` buffer can be converted to.
-const CHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_CHAR, SQL_VARCHAR, SQL_LONGVARCHAR];
-
-/// SQL types a `SQL_C_WCHAR` buffer can be converted to.
-const WCHAR_C_TARGETS: &[SqlSmallInt] = &[SQL_WCHAR, SQL_WVARCHAR, SQL_WLONGVARCHAR];
+/// SQL types a character C buffer can be converted to.
+///
+/// msodbcsql's matching arm (`sqlcfunc.cpp:2861`) also accepts `SQL_SS_XML` and
+/// the binary types, the latter by reading the buffer as a hex string. Neither
+/// is built here yet, so both are rejected at bind with `HYC00`.
+const CHARACTER_C_TARGETS: &[SqlSmallInt] = &[
+    SQL_CHAR,
+    SQL_VARCHAR,
+    SQL_LONGVARCHAR,
+    SQL_WCHAR,
+    SQL_WVARCHAR,
+    SQL_WLONGVARCHAR,
+];
 
 /// SQL types a `SQL_C_BINARY` buffer can be converted to.
 const BINARY_C_TARGETS: &[SqlSmallInt] = &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY];
@@ -50,8 +58,7 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
         "SQL_C_DEFAULT must be resolved before consulting the conversion matrix"
     );
     let targets: &[SqlSmallInt] = match c_type {
-        SQL_C_CHAR => CHAR_C_TARGETS,
-        SQL_C_WCHAR => WCHAR_C_TARGETS,
+        SQL_C_CHAR | SQL_C_WCHAR => CHARACTER_C_TARGETS,
         SQL_C_BINARY => BINARY_C_TARGETS,
         _ if is_integer_c_type(c_type) => INTEGER_C_TARGETS,
         _ => return false,
@@ -67,17 +74,24 @@ mod tests {
         SQL_C_TINYINT, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_GUID,
     };
 
+    /// Cross-family pairings transcode UTF-8 <-> UTF-16 rather than being
+    /// rejected, so every character C type reaches every character SQL type.
     #[test]
-    fn narrow_character_conversions_are_supported() {
-        for sql_type in [SQL_CHAR, SQL_VARCHAR, SQL_LONGVARCHAR] {
-            assert!(is_supported_conversion(SQL_C_CHAR, sql_type));
-        }
-    }
-
-    #[test]
-    fn wide_character_conversions_are_supported() {
-        for sql_type in [SQL_WCHAR, SQL_WVARCHAR, SQL_WLONGVARCHAR] {
-            assert!(is_supported_conversion(SQL_C_WCHAR, sql_type));
+    fn every_character_c_type_reaches_every_character_sql_type() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for sql_type in [
+                SQL_CHAR,
+                SQL_VARCHAR,
+                SQL_LONGVARCHAR,
+                SQL_WCHAR,
+                SQL_WVARCHAR,
+                SQL_WLONGVARCHAR,
+            ] {
+                assert!(
+                    is_supported_conversion(c_type, sql_type),
+                    "{c_type} -> {sql_type} should be supported"
+                );
+            }
         }
     }
 
@@ -86,12 +100,6 @@ mod tests {
         for sql_type in [SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY] {
             assert!(is_supported_conversion(SQL_C_BINARY, sql_type));
         }
-    }
-
-    #[test]
-    fn cross_family_character_conversions_are_unsupported() {
-        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_WVARCHAR));
-        assert!(!is_supported_conversion(SQL_C_WCHAR, SQL_VARCHAR));
         assert!(!is_supported_conversion(SQL_C_BINARY, SQL_VARCHAR));
     }
 

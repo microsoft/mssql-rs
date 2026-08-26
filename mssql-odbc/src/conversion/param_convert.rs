@@ -33,7 +33,12 @@ use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_NULL_POINTER,
     ERR_INVALID_PARAM_PRECISION_OR_SCALE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
     ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
-    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED, ERR_RESTRICTED_DATA_TYPE,
+    ERR_PARAM_CONVERSION_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
+    ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
+};
+use crate::api::type_rules::{
+    SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
+    is_wide_character_sql_type,
 };
 use crate::conversion::error::ConvError;
 use crate::conversion::numeric::narrow_i128;
@@ -66,12 +71,18 @@ pub(crate) enum ParamBuildError {
     InvalidLength(SqlLen),
     /// The parameter carries a value but `ParameterValuePtr` is null.
     NullValuePointer,
+    /// Character data longer than the declared length, in more than trailing
+    /// blanks.
+    StringTruncation,
     /// `ColumnSize` cannot be expressed as a T-SQL declaration for `SqlType`.
     InvalidParameterSize(usize),
     /// `DecimalDigits` cannot be expressed as a T-SQL scale for `SqlType`.
     InvalidDecimalDigits(SqlSmallInt),
     /// The SQL type cannot be materialised as a typed NULL.
     UnsupportedSqlType(SqlSmallInt),
+    /// Backstop only: the C and SQL families are both known but the pairing
+    /// between them is not built yet, so the matrix and this module disagree.
+    ConversionNotImplemented,
     /// The value could not be represented in the target SQL type.
     Value(ConvError),
 }
@@ -84,10 +95,12 @@ impl ParamBuildError {
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
+            Self::StringTruncation => ERR_PARAM_STRING_TRUNCATION,
             Self::InvalidParameterSize(_) | Self::InvalidDecimalDigits(_) => {
                 ERR_INVALID_PARAM_PRECISION_OR_SCALE
             }
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
+            Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
             Self::Value(ConvError::InvalidCharacterValue) => ERR_INVALID_CHARACTER_VALUE,
             // Backstop only: parameter legality is settled by the bind-time
@@ -135,23 +148,27 @@ pub(crate) unsafe fn bound_param_to_value(
         Indicator::Length(len) => len,
     };
 
-    let value = match unsafe { read_param_value(param, len_spec) }? {
-        AppValue::Integer(v) => integer_value(param.sql_type, v)?,
-        AppValue::NarrowText(bytes) => {
-            // `SqlString`'s UTF-8 decode unwraps, so only hand it bytes already
-            // checked. Valid input keeps its allocation all the way to the wire.
-            let bytes = match String::from_utf8(bytes) {
-                Ok(text) => text.into_bytes(),
-                Err(e) => String::from_utf8_lossy(e.as_bytes())
-                    .into_owned()
-                    .into_bytes(),
-            };
-            SqlType::VarcharMax(Some(SqlString::new(bytes, EncodingType::Utf8)))
+    let app_value = unsafe { read_param_value(param, len_spec) }?;
+    let family =
+        sql_family(param.sql_type).ok_or(ParamBuildError::UnsupportedSqlType(param.sql_type))?;
+
+    let value = match (app_value, family) {
+        (AppValue::Integer(v), SqlFamily::Integer) => convert_integer_sql(param.sql_type, v)?,
+        (AppValue::NarrowText(bytes), SqlFamily::Character) => {
+            convert_character_sql(param.sql_type, param.column_size, AppText::Utf8(bytes))?
         }
-        AppValue::WideText(bytes) => {
-            SqlType::NVarcharMax(Some(SqlString::new(bytes, EncodingType::Utf16)))
+        (AppValue::WideText(bytes), SqlFamily::Character) => {
+            convert_character_sql(param.sql_type, param.column_size, AppText::Utf16(bytes))?
         }
-        AppValue::Binary(bytes) => SqlType::VarBinaryMax(Some(bytes)),
+        (AppValue::Binary(bytes), SqlFamily::Binary) => SqlType::VarBinaryMax(Some(bytes)),
+        (AppValue::Integer(_), SqlFamily::Character | SqlFamily::Binary)
+        | (
+            AppValue::NarrowText(_) | AppValue::WideText(_),
+            SqlFamily::Integer | SqlFamily::Binary,
+        )
+        | (AppValue::Binary(_), SqlFamily::Integer | SqlFamily::Character) => {
+            return Err(ParamBuildError::ConversionNotImplemented);
+        }
     };
 
     Ok((value, None))
@@ -176,10 +193,241 @@ pub(crate) fn dae_placeholder_type(
     }
 }
 
+/// The SQL-side axis of the conversion matrix.
+///
+/// [`AppValue`] is the C buffer normalised per family; `SqlFamily` picks the
+/// converter that owns the target rules. A cross-family pairing is an adapter
+/// between those canonical values - never a new per-pair conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlFamily {
+    Integer,
+    Character,
+    Binary,
+}
+
+/// `None` for a SQL type no builder covers yet, which the bind-time matrix has
+/// already rejected.
+fn sql_family(sql_type: SqlSmallInt) -> Option<SqlFamily> {
+    match sql_type {
+        SQL_TINYINT | SQL_SMALLINT | SQL_INTEGER | SQL_BIGINT => Some(SqlFamily::Integer),
+        SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR | SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR => {
+            Some(SqlFamily::Character)
+        }
+        SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => Some(SqlFamily::Binary),
+        _ => None,
+    }
+}
+
+/// Application text in the encoding its C type dictates.
+///
+/// The narrow buffer is taken as UTF-8 because the only supported consumer is
+/// mssql-python, which is UTF-8 native. msodbcsql instead reads it in the client
+/// code page (`GetACP()` on Windows, `nl_langinfo(CODESET)` elsewhere -
+/// `odbc/sqlcprot.h:2830`, `Common/include/Localization.hpp:742`), so the two
+/// agree on a UTF-8 locale and differ on a default Windows one. The ODBC spec
+/// fixes no encoding for `SQL_C_CHAR`. Client code page support is AB#47565.
+enum AppText {
+    Utf8(Vec<u8>),
+    /// UTF-16LE bytes, not code units.
+    Utf16(Vec<u8>),
+}
+
+impl AppText {
+    /// Re-encodes into the target family's encoding.
+    fn transcode(self, wide_target: bool) -> Self {
+        match (self, wide_target) {
+            (Self::Utf16(bytes), true) => Self::Utf16(bytes),
+            (Self::Utf8(bytes), false) => {
+                // Not a no-op: `SqlString`'s UTF-8 decode unwraps, so only hand
+                // it checked bytes. Removable once that decode stops panicking
+                // (AB#47576). Valid input keeps its allocation to the wire.
+                match String::from_utf8(bytes) {
+                    Ok(text) => Self::Utf8(text.into_bytes()),
+                    Err(e) => Self::Utf8(
+                        String::from_utf8_lossy(e.as_bytes())
+                            .into_owned()
+                            .into_bytes(),
+                    ),
+                }
+            }
+            (Self::Utf8(bytes), true) => Self::Utf16(
+                String::from_utf8_lossy(&bytes)
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            ),
+            (Self::Utf16(bytes), false) => Self::Utf8(decode_utf16le(&bytes).into_bytes()),
+        }
+    }
+
+    fn into_sql_string(self) -> SqlString {
+        match self {
+            Self::Utf8(bytes) => SqlString::new(bytes, EncodingType::Utf8),
+            Self::Utf16(bytes) => SqlString::new(bytes, EncodingType::Utf16),
+        }
+    }
+
+    /// Length in the units the declared length is compared against.
+    ///
+    /// A wide source counts its UTF-16 units whichever family it lands in -
+    /// msodbcsql assumes "1 WCHAR converts to 1 byte" for a narrow target
+    /// (`sqlcfunc.cpp:2946`) rather than encoding to find out.
+    fn len_in_target_units(&self, wide_target: bool) -> usize {
+        match self {
+            Self::Utf16(bytes) => bytes.len() / size_of::<u16>(),
+            Self::Utf8(bytes) if !wide_target => bytes.len(),
+            Self::Utf8(bytes) => String::from_utf8_lossy(bytes).encode_utf16().count(),
+        }
+    }
+}
+
+/// Lossy UTF-16LE decode. An odd trailing byte is dropped: `read_wchar_bytes`
+/// already floors the length to whole units, so this only guards a caller that
+/// bypasses it.
+fn decode_utf16le(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Emits the character `SqlType` named by `ParameterType`, transcoding when the
+/// C type and the target are of different families.
+///
+/// `ColumnSize` is a character count for every character SQL type, per the ODBC
+/// "Column Size" appendix.
+fn convert_character_sql(
+    sql_type: SqlSmallInt,
+    column_size: usize,
+    text: AppText,
+) -> Result<SqlType, ParamBuildError> {
+    let wide = is_wide_character_sql_type(sql_type);
+    let max_length = if wide {
+        SQL_PREC_NCHAR
+    } else {
+        SQL_PREC_BIGCHARBINARY
+    };
+
+    // The declared length for the T-SQL type, and the bound truncation is
+    // measured against. They differ only for `text`/`ntext`, which carry no
+    // declared length but are still bounded by `ColumnSize`
+    // (`sqlcfunc.cpp:2898`); only the `max` types are unbounded.
+    let (declared, limit) = match sql_type {
+        SQL_CHAR | SQL_WCHAR => {
+            let length = fixed_length(column_size, max_length)?;
+            (Some(length), Some(usize::from(length)))
+        }
+        SQL_VARCHAR | SQL_WVARCHAR => {
+            let declared = variable_length(column_size, max_length);
+            (declared, declared.map(usize::from))
+        }
+        SQL_LONGVARCHAR => (None, Some(column_size.min(SQL_PREC_TEXTIMAGE))),
+        SQL_WLONGVARCHAR => (None, Some(column_size.min(SQL_PREC_NTEXT))),
+        other => return Err(ParamBuildError::UnsupportedSqlType(other)),
+    };
+
+    // Fit before transcoding: the limit counts source units, not the encoded
+    // result - see [`fit_to_declared_length`].
+    let text = match limit {
+        Some(limit) => fit_to_declared_length(text, limit, wide)?,
+        None => text,
+    };
+    let value = Some(text.transcode(wide).into_sql_string());
+
+    Ok(match (sql_type, declared) {
+        (SQL_CHAR, Some(length)) => SqlType::Char(value, length),
+        (SQL_WCHAR, Some(length)) => SqlType::NChar(value, length),
+        (SQL_VARCHAR, Some(length)) => SqlType::Varchar(value, length),
+        (SQL_VARCHAR, None) => SqlType::VarcharMax(value),
+        (SQL_WVARCHAR, Some(length)) => SqlType::NVarchar(value, length),
+        (SQL_WVARCHAR, None) => SqlType::NVarcharMax(value),
+        (SQL_LONGVARCHAR, _) => SqlType::Text(value),
+        (SQL_WLONGVARCHAR, _) => SqlType::NText(value),
+        // Unreachable: the match above already rejected everything else.
+        (other, _) => return Err(ParamBuildError::UnsupportedSqlType(other)),
+    })
+}
+
+/// Trims `text` to `limit` units, or reports `22001`.
+///
+/// The units are msodbcsql's, and they are an approximation on purpose. The
+/// exact count is unknowable here: `varchar(n)` bounds *collation* bytes, and
+/// the collation is only applied downstream by `serialize_string` in mssql-tds.
+/// So a wide source counts its UTF-16 units whichever family it lands in
+/// (`sqlcfunc.cpp:2946`, "Assumption: 1 WCHAR converts to 1 byte"), and a narrow
+/// source counts its own bytes for a narrow target or the UTF-16 units it would
+/// produce for a wide one (`:2915`).
+///
+/// Overflowing *blanks* are dropped silently; anything else is an error --
+/// msodbcsql checks the overflow with `CheckTrailingChars` /
+/// `CheckTrailingWChars` before deciding (`sqlcfunc.cpp:2957`). Inbound
+/// truncation is an error, unlike the benign outbound `01004`.
+///
+/// TODO: the narrow count is only approximate *here*, not in msodbcsql, which
+/// ships `SQL_C_CHAR` bytes verbatim under the client collation and so compares
+/// the exact wire length (`sqlcmisc.cpp:7328`). We re-encode to the server
+/// collation in `serialize_string`, which usually shrinks the value but can grow
+/// it - GB18030 emits 4 bytes where UTF-8 uses 2. A bounded `char`/`varchar`
+/// then fails in `serialize_char_varchar_direct` with an opaque `UsageError`
+/// rather than `22001`; `text`/`ntext` and the `max` types carry no such check
+/// and send the over-long value. Exactness needs the collation at this layer.
+///
+/// TODO: msodbcsql's narrow-to-wide arm never reaches this logic -- its walk
+/// tests `cchDest > cchMax` before incrementing and then `break`s past the trim
+/// (`sqlcfunc.cpp:2926`), so one character of overflow escapes and overflowing
+/// blanks are never dropped. Deliberately not replicated.
+fn fit_to_declared_length(
+    text: AppText,
+    limit: usize,
+    wide_target: bool,
+) -> Result<AppText, ParamBuildError> {
+    const BLANK_UTF16: [u8; 2] = [b' ', 0];
+
+    // A UTF-8 buffer never yields more UTF-16 units than it has bytes, so fitting
+    // by byte count settles it without the walk - msodbcsql short-circuits the
+    // same way at `sqlcfunc.cpp:2917`.
+    if let AppText::Utf8(bytes) = &text
+        && wide_target
+        && bytes.len() <= limit
+    {
+        return Ok(text);
+    }
+
+    let overflow = text.len_in_target_units(wide_target).saturating_sub(limit);
+    if overflow == 0 {
+        return Ok(text);
+    }
+
+    // Only trailing blanks may be dropped, and a blank is one unit in both
+    // encodings, so the overflow maps 1:1 onto trailing source units.
+    Ok(match text {
+        AppText::Utf8(mut bytes) => {
+            let keep = bytes.len().saturating_sub(overflow);
+            if bytes[keep..].iter().any(|b| *b != b' ') {
+                return Err(ParamBuildError::StringTruncation);
+            }
+            bytes.truncate(keep);
+            AppText::Utf8(bytes)
+        }
+        AppText::Utf16(mut bytes) => {
+            let keep = bytes.len().saturating_sub(overflow * size_of::<u16>());
+            if bytes[keep..]
+                .chunks_exact(size_of::<u16>())
+                .any(|unit| unit != BLANK_UTF16)
+            {
+                return Err(ParamBuildError::StringTruncation);
+            }
+            bytes.truncate(keep);
+            AppText::Utf16(bytes)
+        }
+    })
+}
+
 /// Emits the integer `SqlType` named by `ParameterType`, not by the C type, so
 /// `@P1` is declared as the application asked. A value outside the target's
 /// range is `22003` rather than a silently wrapped wire value.
-fn integer_value(sql_type: SqlSmallInt, v: i128) -> Result<SqlType, ParamBuildError> {
+fn convert_integer_sql(sql_type: SqlSmallInt, v: i128) -> Result<SqlType, ParamBuildError> {
     Ok(match sql_type {
         SQL_TINYINT => {
             SqlType::TinyInt(Some(narrow_i128::<u8>(v).map_err(ParamBuildError::Value)?))
@@ -196,12 +444,6 @@ fn integer_value(sql_type: SqlSmallInt, v: i128) -> Result<SqlType, ParamBuildEr
 /// `@P1 <type>` declaration and the wire `TYPE_INFO`.
 type TypedValue = (SqlType, Option<RpcTypeMetadata>);
 
-/// Longest non-`max` length of the narrow character and binary types.
-const MAX_NARROW_LENGTH: usize = 8000;
-/// Longest non-`max` length of the wide character types.
-const MAX_WIDE_LENGTH: usize = 4000;
-/// T-SQL `decimal`/`numeric` precision bounds.
-const PRECISION_RANGE: std::ops::RangeInclusive<usize> = 1..=38;
 /// Largest fractional-seconds scale of `time`/`datetime2`/`datetimeoffset`.
 const MAX_DATETIME_SCALE: u8 = 7;
 
@@ -242,20 +484,20 @@ fn typed_null(
             let metadata = decimal_metadata(column_size, decimal_digits)?;
             return Ok((SqlType::Numeric(None), Some(metadata)));
         }
-        SQL_CHAR => SqlType::Char(None, fixed_length(column_size, MAX_NARROW_LENGTH)?),
-        SQL_VARCHAR => match variable_length(column_size, MAX_NARROW_LENGTH) {
+        SQL_CHAR => SqlType::Char(None, fixed_length(column_size, SQL_PREC_BIGCHARBINARY)?),
+        SQL_VARCHAR => match variable_length(column_size, SQL_PREC_BIGCHARBINARY) {
             Some(length) => SqlType::Varchar(None, length),
             None => SqlType::VarcharMax(None),
         },
         SQL_LONGVARCHAR => SqlType::Text(None),
-        SQL_WCHAR => SqlType::NChar(None, fixed_length(column_size, MAX_WIDE_LENGTH)?),
-        SQL_WVARCHAR => match variable_length(column_size, MAX_WIDE_LENGTH) {
+        SQL_WCHAR => SqlType::NChar(None, fixed_length(column_size, SQL_PREC_NCHAR)?),
+        SQL_WVARCHAR => match variable_length(column_size, SQL_PREC_NCHAR) {
             Some(length) => SqlType::NVarchar(None, length),
             None => SqlType::NVarcharMax(None),
         },
         SQL_WLONGVARCHAR => SqlType::NText(None),
-        SQL_BINARY => SqlType::Binary(None, fixed_length(column_size, MAX_NARROW_LENGTH)?),
-        SQL_VARBINARY => match variable_length(column_size, MAX_NARROW_LENGTH) {
+        SQL_BINARY => SqlType::Binary(None, fixed_length(column_size, SQL_PREC_BIGCHARBINARY)?),
+        SQL_VARBINARY => match variable_length(column_size, SQL_PREC_BIGCHARBINARY) {
             Some(length) => SqlType::VarBinary(None, length),
             None => SqlType::VarBinaryMax(None),
         },
@@ -312,10 +554,12 @@ fn fixed_length(column_size: usize, max: usize) -> Result<u16, ParamBuildError> 
 /// legitimately pass a `ColumnSize` past the non-`max` limit; both widen to
 /// `max` rather than erroring, matching `RpcParameter::get_sql_name`.
 ///
-/// Also matches msodbcsql, which skips precision validation entirely for
-/// `SQL_VARCHAR`/`SQL_WVARCHAR` and uses the data length instead
-/// (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`, the `wSqlType != SQL_WVARCHAR &&
-/// wSqlType != SQL_VARCHAR` guard before `FixupColumnSizeDecimalDigits`).
+/// msodbcsql draws the same line at 0: against a Yukon-or-later server
+/// `CheckSqlPrecScale` checks only the upper bound for these types
+/// (`sqlcdesc.cpp:11722` for `SQL_WVARCHAR`, `:11748` for `SQL_VARCHAR`) and
+/// skips the zero check the fixed-length types get, because 0 *is* the `max`
+/// spelling. Past the bound it does report `HY104` - so does the bind gate,
+/// which makes the widening here unreachable through the API.
 fn variable_length(column_size: usize, max: usize) -> Option<u16> {
     if column_size == 0 || column_size > max {
         None
@@ -330,7 +574,7 @@ fn decimal_metadata(
 ) -> Result<RpcTypeMetadata, ParamBuildError> {
     let precision = u8::try_from(column_size)
         .ok()
-        .filter(|_| PRECISION_RANGE.contains(&column_size))
+        .filter(|_| (1..=SQL_PREC_NUMERIC).contains(&column_size))
         .ok_or(ParamBuildError::InvalidParameterSize(column_size))?;
     let scale = u8::try_from(decimal_digits)
         .ok()
@@ -558,7 +802,8 @@ mod tests {
                 p.column_size = 10;
                 if let Err(
                     e @ (ParamBuildError::UnsupportedCType(_)
-                    | ParamBuildError::UnsupportedSqlType(_)),
+                    | ParamBuildError::UnsupportedSqlType(_)
+                    | ParamBuildError::ConversionNotImplemented),
                 ) = unsafe { bound_param_to_value(&p) }
                 {
                     panic!(
@@ -575,7 +820,8 @@ mod tests {
     fn char_nts_becomes_varchar() {
         let mut buf: Vec<u8> = b"hello\0".to_vec();
         let mut ind: SqlLen = SQL_NTS as SqlLen;
-        let p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let mut p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_VARCHAR;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::VarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hello"),
@@ -590,7 +836,8 @@ mod tests {
     fn char_round_trips_non_ascii_utf8() {
         let mut buf: Vec<u8> = "caf\u{e9} \u{2615}\0".as_bytes().to_vec();
         let mut ind: SqlLen = SQL_NTS as SqlLen;
-        let p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let mut p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_VARCHAR;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::VarcharMax(Some(s)) => {
@@ -699,11 +946,298 @@ mod tests {
     fn wchar_explicit_length_becomes_nvarchar() {
         let mut buf: Vec<u16> = "hi".encode_utf16().collect();
         let mut ind: SqlLen = (buf.len() * 2) as SqlLen;
-        let p = param(SQL_C_WCHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        let mut p = param(SQL_C_WCHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_WVARCHAR;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         match value {
             SqlType::NVarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hi"),
             other => panic!("expected NVarcharMax(Some), got {other:?}"),
+        }
+    }
+
+    /// Binds `text` under `sql_type`/`column_size` and returns the wire value.
+    fn convert_char(
+        c_type: SqlSmallInt,
+        sql_type: SqlSmallInt,
+        column_size: usize,
+        text: &str,
+    ) -> Result<SqlType, ParamBuildError> {
+        let mut narrow: Vec<u8>;
+        let mut wide: Vec<u16>;
+        let (ptr, byte_len) = if c_type == SQL_C_WCHAR {
+            wide = text.encode_utf16().collect();
+            let len = wide.len() * size_of::<u16>();
+            (wide.as_mut_ptr() as *mut c_void, len)
+        } else {
+            narrow = text.as_bytes().to_vec();
+            let len = narrow.len();
+            (narrow.as_mut_ptr() as *mut c_void, len)
+        };
+        let mut ind: SqlLen = byte_len as SqlLen;
+        let mut p = param(c_type, ptr, &mut ind);
+        p.sql_type = sql_type;
+        p.column_size = column_size;
+        unsafe { bound_param_to_value(&p) }.map(|(value, _)| value)
+    }
+
+    /// One buffer, six declarations: as with the integer quadrant, the wire type
+    /// follows `ParameterType`, not the C type that happened to be bound.
+    #[test]
+    fn parameter_type_names_the_character_wire_type() {
+        let cases: &[(SqlSmallInt, SqlType)] = &[
+            (SQL_CHAR, SqlType::Char(None, 8)),
+            (SQL_VARCHAR, SqlType::Varchar(None, 8)),
+            (SQL_LONGVARCHAR, SqlType::Text(None)),
+            (SQL_WCHAR, SqlType::NChar(None, 8)),
+            (SQL_WVARCHAR, SqlType::NVarchar(None, 8)),
+            (SQL_WLONGVARCHAR, SqlType::NText(None)),
+        ];
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for (sql_type, expected) in cases {
+                let value = convert_char(c_type, *sql_type, 8, "abc").unwrap();
+                assert_eq!(
+                    std::mem::discriminant(&value),
+                    std::mem::discriminant(expected),
+                    "{c_type} -> {sql_type} named the wrong wire type: {value:?}"
+                );
+            }
+        }
+    }
+
+    /// A cross-family pairing transcodes instead of being rejected, and the
+    /// payload survives the round trip in both directions.
+    #[test]
+    fn cross_family_pairings_transcode() {
+        let text = "caf\u{e9} \u{2615}";
+        match convert_char(SQL_C_CHAR, SQL_WVARCHAR, 0, text).unwrap() {
+            SqlType::NVarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), text),
+            other => panic!("expected NVarcharMax(Some), got {other:?}"),
+        }
+        match convert_char(SQL_C_WCHAR, SQL_VARCHAR, 0, text).unwrap() {
+            SqlType::VarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), text),
+            other => panic!("expected VarcharMax(Some), got {other:?}"),
+        }
+    }
+
+    /// `ColumnSize == 0` is the unbounded sentinel, so a `varchar` parameter
+    /// widens to `varchar(max)` rather than declaring a zero length.
+    #[test]
+    fn unbounded_column_size_selects_the_max_types() {
+        assert!(matches!(
+            convert_char(SQL_C_CHAR, SQL_VARCHAR, 0, "abc").unwrap(),
+            SqlType::VarcharMax(Some(_))
+        ));
+        assert!(matches!(
+            convert_char(SQL_C_WCHAR, SQL_WVARCHAR, 0, "abc").unwrap(),
+            SqlType::NVarcharMax(Some(_))
+        ));
+    }
+
+    /// `ColumnSize` past the non-`max` ceiling also means `max`, and the ceiling
+    /// itself still declares a bounded length.
+    ///
+    /// The `+ 1` cases pin the internal contract only: `SQLBindParameter`
+    /// rejects them with `HY104` first (`parameter_column_size_is_valid`), so
+    /// they are unreachable through the API. `variable_length` is deliberately
+    /// laxer than the gate - see its doc comment.
+    #[test]
+    fn column_size_at_and_past_the_ceiling() {
+        assert!(matches!(
+            convert_char(SQL_C_CHAR, SQL_VARCHAR, SQL_PREC_BIGCHARBINARY, "abc").unwrap(),
+            SqlType::Varchar(_, 8000)
+        ));
+        assert!(matches!(
+            convert_char(SQL_C_CHAR, SQL_VARCHAR, SQL_PREC_BIGCHARBINARY + 1, "abc").unwrap(),
+            SqlType::VarcharMax(_)
+        ));
+        assert!(matches!(
+            convert_char(SQL_C_WCHAR, SQL_WVARCHAR, SQL_PREC_NCHAR, "abc").unwrap(),
+            SqlType::NVarchar(_, 4000)
+        ));
+        assert!(matches!(
+            convert_char(SQL_C_WCHAR, SQL_WVARCHAR, SQL_PREC_NCHAR + 1, "abc").unwrap(),
+            SqlType::NVarcharMax(_)
+        ));
+    }
+
+    /// Overflow that is not all blanks is an error, not a silent trim.
+    #[test]
+    fn overlong_value_is_22001() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for sql_type in [SQL_CHAR, SQL_VARCHAR, SQL_WCHAR, SQL_WVARCHAR] {
+                let err = convert_char(c_type, sql_type, 3, "abcd").unwrap_err();
+                assert!(
+                    matches!(err, ParamBuildError::StringTruncation),
+                    "{c_type} -> {sql_type} gave {err:?}"
+                );
+                assert_eq!(err.diag().state, *b"22001");
+            }
+        }
+    }
+
+    /// Overflowing *blanks* are dropped without a diagnostic - msodbcsql checks
+    /// the overflow with `CheckTrailingChars` before raising `22001`.
+    #[test]
+    fn overflowing_blanks_are_trimmed_silently() {
+        match convert_char(SQL_C_CHAR, SQL_VARCHAR, 3, "abc   ").unwrap() {
+            SqlType::Varchar(Some(s), 3) => assert_eq!(s.to_utf8_string(), "abc"),
+            other => panic!("expected Varchar(Some, 3), got {other:?}"),
+        }
+        match convert_char(SQL_C_WCHAR, SQL_WVARCHAR, 3, "abc ").unwrap() {
+            SqlType::NVarchar(Some(s), 3) => assert_eq!(s.to_utf8_string(), "abc"),
+            other => panic!("expected NVarchar(Some, 3), got {other:?}"),
+        }
+    }
+
+    /// A wide source is measured in its own UTF-16 units for *both* families -
+    /// msodbcsql assumes one byte per `WCHAR` for a narrow target rather than
+    /// encoding to find out. Counting the transcoded UTF-8 instead would falsely
+    /// reject values that fit: `varchar(n)` bounds collation bytes, and under a
+    /// single-byte collation "caf\u{e9}" is four of them, not five.
+    #[test]
+    fn a_wide_source_is_measured_in_utf16_units_for_both_families() {
+        let text = "caf\u{e9}";
+        assert!(convert_char(SQL_C_WCHAR, SQL_VARCHAR, 4, text).is_ok());
+        assert!(convert_char(SQL_C_WCHAR, SQL_WVARCHAR, 4, text).is_ok());
+        assert_eq!(
+            convert_char(SQL_C_WCHAR, SQL_VARCHAR, 3, text).unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+    }
+
+    /// A narrow source counts its own UTF-8 bytes for a narrow target, and the
+    /// UTF-16 units it would produce for a wide one.
+    #[test]
+    fn a_narrow_source_is_measured_per_target_family() {
+        let text = "\u{2615}\u{2615}\u{2615}";
+        assert_eq!(
+            convert_char(SQL_C_CHAR, SQL_VARCHAR, 3, text).unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+        assert!(convert_char(SQL_C_CHAR, SQL_VARCHAR, 9, text).is_ok());
+        assert!(convert_char(SQL_C_CHAR, SQL_WVARCHAR, 3, text).is_ok());
+    }
+
+    /// Malformed narrow input is repaired lossily rather than reported. Pinned
+    /// so a later switch to `22018` registers as a behaviour change (AB#47565).
+    #[test]
+    fn malformed_utf8_is_repaired_lossily() {
+        let mut buf: Vec<u8> = vec![b'a', 0xFF, b'b'];
+        let mut ind: SqlLen = buf.len() as SqlLen;
+        let mut p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_VARCHAR;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::VarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "a\u{FFFD}b"),
+            other => panic!("expected VarcharMax(Some), got {other:?}"),
+        }
+    }
+
+    /// A surrogate pair costs two units, which is what `nvarchar(n)` counts.
+    #[test]
+    fn a_surrogate_pair_costs_two_units() {
+        let emoji = "\u{1F600}";
+        assert_eq!(
+            convert_char(SQL_C_WCHAR, SQL_WVARCHAR, 1, emoji).unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+        match convert_char(SQL_C_WCHAR, SQL_WVARCHAR, 2, emoji).unwrap() {
+            SqlType::NVarchar(Some(s), 2) => assert_eq!(s.to_utf8_string(), emoji),
+            other => panic!("expected NVarchar(Some, 2), got {other:?}"),
+        }
+    }
+
+    /// A lone surrogate is counted before it is repaired, so the unit we measure
+    /// is not always the unit that ships: a wide target passes it through, while
+    /// a narrow one replaces it with U+FFFD - one UTF-16 unit in, three UTF-8
+    /// bytes out. The wide-source mirror of `malformed_utf8_is_repaired_lossily`,
+    /// and reachable from any application that binds one.
+    ///
+    /// The narrow half is also the collation gap in miniature: three UTF-8 bytes
+    /// in a `varchar(1)`, which only fits once `serialize_string` folds them to a
+    /// single-byte code page.
+    #[test]
+    fn a_lone_surrogate_is_measured_before_repair() {
+        let mut units: Vec<u16> = vec![0xD800];
+        let mut ind: SqlLen = std::mem::size_of_val(&units[..]) as SqlLen;
+
+        let mut p = param(SQL_C_WCHAR, units.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_WVARCHAR;
+        p.column_size = 1;
+        match unsafe { bound_param_to_value(&p) }.unwrap().0 {
+            SqlType::NVarchar(Some(s), 1) => {
+                assert_eq!(s.as_utf16_bytes(), Some(&[0x00, 0xD8][..]))
+            }
+            other => panic!("expected NVarchar(Some, 1), got {other:?}"),
+        }
+
+        let mut p = param(SQL_C_WCHAR, units.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_VARCHAR;
+        p.column_size = 1;
+        match unsafe { bound_param_to_value(&p) }.unwrap().0 {
+            SqlType::Varchar(Some(s), 1) => assert_eq!(s.to_utf8_string(), "\u{FFFD}"),
+            other => panic!("expected Varchar(Some, 1), got {other:?}"),
+        }
+    }
+
+    /// Only the `max` types are unbounded. `text`/`ntext` have no declared
+    /// length but are still bounded by `ColumnSize`, as msodbcsql bounds them
+    /// (`sqlcfunc.cpp:2898`).
+    #[test]
+    fn only_the_max_types_are_unbounded() {
+        use crate::api::type_rules::parameter_column_size_is_valid;
+
+        let long = "x".repeat(9000);
+        for (c_type, sql_type) in [(SQL_C_CHAR, SQL_VARCHAR), (SQL_C_WCHAR, SQL_WVARCHAR)] {
+            assert!(
+                convert_char(c_type, sql_type, 0, &long).is_ok(),
+                "{c_type} -> {sql_type} truncated a max target"
+            );
+        }
+        for (c_type, sql_type) in [
+            (SQL_C_CHAR, SQL_LONGVARCHAR),
+            (SQL_C_CHAR, SQL_WLONGVARCHAR),
+            (SQL_C_WCHAR, SQL_LONGVARCHAR),
+            (SQL_C_WCHAR, SQL_WLONGVARCHAR),
+        ] {
+            assert!(convert_char(c_type, sql_type, 9000, &long).is_ok());
+            assert_eq!(
+                convert_char(c_type, sql_type, 3, "abcd").unwrap_err(),
+                ParamBuildError::StringTruncation,
+                "{c_type} -> {sql_type} ignored ColumnSize"
+            );
+        }
+
+        // 0 is not the `max` spelling for these: it sets the bound to zero and
+        // rejects every non-empty value, so the bind gate refuses it with HY104
+        // first - as msodbcsql's `CheckSqlPrec` does (`sqlcdesc.cpp:11805`).
+        for sql_type in [SQL_LONGVARCHAR, SQL_WLONGVARCHAR] {
+            assert!(!parameter_column_size_is_valid(sql_type, 0));
+            assert_eq!(
+                convert_char(SQL_C_CHAR, sql_type, 0, "a").unwrap_err(),
+                ParamBuildError::StringTruncation,
+                "sql_type {sql_type}"
+            );
+        }
+    }
+
+    /// `sql_family` and the bind-time matrix hold the same family knowledge in
+    /// two places, so pin them together in both directions: every `sql_type` the
+    /// matrix lets a representative C type reach must classify into the matching
+    /// family, and every `sql_type` with a family must be reachable from it.
+    #[test]
+    fn sql_family_agrees_with_the_conversion_matrix() {
+        for sql_type in -160..=120 {
+            let from_matrix = if is_supported_conversion(SQL_C_CHAR, sql_type) {
+                Some(SqlFamily::Character)
+            } else if is_supported_conversion(SQL_C_SLONG, sql_type) {
+                Some(SqlFamily::Integer)
+            } else if is_supported_conversion(SQL_C_BINARY, sql_type) {
+                Some(SqlFamily::Binary)
+            } else {
+                None
+            };
+            assert_eq!(sql_family(sql_type), from_matrix, "sql_type {sql_type}");
         }
     }
 

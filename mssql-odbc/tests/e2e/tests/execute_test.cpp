@@ -6,6 +6,7 @@
 #include "odbc_test_fixture.h"
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 // ===================================================================

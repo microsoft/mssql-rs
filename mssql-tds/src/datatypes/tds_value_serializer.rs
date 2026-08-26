@@ -3977,6 +3977,20 @@ mod tests {
         assert_eq!(first_encoding, b"Hello123", "ASCII should be encoded as-is");
     }
 
+    /// A character the target code page cannot represent is not dropped and not
+    /// replaced with `?`: `encoding_rs` substitutes a decimal numeric character
+    /// reference, so one character becomes eight ASCII bytes and what the server
+    /// stores is markup rather than text. `serialize_string` only logs a warning
+    /// for `had_errors`, so nothing upstream sees this.
+    #[test]
+    fn unmappable_character_becomes_a_numeric_character_reference() {
+        let encoding = lcid_to_encoding(0x0409).unwrap();
+        let (encoded, _enc, had_errors) = encoding.encode("\u{65E5}");
+
+        assert!(had_errors);
+        assert_eq!(&encoded[..], b"&#26085;");
+    }
+
     #[test]
     fn test_latin1_fallback_for_unsupported_lcid() {
         // Test that unsupported LCID returns error (fallback handled in serialize_string)

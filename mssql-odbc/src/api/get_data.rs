@@ -230,11 +230,13 @@ fn write_captured_column(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    // Codepage note: SQL_C_CHAR output is UTF-8. This diverges from msodbcsql,
-    // which converts character data to the client's Windows ANSI codepage. The
-    // divergence is intentional (this driver is codepage-agnostic and UTF-8
-    // native); callers that need ANSI must transcode. SQL_C_WCHAR is UTF-16LE on
-    // both drivers.
+    // Codepage note: SQL_C_CHAR output is UTF-8, unconditionally. msodbcsql
+    // instead converts to the client code page (`GetACP()` on Windows,
+    // `nl_langinfo(CODESET)` elsewhere), so the two agree on a UTF-8 locale and
+    // differ on a default Windows one. UTF-8 is chosen because the only
+    // supported consumer is mssql-python, which is UTF-8 native; the ODBC spec
+    // fixes no encoding for SQL_C_CHAR, so neither is more conformant. Client
+    // code page support is AB#47564. SQL_C_WCHAR is UTF-16LE on both drivers.
     // Check target type first — an unsupported type must not consume last_captured so the app can retry.
     // A zero-length SQL_C_BINARY read is a length/NULL probe rather than a data
     // read. mssql-python issues one on every sql_variant column to detect NULL
@@ -570,9 +572,8 @@ fn stream_active_plp_chunk(
         // varchar->SQL_C_WCHAR widening are not yet implemented; they return
         // HYC00 and are deferred to a follow-up change.
         //
-        // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8,
-        // which diverges from msodbcsql's Windows ANSI codepage conversion. This
-        // is intentional; SQL_C_WCHAR is UTF-16LE on both drivers.
+        // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8
+        // rather than the client code page msodbcsql uses (AB#47564).
         let encoding = stmt_state.active_plp.as_ref().map(|s| s.encoding);
         let compatible = matches!(
             (target_type, encoding),
@@ -764,8 +765,9 @@ fn stream_active_plp_chunk(
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         };
         match plp_encoding {
-            // varchar(max)/char/text — single-byte / codepage text. Codepage
-            // conversion will attach here in a follow-up.
+            // varchar(max)/char/text — single-byte / codepage text. Delivered
+            // verbatim today, so a non-UTF-8 server collation yields raw
+            // codepage bytes labelled UTF-8. Conversion attaches here: AB#47566.
             Some(PlpEncoding::SingleByteText) => copy_verbatim(),
             // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
             // stay distinct from SingleByteText (see above).
@@ -827,7 +829,7 @@ fn stream_active_plp_chunk(
         SQL_NO_TOTAL
     };
     unsafe { write_if_some(strlen_or_ind_ptr, remaining_indicator) };
-    post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+    post_diag(&mut stmt_state, WARN_STRING_TRUNCATION);
 
     SQL_SUCCESS_WITH_INFO
 }
@@ -898,7 +900,7 @@ fn write_string_result<T: Copy + Default>(
     unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
     let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
     if truncated {
-        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+        post_diag(stmt_state, WARN_STRING_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
