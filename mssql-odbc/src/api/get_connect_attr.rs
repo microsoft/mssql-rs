@@ -580,4 +580,58 @@ mod tests {
         };
         assert_eq!(get, SQL_ERROR);
     }
+
+    #[test]
+    fn vendor_attributes_read_back_the_value_the_set_side_stored() {
+        let h = TestHandles::with_env_dbc();
+        // 7 exercises the folding the set side applies: any non-zero encrypt
+        // value normalizes to on, so the get side must report the stored 1
+        // rather than the 7 the caller passed.
+        for (attribute, set_value, expected) in [
+            (SQL_COPT_SS_ENCRYPT, 0usize, 0u32),
+            (SQL_COPT_SS_ENCRYPT, 7, 1),
+            (SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, 1, 1),
+            (SQL_COPT_SS_INTEGRATED_SECURITY, 1, 1),
+        ] {
+            let set =
+                unsafe { sql_set_connect_attr_w(h.dbc, attribute, set_value as SqlPointer, 0) };
+            assert_eq!(set, SQL_SUCCESS, "setting {attribute}");
+            assert_eq!(
+                get_u32(h.dbc, attribute),
+                expected,
+                "reading {attribute} back"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_attributes_report_driver_defaults_before_connect() {
+        // Nothing has resolved yet, so these come from the driver defaults:
+        // encryption on, no trust, no integrated auth.
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), SQL_EN_ON as u32);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE), 0);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_INTEGRATED_SECURITY), 0);
+    }
+
+    #[test]
+    fn vendor_attribute_null_pointer_is_rejected() {
+        let h = TestHandles::with_env_dbc();
+        for attribute in [
+            SQL_COPT_SS_ENCRYPT,
+            SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+            SQL_COPT_SS_INTEGRATED_SECURITY,
+        ] {
+            let get = unsafe {
+                sql_get_connect_attr_w(
+                    h.dbc,
+                    attribute,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(get, SQL_ERROR, "null value pointer for {attribute}");
+        }
+    }
 }
