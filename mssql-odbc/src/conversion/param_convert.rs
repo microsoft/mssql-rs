@@ -182,15 +182,38 @@ pub(crate) fn is_data_at_exec_indicator(indicator: SqlLen) -> bool {
 
 /// Builds the streaming placeholder type for a data-at-execution bound
 /// parameter. The actual bytes arrive later via `SQLPutData`.
+///
+/// The placeholder follows the *C* type, not `ParameterType`, because
+/// `SQLPutData` streams its chunks to the wire untranscoded - a UTF-8 sequence
+/// can straddle two calls, so there is nothing to transcode a chunk against. A
+/// cross-family pairing would therefore declare one encoding and send another,
+/// so it is rejected here rather than silently corrupting the value (AB#47590).
+/// `ColumnSize` is likewise unenforceable: every streamed type is a `max`.
 pub(crate) fn dae_placeholder_type(
     c_type: SqlSmallInt,
+    sql_type: SqlSmallInt,
 ) -> Result<StreamedSqlType, ParamBuildError> {
-    match c_type {
-        SQL_C_CHAR => Ok(StreamedSqlType::VarcharMax),
-        SQL_C_WCHAR => Ok(StreamedSqlType::NVarcharMax),
-        SQL_C_BINARY => Ok(StreamedSqlType::VarBinaryMax),
-        other => Err(ParamBuildError::UnsupportedCType(other)),
+    let streamed = match c_type {
+        SQL_C_CHAR => StreamedSqlType::VarcharMax,
+        SQL_C_WCHAR => StreamedSqlType::NVarcharMax,
+        SQL_C_BINARY => StreamedSqlType::VarBinaryMax,
+        other => return Err(ParamBuildError::UnsupportedCType(other)),
+    };
+    let same_family = match streamed {
+        StreamedSqlType::VarcharMax => {
+            matches!(sql_type, SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR)
+        }
+        StreamedSqlType::NVarcharMax => {
+            matches!(sql_type, SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR)
+        }
+        StreamedSqlType::VarBinaryMax => {
+            matches!(sql_type, SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY)
+        }
+    };
+    if !same_family {
+        return Err(ParamBuildError::ConversionNotImplemented);
     }
+    Ok(streamed)
 }
 
 /// The SQL-side axis of the conversion matrix.
@@ -914,21 +937,61 @@ mod tests {
     #[test]
     fn dae_placeholder_type_covers_the_streamable_c_types() {
         assert!(matches!(
-            dae_placeholder_type(SQL_C_CHAR),
+            dae_placeholder_type(SQL_C_CHAR, SQL_VARCHAR),
             Ok(StreamedSqlType::VarcharMax)
         ));
         assert!(matches!(
-            dae_placeholder_type(SQL_C_WCHAR),
+            dae_placeholder_type(SQL_C_WCHAR, SQL_WVARCHAR),
             Ok(StreamedSqlType::NVarcharMax)
         ));
         assert!(matches!(
-            dae_placeholder_type(SQL_C_BINARY),
+            dae_placeholder_type(SQL_C_BINARY, SQL_VARBINARY),
             Ok(StreamedSqlType::VarBinaryMax)
         ));
 
-        let err = dae_placeholder_type(SQL_C_LONG).unwrap_err();
+        let err = dae_placeholder_type(SQL_C_LONG, SQL_VARCHAR).unwrap_err();
         assert!(matches!(err, ParamBuildError::UnsupportedCType(SQL_C_LONG)));
         assert_eq!(err.diag().state, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state);
+    }
+
+    /// Streaming writes chunks untranscoded, so a pairing the materialized path
+    /// would transcode has to be refused rather than declared in one encoding
+    /// and sent in another (AB#47590). Same-family pairings stay accepted even
+    /// where the declared type is not itself a `max`.
+    #[test]
+    fn cross_family_dae_is_rejected() {
+        for (c_type, sql_type) in [
+            (SQL_C_CHAR, SQL_WCHAR),
+            (SQL_C_CHAR, SQL_WVARCHAR),
+            (SQL_C_CHAR, SQL_WLONGVARCHAR),
+            (SQL_C_WCHAR, SQL_CHAR),
+            (SQL_C_WCHAR, SQL_VARCHAR),
+            (SQL_C_WCHAR, SQL_LONGVARCHAR),
+            (SQL_C_BINARY, SQL_VARCHAR),
+            (SQL_C_CHAR, SQL_VARBINARY),
+        ] {
+            let err = dae_placeholder_type(c_type, sql_type).unwrap_err();
+            assert_eq!(
+                err,
+                ParamBuildError::ConversionNotImplemented,
+                "{c_type} -> {sql_type} should not stream"
+            );
+            assert_eq!(err.diag().state, *b"HYC00");
+        }
+
+        for (c_type, sql_type) in [
+            (SQL_C_CHAR, SQL_CHAR),
+            (SQL_C_CHAR, SQL_LONGVARCHAR),
+            (SQL_C_WCHAR, SQL_WCHAR),
+            (SQL_C_WCHAR, SQL_WLONGVARCHAR),
+            (SQL_C_BINARY, SQL_BINARY),
+            (SQL_C_BINARY, SQL_LONGVARBINARY),
+        ] {
+            assert!(
+                dae_placeholder_type(c_type, sql_type).is_ok(),
+                "{c_type} -> {sql_type} should stream"
+            );
+        }
     }
 
     /// A parameter that reaches value conversion still carrying a

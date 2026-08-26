@@ -649,6 +649,28 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
     EXPECT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Streaming writes SQLPutData chunks to the wire untranscoded - a UTF-8
+// sequence can straddle two calls - so the streamed type must be the one the C
+// buffer already holds. A cross-family binding is therefore refused at execute
+// rather than declared nvarchar and sent as UTF-8. The materialized path does
+// transcode it, so the two paths deliberately differ until AB#47590 lands.
+//
+// msodbcsql supports the pairing, hence the skip.
+TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_WVARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+}
+
 // A wide-character parameter binds as nvarchar and round-trips.
 TEST_F(PrepareExecuteLiveTest, WideCharParam) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
