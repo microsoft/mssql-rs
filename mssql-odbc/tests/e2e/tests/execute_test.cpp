@@ -686,13 +686,18 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
 // The same-family long pairing still streams. Its placeholder is varchar(max),
 // which is also what the materialized path now declares for SQL_LONGVARCHAR
 // until text/ntext can be sent (AB#47592), so the two agree.
+//
+// ColumnSize must be a real length: 0 is the `max` sentinel for SQL_VARCHAR but
+// invalid for the long types on both drivers (HY104), as
+// ZeroColumnSizeIsRejectedForFixedLengthCharTypes pins. The streamed path does
+// not enforce it either way (AB#47590).
 TEST_F(PrepareExecuteLiveTest, LongVarcharDataAtExecutionStreams) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
     SQLCHAR token = 0;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
-                                   SQL_LONGVARCHAR, 0, 0, &token, 0, &ind),
+                                   SQL_LONGVARCHAR, 8000, 0, &token, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
     SQLPOINTER value_ptr = nullptr;
