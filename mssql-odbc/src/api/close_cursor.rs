@@ -201,7 +201,18 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
             error!("drain_and_release: dbc mutex poisoned");
             return DrainOutcome::Failed;
         };
-        dbc_state.client.take()
+        // A fetch may have already released `active_stmt` early once this
+        // statement's own result set was exhausted (AB#47508), independently
+        // of `STMT_STATE_CURSOR_OPEN`, which callers here check instead. If a
+        // *different* statement has since claimed the connection, this
+        // statement has nothing left on the wire to drain — taking the client
+        // here would steal and corrupt whatever the other statement is mid-fetch
+        // on. `active_stmt` being `None` (idle) or still `Some(statement_handle)`
+        // is the ordinary case and proceeds as before.
+        match dbc_state.active_stmt {
+            Some(other) if other != statement_handle => return DrainOutcome::Clean,
+            _ => dbc_state.client.take(),
+        }
     };
 
     let Some(mut client) = client else {
@@ -296,5 +307,56 @@ mod tests {
         // No execute has been called — cursor_open is false; SQL_CLOSE is a no-op.
         let ret = unsafe { sql_free_stmt_close(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    /// Statement A's cursor stays `STMT_STATE_CURSOR_OPEN` after its own fetch
+    /// released `active_stmt` early (AB#47508) — a different statement B may
+    /// have since claimed the connection and be mid-fetch on its own live,
+    /// still-open result set. Closing A's cursor in that window must not touch
+    /// B's client at all: taking it here would drain/corrupt B's pending rows.
+    #[test]
+    fn drain_and_release_does_not_touch_a_different_statements_client() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let stmt_b = h.alloc_extra_stmt();
+        h.mark_dbc_connected();
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // B's live client, positioned on an open result set (has_open_batch) so
+        // `close_query()` would genuinely try to drain it if this stole the
+        // client — with an empty token queue left, that drain would error.
+        let mut client_b = tds_client_from_tokens(vec![col_metadata_empty()]);
+        dbc.runtime
+            .block_on(client_b.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client_b);
+            ds.active_stmt = Some(stmt_b);
+        }
+        {
+            let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt_a
+                .inner
+                .lock()
+                .unwrap()
+                .set_state(STMT_STATE_CURSOR_OPEN);
+        }
+
+        let outcome = drain_and_release(unsafe { handle_from_raw::<StmtHandle>(h.stmt) }, h.stmt);
+
+        assert!(matches!(outcome, DrainOutcome::Clean));
+        let ds = dbc.inner.lock().unwrap();
+        assert_eq!(
+            ds.active_stmt,
+            Some(stmt_b),
+            "B's claim on the connection must be left untouched"
+        );
+        assert!(
+            ds.client.as_ref().is_some_and(|c| c.has_open_batch()),
+            "B's result set must still be open — not drained by A's close"
+        );
     }
 }
