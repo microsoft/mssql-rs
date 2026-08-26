@@ -1051,9 +1051,25 @@ fn xml_to_text(bytes: &[u8]) -> Result<String, TextError> {
 ///
 /// msodbcsql renders these as `.5000` / `-.0001`, not `0.5000` / `-0.0001`, and
 /// applications that compare the rendered text see the difference. It strips
-/// unconditionally, so an exact zero renders `.0000` too. Applied here rather
-/// than in `mssql-tds`'s formatters because this is the ODBC parity contract,
-/// not a general property of number formatting.
+/// unconditionally, so an exact zero renders `.0000` too.
+///
+/// Decimal and money reach that result through separate code, which is why both
+/// were verified rather than one assumed to follow the other:
+/// - `sqlccnvt.cpp` `numerictostring` — the digit loop breaks on
+///   `number.data[0] == 0 && i <= 0`, so it stops once the scale is satisfied
+///   and never emits an integer-part digit for a sub-one value.
+/// - `sqlccnvt.cpp` `BigintToChar`, called with `scale = 4` for money — loops
+///   while `value != 0 || cch <= scale` and emits the separator at
+///   `cch == scale`, arriving at the same shape.
+///
+/// `Real` and `Float` are deliberately **not** stripped. Float rendering goes
+/// through `DoubleToChar`, which has an explicit "put in leading zero before
+/// decimal point" branch, so msodbcsql really does render `0.5` for `FLOAT` and
+/// `.5000` for `DECIMAL`. The asymmetry is the parity-correct answer, not an
+/// oversight — removing it to make the two consistent would create a divergence.
+///
+/// Applied here rather than in `mssql-tds`'s formatters because this is the ODBC
+/// parity contract, not a general property of number formatting.
 fn strip_sub_one_leading_zero(s: String) -> String {
     if let Some(rest) = s.strip_prefix("0.") {
         format!(".{rest}")
@@ -1644,6 +1660,57 @@ mod tests {
             .lock()
             .unwrap();
         assert_last_diag(&s.diag_records, ERR_RESTRICTED_DATA_TYPE);
+    }
+
+    /// The strip rule is only otherwise verified by the e2e parity suite, which
+    /// needs a live SQL Server and msodbcsql installed. Pinned here so a refactor
+    /// of `column_value_to_text` cannot drop it and still look green.
+    #[test]
+    fn sub_one_values_render_without_the_leading_zero() {
+        assert_eq!(strip_sub_one_leading_zero("0.5000".into()), ".5000");
+        assert_eq!(strip_sub_one_leading_zero("-0.0001".into()), "-.0001");
+        // msodbcsql strips unconditionally, so an exact zero loses its digit too.
+        assert_eq!(strip_sub_one_leading_zero("0.0000".into()), ".0000");
+
+        // At or above one, scale 0, and a bare integer are untouched.
+        assert_eq!(strip_sub_one_leading_zero("123.4500".into()), "123.4500");
+        assert_eq!(strip_sub_one_leading_zero("-1.5000".into()), "-1.5000");
+        assert_eq!(strip_sub_one_leading_zero("0".into()), "0");
+        assert_eq!(strip_sub_one_leading_zero("-0".into()), "-0");
+    }
+
+    /// Covers the wiring as well as the helper: a sub-one value has to arrive
+    /// stripped through the real decimal and money arms, not just through a
+    /// hand-built string.
+    #[test]
+    fn sub_one_decimal_and_money_render_stripped() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+
+        let d = ColumnValues::Numeric(DecimalParts::from_string("0.4500", 5, 4).unwrap());
+        assert_eq!(column_value_to_text(&d).ok().unwrap(), ".4500");
+
+        let neg = ColumnValues::Decimal(DecimalParts::from_string("-0.0001", 5, 4).unwrap());
+        assert_eq!(column_value_to_text(&neg).ok().unwrap(), "-.0001");
+
+        // 0.5 in money's fixed 4-digit scale is 5000.
+        let m = ColumnValues::Money(mssql_tds::datatypes::column_values::SqlMoney::from(5000i32));
+        assert_eq!(column_value_to_text(&m).ok().unwrap(), ".5000");
+    }
+
+    /// Float is the deliberate exception: msodbcsql's `DoubleToChar` writes the
+    /// leading zero, so stripping here would create a divergence.
+    #[test]
+    fn sub_one_float_keeps_its_leading_zero() {
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Float(0.5))
+                .ok()
+                .unwrap(),
+            "0.5"
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Real(0.5)).ok().unwrap(),
+            "0.5"
+        );
     }
 
     #[test]

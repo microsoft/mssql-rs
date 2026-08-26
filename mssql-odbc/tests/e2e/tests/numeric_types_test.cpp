@@ -172,6 +172,33 @@ TEST_F(NumericTypesLiveTest, FloatToDoubleTargetViaGetData) {
     SQLCloseCursor(stmt_);
 }
 
+// Float rendered as *text*, which is a different code path from the binary
+// targets above and the one place the sub-one leading zero is deliberately
+// kept: msodbcsql's DoubleToChar writes it, while its decimal and money paths
+// strip it. Asserted here so the asymmetry is verified rather than only
+// described in a comment.
+TEST_F(NumericTypesLiveTest, FloatToCharKeepsItsLeadingZero) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.5 AS FLOAT) AS c1"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    char buf[64] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ("0.5", buf) << "unlike DECIMAL, float keeps the leading zero";
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(NumericTypesLiveTest, RealToCharKeepsItsLeadingZero) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0.5 AS REAL) AS c1"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    char buf[64] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ("0.5", buf);
+    SQLCloseCursor(stmt_);
+}
+
 // ---------------------------------------------------------------------------
 // GUID. SQLGUID is mixed-endian: Data1/2/3 are little-endian integers and Data4
 // is a byte array, so a driver that memcpy's the wire bytes straight through

@@ -109,7 +109,7 @@ TEST_F(DateTimeTypesLiveTest, DateToDateTargetViaBoundFetch) {
 }
 
 // ---------------------------------------------------------------------------
-// SQL_C_TYPE_TIME — truncates to whole seconds, so the fraction is the guard
+// SQL_C_TYPE_TIME — no fractional field, so a TIME(7) source has to truncate
 // ---------------------------------------------------------------------------
 
 TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaGetData) {
@@ -135,6 +135,26 @@ TEST_F(DateTimeTypesLiveTest, TimeToTimeTargetViaBoundFetch) {
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
+    EXPECT_EQ(13, t.hour);
+    EXPECT_EQ(45, t.minute);
+    EXPECT_EQ(59, t.second);
+    SQLCloseCursor(stmt_);
+}
+
+// The truncation itself. TIME(0) above has no fraction to drop, so it never
+// reaches this branch -- and ASSERT_SQL_OK would not have caught the difference
+// anyway, since it wraps SQL_SUCCEEDED and SQL_SUCCESS_WITH_INFO satisfies it.
+// The return code and SQLSTATE are the assertions that matter here.
+TEST_F(DateTimeTypesLiveTest, Time7ToTimeTargetTruncatesTheFraction) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('13:45:59.1234567' AS TIME(7)) AS c1"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQL_TIME_STRUCT t{};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_TYPE_TIME, &t, sizeof(t), &ind);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc) << "dropping the fraction is reported, not silent";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
     EXPECT_EQ(13, t.hour);
     EXPECT_EQ(45, t.minute);
     EXPECT_EQ(59, t.second);
