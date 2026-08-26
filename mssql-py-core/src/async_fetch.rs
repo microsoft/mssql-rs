@@ -134,7 +134,7 @@ async fn fetch_one_on_client(client: &mut TdsClient) -> Result<Option<PyRowWrite
 }
 
 fn map_fetch_error(error: Error) -> PyErr {
-    tracing::debug!("PyAsyncCursor::fetchone: failed: {error}");
+    tracing::error!("PyAsyncCursor::fetchone: failed: {error}");
     pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to fetch row: {error}"))
 }
 
@@ -152,6 +152,7 @@ pub(crate) fn fetchone<'py>(
         fetch_state,
     } = resources;
     if fetch_state.status() == FetchStatus::Exhausted {
+        session_state.ensure_open().map_err(map_claim_error)?;
         return pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Python::attach(|py| Ok(py.None()))
         });
@@ -167,7 +168,6 @@ pub(crate) fn fetchone<'py>(
         // cannot race the in-flight TDS read.
         let _cursor = cursor;
         let mut fetch_guard = FetchGuard::new(future_state, operation_id);
-        tracing::info!("PyAsyncCursor::fetchone: fetching one row");
 
         let (result, has_open_batch) = {
             let mut client = client.lock().await;
@@ -184,9 +184,7 @@ pub(crate) fn fetchone<'py>(
                 } else {
                     FetchStatus::Exhausted
                 });
-                if writer.is_some() {
-                    tracing::info!("PyAsyncCursor::fetchone: row fetched successfully");
-                } else {
+                if writer.is_none() {
                     tracing::info!("PyAsyncCursor::fetchone: result set exhausted");
                 }
                 Python::attach(|py| match writer {

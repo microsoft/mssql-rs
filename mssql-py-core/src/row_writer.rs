@@ -34,12 +34,12 @@ impl PyRowWriter {
     }
 
     pub fn to_py_tuple<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let py_values: Vec<Bound<'py, PyAny>> = self
-            .row
-            .iter()
-            .map(|col_val| PyCoreCursor::column_value_to_python(py, col_val))
-            .collect();
-        PyTuple::new(py, py_values.iter())
+        PyTuple::new(
+            py,
+            self.row
+                .iter()
+                .map(|col_val| PyCoreCursor::column_value_to_python(py, col_val)),
+        )
     }
 }
 

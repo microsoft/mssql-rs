@@ -142,6 +142,15 @@ impl AsyncConnectionState {
         self.next_operation_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    pub(crate) fn ensure_open(&self) -> Result<(), ClaimError> {
+        match self.lock().lifecycle {
+            ConnectionLifecycle::Open => Ok(()),
+            ConnectionLifecycle::Closing => Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => Err(ClaimError::Broken),
+        }
+    }
+
     pub(crate) fn claim_execute(&self, cursor_id: CursorId) -> Result<ExecuteClaim, ClaimError> {
         let mut state = self.lock();
         match state.lifecycle {
@@ -513,16 +522,20 @@ mod tests {
         let state = AsyncConnectionState::new();
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert_eq!(state.ensure_open(), Ok(()));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closing);
+        assert_eq!(state.ensure_open(), Err(ClaimError::Closing));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closing);
         state.mark_closed();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
+        assert_eq!(state.ensure_open(), Err(ClaimError::Closed));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
         state.mark_broken();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        assert_eq!(state.ensure_open(), Err(ClaimError::Broken));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
     }

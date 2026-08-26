@@ -15,10 +15,10 @@ import pytest
 
 class RecordingLogger:
     def __init__(self):
-        self.messages = []
+        self.events = []
 
-    def py_core_log(self, _level, message, _module_name, _line):
-        self.messages.append(message)
+    def py_core_log(self, level, message, module_name, _line):
+        self.events.append((level, message, module_name))
 
 
 async def connect(client_context, python_logger=None):
@@ -61,6 +61,28 @@ def test_fetchone_after_cursor_close_raises(mock_client_context):
 
 
 @pytest.mark.integration
+def test_fetchone_takes_no_arguments_and_distinguishes_null_from_exhaustion(
+    client_context,
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            with pytest.raises(TypeError):
+                cursor.fetchone(None)
+            with pytest.raises(TypeError):
+                cursor.fetchone(size=1)
+
+            await cursor.execute("SELECT CAST(NULL AS int)", use_prepare=False)
+            assert await cursor.fetchone() == (None,)
+            assert await cursor.fetchone() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_fetchone_returns_rows_and_releases_final_exhaustion(client_context):
     async def run():
         conn = await connect(client_context)
@@ -87,26 +109,25 @@ def test_fetchone_returns_rows_and_releases_final_exhaustion(client_context):
 
 
 @pytest.mark.integration
-def test_fetchone_logs_success_and_exhaustion(client_context):
+def test_fetchone_logs_exhaustion(client_context):
     async def run():
         logger = RecordingLogger()
         conn = await connect(client_context, logger)
         try:
             cursor = conn.cursor()
             await cursor.execute("SELECT 1", use_prepare=False)
-            logger.messages.clear()
+            logger.events.clear()
 
             assert await cursor.fetchone() == (1,)
             assert await cursor.fetchone() is None
 
-            assert any(
-                "PyAsyncCursor::fetchone: row fetched successfully" in message
-                for message in logger.messages
-            )
-            assert any(
-                "PyAsyncCursor::fetchone: result set exhausted" in message
-                for message in logger.messages
-            )
+            assert logger.events == [
+                (
+                    20,
+                    "PyAsyncCursor::fetchone: result set exhausted",
+                    "async_fetch.rs",
+                )
+            ]
         finally:
             await conn.close()
 
@@ -323,6 +344,69 @@ def test_fetchone_preserves_temporal_boundaries(client_context):
 
 
 @pytest.mark.integration
+def test_fetchone_preserves_all_temporal_scales_and_legacy_rounding(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST('12:34:56.1234567' AS time(0)),
+                    CAST('12:34:56.1234567' AS time(1)),
+                    CAST('12:34:56.1234567' AS time(2)),
+                    CAST('12:34:56.1234567' AS time(3)),
+                    CAST('12:34:56.1234567' AS time(4)),
+                    CAST('12:34:56.1234567' AS time(5)),
+                    CAST('12:34:56.1234567' AS time(6)),
+                    CAST('12:34:56.1234567' AS time(7)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(0)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(1)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(2)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(3)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(4)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(5)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(6)),
+                    CAST('2026-08-20T12:34:56.1234567' AS datetime2(7)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(0)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(1)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(2)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(3)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(4)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(5)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(6)),
+                    CAST('2026-08-20T12:34:56.1234567+05:30' AS datetimeoffset(7)),
+                    CAST('2026-08-20T12:34:56.002' AS datetime),
+                    CAST('2026-08-20T12:34:30' AS smalldatetime)
+                """,
+                use_prepare=False,
+            )
+
+            row = await cursor.fetchone()
+            microseconds = (0, 100000, 120000, 123000, 123500, 123460, 123457, 123456)
+            assert row[:8] == tuple(
+                datetime.time(12, 34, 56, value) for value in microseconds
+            )
+            assert row[8:16] == tuple(
+                datetime.datetime(2026, 8, 20, 12, 34, 56, value)
+                for value in microseconds
+            )
+            offset = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+            assert row[16:24] == tuple(
+                datetime.datetime(2026, 8, 20, 12, 34, 56, value, tzinfo=offset)
+                for value in microseconds
+            )
+            assert row[24:] == (
+                datetime.datetime(2026, 8, 20, 12, 34, 56, 3333),
+                datetime.datetime(2026, 8, 20, 12, 35),
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_fetchone_preserves_decimal_and_money_boundaries(client_context):
     async def run():
         conn = await connect(client_context)
@@ -353,6 +437,46 @@ def test_fetchone_preserves_decimal_and_money_boundaries(client_context):
                 Decimal("-214748.3648"),
                 Decimal("-0.0001"),
             )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchone_preserves_decimal_precision_scale_and_server_rounding(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                SELECT
+                    CAST(9 AS decimal(1, 0)),
+                    CAST(-9 AS numeric(1, 0)),
+                    CAST(0.99999999999999999999999999999999999999 AS decimal(38, 38)),
+                    CAST(9999999999999999999.9999999999999999999 AS decimal(38, 19)),
+                    CAST(-0.0000000001 AS numeric(38, 10)),
+                    CAST(1.23456789 AS decimal(10, 6)),
+                    CAST(-1.23456789 AS numeric(10, 6)),
+                    CAST(1.23456789 AS real),
+                    CAST(1.2345678901234567 AS float(53))
+                """,
+                use_prepare=False,
+            )
+
+            row = await cursor.fetchone()
+            assert row[:7] == (
+                Decimal("9"),
+                Decimal("-9"),
+                Decimal("0.99999999999999999999999999999999999999"),
+                Decimal("9999999999999999999.9999999999999999999"),
+                Decimal("-0.0000000001"),
+                Decimal("1.234568"),
+                Decimal("-1.234568"),
+            )
+            assert row[7] == pytest.approx(1.23456789, rel=1e-6)
+            assert row[8] == pytest.approx(1.2345678901234567, rel=1e-15)
         finally:
             await conn.close()
 
@@ -485,6 +609,22 @@ def test_fetchone_after_connection_close_raises(mock_client_context):
         cursor = conn.cursor()
         await conn.close()
 
+        with pytest.raises(RuntimeError, match="Connection is closed"):
+            await cursor.fetchone()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_exhausted_fetchone_after_connection_close_raises(client_context):
+    async def run():
+        conn = await connect(client_context)
+        cursor = conn.cursor()
+        await cursor.execute("SELECT 1", use_prepare=False)
+        assert await cursor.fetchone() == (1,)
+        assert await cursor.fetchone() is None
+
+        await conn.close()
         with pytest.raises(RuntimeError, match="Connection is closed"):
             await cursor.fetchone()
 
