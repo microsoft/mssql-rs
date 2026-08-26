@@ -464,12 +464,16 @@ mod tests {
 
     /// A statement handle reused for a new execute after its previous cursor
     /// was fetched to exhaustion (AB#47508's `result_set_exhausted` flag) must
-    /// not carry that flag into the new result set — otherwise the very first
-    /// `SQLFetch` on the fresh cursor would wrongly report `SQL_NO_DATA`.
+    /// not carry that flag — or a stale `pending_fetch_error` from that same
+    /// previous result set — into the new result set. Otherwise the very
+    /// first `SQLFetch` on the fresh cursor would wrongly report
+    /// `SQL_NO_DATA`, or worse, wrongly fail with an error left over from an
+    /// entirely different, already-finished query.
     #[test]
     fn exec_direct_row_returning_clears_a_stale_exhausted_flag() {
         use crate::api::odbc_types::SQL_SUCCESS;
         use crate::handles::dbc::DbcHandle;
+        use mssql_tds::error::Error as TdsError;
         use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -481,11 +485,17 @@ mod tests {
             ds.client = Some(client);
         }
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.inner.lock().unwrap().result_set_exhausted = true;
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.result_set_exhausted = true;
+            ss.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
+        }
 
         let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".to_string());
 
         assert_eq!(ret, SQL_SUCCESS);
-        assert!(!stmt.inner.lock().unwrap().result_set_exhausted);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(!ss.result_set_exhausted);
+        assert!(ss.pending_fetch_error.is_none());
     }
 }

@@ -215,11 +215,25 @@ fn fetch_scroll_safe(
             let rows_fetched_ptr = stmt_state.rows_fetched_ptr;
             let row_status_ptr = stmt_state.row_status_ptr;
             let row_array_size = stmt_state.row_array_size;
+            // That same peek can have found a trailing SQL Server error
+            // instead of a clean end of set (see
+            // `release_busy_if_row_exhausted`): the call that found it had
+            // already committed to delivering its own row successfully, so
+            // the diagnostic was deferred here, to the call that would have
+            // hit it directly without the peek's read-ahead.
+            let rc = if let Some(e) = stmt_state.pending_fetch_error.take() {
+                stmt_state.reset_row_stream();
+                stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+                SQL_ERROR
+            } else {
+                SQL_NO_DATA
+            };
             drop(stmt_state);
             unsafe { write_if_some(rows_fetched_ptr, 0) };
             mark_no_rows(row_status_ptr, 0, row_array_size);
-            debug!("SQLFetchScroll: result set already known exhausted; returning SQL_NO_DATA");
-            return SQL_NO_DATA;
+            debug!(?rc, "SQLFetchScroll: result set already known exhausted");
+            return rc;
         }
 
         let bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
@@ -444,6 +458,9 @@ fn fill_rowset(
     // could still legitimately retrieve. A block fetch (`row_array_size !=
     // 1`) never leaves a row positioned for `SQLGetData` regardless (see the
     // mixed-access comment below), so it is always safe to check there.
+    let peek_is_safe =
+        !client.maybe_has_unread_rows() || row_array_size != 1 || last_column_read == column_count;
+
     if fetch_error.is_some() {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -453,10 +470,7 @@ fn fill_rowset(
         if dbc_state.active_stmt == Some(statement_handle) {
             dbc_state.active_stmt = None;
         }
-    } else if !client.maybe_has_unread_rows()
-        || row_array_size != 1
-        || last_column_read == column_count
-    {
+    } else if peek_is_safe {
         release_busy_if_row_exhausted(dbc, stmt, statement_handle, client);
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
@@ -949,6 +963,49 @@ mod tests {
         // SQLSTATE (not connected / no active client) instead of SQL_NO_DATA.
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_NO_DATA);
+    }
+
+    /// A prior fetch's read-ahead peek can have discovered a trailing SQL
+    /// Server error instead of a clean end of set (see AB#47508's
+    /// `release_busy_if_row_exhausted`), deferred via `pending_fetch_error`
+    /// since that fetch call had already committed to delivering its own
+    /// row successfully. The next `SQLFetch`/`SQLFetchScroll` — the call
+    /// that would have hit this error directly without the peek's
+    /// read-ahead — must drain and report it instead of silently reporting
+    /// `SQL_NO_DATA`, and must not need the connection to do so.
+    #[test]
+    fn exhausted_cursor_fast_path_surfaces_a_pending_fetch_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+        }
+        // Same as the sibling test: no connection is configured at all, so a
+        // fallthrough to the normal fetch path would fail differently.
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert!(
+            s.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the deferred error must be posted, not silently dropped as SQL_NO_DATA"
+        );
+        assert!(
+            s.pending_fetch_error.is_none(),
+            "must be taken so it cannot leak into a later call"
+        );
+        assert!(
+            !s.has_state(STMT_STATE_CURSOR_OPEN),
+            "matches the ordinary fetch-error tail: the cursor cannot be resumed after this"
+        );
     }
 
     /// Reproduces AB#47508's reported scenario directly: statement A's cursor

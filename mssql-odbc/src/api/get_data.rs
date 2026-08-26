@@ -508,6 +508,11 @@ fn resume_row_to_column(
             return SQL_ERROR;
         };
 
+        // Claim while still holding this lock — see the identical fix and
+        // its rationale in more_results.rs's client-take site (AB#47508's
+        // early release can have already left this `None`).
+        dbc_state.active_stmt = Some(statement_handle);
+
         client
     };
 

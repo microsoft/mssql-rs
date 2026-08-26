@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
+use mssql_tds::error::Error as TdsError;
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
@@ -112,6 +113,17 @@ pub(crate) struct StmtState {
     /// Reset whenever a fresh row-returning result is positioned (a new
     /// execute, or `SQLMoreResults` landing on the next result set).
     pub(crate) result_set_exhausted: bool,
+    /// A SQL Server error a read-ahead peek discovered past a row this
+    /// statement had already finished delivering to the caller (see
+    /// `release_busy_if_row_exhausted` in `exec_common.rs`). The call that
+    /// found it has already committed to a success return for the row it
+    /// delivered, so posting the diagnostic there would be silently lost —
+    /// no return code tells the caller to look. Stashed here instead, for
+    /// the next call that would otherwise short-circuit past the wire
+    /// (`SQLFetch`'s `result_set_exhausted` fast path, or `SQLMoreResults`)
+    /// to drain and fail on. Cleared wherever `result_set_exhausted` is,
+    /// since both describe facts about the same now-superseded result set.
+    pub(crate) pending_fetch_error: Option<TdsError>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
@@ -898,6 +910,7 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 result_set_exhausted: false,
+                pending_fetch_error: None,
                 prepared: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),

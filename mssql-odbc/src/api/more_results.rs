@@ -54,6 +54,17 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        if let Some(e) = stmt_state.pending_fetch_error.take() {
+            // A prior fetch's read-ahead peek already discovered this result
+            // set ends in a SQL Server error (see AB#47508's
+            // release_busy_if_row_exhausted), but that call had already
+            // committed to delivering its own row successfully, so the
+            // diagnostic was deferred here instead of being lost under that
+            // call's own success return.
+            reset_cursor_state(&mut stmt_state);
+            post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            return SQL_ERROR;
+        }
         // A pure-DML batch queued one row count per statement; step through them
         // in memory (no cursor or connection) before falling back to the wire.
         if let Some(next) = stmt_state.pending_row_counts.pop_front() {
@@ -100,6 +111,13 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             }
             return SQL_ERROR;
         };
+        // AB#47508's early release can have left this `None` (the previous
+        // result set was fetched to exhaustion without an explicit close),
+        // so claim it now, in the same critical section as the take, rather
+        // than leaving a window where a concurrent statement sees a claimed
+        // client with no owning statement and gets a confusing
+        // "no active TDS client" instead of the correct busy diagnostic.
+        dbc_state.active_stmt = Some(statement_handle);
         client
     };
 
@@ -242,6 +260,7 @@ mod tests {
     use crate::api::sqlstate::ERR_NO_ACTIVE_TDS_CLIENT;
     use crate::handles::dbc::DbcHandle;
     use crate::test_support::TestHandles;
+    use mssql_tds::error::Error as TdsError;
     use mssql_tds::test_client_support::{
         ScriptedToken, col_metadata_empty, done_more, done_no_more, info, tds_client_from_tokens,
     };
@@ -414,6 +433,45 @@ mod tests {
             Some(h.stmt),
             "must explicitly reclaim active_stmt for the still-navigable batch"
         );
+    }
+
+    /// A prior fetch's read-ahead peek can have discovered a trailing SQL
+    /// Server error instead of a clean end of set (see AB#47508's
+    /// `release_busy_if_row_exhausted`), deferred via `pending_fetch_error`
+    /// since that fetch call had already committed to delivering its own row
+    /// successfully. `SQLMoreResults` must drain and report it — not
+    /// silently treat the closed batch as `SQL_NO_DATA` — even when called
+    /// directly, with no intervening `SQLFetch` ever seeing it.
+    #[test]
+    fn more_results_surfaces_a_pending_fetch_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+            ss.result_set_exhausted = true;
+            ss.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+
+        assert_eq!(ret, SQL_ERROR);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the deferred error must be posted, not silently dropped as SQL_NO_DATA"
+        );
+        assert!(
+            ss.pending_fetch_error.is_none(),
+            "must be taken so it cannot leak into a later call"
+        );
+        assert!(!ss.has_state(STMT_STATE_CURSOR_OPEN));
     }
 
     /// SQLMoreResults on an open cursor whose connection has no active client
