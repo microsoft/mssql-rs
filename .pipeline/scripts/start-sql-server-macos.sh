@@ -24,6 +24,9 @@
 # stops as soon as there is not enough budget left to complete another attempt.
 set -euo pipefail
 
+# shellcheck source=.pipeline/scripts/run-bounded.sh
+. "$(dirname "$0")/run-bounded.sh"
+
 : "${SQL_PASSWORD:?SQL_PASSWORD must be set}"
 
 SQL_IMAGE=${SQL_IMAGE:-mcr.microsoft.com/mssql/server:2025-latest}
@@ -46,27 +49,6 @@ START_TIME=$(date +%s)
 SETUP_DEADLINE=$((START_TIME + SETUP_BUDGET_SECONDS))
 
 elapsed() { echo $(($(date +%s) - START_TIME)); }
-
-# macOS ships no coreutils `timeout`, so bound long-running commands by hand.
-run_bounded() {
-  local limit=$1 pid waited=0
-  shift
-  "$@" &
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ "$waited" -ge "$limit" ]; then
-      echo "##[warning]'$1' exceeded ${limit}s — terminating"
-      kill -TERM "$pid" 2>/dev/null || true
-      sleep 5
-      kill -KILL "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      return 124
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
-  wait "$pid"
-}
 
 pull_image() {
   local deadline=$((START_TIME + PULL_BUDGET_SECONDS)) attempt=0 left

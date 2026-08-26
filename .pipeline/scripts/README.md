@@ -81,14 +81,26 @@ Enables Named Pipes and Shared Memory protocols for SQL Server via registry modi
 - Optionally restarts SQL Server service to apply changes
 - Provides detailed configuration status
 
+### run-bounded.sh
+Sourced helper providing `run_bounded <seconds> <command...>`. macOS ships no
+coreutils `timeout`, so long-running commands are bounded by running them in the
+background and killing them on overrun. Returns 124 on timeout.
+
 ### start-colima-macos.sh
 Installs Docker + Colima on a hosted macOS agent and boots the VM, retrying on
-the transient lima hostagent boot failures seen in ~3% of runs. Retries stop
-once `COLIMA_BUDGET_SECONDS` has elapsed. VM size stays at the long-standing
-4 GiB / 4 CPU.
+the transient lima hostagent boot failures seen in ~3% of runs. VM size stays at
+the long-standing 4 GiB / 4 CPU.
+
+Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
+boot still reaches the delete/retry path rather than running until the pipeline
+step timeout. That bound sits above the slowest healthy boot observed over 113
+runs (509s; p95 366s) — the real failures give up within seconds, so a shorter
+bound would only kill slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps
+the retries as a whole.
 
 **Environment overrides:** `COLIMA_CPU`, `COLIMA_MEMORY`, `COLIMA_DISK`,
-`COLIMA_START_ATTEMPTS`, `COLIMA_BUDGET_SECONDS`.
+`COLIMA_START_ATTEMPTS` (3), `COLIMA_START_TIMEOUT_SECONDS` (540),
+`COLIMA_BUDGET_SECONDS` (480).
 
 ### start-sql-server-macos.sh
 Starts the SQL Server test container inside the Colima VM. Retries the image
