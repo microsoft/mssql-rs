@@ -365,8 +365,13 @@ fn convert_character_sql(
         (SQL_VARCHAR, None) => SqlType::VarcharMax(value),
         (SQL_WVARCHAR, Some(length)) => SqlType::NVarchar(value, length),
         (SQL_WVARCHAR, None) => SqlType::NVarcharMax(value),
-        (SQL_LONGVARCHAR, _) => SqlType::Text(value),
-        (SQL_WLONGVARCHAR, _) => SqlType::NText(value),
+        // `text` / `ntext` would be the msodbcsql default, but `mssql-tds`
+        // serializes them in bulk-copy ROW format and the server rejects the
+        // RPC (AB#47591). `max` is what msodbcsql itself sends under
+        // `SQL_COPT_SS_LONGASMAX`, and the `ColumnSize` bound above still
+        // applies, so only the declaration differs. Restoring it is AB#47592.
+        (SQL_LONGVARCHAR, _) => SqlType::VarcharMax(value),
+        (SQL_WLONGVARCHAR, _) => SqlType::NVarcharMax(value),
         // Unreachable: the match above already rejected everything else.
         (other, _) => return Err(ParamBuildError::UnsupportedSqlType(other)),
     })
@@ -512,13 +517,15 @@ fn typed_null(
             Some(length) => SqlType::Varchar(None, length),
             None => SqlType::VarcharMax(None),
         },
-        SQL_LONGVARCHAR => SqlType::Text(None),
+        // TODO: AB#47592
+        SQL_LONGVARCHAR => SqlType::VarcharMax(None),
         SQL_WCHAR => SqlType::NChar(None, fixed_length(column_size, SQL_PREC_NCHAR)?),
         SQL_WVARCHAR => match variable_length(column_size, SQL_PREC_NCHAR) {
             Some(length) => SqlType::NVarchar(None, length),
             None => SqlType::NVarcharMax(None),
         },
-        SQL_WLONGVARCHAR => SqlType::NText(None),
+        // TODO: AB#47592
+        SQL_WLONGVARCHAR => SqlType::NVarcharMax(None),
         SQL_BINARY => SqlType::Binary(None, fixed_length(column_size, SQL_PREC_BIGCHARBINARY)?),
         SQL_VARBINARY => match variable_length(column_size, SQL_PREC_BIGCHARBINARY) {
             Some(length) => SqlType::VarBinary(None, length),
@@ -1050,10 +1057,10 @@ mod tests {
         let cases: &[(SqlSmallInt, SqlType)] = &[
             (SQL_CHAR, SqlType::Char(None, 8)),
             (SQL_VARCHAR, SqlType::Varchar(None, 8)),
-            (SQL_LONGVARCHAR, SqlType::Text(None)),
+            (SQL_LONGVARCHAR, SqlType::VarcharMax(None)),
             (SQL_WCHAR, SqlType::NChar(None, 8)),
             (SQL_WVARCHAR, SqlType::NVarchar(None, 8)),
-            (SQL_WLONGVARCHAR, SqlType::NText(None)),
+            (SQL_WLONGVARCHAR, SqlType::NVarcharMax(None)),
         ];
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
             for (sql_type, expected) in cases {
@@ -1135,6 +1142,70 @@ mod tests {
                 );
                 assert_eq!(err.diag().state, *b"22001");
             }
+        }
+    }
+
+    /// The cross-family boundary, which `overlong_value_is_22001` only pins from
+    /// the failing side: exactly at the limit converts, one unit past is `22001`.
+    #[test]
+    fn cross_family_boundary_is_exact() {
+        for (c_type, sql_type) in [
+            (SQL_C_CHAR, SQL_WVARCHAR),
+            (SQL_C_WCHAR, SQL_VARCHAR),
+            (SQL_C_CHAR, SQL_WCHAR),
+            (SQL_C_WCHAR, SQL_CHAR),
+        ] {
+            assert!(
+                convert_char(c_type, sql_type, 3, "abc").is_ok(),
+                "{c_type} -> {sql_type} rejected a value that exactly fits"
+            );
+            assert_eq!(
+                convert_char(c_type, sql_type, 3, "abcd").unwrap_err(),
+                ParamBuildError::StringTruncation,
+                "{c_type} -> {sql_type} accepted one unit past the limit"
+            );
+        }
+    }
+
+    /// An astral character is two UTF-16 units and four UTF-8 bytes, so a wide
+    /// source measured against a narrow target passes at two units and ships
+    /// four bytes. Harmless under a single-byte collation, which cannot encode
+    /// it anyway, but on a `_UTF8` database the value the server sizes is twice
+    /// what was validated (AB#47584).
+    #[test]
+    fn an_astral_char_costs_two_units_but_four_bytes() {
+        let emoji = "\u{1F600}";
+        match convert_char(SQL_C_WCHAR, SQL_CHAR, 2, emoji).unwrap() {
+            SqlType::Char(Some(s), 2) => {
+                assert_eq!(s.to_utf8_string(), emoji);
+                assert_eq!(s.to_utf8_string().len(), 4);
+            }
+            other => panic!("expected Char(Some, 2), got {other:?}"),
+        }
+        assert_eq!(
+            convert_char(SQL_C_WCHAR, SQL_CHAR, 1, emoji).unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+    }
+
+    /// Malformed narrow input is measured before it is repaired, so a buffer
+    /// that fits exactly grows past the declared length: each bad byte becomes a
+    /// three-byte U+FFFD. The narrow mirror of
+    /// `a_lone_surrogate_is_measured_before_repair` (AB#47584).
+    #[test]
+    fn invalid_utf8_at_the_limit_grows_past_it() {
+        let mut buf: Vec<u8> = vec![b'a', b'b', 0xFF];
+        let mut ind: SqlLen = buf.len() as SqlLen;
+        let mut p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_VARCHAR;
+        p.column_size = 3;
+
+        match unsafe { bound_param_to_value(&p) }.unwrap().0 {
+            SqlType::Varchar(Some(s), 3) => {
+                assert_eq!(s.to_utf8_string(), "ab\u{FFFD}");
+                assert_eq!(s.to_utf8_string().len(), 5);
+            }
+            other => panic!("expected Varchar(Some, 3), got {other:?}"),
         }
     }
 

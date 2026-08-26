@@ -669,6 +669,44 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
 
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    // The refusal happens while building the parameter list, before any RPC is
+    // opened, so no streaming sequence is left half-started: the statement takes
+    // a new binding without an intervening SQLCancel.
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLCHAR> value = {'o', 'k', '\0'};
+    SQLLEN value_ind = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, value, value_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("ok", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The same-family long pairing still streams. Its placeholder is varchar(max),
+// which is also what the materialized path now declares for SQL_LONGVARCHAR
+// until text/ntext can be sent (AB#47592), so the two agree.
+TEST_F(PrepareExecuteLiveTest, LongVarcharDataAtExecutionStreams) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+    const char chunk[] = "streamed";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 8),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("streamed", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // A wide-character parameter binds as nvarchar and round-trips.

@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
-// char_conversions_test.cpp  –  E2E tests for character parameter conversion:
+// char_conversions_test.cpp  -  E2E tests for character parameter conversion:
 // SQL_C_CHAR / SQL_C_WCHAR bound against char, varchar, text and their wide
 // counterparts. Covers the declared wire type, ColumnSize semantics, truncation
 // and its blank exemption, encoding, and the indicator/terminator rules.
@@ -31,7 +31,7 @@ public:
         for (unsigned char ch : text) {
             // char is signed, so widening 0xC3 directly would give 0xFFC3, and a
             // UTF-8 sequence would widen byte by byte. Both are silent.
-            assert(ch < 0x80 && "AsciiParam holds ASCII only");
+            EXPECT_LT(ch, 0x80) << "AsciiParam holds ASCII only";
             wide_.push_back(ch);
         }
     }
@@ -56,7 +56,7 @@ protected:
     void SetUp() override {
         ODBCTest::SetUp();
         if (!ODBCTestConfig::Instance().HasConnection()) {
-            FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
         Connect();
     }
@@ -337,18 +337,10 @@ TEST_F(CharConversionLiveTest, TextParamIsBoundedByColumnSize) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
 
-    // Everything above is refused in the driver, so it never reaches the wire.
-    // Everything below executes a non-NULL text parameter, which mssql-tds
-    // still serializes in bulk-copy ROW format.
-    GTEST_SKIP() << "AB#47591: TEXT/NTEXT RPC parameters carry a bulk-copy "
-                    "textptr/timestamp header plus a stray table-name byte, so "
-                    "executing a text parameter desyncs the stream (SQL Server "
-                    "error 4002). Un-skip as part of that fix.";
-
     // The bound is enforced with the same blank exemption as the sized types.
-    // This is the first case here that executes a non-NULL text parameter, so a
-    // server-side failure would point at the `@P1 text` declaration rather than
-    // at the trimming.
+    // This is the first case here that executes a non-NULL long character
+    // parameter, so a server-side failure would point at the declaration rather
+    // than at the trimming.
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     std::vector<SQLCHAR> padded = {'a', 'b', 'c', ' ', ' '};
     SQLLEN padded_ind = static_cast<SQLLEN>(padded.size());

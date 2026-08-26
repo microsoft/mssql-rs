@@ -228,7 +228,7 @@ SQLSTATE constant or a never-constructed enum variant fails the lint gate:
 
 - `ConvDirection` and the split of `Truncated` into `FractionalTruncation` /
   `StringTruncation` - land with P4/P5, which raise inbound truncation.
-- `SQLSTATE_22001` and its `DiagMsg` - same. `ERR_STRING_RIGHT_TRUNCATION`
+- `SQLSTATE_22001` and its `DiagMsg` - same. `WARN_STRING_TRUNCATION`
   (`01004`) already exists for the outbound path.
 
 #### P1 - Parameter type model and conversion matrix (code complete)
@@ -372,7 +372,10 @@ its UTF-16 units for either family (`cchDest = cbData/sizeof(WCHAR)`,
 own bytes for a narrow target and the UTF-16 units it would produce for a wide
 one (`:2915`). Counting transcoded UTF-8 would falsely reject values that fit:
 under a single-byte collation "cafe" with an acute accent is four collation
-bytes, not five. The inverse - a DBCS collation letting an over-long value
+bytes, not five. The inverse - a collation whose bytes outnumber the units we
+counted, so an over-long value passes - is reachable on any `_UTF8` collation,
+not just a DBCS one: `serialize_char_varchar_direct` then rejects it as a
+`UsageError`, surfacing `HY000` rather than `22001`.
 through - is the untested direction.
 
 Verified against msodbcsql source:
@@ -381,15 +384,15 @@ Verified against msodbcsql source:
   `ColumnSize`: msodbcsql applies the bound whenever `!fIsVarMax` (`:2898`), and
   `fIsVarMax` needs `cbColDef == 0` *and* a varmax type or `longToMax` (`:2577`),
   which no `SQL_LONGVARCHAR` binding satisfies.
-- `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` declare `text` / `ntext`, matching
-  msodbcsql's default - it sends `varchar(max)` only under
-  `SQL_COPT_SS_LONGASMAX` (`sqlcprot.h:1838`), which defaults off
-  (`sqlcconn.cpp:84`, `:4686`). `LongAsMax` is unimplemented here. **Executing a
-  non-NULL `text` parameter currently fails** with SQL Server error 4002:
-  `mssql-tds` serializes `TEXT` / `NTEXT` / `IMAGE` in bulk-copy ROW format, so
-  an RPC parameter carries a textptr/timestamp header and a stray table-name
-  byte that the server does not expect (AB#47591). `TextParamIsBoundedByColumnSize`
-  is `GTEST_SKIP`-ed at the point it would reach the wire.
+- `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` are sent as `varchar(max)` /
+  `nvarchar(max)`, still bounded by `ColumnSize`. msodbcsql declares `text` /
+  `ntext` by default - it sends `max` only under `SQL_COPT_SS_LONGASMAX`
+  (`sqlcprot.h:1838`), which defaults off (`sqlcconn.cpp:84`, `:4686`) - so this
+  matches its `LongAsMax` mode rather than its default. `text` / `ntext` cannot
+  be declared until `mssql-tds` stops serializing them in bulk-copy ROW format:
+  an RPC parameter currently carries a textptr/timestamp header and a stray
+  table-name byte, and the server answers 4002 (AB#47591). Restoring the true
+  declaration, with `SQL_COPT_SS_LONGASMAX` as the opt-in fallback, is AB#47592.
 - **`ColumnSize` is a character count and msodbcsql agrees** - no divergence.
   `SQLBindParameter` converts it to an internal byte count for the wide types
   (`sqlcdesc.cpp:3311`, `cbColDef *= sizeof(WCHAR)`); every `/ sizeof(WCHAR)`
