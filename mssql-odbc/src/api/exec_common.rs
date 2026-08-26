@@ -209,10 +209,10 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// column read, whether via bound columns (`SQLFetch`/`SQLFetchScroll`) or
 /// `SQLGetData` through the last column — and returns `client` to the DBC
 /// accordingly: idle (busy claim released) if the wire is now provably done
-/// with this statement, still busy if another row is pending. A row the peek
-/// finds is not lost; it is parked at the `TdsClient` layer (see
-/// [`TdsClient::peek_past_current_row`]) for the next fetch to consume
-/// without re-reading the wire.
+/// with this statement, still busy if another row — or another *result set*
+/// — is pending. A row the peek finds is not lost; it is parked at the
+/// `TdsClient` layer (see [`TdsClient::peek_past_current_row`]) for the next
+/// fetch to consume without re-reading the wire.
 ///
 /// This is what lets the connection stop being busy as soon as msodbcsql's
 /// wire-state gate would, instead of only when this statement's cursor is
@@ -221,9 +221,27 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// `result_set_exhausted` alone — while no longer blocking a different
 /// statement on the same connection.
 ///
-/// Best-effort: a peek failure is logged and otherwise swallowed, leaving the
-/// connection claimed exactly as it already was — the failure surfaces
-/// normally on the caller's next real call instead of here.
+/// Releasing the busy claim requires the *whole batch* to be done, not just
+/// the current result set: the peek reporting no more rows only means the
+/// result set being fetched from has none — a further result set can still be
+/// pending (`SELECT 1; SELECT 2;`, or an unvisited stored-procedure result
+/// set) with its own COLMETADATA/ROW/DONE tokens still to come, which stay
+/// this statement's to read via `SQLMoreResults`. Handing the connection to a
+/// different statement before that would desync whichever statement reads
+/// next. `client.has_open_batch()` is what distinguishes the two: it is
+/// false only once nothing more remains anywhere in the batch.
+///
+/// A peek failure is posted to `stmt`'s own diagnostics — never silently
+/// dropped — but only counts as the result set being exhausted once
+/// `client.has_open_batch()` confirms the wire agrees: a SQL Server `ERROR`
+/// token collapses the whole batch before returning `Err` (see
+/// `handle_row_read_token`'s `Tokens::Error` arm), so `has_open_batch()` is
+/// already false by the time it's checked here, but a raw transport failure
+/// leaves it untouched. In that case the connection may simply be broken
+/// rather than done — reporting exhaustion would tell a later `SQLFetch` on
+/// this statement there is nothing left (`SQL_NO_DATA`) when the real error
+/// needs to surface instead, so the claim is left exactly as it was and the
+/// failure is deferred to the caller's next real call.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -235,13 +253,7 @@ pub(super) fn release_busy_if_row_exhausted(
     statement_handle: SqlHandle,
     mut client: TdsClient,
 ) {
-    let has_more = match dbc.runtime.block_on(client.peek_past_current_row()) {
-        Ok(has_more) => Some(has_more),
-        Err(e) => {
-            error!(%e, "release_busy_if_row_exhausted: peek past current row failed");
-            None
-        }
-    };
+    let peek_result = dbc.runtime.block_on(client.peek_past_current_row());
 
     // The peek can read past an INFO token (a PRINT/RAISERROR between the last
     // row and the batch's next boundary) before this statement's client is
@@ -249,10 +261,24 @@ pub(super) fn release_busy_if_row_exhausted(
     // here so it is never posted onto whichever statement happens to touch
     // the client next.
     let info_messages = client.take_info_messages();
+    let batch_done = !client.has_open_batch();
+
+    // `Ok(true)`: another row, already parked for the next fetch — never
+    // exhausted. `Ok(false)`: the current result set's own DONE token was
+    // reached cleanly — always exhausted, regardless of whether a further
+    // result set remains pending elsewhere in the batch (`SQLFetch` never
+    // auto-advances across result sets, so reporting `SQL_NO_DATA` for a
+    // fully-read one is correct on its own terms). `Err`: only exhausted if
+    // the wire itself has given up on the whole batch (see doc comment).
+    let result_set_exhausted = match &peek_result {
+        Ok(has_more) => !has_more,
+        Err(_) => batch_done,
+    };
+    let release = result_set_exhausted && batch_done;
 
     if let Ok(mut dbc_state) = dbc.inner.lock() {
         dbc_state.client = Some(client);
-        dbc_state.active_stmt = if has_more == Some(false) {
+        dbc_state.active_stmt = if release {
             None
         } else {
             Some(statement_handle)
@@ -261,7 +287,11 @@ pub(super) fn release_busy_if_row_exhausted(
 
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         post_tds_info_messages(&mut stmt_state, &info_messages);
-        if has_more == Some(false) {
+        if let Err(e) = &peek_result {
+            error!(%e, "release_busy_if_row_exhausted: peek past current row failed");
+            post_tds_error(&mut stmt_state, e, SQLSTATE_HY000);
+        }
+        if result_set_exhausted {
             stmt_state.result_set_exhausted = true;
         }
     }
@@ -567,7 +597,7 @@ mod tests {
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::{
-        ScriptedToken, col_metadata_empty, done_no_more, tds_client_from_tokens,
+        ScriptedToken, col_metadata_empty, done_more, done_no_more, tds_client_from_tokens,
     };
     use std::ffi::c_void;
 
@@ -645,6 +675,47 @@ mod tests {
         assert!(stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
+    /// The reviewer-flagged AB#47508 regression: `SELECT 1; SELECT 2;` as one
+    /// batch. The peek reaches result set 1's own terminating DONE — which
+    /// carries the MORE flag, since result set 2 is still to come — so
+    /// `result_set_exhausted` is correctly set (a further `SQLFetch` on this
+    /// statement, without an intervening `SQLMoreResults`, must report
+    /// `SQL_NO_DATA` per ODBC's per-result-set fetch semantics), but the busy
+    /// claim must NOT be released: `client.has_open_batch()` is still true,
+    /// so a different statement claiming the connection now would desync
+    /// whichever statement later reads result set 2's COLMETADATA/DONE via
+    /// `SQLMoreResults`.
+    #[test]
+    fn release_busy_if_row_exhausted_keeps_busy_when_a_further_result_set_is_pending() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                done_more(),
+                col_metadata_empty(),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client);
+
+        assert_eq!(
+            dbc.inner.lock().unwrap().active_stmt,
+            Some(h.stmt),
+            "a pending second result set must keep this statement's busy claim"
+        );
+        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(
+            stmt.inner.lock().unwrap().result_set_exhausted,
+            "result set 1 itself has no more rows, independent of result set 2 being pending"
+        );
+    }
+
     /// An INFO token the peek reads on its way to the terminating DONE must be
     /// attributed to the statement that produced it, not left to leak onto
     /// whichever statement next touches the client (e.g. a different one that
@@ -676,6 +747,46 @@ mod tests {
                 .any(|d| d.message.contains("trailing message")),
             "the peeked INFO message must land on this statement's own diagnostics"
         );
+    }
+
+    /// A trailing SQL Server `ERROR` token during the peek must not be
+    /// silently swallowed — it collapses the whole batch on the wire
+    /// (`handle_row_read_token`'s error arm forces `has_open_batch` false), so
+    /// the busy claim is released same as an ordinary exhausted result set,
+    /// but unlike that case there is a real server diagnostic that a caller
+    /// like `SQLMoreResults` would otherwise never see.
+    #[test]
+    fn release_busy_if_row_exhausted_posts_and_releases_on_a_trailing_sql_error() {
+        use mssql_tds::test_client_support::sql_error;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                sql_error(547, 16, "FOREIGN KEY constraint violation"),
+                done_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client);
+
+        assert!(
+            dbc.inner.lock().unwrap().active_stmt.is_none(),
+            "the ERROR token ends the batch, so the busy claim must still be released"
+        );
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("FOREIGN KEY constraint violation")),
+            "the peeked ERROR must be posted to this statement's diagnostics, not just logged"
+        );
+        assert!(ss.result_set_exhausted);
     }
 
     // The "peek finds another row and keeps the connection busy" branch is

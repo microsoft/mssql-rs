@@ -241,6 +241,16 @@ fn sql_get_data_safe(
 /// excluded even when `col_index` is the last column, since the stream may
 /// not have reached the wire's end yet; the peek only runs once it completes
 /// naturally on a later `SQLGetData` call.
+///
+/// `ready` alone decides whether to peek — there is no separate `rc ==
+/// SQL_ERROR` bail. Every `write_captured_column` path that returns
+/// `SQL_ERROR` deliberately leaves `current_row_last_col` unadvanced (a
+/// truncated read, an unconvertible type, a malformed payload — all keep the
+/// column resident and re-readable), so `ready` already reads false for
+/// every current error outcome. That also makes this correct for a future
+/// error outcome that legitimately does finish delivering the column (e.g. a
+/// NULL surfaced through an error indicator): `ready` still reflects the true
+/// delivery state instead of a blanket rc check overriding it.
 fn finish_get_data(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
@@ -248,9 +258,6 @@ fn finish_get_data(
     col_index: usize,
     rc: SqlReturn,
 ) -> SqlReturn {
-    if rc == SQL_ERROR {
-        return rc;
-    }
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
@@ -2037,5 +2044,46 @@ mod tests {
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    /// `finish_get_data` must decide whether to peek from delivery state
+    /// (`current_row_last_col`/`column_metadata`/`active_plp`) alone, never
+    /// from `rc`. Every *current* `write_captured_column` error path leaves
+    /// `current_row_last_col` unadvanced, so this combination cannot happen
+    /// today — but a future caller can legitimately finish delivering the
+    /// column while still reporting `SQL_ERROR` (e.g. a NULL surfaced through
+    /// an error-style indicator), and the busy-release optimization must not
+    /// silently skip that case.
+    #[test]
+    fn finish_get_data_releases_busy_purely_on_delivery_state_even_when_rc_is_sql_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata = int_columns(1);
+            s.current_row_last_col = 1; // as if column 1 (the only column) was just fully delivered.
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            mssql_tds::test_client_support::col_metadata_empty(),
+            mssql_tds::test_client_support::done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        let rc = finish_get_data(stmt_handle, h.stmt, stmt_state, 1, SQL_ERROR);
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 }
