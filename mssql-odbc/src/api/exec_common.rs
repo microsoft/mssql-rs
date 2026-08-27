@@ -567,6 +567,10 @@ pub(super) fn finish_execute(
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
+        stmt_state.result_set_exhausted = false;
+        stmt_state.batch_exhausted = false;
+        stmt_state.pending_fetch_error = None;
+        stmt_state.pending_fetch_info.clear();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
