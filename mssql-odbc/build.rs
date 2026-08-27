@@ -6,12 +6,12 @@ fn main() {
 
     match target_os.as_str() {
         "linux" => {
-            // Embed soname: libmssqlodbc.so
-            println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libmssqlodbc.so");
+            // Embed soname: mssql-odbc.so
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,mssql-odbc.so");
         }
         "macos" => {
-            // Embed install name: libmssqlodbc.dylib
-            println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,libmssqlodbc.dylib");
+            // Embed install name: mssql-odbc.dylib
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,mssql-odbc.dylib");
         }
         _ => {}
     }

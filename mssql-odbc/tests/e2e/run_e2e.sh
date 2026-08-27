@@ -17,7 +17,7 @@
 #
 # --skip-build reuses a driver and CMake `build/` produced earlier by
 # build_e2e.sh (no cargo/cmake needed — only the unixODBC runtime). Combine
-# with --driver=PATH to point at the prebuilt libmssqlodbc.so. This is how
+# with --driver=PATH to point at the prebuilt mssql-odbc.so. This is how
 # CI runs prebuilt binaries across distro containers.
 #
 # --retries=N reruns each failing test up to N extra times (ctest
@@ -182,7 +182,7 @@ trap cleanup EXIT
 # `cargo llvm-cov show-env` exports RUSTFLAGS (-C instrument-coverage), the
 # llvm-cov target dir and an LLVM_PROFILE_FILE pattern (with %p/%m so distinct
 # gtest processes and ctest retries never clobber each other's .profraw). The
-# subsequent `cargo build` then produces an instrumented libmssqlodbc.so, and
+# subsequent `cargo build` then produces an instrumented mssql-odbc.so, and
 # every ctest child process inherits LLVM_PROFILE_FILE from this environment.
 setup_coverage_env() {
     echo "=== Enabling coverage instrumentation for the Rust driver ==="
@@ -210,12 +210,12 @@ setup_tracing() {
 # Step 2: Build the Rust driver and resolve its shared library path
 # ----------------------------------------------------------------------------
 build_rust_driver() {
-    # Resolve the driver's shared-library filename for this platform.
+    # Resolve the shipped shared-library filename for this platform.
     local libname
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        libname="libmssqlodbc.dylib"
+        libname="mssql-odbc.dylib"
     else
-        libname="libmssqlodbc.so"
+        libname="mssql-odbc.so"
     fi
 
     # Prebuilt mode: an explicit --driver=PATH wins; otherwise --skip-build
@@ -240,6 +240,7 @@ build_rust_driver() {
                 cargo build
             fi
         )
+        RUST_DRIVER_PATH="$(bash "$ODBC_CRATE_DIR/scripts/finalize-artifact.sh" "$BUILD_TYPE")"
     else
         echo "=== Skipping driver build (--skip-build) ==="
         # build_e2e.sh stages the driver inside the build tree, so prefer that
@@ -249,19 +250,12 @@ build_rust_driver() {
             echo "Using staged driver: $RUST_DRIVER_PATH"
             return
         fi
+        local target_dir
+        target_dir="$(cd "$ODBC_CRATE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
+            || echo "$ODBC_CRATE_DIR/target")"
+        RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/$libname"
     fi
-
-    # Cargo builds into the workspace root's target/ directory, which may
-    # differ from the crate-local directory. Use `cargo metadata` to resolve it.
-    # Under coverage, `cargo llvm-cov show-env` may redirect the build via
-    # CARGO_TARGET_DIR; `cargo metadata` honors that env var, so target_directory
-    # always points at wherever the instrumented .so actually lands.
-    local target_dir
-    target_dir="$(cd "$ODBC_CRATE_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
-        | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
-        || echo "$ODBC_CRATE_DIR/target")"
-
-    RUST_DRIVER_PATH="$target_dir/$BUILD_TYPE/$libname"
 
     if [ ! -f "$RUST_DRIVER_PATH" ]; then
         echo "Error: Rust driver not found at $RUST_DRIVER_PATH" >&2

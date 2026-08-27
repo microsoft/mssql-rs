@@ -432,7 +432,7 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
 # distinct gtest processes and ctest retries never clobber each other's .profraw).
 # PowerShell has no `eval`, so parse each KEY=VALUE line (stripping surrounding
 # quotes) into the process env. The subsequent `cargo build` then produces an
-# instrumented mssqlodbc.dll, and every ctest child process inherits
+# instrumented mssql-odbc.dll, and every ctest child process inherits
 # LLVM_PROFILE_FILE from this environment. The llvm-cov target dir is also
 # exported so the later `cargo metadata` resolves the INSTRUMENTED DLL.
 function Enable-CoverageInstrumentation {
@@ -604,23 +604,7 @@ try {
         Pop-Location
     }
 
-    # Cargo builds into the workspace root's target/ by default, but honors
-    # CARGO_TARGET_DIR (set by CI). Resolve via `cargo metadata` so the driver is
-    # found regardless of where it landed.
-    $TargetDir = $null
-    Push-Location $OdbcCrateDir
-    try {
-        $meta = cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json
-        if ($meta -and $meta.target_directory) { $TargetDir = $meta.target_directory }
-    } catch { }
-    Pop-Location
-    if (-not $TargetDir) { $TargetDir = Join-Path $WorkspaceDir "target" }
-
-    $DriverPath = Join-Path $TargetDir "$BuildType\mssqlodbc.dll"
-    if (-not (Test-Path $DriverPath)) {
-        Write-Error "Driver not found at $DriverPath"
-    }
-    $DriverPath = (Resolve-Path $DriverPath).Path
+    $DriverPath = & (Join-Path $OdbcCrateDir "scripts\finalize-artifact.ps1") -Profile $BuildType
     Write-Host "Rust driver: $DriverPath"
 
     if ($Coverage) {

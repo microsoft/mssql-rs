@@ -5,7 +5,7 @@ built on top of [mssql-tds](../mssql-tds).
 
 ## What it does
 
-Produces a shared library (`libmssqlodbc.so` / `libmssqlodbc.dylib` / `mssqlodbc.dll`) that implements
+Ships a shared library (`mssql-odbc.so` / `mssql-odbc.dylib` / `mssql-odbc.dll`) that implements
 the ODBC C API. The ODBC Driver Manager (`unixODBC` on Linux/macOS, `odbc32` on Windows)
 loads it via `dlopen` — applications use standard ODBC calls without knowing the driver
 is written in Rust.
@@ -13,21 +13,28 @@ is written in Rust.
 ## Build
 
 ```bash
-cargo build              # debug build
-cargo build --release    # release build
+cargo build
+bash scripts/finalize-artifact.sh debug
+
+cargo build --release
+bash scripts/finalize-artifact.sh release
 ```
+
+On Windows, run `scripts/finalize-artifact.ps1` with `-Profile debug` or
+`-Profile release` after the corresponding Cargo build. Cargo uses the internal
+target name `mssqlodbc`; the finalization scripts create the shipped artifact.
 
 Output location: `target/{debug,release}/` with a platform-specific filename:
 
 | Platform | Output file |
 |---|---|
-| Linux | `libmssqlodbc.so` |
-| macOS | `libmssqlodbc.dylib` |
-| Windows | `mssqlodbc.dll` |
+| Linux | `mssql-odbc.so` |
+| macOS | `mssql-odbc.dylib` |
+| Windows | `mssql-odbc.dll` |
 
 The `build.rs` script embeds platform-specific metadata:
-- **Linux:** `soname` → `libmssqlodbc.so`
-- **macOS:** `install_name` → `libmssqlodbc.dylib`
+- **Linux:** `soname` → `mssql-odbc.so`
+- **macOS:** `install_name` → `mssql-odbc.dylib`
 - **Windows:** no extra linker args needed
 
 ## Testing
@@ -84,7 +91,7 @@ Application
     ↓ ODBC C API (SQLAllocHandle, SQLDriverConnect, ...)
 Driver Manager (unixODBC / odbc32)
     ↓ dlopen / LoadLibrary
-libmssqlodbc.so (this crate)
+mssql-odbc.so (this crate)
     ↓
 mssql-tds (TDS protocol)
     ↓

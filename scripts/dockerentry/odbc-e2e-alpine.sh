@@ -7,7 +7,7 @@
 # prebuilt musl driver + ctest binaries (no compiler, no cargo): bash (run_e2e.sh
 # is a bash script), ctest (from cmake), the unixODBC driver manager runtime,
 # libssl, libstdc++/libgcc, and the Kerberos runtime the driver may link. The
-# prebuilt build/ tree (with libmssqlodbc.so staged inside) is restored to
+# prebuilt build/ tree (with mssql-odbc.so staged inside) is restored to
 # mssql-odbc/tests/e2e/build by the calling template.
 #
 # Connection details arrive via ODBC_TEST_* env vars; ODBC_E2E_RETRIES controls

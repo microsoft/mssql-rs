@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Build the mssql-odbc driver (libmssqlodbc.so) and the C++ gtest e2e binaries
+# Build the mssql-odbc driver (mssql-odbc.so) and the C++ gtest e2e binaries
 # inside the Alpine (musl) build container, then stage them into a drop
 # directory that the surrounding pipeline job publishes as an artifact. Later
 # musl test stages download the drop and rerun the prebuilt binaries via

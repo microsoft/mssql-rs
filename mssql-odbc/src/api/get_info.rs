@@ -270,17 +270,17 @@ fn write_wide_str(
 
 #[cfg(target_os = "windows")]
 fn driver_name() -> &'static str {
-    "mssqlodbc.dll"
+    "mssql-odbc.dll"
 }
 
 #[cfg(target_os = "linux")]
 fn driver_name() -> &'static str {
-    "libmssqlodbc.so"
+    "mssql-odbc.so"
 }
 
 #[cfg(target_os = "macos")]
 fn driver_name() -> &'static str {
-    "libmssqlodbc.dylib"
+    "mssql-odbc.dylib"
 }
 
 #[cfg(test)]
