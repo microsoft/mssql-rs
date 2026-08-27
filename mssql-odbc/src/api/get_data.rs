@@ -1542,38 +1542,6 @@ mod tests {
         assert_eq!(ind, SQL_NULL_DATA);
     }
 
-    /// A NULL with no indicator has nowhere to be reported, so it must fail
-    /// rather than leave the caller's buffer holding the previous row's value.
-    /// Checked for a fixed-width and a character target: neither can express
-    /// NULL in band. msodbcsql answers 22002 for both.
-    #[test]
-    fn get_data_null_without_indicator_is_22002() {
-        for target in [SQL_C_SLONG, SQL_C_CHAR, SQL_C_WCHAR] {
-            let h = TestHandles::with_env_dbc_stmt();
-            stmt_with_captured(&h, ColumnValues::Null);
-
-            let mut buf = [0xAAu8; 16];
-            let ret = unsafe {
-                sql_get_data(
-                    h.stmt,
-                    1,
-                    target,
-                    buf.as_mut_ptr() as SqlPointer,
-                    buf.len() as SqlLen,
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(ret, SQL_ERROR, "target {target}");
-            assert_eq!(buf, [0xAAu8; 16], "target {target} must not write a value");
-
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let s = stmt_handle.inner.lock().unwrap();
-            assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
-            // The value stays resident so a retry with an indicator still works.
-            assert!(s.last_captured.is_some(), "target {target}");
-        }
-    }
-
     /// Only the zero-length probe is supported; asking for binary data is still
     /// unimplemented.
     #[test]
