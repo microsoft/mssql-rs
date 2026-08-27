@@ -183,6 +183,33 @@ TEST_F(ExecDirectLiveTest, InfoMessagesSurfaceAsDiagnostics) {
     EXPECT_EQ(SQL_NO_DATA, rc);
 }
 
+// AB#47535: a PRINT reached only after variable assignments must still surface
+// its message on SQLExecDirect itself. The assignments carry a SQLSELECT-tagged
+// DONE_COUNT; when those were treated as update counts the batch stopped on the
+// assignment and SQLExecDirect returned plain SQL_SUCCESS, so callers that only
+// read diagnostics on SQL_SUCCESS_WITH_INFO (mssql-python's cursor.messages)
+// saw nothing at all.
+TEST_F(ExecDirectLiveTest, PrintAfterAssignmentsSurfacesOnExecute) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "DECLARE @msg VARCHAR(MAX);"
+        " SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047);"
+        " PRINT @msg;");
+
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+
+    SQLINTEGER native = 0;
+    std::string message = GetDiagMessageForRecord(stmt_, 1, &native);
+    EXPECT_EQ(0, native);
+    EXPECT_NE(std::string::npos, message.find("aaaaaaaaaa"));
+
+    // The assignments produced no navigable result of their own.
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
 TEST_F(ExecDirectLiveTest, FetchOnFreshStatementReturnsHy010) {
     SQLRETURN rc = SQLFetch(stmt_);
     EXPECT_EQ(SQL_ERROR, rc);
