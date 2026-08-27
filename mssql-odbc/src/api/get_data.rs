@@ -273,6 +273,14 @@ fn write_captured_column(
     };
 
     if matches!(value, ColumnValues::Null) {
+        // No indicator means nowhere to report the NULL, and no target type can
+        // express it in band — an empty string is a value. Refuse rather than
+        // leave the caller's buffer reading back as the previous row. The value
+        // stays resident so a retry with an indicator still works.
+        if strlen_or_ind_ptr.is_null() {
+            post_diag(stmt_state, ERR_INDICATOR_REQUIRED);
+            return SQL_ERROR;
+        }
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         // Only character targets get a terminator; a fixed-width target's
         // buffer is left untouched on NULL.
@@ -1529,6 +1537,38 @@ mod tests {
             unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, SQL_NULL_DATA);
+    }
+
+    /// A NULL with no indicator has nowhere to be reported, so it must fail
+    /// rather than leave the caller's buffer holding the previous row's value.
+    /// Checked for a fixed-width and a character target: neither can express
+    /// NULL in band. msodbcsql answers 22002 for both.
+    #[test]
+    fn get_data_null_without_indicator_is_22002() {
+        for target in [SQL_C_SLONG, SQL_C_CHAR, SQL_C_WCHAR] {
+            let h = TestHandles::with_env_dbc_stmt();
+            stmt_with_captured(&h, ColumnValues::Null);
+
+            let mut buf = [0xAAu8; 16];
+            let ret = unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    target,
+                    buf.as_mut_ptr() as SqlPointer,
+                    buf.len() as SqlLen,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "target {target}");
+            assert_eq!(buf, [0xAAu8; 16], "target {target} must not write a value");
+
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt_handle.inner.lock().unwrap();
+            assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
+            // The value stays resident so a retry with an indicator still works.
+            assert!(s.last_captured.is_some(), "target {target}");
+        }
     }
 
     /// Only the zero-length probe is supported; asking for binary data is still

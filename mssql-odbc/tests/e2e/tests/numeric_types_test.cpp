@@ -275,3 +275,47 @@ TEST_F(NumericTypesLiveTest, NegativeDecimalToCharViaGetData) {
     EXPECT_STREQ("-.0001", buf);
     SQLCloseCursor(stmt_);
 }
+
+// ---------------------------------------------------------------------------
+// NULL with no indicator. A fixed-width target has no in-band way to say NULL,
+// so with nowhere to report it the only safe answer is to refuse — otherwise
+// the caller's buffer reads back as whatever it happened to hold before.
+// ---------------------------------------------------------------------------
+
+TEST_F(NumericTypesLiveTest, NullWithNoIndicatorViaGetDataIs22002) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER v = 7;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_SLONG, &v, sizeof(v), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22002");
+    EXPECT_EQ(7, v) << "the stale value stays visible rather than passing as data";
+    SQLCloseCursor(stmt_);
+}
+
+// The bound path already refuses; pinning both together keeps them from
+// drifting apart again.
+TEST_F(NumericTypesLiveTest, NullWithNoIndicatorViaBoundFetchIs22002) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER v = 7;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &v, sizeof(v), nullptr), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22002");
+    EXPECT_EQ(7, v) << "the stale value stays visible rather than passing as data";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// A character target cannot express NULL in band either — an empty string is a
+// value — so the refusal is not specific to fixed-width targets.
+TEST_F(NumericTypesLiveTest, NullWithNoIndicatorCharTargetIs22002) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS VARCHAR(10)) AS c1"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    char buf[16] = "stale";
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), nullptr));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22002");
+    SQLCloseCursor(stmt_);
+}
