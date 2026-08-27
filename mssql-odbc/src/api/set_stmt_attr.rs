@@ -1413,8 +1413,13 @@ mod tests {
     #[test]
     fn param_bind_offset_accepts_a_misaligned_application_pointer() {
         let mut attrs = InertStmtAttrs::default();
-        let mut storage = [0u8; size_of::<SqlLen>() + 1];
-        let slot = unsafe { storage.as_mut_ptr().add(1).cast::<SqlLen>() };
+        let mut storage: [SqlLen; 2] = [0; 2];
+        let slot = unsafe { storage.as_mut_ptr().cast::<u8>().add(1).cast::<SqlLen>() };
+        assert_ne!(
+            slot as usize % std::mem::align_of::<SqlLen>(),
+            0,
+            "test pointer must be misaligned"
+        );
         unsafe { slot.write_unaligned(24) };
         attrs.set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, slot as SqlULen);
 

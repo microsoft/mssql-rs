@@ -809,8 +809,19 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut value = [0u8; 8];
-        let mut indicator_storage = [0u8; size_of::<SqlLen>() + 1];
-        let shifted_indicator = unsafe { indicator_storage.as_mut_ptr().add(1).cast::<SqlLen>() };
+        let mut indicator_storage: [SqlLen; 2] = [0; 2];
+        let shifted_indicator = unsafe {
+            indicator_storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(1)
+                .cast::<SqlLen>()
+        };
+        assert_ne!(
+            shifted_indicator as usize % std::mem::align_of::<SqlLen>(),
+            0,
+            "test pointer must be misaligned"
+        );
         unsafe { shifted_indicator.write_unaligned(SQL_DATA_AT_EXEC) };
         let mut offset: SqlLen = 1;
 
@@ -826,7 +837,7 @@ mod tests {
             decimal_digits: 0,
             parameter_value_ptr: value.as_mut_ptr().cast(),
             buffer_length: value.len() as SqlLen,
-            strlen_or_ind_ptr: indicator_storage.as_mut_ptr().cast(),
+            strlen_or_ind_ptr: indicator_storage.as_mut_ptr(),
         }));
 
         let built = unsafe { build_named_params(&mut state, 1, "test") }
