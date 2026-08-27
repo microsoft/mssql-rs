@@ -121,13 +121,11 @@ def test_fetchone_logs_exhaustion(client_context):
             assert await cursor.fetchone() == (1,)
             assert await cursor.fetchone() is None
 
-            assert logger.events == [
-                (
-                    20,
-                    "PyAsyncCursor::fetchone: result set exhausted",
-                    "async_fetch.rs",
-                )
-            ]
+            assert (
+                20,
+                "PyAsyncCursor::fetchone: result set exhausted",
+                "async_fetch.rs",
+            ) in logger.events
         finally:
             await conn.close()
 

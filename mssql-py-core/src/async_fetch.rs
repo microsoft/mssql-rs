@@ -178,13 +178,14 @@ pub(crate) fn fetchone<'py>(
 
         match result {
             Ok(writer) => {
-                fetch_guard.complete(writer.is_some(), has_open_batch);
-                fetch_state.set(if writer.is_some() {
+                let has_row = writer.is_some();
+                fetch_state.set(if has_row {
                     FetchStatus::Ready
                 } else {
                     FetchStatus::Exhausted
                 });
-                if writer.is_none() {
+                fetch_guard.complete(has_row, has_open_batch);
+                if !has_row {
                     tracing::info!("PyAsyncCursor::fetchone: result set exhausted");
                 }
                 Python::attach(|py| match writer {
