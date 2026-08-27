@@ -26,7 +26,7 @@ These apply to **every** phase. Do not defer them to the user.
 |---|---|
 | D1 | New crate `mssql-sqlcmd` inside the `mssql-rs` cargo workspace (sibling of `mssql-tds-cli`). Binary name `sqlcmd`. |
 | D2 | **ODBC sqlcmd behavior is the default.** Go-sqlcmd divergences are opt-in via a compat switch (`--compat go` / `SQLCMDCOMPAT=go`). |
-| D3 | ~~v1 scope = ODBC sqlcmd feature set only.~~ **Superseded twice.** The go-sqlcmd legacy-CLI features are implemented (Phase 11), the modern subcommand CLI and container lifecycle are implemented (Phase 13), and so is `SQLCMDCOLORSCHEME` (11.8). What remains deliberately unimplemented is `--server-name` (11.7) and `open ads` (13.5) — both refused with a message rather than accepted and ignored. |
+| D3 | ~~v1 scope = ODBC sqlcmd feature set only.~~ **Superseded.** Both reference feature sets are implemented: the go-sqlcmd legacy CLI (Phase 11), the modern subcommand CLI and container lifecycle (Phase 13), `SQLCMDCOLORSCHEME` (11.8), `--server-name` (11.7), `open ads` (13.5), `SQLCMDINI` (2.6), and the full set of Entra methods (8.3). What remains is verification against a live Entra server, not implementation. |
 | D4 | Where a flag exists under two names, **accept both** (ODBC short form + Go long form), ODBC semantics win. |
 | D5 | Verification = **differential golden-file testing** against the installed ODBC `sqlcmd.exe` (v17.0.4055.3) on this machine. No hand-authored expected output where a diff is possible. |
 | D6 | `mssql-tds` may be modified. Every driver-side change goes in its **own commit** (and its own PR per repo `pr-workflow.instructions.md`). |
@@ -170,9 +170,14 @@ SQLCMDLOGINTIMEOUT = "8"
   `SQLCMDSERVER`, `SQLCMDUSER`, `SQLCMDWORKSTATION`. Everything else in the built-in table is
   writable, including `SQLCMDLOGINTIMEOUT` and `SQLCMDERRORLEVEL`, which the plan had assumed
   were protected. `MSG_RDONLY_VAR` goes to **stderr**.
-2.5 `[x]` Precedence: `:setvar` > `-v` > env var > built-in default. `-X` skips env seeding.
-2.6 `[!]` `SQLCMDINI` startup script — not implemented. The variable exists and is reported, but
-  no script is run. Deferred with `:ed` and `:perftrace`.
+2.5 `[x]` Precedence: `:setvar` > `-v` > env var > built-in default. `-X` skips env seeding
+  under go-sqlcmd only; ODBC seeds regardless.
+2.6 `[x]` `SQLCMDINI` startup script — runs before any user input, after connecting and before
+  `-q`/`-Q`/`-i`. Two behaviours had to be measured rather than assumed: a script that cannot be
+  opened reports `The environment variable: 'SQLCMDINI' has invalid value: '...'`, and `-X`
+  suppresses it only under go-sqlcmd. ODBC still seeds `SQLCMD*` from the environment under `-X`
+  — confirmed with `:listvar` against both references — so the variable survives and the script
+  still runs. `:ed` and `:perftrace` remain deferred.
 2.7 `[x]` `-x` disables `$(var)` substitution globally.
 
 **Verify:** differential cases for `-v`, `:setvar` then use, substitution inside a literal,
@@ -328,11 +333,15 @@ an unknown colon word, `:exit` in all three forms, `:quit`, and `:on error exit`
 
 ## Phase 7 — Console, I/O, exit codes  `[~]`
 
-7.1 `[!]` **O1 still open.** A numbered prompt (`1> `, `2> `) is written when stdin is a terminal,
-  but this has not been compared against the reference, which cannot be driven through the
-  differential harness because the harness always pipes stdin.
-7.2 `[!]` `rustyline` is a dependency but is not wired up — input is read with `read_line`, so
-  there is no history or line editing. Prompts are already suppressed for piped stdin.
+7.1 `[x]` The numbered prompt (`1> `, `2> `) is written when stdin is a terminal, and matches
+  go-sqlcmd's through a PTY capture — plain text, no escape sequences. This needed a PTY because
+  the differential harness always pipes stdin.
+7.2 `[!]` No line editing or history at the interactive prompt. `rustyline` was wired up and
+  then backed out: it owns the line it edits and redraws it, while the results stream is written
+  independently, so the redraw erased output already on screen — captured through a PTY, the `a`
+  column heading came back blank where both references show it. Fixing that properly means
+  routing every write through the editor's external printer. The dependency was dropped rather
+  than left unused.
 7.3 `[x]` Ctrl+C cancels the running query via `CancelHandle` and prints `MSG_USER_TERMINATED`;
   the connection survives and the prompt returns.
 7.4 `[x]` `-i` multi-file sequencing, `-o`, `-u`, `-e`.
@@ -342,15 +351,21 @@ an unknown colon word, `:exit` in all three forms, `:quit`, and `:on error exit`
   - **`-e` correction:** echo covers the **statement text only**. The terminator line is not
     echoed; instead a blank line follows the statement, which is what the reference emits.
 7.5 `[x]` `-f` is parsed (`-f cp`, `-f i:cp`, `-f o:cp`, `-f i:cp,o:cp`); the input side decodes
-  `-i` and `:r` files, the output side encodes the results stream. Only the common Windows and
-  ISO code pages plus `65001` are mapped; an unmapped number falls back to UTF-8 rather than
-  erroring, which is a deviation worth revisiting.
+  `-i` and `:r` files, the output side encodes the results stream. A code page with no encoding
+  behind it is **refused**, with the reference's own wording — falling back to UTF-8 would write
+  bytes the caller did not ask for and leave them no way to tell. go-sqlcmd has no `-f` at all.
 7.6 `[x]` `-r0` routes errors to stderr, `-r1` errors and informational messages. Absent, both go
   to the results stream. Note sqlcmd's **own** diagnostics always go to stderr regardless.
 7.7 `[x]` Exit codes. `:exit(query)` returns the **full signed value**, not a byte: the reference
   returns `-101` for a query with no rows and `-102` for a non-numeric first cell, so the process
   must exit via `std::process::exit` rather than `ExitCode`, which only accepts a `u8`.
-  `-V n` yields the severity itself. `127` for msgstate 127 is not implemented.
+  `-V n` yields the severity itself.
+
+  **Message state 127** ends the session whatever the severity, and outranks `-b` and `-V`. The
+  exit code is the *message number*: `RAISERROR(14599, 16, 127)` exits 14599, an ad-hoc
+  `RAISERROR('boom', 16, 127)` exits 50000. Unix statuses are 8 bits and the two tools disagree
+  about that — go-sqlcmd lets the OS truncate (50000 becomes 80, 14599 becomes 7) while msodbcsql
+  clamps to 1. All four combinations were measured. The rest of the batch is discarded.
 7.8 `[x]` `-q` runs then continues; `-Q` runs and exits.
 
 **Verify:** differential cases for `-e`, stdin input, two `-i` files, a missing `-i` file, `-o`,
@@ -368,9 +383,15 @@ paths are wired but unverified, for want of a server to verify them against.
   Windows). Exercised by every connecting case on Linux.
 8.2 `[x]` `-E` integrated — the default when no `-U` is given, and what every connecting
   differential case on Windows uses.
-8.3 `[~]` `-G` dispatch is implemented as the plan describes, but `-G -P <tokenfile>` maps to
-  `AccessToken` **without reading the file**, so that path cannot work yet. Unverified: no Entra
-  server was available. `--authentication-method` names a method outright — see Phase 11.
+8.3 `[x]` `-G` dispatch, and `--authentication-method` naming a method outright. Every federated
+  method now has a token factory registered on the client context — without one the connection
+  reaches the FedAuth handshake with nothing to send and fails at login, which is what happened
+  before. Covered: default, integrated, password, interactive, managed identity (and the `MSI`
+  alias), service principal (and the `Application` alias), device code, workload identity, Azure
+  CLI, Azure Developer CLI, Azure Pipelines, environment, and client assertion. Most map onto an
+  `azure_identity` credential; password and device code go to the token endpoint directly,
+  because the Rust SDK has no equivalent. Unverified against a live Entra server — there was none
+  to test against — so this is the main remaining risk.
 8.4 `[~]` `-z`/`-Z` set `new_password` on the context and `-Z` exits after connecting. Untested —
   deliberately not run against the shared account.
 8.5 `[x]` `-A`, and the `admin:` prefix on `-S`, both request a dedicated admin connection.
@@ -447,11 +468,11 @@ rejects the flags outright. They are covered instead by golden assertions in
   `...AzureDeveloperCli`) are therefore rejected rather than mapped to something approximate.
 11.6 `[x]` `--driver-logging-level` and `--trace-file`. Levels 1–5 map onto error/warn/info/debug/
   trace; 0 disables. Diagnostics go to the trace file only, never into the results stream.
-11.7 `[!]` `--server-name` — **refused with a clear message rather than accepted and ignored.**
-  Dialling one address while presenting another at login needs `mssql-tds` to carry a separate
-  login name through LOGIN7, and that name is written in three places whose lengths must agree,
-  so it is a real driver change rather than a flag mapping. Accepting it silently would connect
-  with an identity the caller did not ask for.
+11.7 `[x]` `--server-name` — dialling one address while presenting another at login. Rests on
+  `ClientContext::login_server_name`, added to `mssql-tds`: LOGIN7 stores ServerName as an
+  offset/length pair separate from its payload, so both are read from one accessor. Verified by
+  reading the name back off a mock server, with overrides both longer and shorter than the
+  address dialled.
 11.8 `[x]` `SQLCMDCOLORSCHEME` — 24-bit ANSI colouring of results, messages and `PRINT`.
   All 74 chroma v2.27.0 styles are carried in `fmt/schemes.rs`, generated by
   `scripts/extract-styles.ps1` from the chroma XML. `:list color` names them. Verified through a
@@ -556,8 +577,12 @@ is untouched.
 13.4 `[x]` `create` / `start` / `stop` / `delete` — the container lifecycle, driving `docker` or
   `podman` through its CLI. Verified end to end: create pulls the image, waits for SQL Server to
   log itself ready, writes the context; `query` then connects and returns `@@VERSION`.
-13.5 `[!]` `open ads` — **refused with a message.** It launches an external application, which
-  this port does not do.
+13.5 `[x]` `open ads` — opens the current context in Azure Data Studio. The reference only
+  implements Windows: its macOS build writes no password (Azure Data Studio reads UTF-16 from the
+  Keychain, the Go library writes UTF-8) and its Linux build panics in `searchLocations`. This
+  launches on all three, and hands the password to the credential store only on Windows, where
+  that can be done correctly. Elsewhere Azure Data Studio prompts — better than storing something
+  it cannot decode.
 13.6 `[x]` `create mssql get-tags` — lists the image tags from the registry. Pages through the
   `Link` headers of `/v2/mssql/server/tags/list`; the 274 tags match the reference exactly.
   `reqwest` was already in the dependency tree via `mssql-tds`, so nothing new is linked.
@@ -599,16 +624,16 @@ needs a password that cannot be derived from the time it was created.
 
 | harness | Windows | Linux |
 |---|---|---|
-| ODBC `sqlcmd` (`tests/diff.rs`) | 116 passed, 0 failed, 1 skipped | 111 passed, 0 failed, 6 skipped |
-| go-sqlcmd legacy CLI (`tests/go_diff.rs`) | 62 passed, 0 failed | 62 passed, 0 failed |
+| ODBC `sqlcmd` (`tests/diff.rs`) | 121 passed, 0 failed, 1 skipped | 116 passed, 0 failed, 6 skipped |
+| go-sqlcmd legacy CLI (`tests/go_diff.rs`) | 64 passed, 0 failed | 64 passed, 0 failed |
 | go-sqlcmd subcommand CLI (`tests/modern_diff.rs`) | 49 passed, 0 failed, 4 skipped | 49 passed, 0 failed, 4 skipped |
 | …with `SQLCMD_DIFF_CONTAINERS=1` | 53 passed, 0 failed, 0 skipped | — |
 | `SQLCMDCOLORSCHEME` through a PTY | — | 35 matched, 0 differ |
 
   Plus the golden assertions in `tests/go_features.rs`. Every skip is recorded in the case files
   with its reason; the Linux skips are Windows-only surface (named pipes, the registry DSN path).
-10.2 `[x]` `cargo bfmt`, `cargo bclippy` and `cargo btest` all clean: **208 tests pass** on
-  Windows, 192 on Linux (the difference is `#[cfg(windows)]` cases). `cargo-llvm-cov` is
+10.2 `[x]` `cargo bfmt`, `cargo bclippy` and `cargo btest` all clean: **231 tests pass** on
+  Windows, 212 on Linux (the difference is `#[cfg(windows)]` cases). `cargo-llvm-cov` is
   installed, so `cargo btest` runs as the repo intends.
 10.3 `[x]` Self-review pass. Found and fixed: a `last_error_number` field written but never read;
   `-f`'s input code page stored but never applied; redundant first-cell bookkeeping in the result

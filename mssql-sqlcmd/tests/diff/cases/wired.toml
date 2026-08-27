@@ -36,6 +36,32 @@ name = "severity threshold above the error leaves the exit code alone"
 connect = true
 args = ["-C", "-V", "17", "-Q", "RAISERROR('boom', 16, 1)"]
 
+# State 127 ends the session whatever the severity, and outranks -b and -V.
+[[case]]
+name = "message state 127 ends the session"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 16, 127)"]
+
+[[case]]
+name = "message state 127 ends it even below the error level"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 11, 127)"]
+
+[[case]]
+name = "message state 127 abandons the rest of the batch"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 16, 127) SELECT 1 AS after"]
+
+[[case]]
+name = "message state 127 outranks a severity threshold"
+connect = true
+args = ["-C", "-V", "17", "-Q", "RAISERROR('boom', 16, 127)"]
+
+[[case]]
+name = "an ordinary state leaves the session running"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 16, 1) SELECT 1 AS after"]
+
 [[case]]
 name = "a recursive include is refused"
 connect = true

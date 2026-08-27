@@ -44,6 +44,9 @@ pub struct Session {
     on_error: OnError,
     /// Highest severity seen, for the `-V` exit-code threshold.
     highest_severity: i32,
+    /// The number of the first message with state 127, which ends the session
+    /// and supplies the exit code.
+    terminating_message: Option<u32>,
     exit_code: i32,
     /// `:r` ancestry, so a file cannot include itself.
     including: Vec<String>,
@@ -115,6 +118,7 @@ impl Session {
             // results stream unless `-r` moves them here.
             errors: Sink::stderr(),
             highest_severity: 0,
+            terminating_message: None,
             exit_code: exitcode::SUCCESS,
             including: Vec::new(),
             xml_mode: false,
@@ -227,6 +231,12 @@ impl Session {
         if self.exit_code != exitcode::SUCCESS {
             return self.exit_code;
         }
+        // A message with state 127 ends the session whatever its severity and
+        // whatever `-b` says, so it outranks the `-V` and `-b` rules below.
+        // The exit code is the message's own number.
+        if let Some(number) = self.terminating_message {
+            return exitcode::terminating(number, self.options.compat.is_go());
+        }
         // `-V n` turns a message at or above severity n into an exit code that
         // *is* that severity, rather than a plain failure.
         if self.options.severity_level > 0
@@ -282,63 +292,25 @@ impl Session {
 
     /// Reads from stdin, prompting when a terminal is attached.
     ///
-    /// On a terminal this goes through `rustyline`, which brings line editing
-    /// and history. Piped input takes the plain path instead: an editor on a
-    /// non-terminal would strip the very bytes the batch parser needs, and the
-    /// differential harnesses all pipe.
+    /// A line editor was tried here and backed out. `rustyline` owns the line
+    /// it is editing and redraws it, but the results stream is written
+    /// independently, so the redraw erased output that had already been
+    /// printed: captured through a PTY, the `a` column heading came back blank
+    /// where both references show it. Coordinating the two would mean routing
+    /// every write through the editor's external printer, which is a larger
+    /// change than the history and line editing are worth. The prompt is
+    /// therefore plain text, exactly as the references emit it.
     async fn interactive(&mut self) -> Stop {
-        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            self.interactive_editor().await
-        } else {
-            self.interactive_piped().await
-        }
-    }
-
-    /// The line-edited path: history, recall and editing at the `1>` prompt.
-    async fn interactive_editor(&mut self) -> Stop {
-        let mut editor = match rustyline::DefaultEditor::new() {
-            Ok(editor) => editor,
-            // No terminal to drive after all; fall back rather than fail.
-            Err(_) => return Box::pin(self.interactive_piped()).await,
-        };
-
-        loop {
-            // The results stream may be redirected, so the prompt goes through
-            // rustyline rather than `prompt()`, which writes to that stream.
-            let prompt = format!("{}> ", self.batch.line_count() + 1);
-            match editor.readline(&prompt) {
-                Ok(line) => {
-                    // Only whole statements are worth recalling; a bare
-                    // continuation line on its own is noise in the history.
-                    if !line.trim().is_empty() {
-                        let _ = editor.add_history_entry(line.as_str());
-                    }
-                    // rustyline hands back the line without its terminator, and
-                    // the batch parser needs one to close the line.
-                    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
-                    if let Some(stop) = Box::pin(self.line(&line, eol)).await {
-                        return stop;
-                    }
-                }
-                // Ctrl+C abandons the half-typed batch, as the reference does,
-                // and leaves the session running.
-                Err(rustyline::error::ReadlineError::Interrupted) => {
-                    self.batch.reset();
-                }
-                // Ctrl+D, or the terminal going away.
-                Err(_) => return Stop::EndOfInput,
-            }
-        }
-    }
-
-    /// The plain path, for piped or redirected input.
-    async fn interactive_piped(&mut self) -> Stop {
         use std::io::BufRead;
 
         let stdin = std::io::stdin();
+        let interactive = std::io::IsTerminal::is_terminal(&stdin);
         let mut line = String::new();
 
         loop {
+            if interactive {
+                self.prompt();
+            }
             line.clear();
             match stdin.lock().read_line(&mut line) {
                 Ok(0) => return Stop::EndOfInput,
@@ -351,6 +323,12 @@ impl Session {
                 return stop;
             }
         }
+    }
+
+    fn prompt(&mut self) {
+        let number = self.batch.line_count() + 1;
+        self.results.write(&format!("{number}> "));
+        self.results.flush();
     }
 
     /// The terminator to record for an input line.
@@ -408,6 +386,14 @@ impl Session {
     }
 
     fn stop_if_failed(&mut self) -> Option<Stop> {
+        // A message with state 127 ends the session whatever its severity, and
+        // whatever `-b` says.
+        if let Some(number) = self.terminating_message {
+            return Some(Stop::Requested(exitcode::terminating(
+                number,
+                self.options.compat.is_go(),
+            )));
+        }
         let failed = self.highest_severity > self.options.error_level as i32;
         if failed && matches!(self.on_error, OnError::Exit) {
             return Some(Stop::Requested(exitcode::FAILURE));
@@ -830,9 +816,23 @@ impl Session {
         let go = self.options.compat.is_go();
 
         for item in outcome.output {
+            // Once a state-127 message has been seen the session is over, so
+            // whatever the batch produced after it is discarded. Both
+            // references drop the trailing result sets this way.
+            if self.terminating_message.is_some() && matches!(item, Output::Result(_)) {
+                continue;
+            }
             match item {
                 Output::Result(text) => self.results.write(&text),
                 Output::Message(message) => {
+                    // State 127 ends the session once this outcome has been
+                    // written out; the message itself is still reported, and
+                    // its number becomes the exit code.
+                    if message.state == exitcode::TERMINATING_STATE
+                        && self.terminating_message.is_none()
+                    {
+                        self.terminating_message = Some(message.number);
+                    }
                     // `-m n` hides anything below severity n. ODBC applies the
                     // threshold as given; go-sqlcmd never hides `PRINT` output
                     // and other severity-10 chatter, whatever `-m` says.

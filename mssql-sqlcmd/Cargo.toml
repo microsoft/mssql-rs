@@ -16,7 +16,6 @@ thiserror = "2.0.17"
 mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
 encoding_rs = "0.8"
-rustyline = "17.0.2"
 # `create mssql get-tags` reads the container registry's tag catalogue. Same
 # version and features as the driver already uses, so nothing new is vendored.
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "form"] }

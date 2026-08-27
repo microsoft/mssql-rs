@@ -105,6 +105,15 @@ args = ["-Q", "PRINT 'before' SELECT 1 AS a PRINT 'after'"]
 name = "severity threshold sets the exit code"
 args = ["-V", "11", "-Q", "RAISERROR('boom', 16, 1)"]
 
+# go-sqlcmd returns 80 after a state-127 message, where ODBC returns 1.
+[[case]]
+name = "message state 127 ends the session"
+args = ["-Q", "RAISERROR('boom', 16, 127)"]
+
+[[case]]
+name = "message state 127 abandons the rest of the batch"
+args = ["-Q", "RAISERROR('boom', 16, 127) SELECT 1 AS after"]
+
 [[case]]
 name = "error level hides lower severities"
 args = ["-m", "17", "-i", "in.sql"]
