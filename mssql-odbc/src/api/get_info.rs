@@ -382,6 +382,15 @@ mod tests {
 
     #[test]
     fn driver_name_writes_wide_string() {
+        #[cfg(target_os = "windows")]
+        let expected = "mssql-odbc.dll";
+        #[cfg(target_os = "linux")]
+        let expected = "mssql-odbc.so";
+        #[cfg(target_os = "macos")]
+        let expected = "mssql-odbc.dylib";
+
+        assert_eq!(driver_name(), expected);
+
         let h = TestHandles::with_env_dbc();
         let mut buf = [0u16; 64];
         let mut len: SqlSmallInt = -1;
@@ -395,7 +404,6 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_SUCCESS);
-        let expected = driver_name();
         assert_eq!(len, (expected.encode_utf16().count() * 2) as SqlSmallInt);
         let n = (len as usize) / 2;
         assert_eq!(String::from_utf16_lossy(&buf[..n]), expected);
