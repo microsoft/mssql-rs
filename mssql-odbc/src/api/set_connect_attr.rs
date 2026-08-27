@@ -98,6 +98,11 @@ pub(crate) unsafe fn sql_set_connect_attr(
 }
 
 #[cfg(not(windows))]
+fn requires_ansi_transcoding(attribute: SqlInteger) -> bool {
+    matches!(attribute, SQL_ATTR_CURRENT_CATALOG)
+}
+
+#[cfg(not(windows))]
 unsafe fn sql_set_connect_attr_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
@@ -105,7 +110,7 @@ unsafe fn sql_set_connect_attr_impl(
     string_length: SqlInteger,
 ) -> SqlReturn {
     if connection_handle.is_null()
-        || attribute != SQL_ATTR_CURRENT_CATALOG
+        || !requires_ansi_transcoding(attribute)
         || value_ptr.is_null()
         || (string_length < 0 && string_length != SqlInteger::from(SQL_NTS))
     {
