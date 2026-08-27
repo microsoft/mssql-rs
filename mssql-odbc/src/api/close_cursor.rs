@@ -233,10 +233,7 @@ pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtStat
     stmt_state.reset_row_stream();
     stmt_state.column_metadata.clear();
     stmt_state.pending_row_counts.clear();
-    stmt_state.result_set_exhausted = false;
-    stmt_state.batch_exhausted = false;
-    stmt_state.pending_fetch_error = None;
-    stmt_state.pending_fetch_info.clear();
+    stmt_state.clear_exhaustion_state();
 }
 
 /// Outcome of draining the TDS stream and releasing the connection on cursor close.

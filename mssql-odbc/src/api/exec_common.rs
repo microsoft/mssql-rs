@@ -529,10 +529,7 @@ pub(super) fn finish_execute(
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
         stmt_state.row_count = client.last_rows_affected();
-        stmt_state.result_set_exhausted = false;
-        stmt_state.batch_exhausted = false;
-        stmt_state.pending_fetch_error = None;
-        stmt_state.pending_fetch_info.clear();
+        stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -567,10 +564,7 @@ pub(super) fn finish_execute(
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
-        stmt_state.result_set_exhausted = false;
-        stmt_state.batch_exhausted = false;
-        stmt_state.pending_fetch_error = None;
-        stmt_state.pending_fetch_info.clear();
+        stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -593,10 +587,7 @@ pub(super) fn finish_execute(
     stmt_state.begin_batch(metadata);
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
-    stmt_state.result_set_exhausted = false;
-    stmt_state.batch_exhausted = false;
-    stmt_state.pending_fetch_error = None;
-    stmt_state.pending_fetch_info.clear();
+    stmt_state.clear_exhaustion_state();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);

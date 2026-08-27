@@ -110,8 +110,10 @@ pub(crate) struct StmtState {
     /// `SQLFetch`/`SQLFetchScroll` can report `SQL_NO_DATA` without needing
     /// the connection (another statement may have claimed it in the
     /// meantime — the answer is already known and needs no more wire access).
-    /// Reset whenever a fresh row-returning result is positioned (a new
-    /// execute, or `SQLMoreResults` landing on the next result set).
+    /// Reset by [`StmtState::clear_exhaustion_state`] whenever a fresh
+    /// execute positions a new result (see also `SQLMoreResults`'s
+    /// `Rows`/`NoRows` arms, which reset it individually while landing on a
+    /// further result within the same batch).
     pub(crate) result_set_exhausted: bool,
     /// Set alongside `result_set_exhausted`, but only when the wire has
     /// confirmed nothing remains anywhere in the batch — i.e. exactly when
@@ -127,7 +129,8 @@ pub(crate) struct StmtState {
     /// `SQLMoreResults` has no busy check of its own (`GetBatchCtxOrRecover`
     /// just falls through to `SQL_NO_DATA_FOUND` once the batch context is
     /// gone) and so is never blocked by a different statement that has since
-    /// claimed the connection. Reset everywhere `result_set_exhausted` is.
+    /// claimed the connection. Reset by [`StmtState::clear_exhaustion_state`]
+    /// alongside `result_set_exhausted`.
     pub(crate) batch_exhausted: bool,
     /// A SQL Server error a read-ahead peek discovered past a row this
     /// statement had already finished delivering to the caller (see
@@ -145,8 +148,9 @@ pub(crate) struct StmtState {
     /// still posts this to the statement's diagnostics but does not fail its
     /// own return, since that return code specifically means "the stream
     /// failed to drain," which a stale diagnostic on an already-closed batch
-    /// does not make true. Cleared wherever `result_set_exhausted` is, since
-    /// both describe facts about the same now-superseded result set.
+    /// does not make true. Cleared by [`StmtState::clear_exhaustion_state`],
+    /// since both it and `result_set_exhausted` describe facts about the
+    /// same now-superseded result set.
     pub(crate) pending_fetch_error: Option<TdsError>,
     /// Server INFO messages a read-ahead peek drained from the client when
     /// `release_busy_if_row_exhausted` released the busy claim on a zero-row
@@ -156,7 +160,8 @@ pub(crate) struct StmtState {
     /// path or a cursor close to surface, exactly as the deferred-error
     /// twin above. Both fast paths release the connection without the
     /// caller re-touching the wire, so nothing else would ever drain them.
-    /// Cleared wherever `batch_exhausted` is.
+    /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
+    /// `batch_exhausted`.
     pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
@@ -738,6 +743,19 @@ impl StmtState {
 
     pub(crate) fn clear_state(&mut self, mask: u32) {
         self.state_flags &= !mask;
+    }
+
+    /// Clears everything AB#47508's read-ahead peek can leave behind, so a
+    /// fresh result set never inherits a previous one's exhaustion state or
+    /// deferred diagnostics. Called from every `finish_execute` terminal
+    /// branch and `close_cursor.rs`'s `reset_cursor_state` — folded into one
+    /// method so the invariant lives in a single place rather than four
+    /// call sites that could each independently drift or be missed.
+    pub(crate) fn clear_exhaustion_state(&mut self) {
+        self.result_set_exhausted = false;
+        self.batch_exhausted = false;
+        self.pending_fetch_error = None;
+        self.pending_fetch_info.clear();
     }
 
     /// Binds, or rebinds, one column. A column can only be bound once, so an
