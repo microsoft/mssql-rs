@@ -122,6 +122,12 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
 ///
 /// unixODBC converts character-valued attributes set before driver selection to
 /// ANSI, then replays them through this symbol when the driver is loaded.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle.
+/// - `attribute` must be a valid connection attribute identifier.
+/// - `value_ptr` validity depends on the attribute type.
+/// - `string_length` is used only for string-type attributes.
 #[cfg(not(windows))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetConnectAttr(
