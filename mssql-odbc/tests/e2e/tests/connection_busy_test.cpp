@@ -9,12 +9,13 @@
 // lets the driver peek one token past the row and discover the batch is
 // done. This suite locks in that same wire-state behavior for mssql-odbc.
 //
-// A and B are two HSTMTs on one HDBC throughout, matching the review's
-// parity table (PR #383 / microsoft/mssql-rs#399 has the full 12-row table;
-// this file covers the six rows whose verdict this PR's fix actually
-// changes — 1, 1b, 2, 3, 4, 4b). None of these need
-// SKIP_IF_COMPARING_MSODBCSQL(): every assertion here also holds for
-// msodbcsql 18, confirmed empirically during review by running this same
+// A and B are two HSTMTs on one HDBC throughout, matching the review's full
+// 12-row parity table (see microsoft/mssql-rs#399 for the table and its
+// history): rows 1, 1b, 2, 3, 4, 4b are the ones whose verdict this PR's fix
+// actually changes; rows 3b, 5, 6, 7, 8, 9 keep their verdict unchanged from
+// `main` and are included for completeness/regression coverage. None of
+// these need SKIP_IF_COMPARING_MSODBCSQL(): every assertion here also holds
+// for msodbcsql 18, confirmed empirically during review by running this same
 // probe shape against both drivers.
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
@@ -195,4 +196,126 @@ TEST_F(ConnectionBusyLiveTest, MoreResultsAfterBoundFetchExhaustionReturnsNoData
     ASSERT_SQL_OK(SQLGetData(b, 1, SQL_C_SLONG, &value_b, sizeof(value_b), nullptr),
                   SQL_HANDLE_STMT, b);
     EXPECT_EQ(20, value_b);
+}
+
+// Row 3b: SQLGetData on the *first* of two rows in a result set must NOT
+// release the connection — the peek finds a second row still pending, so
+// the connection correctly stays busy. Same trigger as row 2, but with a
+// result set that isn't actually exhausted yet: distinguishes "every column
+// of the current row was read" from "the whole result set is done" (only
+// the latter releases). Matches msodbcsql exactly.
+TEST_F(ConnectionBusyLiveTest, GetDataOfFirstRowLeavesConnectionBusyWhenAnotherRowIsStillPending) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 10 UNION ALL SELECT 20"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(10, value);
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"))
+        << "a pending second row in A's result set must keep the connection busy";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+}
+
+// Row 5: a further result set pending in the same batch must keep the
+// connection busy for B, while A's own SQLMoreResults still genuinely
+// advances and reads the next result set. Unaffected by this PR's fix
+// (identical on main and msodbcsql); included for completeness.
+TEST_F(ConnectionBusyLiveTest, PendingSecondResultSetKeepsConnectionBusyAndAdvancesCorrectly) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1; SELECT 2"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, value);
+
+    // A further result set is still pending in the batch — B must see busy.
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 20"));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+
+    // A can still genuinely advance to, and read, its own second result set.
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, value);
+}
+
+// Row 6: binding only a prefix of the row's columns and never reading the
+// rest via SQLGetData is a deliberate scope limit (documented in
+// exec_common.rs / README.md) — peeking early would discard the still
+// legally-retrievable unbound column, so the connection correctly stays
+// busy here. Parity with msodbcsql, not a gap.
+TEST_F(ConnectionBusyLiveTest, PrefixBoundFetchLeavesConnectionBusy) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1 AS c1, 2 AS c2"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER c1 = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &c1, sizeof(c1), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, c1);
+    // c2 is never bound or read via SQLGetData.
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"))
+        << "an unread trailing column must keep the connection busy";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+}
+
+// Row 7: same shape as row 6 (an unread trailing column), but with a large
+// nvarchar(max) column — the SQLGetData PLP/streaming completion path is
+// not wired to the new peek in this PR, so an unread streamed column also
+// keeps the connection busy. Parity with msodbcsql, not a gap.
+TEST_F(ConnectionBusyLiveTest, UnreadTrailingNvarcharMaxColumnLeavesConnectionBusy) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(
+        Run(stmt_, "SELECT 1 AS c1, CAST(REPLICATE('x', 10000) AS nvarchar(max)) AS c2"),
+        SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER c1 = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &c1, sizeof(c1), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, c1);
+    // c2 (nvarchar(max)) is never bound or read via SQLGetData.
+
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"))
+        << "an unread nvarchar(max) column must keep the connection busy";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
+}
+
+// Row 8: a leading PRINT before a zero-row SELECT surfaces its message on
+// the SQLExecDirect call itself — the driver reads past PRINT's INFO/DONE
+// tokens on the way to the SELECT's own COLMETADATA (the first row-bearing
+// stopping point), so the message is already captured by the time that same
+// execute call returns. Unaffected by this PR's fix; included for
+// completeness.
+TEST_F(ConnectionBusyLiveTest, LeadingPrintMessageSurfacesOnExecDirect) {
+    SQLRETURN rc = Run(stmt_, "PRINT 'row8 leading print'; SELECT 1 WHERE 1 = 0");
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    std::string msg = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    EXPECT_NE(std::string::npos, msg.find("row8 leading print"));
+}
+
+// Row 9: the same PRINT reordered *after* a zero-row SELECT surfaces its
+// message on the SQLMoreResults call that advances past the SELECT — the
+// PRINT statement hasn't been read off the wire yet at execute time (the
+// driver stops at the SELECT's own COLMETADATA), so its message can only be
+// captured once SQLMoreResults reaches it. Unaffected by this PR's fix;
+// included for completeness.
+TEST_F(ConnectionBusyLiveTest, TrailingPrintMessageSurfacesOnMoreResults) {
+    ASSERT_SQL_OK(Run(stmt_, "SELECT 1 WHERE 1 = 0; PRINT 'row9 trailing print'"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // The zero-row SELECT's cursor is open but empty.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    SQLRETURN rc = SQLMoreResults(stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    std::string msg = ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    EXPECT_NE(std::string::npos, msg.find("row9 trailing print"));
 }
