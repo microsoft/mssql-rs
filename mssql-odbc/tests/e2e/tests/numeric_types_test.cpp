@@ -38,8 +38,11 @@ protected:
 };
 
 // ---------------------------------------------------------------------------
-// Integers. TINYINT is unsigned 0..255 on the server, so the top of its range
-// is the interesting value for a signed C target.
+// Integers. TINYINT is unsigned 0..255 on the server, so a value above 127 is
+// the interesting one: SQL_C_TINYINT is sign-ambiguous rather than signed, and
+// for a tinyint source it copies the byte through without a range check, which
+// is how 200 survives. Narrowing to i8 -- and the 22003 that 200 would produce
+// -- applies to SQL_C_STINYINT and to any other source. See fetch_convert.rs.
 // ---------------------------------------------------------------------------
 
 TEST_F(NumericTypesLiveTest, TinyintToTinyintTargetViaBoundFetch) {
