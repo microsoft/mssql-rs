@@ -96,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_conversions_are_supported() {
+    fn binary_c_type_reaches_only_the_binary_sql_types() {
         for sql_type in [SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY] {
             assert!(is_supported_conversion(SQL_C_BINARY, sql_type));
         }

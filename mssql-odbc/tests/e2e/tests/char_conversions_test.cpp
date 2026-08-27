@@ -11,7 +11,6 @@
 
 #include "odbc_test_fixture.h"
 
-#include <cassert>
 #include <string>
 #include <vector>
 

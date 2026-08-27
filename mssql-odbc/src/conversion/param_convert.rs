@@ -199,16 +199,18 @@ pub(crate) fn dae_placeholder_type(
         SQL_C_BINARY => StreamedSqlType::VarBinaryMax,
         other => return Err(ParamBuildError::UnsupportedCType(other)),
     };
+    // Derived from `sql_family` rather than a third type list, so the streamable
+    // set cannot drift from the conversion matrix.
     let same_family = match streamed {
         StreamedSqlType::VarcharMax => {
-            matches!(sql_type, SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR)
+            sql_family(sql_type) == Some(SqlFamily::Character)
+                && !is_wide_character_sql_type(sql_type)
         }
         StreamedSqlType::NVarcharMax => {
-            matches!(sql_type, SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR)
+            sql_family(sql_type) == Some(SqlFamily::Character)
+                && is_wide_character_sql_type(sql_type)
         }
-        StreamedSqlType::VarBinaryMax => {
-            matches!(sql_type, SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY)
-        }
+        StreamedSqlType::VarBinaryMax => sql_family(sql_type) == Some(SqlFamily::Binary),
     };
     if !same_family {
         return Err(ParamBuildError::ConversionNotImplemented);
@@ -430,7 +432,10 @@ fn fit_to_declared_length(
     }
 
     // Only trailing blanks may be dropped, and a blank is one unit in both
-    // encodings, so the overflow maps 1:1 onto trailing source units.
+    // encodings, so the overflow maps 1:1 onto trailing source units. That also
+    // makes `overflow` usable as a byte count on the UTF-8 arm below: `b' '`
+    // never occurs as a continuation byte, so an all-blank tail is that many
+    // whole characters and the cut lands on a boundary.
     Ok(match text {
         AppText::Utf8(mut bytes) => {
             let keep = bytes.len().saturating_sub(overflow);
@@ -1222,6 +1227,18 @@ mod tests {
         match convert_char(SQL_C_WCHAR, SQL_WVARCHAR, 3, "abc ").unwrap() {
             SqlType::NVarchar(Some(s), 3) => assert_eq!(s.to_utf8_string(), "abc"),
             other => panic!("expected NVarchar(Some, 3), got {other:?}"),
+        }
+    }
+
+    /// Trimming a narrow source against a wide target mixes units - `overflow`
+    /// counts UTF-16 units, `keep` is a byte offset - which holds only because a
+    /// blank is one byte and never a UTF-8 continuation byte. Multibyte content
+    /// is what would expose it.
+    #[test]
+    fn a_multibyte_narrow_source_trims_blanks_on_a_char_boundary() {
+        match convert_char(SQL_C_CHAR, SQL_WVARCHAR, 1, "\u{e9}   ").unwrap() {
+            SqlType::NVarchar(Some(s), 1) => assert_eq!(s.to_utf8_string(), "\u{e9}"),
+            other => panic!("expected NVarchar(Some, 1), got {other:?}"),
         }
     }
 
