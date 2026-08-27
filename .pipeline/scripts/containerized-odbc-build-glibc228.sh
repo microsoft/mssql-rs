@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Build the mssql-odbc driver (libmsodbcsql18.so) and the C++ gtest e2e binaries
+# Build the mssql-odbc driver (libmssqlodbc.so) and the C++ gtest e2e binaries
 # on a glibc-2.28 base (PyPA manylinux_2_28 = AlmaLinux 8), then stage them into
 # a drop directory the surrounding pipeline job publishes as an artifact. Later
 # the RHEL 8 test stage downloads the drop and reruns the prebuilt binaries via

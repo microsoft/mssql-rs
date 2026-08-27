@@ -43,9 +43,9 @@ done
 # Resolve the driver shared-library filename for this platform.
 # ----------------------------------------------------------------------------
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    DRIVER_FILE="libmsodbcsql18.dylib"
+    DRIVER_FILE="libmssqlodbc.dylib"
 else
-    DRIVER_FILE="libmsodbcsql18.so"
+    DRIVER_FILE="libmssqlodbc.so"
 fi
 
 # ----------------------------------------------------------------------------

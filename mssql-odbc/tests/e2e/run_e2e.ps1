@@ -432,7 +432,7 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
 # distinct gtest processes and ctest retries never clobber each other's .profraw).
 # PowerShell has no `eval`, so parse each KEY=VALUE line (stripping surrounding
 # quotes) into the process env. The subsequent `cargo build` then produces an
-# instrumented msodbcsql18.dll, and every ctest child process inherits
+# instrumented mssqlodbc.dll, and every ctest child process inherits
 # LLVM_PROFILE_FILE from this environment. The llvm-cov target dir is also
 # exported so the later `cargo metadata` resolves the INSTRUMENTED DLL.
 function Enable-CoverageInstrumentation {
@@ -616,7 +616,7 @@ try {
     Pop-Location
     if (-not $TargetDir) { $TargetDir = Join-Path $WorkspaceDir "target" }
 
-    $DriverPath = Join-Path $TargetDir "$BuildType\msodbcsql18.dll"
+    $DriverPath = Join-Path $TargetDir "$BuildType\mssqlodbc.dll"
     if (-not (Test-Path $DriverPath)) {
         Write-Error "Driver not found at $DriverPath"
     }

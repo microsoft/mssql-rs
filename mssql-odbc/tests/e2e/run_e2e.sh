@@ -17,7 +17,7 @@
 #
 # --skip-build reuses a driver and CMake `build/` produced earlier by
 # build_e2e.sh (no cargo/cmake needed — only the unixODBC runtime). Combine
-# with --driver=PATH to point at the prebuilt libmsodbcsql18.so. This is how
+# with --driver=PATH to point at the prebuilt libmssqlodbc.so. This is how
 # CI runs prebuilt binaries across distro containers.
 #
 # --retries=N reruns each failing test up to N extra times (ctest
@@ -49,7 +49,7 @@
 # Rust driver logs are controlled by MSSQL_TDS_TRACE and
 # MSSQL_TDS_TRACE_LEVEL.
 # In --verbose mode, this script defaults to:
-#   MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL=warn,msodbcsql18=debug
+#   MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL=warn,mssqlodbc=debug
 # unless they are already set in the environment.
 #
 # Examples:
@@ -182,7 +182,7 @@ trap cleanup EXIT
 # `cargo llvm-cov show-env` exports RUSTFLAGS (-C instrument-coverage), the
 # llvm-cov target dir and an LLVM_PROFILE_FILE pattern (with %p/%m so distinct
 # gtest processes and ctest retries never clobber each other's .profraw). The
-# subsequent `cargo build` then produces an instrumented libmsodbcsql18.so, and
+# subsequent `cargo build` then produces an instrumented libmssqlodbc.so, and
 # every ctest child process inherits LLVM_PROFILE_FILE from this environment.
 setup_coverage_env() {
     echo "=== Enabling coverage instrumentation for the Rust driver ==="
@@ -201,7 +201,7 @@ setup_coverage_env() {
 setup_tracing() {
     if [ "$VERBOSE" -eq 1 ]; then
         export MSSQL_TDS_TRACE="${MSSQL_TDS_TRACE:-true}"
-        export MSSQL_TDS_TRACE_LEVEL="${MSSQL_TDS_TRACE_LEVEL:-warn,msodbcsql18=debug}"
+        export MSSQL_TDS_TRACE_LEVEL="${MSSQL_TDS_TRACE_LEVEL:-warn,mssqlodbc=debug}"
         echo "Verbose: MSSQL_TDS_TRACE=$MSSQL_TDS_TRACE MSSQL_TDS_TRACE_LEVEL=$MSSQL_TDS_TRACE_LEVEL"
     fi
 }
@@ -213,9 +213,9 @@ build_rust_driver() {
     # Resolve the driver's shared-library filename for this platform.
     local libname
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        libname="libmsodbcsql18.dylib"
+        libname="libmssqlodbc.dylib"
     else
-        libname="libmsodbcsql18.so"
+        libname="libmssqlodbc.so"
     fi
 
     # Prebuilt mode: an explicit --driver=PATH wins; otherwise --skip-build

@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [lib]
-name = "msodbcsql18"
+name = "mssqlodbc"
 crate-type = ["cdylib"]
 
 [dependencies]

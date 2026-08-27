@@ -7,7 +7,7 @@
 # only the RUNTIME deps to rerun the prebuilt driver + ctest binaries: ctest
 # (from cmake), the unixODBC driver manager runtime, OpenSSL libs, and the
 # Kerberos runtime. The prebuilt
-# build/ tree (with libmsodbcsql18.so staged inside) is restored to
+# build/ tree (with libmssqlodbc.so staged inside) is restored to
 # mssql-odbc/tests/e2e/build by the calling template.
 #
 # Connection details arrive via ODBC_TEST_* env vars; ODBC_E2E_RETRIES controls

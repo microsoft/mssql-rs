@@ -210,7 +210,7 @@ steps:
     set -euo pipefail
     docker exec mssql-python-odbc-tests bash -c '
       source /opt/venv/bin/activate
-      MSSQL_ODBC_DRIVER=/mssql-odbc/libmsodbcsql18.so \
+      MSSQL_ODBC_DRIVER=/mssql-odbc/libmssqlodbc.so \
         bash /mssql-rs-scripts/swap-mssql-python-odbc-driver.sh
     '
   displayName: Replace bundled msodbcsql18 with mssql-odbc

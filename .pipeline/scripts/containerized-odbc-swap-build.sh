@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Build just the mssql-odbc cdylib (libmsodbcsql18.so) inside the Linux build
+# Build just the mssql-odbc cdylib (libmssqlodbc.so) inside the Linux build
 # container and stage it into a drop directory, for the job that swaps it in for
 # the driver mssql-python bundles (see swap-mssql-python-odbc-driver.sh).
 #
@@ -31,5 +31,5 @@ cargo build --release -p mssql-odbc
 # adding it here later cannot break the copy after a full release build.
 TARGET_DIR="${CARGO_TARGET_DIR:-/workspace/target}"
 
-cp "$TARGET_DIR/release/libmsodbcsql18.so" "$DROP_DIR/"
+cp "$TARGET_DIR/release/libmssqlodbc.so" "$DROP_DIR/"
 ls -la "$DROP_DIR"
