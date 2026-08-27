@@ -748,7 +748,7 @@ TEST_F(CharConversionLiveTest, MixedFamilyCharParamsInOneStatement) {
 // Skipped under comparison: msodbcsql converts with SystemLocale::FromUtf16
 // (WideCharToMultiByte), which substitutes a single '?'.
 //
-// Known-wrong, deferred (AB#47584).
+// Known-wrong, deferred (AB#47598).
 TEST_F(CharConversionLiveTest, UnmappableCharacterIsSilentlyCorrupted) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
