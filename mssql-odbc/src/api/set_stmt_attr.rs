@@ -22,8 +22,10 @@
 //! `SQL_ATTR_SIMULATE_CURSOR`) substitute and warn with `01S02`.
 //! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger
 //! batches, since parameter arrays are not yet consumed and a silent success
-//! would execute only the first row. Unrecognized attribute identifiers fail
-//! with `HY092`.
+//! would execute only the first row. `SQL_ATTR_METADATA_ID` accepts its
+//! pattern-mode default (`SQL_FALSE`) but returns `HYC00` for `SQL_TRUE` until
+//! catalog calls implement identifier matching. Unrecognized attribute
+//! identifiers fail with `HY092`.
 //!
 //! The SQL Server vendor attributes (`SQL_SOPT_SS_*`, ids 1225-1238) differ from
 //! the rest in that the driver, not the Driver Manager, validates their values:
@@ -50,19 +52,20 @@ use crate::api::odbc_types::{
     MAX_QUERY_TIMEOUT, MSODBCSQL_MAX_LENGTH, SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC,
     SQL_ATTR_CONCURRENCY, SQL_ATTR_CURSOR_SCROLLABLE, SQL_ATTR_CURSOR_SENSITIVITY,
     SQL_ATTR_CURSOR_TYPE, SQL_ATTR_IMP_PARAM_DESC, SQL_ATTR_IMP_ROW_DESC, SQL_ATTR_KEYSET_SIZE,
-    SQL_ATTR_MAX_LENGTH, SQL_ATTR_MAX_ROWS, SQL_ATTR_PARAMSET_SIZE, SQL_ATTR_QUERY_TIMEOUT,
-    SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR, SQL_ATTR_ROW_BIND_TYPE,
-    SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR, SQL_ATTR_ROWS_FETCHED_PTR,
-    SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY, SQL_CURSOR_FORWARD_ONLY, SQL_ERROR,
-    SQL_INSENSITIVE, SQL_INVALID_HANDLE, SQL_NONSCROLLABLE, SQL_NTS, SQL_SC_UNIQUE,
-    SQL_SOPT_SS_CURRENT_COMMAND, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
-    SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
-    SqlInteger, SqlPointer, SqlReturn, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_ATTR_MAX_LENGTH, SQL_ATTR_MAX_ROWS, SQL_ATTR_METADATA_ID, SQL_ATTR_PARAMSET_SIZE,
+    SQL_ATTR_QUERY_TIMEOUT, SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROW_BIND_OFFSET_PTR,
+    SQL_ATTR_ROW_BIND_TYPE, SQL_ATTR_ROW_NUMBER, SQL_ATTR_ROW_STATUS_PTR,
+    SQL_ATTR_ROWS_FETCHED_PTR, SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY,
+    SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_FALSE, SQL_INSENSITIVE, SQL_INVALID_HANDLE,
+    SQL_NONSCROLLABLE, SQL_NTS, SQL_SC_UNIQUE, SQL_SOPT_SS_CURRENT_COMMAND,
+    SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen,
+    SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CURSOR_STATE,
-    ERR_INVALID_USE_OF_AUTO_DESC, SQLSTATE_01S02, SQLSTATE_HYC00, WARN_OPTION_VALUE_CHANGED,
-    post_diag,
+    ERR_INVALID_USE_OF_AUTO_DESC, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_01S02,
+    SQLSTATE_HYC00, WARN_OPTION_VALUE_CHANGED, post_diag,
 };
 use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
@@ -363,6 +366,26 @@ unsafe fn sql_set_stmt_attr_w_safe(
                 .set(SQL_ATTR_CURSOR_SENSITIVITY, effective);
             SQL_SUCCESS
         }
+        SQL_ATTR_METADATA_ID => {
+            let requested = value_ptr as SqlULen;
+            if requested == SqlULen::from(SQL_FALSE) {
+                state
+                    .inert_attrs
+                    .set(SQL_ATTR_METADATA_ID, SqlULen::from(SQL_FALSE));
+                SQL_SUCCESS
+            } else if requested == SqlULen::from(SQL_TRUE) {
+                error!("SQLSetStmtAttrW: metadata identifier mode is not implemented");
+                post_diag(&mut state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+                SQL_ERROR
+            } else {
+                error!(
+                    value = requested,
+                    "SQLSetStmtAttrW: invalid SQL_ATTR_METADATA_ID value"
+                );
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                SQL_ERROR
+            }
+        }
         SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT | SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS => {
             // The only two string-valued statement attributes. `string_length`
             // is a byte count (or SQL_NTS), which is why the set entry point
@@ -412,18 +435,6 @@ unsafe fn sql_set_stmt_attr_w_safe(
                 SQL_ERROR
             }
         }
-        // Recognized attributes stored and round-tripped without effect: these
-        // parameter and cursor controls do not change the implemented
-        // forward-only, read-only behavior, but msodbcsql reports back whatever
-        // was written, so silently discarding the value would diverge on the
-        // very next get.
-        attribute if state.inert_attrs.set(attribute, value_ptr as SqlULen) => {
-            debug!(
-                attribute,
-                "SQLSetStmtAttrW: attribute stored without effect"
-            );
-            SQL_SUCCESS
-        }
         SQL_ATTR_APP_ROW_DESC => match validate_descriptor_association(stmt, stmt.ard, value_ptr) {
             Ok(new_active) => {
                 state.active_ard = new_active;
@@ -453,11 +464,24 @@ unsafe fn sql_set_stmt_attr_w_safe(
             }
         },
         _ => {
-            post_diag(
-                &mut state,
-                unimplemented_attr_diag(AttrScope::Stmt, AttrOp::Set, attribute),
-            );
-            SQL_ERROR
+            // Recognized attributes stored and round-tripped without effect:
+            // these parameter and cursor controls do not change the implemented
+            // forward-only, read-only behavior, but msodbcsql reports back
+            // whatever was written.
+            if state.inert_attrs.contains(attribute) {
+                state.inert_attrs.set(attribute, value_ptr as SqlULen);
+                debug!(
+                    attribute,
+                    "SQLSetStmtAttrW: attribute stored without effect"
+                );
+                SQL_SUCCESS
+            } else {
+                post_diag(
+                    &mut state,
+                    unimplemented_attr_diag(AttrScope::Stmt, AttrOp::Set, attribute),
+                );
+                SQL_ERROR
+            }
         }
     }
 }
@@ -1455,7 +1479,6 @@ mod tests {
             (SQL_ATTR_PARAMS_PROCESSED_PTR, 0x5678),
             (SQL_ATTR_ROW_BIND_OFFSET_PTR, 0x6789),
             (SQL_ATTR_ROW_OPERATION_PTR, 0x789a),
-            (SQL_ATTR_METADATA_ID, 1),
         ] {
             assert_eq!(
                 set_attr(h.stmt, attribute, value),
@@ -1464,6 +1487,22 @@ mod tests {
             );
             assert_eq!(get_attr(h.stmt, attribute), value, "readback {attribute}");
         }
+    }
+
+    #[test]
+    fn metadata_id_rejects_identifier_mode_until_catalog_supports_it() {
+        let h = TestHandles::with_env_dbc_stmt();
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_METADATA_ID, 0), SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_METADATA_ID), 0);
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_METADATA_ID, 1), SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HYC00);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_METADATA_ID), 0);
+
+        assert_eq!(set_attr(h.stmt, SQL_ATTR_METADATA_ID, 2), SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+        assert_eq!(get_attr(h.stmt, SQL_ATTR_METADATA_ID), 0);
     }
 
     /// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` holds a *pointer to* the offset, so it
@@ -2129,6 +2168,28 @@ mod tests {
             (rc, value.as_str(), written),
             (SQL_SUCCESS, "service=x", 18)
         );
+    }
+
+    #[test]
+    fn query_notification_null_set_clears_the_value() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for attribute in [
+            SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+            SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS,
+        ] {
+            assert_eq!(
+                set_str_attr(h.stmt, attribute, "SEED", SQL_NTS.into()),
+                SQL_SUCCESS
+            );
+            let rc = unsafe {
+                sql_set_stmt_attr_w(h.stmt, attribute, std::ptr::null_mut(), SQL_NTS.into())
+            };
+            assert_eq!(rc, SQL_SUCCESS, "clear attr {attribute}");
+            assert_eq!(
+                get_str_attr(h.stmt, attribute, 64),
+                (SQL_SUCCESS, String::new(), 0)
+            );
+        }
     }
 
     /// `StringLength` on the set side is a **byte** count, so an explicit 6

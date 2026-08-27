@@ -307,6 +307,12 @@ impl InertStmtAttrs {
     fn index_of(attribute: SqlInteger) -> Option<usize> {
         INERT_STMT_ATTRS.iter().position(|(id, _)| *id == attribute)
     }
+
+    /// Returns whether `attribute` belongs to this store without changing it.
+    pub(crate) fn contains(&self, attribute: SqlInteger) -> bool {
+        Self::index_of(attribute).is_some()
+    }
+
     /// Returns the stored value, or `None` when `attribute` is not one of the
     /// inert identifiers.
     pub(crate) fn get(&self, attribute: SqlInteger) -> Option<SqlULen> {

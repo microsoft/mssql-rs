@@ -8,6 +8,8 @@
 //! msodbcsql. Once connected, setting it issues a `USE` batch and reading it
 //! reports the database the server says is current, so a database changed by raw
 //! T-SQL (or by a `USE` inside a stored procedure) is still reported correctly.
+//! An empty pre-connect value selects the login's default database; the same
+//! value is invalid once connected because there is no database to switch to.
 //!
 //! Behavior mirrors msodbcsql's `SQLSetConnectAttrW` arm (`sqlcmisc.cpp:1829`),
 //! its `ChangeDatabase` helper (`sqlcconn.cpp:4970`), and the `fCopyStrToBuffer`
@@ -104,7 +106,7 @@ pub(super) unsafe fn set_current_catalog(
 
         // msodbcsql measures the limit in UTF-16 code units (`wcslen`), so a
         // name of astral characters hits it in half as many `char`s.
-        if name.is_empty() || name.encode_utf16().count() > SYSNAMELEN {
+        if name.encode_utf16().count() > SYSNAMELEN {
             error!(len = name.len(), "{SET_OP}: invalid database name length");
             post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
             return SQL_ERROR;
@@ -137,6 +139,15 @@ fn decide(dbc: &DbcHandle, name: &str) -> Result<CatalogAction, SqlReturn> {
         state.current_catalog = Some(name.to_string());
         debug!(name, "{SET_OP}: stored for next connect");
         return Ok(CatalogAction::Done);
+    }
+
+    // An empty value is valid configuration before login: it means the login's
+    // default database. Once connected there is no database name to switch to,
+    // and msodbcsql rejects it with HY024.
+    if name.is_empty() {
+        error!("{SET_OP}: empty database name on a connected handle");
+        post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+        return Err(SQL_ERROR);
     }
 
     // A `USE` cannot be sent while a cursor is streaming, and msodbcsql refuses
@@ -403,8 +414,20 @@ mod tests {
     }
 
     #[test]
-    fn set_rejects_an_empty_name() {
+    fn set_accepts_an_empty_name_before_connect() {
         let h = TestHandles::with_env_dbc();
+        assert_eq!(set_catalog(h.dbc, ""), SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().current_catalog.as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn set_rejects_an_empty_name_when_connected() {
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
         assert_eq!(set_catalog(h.dbc, ""), SQL_ERROR);
         assert_eq!(sqlstate(h.dbc), "HY024");
     }

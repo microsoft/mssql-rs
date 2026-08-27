@@ -37,6 +37,7 @@
 //   22. SetCurrentCatalogQuotesIdentifier  - injection attempt stays one name
 //   23. PreConnectDefaultCatalogIsNotASentinel - "(Default)" only means
 //                                            "no change" once connected
+//   23b.PreConnectEmptyCatalogUsesLoginDefault - empty means server default
 //
 // Attribute rejection policy:
 //   24. UnknownStatementAttributeIsInvalidIdentifier   - HY092
@@ -44,7 +45,7 @@
 //   26. StatementOnlyAttributeIsRejectedOnAConnection  - scope-keyed HY092
 //   27. ConnectionOnlyAttributeIsRejectedOnAStatement  - the mirror image
 //   28. RowNumberIsNotSettable                         - operation-keyed HY092
-//   29. EveryRecognizedStatementAttributeIsAnswered    - no HY092/HYC00 left
+//   29. EveryImplementedStatementAttributeIsAnswered   - no unexpected HY092/HYC00
 //   30. UnimplementedConnectionAttributeIsNotImplemented - HYC00 on the get path
 //   31. HostileAttributePayloadDoesNotFault            - HYC00, session survives
 //   32. KeystoreDataGetIsRecognizedNotUnknown          - recognized on both, never HY092
@@ -52,6 +53,7 @@
 // Remaining statement attributes:
 //   33. StatementAttributeDefaultsMatchMsodbcsql       - four defaults are not 0
 //   34. StatementAttributesRoundTrip                   - written values survive
+//   34b.MetadataIdTrueIsNotImplemented                 - HYC00, state stays false
 //   35. RowsetSizeIsIndependentOfRowArraySize          - 9 and 27 are not aliases
 //   36. MaxLengthIsSubstitutedWithAWarning             - non-zero -> 8000 + 01S02
 //   37. KeysetSizeIsRefusedWithAWarning                - non-zero -> 01S02, stays 0
@@ -634,6 +636,51 @@ TEST_F(AttributesTest, PreConnectDefaultCatalogIsNotASentinel) {
     SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 }
 
+// -------------------------------------------------------------------
+// Variation 23b - before connect, an empty current catalog means "use the
+// login's default database". Both drivers accept the attribute and connect.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, PreConnectEmptyCatalogUsesLoginDefault) {
+    const auto& cfg = ODBCTestConfig::Instance();
+    if (cfg.HasConnStr() || cfg.HasDSN() || cfg.Server().empty() ||
+        cfg.Driver().empty()) {
+        GTEST_SKIP() << "Needs generated DSN-less connection settings";
+    }
+
+    std::string cs =
+        ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString());
+    const size_t database = cs.find("Database=");
+    ASSERT_NE(std::string::npos, database);
+    const size_t delimiter = cs.find(';', database);
+    ASSERT_NE(std::string::npos, delimiter);
+    cs.erase(database, delimiter - database + 1);
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
+
+    SQLTCHAR empty[] = {0};
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc, SQL_ATTR_CURRENT_CATALOG, empty, SQL_NTS),
+                  SQL_HANDLE_DBC, dbc);
+
+    SqlTString conn = ODBCTestUtils::ToSqlTStr(cs);
+    SQLTCHAR out[1024] = {};
+    SQLSMALLINT out_len = 0;
+    ASSERT_SQL_OK(SQLDriverConnect(dbc, nullptr, conn.data(), SQL_NTS, out, 1024,
+                                   &out_len, SQL_DRIVER_NOPROMPT),
+                  SQL_HANDLE_DBC, dbc);
+
+    SQLTCHAR catalog[256] = {};
+    SQLINTEGER catalog_len = -1;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc, SQL_ATTR_CURRENT_CATALOG, catalog,
+                                    sizeof(catalog), &catalog_len),
+                  SQL_HANDLE_DBC, dbc);
+    EXPECT_GT(catalog_len, 0);
+    EXPECT_FALSE(ODBCTestUtils::ToNarrow(SqlTString(catalog)).empty());
+
+    SQLDisconnect(dbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+}
+
 // ===========================================================================
 // Attribute rejection policy (§4.10 pass-through hardening)
 //
@@ -720,9 +767,10 @@ TEST_F(AttributesTest, RowNumberIsNotSettable) {
 // Variation 29 - every statement attribute msodbcsql recognizes on the
 // set path is recognized here too. Before slice S6 this variation held
 // the opposite: an attribute msodbcsql accepted and this driver answered
-// with HYC00. That class is now empty, so the useful assertion is that it
-// stays empty - a new row in the recognition table that nobody wired up
-// fails here rather than reaching an application as HYC00.
+// with HYC00. SQL_ATTR_METADATA_ID is the one deliberate exception while
+// identifier-mode catalog matching is pending, and Variation 34b pins it.
+// A new unimplemented row still fails here rather than reaching an
+// application as an unexplained HYC00.
 //
 // Recognition is asserted independently of the value, because 21 of these
 // reject the probe value with HY024; what must never come back is HY092
@@ -739,13 +787,12 @@ TEST_F(AttributesTest, RowNumberIsNotSettable) {
 // them with a placeholder access-violates inside the driver. Recognition
 // of those is covered by the get path instead.
 // -------------------------------------------------------------------
-TEST_F(AttributesTest, EveryRecognizedStatementAttributeIsAnswered) {
+TEST_F(AttributesTest, EveryImplementedStatementAttributeIsAnswered) {
     const SQLINTEGER attributes[] = {
         -2,   -1,   0,    1,    2,    3,    4,    5,    6,    7,
         8,    9,    10,   11,   12,   15,   16,   17,   18,   19,
         20,   21,   22,   23,   24,   25,   26,   27,   1225, 1227,
         1228, 1229, 1230, 1232, 1233, 1234, 1235, 1236, 1237, 1238,
-        10014,
     };
 
     for (SQLINTEGER attribute : attributes) {
@@ -876,7 +923,7 @@ TEST_F(AttributesTest, StatementAttributesRoundTrip) {
         {SQL_ATTR_RETRIEVE_DATA, SQL_RD_ON},
         {SQL_ATTR_USE_BOOKMARKS, SQL_UB_VARIABLE},
         {SQL_ATTR_ENABLE_AUTO_IPD, SQL_FALSE},
-        {SQL_ATTR_METADATA_ID, SQL_TRUE},
+        {SQL_ATTR_METADATA_ID, SQL_FALSE},
         {SQL_ATTR_PARAM_BIND_TYPE, 16},
         {kRowsetSizeAttr, 10},
     };
@@ -886,6 +933,22 @@ TEST_F(AttributesTest, StatementAttributesRoundTrip) {
         EXPECT_EQ(c.value, GetStmtULen(c.attribute))
             << "readback " << c.attribute;
     }
+}
+
+// -------------------------------------------------------------------
+// Variation 34b - identifier matching is not implemented yet. Succeeding here
+// would silently keep pattern semantics, so this driver reports HYC00 and keeps
+// the readable state false until the catalog path can honor SQL_TRUE.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, MetadataIdTrueIsNotImplemented) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_METADATA_ID, SQL_FALSE));
+    EXPECT_EQ(SQLULEN{SQL_FALSE}, GetStmtULen(SQL_ATTR_METADATA_ID));
+
+    EXPECT_EQ(SQL_ERROR, SetStmtULen(SQL_ATTR_METADATA_ID, SQL_TRUE));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    EXPECT_EQ(SQLULEN{SQL_FALSE}, GetStmtULen(SQL_ATTR_METADATA_ID));
 }
 
 // -------------------------------------------------------------------
@@ -1493,6 +1556,23 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
     EXPECT_EQ(SQL_SUCCESS,
               SQLGetStmtAttr(stmt_, kSsQnMsgtext, nullptr, 0, &written));
     EXPECT_EQ(value_bytes, written);
+
+    // A null set pointer clears either value. This is distinct from a null get
+    // pointer above, which only asks for the current length.
+    for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, msg, SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, nullptr, SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+
+        std::memset(buffer, 0, sizeof(buffer));
+        written = -1;
+        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer, sizeof(buffer),
+                                     &written),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(0, written);
+        EXPECT_EQ(SQLTCHAR{0}, buffer[0]);
+    }
 }
 
 // -------------------------------------------------------------------

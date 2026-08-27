@@ -89,7 +89,7 @@ their measured not-implemented diagnostic; an unknown identifier returns `HY092`
 | `SQL_ATTR_MAX_LENGTH`, `NOSCAN`, `RETRIEVE_DATA`, `USE_BOOKMARKS` | ✅ | ✅ |
 | `SQL_ATTR_PARAM_BIND_OFFSET_PTR` | ✅ enforced | ✅ |
 | `SQL_ATTR_PARAM_BIND_TYPE`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`, `ROW_BIND_OFFSET_PTR` | ✅ stored | ✅ |
-| `SQL_ATTR_METADATA_ID` | ✅ stored | ✅ | catalog effect pending S5b |
+| `SQL_ATTR_METADATA_ID` | `SQL_FALSE` ✅; `SQL_TRUE` → `HYC00` | ✅ (`SQL_FALSE`) | identifier mode pending S5b |
 | **`SQL_ATTR_QUERY_TIMEOUT`** | ✅ | ✅ | **delivered by S2** |
 | `SQL_SOPT_SS_*` 1225–1238 | measured per id | measured per id | **delivered by S6** |
 
@@ -401,7 +401,7 @@ ideal rather than what this driver does.
 | 17 | `PARAM_BIND_OFFSET_PTR` | 0 (null) | **enforced**: dereferenced at execute and added to both bound pointers |
 | 16, 18–21, 23–24 | bind/offset/status pointers | 0 | stored |
 | 22 | `PARAMSET_SIZE` | 1 | 1 → success; above 1 → `HYC00` (array binding is a deferred feature) |
-| 10014 | `METADATA_ID` | 0 | stored |
+| 10014 | `METADATA_ID` | 0 | `SQL_FALSE` accepted; `SQL_TRUE` → `HYC00` |
 | -1 | `CURSOR_SCROLLABLE` | `SQL_NONSCROLLABLE` | the boolean face of `CURSOR_TYPE` |
 | -2 | `CURSOR_SENSITIVITY` | `SQL_INSENSITIVE` | `SQL_UNSPECIFIED` normalises to insensitive, silently |
 
@@ -449,10 +449,9 @@ feature. It is the same single divergence already recorded for
 shared invariant on both drivers and the per-driver state separately.
 
 **Cross-story notes:** `SQL_ATTR_NOSCAN` is now readable for AB#46384.
-`SQL_ATTR_METADATA_ID` is stored and round-trips, but catalog dispatch still
-forces pattern mode. Accepting `SQL_TRUE` without honoring identifier semantics
-is a known temporary divergence; S5b must either wire it into catalog matching or
-return `HYC00` until that behavior exists.
+`SQL_ATTR_METADATA_ID = SQL_FALSE` succeeds and reads back. `SQL_TRUE` returns
+`HYC00` until S5b wires identifier semantics into catalog matching; silently
+accepting it while forcing pattern mode would return the wrong rows.
 
 **Size:** M. **Depends on:** S1.
 
@@ -521,9 +520,9 @@ three above — which the `CURRENT_CATALOG` contrast shows is not safe.
   `FAILOVER_PARTNER`, `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`.
 - **Read-only/diagnostic:** `SQL_COPT_SS_CLIENT_CONNECTION_ID`, `SQL_COPT_SS_SPID`,
   `SQL_COPT_SS_USER_DATA`.
-- **Standard leftovers:** `SQL_ATTR_METADATA_ID` (stored today, but catalog
-  dispatch still forces pattern mode), `SQL_ATTR_ASYNC_ENABLE`, `SQL_ATTR_AUTO_IPD`,
-  `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.
+- **Standard leftovers:** `SQL_ATTR_METADATA_ID = SQL_TRUE` (currently `HYC00`
+  because catalog dispatch still forces pattern mode), `SQL_ATTR_ASYNC_ENABLE`,
+  `SQL_ATTR_AUTO_IPD`, `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.
 - **Implement the statement-option fan-out (F3)** so an unrecognized connection
   attribute that is a valid statement option propagates to the connection's
   statements, as msodbcsql does at `sqlcmisc.cpp:2879` — generalizing the
@@ -692,7 +691,7 @@ flowchart TD
 
     S2 -.->|enforcement| E1["AB#46385 Query-timeout enforcement"]
     S4 -.->|NOSCAN consumer| E2["AB#46384 ODBC escape sequences"]
-    S4 -.->|METADATA_ID| E3["catalog.rs assumes always FALSE"]
+    S4 -.->|METADATA_ID| E3["catalog matching remains pattern-only"]
     S6 -.->|PARAM_FOCUS| E4["AB#46374 Descriptors"]
 
     classDef shipped fill:#238636,color:#fff
@@ -713,9 +712,8 @@ the remaining follow-up under AB#47526.
 2. **Attribute vs. keyword precedence** is measured for S5a's three attributes.
    Every S5b keyword-equivalent attribute still needs its own measurement because
    the `CURRENT_CATALOG` result proves there is no safe global rule.
-3. **`SQL_ATTR_METADATA_ID`** is accepted but not honored by catalog dispatch.
-   S5b must implement identifier mode or reject `SQL_TRUE` with `HYC00`; silent
-   pattern matching is not a valid final state.
+3. **`SQL_ATTR_METADATA_ID = SQL_TRUE`** returns `HYC00` while catalog dispatch
+   remains pattern-only. S5b must implement identifier mode before accepting it.
 4. **Parity-sweep cost:** S1's sweep needs a live SQL Server and both drivers
    registered. If `--compare-with-msodbcsql` cannot run in CI, the truth table
    must be captured once and checked in as a fixture.
