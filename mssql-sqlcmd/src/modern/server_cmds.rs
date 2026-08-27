@@ -212,20 +212,28 @@ pub fn create(invocation: &mut Invocation, mut context: Context) -> Result<Strin
         return Err(format!("{e}; the container was removed"));
     }
 
+    // The reference offers the Azure Data Studio hint only where it implements
+    // `open ads` -- Windows and macOS. This port also runs it on Linux, but the
+    // hint list is compared against the reference, so it follows the same rule.
+    let mut hint_list: Vec<(&str, &str)> = Vec::new();
+    if cfg!(any(windows, target_os = "macos")) {
+        hint_list.push(("Open in Azure Data Studio", "sqlcmd open ads"));
+    }
+    hint_list.extend([
+        ("Run a query", "sqlcmd query \"SELECT @@version\""),
+        ("Start interactive session", "sqlcmd query"),
+        ("View sqlcmd configuration", "sqlcmd config view"),
+        ("See connection strings", "sqlcmd config connection-strings"),
+        ("Remove", "sqlcmd delete"),
+    ]);
+
     Ok(format!(
         "{progress}\
          Created context \"{name}\" in \"{}\", configuring user account...\n\
          Disabled \"sa\" account (and rotated \"sa\" password). Creating user \"{account}\"\n\
          Now ready for client connections on port {port}\n\n{}",
         context.path.display(),
-        crate::modern::config_cmds::hints(&[
-            ("Open in Azure Data Studio", "sqlcmd open ads"),
-            ("Run a query", "sqlcmd query \"SELECT @@version\""),
-            ("Start interactive session", "sqlcmd query"),
-            ("View sqlcmd configuration", "sqlcmd config view"),
-            ("See connection strings", "sqlcmd config connection-strings"),
-            ("Remove", "sqlcmd delete"),
-        ])
+        crate::modern::config_cmds::hints(&hint_list)
     ))
 }
 

@@ -50,12 +50,31 @@ output byte for byte.
 | vs ODBC `sqlcmd` | **121 pass, 0 fail**, 1 skip | **116 pass, 0 fail**, 6 skip |
 | vs Go legacy CLI | **64 pass, 0 fail** | **64 pass, 0 fail** |
 | vs Go subcommand CLI | **49 pass, 0 fail**, 4 skip | **49 pass, 0 fail**, 4 skip |
-| …with container lifecycle | **53 pass, 0 fail, 0 skip** | — |
-| `SQLCMDCOLORSCHEME` (PTY) | — | **35 match, 0 differ** |
-| Unit + integration | **231 pass** | **212 pass** |
-
+| …with container lifecycle | **53 pass, 0 fail, 0 skip** | **53 pass, 0 fail, 0 skip** |
+| `SQLCMDCOLORSCHEME` — gate + `:list color` | **3 pass** | **3 pass** |
+| `SQLCMDCOLORSCHEME` — full colour, via PTY | see below | **35 match, 0 differ** |
+| Unit + integration | **234 pass** | **215 pass** |
 Skips are recorded with reasons. The Linux ODBC skips are Windows-only surface
 (named pipes, registry DSNs) that does not exist there.
+
+**Why two rows differ by platform** — both are *test* coverage, not feature gaps:
+
+- **Container lifecycle** runs on both, and is gated behind
+  `SQLCMD_DIFF_CONTAINERS=1` only because each case pulls or starts a SQL Server
+  image and costs minutes. Off by default keeps it out of a pre-push loop.
+- **Full colour comparison** needs a pseudo-terminal, because both tools
+  suppress colour on a redirected stream — an ordinary pipe would compare two
+  blank outputs and pass. Linux has `script(1)`; the harness has no Windows
+  equivalent. What *can* be checked without a PTY runs on both: the suppression
+  gate, `:list color`, and the escape sequences themselves (unit-tested against
+  bytes captured from the reference). Redirected output was also confirmed
+  byte-identical to go-sqlcmd on Windows — 59 bytes each, zero escapes.
+
+  The residual Windows gap is narrow: whether a real console *renders* the
+  sequences. Neither go-sqlcmd nor this build calls `SetConsoleMode` to enable
+  virtual-terminal processing, so both depend on the host having it on — the
+  default in Windows Terminal and modern conhost. Worth one manual check before
+  release.
 
 ### Can it drop in?
 
@@ -108,6 +127,16 @@ semantics.
 | State-127 exit (Unix) | clamps to `1` | truncates to 8 bits | ODBC |
 | Error routed to stderr | keeps `Msg …` header | drops header, adds blank line | ODBC |
 | `-m` and `PRINT` output | hidden below threshold | never hidden | ODBC |
+| Stray word `sqlcmd foo` | `'foo': Unexpected argument` | `'foo': Unknown command` | ODBC, in both modes |
+
+The last row is the only wording difference left, and it is cosmetic. A bare
+word is a *subcommand name* to go-sqlcmd, since its modern CLI is command-based,
+so it reports "Unknown command"; the legacy path here treats it as a stray
+argument, matching ODBC exactly. It cannot appear in a working script.
+
+Unknown *options* do match Go's and ODBC's wording exactly — `-9`, `-8` and
+`-BOGUS` all produce `Sqlcmd: '<token>': Unknown Option. Enter '-?' for help.`,
+byte for byte, and are covered by differential cases.
 
 ---
 
@@ -304,7 +333,7 @@ Precedence: `:setvar` > `-v` > environment > built-in default.
 | `create mssql get-tags` | = | = | 274 tags, matching exactly |
 | `start` / `stop` | = | = | |
 | `delete` | = | = | Requires `--yes` when it would destroy a container |
-| `open ads` | Windows only | **all platforms** | Go's Linux build panics; its macOS build silently stores no password. Rust launches on all three and hands over the password only where that can be done correctly |
+| `open ads` | Windows only | **all platforms** | Go's Linux build panics; its macOS build silently stores no password. Rust launches on all three and hands over the password only where that can be done correctly. The `create` hint that advertises it is still shown only on Windows and macOS, matching Go |
 
 ---
 
