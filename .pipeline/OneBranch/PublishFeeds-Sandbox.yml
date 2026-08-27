@@ -191,7 +191,7 @@ extends:
           displayName: 'Build mock abi3 wheel (manylinux_2_34 x86_64)'
           env:
             CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest
-            EXPECTED_PLATFORM_TAG: manylinux
+            EXPECTED_PLATFORM_TAG: linux_x86_64
             OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/manylinux
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -200,7 +200,7 @@ extends:
           displayName: 'Build mock abi3 wheel (musllinux_1_2 x86_64)'
           env:
             CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest
-            EXPECTED_PLATFORM_TAG: musllinux
+            EXPECTED_PLATFORM_TAG: musllinux_1_2_x86_64
             MATURIN_FEATURES: vendored-openssl
             OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/musllinux
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
@@ -261,7 +261,7 @@ extends:
           displayName: 'Build mock abi3 wheel (manylinux_2_34 aarch64)'
           env:
             CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest
-            EXPECTED_PLATFORM_TAG: manylinux
+            EXPECTED_PLATFORM_TAG: linux_aarch64
             OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/manylinux
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
             CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
@@ -270,7 +270,7 @@ extends:
           displayName: 'Build mock abi3 wheel (musllinux_1_2 aarch64)'
           env:
             CONTAINER_IMAGE: ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest
-            EXPECTED_PLATFORM_TAG: musllinux
+            EXPECTED_PLATFORM_TAG: musllinux_1_2_aarch64
             MATURIN_FEATURES: vendored-openssl
             OB_OUTPUTDIRECTORY: $(ob_outputDirectory)/musllinux
             BUILD_SOURCESDIRECTORY: $(Build.SourcesDirectory)
