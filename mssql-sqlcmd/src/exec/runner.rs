@@ -38,9 +38,21 @@ pub struct RunStyle {
     pub format: Format,
     /// Whose behaviour to follow where the two tools disagree.
     pub compat: Compat,
+    /// `-R` — render money, `decimal`/`numeric` and timestamps with the
+    /// client's regional settings.
+    pub regional: bool,
     /// `SQLCMDCOLORSCHEME`. Inactive unless a scheme is named and the results
     /// are going to a terminal.
     pub colors: crate::fmt::color::Colorizer,
+}
+
+impl RunStyle {
+    fn values(&self) -> crate::fmt::value::ValueStyle {
+        crate::fmt::value::ValueStyle {
+            compat: self.compat,
+            regional: self.regional,
+        }
+    }
 }
 
 /// Outcome of one batch, used for `-b`, `-V` and the final exit code.
@@ -177,7 +189,7 @@ async fn render_result_set(
                 outcome.first_cell = row.first().cloned();
             }
             for (cell, column) in row.iter().zip(&columns) {
-                buffer.push_str(&value::render(cell, column, style.compat));
+                buffer.push_str(&value::render(cell, column, style.values()));
             }
         }
         if !buffer.is_empty() {
@@ -214,7 +226,7 @@ async fn render_result_set(
         let cells: Vec<String> = row
             .iter()
             .zip(&columns)
-            .map(|(cell, column)| value::render(cell, column, style.compat))
+            .map(|(cell, column)| value::render(cell, column, style.values()))
             .collect();
         if tabular {
             for line in table.row(&cells) {

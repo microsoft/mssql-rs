@@ -47,13 +47,13 @@ output byte for byte.
 
 | Harness | Windows | Linux |
 |---|---|---|
-| vs ODBC `sqlcmd` | **121 pass, 0 fail**, 1 skip | **116 pass, 0 fail**, 6 skip |
+| vs ODBC `sqlcmd` | **131 pass, 0 fail**, 1 skip | **126 pass, 0 fail**, 6 skip |
 | vs Go legacy CLI | **64 pass, 0 fail** | **64 pass, 0 fail** |
 | vs Go subcommand CLI | **49 pass, 0 fail**, 4 skip | **49 pass, 0 fail**, 4 skip |
 | …with container lifecycle | **53 pass, 0 fail, 0 skip** | **53 pass, 0 fail, 0 skip** |
 | `SQLCMDCOLORSCHEME` — gate + `:list color` | **3 pass** | **3 pass** |
 | `SQLCMDCOLORSCHEME` — full colour, via PTY | see below | **35 match, 0 differ** |
-| Unit + integration | **234 pass** | **215 pass** |
+| Unit + integration | **241 pass** | **226 pass** |
 Skips are recorded with reasons. The Linux ODBC skips are Windows-only surface
 (named pipes, registry DSNs) that does not exist there.
 
@@ -242,7 +242,7 @@ server advertises.
 | `-u` | `--unicode-output-file` | = | = | = | UTF-16LE with BOM |
 | `-e` | `--echo-input` | = | = | ≠ | Statement text only. ODBC adds a blank line after; Go does not |
 | `-f` | — | = | **absent** | + | Code pages, `-f cp`, `-f i:cp`, `-f o:cp`. **An unusable code page is now refused**, not silently switched to UTF-8 |
-| `-R` | `--client-regional-setting` | accepted, ignored | same | same | Ignored by all three |
+| `-R` | `--client-regional-setting` | **implemented** | accepted, ignored | **=** | Formats money, `decimal`/`numeric` and the date/time types with the client's locale. Only ODBC implements it; matching meant going through the platform's own locale services, as the reference does. See below |
 | `--vertical` | — | absent | = | = | One field per line |
 | `--ascii` | — | absent | = | = | ASCII box-drawn table |
 | `--format` | — | absent | **absent** | **extension** | `csv` / `json`. Go has the `SQLCMDFORMAT` variable and `--vertical`/`--ascii`, but no `--format` flag |
@@ -362,7 +362,22 @@ Precedence: `:setvar` > `-v` > environment > built-in default.
 | Item | Why |
 |---|---|
 | `-T` semantics | Undocumented in the reference; accepted and ignored, as ODBC does |
-| `-R` regional formatting | Accepted and ignored by all three |
+
+### Three reference defects deliberately not reproduced
+
+`-R` is the one place where matching the reference byte for byte would mean
+putting something in front of a user that cannot be intended. All three were
+measured:
+
+| Reference behaviour | Platform | What this build does |
+|---|---|---|
+| `datetime2` renders as `1:45:06.%07lu PM` — an unsubstituted `printf` specifier | Windows | Formats it like the neighbouring types |
+| `time` fails with *"Internal error at LocalizeTimestampData"* | Windows | Formats it |
+| Negative `money` fails with *"Internal error at ReadAndHandleColumnData"* | Linux | Renders `-1235` |
+
+Everything `-R` renders correctly is matched exactly, on both platforms — ten
+differential cases covering money, `smallmoney`, `decimal`, `numeric`, `date`,
+`datetime`, `smalldatetime`, and the types it deliberately leaves alone.
 
 ---
 

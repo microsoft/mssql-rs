@@ -11,6 +11,20 @@ use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::query::metadata::ColumnMetadata;
 
 use crate::compat::Compat;
+use crate::fmt::regional;
+
+/// How a value is rendered: whose conventions to follow, and whether `-R` asked
+/// for the client's regional settings.
+///
+/// `-R` only ever *replaces* a rendering, never changes which one applies, so
+/// the two are independent.
+#[derive(Debug, Clone, Copy)]
+pub struct ValueStyle {
+    pub compat: Compat,
+    /// `-R`. Affects money, `decimal`/`numeric` and the date/time types; leaves
+    /// integers and floats alone, matching the reference.
+    pub regional: bool,
+}
 
 /// What the reference prints for a NULL, in every type.
 pub const NULL_TEXT: &str = "NULL";
@@ -24,7 +38,8 @@ const TICKS_PER_SECOND: u64 = 10_000_000;
 /// the former, `datetime` and `smalldatetime` from the latter.
 const DAYS_FROM_YEAR_ONE_TO_1900: i64 = 693_595;
 
-pub fn render(value: &ColumnValues, column: &ColumnMetadata, compat: Compat) -> String {
+pub fn render(value: &ColumnValues, column: &ColumnMetadata, style: ValueStyle) -> String {
+    let compat = style.compat;
     match value {
         ColumnValues::Null => NULL_TEXT.to_string(),
         ColumnValues::Bit(b) => i32::from(*b).to_string(),
@@ -48,9 +63,16 @@ pub fn render(value: &ColumnValues, column: &ColumnMetadata, compat: Compat) -> 
                 float_text(*v, 17)
             }
         }
-        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => d.to_string(),
-        ColumnValues::Money(m) => money_text(money_units(m), compat),
-        ColumnValues::SmallMoney(m) => money_text(m.int_val as i64, compat),
+        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
+            let plain = d.to_string();
+            style
+                .regional
+                .then(|| regional::number(&plain))
+                .flatten()
+                .unwrap_or(plain)
+        }
+        ColumnValues::Money(m) => money(money_units(m), style),
+        ColumnValues::SmallMoney(m) => money(m.int_val as i64, style),
         // `SqlString`'s `Display` prints raw bytes for collation-encoded data,
         // so decode explicitly.
         ColumnValues::String(s) => s.to_utf8_string(),
@@ -65,11 +87,57 @@ pub fn render(value: &ColumnValues, column: &ColumnMetadata, compat: Compat) -> 
             }
         }
         ColumnValues::Bytes(bytes) => binary_text(bytes, fixed_binary_len(column)),
-        ColumnValues::Date(d) => date_text(d.get_days() as i64),
-        ColumnValues::Time(t) => time_text(t.time_nanoseconds, t.scale),
-        ColumnValues::DateTime(dt) => datetime_text(dt.days as i64, dt.time),
-        ColumnValues::SmallDateTime(dt) => smalldatetime_text(dt.days as i64, dt.time),
-        ColumnValues::DateTime2(dt) => datetime2_text(dt.days as i64, &dt.time),
+        ColumnValues::Date(d) => {
+            let days = d.get_days() as i64;
+            regional_or(
+                style,
+                || stamp(days, 0).and_then(regional::short_date),
+                || date_text(days),
+            )
+        }
+        ColumnValues::Time(t) => {
+            let ticks = t.time_nanoseconds;
+            let scale = t.scale;
+            regional_or(
+                style,
+                // The reference fails here on Windows with an internal error
+                // and works on Linux; formatting it is the useful reading.
+                || stamp(0, (ticks / TICKS_PER_SECOND) as u32).and_then(regional::long_time),
+                || time_text(ticks, scale),
+            )
+        }
+        ColumnValues::DateTime(dt) => {
+            let (days, ticks) = (dt.days as i64, dt.time);
+            regional_or(
+                style,
+                || {
+                    let seconds = (ticks as u64 * 1000 + 150) / 300 / 1000;
+                    stamp(days + DAYS_FROM_YEAR_ONE_TO_1900, seconds as u32)
+                        .and_then(regional::date_and_time)
+                },
+                || datetime_text(days, ticks),
+            )
+        }
+        ColumnValues::SmallDateTime(dt) => {
+            let (days, minutes) = (dt.days as i64, dt.time);
+            regional_or(
+                style,
+                || {
+                    stamp(days + DAYS_FROM_YEAR_ONE_TO_1900, minutes as u32 * 60)
+                        .and_then(regional::date_and_time)
+                },
+                || smalldatetime_text(days, minutes),
+            )
+        }
+        ColumnValues::DateTime2(dt) => {
+            let days = dt.days as i64;
+            let seconds = (dt.time.time_nanoseconds / TICKS_PER_SECOND) as u32;
+            regional_or(
+                style,
+                || stamp(days, seconds).and_then(regional::date_and_time),
+                || datetime2_text(days, &dt.time),
+            )
+        }
         ColumnValues::DateTimeOffset(dto) => {
             // The driver reports the instant in UTC; the reference shows local
             // time alongside the offset that produced it.
@@ -78,15 +146,63 @@ pub fn render(value: &ColumnValues, column: &ColumnMetadata, compat: Compat) -> 
             let day_ticks = seconds_per_day() * TICKS_PER_SECOND as i64;
             let days = dto.datetime2.days as i64 + ticks.div_euclid(day_ticks);
             let local = ticks.rem_euclid(day_ticks) as u64;
-            format!(
-                "{} {} {}",
-                date_text(days),
-                time_text(local, dto.datetime2.time.scale),
-                offset_text(dto.offset)
+            let offset = offset_text(dto.offset);
+            regional_or(
+                style,
+                || {
+                    stamp(days, (local / TICKS_PER_SECOND) as u32)
+                        .and_then(regional::date_and_time)
+                        .map(|text| format!("{text} {offset}"))
+                },
+                || {
+                    format!(
+                        "{} {} {}",
+                        date_text(days),
+                        time_text(local, dto.datetime2.time.scale),
+                        offset
+                    )
+                },
             )
         }
         ColumnValues::Vector(v) => format!("{v:?}"),
     }
+}
+
+/// Uses the regional rendering when `-R` asked for it and the platform could
+/// supply one, and the plain rendering otherwise.
+///
+/// Falling back rather than failing matters: a locale service that cannot
+/// answer should cost formatting, not the value.
+fn regional_or(
+    style: ValueStyle,
+    localized: impl FnOnce() -> Option<String>,
+    plain: impl FnOnce() -> String,
+) -> String {
+    if style.regional
+        && let Some(text) = localized()
+    {
+        return text;
+    }
+    plain()
+}
+
+/// Splits a day number and a second-of-day into calendar fields.
+fn stamp(days_from_year_one: i64, seconds_of_day: u32) -> Option<regional::Timestamp> {
+    let (year, month, day) = civil_from_days(days_from_year_one);
+    Some(regional::Timestamp {
+        year: i32::try_from(year).ok()?,
+        month,
+        day,
+        hour: seconds_of_day / 3600,
+        minute: (seconds_of_day % 3600) / 60,
+        second: seconds_of_day % 60,
+    })
+}
+
+/// `money` in the locale's currency format, or its plain four decimals.
+fn money(units: i64, style: ValueStyle) -> String {
+    let plain = money_text(units, style.compat);
+    regional_or(style, || regional::currency(&plain), || plain.clone())
 }
 
 /// `binary(n)` is zero-padded to its declared length; `varbinary` is not.

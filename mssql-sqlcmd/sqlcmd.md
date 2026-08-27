@@ -284,7 +284,18 @@ counting its dashed rule, not read from documentation.
   — see the driver change below. That is what makes `SET NOCOUNT ON` behave.
 5.12 `[x]` `-p` / `-p1` statistics block.
 5.13 `[x]` `:xml on|off`.
-5.14 `[!]` `-R` regional formatting — accepted and ignored; see Phase 9.
+5.14 `[x]` `-R` regional formatting — implemented. The earlier note here claimed all three tools
+  ignored it; that was wrong, and only checking the binary showed it. ODBC formats money,
+  `decimal`/`numeric` and every date/time type through the platform's locale services, and does
+  so on Linux as well as Windows — `1234.56` becomes `$1,234.56` on en-US Windows and `1235` in
+  the Linux `C` locale, where POSIX reports `frac_digits` as unspecified. go-sqlcmd accepts the
+  flag and ignores it, so `-R` is inert under `--compat go`.
+
+  Three reference defects are deliberately not reproduced, since each puts something in front of
+  a user that cannot be intended: `datetime2` renders an unsubstituted `printf` specifier
+  (`1:45:06.%07lu PM`) on Windows; `time` fails there with an internal error; and negative
+  `money` fails on Linux with another. Ten differential cases cover everything it renders
+  correctly, on both platforms.
 
 **Verify:** 20 differential cases covering one column per type family, NULLs, `-s`, `-W`, `-h`,
 `-w`, `-y`, `-Y`, and the `-k` family.
@@ -440,8 +451,6 @@ paths are wired but unverified, for want of a server to verify them against.
 
 ### Still accepted and ignored, deliberately
 
-- `-R` — asks for locale-driven number and date formatting, which differs from the invariant
-  form only on non-English locales. go-sqlcmd ignores it too. Documented on the field.
 - `-T` — undocumented bind token.
 - `:serverlist`, `:perftrace`.
 

@@ -914,6 +914,9 @@ impl Session {
             xml: self.xml_mode,
             format: self.format,
             compat: self.options.compat,
+            // go-sqlcmd accepts `-R` and ignores it, so the flag only takes
+            // effect in ODBC mode, where the reference honours it.
+            regional: self.options.use_regional_settings && !self.options.compat.is_go(),
             colors: self.colors,
         }
     }

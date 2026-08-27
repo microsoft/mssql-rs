@@ -5,6 +5,7 @@
 
 pub mod color;
 pub mod layout;
+pub mod regional;
 pub mod report;
 pub mod schemes;
 pub mod table;

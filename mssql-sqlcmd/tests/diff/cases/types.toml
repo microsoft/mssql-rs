@@ -119,3 +119,60 @@ args = ["-C", "-Q", "SELEC 1"]
 name = "set nocount suppresses the row count"
 connect = true
 args = ["-C", "-Q", "SET NOCOUNT ON SELECT 1 AS a"]
+
+# --- -R, the client's regional settings ---------------------------------------
+#
+# Only ODBC implements this; go-sqlcmd accepts the flag and ignores it. What the
+# text looks like depends on the machine's locale, which is exactly why these
+# are differential rather than golden: on en-US Windows `1234.56` renders as
+# `$1,234.56`, in the Linux `C` locale as `1235`.
+[[case]]
+name = "regional money"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS money) AS v"]
+
+[[case]]
+name = "regional smallmoney"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(12.34 AS smallmoney) AS v"]
+
+[[case]]
+name = "regional decimal"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS decimal(10,2)) AS v"]
+
+[[case]]
+name = "regional numeric"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS numeric(10,4)) AS v"]
+
+[[case]]
+name = "regional date"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST('2026-03-04' AS date) AS v"]
+
+[[case]]
+name = "regional datetime"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST('2026-03-04 13:45:06' AS datetime) AS v"]
+
+[[case]]
+name = "regional smalldatetime"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST('2026-03-04 13:45' AS smalldatetime) AS v"]
+
+# `-R` deliberately leaves these alone, in both tools.
+[[case]]
+name = "regional leaves int alone"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234567 AS int) AS v"]
+
+[[case]]
+name = "regional leaves float alone"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS float) AS v"]
+
+[[case]]
+name = "regional leaves text alone"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT 'plain text' AS v"]
