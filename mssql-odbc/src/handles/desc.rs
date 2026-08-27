@@ -56,38 +56,51 @@
 //! today. Tracked under the same AB#47437 aliasing work as the IRD/IPD
 //! record population above.
 
+use std::ffi::c_void;
 use std::sync::Mutex;
 
 use super::{HandleType, HasObjectType};
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ARRAY_SIZE,
-    SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE, SQL_DESC_CONCISE_TYPE,
-    SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_INDICATOR_PTR,
-    SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE, SQL_DESC_OCTET_LENGTH,
-    SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
+    SQL_C_DEFAULT, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER,
+    SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
+    SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
+    SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
+    SQL_DESC_OCTET_LENGTH, SQL_DESC_OCTET_LENGTH_PTR, SQL_DESC_PARAMETER_TYPE, SQL_DESC_PRECISION,
     SQL_DESC_ROWS_PROCESSED_PTR, SQL_DESC_SCALE, SQL_DESC_TYPE, SQL_DESC_UNNAMED, SQL_NULLABLE,
     SQL_PARAM_INPUT, SQL_ROWSET_SIZE_DEFAULT, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
     SqlUSmallInt,
 };
 use crate::error::{DiagRecord, HasDiagnostics};
 
-/// The four automatically-allocated implicit descriptors owned by every
-/// statement: application/implementation row/parameter descriptors.
+/// The five descriptor shapes this driver constructs: the four
+/// automatically-allocated implicit descriptors owned by every statement
+/// (application/implementation row/parameter), plus the generic explicit
+/// application descriptor allocated by `SQLAllocHandle(SQL_HANDLE_DESC, ...)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DescKind {
     AppRow,
     AppParam,
     ImpRow,
     ImpParam,
+    /// An explicitly-allocated application descriptor. Unlike `AppRow`/
+    /// `AppParam`, it has no fixed row-or-parameter role: a single explicit
+    /// descriptor can be associated as one statement's ARD and another's APD
+    /// at the same time (`SQLSetStmtAttrW`), so it cannot be tagged with
+    /// either role at allocation time. Behaves identically to `AppRow`/
+    /// `AppParam` for field classification — msodbcsql tags all three the
+    /// same generic `SQL_HANDLE_AD` (`sqlcdesc.cpp:5891`), since ARD and APD
+    /// were never a behaviorally distinct pair to begin with.
+    Ad,
 }
 
 impl DescKind {
-    /// `true` for the two application descriptors (ARD/APD) an application
-    /// binds directly; `false` for the driver-owned implementation
-    /// descriptors (IRD/IPD). msodbcsql calls the ARD/APD shape `AD` since
-    /// both share one record layout (`sqlsrv.h:1546-1557`).
+    /// `true` for descriptors an application binds directly (the two
+    /// implicit application descriptors, ARD/APD, plus any explicit
+    /// descriptor); `false` for the driver-owned implementation descriptors
+    /// (IRD/IPD). msodbcsql calls this shape `AD` since all three share one
+    /// record layout (`sqlsrv.h:1546-1557`).
     pub(crate) fn is_application(self) -> bool {
-        matches!(self, DescKind::AppRow | DescKind::AppParam)
+        matches!(self, DescKind::AppRow | DescKind::AppParam | DescKind::Ad)
     }
 }
 
@@ -96,6 +109,26 @@ impl DescKind {
 pub(crate) struct DescHandle {
     pub(crate) object_type: HandleType,
     pub(crate) kind: DescKind,
+    /// `SQL_DESC_ALLOC_TYPE`: `SQL_DESC_ALLOC_AUTO` for the four implicit
+    /// descriptors, `SQL_DESC_ALLOC_USER` for one allocated by
+    /// `SQLAllocHandle(SQL_HANDLE_DESC, ...)`. Mirrored into
+    /// `DescState::header::alloc_type` for the `SQLGetDescFieldW`-visible
+    /// copy; kept here too, outside `inner`, so lifecycle code (association,
+    /// free) can tell implicit and explicit descriptors apart without a lock.
+    /// Sound as a plain field because the value is fixed at construction and
+    /// `SQL_DESC_ALLOC_TYPE` is permanently read-only (`classify_field`), so
+    /// the two copies can never diverge.
+    pub(crate) alloc_type: SqlSmallInt,
+    /// Back-pointer to the owning DBC. Every descriptor has one — including
+    /// the four implicit descriptors, owned by their statement's parent DBC —
+    /// but only explicit descriptors need it: it is what
+    /// `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC)` compares
+    /// against the target statement's own `parent_dbc` (HY024 on mismatch),
+    /// and what `SQLFreeHandle(SQL_HANDLE_DESC)` uses to find every statement
+    /// that might currently have this descriptor as its active ARD/APD. Set
+    /// once at construction, never mutated — same soundness rationale as
+    /// `StmtHandle::parent_dbc`.
+    pub(crate) parent_dbc: *mut c_void,
     pub(crate) inner: Mutex<DescState>,
 }
 
@@ -105,9 +138,10 @@ pub(crate) struct DescHandle {
 /// shared `GENDESCTAG` (`sqlsrv.h:1167-1178`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DescHeader {
-    /// `SQL_DESC_ALLOC_TYPE`. Always `SQL_DESC_ALLOC_AUTO`: every descriptor
-    /// is implicit until explicit allocation (`SQLAllocHandle(SQL_HANDLE_DESC,
-    /// ...)`, AB#47436) exists.
+    /// `SQL_DESC_ALLOC_TYPE`, mirrored from [`DescHandle::alloc_type`] at
+    /// construction (see that field's doc comment for why the value lives in
+    /// both places). Always read-only through `SQLSetDescFieldW`
+    /// (`classify_field`).
     pub(crate) alloc_type: SqlSmallInt,
     /// `SQL_DESC_ARRAY_SIZE`. ARD/APD only.
     pub(crate) array_size: SqlULen,
@@ -191,7 +225,7 @@ impl DescRecord {
     /// IRD record here is simply zeroed, matching an unpopulated column.
     fn default_for(kind: DescKind) -> Self {
         let (concise_type, parameter_type, nullable) = match kind {
-            DescKind::AppRow | DescKind::AppParam => (SQL_C_DEFAULT, 0, 0),
+            DescKind::AppRow | DescKind::AppParam | DescKind::Ad => (SQL_C_DEFAULT, 0, 0),
             DescKind::ImpParam => (0, SQL_PARAM_INPUT, SQL_NULLABLE),
             DescKind::ImpRow => (0, 0, SQL_NULLABLE),
         };
@@ -276,16 +310,28 @@ impl DescState {
 }
 
 impl DescHandle {
-    pub(crate) fn new(kind: DescKind) -> Self {
+    pub(crate) fn new(kind: DescKind, alloc_type: SqlSmallInt, parent_dbc: *mut c_void) -> Self {
         Self {
             object_type: HandleType::Desc,
             kind,
+            alloc_type,
+            parent_dbc,
             inner: Mutex::new(DescState {
                 diag_records: Vec::new(),
-                header: DescHeader::default(),
+                header: DescHeader {
+                    alloc_type,
+                    ..DescHeader::default()
+                },
                 records: Vec::new(),
             }),
         }
+    }
+
+    /// `true` for an explicitly-allocated descriptor
+    /// (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`), `false` for one of the four
+    /// implicit descriptors a statement owns from creation.
+    pub(crate) fn is_explicit(&self) -> bool {
+        self.alloc_type == SQL_DESC_ALLOC_USER
     }
 }
 
@@ -306,15 +352,21 @@ impl HasDiagnostics for DescState {
 
 // SAFETY: `DescHeader`/`DescRecord` hold raw pointers
 // (`array_status_ptr`, `bind_offset_ptr`, `rows_processed_ptr`, `data_ptr`,
-// `indicator_ptr`, `octet_length_ptr`), which prevents auto-derivation of
+// `indicator_ptr`, `octet_length_ptr`), and `DescHandle` itself holds
+// `parent_dbc`, which together prevent auto-derivation of
 // `Send`/`Sync` for `DescState` and therefore `DescHandle` (same pattern as
 // `StmtHandle`/`BoundParam`, which store the analogous application buffer
-// addresses). Every one of these pointers is an opaque application-owned
-// address: copied in by `SQLSetDescFieldW`/`SQLSetStmtAttrW`, copied out by
+// addresses). Every one of the `DescHeader`/`DescRecord` pointers is an
+// opaque application-owned address: copied in by
+// `SQLSetDescFieldW`/`SQLSetStmtAttrW`, copied out by
 // `SQLGetDescFieldW`/`SQLGetStmtAttrW`, and never dereferenced by this
-// module. The Driver Manager may legitimately call ODBC entry points for the
-// same handle from different threads (serialized by `inner`'s mutex), so the
-// handle itself must be `Send + Sync`.
+// module. `parent_dbc` is set once at construction and never mutated, and the
+// parent DBC is guaranteed alive because the DM ensures every descriptor —
+// implicit (freed with its owning statement) or explicit (freed by
+// `SQLFreeHandle(SQL_HANDLE_DESC)`) — is freed before its connection. The
+// Driver Manager may legitimately call ODBC entry points for the same handle
+// from different threads (serialized by `inner`'s mutex), so the handle
+// itself must be `Send + Sync`.
 unsafe impl Send for DescHandle {}
 unsafe impl Sync for DescHandle {}
 
@@ -415,11 +467,12 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_DATETIME, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP};
 
-    const ALL_KINDS: [DescKind; 4] = [
+    const ALL_KINDS: [DescKind; 5] = [
         DescKind::AppRow,
         DescKind::AppParam,
         DescKind::ImpRow,
         DescKind::ImpParam,
+        DescKind::Ad,
     ];
 
     #[test]
@@ -576,11 +629,27 @@ mod tests {
 
     #[test]
     fn new_descriptor_starts_with_no_records_and_default_header() {
-        let handle = DescHandle::new(DescKind::AppParam);
+        let handle = DescHandle::new(
+            DescKind::AppParam,
+            SQL_DESC_ALLOC_AUTO,
+            std::ptr::null_mut(),
+        );
         let state = handle.inner.lock().unwrap();
         assert!(state.records.is_empty());
         assert_eq!(state.header.alloc_type, SQL_DESC_ALLOC_AUTO);
         assert_eq!(state.header.array_size, SQL_ROWSET_SIZE_DEFAULT);
+    }
+
+    #[test]
+    fn new_explicit_descriptor_reports_alloc_user_on_both_copies() {
+        let dbc = 0x1234_usize as *mut c_void;
+        let handle = DescHandle::new(DescKind::Ad, SQL_DESC_ALLOC_USER, dbc);
+        assert!(handle.is_explicit());
+        assert_eq!(handle.parent_dbc, dbc);
+        assert_eq!(
+            handle.inner.lock().unwrap().header.alloc_type,
+            SQL_DESC_ALLOC_USER
+        );
     }
 
     #[test]
