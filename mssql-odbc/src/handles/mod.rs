@@ -25,7 +25,6 @@ pub(crate) enum HandleType {
     Env = 1,
     Dbc = 2,
     Stmt = 3,
-    #[allow(dead_code)]
     Desc = 4,
     Invalid = 0xDEADBEEF,
 }
