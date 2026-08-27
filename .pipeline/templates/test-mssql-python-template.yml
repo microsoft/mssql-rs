@@ -85,6 +85,8 @@ steps:
         update-ca-certificates
         source ~/.cargo/env
 
+        bash /workspace/.pipeline/scripts/ensure-rust-toolchain.sh /workspace
+
         # Use the build image'"'"'s pre-installed Python 3.10 (mssql-python requires >=3.10).
         # No PPA install — avoids dependency on Launchpad availability.
         python3 -m venv /tmp/py-venv

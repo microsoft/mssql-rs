@@ -181,26 +181,40 @@ fn sql_param_data_safe(
         Ok(StreamedParamStatus::NeedData { param_name: _ }) => {
             // Advance to the next DAE parameter.
             let next_ptr = {
-                let Ok(mut stmt_state) = stmt.inner.lock() else {
-                    error!("SQLParamData: stmt mutex poisoned advancing DAE index");
-                    // The RPC is still open on the next parameter and the
-                    // statement can no longer hold the client. Discard the
-                    // half-written request before the client goes back to the
-                    // idle pool, or the next command on it fails as already
-                    // executing.
-                    dbc.runtime.block_on(client.cancel_streamed_write());
-                    return_client_idle(dbc, statement_handle, client);
-                    return SQL_ERROR;
+                let mut stmt_state = match stmt.inner.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        error!("SQLParamData: stmt mutex poisoned advancing DAE index");
+                        // The RPC is still open on the next parameter and the
+                        // statement can no longer hold the client. Discard the
+                        // half-written request before the client goes back to
+                        // the idle pool, or the next command on it fails as
+                        // already executing.
+                        dbc.runtime.block_on(client.cancel_streamed_write());
+                        return_client_idle(dbc, statement_handle, client);
+                        return SQL_ERROR;
+                    }
                 };
-                let Some(dae) = stmt_state.dae.as_mut() else {
-                    error!("SQLParamData: DAE sequence vanished while advancing");
-                    dbc.runtime.block_on(client.cancel_streamed_write());
-                    return_client_idle(dbc, statement_handle, client);
-                    return SQL_ERROR;
-                };
-                dae.return_client(client);
-                dae.advance();
-                stmt_state.dae_current_value_ptr()
+                match stmt_state.dae.as_mut() {
+                    Some(dae) => {
+                        dae.return_client(client);
+                        dae.advance();
+                        stmt_state.dae_current_value_ptr()
+                    }
+                    None => {
+                        // Drop the STMT guard before touching the DBC lock in
+                        // `return_client_idle`: `SQLFreeHandle(SQL_HANDLE_DESC)`
+                        // locks DBC then STMT (to reset any statement whose
+                        // active ARD/APD is the freed descriptor), so holding
+                        // STMT across a DBC-lock call here would be the
+                        // reverse order and risk an ABBA deadlock against it.
+                        drop(stmt_state);
+                        error!("SQLParamData: DAE sequence vanished while advancing");
+                        dbc.runtime.block_on(client.cancel_streamed_write());
+                        return_client_idle(dbc, statement_handle, client);
+                        return SQL_ERROR;
+                    }
+                }
             };
 
             unsafe { write_if_some(value_ptr_ptr, next_ptr) };
