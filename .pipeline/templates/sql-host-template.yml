@@ -56,8 +56,8 @@ parameters:
     type: string
     default: 'imageOverride -equals RUST-UBUSLIM'
   - name: jobCondition
-    # Job-level condition. Defaults to succeeded(); callers that only need the
-    # SQL host on PRs (e.g. the Build stage) pass a Build.Reason check.
+    # Job-level condition. Defaults to succeeded(); custom conditions must retain
+    # a status check so cancellation does not leave the SQL host running.
     type: string
     default: succeeded()
 
