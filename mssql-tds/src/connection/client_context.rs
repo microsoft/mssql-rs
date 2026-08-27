@@ -174,6 +174,16 @@ pub enum TdsAuthenticationMethod {
     ActiveDirectoryWorkloadIdentity,
     /// Azure AD integrated authentication using current user's Kerberos ticket.
     ActiveDirectoryIntegrated,
+    /// Azure CLI (`az login`) credentials.
+    ActiveDirectoryAzCli,
+    /// Azure Developer CLI (`azd auth login`) credentials.
+    ActiveDirectoryAzureDeveloperCli,
+    /// Azure Pipelines workload identity federation via a service connection.
+    ActiveDirectoryAzurePipelines,
+    /// Credentials taken from the standard `AZURE_*` environment variables.
+    ActiveDirectoryEnvironment,
+    /// Confidential client authenticating with a signed client assertion.
+    ActiveDirectoryClientAssertion,
     /// Pre-acquired access token (bearer JWT).
     AccessToken,
 }
@@ -303,6 +313,18 @@ pub struct ClientContext {
     /// If not provided, the SPN will be automatically generated from the server address.
     /// Format: MSSQLSvc/<hostname>:<port> or MSSQLSvc/<hostname>:<instance>
     pub server_spn: Option<String>,
+    /// Overrides the server name written into the LOGIN7 packet, leaving the
+    /// address actually dialled untouched.
+    ///
+    /// This separates *where to connect* from *what name to present at login*,
+    /// which is what a connection through a tunnel, proxy or port-forward
+    /// needs: the socket goes to `localhost:1433` while the login must still
+    /// name the real server so the server-side routing and any name-based
+    /// policy see the intended target.
+    ///
+    /// `None` (the default) writes the dialled address, matching the previous
+    /// behaviour.
+    pub login_server_name: Option<String>,
     pub(crate) transport_context: TransportContext,
     /// Protocol vector version for feature negotiation.
     pub vector_version: VectorVersion,
@@ -501,6 +523,7 @@ impl ClientContext {
             pooling: false,
             replication: false,
             server_spn: None,
+            login_server_name: None,
             tds_authentication_method: TdsAuthenticationMethod::Password,
             user_instance: false,
             user_name: "".to_string(),
@@ -568,6 +591,7 @@ impl ClientContext {
             user_name: "".to_string(),
             workstation_id: ClientContext::default_workstation_id(hostname::get),
             server_spn: None,
+            login_server_name: None,
             access_token: None,
             transport_context: TransportContext::Tcp {
                 host: "localhost".to_string(),
@@ -683,6 +707,19 @@ impl ClientContext {
                     self.tds_authentication_method
                 ))
             })
+    }
+
+    /// The server name to write into LOGIN7: the `login_server_name` override
+    /// when one is set, otherwise the address being dialled.
+    ///
+    /// The login packet stores this as an offset/length pair separate from the
+    /// payload, so the length and the bytes must be derived from the same
+    /// value — hence a single accessor rather than two call sites reading the
+    /// override independently.
+    pub(crate) fn login_server_name(&self, transport: &TransportContext) -> String {
+        self.login_server_name
+            .clone()
+            .unwrap_or_else(|| transport.get_login_server_name())
     }
 }
 
@@ -814,6 +851,7 @@ impl Clone for ClientContext {
             user_name: self.user_name.clone(),
             workstation_id: self.workstation_id.clone(),
             server_spn: self.server_spn.clone(),
+            login_server_name: self.login_server_name.clone(),
             access_token: self.access_token.clone(),
             transport_context: self.transport_context.clone(),
             vector_version: self.vector_version,
