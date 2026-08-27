@@ -51,11 +51,19 @@ output byte for byte.
 | vs Go legacy CLI | **64 pass, 0 fail** | **64 pass, 0 fail** |
 | vs Go subcommand CLI | **49 pass, 0 fail**, 4 skip | **49 pass, 0 fail**, 4 skip |
 | …with container lifecycle | **53 pass, 0 fail, 0 skip** | **53 pass, 0 fail, 0 skip** |
-| `SQLCMDCOLORSCHEME` — gate + `:list color` | **3 pass** | **3 pass** |
+| Go-only features (`--vertical`, `--ascii`, `-p`, `--trace-file`) | **17 pass, 0 fail** | **17 pass, 0 fail** |
 | `SQLCMDCOLORSCHEME` — full colour, via PTY | see below | **35 match, 0 differ** |
-| Unit + integration | **241 pass** | **226 pass** |
+| Whole `mssql-sqlcmd` suite | **246 run, 246 pass, 0 fail** | **254 run, 254 pass, 0 fail** |
+
 Skips are recorded with reasons. The Linux ODBC skips are Windows-only surface
 (named pipes, registry DSNs) that does not exist there.
+
+The two totals differ because `cargo nextest` counts each unit test separately
+and the Linux run reaches eight more of them: the Go-only feature cases that
+need a server used to hard-code a Windows integrated-auth connection, so they
+could never have run on Linux. They now take the same connection prefix as
+every other suite, and seven cases that were silently Windows-only became real
+Linux coverage.
 
 **Why two rows differ by platform** — both are *test* coverage, not feature gaps:
 
@@ -95,8 +103,10 @@ winner, the Rust build carries both behaviours:
 
 - **ODBC behaviour is the default**, so an existing script keeps working with no
   changes and no flags. ODBC has the larger installed base.
-- **`--compat go`** (or `SQLCMDCOMPAT=go`) switches to Go's rendering, wording
-  and exit codes.
+- **`--compat go`** switches to Go's rendering, wording and exit codes.
+  `SQLCMDCOMPAT=go` in the environment does the same thing; the flag wins when
+  both are present, and a name neither tool answers to is refused rather than
+  ignored.
 - **Go's subcommands** (`sqlcmd config`, `query`, `create`, `start`, `stop`,
   `delete`, `open`) are always available — they use a different syntax, so
   nothing conflicts.
@@ -109,34 +119,51 @@ semantics.
 
 ### Measured divergences
 
-| Behaviour | ODBC | Go | Rust default |
-|---|---|---|---|
-| Row count wording | `(1 rows affected)` | `(1 row affected)` | ODBC |
-| Batch line endings | preserved from input | rewritten to platform | ODBC |
-| `-e` echo | blank line after | none | ODBC |
-| `-h 2` repeated heading | blank line after rule | none | ODBC |
-| `SET NOCOUNT ON` | trailing blank line | none | ODBC |
-| `--ascii` before count | no blank line | blank line | ODBC |
-| `SQLCMDLOGINTIMEOUT` default | `30` | `8` | ODBC |
-| `SQLCMDEDITOR` default | `edit.com` | `vi` | ODBC |
-| `SQLCMDDBNAME` without `-d` | `""` | `master` | ODBC |
-| `SQLCMDUSER` under `-E` | `DOMAIN\user` | `""` | ODBC |
-| `-i` with `-q`/`-Q` | refused as exclusive | accepted | ODBC |
-| `-X` and env seeding | still seeds | suppresses | ODBC |
-| `-X` and `SQLCMDINI` | still runs script | suppresses | ODBC |
-| State-127 exit (Unix) | clamps to `1` | truncates to 8 bits | ODBC |
-| Error routed to stderr | keeps `Msg …` header | drops header, adds blank line | ODBC |
-| `-m` and `PRINT` output | hidden below threshold | never hidden | ODBC |
-| Stray word `sqlcmd foo` | `'foo': Unexpected argument` | `'foo': Unknown command` | ODBC, in both modes |
+Every row was measured by running all four binaries — ODBC, go-sqlcmd, and this
+build in each mode — against the same SQL Server. The last two columns say which
+reference each mode actually matched, not which one it was meant to.
 
-The last row is the only wording difference left, and it is cosmetic. A bare
-word is a *subcommand name* to go-sqlcmd, since its modern CLI is command-based,
-so it reports "Unknown command"; the legacy path here treats it as a stray
-argument, matching ODBC exactly. It cannot appear in a working script.
+| Behaviour | ODBC | Go | Default | `--compat go` |
+|---|---|---|---|---|
+| Row count wording | `(1 rows affected)` | `(1 row affected)` | ODBC | Go |
+| Batch line endings | preserved from input | rewritten to platform | ODBC | Go |
+| `-e` echo | blank line after | none | ODBC | Go |
+| `-h 2` repeated heading | blank line after rule | none | ODBC | Go |
+| `SET NOCOUNT ON` | trailing blank line | none | ODBC | Go |
+| `--ascii` before count | no blank line | blank line | ODBC | Go |
+| `SQLCMDLOGINTIMEOUT` default | `8` | `30` | ODBC | Go |
+| `SQLCMDEDITOR` default | `edit.com` | `notepad.exe` on Windows, `vi` elsewhere | ODBC | Go |
+| `SQLCMDUSER` under `-E` | bare `user` | `DOMAIN\user` | ODBC | Go |
+| `SQLCMDDBNAME` after `:connect` with no database | keeps the previous value | cleared | ODBC | Go |
+| `-X` and env seeding | still seeds | suppresses | ODBC | Go |
+| `-X` and `SQLCMDINI` | still runs script | suppresses | ODBC | Go |
+| State-127 exit (Unix) | clamps to `1` | truncates to 8 bits | ODBC | Go |
+| Error routed to stderr | keeps `Msg …` header | drops header, adds blank line | ODBC | Go |
+| `-m` and messages at severity ≤ 10 | hidden below the threshold | never hidden | ODBC | Go |
+| `-m -1` | adds the `Msg …` header to low-severity messages | no header | ODBC | Go |
+| `-i` with `-q`/`-Q` | refused as exclusive | accepted | ODBC | **ODBC, in both modes** |
+| Stray word `sqlcmd foo` | `'foo': Unexpected argument` | `'foo': Unknown command` | ODBC | **ODBC, in both modes** |
+
+`SQLCMDDBNAME` is *not* in this table: both references leave it empty when `-d`
+is absent — neither fills in the database the login landed in — and both set it
+to exactly what `-d` asked for. `PRINT` output is likewise not a divergence:
+neither reference ever hides it, whatever `-m` says.
+
+#### The two rows that do not follow `--compat go`
+
+Both are argument-parsing decisions taken before a connection exists, and
+neither can appear in a script that works today:
+
+- **Stray word.** A bare word is a *subcommand name* to go-sqlcmd, whose modern
+  CLI is command-based, so it reports "Unknown command". The legacy path here
+  treats it as a stray argument and matches ODBC exactly.
+- **`-i` with `-q`/`-Q`.** ODBC refuses the combination on Windows; go-sqlcmd
+  accepts it. This build refuses it in both modes.
 
 Unknown *options* do match Go's and ODBC's wording exactly — `-9`, `-8` and
 `-BOGUS` all produce `Sqlcmd: '<token>': Unknown Option. Enter '-?' for help.`,
 byte for byte, and are covered by differential cases.
+
 
 ---
 
@@ -363,6 +390,31 @@ Precedence: `:setvar` > `-v` > environment > built-in default.
 |---|---|
 | `-T` semantics | Undocumented in the reference; accepted and ignored, as ODBC does |
 
+### Defects this document previously hid
+
+Every row below was a real defect found by re-measuring the claims in §2
+against all four binaries rather than trusting the table. Each is fixed and
+covered by a test. They are recorded because they show what the differential
+suite could *not* catch on its own: a case that no differential case exercised,
+or a table row written from expectation rather than measurement.
+
+| Defect | Was | Now |
+|---|---|---|
+| `SQLCMDCOMPAT` | Documented here and in the source, but never read — the only caller of the parser was the `--compat` flag | Honoured, with the flag taking precedence and an unrecognised name refused |
+| `$(var)` in `-Q` / `-q` | Sent to the server unexpanded. Substitution worked from `-i` files, because only those went through the batch pipeline | Substituted, whatever the source |
+| `-e` with `-Q` / `-q` | Echoed nothing, for the same reason | Echoes, matching each reference |
+| `-q` **and** `-Q` together | Ran both queries | `-Q` wins, as both references do |
+| `PRINT` under `-m n` | Hidden below the threshold | Shown — measured, neither reference ever hides `PRINT` |
+| `-m -1` | No `Msg …` header | Header restored on numbered messages, ODBC mode |
+| `SQLCMDUSER` under `-E` | Empty | The OS account: bare under ODBC, `DOMAIN\user` under Go |
+| `SQLCMDDBNAME` without `-d` | `master` | Empty — measured, both references leave it empty |
+
+Four rows of the divergence table were also **wrong in this document**:
+`SQLCMDLOGINTIMEOUT` had ODBC and Go the wrong way round (ODBC is 8, Go is 30),
+`SQLCMDEDITOR` gave Go's default as `vi` when Windows uses `notepad.exe`,
+`SQLCMDUSER` was inverted, and `SQLCMDDBNAME` was listed as a divergence when
+the two references agree.
+
 ### Three reference defects deliberately not reproduced
 
 `-R` is the one place where matching the reference byte for byte would mean
@@ -386,8 +438,15 @@ differential cases covering money, `smallmoney`, `decimal`, `numeric`, `date`,
 **Testing is differential, not golden.** Almost nothing is asserted against
 hand-written expected output. Each case runs the real binary and the Rust binary
 side by side and compares bytes, so the suite cannot drift from what the
-references actually do. That is also why the divergence tables above are
-trustworthy: every row was measured.
+references actually do.
+
+**But a differential suite only covers what it exercises.** Eight real defects
+sat behind a green suite until the divergence table in §2 was re-measured
+against all four binaries — most of them in `-Q`, which no differential case
+combined with `-e` or a `$(var)`. Two more only surfaced because the tables
+themselves were checked against the binaries rather than reread: four rows were
+recorded backwards. The rule that follows is that a claim about a reference is
+worth nothing until the reference has been run.
 
 **Cross-platform testing caught a bug Windows structurally could not.** Every
 line was terminated with Windows line endings, but both references use Unix

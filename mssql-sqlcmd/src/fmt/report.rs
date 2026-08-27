@@ -58,18 +58,33 @@ impl Message {
         self.severity > 10
     }
 
+    /// `PRINT` arrives as an info token numbered zero, where `RAISERROR` always
+    /// carries a number even at severity zero. The two are otherwise identical
+    /// on the wire, and every `-m` rule below turns on telling them apart:
+    /// `PRINT` is program output rather than a message, so no threshold hides
+    /// it and no `-m -1` gives it a header.
+    pub fn is_print(&self) -> bool {
+        self.number == 0
+    }
+
     /// The rendered form, already newline-terminated.
     ///
     /// `raw` is `-j`: the reference normally strips the driver's own prefix
     /// from the message text and `-j` leaves it on.
-    pub fn render(&self, raw: bool) -> String {
+    ///
+    /// `force_header` is ODBC's `-m -1`, which puts the `Msg ...` header on
+    /// messages that would otherwise print bare.
+    pub fn render(&self, raw: bool, force_header: bool) -> String {
         let text = if raw {
             format!("{DRIVER_PREFIX}{}", self.text)
         } else {
             self.text.clone()
         };
 
-        if !self.is_error() {
+        // An error always gets the header. `-m -1` extends it to the numbered
+        // messages that would otherwise print bare, but never to `PRINT`.
+        let wants_header = self.is_error() || (force_header && !self.is_print());
+        if !wants_header {
             return format!("{text}{EOL}");
         }
 
@@ -149,7 +164,7 @@ mod tests {
     #[test]
     fn errors_carry_the_msg_header() {
         assert_eq!(
-            message(16, None).render(false),
+            message(16, None).render(false, false),
             format!("Msg 50000, Level 16, State 1, Server SRV, Line 1{EOL}boom{EOL}")
         );
     }
@@ -157,7 +172,7 @@ mod tests {
     #[test]
     fn a_procedure_name_adds_a_field() {
         assert_eq!(
-            message(16, Some("dbo.p")).render(false),
+            message(16, Some("dbo.p")).render(false, false),
             format!(
                 "Msg 50000, Level 16, State 1, Server SRV, Procedure dbo.p, Line 1{EOL}boom{EOL}"
             )
@@ -167,21 +182,51 @@ mod tests {
     #[test]
     fn an_empty_procedure_name_is_omitted_rather_than_printed_blank() {
         assert_eq!(
-            message(16, Some("")).render(false),
+            message(16, Some("")).render(false, false),
             format!("Msg 50000, Level 16, State 1, Server SRV, Line 1{EOL}boom{EOL}")
         );
     }
 
     #[test]
     fn print_output_is_printed_bare() {
-        assert_eq!(message(10, None).render(false), format!("boom{EOL}"));
-        assert_eq!(message(0, None).render(false), format!("boom{EOL}"));
+        assert_eq!(message(10, None).render(false, false), format!("boom{EOL}"));
+        assert_eq!(message(0, None).render(false, false), format!("boom{EOL}"));
     }
 
     #[test]
     fn raw_mode_keeps_the_driver_prefix() {
-        assert!(message(16, None).render(true).contains("[SQL Server]boom"));
-        assert!(message(10, None).render(true).contains("[SQL Server]boom"));
+        assert!(
+            message(16, None)
+                .render(true, false)
+                .contains("[SQL Server]boom")
+        );
+        assert!(
+            message(10, None)
+                .render(true, false)
+                .contains("[SQL Server]boom")
+        );
+    }
+
+    /// `-m -1` against ODBC puts the header on a numbered severity-0 message
+    /// that would otherwise print bare. Measured: `RAISERROR('s0', 0, 1)`
+    /// prints `Msg 50000, Level 0, State 1, ... ` under `-m -1` and just `s0`
+    /// under `-m 0`.
+    #[test]
+    fn forcing_the_header_promotes_a_numbered_low_severity_message() {
+        assert_eq!(
+            message(0, None).render(false, true),
+            format!("Msg 50000, Level 0, State 1, Server SRV, Line 1{EOL}boom{EOL}")
+        );
+    }
+
+    /// `PRINT` is numbered zero and stays bare even under `-m -1`, which is
+    /// what both references do.
+    #[test]
+    fn forcing_the_header_leaves_print_alone() {
+        let mut print = message(0, None);
+        print.number = 0;
+        assert!(print.is_print());
+        assert_eq!(print.render(false, true), format!("boom{EOL}"));
     }
 
     #[test]

@@ -318,6 +318,20 @@ fn check_conflicts(lexed: &Lexed) -> Result<(), CliError> {
     Ok(())
 }
 
+/// `--compat` beats `SQLCMDCOMPAT`, which beats the ODBC default. Text that
+/// names neither tool is handed back so the caller can refuse it: a typo in
+/// the environment must not quietly leave the wrong mode running.
+fn resolve_compat(flag: Option<&str>, from_env: Option<&str>) -> Result<Compat, String> {
+    let chosen = match flag {
+        Some(text) => Some(text),
+        None => from_env.filter(|text| !text.trim().is_empty()),
+    };
+    match chosen {
+        Some(text) => Compat::parse(text).ok_or_else(|| text.to_string()),
+        None => Ok(Compat::default()),
+    }
+}
+
 /// Apply lexed options over the defaults.
 pub fn resolve(lexed: &Lexed) -> Result<Options, CliError> {
     check_conflicts(lexed)?;
@@ -326,10 +340,14 @@ pub fn resolve(lexed: &Lexed) -> Result<Options, CliError> {
     let mut headers_set = false;
     // `--compat` may appear after the options whose defaults it changes, so the
     // mode is settled first and the affected defaults applied before the pass.
-    if let Some(opt) = lexed.options.iter().find(|opt| opt.short == spec::COMPAT) {
-        o.compat = Compat::parse(value(opt))
-            .ok_or_else(|| CliError::Stderr(messages::unknown_compat(value(opt))))?;
-    }
+    let flag = lexed
+        .options
+        .iter()
+        .find(|opt| opt.short == spec::COMPAT)
+        .map(value);
+    let from_env = std::env::var("SQLCMDCOMPAT").ok();
+    o.compat = resolve_compat(flag, from_env.as_deref())
+        .map_err(|text| CliError::Stderr(messages::unknown_compat(&text)))?;
     if o.compat.is_go() {
         o.login_timeout = GO_LOGIN_TIMEOUT;
     }
@@ -579,6 +597,40 @@ mod tests {
             format!("Sqlcmd: '-w 3': value must be greater than 8 and less than 65536.{EOL}")
         );
         assert_eq!(resolve_args(&["-w", "9"]).unwrap().column_width, 9);
+    }
+
+    /// The environment picks the mode when no flag does, and loses to the flag
+    /// when both are present. Driven through the pure helper rather than the
+    /// real environment so the test cannot be disturbed by the shell it runs
+    /// under, or by a sibling test running beside it.
+    #[test]
+    fn the_compat_flag_outranks_the_environment() {
+        assert_eq!(resolve_compat(None, None), Ok(Compat::Odbc));
+        assert_eq!(resolve_compat(None, Some("go")), Ok(Compat::Go));
+        assert_eq!(resolve_compat(Some("odbc"), Some("go")), Ok(Compat::Odbc));
+        assert_eq!(resolve_compat(Some("go"), Some("odbc")), Ok(Compat::Go));
+    }
+
+    /// An empty `SQLCMDCOMPAT` is treated as unset, which is what a shell
+    /// leaves behind after `set SQLCMDCOMPAT=`.
+    #[test]
+    fn an_empty_compat_environment_variable_is_ignored() {
+        assert_eq!(resolve_compat(None, Some("")), Ok(Compat::Odbc));
+        assert_eq!(resolve_compat(None, Some("   ")), Ok(Compat::Odbc));
+    }
+
+    /// A misspelled mode is refused from either source rather than falling
+    /// back to a default the caller did not ask for.
+    #[test]
+    fn an_unknown_compat_name_is_refused_from_either_source() {
+        assert_eq!(
+            resolve_compat(Some("nonsense"), None),
+            Err("nonsense".into())
+        );
+        assert_eq!(
+            resolve_compat(None, Some("nonsense")),
+            Err("nonsense".into())
+        );
     }
 
     #[test]

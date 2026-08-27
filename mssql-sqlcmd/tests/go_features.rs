@@ -12,6 +12,12 @@ use std::process::{Command, Stdio};
 
 const SERVER_ENV: &str = "SQLCMD_DIFF_SERVER";
 
+/// The arguments that reach the server, matching the differential harness.
+/// Windows finds the default local instance over integrated auth with nothing
+/// but `-C`; Linux has neither a default instance nor a Kerberos ticket, so it
+/// needs the `-S`/`-U`/`-P` this carries.
+const CONNECT_ENV: &str = "SQLCMD_DIFF_CONNECT";
+
 struct Run {
     stdout: String,
     stderr: String,
@@ -39,6 +45,24 @@ fn sqlcmd(args: &[&str]) -> Run {
 
 fn have_server() -> bool {
     std::env::var_os(SERVER_ENV).is_some()
+}
+
+/// Runs a case that needs a server, prefixing whatever it takes to reach one.
+///
+/// The prefix goes first so a case can still override any of it. `-C` is the
+/// fallback rather than the default because the connection details cannot be
+/// baked in: the suite has to run against a local instance on Windows and a
+/// container on Linux.
+fn connected(args: &[&str]) -> Run {
+    let prefix: Vec<String> = match std::env::var(CONNECT_ENV) {
+        Ok(text) if !text.trim().is_empty() => {
+            text.split_whitespace().map(str::to_string).collect()
+        }
+        _ => vec!["-C".to_string()],
+    };
+    let mut all: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    all.extend_from_slice(args);
+    sqlcmd(&all)
 }
 
 #[test]
@@ -154,7 +178,7 @@ fn vertical_prints_one_field_per_line() {
     if !have_server() {
         return;
     }
-    let run = sqlcmd(&["-C", "--vertical", "-Q", "SELECT 1 AS id, 'Alice' AS name"]);
+    let run = connected(&["--vertical", "-Q", "SELECT 1 AS id, 'Alice' AS name"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert_eq!(run.stdout, "id   1\nname Alice\n\n\n(1 rows affected)\n");
 }
@@ -164,7 +188,7 @@ fn vertical_field_names_are_padded_to_the_longest() {
     if !have_server() {
         return;
     }
-    let run = sqlcmd(&["-C", "--vertical", "-Q", "SELECT 1 AS a, 2 AS longer"]);
+    let run = connected(&["--vertical", "-Q", "SELECT 1 AS a, 2 AS longer"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert_eq!(run.stdout, "a      1\nlonger 2\n\n\n(1 rows affected)\n");
 }
@@ -174,8 +198,7 @@ fn ascii_draws_a_bordered_table() {
     if !have_server() {
         return;
     }
-    let run = sqlcmd(&[
-        "-C",
+    let run = connected(&[
         "--ascii",
         "-Q",
         "SELECT 1 AS id, 'Alice' AS name UNION ALL SELECT 22, 'Bob'",
@@ -198,7 +221,7 @@ fn ascii_uses_the_column_separator_for_its_borders() {
     if !have_server() {
         return;
     }
-    let run = sqlcmd(&["-C", "--ascii", "-s", "#", "-Q", "SELECT 1 AS a"]);
+    let run = connected(&["--ascii", "-s", "#", "-Q", "SELECT 1 AS a"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert_eq!(
         run.stdout,
@@ -211,8 +234,8 @@ fn the_format_option_selects_a_layout_by_name() {
     if !have_server() {
         return;
     }
-    let by_name = sqlcmd(&["-C", "--format", "vert", "-Q", "SELECT 1 AS a"]);
-    let by_flag = sqlcmd(&["-C", "--vertical", "-Q", "SELECT 1 AS a"]);
+    let by_name = connected(&["--format", "vert", "-Q", "SELECT 1 AS a"]);
+    let by_flag = connected(&["--vertical", "-Q", "SELECT 1 AS a"]);
     assert_eq!(by_name.stdout, by_flag.stdout);
 }
 
@@ -221,7 +244,7 @@ fn statistics_follow_each_batch() {
     if !have_server() {
         return;
     }
-    let run = sqlcmd(&["-C", "-p", "-Q", "SELECT 1 AS a"]);
+    let run = connected(&["-p", "-Q", "SELECT 1 AS a"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(
         run.stdout.contains("Network packet size (bytes): 4096"),
@@ -241,7 +264,7 @@ fn the_colon_statistics_form_is_a_single_line() {
     if !have_server() {
         return;
     }
-    let run = sqlcmd(&["-C", "-p1", "-Q", "SELECT 1 AS a"]);
+    let run = connected(&["-p1", "-Q", "SELECT 1 AS a"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     let stats = run
         .stdout
@@ -260,8 +283,7 @@ fn a_trace_file_records_each_batch() {
     }
     let dir = tempfile::tempdir().expect("a temp dir");
     let trace = dir.path().join("trace.txt");
-    let run = sqlcmd(&[
-        "-C",
+    let run = connected(&[
         "--trace-file",
         trace.to_str().unwrap(),
         "-Q",

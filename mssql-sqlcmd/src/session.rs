@@ -180,31 +180,50 @@ impl Session {
             }
         }
 
-        if let Some(query) = self.options.initial_query.clone() {
-            self.run_text(&query, 1).await;
-        }
+        // `-Q` supersedes `-q` whichever order the two appear in: both
+        // references run the `-Q` text and discard the `-q` text rather than
+        // running one after the other.
+        let exit_after_command = self.options.query_and_exit.is_some();
+        let command_text = self
+            .options
+            .query_and_exit
+            .clone()
+            .or_else(|| self.options.initial_query.clone());
 
         let mut stop = Stop::EndOfInput;
 
-        if let Some(query) = self.options.query_and_exit.clone() {
-            self.run_text(&query, 1).await;
-        } else if !self.options.input_files.is_empty() {
-            for path in self.options.input_files.clone() {
-                match self.read_input(&path) {
-                    Some(text) => {
-                        if let Stop::Requested(code) = Box::pin(self.feed(&text)).await {
-                            stop = Stop::Requested(code);
-                            break;
+        if let Some(query) = command_text {
+            // Feeding this through the script path is what gives `-e` its echo
+            // and `$(var)` its substitution. Handing the text straight to
+            // `run_text` skipped both, so `-Q "SELECT '$(SQLCMDSERVER)'"` sent
+            // the unexpanded text to the server.
+            stop = Box::pin(self.feed(&query)).await;
+            if let Stop::EndOfInput = stop
+                && !self.batch.is_empty()
+            {
+                self.execute_cache(1).await;
+            }
+        }
+
+        if !exit_after_command && matches!(stop, Stop::EndOfInput) {
+            if self.options.input_files.is_empty() {
+                stop = Box::pin(self.interactive()).await;
+            } else {
+                for path in self.options.input_files.clone() {
+                    match self.read_input(&path) {
+                        Some(text) => {
+                            if let Stop::Requested(code) = Box::pin(self.feed(&text)).await {
+                                stop = Stop::Requested(code);
+                                break;
+                            }
                         }
-                    }
-                    None => {
-                        self.errors.write(&messages::invalid_input_filename(&path));
-                        self.exit_code = exitcode::FAILURE;
+                        None => {
+                            self.errors.write(&messages::invalid_input_filename(&path));
+                            self.exit_code = exitcode::FAILURE;
+                        }
                     }
                 }
             }
-        } else {
-            stop = Box::pin(self.interactive()).await;
         }
 
         // Anything still in the cache at end of input is run, as the reference does.
@@ -274,12 +293,10 @@ impl Session {
                 if let Some(server) = &self.options.server {
                     self.vars.set_internal("SQLCMDSERVER", server);
                 }
-                // go-sqlcmd reports only what the caller asked for, leaving
-                // `SQLCMDDBNAME` empty when `-d` was not given; ODBC fills in
-                // whichever database the login landed in.
-                if !self.options.compat.is_go() {
-                    self.vars.set_internal("SQLCMDDBNAME", client.database());
-                }
+                // `SQLCMDDBNAME` was already seeded from `-d`. Neither
+                // reference overwrites it with the database the login
+                // actually landed in: measured, both leave it empty when `-d`
+                // was absent even though the session is sitting in `master`.
                 self.client = Some(client);
                 Ok(())
             }
@@ -658,7 +675,14 @@ impl Session {
                 if let Some(server) = &options.server {
                     self.vars.set_internal("SQLCMDSERVER", server);
                 }
-                self.vars.set_internal("SQLCMDDBNAME", client.database());
+                // A `:connect` naming a database moves the variable with it.
+                // Naming none leaves ODBC's copy alone but clears go's, which
+                // reports only what the caller asked for.
+                match &options.database {
+                    Some(database) => self.vars.set_internal("SQLCMDDBNAME", database),
+                    None if options.compat.is_go() => self.vars.set_internal("SQLCMDDBNAME", ""),
+                    None => {}
+                }
                 if let Some(user) = &options.user {
                     self.vars.set_internal("SQLCMDUSER", user);
                 }
@@ -834,12 +858,19 @@ impl Session {
                         self.terminating_message = Some(message.number);
                     }
                     // `-m n` hides anything below severity n. ODBC applies the
-                    // threshold as given; go-sqlcmd never hides `PRINT` output
-                    // and other severity-10 chatter, whatever `-m` says.
-                    let hidden = threshold >= 0 && (message.severity as i64) < threshold;
+                    // threshold to server messages only; go-sqlcmd narrows it
+                    // further to errors, so its severity-10 chatter survives.
+                    // `PRINT` is program output rather than a message and both
+                    // references let it through whatever `-m` says.
+                    let hidden = threshold >= 0
+                        && (message.severity as i64) < threshold
+                        && !message.is_print();
                     if hidden && (!go || message.is_error()) {
                         continue;
                     }
+                    // `-m -1` asks ODBC for the `Msg ...` header on everything
+                    // it does print. go-sqlcmd has no such mode.
+                    let force_header = !go && threshold < 0;
                     let to_stderr = match route_errors {
                         // `-r` absent: everything goes to the results stream.
                         n if n < 0 => false,
@@ -852,7 +883,7 @@ impl Session {
                     let rendered = if to_stderr && go {
                         format!("{}{EOL}{EOL}", message.text)
                     } else {
-                        message.render(raw)
+                        message.render(raw, force_header)
                     };
                     // A message above severity 10 is an error; the rest,
                     // including `PRINT`, are drawn as warnings.
@@ -1050,14 +1081,14 @@ fn seed_from_options(vars: &mut Variables, options: &Options, workstation: &str)
     }
     match &options.user {
         Some(user) => vars.set_internal("SQLCMDUSER", user),
-        // Under integrated auth go-sqlcmd reports the OS account it will
-        // authenticate as; ODBC leaves the variable empty.
-        None if options.compat.is_go() => {
-            if let Some(account) = os_account() {
+        // Under integrated auth both references report the OS account they
+        // will authenticate as. Measured on Windows: ODBC gives the bare
+        // `shiwanigupta`, go-sqlcmd the qualified `REDMOND\shiwanigupta`.
+        None => {
+            if let Some(account) = os_account(options.compat.is_go()) {
                 vars.set_internal("SQLCMDUSER", &account);
             }
         }
-        None => {}
     }
     if let Some(database) = &options.database {
         vars.set_internal("SQLCMDDBNAME", database);
@@ -1113,12 +1144,15 @@ fn hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string())
 }
 
-/// The account integrated authentication will present, in the `DOMAIN\user`
-/// form go-sqlcmd shows.
-fn os_account() -> Option<String> {
+/// The account integrated authentication will present. `qualified` asks for
+/// the `DOMAIN\user` form go-sqlcmd shows; ODBC shows the user name alone.
+fn os_account(qualified: bool) -> Option<String> {
     let user = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .ok()?;
+    if !qualified {
+        return Some(user);
+    }
     match std::env::var("USERDOMAIN") {
         Ok(domain) if !domain.is_empty() => Some(format!("{domain}\\{user}")),
         _ => Some(user),

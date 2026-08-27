@@ -22,6 +22,7 @@ pub enum Compat {
 impl Compat {
     /// Parses a `--compat` value or `SQLCMDCOMPAT`. Returns `None` for a name
     /// neither tool answers to, so the caller can refuse rather than guess.
+    /// Precedence between the two sources is settled in `cli::validate`.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "odbc" => Some(Compat::Odbc),
