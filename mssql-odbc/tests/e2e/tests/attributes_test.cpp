@@ -76,6 +76,7 @@
 //   52. VendorGetOnlyAttributesAreNotSettable          - HY092, not HY024
 //   53. CurrentCommandTracksTheResultSetOrdinal        - per execute, not a flag
 //   54. QueryNotificationStringsFollowTheByteLengthContract - bytes, not chars
+//   54b.QueryNotificationNullNtsSetClearsWithoutFault   - safe divergence
 //   55. IntegerGetsReportTheValueWidth                 - StringLength on success
 //   56. CurrentCommandAdvancesThroughNonRowResults     - DML counts too
 //   57. QueryNotificationStringsRejectBadNegativeLengths - only SQL_NTS
@@ -658,6 +659,9 @@ TEST_F(AttributesTest, PreConnectEmptyCatalogUsesLoginDefault) {
     SQLHDBC dbc = SQL_NULL_HDBC;
     ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc)));
 
+    // Windows' generic API resolves to W, matching mssql-python. On Unix,
+    // unixODBC caches this as ANSI until the DSN-less string identifies the
+    // driver, then replays it through the driver's unsuffixed setter.
     SQLTCHAR empty[] = {0};
     ASSERT_SQL_OK(SQLSetConnectAttr(dbc, SQL_ATTR_CURRENT_CATALOG, empty, SQL_NTS),
                   SQL_HANDLE_DBC, dbc);
@@ -1557,16 +1561,41 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
               SQLGetStmtAttr(stmt_, kSsQnMsgtext, nullptr, 0, &written));
     EXPECT_EQ(value_bytes, written);
 
-    // A null set pointer clears either value. This is distinct from a null get
-    // pointer above, which only asks for the current length.
+    // A null set pointer with a zero byte count clears either value. This is
+    // distinct from a null get pointer above, which only asks for the current
+    // length.
     for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
         ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, msg, SQL_NTS),
                       SQL_HANDLE_STMT, stmt_);
-        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, nullptr, SQL_NTS),
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, nullptr, 0),
                       SQL_HANDLE_STMT, stmt_);
 
         std::memset(buffer, 0, sizeof(buffer));
         written = -1;
+        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer, sizeof(buffer),
+                                     &written),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(0, written);
+        EXPECT_EQ(SQLTCHAR{0}, buffer[0]);
+    }
+}
+
+// msodbcsql 18.6.2.1 dereferences the null value while validating SQL_NTS and
+// access-violates. mssql-odbc handles the input safely and clears the value.
+TEST_F(AttributesTest, QueryNotificationNullNtsSetClearsWithoutFault) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    SqlTString value = ODBCTestUtils::ToSqlTStr("seed");
+    SQLTCHAR* text = const_cast<SQLTCHAR*>(value.c_str());
+    SQLTCHAR buffer[16] = {};
+
+    for (SQLINTEGER attribute : {kSsQnMsgtext, kSsQnOptions}) {
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, text, SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, attribute, nullptr, SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+
+        SQLINTEGER written = -1;
         ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, attribute, buffer, sizeof(buffer),
                                      &written),
                       SQL_HANDLE_STMT, stmt_);

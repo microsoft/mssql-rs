@@ -263,6 +263,14 @@ fn effective_vendor_settings(
     }
 }
 
+fn initial_database(database_keyword: &str, current_catalog: Option<&str>) -> String {
+    if database_keyword.is_empty() {
+        current_catalog.unwrap_or_default().to_string()
+    } else {
+        database_keyword.to_string()
+    }
+}
+
 /// Inner connect logic, separated so the caller can reset state on failure.
 fn do_connect(
     dbc: &DbcHandle,
@@ -343,11 +351,7 @@ fn do_connect(
     // `SQLSetConnectAttr(SQL_ATTR_CURRENT_CATALOG)`: msodbcsql overwrites the
     // attribute's `conninfo.DataBase` while parsing the keywords, so a caller
     // supplying both logs in to the `Database=` one.
-    context.database = if params.database.is_empty() {
-        state.current_catalog.clone().unwrap_or_default()
-    } else {
-        params.database.clone()
-    };
+    context.database = initial_database(&params.database, state.current_catalog.as_deref());
 
     // Apply an app-set SQL_ATTR_LOGIN_TIMEOUT before configuring auth so an
     // explicit login timeout takes precedence over any method-specific default
@@ -512,6 +516,17 @@ mod tests {
         SQL_DRIVER_COMPLETE, SQL_HANDLE_DBC, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_HANDLE,
     };
     use crate::test_support::{TestHandles, cs};
+
+    #[test]
+    fn initial_database_uses_keyword_then_attribute_then_login_default() {
+        assert_eq!(
+            initial_database("keyword_db", Some("attribute_db")),
+            "keyword_db"
+        );
+        assert_eq!(initial_database("", Some("attribute_db")), "attribute_db");
+        assert_eq!(initial_database("", Some("")), "");
+        assert_eq!(initial_database("", None), "");
+    }
 
     /// The value a get reports must match the encryption the connection
     /// actually uses. These are two separate mappings over the same keyword

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implementation of SQLSetConnectAttrW.
+//! Implementation of SQLSetConnectAttrW and the Unix SQLSetConnectAttr shim.
 //!
 //! Handles the msodbcsql-specific `SQL_COPT_SS_ACCESS_TOKEN` attribute (a
 //! pre-acquired Entra access token), `SQL_ATTR_LOGIN_TIMEOUT` (the login
@@ -26,6 +26,8 @@ use crate::api::odbc_types::{
     SQL_EN_STRICT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlInteger, SqlPointer, SqlReturn,
 };
+#[cfg(not(windows))]
+use crate::api::odbc_types::{SQL_NTS, SYSNAMELEN, SqlWChar};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, StmtHandle, handle_from_raw};
@@ -67,6 +69,74 @@ pub(crate) unsafe fn sql_set_connect_attr_w(
     crate::ffi_entry!("SQLSetConnectAttrW", unsafe {
         sql_set_connect_attr_w_impl(connection_handle, attribute, value_ptr, string_length)
     })
+}
+
+/// Unix ANSI entry point used by unixODBC to replay pre-connect attributes.
+///
+/// unixODBC stores an attribute passed to `SQLSetConnectAttrW` before it knows
+/// the target driver as ANSI bytes. Once the driver is loaded, it prefers the
+/// unsuffixed setter for replay. The native Linux msodbcsql driver exports this
+/// symbol alongside `SQLSetConnectAttrW` for the same path.
+#[cfg(not(windows))]
+pub(crate) unsafe fn sql_set_connect_attr(
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
+) -> SqlReturn {
+    debug!(
+        ?connection_handle,
+        attribute,
+        ?value_ptr,
+        string_length,
+        "SQLSetConnectAttr called",
+    );
+
+    crate::ffi_entry!("SQLSetConnectAttr", unsafe {
+        sql_set_connect_attr_impl(connection_handle, attribute, value_ptr, string_length)
+    })
+}
+
+#[cfg(not(windows))]
+unsafe fn sql_set_connect_attr_impl(
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
+) -> SqlReturn {
+    if connection_handle.is_null()
+        || attribute != SQL_ATTR_CURRENT_CATALOG
+        || value_ptr.is_null()
+        || (string_length < 0 && string_length != SqlInteger::from(SQL_NTS))
+    {
+        return unsafe {
+            sql_set_connect_attr_w_impl(connection_handle, attribute, value_ptr, string_length)
+        };
+    }
+
+    let bytes = if string_length == SqlInteger::from(SQL_NTS) {
+        // SAFETY: SQL_NTS requires a non-null NUL-terminated SQLCHAR string.
+        unsafe { std::ffi::CStr::from_ptr(value_ptr.cast()).to_bytes() }
+    } else {
+        let byte_len = usize::try_from(string_length).unwrap_or_default();
+        // SAFETY: a nonnegative explicit length requires that many readable bytes.
+        unsafe { std::slice::from_raw_parts(value_ptr.cast(), byte_len) }
+    };
+    let text = String::from_utf8_lossy(bytes);
+    // More than SYSNAMELEN units is rejected by the shared wide implementation;
+    // retaining one extra unit preserves that decision without a large allocation.
+    let wide: Vec<SqlWChar> = text.encode_utf16().take(SYSNAMELEN + 1).collect();
+    let wide_byte_len =
+        SqlInteger::try_from(wide.len() * std::mem::size_of::<SqlWChar>()).unwrap_or_default();
+
+    unsafe {
+        sql_set_connect_attr_w_impl(
+            connection_handle,
+            attribute,
+            wide.as_ptr() as SqlPointer,
+            wide_byte_len,
+        )
+    }
 }
 
 unsafe fn sql_set_connect_attr_w_impl(
@@ -444,6 +514,65 @@ mod tests {
         let buf: Vec<u8> = 200_000u32.to_le_bytes().to_vec();
         let decoded = unsafe { decode_access_token(buf.as_ptr() as SqlPointer) };
         assert_eq!(decoded, None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ansi_setter_transcodes_preconnect_current_catalog() {
+        let h = TestHandles::with_env_dbc();
+        let catalog = b"reporting\0";
+        let ret = unsafe {
+            sql_set_connect_attr(
+                h.dbc,
+                SQL_ATTR_CURRENT_CATALOG,
+                catalog.as_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().current_catalog.as_deref(),
+            Some("reporting")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ansi_setter_respects_explicit_byte_length() {
+        let h = TestHandles::with_env_dbc();
+        let catalog = b"tempdb-not-part-of-value";
+        let ret = unsafe {
+            sql_set_connect_attr(
+                h.dbc,
+                SQL_ATTR_CURRENT_CATALOG,
+                catalog.as_ptr() as SqlPointer,
+                6,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().current_catalog.as_deref(),
+            Some("tempdb")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ansi_setter_null_handle_is_invalid() {
+        let catalog = b"tempdb\0";
+        let ret = unsafe {
+            sql_set_connect_attr(
+                std::ptr::null_mut(),
+                SQL_ATTR_CURRENT_CATALOG,
+                catalog.as_ptr() as SqlPointer,
+                SqlInteger::from(SQL_NTS),
+            )
+        };
+        assert_eq!(ret, SQL_INVALID_HANDLE);
     }
 
     #[test]

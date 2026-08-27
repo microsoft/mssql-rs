@@ -36,7 +36,9 @@
 //! reports the batch command ordinal, and `SQL_SOPT_SS_NOCOUNT_STATUS`), and two
 //! are string-valued (the query-notification message text and options) — the
 //! only statement attributes that use `buffer_length` / `string_length_ptr`
-//! rather than passing an integer in the pointer slot.
+//! rather than passing an integer in the pointer slot. A null pointer clears
+//! either string; msodbcsql faults on that input, so this is a deliberate safe
+//! result rather than parity.
 //!
 //! `SQL_ATTR_APP_ROW_DESC`/`SQL_ATTR_APP_PARAM_DESC` associate an explicitly
 //! allocated descriptor as the statement's active ARD/APD after validating
@@ -404,6 +406,8 @@ unsafe fn sql_set_stmt_attr_w_safe(
                 post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
                 return SQL_ERROR;
             }
+            // msodbcsql faults on null for these ids, so there is no result to
+            // match. Clear the value rather than faulting the host process.
             let value = unsafe { read_utf16_attr(value_ptr as *const SqlWChar, string_length) };
             if attribute == SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT {
                 state.qn_msgtext = value;

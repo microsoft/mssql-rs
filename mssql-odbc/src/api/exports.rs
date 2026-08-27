@@ -118,6 +118,29 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
     }
 }
 
+/// Sets a connection attribute through the Unix ANSI entry point.
+///
+/// unixODBC converts character-valued attributes set before driver selection to
+/// ANSI, then replays them through this symbol when the driver is loaded.
+#[cfg(not(windows))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetConnectAttr(
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::set_connect_attr::sql_set_connect_attr(
+            connection_handle,
+            attribute,
+            value_ptr,
+            string_length,
+        )
+    }
+}
+
 /// Retrieves a statement attribute.
 ///
 /// # Safety

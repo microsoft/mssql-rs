@@ -340,6 +340,10 @@ Two details worth calling out because they are not derivable from the ODBC spec:
 - **Set pre-connect:** seeds the login packet's database. The connection string's
   `Database=` keyword still wins if both are supplied, matching msodbcsql, which
   overwrites `conninfo.DataBase` while parsing keywords.
+- **Unix pre-connect replay:** unixODBC caches wide character attributes as
+  ANSI before a DSN-less connection identifies the driver, then prefers the
+  unsuffixed `SQLSetConnectAttr` symbol when replaying them. The Unix shim
+  decodes that UTF-8 value and routes it through the shared wide implementation.
 - **Set post-connect:** emits `USE [<db>]` with `]` doubled for quoting
   (`sqlcfunc.cpp:1933-1972` always bracket-quotes). A transaction stays open
   across the switch; an **open cursor is rejected with `24000`** rather than
@@ -580,7 +584,7 @@ is unconditional rather than a licence check. The QN timeout ceiling is
 `i32::MAX`, not the full `SQLULEN` width the pointer slot can carry on a 64-bit
 build: 2147483647 succeeds, 2147483648 and above are `HY024`.
 
-Seven findings changed the implementation:
+Eight findings changed the implementation:
 
 - **Value rejection is mandatory here, unlike S4.** S4 deliberately skipped
   range validation because `HY024` for standard attributes is emitted by the DM
@@ -626,6 +630,12 @@ Seven findings changed the implementation:
   returns `SQL_SUCCESS` and never touches the pointer, while this driver formed
   a zero-length slice from it and hit Rust's alignment precondition, which is a
   *non-unwinding* panic and therefore an `abort()`. See "Robustness fix" below.
+- **A null value with `SQL_NTS` exposes a bug in msodbcsql 18.6.2.1.** Its
+  `SQLSetStmtAttrW` validation calls `wcslen` on the null value before the
+  storage path can clear it, causing an access violation. A null value with
+  `StringLength = 0` clears either QN string normally. This driver accepts both
+  forms and clears safely; the `SQL_NTS` form deliberately exceeds parity
+  rather than copying a process crash.
 
 #### Robustness fix — zero-length string writes
 
@@ -634,6 +644,8 @@ attribute, so the abort above was reachable from
 `SQLSetConnectAttrW(dbc, SQL_ATTR_CURRENT_CATALOG, ptr, 0)` too — it predates
 S6 and shipped with S3. It is fixed at the root: a null pointer and any
 non-positive length both read as the empty string without forming a slice.
+For the QN string attributes this also makes null plus `SQL_NTS` safe, unlike
+msodbcsql 18.6.2.1.
 
 This matters more than a parity nit because mssql-python loads the driver
 in-process inside CPython. An `abort()` takes down the interpreter with no
