@@ -469,8 +469,10 @@ pub const SQL_DESC_DATA_PTR: SqlUSmallInt = 1010;
 pub const SQL_DESC_NAME: SqlUSmallInt = 1011;
 pub const SQL_DESC_UNNAMED: SqlUSmallInt = 1012;
 pub const SQL_DESC_OCTET_LENGTH: SqlUSmallInt = 1013;
-/// Read-only: `SQL_DESC_ALLOC_AUTO` for every descriptor until explicit
-/// descriptor allocation (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`) lands.
+/// `SQL_DESC_ALLOC_AUTO` for the four implicit descriptors every statement
+/// owns; `SQL_DESC_ALLOC_USER` for one allocated by
+/// `SQLAllocHandle(SQL_HANDLE_DESC, ...)`. Always read-only through
+/// `SQLSetDescFieldW`.
 pub const SQL_DESC_ALLOC_TYPE: SqlUSmallInt = 1099;
 
 // ---- Descriptor header field identifiers (SQLGetDescField / SQLSetDescField,

@@ -65,6 +65,7 @@ fn map_claim_error(error: ClaimError) -> PyErr {
         ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
         ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
         ClaimError::Busy => PyRuntimeError::new_err("Connection is busy with another operation"),
+        ClaimError::NoResultSet => PyRuntimeError::new_err("No active result set"),
     }
 }
 

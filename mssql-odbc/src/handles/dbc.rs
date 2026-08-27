@@ -86,6 +86,13 @@ pub(crate) struct DbcState {
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
     pub(crate) statements: Vec<*mut c_void>,
+    /// Explicitly-allocated DESC handles (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`),
+    /// owned by this connection independent of any one statement. A statement
+    /// references one by raw pointer in `StmtState::active_ard`/`active_apd`
+    /// once associated (`SQLSetStmtAttrW`); freeing an entry here
+    /// (`SQLFreeHandle(SQL_HANDLE_DESC)`) resets every statement referencing
+    /// it back to its own implicit descriptor first.
+    pub(crate) descriptors: Vec<*mut c_void>,
     /// The STMT handle that currently has an open cursor, if any.
     /// Set when SQLExecDirect succeeds; cleared by SQLCloseCursor /
     /// SQLFreeStmt(SQL_CLOSE). Used to enforce the non-MARS rule that only
@@ -179,6 +186,7 @@ impl std::fmt::Debug for DbcState {
             .field("diag_records", &self.diag_records)
             .field("connection_state", &self.connection_state)
             .field("statements", &self.statements)
+            .field("descriptors", &self.descriptors)
             .field("active_stmt", &self.active_stmt)
             .field("client", &self.client)
             .field(
@@ -214,6 +222,7 @@ impl DbcHandle {
                 diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
+                descriptors: Vec::new(),
                 active_stmt: None,
                 client: None,
                 access_token: None,

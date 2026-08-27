@@ -12,7 +12,7 @@ use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClien
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::api::odbc_types::{
-    self, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
+    self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
@@ -81,11 +81,14 @@ pub(crate) struct StmtHandle {
     /// the permanent implicit allocations (cf. msodbcsql's embedded `lpstmt->ARD`
     /// / `cmdp.APD`, `sqlcfunc.cpp`). Set once in `new()`, freed in `Drop`, never
     /// reassigned — hence sound as plain fields outside `inner`, same set-once
-    /// rationale as `parent_dbc`. Do NOT repurpose them into the mutable *active*
-    /// ARD/APD association that `SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC / APP_PARAM_DESC)`
-    /// swaps (msodbcsql's separate `pARD`/`pAPD`); that path is still a stub, and
-    /// when implemented its active pointer belongs in `StmtState` behind `inner`
-    /// (concurrent set/get would otherwise race). IRD/IPD are never swappable.
+    /// rationale as `parent_dbc`. These are NOT the mutable *active* ARD/APD
+    /// association `SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC / APP_PARAM_DESC)`
+    /// swaps (msodbcsql's separate `pARD`/`pAPD`) — that association lives in
+    /// `StmtState::active_ard`/`active_apd` behind `inner`, since concurrent
+    /// set/get would otherwise race. A `None` active slot means "use the
+    /// implicit descriptor here"; `Some(explicit_desc)` means an explicitly
+    /// allocated descriptor has been associated instead. IRD/IPD are never
+    /// swappable, so they have no `active_*` counterpart.
     pub(crate) ard: *mut c_void,
     pub(crate) apd: *mut c_void,
     pub(crate) ird: *mut c_void,
@@ -182,6 +185,16 @@ pub(crate) struct StmtState {
     /// Staying empty is a legal state: an unbound `SQLFetchScroll` still
     /// advances the rowset and reports counts, it just delivers no data.
     pub(crate) bindings: Vec<ColumnBinding>,
+    /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
+    /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
+    /// an explicitly-allocated descriptor associated by
+    /// `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC, ...)`. A raw pointer, not an
+    /// owned handle — the DBC owns explicit descriptors, so freeing one resets
+    /// every statement referencing it back to `None` (`free_handle::free_desc`).
+    pub(crate) active_ard: Option<*mut c_void>,
+    /// The active application parameter descriptor for
+    /// `SQL_ATTR_APP_PARAM_DESC`. See [`Self::active_ard`].
+    pub(crate) active_apd: Option<*mut c_void>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
     /// The data-at-execution sequence in progress, if any. `Some` is exactly
@@ -845,10 +858,26 @@ impl StmtHandle {
         Self {
             object_type: HandleType::Stmt,
             parent_dbc,
-            ard: handle_to_raw(Box::new(DescHandle::new(DescKind::AppRow))),
-            apd: handle_to_raw(Box::new(DescHandle::new(DescKind::AppParam))),
-            ird: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpRow))),
-            ipd: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpParam))),
+            ard: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::AppRow,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
+            apd: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::AppParam,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
+            ird: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::ImpRow,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
+            ipd: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::ImpParam,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
@@ -871,6 +900,8 @@ impl StmtHandle {
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 row_bind_offset_ptr: std::ptr::null_mut(),
                 bindings: Vec::new(),
+                active_ard: None,
+                active_apd: None,
                 state_flags: 0,
                 dae: None,
                 query_timeout,
