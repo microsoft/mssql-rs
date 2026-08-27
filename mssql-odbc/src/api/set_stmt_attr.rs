@@ -1410,6 +1410,17 @@ mod tests {
         assert_eq!(unsafe { attrs.param_bind_offset() }, -8);
     }
 
+    #[test]
+    fn param_bind_offset_accepts_a_misaligned_application_pointer() {
+        let mut attrs = InertStmtAttrs::default();
+        let mut storage = [0u8; size_of::<SqlLen>() + 1];
+        let slot = unsafe { storage.as_mut_ptr().add(1).cast::<SqlLen>() };
+        unsafe { slot.write_unaligned(24) };
+        attrs.set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, slot as SqlULen);
+
+        assert_eq!(unsafe { attrs.param_bind_offset() }, 24);
+    }
+
     /// `SQL_ROWSET_SIZE` shares a name with `SQL_ATTR_ROW_ARRAY_SIZE` but not a
     /// slot: msodbcsql keeps them independent, so treating one as an alias of
     /// the other would silently resize an application's rowset.

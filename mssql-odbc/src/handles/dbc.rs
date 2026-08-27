@@ -103,6 +103,11 @@ pub(crate) struct DbcState {
     /// connection-string keywords. `None` means "the caller did not set this
     /// attribute", which is what lets the keyword stand.
     pub(crate) vendor_overrides: VendorConnOverrides,
+    /// Effective vendor settings for the current connected session. Kept
+    /// separate from [`vendor_overrides`](Self::vendor_overrides) so a keyword
+    /// resolved by one connection is never reused as an explicit attribute on
+    /// the next connection attempt.
+    pub(crate) effective_vendor_settings: Option<VendorConnOverrides>,
     /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
     /// does not yet vary its behaviour on it.
     pub(crate) access_mode: u32,
@@ -213,6 +218,7 @@ impl DbcHandle {
                 client: None,
                 access_token: None,
                 vendor_overrides: VendorConnOverrides::default(),
+                effective_vendor_settings: None,
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
                 connection_timeout: 0,

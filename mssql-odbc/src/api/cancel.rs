@@ -93,6 +93,7 @@ mod tests {
         DaeState::for_test(
             vec![DaeParam {
                 bound_index: 0,
+                value_ptr: std::ptr::null_mut(),
                 expected_len: None,
             }],
             cursor,

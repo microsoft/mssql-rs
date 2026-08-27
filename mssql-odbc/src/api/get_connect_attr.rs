@@ -161,10 +161,9 @@ fn sql_get_connect_attr_w_safe(
             SQL_SUCCESS
         }
         // The `SQL_COPT_SS_*` forms of Encrypt / TrustServerCertificate /
-        // Trusted_Connection. `do_connect` rewrites the stored values to what the
-        // connection actually resolved to, so this reports the effective setting
-        // whether it came from the attribute or from the keyword -- measured:
-        // with no attribute set, `Encrypt=no` reads back 0.
+        // Trusted_Connection. While connected this reports the resolved setting,
+        // whether it came from the attribute or the keyword -- measured: with no
+        // attribute set, `Encrypt=no` reads back 0.
         //
         // Before connect there is nothing to resolve, so an unset attribute falls
         // back to the driver defaults (encryption on, no trust, no integrated
@@ -178,13 +177,18 @@ fn sql_get_connect_attr_w_safe(
                 post_diag(&mut state, ERR_INVALID_NULL_POINTER);
                 return SQL_ERROR;
             }
-            let overrides = &state.vendor_overrides;
+            let settings = if state.connection_state == ConnectionState::Connected {
+                state.effective_vendor_settings.as_ref()
+            } else {
+                None
+            }
+            .unwrap_or(&state.vendor_overrides);
             let value = match attribute {
-                SQL_COPT_SS_ENCRYPT => overrides.encrypt.unwrap_or(SQL_EN_ON as u32),
+                SQL_COPT_SS_ENCRYPT => settings.encrypt.unwrap_or(SQL_EN_ON as u32),
                 SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => {
-                    overrides.trust_server_certificate.unwrap_or(0)
+                    settings.trust_server_certificate.unwrap_or(0)
                 }
-                _ => overrides.integrated_security.unwrap_or(0),
+                _ => settings.integrated_security.unwrap_or(0),
             };
             unsafe { write_if_some(value_ptr as *mut u32, value) };
             debug!(
@@ -256,6 +260,7 @@ mod tests {
         SQL_TXN_SS_SNAPSHOT,
     };
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
+    use crate::handles::dbc::VendorConnOverrides;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -612,6 +617,29 @@ mod tests {
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), SQL_EN_ON as u32);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE), 0);
         assert_eq!(get_u32(h.dbc, SQL_COPT_SS_INTEGRATED_SECURITY), 0);
+    }
+
+    #[test]
+    fn vendor_get_uses_effective_values_only_while_connected() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.effective_vendor_settings = Some(VendorConnOverrides {
+                encrypt: Some(0),
+                trust_server_certificate: Some(1),
+                integrated_security: Some(1),
+            });
+            state.connection_state = ConnectionState::Connected;
+        }
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), 0);
+
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Disconnected;
+        assert_eq!(
+            get_u32(h.dbc, SQL_COPT_SS_ENCRYPT),
+            SQL_EN_ON as u32,
+            "a disconnected reusable handle reports its explicit override or default"
+        );
     }
 
     #[test]

@@ -336,7 +336,7 @@ pub(super) unsafe fn build_named_params(
         // Check for a data-at-execution indicator before dereferencing the
         // value buffer: DAE params carry no value at bind time.
         let dae_indicator = if !bound_param.strlen_or_ind_ptr.is_null() {
-            let ind = unsafe { *bound_param.strlen_or_ind_ptr };
+            let ind = unsafe { bound_param.strlen_or_ind_ptr.read_unaligned() };
             is_data_at_exec_indicator(ind).then_some(ind)
         } else {
             None
@@ -358,6 +358,7 @@ pub(super) unsafe fn build_named_params(
             let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
             dae_params.push(DaeParam {
                 bound_index: i,
+                value_ptr: bound_param.parameter_value_ptr,
                 expected_len: dae_expected_length(indicator),
             });
             params.push(rpc);
@@ -658,6 +659,7 @@ mod tests {
             dae.dae_params,
             vec![DaeParam {
                 bound_index: 1,
+                value_ptr: std::ptr::null_mut(),
                 expected_len: None
             }]
         );
@@ -689,6 +691,7 @@ mod tests {
             dae.dae_params,
             vec![DaeParam {
                 bound_index: 0,
+                value_ptr: std::ptr::null_mut(),
                 expected_len: Some(7)
             }]
         );
@@ -799,6 +802,39 @@ mod tests {
             state.diag_records[0].sql_state,
             ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
         );
+    }
+
+    #[test]
+    fn bind_offset_preserves_a_misaligned_dae_indicator_and_shifted_token() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut value = [0u8; 8];
+        let mut indicator_storage = [0u8; size_of::<SqlLen>() + 1];
+        let shifted_indicator = unsafe { indicator_storage.as_mut_ptr().add(1).cast::<SqlLen>() };
+        unsafe { shifted_indicator.write_unaligned(SQL_DATA_AT_EXEC) };
+        let mut offset: SqlLen = 1;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .inert_attrs
+            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: value.as_mut_ptr().cast(),
+            buffer_length: value.len() as SqlLen,
+            strlen_or_ind_ptr: indicator_storage.as_mut_ptr().cast(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, "test") }
+            .expect("the shifted DAE marker is streamable");
+        assert_eq!(built.dae_params.len(), 1);
+        assert_eq!(built.dae_params.first().unwrap().value_ptr, unsafe {
+            value.as_mut_ptr().add(1).cast()
+        });
     }
 
     /// The companion to the test above: with no offset set, the same binding

@@ -49,8 +49,8 @@ const MAX_LOGIN_TIMEOUT_SECS: u64 = 0xfffe;
 ///   struct: a 4-byte little-endian length prefix followed by that many bytes
 ///   of the UTF-16-LE-encoded access token.
 /// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must point to `string_length`
-///   `SQLWCHAR`s, or to a NUL-terminated wide string when `string_length` is
-///   `SQL_NTS`.
+///   readable bytes of UTF-16, or to a NUL-terminated wide string when
+///   `string_length` is `SQL_NTS`.
 pub(crate) unsafe fn sql_set_connect_attr_w(
     connection_handle: SqlHandle,
     attribute: SqlInteger,

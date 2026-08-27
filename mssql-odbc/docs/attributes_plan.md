@@ -10,11 +10,10 @@ makes, or by the unfiltered pass-through surface it exposes (§4.10).
 (`ExportImp::SQLSetConnectAttrW` L1459, `SQLGetConnectAttrW` L2979,
 `SQLSetStmtAttrW` L3508, `SQLGetStmtAttrW` L4186).
 
-**Status:** S2 and S3 are implemented, with the string-I/O half of S1 pulled in as
-a prerequisite. S1 (remaining), S4, S5 and S6 are open. Behavior marked *measured*
-below was observed by running the same
-`mssql-odbc/tests/e2e/tests/attributes_test.cpp` suite against msodbcsql18 and
-against this driver.
+**Status:** S1–S4, S5a and S6 are shipped. S5b is the only open slice and is
+tracked by AB#47526. Behavior marked *measured* below was observed by running
+the same `mssql-odbc/tests/e2e/tests/attributes_test.cpp` suite against
+msodbcsql18 and against this driver.
 
 ---
 
@@ -65,9 +64,14 @@ mssql-python, so `SQL_ATTR_CONNECTION_POOLING` is out of scope.
 | `SQL_ATTR_CONNECTION_DEAD` | — | ✅ | |
 | `SQL_COPT_SS_ACCESS_TOKEN` | ✅ | — | pre-connect only |
 | `SQL_ATTR_ANSI_APP` | ✅ no-op | ✗ `HYC00` | deliberate |
+| `SQL_ATTR_QUERY_TIMEOUT` | ✅ fan-out | ✗ `HY092` | write-only on a connection |
 | **`SQL_ATTR_CURRENT_CATALOG`** | ✅ | ✅ | **delivered by S3** |
+| `SQL_COPT_SS_INTEGRATED_SECURITY` | ✅ | ✅ | attribute overrides keyword |
+| `SQL_COPT_SS_ENCRYPT` | ✅ | ✅ | attribute overrides keyword |
+| `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE` | ✅ | ✅ | reports effective policy |
 
-Everything else → `SQL_ERROR` / `HY092` (was `HYC00`; see F3).
+The remaining recognized connection attributes are pending in S5b and return
+their measured not-implemented diagnostic; an unknown identifier returns `HY092`.
 
 ### Statement (§4.2.3)
 
@@ -81,10 +85,16 @@ Everything else → `SQL_ERROR` / `HY092` (was `HYC00`; see F3).
 | `SQL_ATTR_PARAMSET_SIZE` | ✅ | ✅ |
 | `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` | ✅ no-op | ✅ |
 | `SQL_ATTR_IMP_ROW_DESC` / `IMP_PARAM_DESC` | — | ✅ |
-| `SQL_ATTR_PARAM_BIND_TYPE`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`, `ROW_BIND_OFFSET_PTR` | ✅ no-op | ❌ |
+| `SQL_ATTR_MAX_ROWS` | ✅ enforced | ✅ |
+| `SQL_ATTR_MAX_LENGTH`, `NOSCAN`, `RETRIEVE_DATA`, `USE_BOOKMARKS` | ✅ | ✅ |
+| `SQL_ATTR_PARAM_BIND_OFFSET_PTR` | ✅ enforced | ✅ |
+| `SQL_ATTR_PARAM_BIND_TYPE`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`, `ROW_BIND_OFFSET_PTR` | ✅ stored | ✅ |
+| `SQL_ATTR_METADATA_ID` | ✅ stored | ✅ | catalog effect pending S5b |
 | **`SQL_ATTR_QUERY_TIMEOUT`** | ✅ | ✅ | **delivered by S2** |
+| `SQL_SOPT_SS_*` 1225–1238 | measured per id | measured per id | **delivered by S6** |
 
-Everything else → `SQL_ERROR` / `HY092`.
+Unknown identifiers return `HY092`; recognized optional behavior that is not
+implemented returns `HYC00`.
 
 ---
 
@@ -115,7 +125,7 @@ the ODBC "set a statement attribute through the connection handle" contract, and
 this driver does not implement it generally. mssql-python's `attrs_before` is
 applied unfiltered, so a caller can reach it. **Partly resolved:** both connect
 catch-alls now return `HY092`, and the fan-out exists for `QUERY_TIMEOUT` only;
-the general mechanism stays in S5.
+the general mechanism stays in S5b.
 
 > Note when reading the tests: id `1234` is a real undocumented `SQL_COPT_SS_*`
 > identifier that msodbcsql accepts, so "unknown attribute" tests must use
@@ -138,8 +148,8 @@ work is routing, not semantics — which makes them one cheap batch, not N stori
 
 ## 4. Proposed split
 
-Six subtasks. **S1–S3 are the mssql-python cutover blockers**; S4–S6 are parity
-completeness.
+Six original subtasks, with S5 later split into S5a/S5b. **S1–S3 are the
+mssql-python cutover blockers**; S4, S5a/S5b and S6 are parity completeness.
 
 ---
 
@@ -268,7 +278,7 @@ by unit + e2e tests.
 - Connection-handle route: `SQLSetConnectAttr(SQL_ATTR_QUERY_TIMEOUT)` sets the
   default for statements on that connection and fans out to the ones already
   open (`sqlcmisc.cpp:2879-2935`). The fan-out is deliberately implemented only
-  for this attribute; the general mechanism stays in S5.
+  for this attribute; the general mechanism stays in S5b.
 - Inheritance: a statement allocated after the connection default is set picks
   it up (`sqlcfunc.cpp:173`); an explicit per-statement set overrides.
 - `SQLGetConnectAttrW` deliberately has **no** arm, so it falls through to
@@ -438,9 +448,11 @@ feature. It is the same single divergence already recorded for
 `SQL_ATTR_CURSOR_TYPE`, since the two are one setting. Variation 40 asserts the
 shared invariant on both drivers and the per-driver state separately.
 
-**Cross-story notes:** `SQL_ATTR_NOSCAN` is now readable for AB#46384;
-`SQL_ATTR_METADATA_ID` is stored and round-trips, but `catalog.rs:767` still
-hardcodes "never TRUE" — wiring it into catalog-function matching is S5 work.
+**Cross-story notes:** `SQL_ATTR_NOSCAN` is now readable for AB#46384.
+`SQL_ATTR_METADATA_ID` is stored and round-trips, but catalog dispatch still
+forces pattern mode. Accepting `SQL_TRUE` without honoring identifier semantics
+is a known temporary divergence; S5b must either wire it into catalog matching or
+return `HYC00` until that behavior exists.
 
 **Size:** M. **Depends on:** S1.
 
@@ -509,8 +521,8 @@ three above — which the `CURRENT_CATALOG` contrast shows is not safe.
   `FAILOVER_PARTNER`, `FAILOVER_PARTNER_SPN`, `ATTACHDBFILENAME`, `OLDPWD`.
 - **Read-only/diagnostic:** `SQL_COPT_SS_CLIENT_CONNECTION_ID`, `SQL_COPT_SS_SPID`,
   `SQL_COPT_SS_USER_DATA`.
-- **Standard leftovers:** `SQL_ATTR_METADATA_ID` (stored today, but `catalog.rs`
-  still hardcodes "never TRUE"), `SQL_ATTR_ASYNC_ENABLE`, `SQL_ATTR_AUTO_IPD`,
+- **Standard leftovers:** `SQL_ATTR_METADATA_ID` (stored today, but catalog
+  dispatch still forces pattern mode), `SQL_ATTR_ASYNC_ENABLE`, `SQL_ATTR_AUTO_IPD`,
   `SQL_ATTR_TRANSLATE_LIB`, `SQL_ATTR_TRANSLATE_OPTION`.
 - **Implement the statement-option fan-out (F3)** so an unrecognized connection
   attribute that is a valid statement option propagates to the connection's
@@ -662,51 +674,49 @@ single line to revisit.
 
 ```mermaid
 flowchart TD
-    S1["S1 — Dispatch spine, string I/O,<br/>parity sweep, defensive rejection"]
-    S2["S2 — SQL_ATTR_QUERY_TIMEOUT"]
-    S3["S3 — SQL_ATTR_CURRENT_CATALOG"]
-    S4["S4 — Remaining ODBC stmt attrs"]
-    S5["S5 — Vendor conn attrs +<br/>attrs_before parity + fan-out"]
-    S6["S6 — Vendor stmt attrs (SQL_SOPT_SS_*)"]
+    S1["S1 — Dispatch spine, string I/O,<br/>parity sweep, defensive rejection — shipped"]
+    S2["S2 — SQL_ATTR_QUERY_TIMEOUT — shipped"]
+    S3["S3 — SQL_ATTR_CURRENT_CATALOG — shipped"]
+    S4["S4 — Remaining ODBC stmt attrs — shipped"]
+    S5a["S5a — Measured vendor conn attrs — shipped"]
+    S5b["S5b — Remaining routing,<br/>fan-out and diagnostics — open"]
+    S6["S6 — Vendor stmt attrs — shipped"]
 
     S1 --> S2
     S1 --> S3
     S1 --> S4
     S1 --> S6
-    S3 --> S5
-    S2 -.->|fan-out mechanism| S5
+    S3 --> S5a
+    S5a --> S5b
+    S2 -.->|fan-out mechanism| S5b
 
     S2 -.->|enforcement| E1["AB#46385 Query-timeout enforcement"]
     S4 -.->|NOSCAN consumer| E2["AB#46384 ODBC escape sequences"]
     S4 -.->|METADATA_ID| E3["catalog.rs assumes always FALSE"]
     S6 -.->|PARAM_FOCUS| E4["AB#46374 Descriptors"]
 
-    style S1 fill:#1f6feb,color:#fff
-    style S2 fill:#1f6feb,color:#fff
-    style S3 fill:#1f6feb,color:#fff
+    classDef shipped fill:#238636,color:#fff
+    classDef open fill:#9a6700,color:#fff
+    class S1,S2,S3,S4,S5a,S6 shipped
+    class S5b open
 ```
 
-Blue = mssql-python cutover blockers. **S2 and S3 have landed**, along with the
-string-I/O and SQLSTATE-policy parts of S1. S4/S5/S6 parallelize once the rest of
-S1 lands.
+All mssql-python cutover blockers and every slice except S5b have shipped. S5b is
+the remaining follow-up under AB#47526.
 
 ---
 
 ## 6. Risks & open questions
 
-1. **Statement-option fan-out (F3)** is a structural change to `SQLSetConnectAttrW`,
-   not an attribute addition. If it proves large, split it out of S5 into its own
-   subtask — S2 only needs the narrow `QUERY_TIMEOUT` case.
-2. **Attribute vs. keyword precedence (S5)** is unspecified in the reference doc.
-   Must be measured against msodbcsql; getting it backwards is a silent
-   misconfiguration, not a visible error.
-3. **`SQL_ATTR_METADATA_ID`** conflicts with a documented assumption in
-   `catalog.rs`. Needs a decision — implement or record as a deliberate deviation
-   per the crate's parity-instructions convention.
-4. **`SQL_ATTR_CURRENT_CATALOG` get semantics**: last-written value vs. live
-   `ENVCHANGE`-tracked value. The live value is correct and is what msodbcsql
-   does; it requires the TDS layer to surface database changes.
-5. **Parity-sweep cost:** S1's sweep needs a live SQL Server and both drivers
+1. **Statement-option fan-out (F3)** remains a structural S5b change to
+   `SQLSetConnectAttrW`; S2 implements only the measured `QUERY_TIMEOUT` case.
+2. **Attribute vs. keyword precedence** is measured for S5a's three attributes.
+   Every S5b keyword-equivalent attribute still needs its own measurement because
+   the `CURRENT_CATALOG` result proves there is no safe global rule.
+3. **`SQL_ATTR_METADATA_ID`** is accepted but not honored by catalog dispatch.
+   S5b must implement identifier mode or reject `SQL_TRUE` with `HYC00`; silent
+   pattern matching is not a valid final state.
+4. **Parity-sweep cost:** S1's sweep needs a live SQL Server and both drivers
    registered. If `--compare-with-msodbcsql` cannot run in CI, the truth table
    must be captured once and checked in as a fixture.
 
@@ -719,10 +729,10 @@ now, add a list of what was done & what is pending in this story & create subtas
 for pending attributes."*
 
 - §2 above is the "what is done" list — paste into AB#46377.
-- S1–S6 are the subtasks. S2 and S3 are complete; the string-I/O and
-  SQLSTATE-policy parts of S1 came with them.
-- Recommend leaving AB#46377 Active tracking the remainder of S1 plus S4–S6, or
-  converting it to a parent and letting the subtasks carry the remaining scope.
+- S1–S4, S5a and S6 are complete.
+- S5b is the only pending slice and is tracked by AB#47526. Keep AB#46377 active
+  only if it is intended to parent that follow-up; otherwise the delivered
+  attribute work in this PR is complete.
 
 ---
 

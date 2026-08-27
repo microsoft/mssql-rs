@@ -297,13 +297,6 @@ fn do_connect(
     apply_vendor_overrides(&mut params, &state.vendor_overrides);
     let params = params;
 
-    // Record what the connection actually resolved to, so a later get reports
-    // the effective setting rather than only what an attribute happened to set.
-    // Measured: with no attribute set at all, `Encrypt=no` reads back 0 and an
-    // absent `TrustServerCertificate` reads back 0, so msodbcsql sources the
-    // get from the keyword when the attribute was never used.
-    state.vendor_overrides = effective_vendor_settings(&params);
-
     // Validate required fields. Let mssql-tds validate based on auth method.
     if params.server.is_empty() {
         error!("SQLDriverConnectW: Server not specified in connection string");
@@ -430,6 +423,10 @@ fn do_connect(
 
     let has_server_info = post_tds_info_messages(state, &info_messages);
 
+    // Publish resolved values only after the connection succeeds. Explicit
+    // attribute overrides remain separate so a reusable DBC does not feed a
+    // previous connection string back into its next connection attempt.
+    state.effective_vendor_settings = Some(effective_vendor_settings(&params));
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
@@ -786,6 +783,36 @@ mod tests {
         };
         assert_eq!(ret, SQL_ERROR);
         assert_eq!(unsafe { diag_sqlstate(dbc, 1) }, "08001");
+    }
+
+    #[test]
+    fn failed_connects_do_not_promote_keywords_to_reusable_attribute_overrides() {
+        let h = TestHandles::with_env_dbc();
+        for encrypt in ["no", "yes"] {
+            let conn_str: Vec<u16> = cs(&format!("UID=u;<PW>=p;Encrypt={encrypt}"))
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let ret = unsafe {
+                sql_driver_connect_w(
+                    h.dbc,
+                    std::ptr::null_mut(),
+                    conn_str.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "attempt with Encrypt={encrypt}");
+
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.connection_state, ConnectionState::Disconnected);
+            assert_eq!(state.vendor_overrides, VendorConnOverrides::default());
+            assert_eq!(state.effective_vendor_settings, None);
+        }
     }
 
     #[test]

@@ -320,8 +320,9 @@ impl InertStmtAttrs {
     /// at set time.
     ///
     /// # Safety
-    /// When set, the pointer must address a live, aligned `SQLLEN` for the
-    /// duration of the execution, per the `SQLSetStmtAttr` contract.
+    /// When set, the pointer must address a live `SQLLEN` for the duration of
+    /// the execution, per the `SQLSetStmtAttr` contract. ODBC does not require
+    /// application pointers to be aligned.
     pub(crate) unsafe fn param_bind_offset(&self) -> isize {
         let ptr = self
             .get(odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR)
@@ -329,19 +330,21 @@ impl InertStmtAttrs {
         if ptr.is_null() {
             return 0;
         }
-        unsafe { ptr.read() }
+        unsafe { ptr.read_unaligned() }
     }
 }
 
-/// One data-at-execution parameter: which binding it refers to and how many
-/// bytes the application promised for it.
+/// One data-at-execution parameter: which binding it refers to, the token
+/// `SQLParamData` returns, and how many bytes the application promised for it.
 ///
-/// Keeping the pair together means a parameter can never be described by an
-/// index with no matching length, which two parallel `Vec`s cannot rule out.
+/// Keeping these fields together means the execution-time token and declared
+/// length cannot drift away from the binding they describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DaeParam {
     /// 0-based index into [`StmtState::bound_params`].
     pub(crate) bound_index: usize,
+    /// `ParameterValuePtr` with the execution's bind offset already applied.
+    pub(crate) value_ptr: SqlPointer,
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
@@ -797,10 +800,12 @@ impl StmtState {
 
     /// The application's `ParameterValuePtr` for the open DAE parameter — the
     /// token `SQLParamData` hands back so the application knows which parameter
-    /// to supply. Null when no parameter is open or its binding is gone.
+    /// to supply. Null when no parameter is open.
     pub(crate) fn dae_current_value_ptr(&self) -> SqlPointer {
-        self.dae_current_bound_param()
-            .map_or(std::ptr::null_mut(), |param| param.parameter_value_ptr)
+        self.dae
+            .as_ref()
+            .and_then(DaeState::current_param)
+            .map_or(std::ptr::null_mut(), |param| param.value_ptr)
     }
 
     /// The bound C type of the open DAE parameter, which `SQLPutData` needs to
