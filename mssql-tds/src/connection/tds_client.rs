@@ -6939,6 +6939,52 @@ mod tests {
         assert_eq!(client.last_rows_affected(), -1);
     }
 
+    /// AB#47535: a PRINT reached only *after* variable assignments. The
+    /// assignments' SQLSELECT-tagged DONE_COUNTs must collapse so the very first
+    /// result the caller sees is the PRINT's message-only result. Treating them
+    /// as update counts stops the batch on the DECLARE, so `execute` returns
+    /// `NoRows { rows_affected: Some(1) }` with no message and the ODBC layer
+    /// reports plain `SQL_SUCCESS` — the shape that hid PRINT output from
+    /// `mssql-python`'s `cursor.messages`.
+    ///
+    /// Observed token sequence for
+    /// `DECLARE @msg VARCHAR(MAX); SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047); PRINT @msg;`.
+    #[tokio::test]
+    async fn execute_surfaces_print_after_assignment_counts() {
+        let printed = "a".repeat(2047);
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 1, true),
+            info_token(0, 0, &printed),
+            done_no_more(),
+        ]);
+
+        let result = client
+            .execute(
+                "DECLARE @msg VARCHAR(MAX);\
+                 SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047);\
+                 PRINT @msg;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+
+        let messages = client.take_info_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, printed);
+        assert_eq!(messages[0].number, 0);
+    }
+
     /// A PRINT on its own statement surfaces as a message-only result (its DONE
     /// carries no count); the following assignment's count is still suppressed.
     #[tokio::test]
