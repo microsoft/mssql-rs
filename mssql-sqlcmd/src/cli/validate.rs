@@ -121,6 +121,10 @@ pub struct Options {
     /// `--authentication-method`: names an Entra method outright instead of
     /// inferring one from `-G` and the credentials beside it.
     pub authentication_method: Option<String>,
+    /// `--server-name`: the name to present at login, when it differs from the
+    /// address dialled. Needed when reaching the server through a tunnel or
+    /// port-forward.
+    pub login_server_name: Option<String>,
     /// `--driver-logging-level`.
     pub driver_logging_level: i64,
     /// `--trace-file`.
@@ -186,6 +190,7 @@ impl Default for Options {
             list_servers_clean: false,
             format: None,
             authentication_method: None,
+            login_server_name: None,
             driver_logging_level: 0,
             trace_file: None,
             compat: Compat::default(),
@@ -401,6 +406,14 @@ pub fn resolve(lexed: &Lexed) -> Result<Options, CliError> {
             'f' => {
                 let (input, output) = code_pages(value(opt))
                     .ok_or_else(|| CliError::Stderr(messages::invalid_parameters('f')))?;
+                // A code page with no encoding behind it must be refused:
+                // falling back to UTF-8 would silently write bytes the caller
+                // did not ask for, and they would have no way to tell.
+                for code_page in [input, output].into_iter().flatten() {
+                    if crate::io::encoding_for_code_page(code_page).is_none() {
+                        return Err(CliError::Stderr(messages::invalid_code_page(code_page)));
+                    }
+                }
                 o.input_code_page = input;
                 o.output_code_page = output;
             }
@@ -446,15 +459,10 @@ pub fn resolve(lexed: &Lexed) -> Result<Options, CliError> {
                 }
                 o.authentication_method = Some(name.to_string());
             }
-            // Dialling one address while presenting another at login needs the
-            // driver to carry a separate login name through the LOGIN7 packet,
-            // which it does not yet do. Refusing is safer than connecting with
-            // an identity the caller did not ask for.
-            spec::SERVER_NAME => {
-                return Err(CliError::Stderr(messages::unsupported_option(
-                    "--server-name",
-                )));
-            }
+            // Dialling one address while presenting another at login. The
+            // driver carries the override through LOGIN7, so a connection via
+            // a tunnel or port-forward can still name the real server.
+            spec::SERVER_NAME => o.login_server_name = Some(value(opt).to_string()),
             spec::DRIVER_LOGGING => o.driver_logging_level = integer(opt).unwrap_or(0),
             spec::TRACE_FILE => o.trace_file = Some(value(opt).to_string()),
             spec::COMPAT => {

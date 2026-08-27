@@ -66,7 +66,14 @@ impl Session {
         }
 
         let mut vars = Variables::with_defaults(&workstation, options.compat);
-        if !options.disable_commands && !options.disable_commands_and_exit {
+        // `-X` blocks environment seeding under go-sqlcmd but not under ODBC,
+        // which still reads `SQLCMDCOLWIDTH`, `SQLCMDINI` and the rest —
+        // measured with `:listvar` against both references. That is also why
+        // ODBC still runs the startup script under `-X`: the variable naming it
+        // was seeded in the first place.
+        let seeding_suppressed = options.compat.is_go()
+            && (options.disable_commands || options.disable_commands_and_exit);
+        if !seeding_suppressed {
             vars.seed_from_environment();
         }
         seed_from_options(&mut vars, &options, &workstation);
@@ -151,14 +158,22 @@ impl Session {
             return exitcode::SUCCESS;
         }
 
-        // The startup script runs before any user input, unless `-X` said not to.
-        if !self.options.disable_commands
-            && !self.options.disable_commands_and_exit
-            && let Some(path) = self.vars.get("SQLCMDINI").map(str::to_string)
+        // The startup script runs before any user input. Under go-sqlcmd `-X`
+        // leaves `SQLCMDINI` unseeded, so there is nothing to run; under ODBC
+        // the variable survives and the script still runs.
+        if let Some(path) = self.vars.get("SQLCMDINI").map(str::to_string)
             && !path.is_empty()
-            && let Some(text) = self.read_input(&path)
         {
-            Box::pin(self.feed(&text)).await;
+            match self.read_input(&path) {
+                Some(text) => {
+                    Box::pin(self.feed(&text)).await;
+                }
+                // Both references name the variable and its value rather than
+                // reporting a bare missing file.
+                None => self
+                    .errors
+                    .write(&messages::invalid_variable_value("SQLCMDINI", &path)),
+            }
         }
 
         if let Some(query) = self.options.initial_query.clone() {
@@ -266,17 +281,64 @@ impl Session {
     }
 
     /// Reads from stdin, prompting when a terminal is attached.
+    ///
+    /// On a terminal this goes through `rustyline`, which brings line editing
+    /// and history. Piped input takes the plain path instead: an editor on a
+    /// non-terminal would strip the very bytes the batch parser needs, and the
+    /// differential harnesses all pipe.
     async fn interactive(&mut self) -> Stop {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            self.interactive_editor().await
+        } else {
+            self.interactive_piped().await
+        }
+    }
+
+    /// The line-edited path: history, recall and editing at the `1>` prompt.
+    async fn interactive_editor(&mut self) -> Stop {
+        let mut editor = match rustyline::DefaultEditor::new() {
+            Ok(editor) => editor,
+            // No terminal to drive after all; fall back rather than fail.
+            Err(_) => return Box::pin(self.interactive_piped()).await,
+        };
+
+        loop {
+            // The results stream may be redirected, so the prompt goes through
+            // rustyline rather than `prompt()`, which writes to that stream.
+            let prompt = format!("{}> ", self.batch.line_count() + 1);
+            match editor.readline(&prompt) {
+                Ok(line) => {
+                    // Only whole statements are worth recalling; a bare
+                    // continuation line on its own is noise in the history.
+                    if !line.trim().is_empty() {
+                        let _ = editor.add_history_entry(line.as_str());
+                    }
+                    // rustyline hands back the line without its terminator, and
+                    // the batch parser needs one to close the line.
+                    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
+                    if let Some(stop) = Box::pin(self.line(&line, eol)).await {
+                        return stop;
+                    }
+                }
+                // Ctrl+C abandons the half-typed batch, as the reference does,
+                // and leaves the session running.
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    self.batch.reset();
+                }
+                // Ctrl+D, or the terminal going away.
+                Err(_) => return Stop::EndOfInput,
+            }
+        }
+    }
+
+    /// The plain path, for piped or redirected input.
+    async fn interactive_piped(&mut self) -> Stop {
         use std::io::BufRead;
 
         let stdin = std::io::stdin();
-        let interactive = std::io::IsTerminal::is_terminal(&stdin);
         let mut line = String::new();
 
         loop {
-            if interactive {
-                self.prompt();
-            }
             line.clear();
             match stdin.lock().read_line(&mut line) {
                 Ok(0) => return Stop::EndOfInput,
@@ -302,12 +364,6 @@ impl Session {
         } else {
             original
         }
-    }
-
-    fn prompt(&mut self) {
-        let number = self.batch.line_count() + 1;
-        self.results.write(&format!("{number}> "));
-        self.results.flush();
     }
 
     /// Feeds a whole script through the same path as interactive input.

@@ -13,6 +13,7 @@
 
 pub mod config_cmds;
 pub mod container;
+pub mod open_cmds;
 pub mod server_cmds;
 pub mod sqlconfig;
 pub mod yaml;
@@ -207,7 +208,15 @@ fn dispatch(argv: &[String]) -> Result<Outcome, String> {
         "delete" | "uninstall" | "drop" | "remove" => {
             server_cmds::delete(&mut invocation, Context::open(path)?).map(Outcome::Done)
         }
-        "open" => Err(unsupported("open")),
+        "open" => {
+            // `ads` is the only target the reference has; anything else is a
+            // typo rather than a tool this port declined to support.
+            let target = invocation.take_word().unwrap_or_default();
+            match target.as_str() {
+                "ads" | "" => open_cmds::ads(Context::open(path)?).map(Outcome::Done),
+                other => Err(unsupported(&format!("open {other}"))),
+            }
+        }
         "--help" => Ok(Outcome::Done(help_for(""))),
         other => Err(format!("unknown command {other:?}")),
     }
@@ -216,10 +225,7 @@ fn dispatch(argv: &[String]) -> Result<Outcome, String> {
 /// Commands that are recognised but not implemented say so, rather than
 /// failing as though the name were a typo.
 fn unsupported(name: &str) -> String {
-    format!(
-        "sqlcmd: '{name}' is not implemented in this build.\n\
-         It launches an external application, which this port does not do."
-    )
+    format!("sqlcmd: '{name}' is not implemented in this build.")
 }
 
 fn help_for(command: &str) -> String {

@@ -144,6 +144,23 @@ pub fn build_context(options: &Options, workstation: &str) -> (ClientContext, Da
 
     context.tds_authentication_method = authentication(options);
 
+    // Reaching the server through a tunnel or port-forward means the address
+    // dialled is not the name the server should see at login.
+    context.login_server_name = options.login_server_name.clone();
+
+    // A federated method needs a token factory registered before the handshake:
+    // the server asks for a bearer token mid-login, and without one the
+    // connection fails with nothing to send.
+    let method = context.tds_authentication_method.clone();
+    super::entra::register(
+        &mut context,
+        super::entra::Credentials {
+            method,
+            user: options.user.clone().unwrap_or_default(),
+            secret: options.password.clone().unwrap_or_default(),
+        },
+    );
+
     (context, source)
 }
 
@@ -189,8 +206,12 @@ fn authentication(options: &Options) -> TdsAuthenticationMethod {
 }
 
 /// The `--authentication-method` names go-sqlcmd accepts, matched
-/// case-insensitively. Methods the driver has no equivalent for are left out
-/// rather than silently mapped to something else.
+/// case-insensitively.
+///
+/// `ActiveDirectoryInteractive` is accepted by name but cannot succeed here:
+/// it needs a browser and a loopback redirect listener. It resolves to the
+/// default credential chain, which will pick up an existing developer sign-in
+/// if there is one.
 pub fn named_method(name: &str) -> Option<TdsAuthenticationMethod> {
     use TdsAuthenticationMethod as M;
     let normalized = name.trim().to_ascii_lowercase();
@@ -201,11 +222,20 @@ pub fn named_method(name: &str) -> Option<TdsAuthenticationMethod> {
         "activedirectoryinteractive" => M::ActiveDirectoryInteractive,
         "activedirectorymanagedidentity" => M::ActiveDirectoryManagedIdentity,
         "activedirectorymsi" => M::ActiveDirectoryMSI,
-        "activedirectoryserviceprincipal" => M::ActiveDirectoryServicePrincipal,
+        // The reference treats `Application` as a synonym for the service
+        // principal flow.
+        "activedirectoryserviceprincipal" | "activedirectoryapplication" => {
+            M::ActiveDirectoryServicePrincipal
+        }
         "activedirectorydevicecode" | "activedirectorydevicecodeflow" => {
             M::ActiveDirectoryDeviceCodeFlow
         }
         "activedirectoryworkloadidentity" => M::ActiveDirectoryWorkloadIdentity,
+        "activedirectoryazcli" => M::ActiveDirectoryAzCli,
+        "activedirectoryazuredevelopercli" => M::ActiveDirectoryAzureDeveloperCli,
+        "activedirectoryazurepipelines" => M::ActiveDirectoryAzurePipelines,
+        "activedirectoryenvironment" => M::ActiveDirectoryEnvironment,
+        "activedirectoryclientassertion" => M::ActiveDirectoryClientAssertion,
         "sqlpassword" => M::Password,
         _ => return None,
     })

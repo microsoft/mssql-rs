@@ -85,13 +85,68 @@ fn an_unknown_auth_method_is_refused_rather_than_ignored() {
 }
 
 #[test]
-fn server_name_is_refused_rather_than_silently_ignored() {
-    let run = sqlcmd(&["--server-name", "other"]);
+fn server_name_is_accepted_and_reaches_the_login_packet() {
+    // The name presented at login is carried through LOGIN7 by the driver, so
+    // the option must parse and connect rather than be refused. What arrives on
+    // the wire is asserted in mssql-tds's `test_login_server_name`, which reads
+    // it back off a mock server.
+    let run = sqlcmd(&["--server-name", "other", "-?"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.is_empty(),
+        "--server-name should be accepted: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn every_entra_method_the_reference_names_is_accepted() {
+    // A method that parses but has no token factory behind it would connect and
+    // then fail at the handshake with nothing to send, so acceptance here is
+    // paired with the registration test in `exec::entra`.
+    for method in [
+        "ActiveDirectoryDefault",
+        "ActiveDirectoryIntegrated",
+        "ActiveDirectoryPassword",
+        "ActiveDirectoryInteractive",
+        "ActiveDirectoryManagedIdentity",
+        "ActiveDirectoryMSI",
+        "ActiveDirectoryServicePrincipal",
+        "ActiveDirectoryApplication",
+        "ActiveDirectoryDeviceCode",
+        "ActiveDirectoryWorkloadIdentity",
+        "ActiveDirectoryAzCli",
+        "ActiveDirectoryAzureDeveloperCli",
+        "ActiveDirectoryAzurePipelines",
+        "ActiveDirectoryEnvironment",
+        "ActiveDirectoryClientAssertion",
+        "SqlPassword",
+    ] {
+        let run = sqlcmd(&["--authentication-method", method, "-?"]);
+        assert!(
+            run.stderr.is_empty(),
+            "{method} should be accepted: {}",
+            run.stderr
+        );
+    }
+}
+
+#[test]
+fn an_unusable_code_page_is_refused_rather_than_falling_back() {
+    // Falling back to UTF-8 would write bytes the caller did not ask for with
+    // no way to tell. Message measured from the reference.
+    let run = sqlcmd(&["-f", "9999"]);
     assert_eq!(run.code, 1);
     assert_eq!(
         run.stderr,
-        "Sqlcmd: '--server-name': Not supported by this build.\n"
+        "Sqlcmd: The code page <9999> specified in option -f is invalid or not installed on this system.\n"
     );
+}
+
+#[test]
+fn a_usable_code_page_is_still_accepted() {
+    let run = sqlcmd(&["-f", "1252", "-?"]);
+    assert!(run.stderr.is_empty(), "stderr: {}", run.stderr);
 }
 
 #[test]

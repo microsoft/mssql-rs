@@ -185,14 +185,21 @@ pub fn unknown_auth_method(name: &str) -> String {
     format!("Sqlcmd: '{name}': Unsupported authentication method.{EOL}")
 }
 
-/// An option this build understands but cannot honour. Refusing is deliberate:
-/// accepting it silently would connect or format in a way the caller did not
-/// ask for, and they would have no way to tell.
-pub fn unsupported_option(option: &str) -> String {
-    format!("Sqlcmd: '{option}': Not supported by this build.{EOL}")
-}
-
 /// A `--compat` value naming neither tool.
 pub fn unknown_compat(name: &str) -> String {
     format!("Sqlcmd: '{name}': Unknown compatibility mode. Use 'odbc' or 'go'.{EOL}")
+}
+
+/// `MSG_INVALID_VARIABLE_VALUE` — an environment variable naming something
+/// unusable, such as a `SQLCMDINI` startup script that cannot be opened.
+pub fn invalid_variable_value(name: &str, value: &str) -> String {
+    format!("Sqlcmd: Error: The environment variable: '{name}' has invalid value: '{value}'.{EOL}")
+}
+
+/// A `-f` code page with no encoding behind it. Refusing beats falling back:
+/// the caller asked for particular bytes and would otherwise get others.
+pub fn invalid_code_page(code_page: u32) -> String {
+    format!(
+        "Sqlcmd: The code page <{code_page}> specified in option -f is invalid or not installed on this system.{EOL}"
+    )
 }
