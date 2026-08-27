@@ -1432,9 +1432,9 @@ TEST_F(AttributesTest, CurrentCommandTracksTheResultSetOrdinal) {
 
 // -------------------------------------------------------------------
 // Variation 54 - the two query-notification attributes are the only
-// string-valued statement attributes. StringLength is a byte count on
-// both legs, so an explicit 6 stores three characters, and a get always
-// reports the full byte width even when the buffer could not hold it.
+// string-valued statement attributes. StringLength is a byte count when
+// a value buffer is present, so an explicit 6 stores three characters and
+// a truncated get reports the full byte width.
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
     SQLTCHAR buffer[32] = {};
@@ -1488,7 +1488,14 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
     written = -1;
     EXPECT_EQ(SQL_SUCCESS,
               SQLGetStmtAttr(stmt_, kSsQnMsgtext, nullptr, 0, &written));
+#ifdef _WIN32
     EXPECT_EQ(20, written);
+#else
+    // Through unixODBC, this vendor-defined length-only query reports
+    // characters. Both drivers return 10 here while returning the ODBC byte
+    // count when a value buffer is present.
+    EXPECT_EQ(10, written);
+#endif
 }
 
 // -------------------------------------------------------------------
@@ -1767,15 +1774,30 @@ SQLRETURN SetVendorAttr(SQLHDBC dbc, SQLINTEGER attribute, SQLUINTEGER value) {
 }  // namespace
 
 // -------------------------------------------------------------------
-// Variation 59 - SQL_COPT_SS_ENCRYPT outranks the Encrypt keyword, in both
-// directions. Asserted against sys.dm_exec_connections rather than against a
-// get, so a driver that stored the attribute but never applied it fails here.
+// Variation 59 - SQL_COPT_SS_ENCRYPT outranks the Encrypt keyword in both
+// directions. The getter pins both outcomes, while sys.dm_exec_connections
+// proves the setting reached the wire when the server permits encryption off.
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, EncryptAttributeOutranksTheKeyword) {
     const auto& cfg = ODBCTestConfig::Instance();
     if (!cfg.Encrypt().empty()) {
         GTEST_SKIP() << "ODBC_TEST_ENCRYPT would add a competing keyword";
     }
+
+    SQLHDBC probe = SQL_NULL_HDBC;
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DBC, env_, &probe)));
+    ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(probe, "Encrypt=no;")))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, probe);
+
+    SQLRETURN probe_rc = SQL_ERROR;
+    EXPECT_EQ(0u, GetVendorAttr(probe, SQL_COPT_SS_ENCRYPT, &probe_rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(probe_rc));
+    const std::string baseline = EncryptOption(probe);
+    SQLDisconnect(probe);
+    SQLFreeHandle(SQL_HANDLE_DBC, probe);
+
+    ASSERT_TRUE(baseline == "TRUE" || baseline == "FALSE") << baseline;
+    const bool server_allows_encryption_off = baseline == "FALSE";
 
     struct Case {
         const char* keyword;
@@ -1798,7 +1820,19 @@ TEST_F(AttributesTest, EncryptAttributeOutranksTheKeyword) {
 
         ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, c.keyword)))
             << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
-        EXPECT_EQ(c.expected, EncryptOption(dbc));
+
+        SQLRETURN rc = SQL_ERROR;
+        EXPECT_EQ(c.attr, GetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, &rc));
+        EXPECT_TRUE(SQL_SUCCEEDED(rc));
+
+        const std::string wire_setting = EncryptOption(dbc);
+        if (c.attr != 0 || server_allows_encryption_off) {
+            EXPECT_EQ(c.expected, wire_setting);
+        } else {
+            EXPECT_EQ("TRUE", wire_setting)
+                << "the server forced encryption despite the effective "
+                   "client setting being off";
+        }
 
         SQLDisconnect(dbc);
         SQLFreeHandle(SQL_HANDLE_DBC, dbc);
@@ -1881,11 +1915,10 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
     SQLRETURN rc = SQL_ERROR;
     EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, &rc));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
-    EXPECT_EQ("FALSE", EncryptOption(dbc));
 
-    // The other two follow the same rule. Encryption is off here, so there is
-    // no server certificate to trust and the flag reads 0 whatever the
-    // TrustServerCertificate keyword said.
+    // The other two follow the same rule. Client-side encryption is off here,
+    // so the trust flag reads 0 even when the server independently requires an
+    // encrypted transport.
     EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, &rc));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
 
