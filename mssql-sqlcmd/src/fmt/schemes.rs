@@ -9,7 +9,7 @@
 //! own token inheritance, so a style defining only `LiteralString` gives the
 //! same answer it would there.
 //!
-//! Generated from chroma v2.27.0 by `scripts/extract-styles.ps1`. A scheme
+//! Generated from chroma v2.27.0 by `scripts/generate-schemes.ps1`. A scheme
 //! chroma knows and this table does not would simply not colour, which is the
 //! same as naming a scheme that does not exist.
 

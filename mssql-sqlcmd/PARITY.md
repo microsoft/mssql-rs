@@ -109,7 +109,7 @@ Linux coverage.
 | **`go-sqlcmd`** | **Yes**, with `--compat go`, or via the subcommand CLI. |
 
 The one caveat for both: Entra ID sign-in is implemented but has never been run
-against a live Entra tenant. See §6.
+against a live Entra tenant. See §8.
 
 ---
 
@@ -289,7 +289,7 @@ server advertises.
 | `-R` | `--client-regional-setting` | **implemented** | accepted, ignored | **=** | Formats money, `decimal`/`numeric` and the date/time types with the client's locale. Only ODBC implements it; matching meant going through the platform's own locale services, as the reference does. See below |
 | `--vertical` | — | absent | = | = | One field per line |
 | `--ascii` | — | absent | = | = | ASCII box-drawn table |
-| `--format` | — | absent | **absent** | **extension** | Names a layout: `vert`/`vertical`, `ascii`, `horiz`/`horizontal`. The same set the `SQLCMDFORMAT` variable takes, which Go has — but Go has no flag for it. **An unrecognised name is not rejected**, see §7 |
+| `--format` | — | absent | **absent** | **extension** | Names a layout: `vert`/`vertical`, `ascii`, `horiz`/`horizontal`. The same set the `SQLCMDFORMAT` variable takes, which Go has — but Go has no flag for it. **An unrecognised name is not rejected**, see §8 |
 | `SQLCMDCOLORSCHEME` | — | absent | = | = | 74 chroma schemes, byte-identical through a PTY. `:list color` names them |
 
 ### 3.6 Errors and exit codes
@@ -381,7 +381,222 @@ Precedence: `:setvar` > `-v` > environment > built-in default.
 
 ---
 
-## 7. What is left
+## 7. How the Go-specific features are implemented
+
+Everything in §3 marked "ODBC absent" had to be built rather than mapped onto an
+existing ODBC behaviour. This section says how, one feature at a time, so a
+reviewer can go straight to the code.
+
+### 7.1 Long option forms
+
+**`src/cli/spec.rs`, `src/cli/args.rs`**
+
+One option table drives both CLIs. Each entry carries a short form, an optional
+long form and an arity (`Flag`, `Value`, `Suffix`, `Retired`). Options that
+exist only in long form — `--vertical`, `--ascii`, `--format`, `--version`,
+`--authentication-method`, `--server-name`, `--driver-logging-level`,
+`--trace-file`, `--compat` — are keyed by private-use scalars (`U+E000`
+onwards) so they occupy a slot in the same table but can never be reached by a
+short-form lookup, because no keyboard produces those characters.
+
+`by_short` matches exactly; `by_long` matches with `eq_ignore_ascii_case`. That
+one detail is what lets go-sqlcmd's oddly capitalised `--login-timeOut` through
+alongside the lowercase spelling. It costs nothing, since no two options differ
+only in case.
+
+### 7.2 `--server-name`
+
+**`src/cli/validate.rs`, `src/exec/connect.rs` — and `mssql-tds`**
+
+The only feature that needed a change in the driver. LOGIN7 carries a server
+name, and until now it was always derived from the address that was dialled.
+`ClientContext::login_server_name: Option<String>` was added, plus a
+`login_server_name(&transport)` accessor that returns the override when set and
+the transport's parsed name otherwise. The tool parses the flag and sets the
+field before connecting.
+
+This matters for tunnels and port-forwards, where the address you dial is not
+the name the server expects to see.
+
+### 7.3 `--authentication-method` and the 15 Entra ID methods
+
+**`src/exec/entra.rs`, `src/exec/entra/oauth.rs`, `src/exec/connect.rs`**
+
+`mssql-tds` asks a registered `EntraIdTokenFactory` for a bearer token during
+the FedAuth handshake. `SqlcmdTokenFactory` implements that trait and is
+inserted into `ClientContext::auth_method_map` before connecting — which is the
+whole fix for the pre-existing defect where these methods parsed but registered
+no provider, and so failed at login with nothing to send.
+
+Most methods delegate to an `azure_identity` credential: managed identity,
+workload identity, Azure CLI, Azure Developer CLI, Azure Pipelines, client
+assertion, service principal, and the developer-tools chain behind
+`ActiveDirectoryDefault`. Two have no SDK equivalent and are implemented
+directly against the OAuth2 token endpoint in `oauth.rs` — resource-owner
+password, and the device-code polling flow that a headless session needs.
+`ActiveDirectoryEnvironment` reads `AZURE_CLIENT_ID` / `_TENANT_ID` /
+`_CLIENT_SECRET` itself.
+
+`ActiveDirectoryInteractive` is accepted by name and served by the default
+chain. A real loopback-redirect browser flow is deliberately not attempted: it
+needs a listener and a browser, neither of which belongs in a tool that is
+usually run non-interactively.
+
+Three further details:
+
+- **Tenant override.** `split_client_and_tenant` splits `-U` on `@`, so
+  `client-id@tenant-id` overrides the tenant the server advertises in
+  FEDAUTHINFO. A trailing `@` names no tenant but still ends the client id.
+- **Credential reuse.** The credential is built once into an
+  `Arc<OnceCell<…>>` and reused, so its own token cache survives repeated
+  logins — session recovery, for instance.
+- **TLS backend.** `azure_core` is pinned to `native-tls`, matching msodbcsql
+  and `mssql-tds`, which keeps `ring` out of the dependency graph.
+
+The authority the token is requested from comes from the server, so it is
+trusted but forced to `https`, and secrets travel in the request body and are
+never logged. On a channel that is not certificate-validated, a hostile server
+could still redirect a secret to an authority it controls — the module says so,
+and points at `-N strict`.
+
+### 7.4 `-J` / `--server-certificate`
+
+**`src/cli/validate.rs`, `src/exec/connect.rs`**
+
+Parsed as a path, checked for readability early, and handed to
+`EncryptionOptions::server_certificate` so the TLS handshake can pin or
+validate against it. Only meaningful when encryption is on.
+
+### 7.5 `--vertical`, `--ascii`, `SQLCMDFORMAT`, `--format`
+
+**`src/fmt/layout.rs`, `src/fmt/table.rs`, `src/fmt/widths.rs`**
+
+A `Format` enum selects the renderer; column widths are computed once in
+`widths.rs` and shared by all three layouts.
+
+- **Vertical** prints one field per line as `name   value`, with names padded to
+  the longest in the set and a blank line between rows. Under `-h -1` the names
+  go and bare values remain.
+- **ASCII** draws `+---+---+` rules and `|` separators, falling back to `|` when
+  the configured separator is blank or a space.
+
+Precedence is flag, then `SQLCMDFORMAT`, then horizontal. `Format::parse` is
+case-insensitive over `vert`, `vertical`, `ascii`. An unknown name falls through
+to horizontal — correct for the variable, because that is what go-sqlcmd does,
+and the known gap for the flag recorded in §8.
+
+### 7.6 `SQLCMDCOLORSCHEME` and `:list color`
+
+**`src/fmt/color.rs`, `src/fmt/schemes.rs`, `scripts/generate-schemes.ps1`**
+
+go-sqlcmd colours its output with chroma, so the schemes were taken from
+chroma's own data rather than re-invented. `generate-schemes.ps1` reads the
+v2.27.0 style XML, walks each style's token-inheritance chain for the five
+things sqlcmd actually colours — cell (`StringOther`), header
+(`GenericHeading`), separator (`StringDelimiter`), error (`GenericError`),
+warning (`GenericEmph`) — and emits a const array of 74 × 5 `Face` values, each
+holding 24-bit RGB plus bold/italic/underline.
+
+Emission matches chroma's `terminal16m` formatter: emphasis and colour as
+separate sequences (`\e[1m`, `\e[3m`, `\e[4m`, `\e[38;2;R;G;Bm`) closed by a
+single `\e[0m`. Multi-line messages are wrapped and reset per line, which was
+established by capturing the reference through a PTY rather than assumed.
+
+Colour is gated on a real terminal — `GetConsoleMode` on a console handle on
+Windows, `isatty(1)` elsewhere — so a redirected stream is always plain and no
+script ever has to strip escapes. An unrecognised scheme name is not an error:
+it resolves to chroma's `swapoff` fallback, as the reference does. `:list color`
+prints the names sorted.
+
+### 7.7 `--driver-logging-level` and `--trace-file`
+
+**`src/tracing.rs`**
+
+go-sqlcmd takes a number, not a level name, so `level_for` maps `≤0` to off and
+`1`–`5` to error/warn/info/debug/trace, with anything higher clamped to trace.
+Rather than pull in a subscriber, the level is written to `RUST_LOG` — once,
+before any thread is spawned — which is where the driver already looks.
+`--trace-file` opens the file into a `static Mutex<Option<File>>`; a file that
+cannot be created is reported before connecting rather than silently dropped,
+since carrying on would discard exactly the output the caller asked for.
+Diagnostics never enter the results stream that scripts parse.
+
+### 7.8 `--version`
+
+**`src/cli/usage.rs`, `src/main.rs`**
+
+Version comes from `env!("CARGO_PKG_VERSION")`. `--version` is caught before
+full option resolution and prints the banner alone; `-?` prints the same banner,
+a blank line, then the syntax block. The platform word is the hardcoded `NT`
+noted in §8.
+
+### 7.9 `SQLCMDUSEAAD` and the other Go-only variables
+
+**`src/vars.rs`**
+
+Three variables exist only under `--compat go`: `SQLCMDFORMAT`, `SQLCMDUSEAAD`
+and `SQLCMDCOLORSCHEME`. Their `:listvar` order is not alphabetical —
+`SQLCMDUSEAAD` sorts in with the rest but `SQLCMDCOLORSCHEME` is appended after
+them — so the latter is held in a separate `trailing` list to reproduce that
+exactly. `SQLCMDUSEAAD` is seeded and listed but not read back to imply `-G`;
+options always win.
+
+### 7.10 The subcommand CLI
+
+**`src/modern.rs` and `src/modern/`**
+
+`modern::claims()` inspects the first argument and routes to the subcommand CLI
+only if it names one; everything else goes to the flag-driven CLI, so the two
+never contend. The invocation parser handles both `--flag value` and
+`--flag=value` and tracks which flags are boolean.
+
+| Piece | File | Approach |
+|---|---|---|
+| `config` (13 subcommands) | `config_cmds.rs`, `sqlconfig.rs` | Pure file manipulation, no connection |
+| `query` | `server_cmds.rs` | Resolves the current context into ordinary arguments and delegates to the flag-driven CLI |
+| `create mssql` | `server_cmds.rs`, `container.rs` | Runs the container, waits for readiness, writes the context |
+| `get-tags` | `container.rs` | Docker Registry V2 `tags/list`, following `Link: …; rel="next"` |
+| `start` / `stop` / `delete` | `container.rs` | Same runtime commands |
+| `open ads` | `open_cmds.rs` | Locate, hand over credentials, launch |
+
+**sqlconfig YAML.** The file is shared with go-sqlcmd, so it has to round-trip
+byte for byte — key order, indentation, and which scalars get quoted. `yaml.rs`
+is a small hand-written parser and emitter covering only the shapes go-sqlcmd
+writes (nested maps, lists of maps, plain scalars, empty collections) and
+erroring on anchors, tags, flow syntax and multi-document input. A general YAML
+library would have been less code and more risk: normalising quoting or
+reordering keys is exactly the behaviour that breaks a shared file.
+
+**Containers.** go-sqlcmd talks to the Docker daemon over its HTTP API. Shelling
+out to the `docker` binary instead keeps this to one dependency-free module and
+works unchanged against Podman, whose CLI is compatible — the two are probed in
+order. Readiness is the *"SQL Server is now ready for client connections"* line
+in the logs, not a fixed sleep.
+
+**`open ads`.** Azure Data Studio is located by searching known install paths,
+Insiders builds first, per platform. On Windows the password is written to the
+Credential Manager under the profile identity ADS composes internally — a
+target name that has to match byte for byte or ADS will not find it. On macOS
+and Linux it is not stored: the reference's macOS build gets the encoding wrong
+and its Linux build panics before it gets that far, so the tool launches ADS and
+lets it prompt. That is better than a panic, and it never leaves a secret
+somewhere it cannot be retrieved from.
+
+### 7.11 `--compat` / `SQLCMDCOMPAT`
+
+**`src/compat.rs`**
+
+`Compat::parse` accepts `odbc` and `go` (also `go-sqlcmd`), case-insensitive and
+trimmed, and returns `None` for anything else so callers refuse rather than
+guess. The flag wins over the environment variable, which wins over the ODBC
+default. `Options::compat` is then threaded into the session, the runner, the
+formatter and the variable table, and read at each of the ~20 measured
+divergence points in §2 via `compat.is_go()` — one value, checked where the two
+references actually differ, rather than two parallel code paths.
+
+---
+
+## 8. What is left
 
 ### Blocked on environment — the real risk
 
@@ -453,7 +668,7 @@ differential cases covering money, `smallmoney`, `decimal`, `numeric`, `date`,
 
 ---
 
-## 8. Notes for reviewers
+## 9. Notes for reviewers
 
 **Testing is differential, not golden.** Almost nothing is asserted against
 hand-written expected output. Each case runs the real binary and the Rust binary
