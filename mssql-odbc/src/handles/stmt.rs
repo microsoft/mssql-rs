@@ -18,10 +18,10 @@ use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
+use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
-#[derive(Debug)]
 pub(crate) struct ActivePlpStream {
     /// 1-based column ordinal being streamed.
     pub(crate) column: usize,
@@ -34,6 +34,39 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
+    /// Incremental decoder for the narrow-text -> `SQL_C_WCHAR` widening path
+    /// (`varchar(max)`/`json` delivered as UTF-16LE). `None` for every other
+    /// combination.
+    ///
+    /// A decoder rather than a byte carry because the column's codepage can be
+    /// multi-byte (`lcid_to_encoding` reaches SHIFT_JIS, GBK, BIG5, EUC-KR and
+    /// UTF-8), so a chunk boundary can split one character across two reads.
+    /// `encoding_rs::Decoder` already holds that partial sequence internally,
+    /// which keeps the boundary rule in one place instead of one per codepage.
+    pub(crate) narrow_to_wide: Option<Decoder>,
+    /// Code units already decoded on a previous call that did not fit the
+    /// caller's buffer, delivered before any further wire bytes.
+    ///
+    /// The decoder writes into a scratch area sized for its own needs rather
+    /// than the caller's, because some decoders refuse to emit anything with
+    /// less than two units of room (`encoding_rs::GBK` returns `OutputFull`
+    /// having consumed nothing). Holding the surplus here lets a caller ask for
+    /// one character at a time without stalling the stream.
+    pub(crate) pending_units: Vec<u16>,
+}
+
+impl std::fmt::Debug for ActivePlpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `encoding_rs::Decoder` is not Debug; report whether one is active.
+        f.debug_struct("ActivePlpStream")
+            .field("column", &self.column)
+            .field("encoding", &self.encoding)
+            .field("pending_byte", &self.pending_byte)
+            .field("pending_high_surrogate", &self.pending_high_surrogate)
+            .field("narrow_to_wide", &self.narrow_to_wide.is_some())
+            .field("pending_units", &self.pending_units.len())
+            .finish()
+    }
 }
 
 /// An application buffer bound to a result-set column by `SQLBindCol`.
