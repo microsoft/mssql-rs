@@ -471,7 +471,7 @@ fn fill_rowset(
             dbc_state.active_stmt = None;
         }
     } else if peek_is_safe {
-        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client);
+        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, rows_filled > 0);
     } else {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
@@ -738,7 +738,9 @@ mod tests {
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
-    use mssql_tds::test_client_support::{int_columns, tds_client_from_tokens};
+    use mssql_tds::test_client_support::{
+        col_metadata_empty, done_no_more, int_columns, tds_client_from_tokens,
+    };
 
     fn binding(
         column_number: SqlUSmallInt,
@@ -1008,12 +1010,18 @@ mod tests {
         );
     }
 
-    /// Reproduces AB#47508's reported scenario directly: statement A's cursor
-    /// is exhausted-but-not-yet-closed (this fetch's peek already released
-    /// the busy claim); statement B must then be able to claim the connection
-    /// without seeing "Connection is busy with results for another command",
-    /// and A must still be able to report SQL_NO_DATA afterward — including
-    /// while B is actively using the connection.
+    /// Given the *consequence* of AB#47508's fix (a cursor whose fetch has
+    /// already released the busy claim and marked its result set
+    /// exhausted — the two post-conditions `release_busy_if_row_exhausted`
+    /// produces, taken as a precondition here since driving a real
+    /// one-row `fill_rowset` fetch through this crate's downstream
+    /// scripted-token test harness cannot itself produce a positioned row,
+    /// see `real_zero_row_fetch_through_fill_rowset_releases_active_stmt`
+    /// below for the closest achievable real-fetch equivalent): statement B
+    /// must then be able to claim the connection without seeing "Connection
+    /// is busy with results for another command", and A must still be able
+    /// to report SQL_NO_DATA afterward — including while B is actively
+    /// using the connection.
     #[test]
     fn one_statements_exhausted_cursor_does_not_block_another_statements_execute() {
         let mut h = TestHandles::with_env_dbc_stmt();
@@ -1048,6 +1056,55 @@ mod tests {
             rc, SQL_NO_DATA,
             "A's exhausted cursor must not contend with B's active claim"
         );
+    }
+
+    /// The real-fetch counterpart to the test above: drives an actual
+    /// zero-row result set (`SELECT ... WHERE 1=0`) through `sql_fetch_scroll`
+    /// → `fill_rowset` → the real `peek_is_safe` branch →
+    /// `release_busy_if_row_exhausted`, and observes `active_stmt` become
+    /// `None` as a *produced effect* of that real code path rather than a
+    /// hand-set precondition. Fails on `main`, which has no early-release
+    /// logic at all.
+    ///
+    /// This is the closest equivalent this crate's test harness can drive:
+    /// [`mssql_tds::test_client_support`]'s scripted-token replay has no real
+    /// row bytes (see its module doc), so `next_row_cursor` can only ever
+    /// return `Ok(false)`/`Err` for it, never `Ok(true)` positioned on an
+    /// actual row — a genuine *one*-row variant of this test is not
+    /// reachable from mssql-odbc today without extending that harness (in
+    /// `mssql-tds`) with a "positioned row" scripted-token variant.
+    #[test]
+    fn real_zero_row_fetch_through_fill_rowset_releases_active_stmt() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_tokens(vec![col_metadata_empty(), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1=0;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+
+        assert_eq!(rc, SQL_NO_DATA);
+        assert!(
+            dbc.inner.lock().unwrap().active_stmt.is_none(),
+            "a real fetch through fill_rowset that finds the result set \
+             already exhausted must release active_stmt itself (AB#47508) — \
+             this never happens on main"
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
     /// Row-wise binding is not implemented, and reporting HYC00 is better than

@@ -277,7 +277,10 @@ fn finish_get_data(
         return rc;
     };
     drop(dbc_state);
-    release_busy_if_row_exhausted(dbc, stmt, statement_handle, client);
+    // A row's column was genuinely captured to reach this point (`ready`
+    // requires it), so a row was always delivered here — unlike
+    // `fetch_scroll.rs`'s zero-row fetch case.
+    release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, true);
     rc
 }
 
@@ -2090,5 +2093,60 @@ mod tests {
         assert_eq!(rc, SQL_ERROR);
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    /// The PLP scope limit (see the doc comment above `finish_get_data`):
+    /// even when the last column of the last row was just delivered, a
+    /// column still mid-PLP-stream (`active_plp` set) must NOT be peeked
+    /// past — the stream may not have reached the wire's end yet, so the
+    /// busy claim must be retained exactly as-is until the PLP stream
+    /// completes naturally on a later `SQLGetData` call.
+    #[test]
+    fn finish_get_data_keeps_busy_while_a_plp_stream_is_still_active() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata = int_columns(1);
+            s.current_row_last_col = 1; // the only column, otherwise fully delivered.
+            s.active_plp = Some(ActivePlpStream {
+                column: 1,
+                encoding: PlpEncoding::SingleByteText,
+                pending_byte: None,
+                pending_high_surrogate: None,
+            });
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // A real, positioned client: if the PLP guard were missing, `ready`
+        // would wrongly read true and the peek below would actually run
+        // (and succeed, since the scripted stream is well-formed) — the
+        // claim retention this test checks would then fail for real,
+        // not just because there was nothing to peek with.
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            mssql_tds::test_client_support::col_metadata_empty(),
+            mssql_tds::test_client_support::done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        let rc = finish_get_data(stmt_handle, h.stmt, stmt_state, 1, SQL_SUCCESS);
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            dbc.inner.lock().unwrap().active_stmt,
+            Some(h.stmt),
+            "an active PLP stream must retain the busy claim, not release it"
+        );
+        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 }

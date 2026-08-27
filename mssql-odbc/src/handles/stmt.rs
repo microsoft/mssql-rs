@@ -113,6 +113,22 @@ pub(crate) struct StmtState {
     /// Reset whenever a fresh row-returning result is positioned (a new
     /// execute, or `SQLMoreResults` landing on the next result set).
     pub(crate) result_set_exhausted: bool,
+    /// Set alongside `result_set_exhausted`, but only when the wire has
+    /// confirmed nothing remains anywhere in the batch — i.e. exactly when
+    /// `release_busy_if_row_exhausted` (`exec_common.rs`) actually released
+    /// the busy claim, not merely when the *current* result set ran out.
+    /// `result_set_exhausted` alone is insufficient here: it is also set when
+    /// a further result set is still pending (`DONE` carrying `MORE`), a case
+    /// where this statement still owns the connection and `SQLMoreResults`
+    /// must genuinely advance rather than fast-path.
+    ///
+    /// Lets `SQLMoreResults` report `SQL_NO_DATA` without touching the
+    /// connection at all once this is `true` — matching msodbcsql, whose
+    /// `SQLMoreResults` has no busy check of its own (`GetBatchCtxOrRecover`
+    /// just falls through to `SQL_NO_DATA_FOUND` once the batch context is
+    /// gone) and so is never blocked by a different statement that has since
+    /// claimed the connection. Reset everywhere `result_set_exhausted` is.
+    pub(crate) batch_exhausted: bool,
     /// A SQL Server error a read-ahead peek discovered past a row this
     /// statement had already finished delivering to the caller (see
     /// `release_busy_if_row_exhausted` in `exec_common.rs`). The call that
@@ -918,6 +934,7 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 result_set_exhausted: false,
+                batch_exhausted: false,
                 pending_fetch_error: None,
                 prepared: None,
                 parameter_metadata: Vec::new(),

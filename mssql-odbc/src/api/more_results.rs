@@ -65,6 +65,20 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
             return SQL_ERROR;
         }
+        if stmt_state.batch_exhausted {
+            // A prior fetch's read-ahead peek already confirmed the wire has
+            // nothing left anywhere in this batch — not just the current
+            // result set, which is all `result_set_exhausted` would prove
+            // (see AB#47508's release_busy_if_row_exhausted). The answer is
+            // already known and needs no connection access at all: report it
+            // even if a different statement has since claimed the
+            // connection. Matches msodbcsql, whose SQLMoreResults has no busy
+            // check of its own (`GetBatchCtxOrRecover` just falls through to
+            // `SQL_NO_DATA_FOUND` once the batch context is gone).
+            reset_cursor_state(&mut stmt_state);
+            debug!("SQLMoreResults: batch already known exhausted; returning SQL_NO_DATA");
+            return SQL_NO_DATA;
+        }
         // A pure-DML batch queued one row count per statement; step through them
         // in memory (no cursor or connection) before falling back to the wire.
         if let Some(next) = stmt_state.pending_row_counts.pop_front() {
@@ -139,6 +153,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             stmt_state.begin_result_set(metadata);
             stmt_state.reset_row_stream();
             stmt_state.result_set_exhausted = false;
+            stmt_state.batch_exhausted = false;
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();
             // Drain INFO only after the lock is held.
@@ -187,6 +202,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // give — so this arm needs the same reset as the `Rows` arm even
             // though there is nothing to fetch on this result itself.
             stmt_state.result_set_exhausted = false;
+            stmt_state.batch_exhausted = false;
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
@@ -472,6 +488,60 @@ mod tests {
             "must be taken so it cannot leak into a later call"
         );
         assert!(!ss.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    /// **The blocking regression this tick fixes**, reproducing the
+    /// reviewer's exact probe: statement A executes a single-statement,
+    /// single-result-set batch, fetches its only row to exhaustion (which
+    /// releases `active_stmt` early per AB#47508 and marks the whole batch
+    /// — not just the current result set — as known-done), and statement B
+    /// then claims the now-idle connection and executes its own query.
+    /// `SQLMoreResults(A)` at that point must report `SQL_NO_DATA` without
+    /// touching the connection at all — msodbcsql's `SQLMoreResults` has no
+    /// busy check of its own — not `SQL_ERROR`/`HY000` from falling through
+    /// to the ordinary busy-check path that only `SQLFetch` had a
+    /// `result_set_exhausted` short-circuit for.
+    #[test]
+    fn more_results_fast_path_reports_no_data_when_batch_already_exhausted() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let stmt_b = h.alloc_extra_stmt();
+        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut sa = stmt_a.inner.lock().unwrap();
+            sa.set_state(STMT_STATE_CURSOR_OPEN);
+            // As if A's own fetch already peeked past its lone row, found
+            // the wire fully done (single-statement batch, no MORE), and
+            // released the claim — exactly what release_busy_if_row_exhausted
+            // does when `release` is true.
+            sa.result_set_exhausted = true;
+            sa.batch_exhausted = true;
+        }
+
+        // B has since claimed the connection and is actively using it.
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(stmt_b);
+        // No client configured at all: if the fast path reached for the
+        // connection this would fail with a different SQLSTATE (busy / no
+        // active client) instead of SQL_NO_DATA.
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+
+        assert_eq!(
+            ret, SQL_NO_DATA,
+            "must match msodbcsql, whose SQLMoreResults has no busy check at all"
+        );
+        assert_eq!(
+            dbc.inner.lock().unwrap().active_stmt,
+            Some(stmt_b),
+            "B's claim on the connection must be left completely untouched"
+        );
+        assert!(
+            !stmt_a
+                .inner
+                .lock()
+                .unwrap()
+                .has_state(STMT_STATE_CURSOR_OPEN)
+        );
     }
 
     /// SQLMoreResults on an open cursor whose connection has no active client
