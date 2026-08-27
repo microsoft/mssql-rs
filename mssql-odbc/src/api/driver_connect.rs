@@ -239,24 +239,23 @@ fn encryption_setting(encrypt: Option<&str>) -> EncryptionSetting {
 }
 
 /// The settings a post-connect get should report, taken from the connection as
-/// it actually resolved.
+/// it actually negotiated.
 ///
 /// Measured against msodbcsql: a get returns the effective value regardless of
-/// which path produced it. `Encrypt=no` with no attribute set reads back `0`,
-/// and an out-of-range attribute value of `7` reads back `1`, so neither the
-/// caller's raw input nor a fixed default would match.
-fn effective_vendor_settings(params: &ConnectionParams) -> VendorConnOverrides {
+/// which path produced it. `Encrypt=no` reads back `0` when the server permits
+/// plaintext and `1` when the server forces TLS, so neither the caller's raw
+/// input nor a fixed default would match.
+fn effective_vendor_settings(
+    params: &ConnectionParams,
+    connection_is_encrypted: bool,
+) -> VendorConnOverrides {
     let mode = encryption_setting(params.encrypt.as_deref());
-    let encrypt = match mode {
-        EncryptionSetting::PreferOff => SQL_EN_OFF,
-        EncryptionSetting::Strict => SQL_EN_STRICT,
-        _ => SQL_EN_ON,
+    let encrypt = match (mode, connection_is_encrypted) {
+        (EncryptionSetting::Strict, _) => SQL_EN_STRICT,
+        (_, true) => SQL_EN_ON,
+        (_, false) => SQL_EN_OFF,
     };
-    // With encryption off there is no server certificate, so nothing is being
-    // trusted. Measured: `Encrypt=no;TrustServerCertificate=Yes` reports the
-    // trust flag as 0 on msodbcsql, so this tracks the effective policy rather
-    // than echoing the keyword.
-    let trust = !matches!(mode, EncryptionSetting::PreferOff) && params.trust_server_certificate;
+    let trust = connection_is_encrypted && params.trust_server_certificate;
     VendorConnOverrides {
         encrypt: Some(encrypt as u32),
         trust_server_certificate: Some(u32::from(trust)),
@@ -426,7 +425,8 @@ fn do_connect(
     // Publish resolved values only after the connection succeeds. Explicit
     // attribute overrides remain separate so a reusable DBC does not feed a
     // previous connection string back into its next connection attempt.
-    state.effective_vendor_settings = Some(effective_vendor_settings(&params));
+    state.effective_vendor_settings =
+        Some(effective_vendor_settings(&params, client.is_encrypted()));
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
@@ -519,21 +519,22 @@ mod tests {
     /// step.
     #[test]
     fn reported_encrypt_matches_the_negotiated_setting() {
-        for (keyword, setting, code) in [
-            (Some("yes"), EncryptionSetting::On, 1u32),
-            (Some("mandatory"), EncryptionSetting::On, 1),
-            (Some("no"), EncryptionSetting::PreferOff, 0),
-            (Some("optional"), EncryptionSetting::PreferOff, 0),
-            (Some("strict"), EncryptionSetting::Strict, 2),
-            (Some("STRICT"), EncryptionSetting::Strict, 2),
-            (None, EncryptionSetting::On, 1),
+        for (keyword, setting, connection_is_encrypted, code) in [
+            (Some("yes"), EncryptionSetting::On, true, 1u32),
+            (Some("mandatory"), EncryptionSetting::On, true, 1),
+            (Some("no"), EncryptionSetting::PreferOff, false, 0),
+            (Some("no"), EncryptionSetting::PreferOff, true, 1),
+            (Some("optional"), EncryptionSetting::PreferOff, false, 0),
+            (Some("strict"), EncryptionSetting::Strict, true, 2),
+            (Some("STRICT"), EncryptionSetting::Strict, true, 2),
+            (None, EncryptionSetting::On, true, 1),
         ] {
             assert_eq!(encryption_setting(keyword), setting, "keyword {keyword:?}");
 
             let (mut params, _) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
             params.encrypt = keyword.map(str::to_string);
             assert_eq!(
-                effective_vendor_settings(&params).encrypt,
+                effective_vendor_settings(&params, connection_is_encrypted).encrypt,
                 Some(code),
                 "keyword {keyword:?}"
             );
@@ -577,7 +578,7 @@ mod tests {
         let (params, _) =
             parse_connection_string(&cs("Server=h;Trusted_Connection=yes;Encrypt=no")).unwrap();
         assert_eq!(
-            effective_vendor_settings(&params),
+            effective_vendor_settings(&params, false),
             VendorConnOverrides {
                 encrypt: Some(0),
                 trust_server_certificate: Some(0),
@@ -592,19 +593,22 @@ mod tests {
     /// asked for -- found by running the e2e parity variation against the
     /// vendor driver.
     #[test]
-    fn trust_is_only_reported_when_something_is_encrypted() {
-        for (keywords, expected) in [
-            ("Encrypt=yes;TrustServerCertificate=yes", 1),
-            ("Encrypt=yes;TrustServerCertificate=no", 0),
-            ("Encrypt=no;TrustServerCertificate=yes", 0),
-            ("Encrypt=no;TrustServerCertificate=no", 0),
+    fn trust_is_only_reported_when_the_connection_is_encrypted() {
+        for (keywords, connection_is_encrypted, expected) in [
+            ("Encrypt=yes;TrustServerCertificate=yes", true, 1),
+            ("Encrypt=yes;TrustServerCertificate=no", true, 0),
+            ("Encrypt=no;TrustServerCertificate=yes", false, 0),
+            ("Encrypt=no;TrustServerCertificate=no", false, 0),
+            ("Encrypt=no;TrustServerCertificate=yes", true, 1),
+            ("Encrypt=no;TrustServerCertificate=no", true, 0),
         ] {
             let (params, _) =
                 parse_connection_string(&cs(&format!("Server=h;UID=u;<PW>=p;{keywords}"))).unwrap();
             assert_eq!(
-                effective_vendor_settings(&params).trust_server_certificate,
+                effective_vendor_settings(&params, connection_is_encrypted)
+                    .trust_server_certificate,
                 Some(expected),
-                "{keywords}"
+                "{keywords}, encrypted={connection_is_encrypted}"
             );
         }
     }

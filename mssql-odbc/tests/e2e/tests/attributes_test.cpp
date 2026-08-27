@@ -1432,9 +1432,9 @@ TEST_F(AttributesTest, CurrentCommandTracksTheResultSetOrdinal) {
 
 // -------------------------------------------------------------------
 // Variation 54 - the two query-notification attributes are the only
-// string-valued statement attributes. StringLength is a byte count when
-// a value buffer is present, so an explicit 6 stores three characters and
-// a truncated get reports the full byte width.
+// string-valued statement attributes. StringLength is a byte count, so an
+// explicit 6 stores six ANSI characters or three UTF-16 characters, and a
+// truncated get reports the full byte width.
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
     SQLTCHAR buffer[32] = {};
@@ -1452,6 +1452,8 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
 
     SqlTString value = ODBCTestUtils::ToSqlTStr("abcdefghij");
     SQLTCHAR* msg = const_cast<SQLTCHAR*>(value.c_str());
+    const SQLINTEGER value_bytes =
+        static_cast<SQLINTEGER>(value.size() * sizeof(SQLTCHAR));
 
     // A NUL-terminated set round-trips, and the two are independent.
     EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, SQL_NTS));
@@ -1459,7 +1461,7 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
     EXPECT_SQL_OK(
         SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
         SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ(20, written);
+    EXPECT_EQ(value_bytes, written);
 
     written = -1;
     EXPECT_SQL_OK(
@@ -1467,13 +1469,15 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(0, written) << "options untouched by a msgtext set";
 
-    // StringLength on the set path is bytes, so 6 stores three characters.
+    // StringLength on the set path is bytes in the application's TCHAR mode.
     EXPECT_EQ(SQL_SUCCESS, SQLSetStmtAttr(stmt_, kSsQnMsgtext, msg, 6));
+    std::memset(buffer, 0, sizeof(buffer));
     written = -1;
     EXPECT_SQL_OK(
         SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, sizeof(buffer), &written),
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(6, written);
+    EXPECT_EQ(value.substr(0, 6 / sizeof(SQLTCHAR)), SqlTString(buffer));
 
     // A short buffer truncates with 01004 but still reports the full width, so
     // a caller can size a second call from the first one's answer. A null
@@ -1483,19 +1487,12 @@ TEST_F(AttributesTest, QueryNotificationStringsFollowTheByteLengthContract) {
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
               SQLGetStmtAttr(stmt_, kSsQnMsgtext, buffer, 10, &written));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
-    EXPECT_EQ(20, written);
+    EXPECT_EQ(value_bytes, written);
 
     written = -1;
     EXPECT_EQ(SQL_SUCCESS,
               SQLGetStmtAttr(stmt_, kSsQnMsgtext, nullptr, 0, &written));
-#ifdef _WIN32
-    EXPECT_EQ(20, written);
-#else
-    // Through unixODBC, this vendor-defined length-only query reports
-    // characters. Both drivers return 10 here while returning the ODBC byte
-    // count when a value buffer is present.
-    EXPECT_EQ(10, written);
-#endif
+    EXPECT_EQ(value_bytes, written);
 }
 
 // -------------------------------------------------------------------
@@ -1789,15 +1786,19 @@ TEST_F(AttributesTest, EncryptAttributeOutranksTheKeyword) {
     ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(probe, "Encrypt=no;")))
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, probe);
 
-    SQLRETURN probe_rc = SQL_ERROR;
-    EXPECT_EQ(0u, GetVendorAttr(probe, SQL_COPT_SS_ENCRYPT, &probe_rc));
-    EXPECT_TRUE(SQL_SUCCEEDED(probe_rc));
     const std::string baseline = EncryptOption(probe);
+    ASSERT_TRUE(baseline == "TRUE" || baseline == "FALSE") << baseline;
+    SQLRETURN probe_rc = SQL_ERROR;
+    EXPECT_EQ(baseline == "TRUE" ? 1u : 0u,
+              GetVendorAttr(probe, SQL_COPT_SS_ENCRYPT, &probe_rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(probe_rc));
     SQLDisconnect(probe);
     SQLFreeHandle(SQL_HANDLE_DBC, probe);
 
-    ASSERT_TRUE(baseline == "TRUE" || baseline == "FALSE") << baseline;
-    const bool server_allows_encryption_off = baseline == "FALSE";
+    if (baseline == "TRUE") {
+        GTEST_SKIP() << "the server forces encryption, so neither precedence "
+                        "direction is observable on the wire";
+    }
 
     struct Case {
         const char* keyword;
@@ -1825,14 +1826,7 @@ TEST_F(AttributesTest, EncryptAttributeOutranksTheKeyword) {
         EXPECT_EQ(c.attr, GetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, &rc));
         EXPECT_TRUE(SQL_SUCCEEDED(rc));
 
-        const std::string wire_setting = EncryptOption(dbc);
-        if (c.attr != 0 || server_allows_encryption_off) {
-            EXPECT_EQ(c.expected, wire_setting);
-        } else {
-            EXPECT_EQ("TRUE", wire_setting)
-                << "the server forced encryption despite the effective "
-                   "client setting being off";
-        }
+        EXPECT_EQ(c.expected, EncryptOption(dbc));
 
         SQLDisconnect(dbc);
         SQLFreeHandle(SQL_HANDLE_DBC, dbc);
@@ -1897,9 +1891,9 @@ TEST_F(AttributesTest, VendorConnectionAttributesAreRejectedAfterConnect) {
 
 // -------------------------------------------------------------------
 // Variation 62 - with no attribute set at all, a get still reports the
-// connection's effective setting, sourced from the keyword. Measured:
-// `Encrypt=no` reads back 0 on msodbcsql even though nothing ever set the
-// attribute, so this is not an echo of a stored value.
+// connection's negotiated setting, sourced from the keyword and server. This
+// is not an echo of a stored value: a server that forces TLS turns
+// `Encrypt=no` into an effective value of 1.
 // -------------------------------------------------------------------
 TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
     const auto& cfg = ODBCTestConfig::Instance();
@@ -1912,14 +1906,21 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
     ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(dbc, "Encrypt=no;")))
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, dbc);
 
+    const std::string wire_setting = EncryptOption(dbc);
+    ASSERT_TRUE(wire_setting == "TRUE" || wire_setting == "FALSE")
+        << wire_setting;
+    const SQLUINTEGER expected_encrypt =
+        wire_setting == "TRUE" ? 1u : 0u;
+    const bool trust_requested =
+        cfg.TrustCert() == "Yes" || cfg.TrustCert() == "yes";
+
     SQLRETURN rc = SQL_ERROR;
-    EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, &rc));
+    EXPECT_EQ(expected_encrypt,
+              GetVendorAttr(dbc, SQL_COPT_SS_ENCRYPT, &rc));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
 
-    // The other two follow the same rule. Client-side encryption is off here,
-    // so the trust flag reads 0 even when the server independently requires an
-    // encrypted transport.
-    EXPECT_EQ(0u, GetVendorAttr(dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, &rc));
+    EXPECT_EQ(expected_encrypt != 0 && trust_requested ? 1u : 0u,
+              GetVendorAttr(dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, &rc));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
 
     const SQLUINTEGER expected_integrated = cfg.HasCredentials() ? 0u : 1u;
@@ -1930,10 +1931,8 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
     SQLDisconnect(dbc);
     SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 
-    // The discriminating half: with encryption on, the same keyword does read
-    // back as trusted, so the 0 above is the encryption state talking and not
-    // the driver simply ignoring TrustServerCertificate.
-    if (cfg.TrustCert() != "Yes" && cfg.TrustCert() != "yes") {
+    // With encryption requested on, the same trust keyword reads back as on.
+    if (!trust_requested) {
         return;
     }
     SQLHDBC encrypted = SQL_NULL_HDBC;
@@ -1941,9 +1940,12 @@ TEST_F(AttributesTest, VendorAttributeGetReportsTheEffectiveSetting) {
     ASSERT_TRUE(SQL_SUCCEEDED(ConnectWith(encrypted, "Encrypt=yes;")))
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DBC, encrypted);
 
+    EXPECT_EQ("TRUE", EncryptOption(encrypted));
     EXPECT_EQ(1u, GetVendorAttr(encrypted, SQL_COPT_SS_ENCRYPT, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
     EXPECT_EQ(1u,
               GetVendorAttr(encrypted, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, &rc));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
 
     SQLDisconnect(encrypted);
     SQLFreeHandle(SQL_HANDLE_DBC, encrypted);
