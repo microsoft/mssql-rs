@@ -365,25 +365,27 @@ held constant), store results across builds, and watch for drift — catching sl
 from dependency/toolchain changes that the isolated mode hides. Three modes in total:
 (1) existing PR-vs-target, (2) new isolated pinned-commit baseline, (3) trend of main.
 
-### Future: perf testing mssql-odbc (Rust ODBC driver)
+### mssql-odbc end-to-end benchmarks
 
-Criterion benchmarks Rust functions compiled into the same test binary (in-process,
-Rust-native). The future `mssql-odbc` will be a `cdylib` exposing the C ABI
-(`SQLConnect`, `SQLExecDirect`, `SQLFetch`, …), normally consumed through an ODBC Driver
-Manager (unixODBC / Windows DM). The representative path is *through the driver manager*,
-the way a real ODBC app uses it.
+[`mssql-odbc-bench`](../mssql-odbc-bench) is a fixed C++ harness that calls the
+ODBC C API through the platform Driver Manager, matching the path a real
+application uses. Google Benchmark supplies cross-platform wall-clock sampling
+and JSON output; the workload itself uses raw ODBC calls, so the same executable
+can run unchanged against the candidate driver, a pinned Rust baseline, or
+`msodbcsql`.
 
-A Rust bench *could* load the driver via FFI (e.g., `odbc-api`) with Criterion as the
-timing engine, but that loses cross-driver comparability and doesn't measure the real
-consumer path. The cross-driver spec already prescribes a **C/C++ ODBC harness**
-(`QueryPerformanceCounter` / `clock_gettime`) for ODBC. Sharing that harness with
-`msodbcsql` enables an apples-to-apples **Rust mssql-odbc vs native msodbcsql** comparison.
+The ODBC comparison swaps the complete `mssql-odbc` shared library, including
+its statically linked `mssql-tds`, while holding the harness and database
+workload constant. That answers whether the shipped driver artifact regressed.
+The source-isolated Criterion harness above remains the tool for attributing a
+change specifically to `mssql-tds`.
 
-This points to a layered strategy:
+The resulting layered strategy is:
 
 - **Layer 1 — mssql-tds (Rust lib):** Criterion component/micro benchmarks → attributes
   protocol/codec/parsing regressions to source. *(This plan.)*
-- **Layer 2 — mssql-odbc (cdylib via ODBC DM):** end-to-end benchmarks via the C/C++ ODBC
-  harness shared with msodbcsql → Rust-vs-native ODBC comparison. *(Future.)*
+- **Layer 2 — mssql-odbc (cdylib via ODBC DM):** end-to-end result-fetch
+  benchmarks via the fixed C++ harness → candidate/baseline driver comparison
+  and optional Rust-vs-native ODBC comparison.
 - **Cross-cutting — longitudinal trend of main:** catches dependency/toolchain drift that
   Layer 1's isolation hides.

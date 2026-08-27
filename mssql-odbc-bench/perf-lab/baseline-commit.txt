@@ -1,0 +1,10 @@
+# Performance baseline commit for mssql-odbc.
+#
+# The perf-lab benchmarks compare the complete driver built from the current
+# commit with the complete driver built from the commit below. Advancing this
+# pointer requires a pull request, so every baseline move is reviewed and
+# recorded.
+#
+# Exactly one full 40-character commit SHA on its own line. Lines starting with
+# '#' and blank lines are ignored.
+6ab0d5b91f83296a979371d039a71a3d314b214b
