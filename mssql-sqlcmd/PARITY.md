@@ -17,26 +17,43 @@ than smoothed over.
 
 | Area | ODBC | Go | Rust | Verdict |
 |---|---|---|---|---|
-| Short options (`-S`, `-Q`, …) | 47 | 45 | **52** | Rust is a superset of both |
+| Short options (`-S`, `-Q`, …) | 47 | 46 | **52** | Rust is a superset of both |
 | Long options (`--server`, …) | none | 53 | **57** | Rust accepts every Go name |
 | Colon commands | 16 | 13 | **16** | Rust matches ODBC; Go lacks 3 |
 | Scripting variables | 15 | 18 | **18** | Rust matches Go's superset |
-| Output formats | fixed-width | + vertical, ASCII | + CSV, JSON | Rust is a superset |
+| Output formats | fixed-width | + vertical, ASCII | + vertical, ASCII | Matches Go exactly |
 | Entra ID methods | 6 | 15 | **15** | Full parity with Go |
 | Container lifecycle | — | yes | **yes** | Full parity |
 | `SQLCMDCOLORSCHEME` | — | 74 schemes | **74 schemes** | Byte-identical via PTY |
 
-Counted from each tool's own usage text, case-sensitively. The short-option
-totals include the two options ODBC retired (`-n`, `-O`) and the aliases each
-tool accepts.
+"Superset" is not an inference from the totals — the three option sets were
+diffed directly. **Nothing either reference accepts is missing here**, in
+either the short or the long form. The counts come from each tool's own usage
+text, compared case-sensitively, and include `-?` and the two options ODBC
+retired (`-n`, `-O`).
+
+**Where the extra options come from.** The numbers are only interesting if you
+can name the difference, so:
+
+- **Short, 52 = ODBC's 47 + 5.** Four of the five — `-D`, `-n`, `-O`, `-T` —
+  are options ODBC *accepts* but leaves out of its Windows usage text, so they
+  are not new surface at all. The fifth, `-J`, is Go's.
+- **Long, 57 = Go's 53 + 4**, and two of the four are not new features either:
+
+| Extra | What it is |
+|---|---|
+| `--dsn` | A long spelling for ODBC's `-D`. Go has no DSN support, so it never named one |
+| `--print-statistics` | A long spelling for ODBC's `-p`/`-p1`. Go has no statistics option |
+| `--compat` | Ours. Picks ODBC or Go behaviour where the two disagree |
+| `--format` | Ours. Names a layout: `vert`, `vertical`, `ascii`, `horiz`, `horizontal` |
 
 **Options one tool has and the other does not:**
 
 - ODBC has, Go lacks: `-D` (DSN), `-f` (code pages), `-p`/`-p1` (statistics), `-T`
-- Go has, ODBC lacks: every long form, `--vertical`, `--ascii`, `--version`,
-  `--authentication-method`, `--server-name`, `--driver-logging-level`,
-  `--trace-file`
-- Rust has both sets, plus `--format` and `--compat`
+- Go has, ODBC lacks: every long form, `-J`, `--vertical`, `--ascii`,
+  `--version`, `--authentication-method`, `--server-name`,
+  `--driver-logging-level`, `--trace-file`
+- Rust has both sets, plus `--compat` and `--format`
 - Platform note: the **Linux** ODBC build lacks `-A` and `-Lc`; the Windows one
   has them. Rust supports them on both.
 
@@ -272,7 +289,7 @@ server advertises.
 | `-R` | `--client-regional-setting` | **implemented** | accepted, ignored | **=** | Formats money, `decimal`/`numeric` and the date/time types with the client's locale. Only ODBC implements it; matching meant going through the platform's own locale services, as the reference does. See below |
 | `--vertical` | — | absent | = | = | One field per line |
 | `--ascii` | — | absent | = | = | ASCII box-drawn table |
-| `--format` | — | absent | **absent** | **extension** | `csv` / `json`. Go has the `SQLCMDFORMAT` variable and `--vertical`/`--ascii`, but no `--format` flag |
+| `--format` | — | absent | **absent** | **extension** | Names a layout: `vert`/`vertical`, `ascii`, `horiz`/`horizontal`. The same set the `SQLCMDFORMAT` variable takes, which Go has — but Go has no flag for it. **An unrecognised name is not rejected**, see §7 |
 | `SQLCMDCOLORSCHEME` | — | absent | = | = | 74 chroma schemes, byte-identical through a PTY. `:list color` names them |
 
 ### 3.6 Errors and exit codes
@@ -378,6 +395,9 @@ Precedence: `:setvar` > `-v` > environment > built-in default.
 
 | Item | Why |
 |---|---|
+| An unrecognised `--format` name is not rejected | `--format nonsense` falls through to the fixed-width layout instead of failing, which breaks the standing rule in §2. The fall-through is *correct* for the `SQLCMDFORMAT` variable — it is what go-sqlcmd does — but the flag is ours and should refuse a name it does not know. The five names it does accept all work |
+| Banner says `NT` on every platform | ODBC prints the platform there — `NT` on Windows, `Linux` on Linux. Ours is hardcoded. The differential tests normalise the version line away, so they never saw it |
+| Not a single self-contained binary | go-sqlcmd links only `libc`. This build also needs system OpenSSL 3 (`libssl`, `libcrypto`), because `native-tls` was chosen over `rustls` to avoid the `ring` dependency. Fixable with `openssl = { features = ["vendored"] }` if single-file portability matters |
 | No line editing or history at the prompt | `rustyline` was wired up and **backed out**: it redraws the line it owns while results are written independently, so the redraw erased output already on screen — through a PTY the `a` column heading came back blank. The prompt itself is verified byte-identical to Go |
 | `:ed`, `:perftrace` | Deferred; both spawn an external editor or profiler |
 | `:serverlist` | Accepted, no-op. `-L` covers the same ground |
