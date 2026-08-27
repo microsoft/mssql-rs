@@ -244,6 +244,12 @@ the rule exists and do not need re-deriving. Last reviewed 2026-08.
   ```bash
   gh issue list --state all --search "row decode perf"
   ```
+- **"This allocates redundantly": read the signature first.** `String::from_utf8_lossy`
+  returns `Cow<'_, str>` and borrows on the valid path — it allocates only to repair
+  malformed input, so "drop the throwaway `String`" is a no-op. Nor are the lossy
+  converters symmetric: `from_utf16_lossy` takes `&[u16]`, has no borrowing form, and
+  genuinely allocates, so one is not precedent for the other. A redundant *scan* is
+  often the real cost, and is a different finding. Retracted twice on one PR.
 - **Repo conventions**: a real convention finding cites the file and line that
   mandates it. Verify against `.github/PULL_REQUEST_TEMPLATE.md`,
   `CONTRIBUTING.md` / `AGENTS.md` / `.github/copilot-instructions.md`, and actual
@@ -262,6 +268,30 @@ the rule exists and do not need re-deriving. Last reviewed 2026-08.
   example, already tracked by a TODO in `disconnect.rs` — is a legitimate deferral,
   because fixing it in one path and not the others is worse than scheduling it as its
   own change.
+
+## Where Reviews Have Failed to Look
+
+The counterpart to the list above: not findings that were raised and were wrong, but
+places a careful pass never examined. Each entry names the spot, not the PR.
+
+- **A documented residual failure still needs its blast radius traced.** When a PR
+  accepts "this now fails later as `HY000` instead of `22001`", the review question is
+  not only which SQLSTATE surfaces but what the failure *costs* — connection,
+  statement, or transaction. In `mssql-tds` that turns on whether `PacketWriter` has
+  flushed: `SqlType::serialize` writes the RPC type metadata preamble before
+  `TdsValueSerializer::serialize_value` (`datatypes/sqltypes.rs`), so bytes exist in
+  the writer, but nothing reaches the wire until `handle_overflow_if_needed` observes
+  `position() >= max_payload_size` (`io/packet_writer.rs`). Below that threshold the
+  message is abandoned by dropping the writer; above it, recovery needs
+  `cancel_current_message` plus consuming the server's DONE token, as that method's
+  own doc comment states. A test written with a short value pins only the benign
+  regime and leaves the risky one uncovered.
+- **Worked examples in `docs/*.md` are checkable claims, not commentary.** Byte
+  counts, code points and expansion arithmetic in a design doc are load-bearing for
+  whoever picks up the deferred work, and cost seconds to verify. One revision called
+  `&#9749;` (U+2615) an "eight-byte numeric character reference" and totalled three of
+  them as 24 bytes offered to a `varchar(3)`; it is seven bytes, so 21. The 8 belonged
+  to the five-digit `&#26085;` (U+65E5) example nearby.
 
 ## Reviewing Alongside Other Reviewers
 
