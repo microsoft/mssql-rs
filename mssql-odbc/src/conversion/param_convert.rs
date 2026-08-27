@@ -1267,6 +1267,27 @@ mod tests {
         }
     }
 
+    /// The blank check covers the *whole* overflow, not just its first unit. An
+    /// overflow that merely starts with a blank is still truncation; dropping it
+    /// would lose the non-blank tail silently. Without this the every-test-blank
+    /// or every-test-non-blank split leaves the `any` untested as a whole-region
+    /// check - weakening it to inspect one unit passes the rest of the suite.
+    #[test]
+    fn a_partially_blank_overflow_is_truncation() {
+        for (c_type, sql_type) in [
+            (SQL_C_CHAR, SQL_VARCHAR),
+            (SQL_C_CHAR, SQL_WVARCHAR),
+            (SQL_C_WCHAR, SQL_WVARCHAR),
+            (SQL_C_WCHAR, SQL_VARCHAR),
+        ] {
+            assert_eq!(
+                convert_char(c_type, sql_type, 2, "ab c").unwrap_err(),
+                ParamBuildError::StringTruncation,
+                "c_type {c_type} -> sql_type {sql_type}"
+            );
+        }
+    }
+
     /// Trimming a narrow source mixes units - `overflow` counts UTF-16 units,
     /// `keep` is a byte offset - which holds only because a blank is one byte
     /// and never a UTF-8 continuation byte. Multibyte content is what would

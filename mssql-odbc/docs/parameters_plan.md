@@ -410,11 +410,11 @@ guesswork - so it belongs with AB#47584 rather than as a local patch.
 improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
 `22001` under the byte count; it is now accepted as three units and fails
 downstream as an opaque `HY000` - or, under a single-byte collation, each
-character is unmappable and becomes an eight-byte numeric character reference
-(AB#47598), so 24 bytes are offered to a `varchar(3)`. CJK and astral input
-bound with an exact character count is the shape that regresses. The trade was
-taken because over-rejection has no application workaround - the byte count is
-encoding-dependent and the application cannot know it - while under-rejection
+character is unmappable and becomes a seven-byte numeric character reference
+(`&#9749;`, AB#47598), so 21 bytes are offered to a `varchar(3)`. CJK and astral
+input bound with an exact character count is the shape that regresses. The trade
+was taken because over-rejection has no application workaround - the byte count
+is encoding-dependent and the application cannot know it - while under-rejection
 still errors, and because byte-counting *both* C types would have broken the
 wide arm, the one msodbcsql gets right. No option preserved both parity and
 self-consistency.
@@ -503,6 +503,11 @@ which confirms the server-side declaration assertions (`DATALENGTH`,
 #### P6 - Parity and e2e hardening (not started)
 
 - Parameter-numbered diagnostics.
+- Pin that a late `HY000` from an over-long parameter leaves the connection
+  reusable. Only a value large enough - or one failing late enough - to have
+  already flushed a packet needs `cancel_current_message` and the DONE token
+  consumed; a short value never reaches a packet boundary, so a test using one
+  passes without exercising the recovery at all.
 - Run the e2e suite under `--compare-with-msodbcsql`; mark driver-specific
   assertions with `SKIP_IF_COMPARING_MSODBCSQL()`.
 - Add `Benefits-from-mock-tds:` notes where only the round-tripped value is
