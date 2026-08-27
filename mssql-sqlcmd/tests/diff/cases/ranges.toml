@@ -1,0 +1,60 @@
+# Numeric range checks. Each option has its own message wording, so every
+# family is covered rather than one representative.
+
+[[case]]
+name = "packet size below range"
+args = ["-a", "1", "-Q", "select 1"]
+
+[[case]]
+name = "packet size above range"
+args = ["-a", "32768", "-Q", "select 1"]
+
+[[case]]
+name = "login timeout below range"
+args = ["-l", "-1", "-Q", "select 1"]
+
+[[case]]
+name = "query timeout above range"
+args = ["-t", "65535", "-Q", "select 1"]
+
+[[case]]
+name = "severity level below range"
+args = ["-V", "0", "-Q", "select 1"]
+
+[[case]]
+name = "severity level above range"
+args = ["-V", "26", "-Q", "select 1"]
+
+[[case]]
+name = "column width below range"
+args = ["-w", "3", "-Q", "select 1"]
+
+[[case]]
+name = "column width above range"
+args = ["-w", "65536", "-Q", "select 1"]
+
+[[case]]
+name = "variable type width above range"
+args = ["-y", "8001", "-Q", "select 1"]
+unix_skip_reason = """\
+The Linux reference garbles this message, echoing several kilobytes of \
+uninitialised memory in place of the option text. Reproducing that would be \
+copying a bug; the value and the limits we report are the same."""
+
+[[case]]
+name = "fixed type width above range"
+args = ["-Y", "8001", "-Q", "select 1"]
+unix_skip_reason = """\
+Same as `-y`: the Linux reference garbles the option text in this message."""
+
+[[case]]
+name = "error level below range"
+args = ["-m", "-2", "-Q", "select 1"]
+
+[[case]]
+name = "header interval below range"
+args = ["-h", "-2", "-Q", "select 1"]
+
+[[case]]
+name = "non numeric value where a number is required"
+args = ["-a", "abc", "-Q", "select 1"]
