@@ -92,10 +92,11 @@ CPU pinning (used by `perf-lab/run-benchmarks.sh` when SQL Server is colocated):
 ## Fixed-baseline comparison on the perf lab
 
 `perf-lab/run-benchmarks.sh` (Linux) and `perf-lab/run-benchmarks.ps1` (Windows)
-are the testScripts run by the shared `PerfTest` lab template, one ADO definition
-per platform (`.pipeline/perf-baseline-linux-pipeline.yml` and
-`.pipeline/perf-baseline-windows-pipeline.yml`). They run on a dedicated perf-lab
-VM and:
+are the default testScripts run by the shared `PerfTest` lab template, one ADO
+definition per platform (`.pipeline/perf-baseline-linux-pipeline.yml` and
+`.pipeline/perf-baseline-windows-pipeline.yml`). The definitions also accept
+manual ODBC runs through `benchmarkSuite=odbc`; scheduled runs use the `tds`
+default. They run on a dedicated perf-lab VM and:
 
 1. Build and run the candidate (`mssql-tds` = working tree) with `--save-baseline candidate`.
 2. Replace the `mssql-tds` source at `../mssql-tds` in place with a local
