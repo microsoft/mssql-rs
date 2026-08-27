@@ -75,9 +75,15 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     // than losing it under that fetch's own SQL_SUCCESS return. The peek
     // already closed the batch on the wire, so the drain below can no
     // longer discover it there — take it now and surface it below instead
-    // of silently closing as if the batch had never errored.
+    // of silently closing as if the batch had never errored. The same peek
+    // can also have stashed trailing server INFO messages it drained but
+    // had no success return to post them under (`StmtState::pending_fetch_info`)
+    // — post those here too, since `drain_and_release`'s own drain can no
+    // longer find them on the wire either.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
+    let pending_fetch_info = std::mem::take(&mut stmt_state.pending_fetch_info);
     reset_cursor_state(&mut stmt_state);
+    let had_pending_info = post_tds_info_messages(&mut stmt_state, &pending_fetch_info);
     drop(stmt_state);
 
     let outcome = drain_and_release(stmt, statement_handle);
@@ -99,7 +105,11 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         }
         DrainOutcome::Clean => {
             debug!("SQLCloseCursor: cursor closed");
-            SQL_SUCCESS
+            if had_pending_info {
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
         }
     }
 }
@@ -127,7 +137,9 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 
     // See the identical comment in sql_close_cursor_safe.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
+    let pending_fetch_info = std::mem::take(&mut stmt_state.pending_fetch_info);
     reset_cursor_state(&mut stmt_state);
+    let had_pending_info = post_tds_info_messages(&mut stmt_state, &pending_fetch_info);
     drop(stmt_state);
 
     let outcome = drain_and_release(stmt, statement_handle);
@@ -149,7 +161,11 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
         }
         DrainOutcome::Clean => {
             debug!("SQLFreeStmt(SQL_CLOSE): cursor closed");
-            SQL_SUCCESS
+            if had_pending_info {
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
         }
     }
 }
@@ -175,7 +191,9 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 /// this function's own return: `SQL_ERROR` here specifically tells the
 /// caller the stream failed to drain, so sending a transaction-manager
 /// request next is unsafe, which an already-closed batch's stale diagnostic
-/// does not make true.
+/// does not make true. Pending INFO messages (`StmtState::pending_fetch_info`)
+/// are posted the same way, unconditionally — this sweep's `SQL_SUCCESS`
+/// already covers `InfoPosted` too, so there is no separate signal to gate on.
 pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
     let pending_fetch_error = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -187,7 +205,9 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
             return SQL_SUCCESS;
         }
         let pending_fetch_error = stmt_state.pending_fetch_error.take();
+        let pending_fetch_info = std::mem::take(&mut stmt_state.pending_fetch_info);
         reset_cursor_state(&mut stmt_state);
+        post_tds_info_messages(&mut stmt_state, &pending_fetch_info);
         pending_fetch_error
     };
 
@@ -216,6 +236,7 @@ pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtStat
     stmt_state.result_set_exhausted = false;
     stmt_state.batch_exhausted = false;
     stmt_state.pending_fetch_error = None;
+    stmt_state.pending_fetch_info.clear();
 }
 
 /// Outcome of draining the TDS stream and releasing the connection on cursor close.
@@ -387,6 +408,65 @@ mod tests {
             "the deferred error must be posted, not silently dropped by the close"
         );
         assert!(ss.pending_fetch_error.is_none());
+    }
+
+    /// A zero-row fetch that also exhausts the whole batch can drain a
+    /// trailing server INFO message its own `SQL_NO_DATA` return has no way
+    /// to carry, stashing it as `StmtState::pending_fetch_info` instead (see
+    /// AB#47508's `release_busy_if_row_exhausted`). If the application calls
+    /// `SQLCloseCursor` directly — without an intervening `SQLMoreResults` —
+    /// the cursor is still open (only `SQLMoreResults`'s `batch_exhausted`
+    /// fast path implicitly closes it), so this must reach the drain path
+    /// and surface the stashed message rather than silently dropping it.
+    #[test]
+    fn close_cursor_surfaces_a_pending_fetch_info() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::error::SqlInfoMessage;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+            ss.batch_exhausted = true;
+            ss.pending_fetch_info = vec![SqlInfoMessage {
+                message: "simulated trailing PRINT message".to_string(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }];
+        }
+        h.mark_dbc_connected();
+        // A fresh, never-executed client: has_open_batch() is false, so
+        // drain_and_release's own close_query()/take_info_messages() finds
+        // nothing new — isolating the assertion to "does the stashed
+        // pending_fetch_info alone get surfaced", independent of a fresh drain.
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
+        // active_stmt left None: mirrors release_busy_if_row_exhausted having
+        // already released the claim on the zero-row fetch that stashed this.
+
+        let ret = unsafe { sql_close_cursor(h.stmt) };
+
+        assert_eq!(
+            ret, SQL_SUCCESS_WITH_INFO,
+            "the stashed message must be surfaced, not silently dropped"
+        );
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing PRINT message")),
+            "the stashed message must land on this statement's own diagnostics"
+        );
+        assert!(
+            ss.pending_fetch_info.is_empty(),
+            "must be taken so it cannot leak into a later call"
+        );
     }
 
     /// Same requirement as `close_cursor_surfaces_a_pending_fetch_error`, for

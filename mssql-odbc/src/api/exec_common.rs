@@ -233,13 +233,19 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// `row_delivered` tells this call whether it actually delivered data —
 /// `true` for `SQLGetData` (a column was just captured) and for a
 /// `SQLFetch`/`SQLFetchScroll` whose rowset held at least one row, `false`
-/// for a zero-row `SQLFetchScroll`. Info messages are only drained from
-/// `client` when both the claim is released *and* a row was delivered:
-/// `fill_rowset` deliberately leaves messages on the client for a zero-row
-/// fetch (its own `SQL_NO_DATA` return can't carry `SQL_SUCCESS_WITH_INFO`,
-/// and few callers inspect diagnostics after it) so `SQLMoreResults`/cursor
-/// close can surface them later — draining them here regardless would work
-/// against that decision by posting them under this call instead.
+/// for a zero-row `SQLFetchScroll`. Info messages are always drained from
+/// `client` once the claim is released, regardless of `row_delivered` —
+/// leaving them on `client` would otherwise leak into whichever statement
+/// claims the connection next and get posted under its unrelated
+/// diagnostics. Where they are *posted* still depends on `row_delivered`:
+/// with a row delivered, this call's own `SQL_SUCCESS`/`SQL_SUCCESS_WITH_INFO`
+/// return can carry them, so they are posted here directly. A zero-row
+/// fetch's `SQL_NO_DATA` return cannot carry `SQL_SUCCESS_WITH_INFO` (and few
+/// callers inspect diagnostics after it), so `fill_rowset` deliberately
+/// leaves them out of its own post — they are stashed on
+/// `StmtState::pending_fetch_info` instead, for `SQLMoreResults`'s
+/// `batch_exhausted` fast path or a cursor close to surface later, exactly
+/// like the deferred-error twin above.
 ///
 /// # Caller obligation
 /// Only call this once every column of the row positioned when `client` was
@@ -268,7 +274,7 @@ pub(super) fn release_busy_if_row_exhausted(
     };
     let release = result_set_exhausted && batch_done;
 
-    let info_messages = if release && row_delivered {
+    let drained_info = if release {
         client.take_info_messages()
     } else {
         Vec::new()
@@ -284,7 +290,11 @@ pub(super) fn release_busy_if_row_exhausted(
     }
 
     if let Ok(mut stmt_state) = stmt.inner.lock() {
-        post_tds_info_messages(&mut stmt_state, &info_messages);
+        if row_delivered {
+            post_tds_info_messages(&mut stmt_state, &drained_info);
+        } else {
+            stmt_state.pending_fetch_info = drained_info;
+        }
         if let Err(e) = peek_result {
             error!(%e, "release_busy_if_row_exhausted: peek past current row failed");
             if batch_done {
@@ -522,6 +532,7 @@ pub(super) fn finish_execute(
         stmt_state.result_set_exhausted = false;
         stmt_state.batch_exhausted = false;
         stmt_state.pending_fetch_error = None;
+        stmt_state.pending_fetch_info.clear();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -581,6 +592,7 @@ pub(super) fn finish_execute(
     stmt_state.result_set_exhausted = false;
     stmt_state.batch_exhausted = false;
     stmt_state.pending_fetch_error = None;
+    stmt_state.pending_fetch_info.clear();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -925,16 +937,24 @@ mod tests {
         );
     }
 
-    /// The other half of the `release && row_delivered` gate: even when the
-    /// claim *is* released (a single-statement zero-row batch — nothing
-    /// pending after it), a fetch that filled zero rows must still leave any
-    /// info message alone. `fill_rowset` deliberately does not drain its own
-    /// info messages for a zero-row fetch (its `SQL_NO_DATA` return can't
-    /// carry `SQL_SUCCESS_WITH_INFO`) — draining them here anyway, just
-    /// because `release` happens to be true, would work against that by
-    /// posting them under this same call.
+    /// The other half of the `release` gate: even when the claim *is*
+    /// released (a single-statement zero-row batch — nothing pending after
+    /// it), a fetch that filled zero rows must still not post any drained
+    /// info message under its own return. `fill_rowset` deliberately does
+    /// not drain its own info messages for a zero-row fetch (its
+    /// `SQL_NO_DATA` return can't carry `SQL_SUCCESS_WITH_INFO`) — posting
+    /// them here anyway, just because `release` happens to be true, would
+    /// work against that. But leaving them resident on `client` isn't safe
+    /// either once the claim is released: a different statement could claim
+    /// the now-idle connection next and have its own unrelated diagnostics
+    /// contaminated by them (or, if nothing else claims it first,
+    /// `SQLMoreResults`'s `batch_exhausted` fast path wouldn't even look at
+    /// `client` to find them — see AB#47508 follow-up). So this drains the
+    /// message off `client` right away and stashes it on
+    /// `StmtState::pending_fetch_info` instead, for `SQLMoreResults` or a
+    /// cursor close to surface later.
     #[test]
-    fn release_busy_if_row_exhausted_leaves_info_messages_when_no_row_was_delivered() {
+    fn release_busy_if_row_exhausted_stashes_info_messages_when_no_row_was_delivered() {
         use mssql_tds::test_client_support::info;
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -957,16 +977,20 @@ mod tests {
             dbc.inner.lock().unwrap().active_stmt.is_none(),
             "the batch is genuinely done here, so the claim is still released"
         );
+        let ss = stmt.inner.lock().unwrap();
         assert!(
-            !stmt
-                .inner
-                .lock()
-                .unwrap()
-                .diag_records
+            !ss.diag_records
                 .iter()
                 .any(|d| d.message.contains("leave me for the next call")),
-            "row_delivered == false must suppress the drain even though release is true"
+            "row_delivered == false must suppress posting under this call's own return"
         );
+        assert!(
+            ss.pending_fetch_info
+                .iter()
+                .any(|m| m.message.contains("leave me for the next call")),
+            "must be drained off the client and stashed for SQLMoreResults/close to surface"
+        );
+        drop(ss);
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(
             dbc_state
@@ -974,9 +998,10 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .info_messages()
-                .iter()
-                .any(|m| m.message.contains("leave me for the next call")),
-            "the message must still be resident on the client for a later reader to find"
+                .is_empty(),
+            "must not stay resident on the client, where a different statement \
+             claiming the connection next could have it misattributed to its \
+             own diagnostics"
         );
     }
 

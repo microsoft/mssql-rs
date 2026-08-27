@@ -75,7 +75,18 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // connection. Matches msodbcsql, whose SQLMoreResults has no busy
             // check of its own (`GetBatchCtxOrRecover` just falls through to
             // `SQL_NO_DATA_FOUND` once the batch context is gone).
+            //
+            // That same peek can have drained trailing server INFO messages
+            // it had no way to post under its own already-committed success
+            // return (see `StmtState::pending_fetch_info`) — surface them now,
+            // same as the `StatementResult::End` arm below does for a normal
+            // (non-fast-path) advance. `SQL_NO_DATA` still can't carry
+            // `SQL_SUCCESS_WITH_INFO`, but the diagnostic remains available
+            // via `SQLGetDiagRec` either way, and this is the last call that
+            // will ever get a chance to post it.
+            let pending_info = std::mem::take(&mut stmt_state.pending_fetch_info);
             reset_cursor_state(&mut stmt_state);
+            post_tds_info_messages(&mut stmt_state, &pending_info);
             debug!("SQLMoreResults: batch already known exhausted; returning SQL_NO_DATA");
             return SQL_NO_DATA;
         }
@@ -541,6 +552,63 @@ mod tests {
                 .lock()
                 .unwrap()
                 .has_state(STMT_STATE_CURSOR_OPEN)
+        );
+    }
+
+    /// A zero-row fetch that also exhausts the whole batch can drain a
+    /// trailing server INFO message its own `SQL_NO_DATA` return has no way
+    /// to carry, stashing it as `StmtState::pending_fetch_info` instead (see
+    /// AB#47508's `release_busy_if_row_exhausted`). The `batch_exhausted`
+    /// fast path above is the whole reason that stash exists: it answers
+    /// without touching the connection at all, so it must surface the
+    /// stashed message itself — leaving it on `client` would either strand
+    /// it forever (nothing else is coming to look) or, worse, let it leak
+    /// onto whichever different statement claims the connection next.
+    #[test]
+    fn more_results_fast_path_surfaces_a_pending_fetch_info() {
+        use mssql_tds::error::SqlInfoMessage;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut sa = stmt_a.inner.lock().unwrap();
+            sa.set_state(STMT_STATE_CURSOR_OPEN);
+            // As if a zero-row SQLFetch's peek found the wire fully done,
+            // released the claim, and drained a trailing INFO message it had
+            // no success return to post under — exactly what
+            // release_busy_if_row_exhausted does for `row_delivered == false`.
+            sa.result_set_exhausted = true;
+            sa.batch_exhausted = true;
+            sa.pending_fetch_info = vec![SqlInfoMessage {
+                message: "trailing PRINT message".to_string(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }];
+        }
+        // No client configured at all: if the fast path reached for the
+        // connection to find this message, it would fail with a different
+        // SQLSTATE (busy / no active client) instead of SQL_NO_DATA.
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+
+        assert_eq!(
+            ret, SQL_NO_DATA,
+            "must still match msodbcsql's SQLMoreResults return for an exhausted batch"
+        );
+        let ss = stmt_a.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("trailing PRINT message")),
+            "the stashed message must be surfaced, not silently dropped"
+        );
+        assert!(
+            ss.pending_fetch_info.is_empty(),
+            "must be taken so it cannot leak into a later call"
         );
     }
 

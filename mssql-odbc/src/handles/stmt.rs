@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
-use mssql_tds::error::Error as TdsError;
+use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
@@ -148,6 +148,16 @@ pub(crate) struct StmtState {
     /// does not make true. Cleared wherever `result_set_exhausted` is, since
     /// both describe facts about the same now-superseded result set.
     pub(crate) pending_fetch_error: Option<TdsError>,
+    /// Server INFO messages a read-ahead peek drained from the client when
+    /// `release_busy_if_row_exhausted` released the busy claim on a zero-row
+    /// fetch (`row_delivered == false`). `fill_rowset`'s own `SQL_NO_DATA`
+    /// can't carry `SQL_SUCCESS_WITH_INFO`, so these are stashed here instead
+    /// of posted immediately — for `SQLMoreResults`'s `batch_exhausted` fast
+    /// path or a cursor close to surface, exactly as the deferred-error
+    /// twin above. Both fast paths release the connection without the
+    /// caller re-touching the wire, so nothing else would ever drain them.
+    /// Cleared wherever `batch_exhausted` is.
+    pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
@@ -936,6 +946,7 @@ impl StmtHandle {
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,
+                pending_fetch_info: Vec::new(),
                 prepared: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
