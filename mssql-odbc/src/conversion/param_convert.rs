@@ -292,15 +292,20 @@ impl AppText {
         }
     }
 
-    /// Length in the units the declared length is compared against.
+    /// Length in the units the declared length is compared against: UTF-16
+    /// units, whatever the source encoding and whatever family it lands in.
     ///
-    /// A wide source counts its UTF-16 units whichever family it lands in -
-    /// msodbcsql assumes "1 WCHAR converts to 1 byte" for a narrow target
-    /// (`sqlcfunc.cpp:2946`) rather than encoding to find out.
-    fn len_in_target_units(&self, wide_target: bool) -> usize {
+    /// msodbcsql measures a wide source that way even for a narrow target
+    /// (`sqlcfunc.cpp:2946`, "Assumption: 1 WCHAR converts to 1 byte") rather
+    /// than encoding to find out. Applying the same unit to a narrow source is
+    /// what keeps the two C types agreeing on one value - counting its UTF-8
+    /// bytes instead would reject `caf\u{e9}` from a `varchar(4)` that
+    /// `SQL_C_WCHAR` is allowed to fill.
+    fn len_in_utf16_units(&self) -> usize {
         match self {
             Self::Utf16(bytes) => bytes.len() / size_of::<u16>(),
-            Self::Utf8(bytes) if !wide_target => bytes.len(),
+            // `from_utf8_lossy` borrows on the valid path, so this allocates
+            // only to repair malformed input.
             Self::Utf8(bytes) => String::from_utf8_lossy(bytes).encode_utf16().count(),
         }
     }
@@ -357,7 +362,7 @@ fn convert_character_sql(
     // Fit before transcoding: the limit counts source units, not the encoded
     // result - see [`fit_to_declared_length`].
     let text = match limit {
-        Some(limit) => fit_to_declared_length(text, limit, wide)?,
+        Some(limit) => fit_to_declared_length(text, limit)?,
         None => text,
     };
     let value = Some(text.transcode(wide).into_sql_string());
@@ -383,50 +388,65 @@ fn convert_character_sql(
 
 /// Trims `text` to `limit` units, or reports `22001`.
 ///
-/// The units are msodbcsql's, and they are an approximation on purpose. The
-/// exact count is unknowable here: `varchar(n)` bounds *collation* bytes, and
-/// the collation is only applied downstream by `serialize_string` in mssql-tds.
-/// So a wide source counts its UTF-16 units whichever family it lands in
-/// (`sqlcfunc.cpp:2946`, "Assumption: 1 WCHAR converts to 1 byte"), and a narrow
-/// source counts its own bytes for a narrow target or the UTF-16 units it would
-/// produce for a wide one (`:2915`).
+/// The unit is msodbcsql's, and it is an approximation on purpose. The exact
+/// count is unknowable here: `varchar(n)` bounds *collation* bytes, and the
+/// collation is only applied downstream by `serialize_string` in mssql-tds. So
+/// every source is measured in the UTF-16 units it holds or would produce
+/// (`sqlcfunc.cpp:2946`, "Assumption: 1 WCHAR converts to 1 byte"), whichever
+/// family it lands in.
+///
+/// That unit is the same for both character C types on purpose, and it is where
+/// this deliberately parts company with msodbcsql. Three of its four arms
+/// already count UTF-16 units - both wide-source arms, and the narrow-to-wide
+/// walk, which even counts an astral character as two (`sqlcfunc.cpp:2935`).
+/// Only narrow-to-narrow counts source bytes (`cchDest = cbData`, `:2952`).
+///
+/// That byte count is the wire length only while no client-side transcode
+/// happens, which is the ordinary case: TDS carries a collation with char data,
+/// so the bytes ship under a declared collation and the *server* converts.
+/// `DoCharToCharConversion` (`sqlcprot.h:4113`) turns the client-side conversion
+/// on only for an encoding TDS cannot name - a UTF-8 client against a non-UTF-8
+/// server, or the ISO-8859-x range - and translation is on by default
+/// (`SQL_XL_DEFAULT`).
+///
+/// A UTF-8 `SQL_C_CHAR` is this driver's permanent state, so that predicate
+/// would always hold here. In that configuration msodbcsql transcodes but still
+/// measures the *pre-transcode* UTF-8 bytes, rejecting `caf\u{e9}` from a
+/// `varchar(4)` that the four bytes it actually sends would fit. Copying the
+/// byte rule reproduced that defect and left the two C types disagreeing on one
+/// value, so it is not replicated - like the narrow-to-wide off-by-one below.
 ///
 /// Overflowing *blanks* are dropped silently; anything else is an error --
 /// msodbcsql checks the overflow with `CheckTrailingChars` /
 /// `CheckTrailingWChars` before deciding (`sqlcfunc.cpp:2957`). Inbound
 /// truncation is an error, unlike the benign outbound `01004`.
 ///
-/// TODO: the narrow count is only approximate *here*, not in msodbcsql, which
-/// ships `SQL_C_CHAR` bytes verbatim under the client collation and so compares
-/// the exact wire length (`sqlcmisc.cpp:7328`). We re-encode to the server
-/// collation in `serialize_string`, which usually shrinks the value but can grow
-/// it - GB18030 emits 4 bytes where UTF-8 uses 2. A bounded `char`/`varchar`
-/// then fails in `serialize_char_varchar_direct` with an opaque `UsageError`
-/// rather than `22001`; `text`/`ntext` and the `max` types carry no such check
-/// and send the over-long value. Exactness needs the collation at this layer.
+/// TODO: the count is still approximate, and now errs low rather than high. We
+/// re-encode to the server collation in `serialize_string`, which usually
+/// shrinks the value but can grow it - GB18030 emits 4 bytes where UTF-8 uses 2.
+/// An over-long value then fails in `serialize_char_varchar_direct` with an
+/// opaque `UsageError` rather than `22001`; `text`/`ntext` and the `max` types
+/// carry no such check and send it. Exactness needs the collation at this layer
+/// (AB#47584); until then the failure mode is a late error on data that does not
+/// fit rather than an early rejection of data that does.
 ///
 /// TODO: msodbcsql's narrow-to-wide arm never reaches this logic -- its walk
 /// tests `cchDest > cchMax` before incrementing and then `break`s past the trim
 /// (`sqlcfunc.cpp:2926`), so one character of overflow escapes and overflowing
 /// blanks are never dropped. Deliberately not replicated.
-fn fit_to_declared_length(
-    text: AppText,
-    limit: usize,
-    wide_target: bool,
-) -> Result<AppText, ParamBuildError> {
+fn fit_to_declared_length(text: AppText, limit: usize) -> Result<AppText, ParamBuildError> {
     const BLANK_UTF16: [u8; 2] = [b' ', 0];
 
     // A UTF-8 buffer never yields more UTF-16 units than it has bytes, so fitting
     // by byte count settles it without the walk - msodbcsql short-circuits the
     // same way at `sqlcfunc.cpp:2917`.
     if let AppText::Utf8(bytes) = &text
-        && wide_target
         && bytes.len() <= limit
     {
         return Ok(text);
     }
 
-    let overflow = text.len_in_target_units(wide_target).saturating_sub(limit);
+    let overflow = text.len_in_utf16_units().saturating_sub(limit);
     if overflow == 0 {
         return Ok(text);
     }
@@ -1195,12 +1215,16 @@ mod tests {
         );
     }
 
-    /// Malformed narrow input is measured before it is repaired, so a buffer
-    /// that fits exactly grows past the declared length: each bad byte becomes a
-    /// three-byte U+FFFD. The narrow mirror of
+    /// Malformed narrow input is repaired before it is measured, so the count
+    /// covers the U+FFFD it will become - but a value that fits in units can
+    /// still exceed the declared length in collation bytes, since each U+FFFD
+    /// occupies three. The narrow mirror of
     /// `a_lone_surrogate_is_measured_before_repair` (AB#47584).
     #[test]
     fn invalid_utf8_at_the_limit_grows_past_it() {
+        // Three bytes into a limit of three never reaches the measurement: the
+        // byte-count short-circuit settles it, because no UTF-8 buffer yields
+        // more UTF-16 units than bytes. The growth still happens on the wire.
         let mut buf: Vec<u8> = vec![b'a', b'b', 0xFF];
         let mut ind: SqlLen = buf.len() as SqlLen;
         let mut p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
@@ -1214,6 +1238,19 @@ mod tests {
             }
             other => panic!("expected Varchar(Some, 3), got {other:?}"),
         }
+
+        // One byte longer does reach the measurement, and it counts the repaired
+        // form: four bytes become four UTF-16 units, one past the limit, and the
+        // overflowing byte is not a blank.
+        let mut buf: Vec<u8> = vec![b'a', b'b', b'c', 0xFF];
+        let mut ind: SqlLen = buf.len() as SqlLen;
+        let mut p = param(SQL_C_CHAR, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_VARCHAR;
+        p.column_size = 3;
+        assert_eq!(
+            unsafe { bound_param_to_value(&p) },
+            Err(ParamBuildError::StringTruncation)
+        );
     }
 
     /// Overflowing *blanks* are dropped without a diagnostic - msodbcsql checks
@@ -1230,15 +1267,19 @@ mod tests {
         }
     }
 
-    /// Trimming a narrow source against a wide target mixes units - `overflow`
-    /// counts UTF-16 units, `keep` is a byte offset - which holds only because a
-    /// blank is one byte and never a UTF-8 continuation byte. Multibyte content
-    /// is what would expose it.
+    /// Trimming a narrow source mixes units - `overflow` counts UTF-16 units,
+    /// `keep` is a byte offset - which holds only because a blank is one byte
+    /// and never a UTF-8 continuation byte. Multibyte content is what would
+    /// expose it, against either target family.
     #[test]
     fn a_multibyte_narrow_source_trims_blanks_on_a_char_boundary() {
         match convert_char(SQL_C_CHAR, SQL_WVARCHAR, 1, "\u{e9}   ").unwrap() {
             SqlType::NVarchar(Some(s), 1) => assert_eq!(s.to_utf8_string(), "\u{e9}"),
             other => panic!("expected NVarchar(Some, 1), got {other:?}"),
+        }
+        match convert_char(SQL_C_CHAR, SQL_VARCHAR, 1, "\u{e9}   ").unwrap() {
+            SqlType::Varchar(Some(s), 1) => assert_eq!(s.to_utf8_string(), "\u{e9}"),
+            other => panic!("expected Varchar(Some, 1), got {other:?}"),
         }
     }
 
@@ -1246,7 +1287,8 @@ mod tests {
     /// msodbcsql assumes one byte per `WCHAR` for a narrow target rather than
     /// encoding to find out. Counting the transcoded UTF-8 instead would falsely
     /// reject values that fit: `varchar(n)` bounds collation bytes, and under a
-    /// single-byte collation "caf\u{e9}" is four of them, not five.
+    /// single-byte collation "caf\u{e9}" is four of them, not five. The narrow
+    /// source is now held to the same unit for the same reason.
     #[test]
     fn a_wide_source_is_measured_in_utf16_units_for_both_families() {
         let text = "caf\u{e9}";
@@ -1258,17 +1300,34 @@ mod tests {
         );
     }
 
-    /// A narrow source counts its own UTF-8 bytes for a narrow target, and the
-    /// UTF-16 units it would produce for a wide one.
+    /// Both character C types measure the same value alike, so a binding one
+    /// accepts the other cannot reject.
+    ///
+    /// Counting a narrow source's UTF-8 bytes put them in disagreement:
+    /// "caf\u{e9}" fitted a `varchar(4)` as `SQL_C_WCHAR` and was `22001` as
+    /// `SQL_C_CHAR`, on data the server accepts - bound one character longer it
+    /// reaches the server and `LEN` returns 4.
     #[test]
-    fn a_narrow_source_is_measured_per_target_family() {
-        let text = "\u{2615}\u{2615}\u{2615}";
-        assert_eq!(
-            convert_char(SQL_C_CHAR, SQL_VARCHAR, 3, text).unwrap_err(),
-            ParamBuildError::StringTruncation
-        );
-        assert!(convert_char(SQL_C_CHAR, SQL_VARCHAR, 9, text).is_ok());
-        assert!(convert_char(SQL_C_CHAR, SQL_WVARCHAR, 3, text).is_ok());
+    fn both_character_c_types_measure_a_value_alike() {
+        // The astral case is why the unit is UTF-16 rather than `char`: one
+        // character but two units, so counting characters would have left the
+        // two C types disagreeing here instead.
+        for text in ["caf\u{e9}", "\u{2615}\u{2615}\u{2615}", "\u{1F600}"] {
+            let units = text.encode_utf16().count();
+            for sql_type in [SQL_VARCHAR, SQL_WVARCHAR] {
+                for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+                    assert!(
+                        convert_char(c_type, sql_type, units, text).is_ok(),
+                        "{c_type} -> {sql_type} rejected {text:?} at its own unit count"
+                    );
+                    assert_eq!(
+                        convert_char(c_type, sql_type, units - 1, text).unwrap_err(),
+                        ParamBuildError::StringTruncation,
+                        "{c_type} -> {sql_type} accepted {text:?} one unit past the limit"
+                    );
+                }
+            }
+        }
     }
 
     /// Malformed narrow input is repaired lossily rather than reported. Pinned

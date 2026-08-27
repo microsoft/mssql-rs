@@ -285,35 +285,58 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
 // the counts agree and the 22001 is correct. The second half pins the gap from
 // the passing side: the count validated is 5, the value stored is 4 long.
 //
-// msodbcsql has no such gap here - it ships SQL_C_CHAR bytes verbatim under the
-// client collation (sqlcmisc.cpp:7328), so the count it checks is the count that
-// lands. Compare is skipped because that makes its result depend on the client
-// code page: a non-UTF-8 client reads these bytes as two CP1252 characters and
-// LEN returns 5.
+// A narrow source is measured in UTF-16 units, the same unit a wide source
+// uses, so the two C types agree on one value. Measuring SQL_C_CHAR in its own
+// UTF-8 bytes rejected "cafe"-with-an-acute from a varchar(4) that SQL_C_WCHAR
+// was allowed to fill, on data the server accepts - LEN returns 4 below.
 //
-// The inverse is the dangerous direction and needs a DBCS-collated database to
-// pin: GB18030 emits four bytes where UTF-8 uses two, so an over-long value
-// reaches serialize_char_varchar_direct and fails there with an opaque driver
-// error rather than 22001.
+// Compare is skipped because msodbcsql's answer depends on the client code
+// page. TDS carries a collation with char data, so it normally ships SQL_C_CHAR
+// bytes under a declared collation and lets the server convert - a CP1252 client
+// counts 4 and agrees with us. A UTF-8 client trips DoCharToCharConversion
+// (sqlcprot.h:4113), so msodbcsql transcodes, yet still measures the
+// pre-transcode UTF-8 bytes: it counts 5 and rejects a value that the 4 bytes it
+// actually sends would fit. That defect is deliberately not replicated.
 //
-// This asserts a known-wrong result, deferred rather than accepted (AB#47584).
-TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf8Bytes) {
+// The count is still approximate, and now errs low rather than high: under a
+// DBCS or _UTF8 collation the server bound is larger than the units we counted,
+// so an over-long value reaches serialize_char_varchar_direct and fails there
+// with an opaque driver error rather than 22001 (AB#47584).
+TEST_F(CharConversionLiveTest, NarrowMultibyteIsMeasuredInUtf16Units) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     std::vector<SQLCHAR> value = {'c', 'a', 'f', 0xC3, 0xA9};
     SQLLEN ind = static_cast<SQLLEN>(value.size());
 
-    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    // Four characters, five UTF-8 bytes: a varchar(4) holds it.
+    ASSERT_SQL_OK(Prepare("SELECT LEN(?) AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
                                    SQL_VARCHAR, 4, 0, value.data(), ind, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("4", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+    // One character less and it is truncation, measured in the same units.
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 3, 0, value.data(), ind, &ind),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
 
+    // The wide C type reaches the same verdict on the accepting side. The
+    // rejecting side is not asserted here - a refused bind sends nothing, so the
+    // server cannot observe it, and both_character_c_types_measure_a_value_alike
+    // covers all four combinations.
+    std::vector<SQLWCHAR> wide = {'c', 'a', 'f', 0x00E9};
+    SQLLEN wind = static_cast<SQLLEN>(wide.size() * sizeof(SQLWCHAR));
     ASSERT_SQL_OK(Prepare("SELECT LEN(?) AS v"), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
-                                   SQL_VARCHAR, 5, 0, value.data(), ind, &ind),
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR,
+                                   SQL_VARCHAR, 4, 0, wide.data(), wind, &wind),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);

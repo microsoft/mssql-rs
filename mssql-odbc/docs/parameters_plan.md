@@ -366,19 +366,58 @@ character; an overflow of trailing blanks is trimmed silently
 
 **The length is measured in msodbcsql's units, which approximate** (AB#47584).
 The exact count is unknowable at conversion time - `varchar(n)` bounds
-*collation* bytes, applied downstream by `serialize_string`. A wide source counts
-its UTF-16 units for either family (`cchDest = cbData/sizeof(WCHAR)`,
-*"Assumption: 1 WCHAR converts to 1 byte"*, `:2946`); a narrow source counts its
-own bytes for a narrow target and the UTF-16 units it would produce for a wide
-one (`:2915`). Counting transcoded UTF-8 would falsely reject values that fit:
-under a single-byte collation "cafe" with an acute accent is four collation
-bytes, not five. The inverse - a collation whose bytes outnumber the units we
-counted, so an over-long value passes - is reachable on any `_UTF8` collation,
-not just a DBCS one: `serialize_char_varchar_direct` then rejects it as a
-`UsageError`, surfacing `HY000` rather than the `22001` the application should
-see. Routing it to `ERR_PARAM_STRING_TRUNCATION` needs a typed error out of
-`mssql-tds` - matching on the message text would be guesswork - so it belongs
-with AB#47584 rather than as a local patch.
+*collation* bytes, applied downstream by `serialize_string`. Every source is
+therefore measured in the UTF-16 units it holds or would produce (`cchDest =
+cbData/sizeof(WCHAR)`, *"Assumption: 1 WCHAR converts to 1 byte"*, `:2946`),
+whichever family it lands in. Counting transcoded UTF-8 would falsely reject
+values that fit: under a single-byte collation "cafe" with an acute accent is
+four collation bytes, not five.
+
+The unit is deliberately the same for both character C types, and this is where
+P4 parts company with msodbcsql. Three of its four arms already count UTF-16
+units - both wide-source arms, and the narrow-to-wide walk, which even counts an
+astral character as two (`:2935`). Only narrow-to-narrow counts source bytes
+(`cchDest = cbData`, `:2952`).
+
+That byte count is the wire length only while no client-side transcode happens,
+which is the ordinary case: TDS carries a collation with char data, so the bytes
+ship under a declared collation and the *server* converts.
+`DoCharToCharConversion` (`sqlcprot.h:4113`) enables the client-side conversion
+only for an encoding TDS cannot name - a UTF-8 client against a non-UTF-8 server,
+or the ISO-8859-x range - and translation is on by default (`SQL_XL_DEFAULT`).
+
+A UTF-8 `SQL_C_CHAR` is this driver's permanent state, so that predicate would
+always hold here. In that configuration msodbcsql transcodes but still measures
+the *pre-transcode* UTF-8 bytes, rejecting "cafe" with an acute accent from a
+`varchar(4)` that the four bytes it actually sends would fit. Copying the byte
+rule reproduced that defect and left the two C types disagreeing on one value -
+the same string was accepted as `SQL_C_WCHAR` and `22001` as `SQL_C_CHAR`. So it
+is not replicated, on the same footing as the narrow-to-wide off-by-one below.
+Holding both C types to UTF-16 units is what makes them agree; `char` counts
+would not, since an astral character is one `char` but two units.
+
+The residual error now runs one way only: the count errs low, never high. On a
+collation whose bytes outnumber the units counted - reachable on any `_UTF8`
+collation, not just a DBCS one - an over-long value passes here and
+`serialize_char_varchar_direct` rejects it as a `UsageError`, surfacing `HY000`
+rather than the `22001` the application should see. The `max` types and
+`text`/`ntext` carry no such check at all and send the over-long value, which is
+the worse outcome of the two. Routing either to `ERR_PARAM_STRING_TRUNCATION`
+needs a typed error out of `mssql-tds` - matching on the message text would be
+guesswork - so it belongs with AB#47584 rather than as a local patch.
+
+**This is a behavioural regression for a subset of inputs, not a pure
+improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
+`22001` under the byte count; it is now accepted as three units and fails
+downstream as an opaque `HY000` - or, under a single-byte collation, each
+character is unmappable and becomes an eight-byte numeric character reference
+(AB#47598), so 24 bytes are offered to a `varchar(3)`. CJK and astral input
+bound with an exact character count is the shape that regresses. The trade was
+taken because over-rejection has no application workaround - the byte count is
+encoding-dependent and the application cannot know it - while under-rejection
+still errors, and because byte-counting *both* C types would have broken the
+wide arm, the one msodbcsql gets right. No option preserved both parity and
+self-consistency.
 
 Verified against msodbcsql source:
 
