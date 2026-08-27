@@ -288,10 +288,10 @@ places a careful pass never examined. Each entry names the spot, not the PR.
   regime and leaves the risky one uncovered.
 - **Worked examples in `docs/*.md` are checkable claims, not commentary.** Byte
   counts, code points and expansion arithmetic in a design doc are load-bearing for
-  whoever picks up the deferred work, and cost seconds to verify. One PR shipped
-  "eight-byte numeric character reference ... 24 bytes" for `&#9749;` (U+2615), which
-  is seven characters and 21 — a figure carried over from the five-digit `&#26085;`
-  (U+65E5) example nearby.
+  whoever picks up the deferred work, and cost seconds to verify. One revision called
+  `&#9749;` (U+2615) an "eight-byte numeric character reference" and totalled three of
+  them as 24 bytes offered to a `varchar(3)`; it is seven bytes, so 21. The 8 belonged
+  to the five-digit `&#26085;` (U+65E5) example nearby.
 
 ## Reviewing Alongside Other Reviewers
 
