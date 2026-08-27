@@ -133,6 +133,30 @@ pub(crate) struct SuspendedMessage {
     eom_pending: bool,
 }
 
+impl SuspendedMessage {
+    /// `true` while no packet of this message has reached the network yet, so
+    /// the request can be abandoned locally without the server ever learning it
+    /// existed.
+    pub(crate) fn nothing_sent(&self) -> bool {
+        self.is_first_packet
+    }
+
+    /// Discards an unsent message, returning any RESETCONNECTION request it was
+    /// carrying to `network_writer`.
+    ///
+    /// [`PacketWriter::new`] consumes the connection's pending reset bit so it
+    /// applies to exactly one message. Dropping a message that never reached the
+    /// network would therefore swallow the reset: the transport no longer holds
+    /// it, the request that would have carried it is gone, and the pool's
+    /// `reset_pending` would stay true forever. Re-arming puts the bit back on
+    /// the connection so the next request carries it instead.
+    pub(crate) fn abandon(self, network_writer: &mut dyn NetworkWriter) {
+        if self.reset_mode != ResetConnectionMode::None {
+            network_writer.set_reset_mode(self.reset_mode);
+        }
+    }
+}
+
 impl<'a> PacketWriter<'a> {
     pub(crate) const PACKET_HEADER_SIZE: usize = 8;
 
@@ -240,7 +264,13 @@ impl<'a> PacketWriter<'a> {
         }
     }
 
-    #[cfg(test)]
+    /// Terminates the current message with an EOM | IGNORE packet, telling the
+    /// server to discard everything it has received for it (MS-TDS 2.2.3.1.2).
+    ///
+    /// Only meaningful once at least one packet of the message has been sent —
+    /// an unsent message is abandoned by dropping the writer. The server still
+    /// answers an ignored message with a DONE token, which the caller must
+    /// consume before reusing the connection.
     pub(crate) async fn cancel_current_message(&mut self) -> TdsResult<()> {
         self.populate_header_and_send(true, true).await
     }
@@ -289,9 +319,13 @@ impl<'a> PacketWriter<'a> {
         // If the ignore bit is set, it must be the end of the message per the protocol.
         assert!(is_last_packet || !is_ignore_packet);
 
-        // Record the position of the packet payload. Set the payload size to zero if this is an ignore packet.
+        // Record the position of the packet payload. An ignore packet carries no
+        // payload at all — whatever was buffered is discarded rather than
+        // flushed — but it is still a packet, and the header's Length field
+        // counts the header itself (MS-TDS 2.2.3.1), so it measures
+        // PACKET_HEADER_SIZE rather than zero.
         let saved_position = match is_ignore_packet {
-            true => 0,
+            true => Self::PACKET_HEADER_SIZE as u64,
             false => self.payload_cursor.position(),
         };
 
@@ -831,6 +865,25 @@ pub(crate) mod tests {
             buf[1],
             PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
         );
+
+        // An ignore packet is header-only, and the length field counts the
+        // header, so the packet must actually reach the wire as 8 bytes rather
+        // than being truncated away to nothing.
+        assert_eq!(
+            mock.data.len(),
+            PacketWriter::PACKET_HEADER_SIZE,
+            "the ignore packet must be sent, not discarded"
+        );
+        assert_eq!(
+            mock.data[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8
+        );
+        assert_eq!(
+            u16::from_be_bytes([mock.data[2], mock.data[3]]) as usize,
+            PacketWriter::PACKET_HEADER_SIZE
+        );
+        // The buffered payload byte must not be part of the ignored packet.
+        assert!(!mock.data.contains(&0xAB));
     }
 
     #[test]

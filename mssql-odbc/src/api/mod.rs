@@ -4,6 +4,7 @@
 pub(crate) mod alloc_handle;
 mod bind_col;
 mod bind_param;
+mod cancel;
 mod catalog;
 mod close_cursor;
 mod col_attribute;
@@ -30,7 +31,9 @@ mod get_type_info;
 mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;
+mod param_data;
 mod prepare;
+mod put_data;
 mod row_count;
 pub(crate) mod set_connect_attr;
 pub(crate) mod set_desc_field;

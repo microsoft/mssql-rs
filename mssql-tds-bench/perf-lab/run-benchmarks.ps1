@@ -480,7 +480,7 @@ Write-Host $comparison
 [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'comparison.txt'), $comparison + "`n", $Utf8NoBom)
 
 $thr = [double]($env:BENCH_REGRESSION_RATIO)
-if (-not $thr) { $thr = 1.10 }
+if (-not $thr) { $thr = 1.05 }
 $regressions = @(Get-CritcmpRegressions $comparison $thr)
 $impThr = [double]($env:BENCH_IMPROVEMENT_VERIFY_RATIO)
 # Same magnitude as the regression threshold by default: a baseline-slower

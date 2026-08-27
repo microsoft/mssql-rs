@@ -3,12 +3,14 @@
 
 <#
 .SYNOPSIS
-  SANDBOX / TEST-ONLY helper. Stamps a PEP 440 version into the mock wheel manifests.
+  SANDBOX / TEST-ONLY helper. Stamps the run's version into the mock wheel manifests.
 
 .DESCRIPTION
-  Writes the same version into mssql-mock-tds-py/pyproject.toml and
-  mssql-mock-tds-py/Cargo.toml so maturin bakes it into the wheel. Used by the
-  Windows build jobs (the Linux/macOS jobs use stamp-mock-wheel-version.sh).
+  Writes the run's version into mssql-mock-tds-py/pyproject.toml and
+  mssql-mock-tds-py/Cargo.toml. maturin reads the wheel version from pyproject.toml's
+  [project].version, so pyproject gets the PEP 440 spelling (0.1.0.dev123) while
+  Cargo.toml gets the SemVer one (0.1.0-dev.123) that `cargo metadata` will accept.
+  Used by the Windows build jobs (the Linux/macOS jobs use stamp-mock-wheel-version.sh).
 
   Emits the resolved version as the `mockWheelVersion` pipeline variable.
 
@@ -53,11 +55,20 @@ else {
     }
 }
 
-Write-Host "Sandbox wheel version: $ver"
+# Cargo rejects PEP 440's `.devN` suffix ("unexpected character '.' after patch
+# version number") because SemVer spells a prerelease with a hyphen. Release
+# versions carry no dev segment and are already valid SemVer.
+$cargoVer = if ($ver -match '^(.*)\.dev(\d+)$') { "$($Matches[1])-dev.$($Matches[2])" } else { $ver }
 
-foreach ($f in $pyproject, $cargo) {
-    (Get-Content $f -Raw) -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$ver`"" |
-        Set-Content $f -NoNewline
+Write-Host "Sandbox wheel version: $ver (Cargo manifest: $cargoVer)"
+
+function Set-ManifestVersion {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Version)
+    (Get-Content $Path -Raw) -replace '(?m)^(version\s*=\s*)"[^"]+"', "`$1`"$Version`"" |
+        Set-Content $Path -NoNewline
 }
+
+Set-ManifestVersion -Path $pyproject -Version $ver
+Set-ManifestVersion -Path $cargo -Version $cargoVer
 
 Write-Host "##vso[task.setvariable variable=mockWheelVersion]$ver"

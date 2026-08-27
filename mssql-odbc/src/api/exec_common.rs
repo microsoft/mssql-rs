@@ -11,16 +11,22 @@ use tracing::error;
 
 use std::collections::VecDeque;
 
-use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
+use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
-use crate::api::odbc_types::{SQL_ERROR, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn};
-use crate::conversion::param_convert::{ParamBuildError, bound_param_to_rpc};
+use crate::api::odbc_types::{
+    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+};
+use crate::conversion::param_convert::{
+    ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
+};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
-    STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, StmtState,
+    DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
+    STMT_STATE_EXEC_STARTED, StmtState,
 };
 use crate::handles::{DbcHandle, StmtHandle};
 
@@ -30,6 +36,77 @@ pub(super) fn clear_exec_started(stmt: &StmtHandle) {
     if let Ok(mut stmt_state) = stmt.inner.lock() {
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     }
+}
+
+/// Tears down an in-progress data-at-execution sequence and returns the
+/// connection to the idle pool.
+///
+/// The transport is mid-write when a DAE sequence is abandoned, so the parked
+/// request must be discarded via `cancel_streamed_write` before the client can
+/// serve another command. `prepared` and `pending_unprepare` are restored so the
+/// statement can simply be executed again, which is what the ODBC spec requires
+/// after `SQLCancel`.
+///
+/// `diag`, when supplied, is posted against the statement before the state is
+/// cleared.
+pub(super) fn unwind_dae(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: Option<DiagMsg>,
+) {
+    let client = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("stmt mutex poisoned unwinding DAE sequence");
+            return;
+        };
+        if let Some(diag) = diag {
+            post_diag(&mut stmt_state, diag);
+        }
+        let client = stmt_state.take_dae();
+        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        client
+    };
+
+    if let Some(mut client) = client {
+        dbc.runtime.block_on(client.cancel_streamed_write());
+        return_client_idle(dbc, statement_handle, client);
+    }
+}
+
+/// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
+/// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
+/// `active_stmt` set, so the connection stays busy for the duration.
+///
+/// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
+/// and has no plan to restore when the sequence completes.
+pub(super) fn park_dae_client(
+    stmt: &StmtHandle,
+    client: TdsClient,
+    prepared: Option<PreparedPlan>,
+    orphaned: Option<StatementId>,
+    dae_params: Vec<DaeParam>,
+    op: &str,
+) -> SqlReturn {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        // The client has nowhere to go: the statement that owns it is
+        // unreachable and the DBC still records it as busy.
+        error!("{op}: stmt mutex poisoned while parking DAE client");
+        return SQL_ERROR;
+    };
+    stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    SQL_NEED_DATA
+}
+
+/// Aborts a data-at-execution sequence with a diagnostic. Always `SQL_ERROR`.
+pub(super) fn abort_dae_with_diag(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: DiagMsg,
+) -> SqlReturn {
+    unwind_dae(dbc, stmt, statement_handle, Some(diag));
+    SQL_ERROR
 }
 
 /// Acquires the connection's TDS client for an execution, enforcing the
@@ -185,11 +262,47 @@ pub(super) fn flush_pending_unprepare(
     }
 }
 
+/// Result of [`build_named_params`]: the full RPC parameter list (with
+/// data-at-execution placeholders) and a description of those placeholders.
+pub(super) struct ParamsWithDae {
+    /// All `@P1..@Pn` parameters in original order.  DAE entries carry a
+    /// `data_at_exec()` flag and a `None` value; their data arrives later via
+    /// `SQLPutData`.
+    pub(super) params: Vec<RpcParameter>,
+    /// Every DAE entry, in original parameter order.
+    pub(super) dae_params: Vec<DaeParam>,
+}
+
+/// The byte total an application declared with `SQL_LEN_DATA_AT_EXEC(n)`, or
+/// `None` when it declared no total and the length is whatever gets streamed.
+///
+/// `SQL_LEN_DATA_AT_EXEC(0)` is "unspecified", not "must be empty": msodbcsql
+/// guards both of its length checks with `cbDAEDataTotal > 0`
+/// (`sqlccmd.cpp:4548` per-put, `sqlccmd.cpp:6010` at close) and treats a zero
+/// total the same as `NO_PARAM_LENGTH` (`sqlccmd.cpp:4160`). Folding it into
+/// `None` here keeps that behaviour instead of rejecting the first byte with
+/// `22026`.
+fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
+    if indicator == SQL_DATA_AT_EXEC {
+        return None;
+    }
+    match (SQL_LEN_DATA_AT_EXEC_OFFSET - indicator) as usize {
+        0 => None,
+        n => Some(n),
+    }
+}
+
 /// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
-/// parameters, reading application value buffers by reference. Posts the
-/// matching diagnostic and returns `Err(SQL_ERROR)` when a marker is unbound
-/// (`07002`) or a parameter cannot be built. Shared by `SQLExecute`
-/// and `SQLExecDirect`; `op` names the entry point for traceable diagnostics.
+/// parameters, reading application value buffers by reference. Shared by
+/// `SQLExecute` and `SQLExecDirect`; `op` names the entry point for traceable
+/// diagnostics.
+///
+/// Parameters with `SQL_DATA_AT_EXEC` or `SQL_LEN_DATA_AT_EXEC(n)` indicators
+/// become streaming placeholders instead of having their value buffer read
+/// eagerly, and are recorded in [`ParamsWithDae::dae_params`]; all others are
+/// converted immediately. Posts the matching diagnostic and returns
+/// `Err(SQL_ERROR)` when a marker is unbound (`07002`) or a parameter cannot be
+/// built.
 ///
 /// # Safety
 /// Each bound parameter's value/indicator pointers must still satisfy the
@@ -198,29 +311,71 @@ pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
     op: &str,
-) -> Result<Vec<RpcParameter>, SqlReturn> {
-    let mut named_params = Vec::with_capacity(marker_count);
+) -> Result<ParamsWithDae, SqlReturn> {
+    use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+    let mut params = Vec::with_capacity(marker_count);
+    let mut dae_params = Vec::new();
+
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
             error!("{op}: parameter {} has no bound value", i + 1);
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
+
         let name = format!("@P{}", i + 1);
-        match unsafe { bound_param_to_rpc(name, bound_param) } {
-            Ok(param) => named_params.push(param),
-            Err(e) => {
-                if let ParamBuildError::InvalidLength(len) = e {
-                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
-                } else {
-                    error!("{op}: parameter {} rejected: {}", i + 1, e.diag().text);
+
+        // Check for a data-at-execution indicator before dereferencing the
+        // value buffer: DAE params carry no value at bind time.
+        let dae_indicator = if !bound_param.strlen_or_ind_ptr.is_null() {
+            let ind = unsafe { *bound_param.strlen_or_ind_ptr };
+            is_data_at_exec_indicator(ind).then_some(ind)
+        } else {
+            None
+        };
+
+        if let Some(indicator) = dae_indicator {
+            let placeholder_type = match dae_placeholder_type(bound_param.c_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(
+                        "{op}: parameter {} DAE type not streamable: {}",
+                        i + 1,
+                        e.diag().text
+                    );
+                    post_diag(stmt_state, e.diag());
+                    return Err(SQL_ERROR);
                 }
-                post_diag(stmt_state, e.diag());
-                return Err(SQL_ERROR);
+            };
+            let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
+            dae_params.push(DaeParam {
+                bound_index: i,
+                expected_len: dae_expected_length(indicator),
+            });
+            params.push(rpc);
+        } else {
+            match unsafe { bound_param_to_rpc(name, bound_param) } {
+                Ok(param) => params.push(param),
+                Err(ParamBuildError::InvalidLength(len)) => {
+                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
+                    post_diag(stmt_state, ParamBuildError::InvalidLength(len).diag());
+                    return Err(SQL_ERROR);
+                }
+                Err(e) => {
+                    error!(
+                        "{op}: parameter {} conversion failed: {}",
+                        i + 1,
+                        e.diag().text
+                    );
+                    post_diag(stmt_state, e.diag());
+                    return Err(SQL_ERROR);
+                }
             }
         }
     }
-    Ok(named_params)
+
+    Ok(ParamsWithDae { params, dae_params })
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -332,7 +487,8 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_DEFAULT_PARAM, SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+        SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT,
+        SQL_VARCHAR, SqlLen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -342,6 +498,17 @@ mod tests {
     // The success path of `try_claim_idle_client` needs a real `TdsClient`,
     // which unit tests can't construct; these cover the guard branches (each
     // returns `None` without claiming `active_stmt`).
+
+    /// `SQL_LEN_DATA_AT_EXEC(0)` declares no total rather than an empty value,
+    /// matching msodbcsql's `cbDAEDataTotal > 0` guards. Treating it as
+    /// `Some(0)` would reject the first byte with `22026`.
+    #[test]
+    fn dae_expected_length_treats_zero_as_unspecified() {
+        assert_eq!(dae_expected_length(SQL_DATA_AT_EXEC), None);
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
+        assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
 
     #[test]
     fn try_claim_idle_client_none_when_disconnected() {
@@ -384,8 +551,9 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
-        let params = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
-        assert!(params.is_empty());
+        let built = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
+        assert!(built.params.is_empty());
+        assert!(built.dae_params.is_empty());
     }
 
     #[test]
@@ -406,8 +574,9 @@ mod tests {
             .bound_params
             .push(Some(char_param(&mut buf2, &mut ind2)));
 
-        let params = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
-        assert_eq!(params.len(), 2);
+        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        assert_eq!(built.params.len(), 2);
+        assert!(built.dae_params.is_empty());
     }
 
     #[test]
@@ -417,7 +586,7 @@ mod tests {
         // One marker expected, but nothing bound.
         let mut state = stmt.inner.lock().unwrap();
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
-        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
     }
 
@@ -438,7 +607,140 @@ mod tests {
             .push(Some(char_param(&mut buf, &mut ind)));
 
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
-        assert_eq!(ret.unwrap_err(), SQL_ERROR);
+        assert!(ret.is_err());
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07S01);
+    }
+
+    /// A data-at-execution marker between two ordinary binds keeps its ordinal
+    /// position: the `@P1..@Pn` list still carries one entry per marker in
+    /// order, and only the middle one is staged for streaming. Pins the
+    /// interleaving that `DataAtExecutionInterleavesWithBoundParams` can only
+    /// observe through the concatenated server result.
+    #[test]
+    fn build_named_params_keeps_streamed_marker_in_position() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut first: Vec<u8> = b"a\0".to_vec();
+        let mut first_ind: SqlLen = SQL_NTS as SqlLen;
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        let mut last: Vec<u8> = b"d\0".to_vec();
+        let mut last_ind: SqlLen = SQL_NTS as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .bound_params
+            .push(Some(char_param(&mut first, &mut first_ind)));
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state
+            .bound_params
+            .push(Some(char_param(&mut last, &mut last_ind)));
+
+        let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
+        assert_eq!(dae.params.len(), 3);
+        assert_eq!(
+            dae.dae_params,
+            vec![DaeParam {
+                bound_index: 1,
+                expected_len: None
+            }]
+        );
+    }
+
+    /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
+    /// `SQLParamData` enforces; `SQL_DATA_AT_EXEC` promises nothing.
+    #[test]
+    fn build_named_params_records_declared_length() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut ind: SqlLen = sql_len_data_at_exec(7);
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+        }));
+
+        let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+        assert_eq!(
+            dae.dae_params,
+            vec![DaeParam {
+                bound_index: 0,
+                expected_len: Some(7)
+            }]
+        );
+    }
+
+    /// Without an indicator pointer there is nothing to carry a
+    /// data-at-execution request, so the binding is an ordinary value even
+    /// though its buffer is empty.
+    #[test]
+    fn build_named_params_without_indicator_is_never_streamed() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut buf: Vec<u8> = b"abc".to_vec();
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
+            buffer_length: buf.len() as SqlLen,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+        assert_eq!(built.params.len(), 1);
+        assert!(built.dae_params.is_empty());
+    }
+
+    /// `SQLBindParameter` accepts a data-at-execution indicator on any C type,
+    /// so a type `SQLPutData` cannot stream is only caught here, at execute
+    /// time.
+    #[test]
+    fn build_named_params_unstreamable_dae_c_type_posts_hyc00() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut value: i32 = 0;
+        let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+        }));
+
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        assert!(ret.is_err());
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
+        );
     }
 }

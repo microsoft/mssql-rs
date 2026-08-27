@@ -322,7 +322,7 @@ cpu_sample "interleave-end" || true
 echo ">>> Comparing base -> candidate..."
 critcmp base candidate | tee "$RESULTS_DIR/comparison.txt"
 
-THR="${BENCH_REGRESSION_RATIO:-1.10}"
+THR="${BENCH_REGRESSION_RATIO:-1.05}"
 # Improvements are verified at the SAME magnitude as regressions by default: a
 # baseline-slower anomaly pollutes the recorded numbers (and the run-over-run
 # trend they feed) exactly as much as a candidate-slower one, and both directions

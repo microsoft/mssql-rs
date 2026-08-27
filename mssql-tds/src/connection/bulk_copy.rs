@@ -67,7 +67,8 @@ pub struct BulkCopyOptions {
     /// Number of rows in each batch. Default: 0 (all rows in one batch)
     pub batch_size: usize,
 
-    /// Timeout for the operation in seconds. Default: 30
+    /// Timeout for the operation in seconds. Default: 30. A value of `0`
+    /// means unlimited.
     pub timeout_sec: u32,
 
     /// Check constraints on the destination table. Default: false
@@ -417,9 +418,27 @@ impl<'a> BulkCopy<'a> {
         self
     }
 
+    /// Convert a timeout duration to the whole-second representation used internally.
+    ///
+    /// A zero duration represents an unlimited timeout. Any positive duration less
+    /// than one second is rounded up to one second so it cannot be interpreted as
+    /// the unlimited-timeout sentinel. Durations exceeding the maximum `u32`
+    /// timeout are saturated at `u32::MAX`.
+    fn duration_to_timeout_seconds(timeout: Duration) -> u32 {
+        if timeout > Duration::ZERO {
+            u32::try_from(timeout.as_secs().max(1)).unwrap_or(u32::MAX)
+        } else {
+            0
+        }
+    }
+
     /// Set the operation timeout.
     ///
     /// Default: 30 seconds
+    ///
+    /// A timeout of `Duration::ZERO` disables the timeout. Positive durations
+    /// shorter than one second are treated as a one-second timeout. Durations
+    /// exceeding the maximum supported timeout are clamped to that maximum.
     ///
     /// # Arguments
     ///
@@ -432,7 +451,7 @@ impl<'a> BulkCopy<'a> {
     /// bulk_copy.timeout(Duration::from_secs(120)); // 2 minute timeout
     /// ```
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.options.timeout_sec = timeout.as_secs() as u32;
+        self.options.timeout_sec = Self::duration_to_timeout_seconds(timeout);
         self
     }
 
@@ -1599,6 +1618,43 @@ mod tests {
         assert!(
             opts.use_internal_transaction,
             "use_internal_transaction should be configurable to true"
+        );
+    }
+
+    #[test]
+    fn test_duration_to_timeout_seconds() {
+        assert_eq!(BulkCopy::duration_to_timeout_seconds(Duration::ZERO), 0);
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_millis(1)),
+            1
+        );
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_millis(500)),
+            1
+        );
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_millis(999)),
+            1
+        );
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_secs(1)),
+            1
+        );
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_secs(2)),
+            2
+        );
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_millis(2500)),
+            2
+        );
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_secs(u32::MAX as u64)),
+            u32::MAX
+        );
+        assert_eq!(
+            BulkCopy::duration_to_timeout_seconds(Duration::from_secs(1_u64 << 32)),
+            u32::MAX
         );
     }
 

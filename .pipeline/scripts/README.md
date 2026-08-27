@@ -81,6 +81,49 @@ Enables Named Pipes and Shared Memory protocols for SQL Server via registry modi
 - Optionally restarts SQL Server service to apply changes
 - Provides detailed configuration status
 
+### run-bounded.sh
+Sourced helper providing `run_bounded <seconds> <command...>`. macOS ships no
+coreutils `timeout`, so long-running commands are bounded by running them in the
+background and killing them on overrun. Returns 124 on timeout.
+
+### start-colima-macos.sh
+Installs Docker + Colima on a hosted macOS agent and boots the VM, retrying on
+the transient lima hostagent boot failures seen in ~3% of runs. VM size stays at
+the long-standing 4 GiB / 4 CPU.
+
+Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
+boot still reaches the delete/retry path rather than running until the pipeline
+step timeout. That bound sits above the slowest healthy boot observed over 113
+runs (509s; p95 366s) — the real failures give up within seconds, so a shorter
+bound would only kill slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps
+the retries as a whole.
+
+**Environment overrides:** `COLIMA_CPU`, `COLIMA_MEMORY`, `COLIMA_DISK`,
+`COLIMA_START_ATTEMPTS` (3), `COLIMA_START_TIMEOUT_SECONDS` (540),
+`COLIMA_BUDGET_SECONDS` (480).
+
+### start-sql-server-macos.sh
+Starts the SQL Server test container inside the Colima VM. Retries the image
+pull, recreates the container when SQL Server hits a SQLPAL startup crash
+(~13% of macOS runs), dumps container state plus logs on every failed attempt,
+and exits non-zero when the server never becomes reachable.
+
+The macOS job is capped at 60 minutes, so every retry is bounded by wall clock
+as well as by attempt count: `SETUP_BUDGET_SECONDS` covers the whole step,
+`PULL_BUDGET_SECONDS` carves out the pull phase so a slow registry cannot
+starve the retries, and `READY_TIMEOUT_SECONDS` bounds each container attempt.
+The pipeline step adds a `timeoutInMinutes` backstop over the top.
+
+Every bound is sized above the measured worst case of the *successful* runs, so
+it only ever catches a hang: pulls run p50 292s / p95 478s / max 724s over 112
+runs, and a healthy readiness wait maxes out at 157s over 97 runs. An earlier
+480s pull budget would have killed 4.5% of runs outright.
+
+**Environment:** requires `SQL_PASSWORD`. Overrides: `SQL_IMAGE`,
+`SQL_CONTAINER`, `SETUP_BUDGET_SECONDS` (1200), `PULL_BUDGET_SECONDS` (900),
+`READY_TIMEOUT_SECONDS` (240), `MAX_START_ATTEMPTS` (3),
+`PROBE_LOGIN_TIMEOUT_SECONDS` (5), `PROBE_INTERVAL_SECONDS` (3).
+
 ## Pipeline Integration
 
 These scripts are referenced in the Azure DevOps pipeline template:

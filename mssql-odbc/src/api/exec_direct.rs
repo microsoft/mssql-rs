@@ -5,8 +5,11 @@
 
 use tracing::{debug, error};
 
+use mssql_tds::connection::tds_client::StreamedParamStatus;
+
 use super::exec_common::{
-    build_named_params, claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+    ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
+    flush_pending_unprepare, park_dae_client,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -89,6 +92,15 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        // A statement awaiting data-at-execution input is in the ODBC "Need
+        // Data" state, where anything but SQLPutData/SQLParamData/SQLCancel is a
+        // sequence error rather than the cursor error a merely-busy statement
+        // gets.
+        if stmt_state.needs_data() {
+            error!("SQLExecDirectW: statement is awaiting data-at-execution input");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return SQL_ERROR;
+        }
         if stmt_state.has_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN) {
             error!("SQLExecDirectW: statement has an active execute or open cursor");
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
@@ -120,6 +132,8 @@ fn sql_exec_direct_w_safe(
         (named_params, rewritten_sql, marker_count)
     };
 
+    let ParamsWithDae { params, dae_params } = named_params;
+
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
         Err(rc) => return rc,
@@ -132,12 +146,39 @@ fn sql_exec_direct_w_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
+    // Data-at-execution parameters park the half-written RPC on the statement
+    // and hand control to SQLParamData / SQLPutData. There is no prepared plan
+    // to restore afterwards, so `None` is passed for it.
+    if !dae_params.is_empty() {
+        let begin_result =
+            dbc.runtime
+                .block_on(client.begin_sp_executesql(rewritten_sql, params, ()));
+        return match begin_result {
+            // Defensive: staging only reports DAE parameters when at least one
+            // placeholder is present, so the TDS layer should not complete here.
+            Ok(StreamedParamStatus::Complete(_)) => {
+                error!(
+                    dae_param_count = dae_params.len(),
+                    "SQLExecDirectW: begin_sp_executesql completed despite data-at-execution parameters"
+                );
+                finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+            }
+            Ok(StreamedParamStatus::NeedData { .. }) => {
+                park_dae_client(stmt, client, None, None, dae_params, "SQLExecDirectW")
+            }
+            Err(e) => {
+                error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
+                fail_with_tds(dbc, stmt, statement_handle, client, &e)
+            }
+        };
+    }
+
     // Parameterized text runs via sp_executesql (direct execution, no cached
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
     // STMT lock is held during I/O.
     let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
         dbc.runtime
-            .block_on(client.execute_sp_executesql(rewritten_sql, named_params, ()))
+            .block_on(client.execute_sp_executesql(rewritten_sql, params, ()))
             .map(|_| ())
     } else {
         // Statement-wise navigation: position on the batch's first statement
@@ -189,6 +230,33 @@ mod tests {
         let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
         // DBC is not connected
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    /// A statement awaiting `SQLPutData` is in the Need Data state, where the
+    /// spec calls anything but SQLPutData/SQLParamData/SQLCancel a sequence
+    /// error. Without the dedicated guard this falls through to the
+    /// cursor-state check and reports 24000 instead.
+    #[test]
+    fn exec_direct_during_need_data_posts_hy010() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_STARTED);
+            state.dae = Some(crate::handles::stmt::DaeState::for_test(Vec::new(), None));
+        }
+
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY010);
     }
 
     #[test]
@@ -322,6 +390,42 @@ mod tests {
         let ds = dbc.inner.lock().unwrap();
         assert_eq!(ds.active_stmt, Some(h.stmt));
         assert!(ds.client.is_some());
+    }
+
+    /// SQL Server compiles variable assignment as a SQLSELECT command carrying
+    /// DONE_COUNT. `SQLExecDirect` must skip past it and open the following row
+    /// set, so an immediate `SQLFetch` succeeds instead of failing with 24000.
+    #[test]
+    fn exec_direct_skips_assignment_count_and_opens_rowset() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_more_select_with_count, done_no_more, int_columns,
+            tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![
+            done_more_select_with_count(1),
+            col_metadata(int_columns(1)),
+            done_no_more(),
+        ]);
+        dbc.inner.lock().unwrap().client = Some(client);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ret = sql_exec_direct_w_safe(
+            h.stmt,
+            stmt,
+            "DECLARE @out int = 1; EXEC dbo.p;".to_string(),
+        );
+
+        assert_eq!(ret, SQL_SUCCESS);
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+        assert_eq!(state.column_metadata.len(), 1);
+        assert_eq!(state.row_count, -1);
     }
 
     /// A no-row statement that also produced a message surfaces its diagnostics
