@@ -289,6 +289,7 @@ mod tests {
         DaeState::for_test(
             vec![DaeParam {
                 bound_index: 0,
+                value_ptr: std::ptr::null_mut(),
                 expected_len,
             }],
             Some(0),
@@ -311,6 +312,30 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+    }
+
+    #[test]
+    fn first_call_returns_the_staged_dae_token() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut token = 0u8;
+        let token_ptr = (&raw mut token).cast();
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![DaeParam {
+                    bound_index: 0,
+                    value_ptr: token_ptr,
+                    expected_len: None,
+                }],
+                None,
+            ));
+        }
+
+        let mut returned = std::ptr::null_mut();
+        let ret = unsafe { sql_param_data(h.stmt, &mut returned) };
+        assert_eq!(ret, SQL_NEED_DATA);
+        assert_eq!(returned, token_ptr);
     }
 
     #[test]

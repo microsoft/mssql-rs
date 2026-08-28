@@ -161,7 +161,7 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
     };
     free_errors(&mut dbc_state);
 
-    let stmt = Box::new(StmtHandle::new(input_handle));
+    let stmt = Box::new(StmtHandle::new(input_handle, dbc_state.stmt_query_timeout));
     let raw = handle_to_raw(stmt);
     dbc_state.statements.push(raw);
 

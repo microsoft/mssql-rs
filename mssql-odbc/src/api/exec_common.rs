@@ -316,6 +316,9 @@ pub(super) unsafe fn build_named_params(
 
     let mut params = Vec::with_capacity(marker_count);
     let mut dae_params = Vec::new();
+    // Read once per execution: the attribute holds a pointer, and every
+    // binding shifts by the same amount.
+    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
 
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
@@ -323,39 +326,45 @@ pub(super) unsafe fn build_named_params(
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
+        // Applied before anything reads the binding: ODBC shifts the
+        // indicator pointer alongside the value pointer, so the
+        // data-at-execution check below has to see the shifted indicator.
+        let bound_param = bound_param.with_bind_offset(bind_offset);
 
         let name = format!("@P{}", i + 1);
 
         // Check for a data-at-execution indicator before dereferencing the
         // value buffer: DAE params carry no value at bind time.
         let dae_indicator = if !bound_param.strlen_or_ind_ptr.is_null() {
-            let ind = unsafe { *bound_param.strlen_or_ind_ptr };
+            let ind = unsafe { bound_param.strlen_or_ind_ptr.read_unaligned() };
             is_data_at_exec_indicator(ind).then_some(ind)
         } else {
             None
         };
 
         if let Some(indicator) = dae_indicator {
-            let placeholder_type = match dae_placeholder_type(bound_param.c_type) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(
-                        "{op}: parameter {} DAE type not streamable: {}",
-                        i + 1,
-                        e.diag().text
-                    );
-                    post_diag(stmt_state, e.diag());
-                    return Err(SQL_ERROR);
-                }
-            };
+            let placeholder_type =
+                match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(
+                            "{op}: parameter {} DAE type not streamable: {}",
+                            i + 1,
+                            e.diag().text
+                        );
+                        post_diag(stmt_state, e.diag());
+                        return Err(SQL_ERROR);
+                    }
+                };
             let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
             dae_params.push(DaeParam {
                 bound_index: i,
+                value_ptr: bound_param.parameter_value_ptr,
                 expected_len: dae_expected_length(indicator),
             });
             params.push(rpc);
         } else {
-            match unsafe { bound_param_to_rpc(name, bound_param) } {
+            match unsafe { bound_param_to_rpc(name, &bound_param) } {
                 Ok(param) => params.push(param),
                 Err(ParamBuildError::InvalidLength(len)) => {
                     error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
@@ -410,7 +419,7 @@ pub(super) fn finish_execute(
             return_client_busy(dbc, client);
             return SQL_ERROR;
         };
-        stmt_state.column_metadata = metadata; // empty (0 columns)
+        stmt_state.begin_batch(metadata); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
@@ -446,7 +455,7 @@ pub(super) fn finish_execute(
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
-        stmt_state.column_metadata = metadata; // empty
+        stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
@@ -468,7 +477,7 @@ pub(super) fn finish_execute(
         return_client_busy(dbc, client);
         return SQL_ERROR;
     };
-    stmt_state.column_metadata = metadata;
+    stmt_state.begin_batch(metadata);
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
@@ -487,8 +496,8 @@ pub(super) fn finish_execute(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT,
-        SQL_VARCHAR, SqlLen, sql_len_data_at_exec,
+        SQL_ATTR_PARAM_BIND_OFFSET_PTR, SQL_C_CHAR, SQL_C_LONG, SQL_DEFAULT_PARAM, SQL_INTEGER,
+        SQL_NTS, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, SqlULen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -651,6 +660,7 @@ mod tests {
             dae.dae_params,
             vec![DaeParam {
                 bound_index: 1,
+                value_ptr: std::ptr::null_mut(),
                 expected_len: None
             }]
         );
@@ -682,6 +692,7 @@ mod tests {
             dae.dae_params,
             vec![DaeParam {
                 bound_index: 0,
+                value_ptr: std::ptr::null_mut(),
                 expected_len: Some(7)
             }]
         );
@@ -741,6 +752,132 @@ mod tests {
         assert_eq!(
             state.diag_records[0].sql_state,
             ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
+        );
+    }
+
+    /// The bind offset displaces the indicator pointer as well as the value
+    /// pointer, so a data-at-execution marker can sit in a slot only the
+    /// offset reaches. The offset therefore has to be applied before the
+    /// marker is read, not just before the value is converted.
+    ///
+    /// Applying it later makes the two reads of the indicator disagree: the
+    /// check sees row 0 and routes the parameter down the ordinary path, then
+    /// the conversion sees row 1's marker and rejects it as unstaged with
+    /// `HY000`. Confirmed by reproducing that ordering, which turns the
+    /// `HYC00` below into `HY000`.
+    ///
+    /// Discriminating because row 0 holds an ordinary length: with no offset
+    /// this same binding converts cleanly, as its companion test shows.
+    #[test]
+    fn build_named_params_reads_the_dae_indicator_through_the_bind_offset() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Two rows of a parameter array. Row 0 is an ordinary bound value;
+        // only row 1 carries the data-at-execution marker.
+        let mut values: [i32; 4] = [7; 4];
+        let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
+        let mut offset: SqlLen = size_of::<SqlLen>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .inert_attrs
+            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: inds.as_mut_ptr(),
+        }));
+
+        // `SQL_C_LONG` is not streamable, so reaching the DAE branch is
+        // reported as `HYC00`. That rejection is the observable proof the
+        // offset indicator was the one consulted.
+        let ret = unsafe { build_named_params(&mut state, 1, "test") };
+        assert!(ret.is_err(), "the offset indicator marks this param as DAE");
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state
+        );
+    }
+
+    #[test]
+    fn bind_offset_preserves_a_misaligned_dae_indicator_and_shifted_token() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut value = [0u8; 8];
+        let mut indicator_storage: [SqlLen; 2] = [0; 2];
+        let shifted_indicator = unsafe {
+            indicator_storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(1)
+                .cast::<SqlLen>()
+        };
+        assert_ne!(
+            shifted_indicator as usize % std::mem::align_of::<SqlLen>(),
+            0,
+            "test pointer must be misaligned"
+        );
+        unsafe { shifted_indicator.write_unaligned(SQL_DATA_AT_EXEC) };
+        let mut offset: SqlLen = 1;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state
+            .inert_attrs
+            .set(SQL_ATTR_PARAM_BIND_OFFSET_PTR, &raw mut offset as SqlULen);
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: value.as_mut_ptr().cast(),
+            buffer_length: value.len() as SqlLen,
+            strlen_or_ind_ptr: indicator_storage.as_mut_ptr(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, "test") }
+            .expect("the shifted DAE marker is streamable");
+        assert_eq!(built.dae_params.len(), 1);
+        assert_eq!(built.dae_params.first().unwrap().value_ptr, unsafe {
+            value.as_mut_ptr().add(1).cast()
+        });
+    }
+
+    /// The companion to the test above: with no offset set, the same binding
+    /// reads row 0's ordinary length and converts normally. Without this, a
+    /// driver that treated *every* parameter as data-at-execution would still
+    /// pass the offset test.
+    #[test]
+    fn build_named_params_without_a_bind_offset_reads_the_unshifted_indicator() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut values: [i32; 4] = [7; 4];
+        let mut inds: [SqlLen; 2] = [4, SQL_DATA_AT_EXEC];
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_LONG,
+            sql_type: SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
+            buffer_length: 4,
+            strlen_or_ind_ptr: inds.as_mut_ptr(),
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 1, "test") }
+            .expect("row 0 is an ordinary length, not a DAE marker");
+        assert!(
+            built.dae_params.is_empty(),
+            "nothing should be staged for streaming"
         );
     }
 }

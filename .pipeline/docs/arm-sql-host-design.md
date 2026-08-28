@@ -275,11 +275,13 @@ full multi-distro ARM test matrices still run on merge.
 | `Test_alpine_arm64`               | non-PR (merge) | full musl matrix (Alpine 3.18–3.21)         |
 
 `Sql_Host_build_arm` is a PR-only instance of `sql-host-template.yml` added to
-the Build stage (`jobCondition: eq(Build.Reason, 'PullRequest')`). It runs
-concurrently with `Build_Linux_ARM` (no `dependsOn`) and the two rendezvous
-via the same `sql-ready-build_arm` / `build_arm` sentinel pair used by the
-test stages. On merge the host job is skipped and the ARM build's test pass
-does not run (its steps are PR-gated), so no x64 agent is idled.
+the Build stage (`jobCondition: and(not(canceled()), eq(Build.Reason,
+'PullRequest'))`). The cancellation guard stops the host when the run is
+cancelled without suppressing it after unrelated failures. It runs concurrently
+with `Build_Linux_ARM` (no `dependsOn`) and the two rendezvous via the same
+`sql-ready-build_arm` / `build_arm` sentinel pair used by the test stages. On
+merge the host job is skipped and the ARM build's test pass does not run (its
+steps are PR-gated), so no x64 agent is idled.
 
 Python integration tests stay `--skip-integration` on ARM: the Python test
 harness builds `Server={host}` with no port, so it cannot target the SQL

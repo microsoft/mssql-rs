@@ -977,8 +977,9 @@ fn stream_active_plp_chunk(
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         };
         match plp_encoding {
-            // varchar(max)/char/text — single-byte / codepage text. Codepage
-            // conversion will attach here in a follow-up.
+            // varchar(max)/char/text — single-byte / codepage text. Delivered
+            // verbatim today, so a non-UTF-8 server collation yields raw
+            // codepage bytes labelled UTF-8. Conversion attaches here: AB#47566.
             Some(PlpEncoding::SingleByteText) => copy_verbatim(),
             // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
             // stay distinct from SingleByteText (see above).
@@ -1052,7 +1053,7 @@ fn stream_active_plp_chunk(
         SQL_NO_TOTAL
     };
     unsafe { write_if_some(strlen_or_ind_ptr, remaining_indicator) };
-    post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+    post_diag(&mut stmt_state, WARN_STRING_TRUNCATION);
 
     SQL_SUCCESS_WITH_INFO
 }
@@ -1123,7 +1124,7 @@ fn write_string_result<T: Copy + Default>(
     unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
     let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
     if truncated {
-        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+        post_diag(stmt_state, WARN_STRING_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
