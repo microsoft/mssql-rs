@@ -256,14 +256,10 @@ run_leg() {
     local scenario="$1"
     local driver="$2"
     local output="$3"
-    local packet_size_keyword="PacketSize"
-    if [ "$driver" = "$MICROSOFT_DRIVER_NAME" ]; then
-        packet_size_keyword="Packet Size"
-    fi
     echo ">>> Running $scenario with $driver..."
     ODBC_BENCH_DRIVER="$driver" \
         ODBC_BENCH_SCENARIO="$scenario" \
-        ODBC_BENCH_PACKET_SIZE_KEYWORD="$packet_size_keyword" \
+        ODBC_BENCH_PACKET_SIZE_KEYWORD="PacketSize" \
         "${BENCH_PREFIX[@]}" "$BENCH_EXE" \
         "--benchmark_repetitions=$REPETITIONS" \
         "--benchmark_out=$output" \
