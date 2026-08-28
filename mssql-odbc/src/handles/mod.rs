@@ -90,6 +90,17 @@ static LIVE_HANDLES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::n
 /// place. If the registry lock is itself poisoned, conservatively reports
 /// "not live" — treating an ambiguous handle as already-freed risks a leak,
 /// treating it as live risks a genuine use-after-free.
+///
+/// That leak-over-UAF trade-off is permanent once triggered, not scoped to
+/// one call: a poisoned `std::sync::Mutex` never un-poisons, and
+/// `handle_to_raw` makes the matching choice on the insert side (silently
+/// skips registering new handles rather than panicking), so every handle —
+/// past and future — would report "not live" for the rest of the process,
+/// making `free_stmt`/`free_desc` skip freeing them all. In practice this
+/// needs a panic while holding `LIVE_HANDLES`'s lock, whose critical
+/// sections are a single `HashSet` op each with no user code or I/O that
+/// could panic, so it's realistically very unlikely — documented here so it
+/// isn't rediscovered as a mystery leak later.
 pub(crate) fn is_live(raw: *mut c_void) -> bool {
     LIVE_HANDLES
         .lock()
