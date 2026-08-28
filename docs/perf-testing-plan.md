@@ -382,14 +382,46 @@ change specifically to `mssql-tds`.
 
 Dedicated Linux and Windows PerfTest pipelines run five repetitions of each
 workload against the pinned `mssql-odbc` commit, Microsoft ODBC Driver 18.6.2.1,
-and the candidate. Their uploaded `summary.md` leads with the optional gate
-verdict and three median complete-result wall times, followed by separate
-colored diverging-bar tables for candidate vs Rust baseline and candidate vs
-Microsoft ODBC. The bars use about five percentage points per square (capped at
-20), while each row retains the exact lower/higher wall-time percentage and
-speedup factor. Only candidate vs the pinned Rust baseline can fail the optional
-gate; Microsoft is an informational reference. The scripts also echo the report
-to the step log and retain raw JSON, context, and comparison artifacts.
+and the candidate. Their uploaded `summary.md` leads with the gate verdict and
+three median complete-result wall times, followed by separate colored
+diverging-bar tables for candidate vs Rust baseline and candidate vs Microsoft
+ODBC. The bars use about five percentage points per square (capped at 20), while
+each row retains the exact lower/higher wall-time percentage and speedup factor.
+Only candidate vs the pinned Rust baseline can fail the gate; Microsoft is an
+informational reference. The scripts also echo the report to the step log and
+retain raw JSON, context, and comparison artifacts.
+
+The gate uses the same 5% threshold and the same auto-confirm contract as the
+fixed-baseline `mssql-tds` runner. The initial five-sample median only screens:
+it selects the candidate-vs-baseline regressions and up to three of the largest
+apparent improvements, which are then re-measured with the candidate and the
+pinned baseline back-to-back for four confirmation rounds, alternating which
+driver runs first. A result counts only when it reproduces in at least three of
+those four rounds, and the headline change is the median of the four confirmation
+ratios — the initial pass that triggered the re-measurement is excluded so the
+outlier under test does not vote on its own verdict. Regression-direction hits
+are counted independently, so an apparent improvement that reverses into a
+3-of-4 regression still fails the run by default.
+
+The pairwise math is Google Benchmark's own `tools/compare.py` and
+`gbench.report` from the pinned v1.9.1 checkout in the CMake build tree, run once
+per comparison pair with its text and JSON output retained.
+`compare-odbc-benchmarks.py` stays a thin wrapper for the repo-specific policy:
+exact benchmark-set validation, the combined three-way report, custom counters
+and pins, the gate, the confirmation overrides, and the Azure DevOps Markdown.
+The Mann-Whitney U test is disabled explicitly because five repetitions are well
+below the nine that Google Benchmark documents as meaningful for it; the
+confirmation rounds establish reproduction instead.
+
+Both runners apply the same noise controls as the `mssql-tds` lab: a SQL Server
+configuration snapshot from the shared `sql-config-dump.sql`, CPU
+frequency/utilization telemetry bracketing the initial pass and every
+confirmation round, optional client CPU pinning, and platform-specific
+large-buffer tuning (glibc mmap/trim thresholds on Linux; debug-heap opt-out,
+priority class, and power scheme on Windows, all restored afterwards).
+Connection-churn network tuning is deliberately not applied: this harness opens
+one connection and reuses it for every measured retrieval, so there is no
+ephemeral-port or TIME_WAIT pressure to relieve.
 
 The resulting layered strategy is:
 
@@ -397,6 +429,6 @@ The resulting layered strategy is:
   protocol/codec/parsing regressions to source. *(This plan.)*
 - **Layer 2 — mssql-odbc (cdylib via ODBC DM):** end-to-end result-fetch
   benchmarks via the fixed C++ harness → candidate/baseline driver comparison
-  and optional Rust-vs-native ODBC comparison.
+  and informational Rust-vs-native ODBC comparison.
 - **Cross-cutting — longitudinal trend of main:** catches dependency/toolchain drift that
   Layer 1's isolation hides.
