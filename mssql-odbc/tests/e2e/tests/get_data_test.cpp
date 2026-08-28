@@ -96,11 +96,17 @@ std::string Utf16ToUtf8(const std::u16string& units) {
 // Chunks are appended up to the terminator rather than by the indicator: on a
 // transcoding path the indicator is SQL_NO_TOTAL (wire bytes are not delivered
 // code units), so the terminator is the only length signal an application has.
-std::string ReadWCharDataInChunksAsUtf8(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_bytes) {
+//
+// When `per_call_units` is given, it receives the code units delivered by each
+// SQLGetData call, so a caller can assert on the chunk boundaries the assembled
+// value hides.
+std::string ReadWCharDataInChunksAsUtf8(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_bytes,
+                                        std::vector<size_t>* per_call_units = nullptr) {
     std::u16string units;
     std::vector<SQLCHAR> buf(buf_bytes, 0);
     int guard = 0;
     while (true) {
+        const size_t units_before = units.size();
         std::fill(buf.begin(), buf.end(), 0);
         SQLLEN ind = 0;
         SQLRETURN rc = SQLGetData(stmt, col, SQL_C_WCHAR, buf.data(),
@@ -120,6 +126,9 @@ std::string ReadWCharDataInChunksAsUtf8(SQLHSTMT stmt, SQLUSMALLINT col, size_t 
                 break;
             }
             units.push_back(static_cast<char16_t>(unit));
+        }
+        if (per_call_units != nullptr) {
+            per_call_units->push_back(units.size() - units_before);
         }
         if (rc == SQL_SUCCESS) {
             break;
@@ -1248,11 +1257,17 @@ TEST_F(GetDataLiveTest, JsonLengthProbeReportsTruncationAndKeepsValue) {
     SQLCloseCursor(stmt_);
 }
 
-// An astral character needs two code units, so a two-character buffer is the
-// tightest one that can carry it. The read must still complete a whole character
-// per call: a call that consumes wire bytes but writes nothing reports truncation
-// with an empty payload, which an application reading to the terminator cannot
-// distinguish from a stream that has stopped advancing.
+// A two-code-unit buffer is the tightest one an astral character fits in, so it
+// is where the widening read is most likely to consume wire bytes without being
+// able to emit anything.
+//
+// What that has to guarantee is forward progress, not surrogate atomicity: every
+// truncated call must carry a non-empty payload, because an application reading
+// to the terminator cannot tell an empty chunk apart from a stream that has
+// stopped advancing. A surrogate pair may still span two calls -- SQL_C_WCHAR
+// chunking is in code units, and the UTF-16 passthrough path splits on the same
+// rule -- so it is the assembled value, not the chunk boundaries, that has to
+// round-trip.
 TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
                               "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
@@ -1264,7 +1279,14 @@ TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 6));
+    std::vector<size_t> per_call;
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 6, &per_call));
+
+    // Only the final call, which reports SQL_SUCCESS, may deliver nothing.
+    ASSERT_FALSE(per_call.empty());
+    for (size_t i = 0; i + 1 < per_call.size(); ++i) {
+        EXPECT_GT(per_call[i], 0u) << "truncated call " << i << " delivered an empty payload";
+    }
 
     SQLCloseCursor(stmt_);
 }

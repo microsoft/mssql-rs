@@ -18,6 +18,7 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
+use mssql_tds::encoding_rs::{self, Decoder};
 
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
@@ -600,12 +601,12 @@ fn stream_active_plp_chunk(
             let narrow_to_wide = if target_type == SQL_C_WCHAR {
                 let encoder = match encoding {
                     // json is UTF-8 on the wire and carries no collation.
-                    PlpEncoding::Utf8Text => Some(mssql_tds::encoding_rs::UTF_8),
+                    PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8),
                     PlpEncoding::SingleByteText => column_meta
                         .and_then(|m| m.get_collation())
                         .and_then(|collation| {
                             if collation.utf8() {
-                                Some(mssql_tds::encoding_rs::UTF_8)
+                                Some(encoding_rs::UTF_8)
                             } else {
                                 EncodingType::LcidBased(collation).encoding()
                             }
@@ -679,17 +680,15 @@ fn stream_active_plp_chunk(
         }
     }
 
-    let plp_encoding = {
+    let (plp_encoding, widen_carry_len) = {
         let Ok(ss) = stmt.inner.lock() else {
             return SQL_ERROR;
         };
-        ss.active_plp.as_ref().map(|s| s.encoding)
-    };
-    let widen_carry_len = {
-        let Ok(ss) = stmt.inner.lock() else {
-            return SQL_ERROR;
-        };
-        ss.active_plp.as_ref().map_or(0, |s| s.pending_units.len())
+        let stream = ss.active_plp.as_ref();
+        (
+            stream.map(|s| s.encoding),
+            stream.map_or(0, |s| s.pending_units.len()),
+        )
     };
     let is_unicode_plp = matches!(plp_encoding, Some(PlpEncoding::Utf16Text));
     // SQL_C_CHAR delivery of a UTF-16 PLP column must transcode on the fly.
@@ -703,11 +702,14 @@ fn stream_active_plp_chunk(
             Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
         );
 
-    let payload_capacity = if target_type == SQL_C_WCHAR {
-        (buffer_length as usize).saturating_sub(std::mem::size_of::<SqlWChar>())
+    // Room the caller left for payload, once the terminator every character
+    // target needs is set aside.
+    let terminator_bytes = if target_type == SQL_C_WCHAR {
+        std::mem::size_of::<SqlWChar>()
     } else {
-        (buffer_length as usize).saturating_sub(1)
+        1
     };
+    let payload_capacity = (buffer_length as usize).saturating_sub(terminator_bytes);
     let widen_out_units = if widen_narrow_to_utf16 {
         payload_capacity / std::mem::size_of::<SqlWChar>()
     } else {
@@ -776,11 +778,6 @@ fn stream_active_plp_chunk(
     // its read from output units rather than byte capacity, so its own
     // zero-progress shapes have to be spelled out rather than inferred from
     // `max_read`.
-    let terminator_bytes = if target_type == SQL_C_WCHAR {
-        std::mem::size_of::<SqlWChar>()
-    } else {
-        1
-    };
     let is_length_probe = buffer_length == 0 || buffer_length as usize == terminator_bytes;
     let makes_no_progress = if widen_narrow_to_utf16 {
         widen_out_units == 0
@@ -869,43 +866,34 @@ fn stream_active_plp_chunk(
                 error!("SQLGetData: narrow PLP stream vanished mid-call");
                 return SQL_ERROR;
             };
-            // Decode into scratch rather than straight into the caller's buffer.
-            // `n` input bytes yield at most `n + 1` code units, so this never
-            // fills, which matters for more than tidiness: a decoder that hits
-            // `OutputFull` can return having consumed nothing (`encoding_rs::GBK`
-            // does exactly that with one unit of room), and the caller's buffer
-            // may legitimately be that small.
-            let mut scratch = vec![0u16; read + 2];
-            let Some(decoder) = stream.narrow_to_wide.as_mut() else {
+            let ActivePlpStream {
+                narrow_to_wide,
+                pending_units,
+                ..
+            } = stream;
+            let Some(decoder) = narrow_to_wide.as_mut() else {
                 error!("SQLGetData: narrow PLP stream lost its decoder");
                 return SQL_ERROR;
             };
-            // `reached_end` flushes any half-formed sequence to U+FFFD, and the
-            // decoder must not be used afterwards. Once the wire is exhausted
-            // there is nothing left to feed it, so later calls only drain what is
-            // already decoded.
-            let written = if read == 0 && reached_end {
-                0
-            } else {
-                let (_, _, written, _) =
-                    decoder.decode_to_utf16(&payload[..read], &mut scratch, reached_end);
-                written
-            };
-            stream.pending_units.extend_from_slice(&scratch[..written]);
-
-            let emit = widen_out_units.min(stream.pending_units.len());
+            let emit = widen_into_pending(
+                decoder,
+                pending_units,
+                &payload[..read],
+                reached_end,
+                widen_out_units,
+            );
             unsafe {
                 copy_with_nul(
                     target_value_ptr as *mut SqlWChar,
                     buf_elements,
-                    &stream.pending_units[..emit],
+                    &pending_units[..emit],
                 );
                 write_if_some(
                     strlen_or_ind_ptr,
                     (emit * std::mem::size_of::<SqlWChar>()) as SqlLen,
                 );
             }
-            stream.pending_units.drain(..emit);
+            pending_units.drain(..emit);
             emit
         };
         // Reading at least one whole character's worth of bytes, plus the carry,
@@ -1056,6 +1044,46 @@ fn stream_active_plp_chunk(
     post_diag(&mut stmt_state, WARN_STRING_TRUNCATION);
 
     SQL_SUCCESS_WITH_INFO
+}
+
+/// Decodes one chunk of narrow PLP wire bytes to UTF-16 for `SQL_C_WCHAR`
+/// delivery, accumulating into `pending`, and returns how many code units the
+/// caller's buffer can take.
+///
+/// The caller emits `pending[..n]` and drains it. Keeping the emit out of here
+/// leaves this a pure decode-and-accumulate step over the two pieces of stream
+/// state, so the chunk-boundary rules can be tested without a live wire.
+///
+/// `decoder` carries a character split across a chunk boundary; `pending`
+/// carries code units the caller's buffer had no room for. Both are needed:
+/// the wire and the caller advance at rates that are unrelated when the
+/// encoding is variable-width.
+fn widen_into_pending(
+    decoder: &mut Decoder,
+    pending: &mut Vec<u16>,
+    payload: &[u8],
+    reached_end: bool,
+    out_units: usize,
+) -> usize {
+    // Decode onto the tail of `pending` rather than into the caller's buffer.
+    // `n` input bytes yield at most `n + 1` code units, so the reserved tail
+    // never fills. That matters for more than tidiness: a decoder that hits
+    // `OutputFull` can return having consumed nothing (`encoding_rs::GBK` does
+    // exactly that with one unit of room), and the caller's buffer may
+    // legitimately be that small. Reusing `pending`'s capacity also keeps a
+    // chunk loop from allocating a scratch buffer per call.
+    //
+    // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
+    // must not be used afterwards. Once the wire is exhausted there is nothing
+    // left to feed it, so later calls only drain what is already decoded.
+    if !(payload.is_empty() && reached_end) {
+        let base = pending.len();
+        pending.resize(base + payload.len() + 2, 0);
+        let (_, _, written, _) =
+            decoder.decode_to_utf16(payload, &mut pending[base..], reached_end);
+        pending.truncate(base + written);
+    }
+    out_units.min(pending.len())
 }
 
 /// Transcodes a chunk of UTF-16LE PLP wire bytes to UTF-8 for SQL_C_CHAR
@@ -1571,6 +1599,115 @@ mod tests {
     fn utf16_chunk_lone_high_surrogate_at_end_is_replacement() {
         let out = transcode_whole(&[0x3D, 0xD8]); // D83D, no low surrogate
         assert_eq!(out, "\u{FFFD}");
+    }
+
+    /// Drives `widen_into_pending` the way `stream_active_plp_chunk` does:
+    /// feed a chunk, take what the caller's buffer holds, drain it, repeat.
+    /// Returns the assembled string and the units delivered per call.
+    fn drain_widening(
+        encoding: &'static encoding_rs::Encoding,
+        wire: &[u8],
+        chunk_bytes: usize,
+        out_units: usize,
+    ) -> (String, Vec<usize>) {
+        let mut decoder = encoding.new_decoder_without_bom_handling();
+        let mut pending: Vec<u16> = Vec::new();
+        let mut delivered: Vec<u16> = Vec::new();
+        let mut per_call = Vec::new();
+        let mut offset = 0;
+
+        loop {
+            let end = (offset + chunk_bytes).min(wire.len());
+            let payload = &wire[offset..end];
+            let reached_end = end == wire.len();
+            offset = end;
+
+            let emit =
+                widen_into_pending(&mut decoder, &mut pending, payload, reached_end, out_units);
+            delivered.extend_from_slice(&pending[..emit]);
+            pending.drain(..emit);
+            per_call.push(emit);
+
+            if reached_end && pending.is_empty() {
+                break;
+            }
+            assert!(per_call.len() < 10_000, "widening made no forward progress");
+        }
+        (String::from_utf16(&delivered).unwrap(), per_call)
+    }
+
+    /// A multi-byte character split across a chunk boundary is rejoined by the
+    /// carried decoder rather than each half becoming U+FFFD. GBK puts two
+    /// bytes on the wire per CJK character, so an odd chunk size splits one on
+    /// almost every call.
+    #[test]
+    fn widening_carries_a_character_across_a_chunk_boundary() {
+        let wire = encoding_rs::GBK.encode("你好世界abc").0.into_owned();
+        let (got, _) = drain_widening(encoding_rs::GBK, &wire, 3, 64);
+        assert_eq!(got, "你好世界abc");
+    }
+
+    /// The caller's buffer does not bound the decode. `encoding_rs::GBK`
+    /// returns `OutputFull` having consumed nothing when given a single unit of
+    /// room, so decoding straight into a one-unit caller buffer would stall;
+    /// accumulating into `pending` keeps every call delivering exactly one unit.
+    #[test]
+    fn widening_serves_a_one_unit_buffer_without_stalling() {
+        let wire = encoding_rs::GBK.encode("你好世界abc").0.into_owned();
+        let (got, per_call) = drain_widening(encoding_rs::GBK, &wire, 8, 1);
+        assert_eq!(got, "你好世界abc");
+        assert!(
+            per_call.iter().take(per_call.len() - 1).all(|&n| n == 1),
+            "every call but the last must deliver one unit: {per_call:?}"
+        );
+    }
+
+    /// Surplus code units the caller had no room for outlive the wire: once
+    /// `reached_end` is reported the decoder is spent, and later calls drain
+    /// what is already decoded rather than feeding it again.
+    #[test]
+    fn widening_drains_pending_units_after_the_wire_is_exhausted() {
+        let wire = b"abcdef";
+        let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+        let mut pending = Vec::new();
+
+        // Whole value arrives at once, but the caller can only take two units.
+        let emit = widen_into_pending(&mut decoder, &mut pending, wire, true, 2);
+        assert_eq!(emit, 2);
+        assert_eq!(pending.len(), 6, "the surplus must be held, not dropped");
+        pending.drain(..emit);
+
+        // No wire left: the decoder must not be flushed twice, and the rest is
+        // still delivered.
+        let emit = widen_into_pending(&mut decoder, &mut pending, &[], true, 2);
+        assert_eq!(emit, 2);
+        pending.drain(..emit);
+        let emit = widen_into_pending(&mut decoder, &mut pending, &[], true, 2);
+        assert_eq!(emit, 2);
+        pending.drain(..emit);
+        assert!(pending.is_empty());
+    }
+
+    /// An astral character is two UTF-16 code units, so a buffer with room for
+    /// one splits the pair across calls. That is legal — SQL_C_WCHAR chunking
+    /// is in code units — and the assembled value must still round-trip.
+    #[test]
+    fn widening_splits_a_surrogate_pair_across_calls_without_corruption() {
+        let wire = "😀ab😀".as_bytes();
+        let (got, per_call) = drain_widening(encoding_rs::UTF_8, wire, 16, 1);
+        assert_eq!(got, "😀ab😀");
+        assert!(per_call.iter().take(per_call.len() - 1).all(|&n| n == 1));
+    }
+
+    /// A caller with no payload room is a length probe: nothing is emitted, and
+    /// nothing decoded is lost.
+    #[test]
+    fn widening_emits_nothing_for_a_zero_capacity_buffer() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder_without_bom_handling();
+        let mut pending = Vec::new();
+        let emit = widen_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
+        assert_eq!(emit, 0);
+        assert_eq!(pending, vec![b'a' as u16, b'b' as u16, b'c' as u16]);
     }
 
     /// Option-returning shim so these tests read the same as before the
