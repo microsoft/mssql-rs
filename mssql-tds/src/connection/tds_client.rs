@@ -73,6 +73,7 @@ const CANCEL_TIMEOUT_SECS: u32 = 120;
 /// Derived rather than converted, so the budget cannot degrade to unbounded.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(CANCEL_TIMEOUT_SECS as u64);
 
+#[derive(Debug)]
 enum Withdrawal {
     /// Ignore packet sent and the server's DONE consumed.
     Done,
@@ -80,6 +81,9 @@ enum Withdrawal {
     ConnectionAlreadyDead,
     /// Neither complete nor retracted; the transport must go.
     Failed(crate::error::Error),
+    /// The ignore write was dropped mid-flight, so the transport must go
+    /// *without* another write on the stream.
+    WriteAbandoned(crate::error::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1384,11 +1388,8 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
-        if let Err(e) = serialize_result {
-            drop(rpc);
-            self.retract_partial_request(message).await;
-            return Err(e);
-        }
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.position_on_first_result().await
     }
@@ -1828,6 +1829,10 @@ impl TdsClient {
                 warn!(%error, "Failed to withdraw a cancelled streamed write");
                 self.abort_streamed_write().await;
             }
+            Withdrawal::WriteAbandoned(error) => {
+                warn!(%error, "Abandoned a cancelled streamed write mid-write");
+                self.retire_without_writing();
+            }
         }
     }
 
@@ -1839,6 +1844,11 @@ impl TdsClient {
     /// [`cancel_streamed_write`](Self::cancel_streamed_write), for the ordinary
     /// (non-data-at-execution) path.
     async fn retract_partial_request(&mut self, message: SuspendedMessage) {
+        // Before anything that drains: a RETURNVALUE read with the capture still
+        // armed would record a handle for a request that never ran.
+        // `cancel_streamed_write` disarms up front for the same reason.
+        self.abort_pending_prepare_capture();
+
         if message.nothing_sent() {
             // Not a plain drop: re-arm the RESETCONNECTION bit this message took.
             message.abandon(self.transport.as_writer());
@@ -1853,6 +1863,10 @@ impl TdsClient {
             Withdrawal::Failed(error) => {
                 warn!(%error, "Failed to withdraw a partially sent request");
                 self.abort_partial_request().await;
+            }
+            Withdrawal::WriteAbandoned(error) => {
+                warn!(%error, "Abandoned a partially sent request mid-write");
+                self.retire_without_writing();
             }
         }
     }
@@ -1881,9 +1895,9 @@ impl TdsClient {
             self.transport.as_writer(),
         );
         // `PacketWriter` only checks its budget once a write returns, so the
-        // ignore packet needs a deadline of its own. Dropping a write future
-        // mid-flight is safe only because every path out of a failed withdrawal
-        // retires the transport, as `send_attention_and_wait` does.
+        // ignore packet needs a deadline of its own. Timing out drops the write
+        // future, which leaves the TLS stream mid-record, so that branch retires
+        // the transport without writing to it again.
         let ignored =
             tokio::time::timeout(CANCEL_TIMEOUT, packet_writer.cancel_current_message()).await;
         drop(packet_writer);
@@ -1891,7 +1905,7 @@ impl TdsClient {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Withdrawal::Failed(error),
             Err(_) => {
-                return Withdrawal::Failed(crate::error::Error::TimeoutError(
+                return Withdrawal::WriteAbandoned(crate::error::Error::TimeoutError(
                     crate::error::TimeoutErrorType::String(
                         "Timed out sending the ignore packet".to_string(),
                     ),
@@ -1920,6 +1934,11 @@ impl TdsClient {
     /// ignored message, reset included. Leaving that record set would make the
     /// withdrawal's own DONE look like a request that ran without resetting, and
     /// `observe_response_token` would condemn a connection that is still fine.
+    ///
+    /// Deliberately diverges from msodbcsql, which clears `m_fResetConnection`
+    /// as the bit goes out (`SendPacket`, `tds/TdsSend.cpp`) and re-arms only on
+    /// pooled reuse (`odbc/sqlcmisc.cpp`). It has the same hole and never
+    /// notices, having no reset-acknowledgement check to break.
     fn rearm_withdrawn_reset(&mut self, carried_reset: ResetConnectionMode) {
         if carried_reset == ResetConnectionMode::None {
             return;
@@ -1928,17 +1947,45 @@ impl TdsClient {
         self.transport.as_writer().set_reset_mode(carried_reset);
     }
 
+    /// Completes a send, retracting the half-sent message when serialization
+    /// failed so the failure costs the request rather than the connection.
+    ///
+    /// The `drop(rpc)` stays at each call site: `SqlRpc` borrows
+    /// `&self.execution_context`, so that borrow has to end before `&mut self`.
+    async fn finish_send(
+        &mut self,
+        serialize_result: TdsResult<()>,
+        message: SuspendedMessage,
+    ) -> TdsResult<()> {
+        if let Err(e) = serialize_result {
+            self.retract_partial_request(message).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Closes the transport after a request could not be retracted.
     /// RESETCONNECTION applies to a later request and cannot terminate an
     /// incomplete one, so the socket is all that is left to discard. Clearing
     /// the open-batch flag lets the next `check_and_reconnect` recover.
     async fn abort_partial_request(&mut self) {
-        self.execution_context.set_has_open_batch(false);
-        self.abort_pending_prepare_capture();
-        self.transport.mark_known_dead();
+        self.retire_without_writing();
         if let Err(error) = self.transport.close_transport().await {
             warn!(%error, "Failed to close transport after a partial request abort");
         }
+    }
+
+    /// Retires the transport without shutting the stream down.
+    ///
+    /// For a write that was dropped mid-flight the stream may still hold a
+    /// half-flushed record, and `close_transport` shuts it down — which on the
+    /// native-tls engine emits a close_notify, one more write on exactly that
+    /// stream. `send_attention_and_wait` avoids it the same way, by marking the
+    /// connection dead and never writing again.
+    fn retire_without_writing(&mut self) {
+        self.execution_context.set_has_open_batch(false);
+        self.abort_pending_prepare_capture();
+        self.transport.mark_known_dead();
     }
 
     /// Marks the streamed parameter currently open for data as SQL NULL.
@@ -2580,11 +2627,8 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
-        if let Err(e) = serialize_result {
-            drop(rpc);
-            self.retract_partial_request(message).await;
-            return Err(e);
-        }
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.position_on_first_result().await
     }
@@ -2732,11 +2776,8 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
-        if let Err(e) = serialize_result {
-            drop(rpc);
-            self.retract_partial_request(message).await;
-            return Err(e);
-        }
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         // Drain to completion to get output parameters and any server errors.
         let server_errors = self.drain_stream_or_retire().await?;
@@ -2866,11 +2907,8 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
-        if let Err(e) = serialize_result {
-            drop(rpc);
-            self.retract_partial_request(message).await;
-            return Err(e);
-        }
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         // Drain the result set. A successful unprepare returns no results,
         // but surface any server errors collected during the drain instead of
@@ -3343,13 +3381,8 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
-        if let Err(e) = serialize_result {
-            drop(rpc);
-            // Before the retraction, not after: it drains, and a RETURNVALUE read
-            // with the capture still armed would record a handle for an execute
-            // that never ran.
-            self.abort_pending_prepare_capture();
-            self.retract_partial_request(message).await;
+        drop(rpc);
+        if let Err(e) = self.finish_send(serialize_result, message).await {
             self.report_issued_id(issued_id, statement_id);
             return Err(e);
         }
@@ -3523,11 +3556,8 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
-        if let Err(e) = serialize_result {
-            drop(rpc);
-            self.retract_partial_request(message).await;
-            return Err(e);
-        }
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         self.position_on_first_result().await
     }
@@ -4491,11 +4521,8 @@ impl TdsClient {
             rpc.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
         let serialize_result = rpc.serialize(&mut packet_writer).await;
         let message = packet_writer.suspend();
-        if let Err(e) = serialize_result {
-            drop(rpc);
-            self.retract_partial_request(message).await;
-            return Err(e);
-        }
+        drop(rpc);
+        self.finish_send(serialize_result, message).await?;
 
         let mut result = DescribeParameterEncryptionResult::new();
 

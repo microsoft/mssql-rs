@@ -487,7 +487,7 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
     const char reuse[] = "after-cancel";
     ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
-    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(reuse), 12),
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(reuse), sizeof(reuse) - 1),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);

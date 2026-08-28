@@ -92,12 +92,24 @@ protected:
     // only the LCID has to be Latin1 for U+65E5 to be unmappable. The parameter
     // carries the *database* collation, which need not match the instance's.
     bool DatabaseIsLatin1() {
+        // Each step returns early: EXPECT_* is non-fatal, and falling through to
+        // GetColumnChar on an unfetched row reports a collation mismatch instead
+        // of the prepare or fetch that actually failed.
         EXPECT_SQL_OK(
             Prepare("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation')"
                     " AS VARCHAR(128))"),
             SQL_HANDLE_STMT, stmt_);
+        if (::testing::Test::HasFailure()) {
+            return false;
+        }
         EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        if (::testing::Test::HasFailure()) {
+            return false;
+        }
         EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        if (::testing::Test::HasFailure()) {
+            return false;
+        }
         const std::string collation = GetColumnChar(1);
         EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
         return collation.find("Latin1_General") != std::string::npos;
