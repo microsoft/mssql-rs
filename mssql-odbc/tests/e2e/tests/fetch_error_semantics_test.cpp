@@ -247,7 +247,8 @@ TEST_F(FetchErrorSemanticsLiveTest, ABufferThatExactlyFitsSucceeds) {
 // ---------------------------------------------------------------------------
 
 TEST_F(FetchErrorSemanticsLiveTest, ARangeErrorIsARowErrorInABlockFetch) {
-    ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS INT) AS c1 UNION ALL SELECT CAST(300 AS INT)"),
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS INT) AS c1 UNION ALL SELECT CAST(300 AS INT) "
+                            "ORDER BY c1"),
                   SQL_HANDLE_STMT, stmt_);
 
     signed char v[2] = {0, 0};
