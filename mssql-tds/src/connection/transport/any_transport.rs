@@ -10,10 +10,12 @@ use futures::future::Either;
 use crate::connection::transport::network_transport::NetworkTransport;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, TdsResult};
+use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::row_writer::RowWriter;
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    TdsTokenStreamReader,
 };
 use crate::token::tokens::Tokens;
 
@@ -141,6 +143,45 @@ impl AnyTransport {
                     .receive_row_header(context, remaining_request_timeout, cancel_handle)
                     .await
             }
+        }
+    }
+
+    pub(crate) fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        match self {
+            Self::Network(transport) => {
+                TdsTokenStreamReader::try_receive_row_header(transport, context)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.try_receive_row_header(context),
+        }
+    }
+
+    pub(crate) fn try_read_buffered_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        match self {
+            Self::Network(transport) => {
+                TdsTokenStreamReader::try_read_buffered_column(transport, pause_state, target)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.try_read_buffered_column(pause_state, target),
+        }
+    }
+
+    pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        match self {
+            Self::Network(transport) => transport.try_read_buffered_row_into(pause_state, writer),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(false),
         }
     }
 

@@ -218,6 +218,10 @@ impl TdsReadBuffer {
     pub(crate) fn get_slice(&self) -> &[u8] {
         &self.working_buffer[self.buffer_position..]
     }
+
+    pub(crate) fn get_buffered_slice(&self) -> &[u8] {
+        &self.working_buffer[self.buffer_position..self.buffer_length]
+    }
 }
 
 impl Debug for TdsReadBuffer {
