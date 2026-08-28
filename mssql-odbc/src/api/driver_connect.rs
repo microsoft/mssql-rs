@@ -394,7 +394,8 @@ fn do_connect(
 
     apply_connection_params(&mut context, &params);
 
-    // Connect via mssql-tds (lock is NOT held - the 'Connecting' state prevents races)
+    // Connect via mssql-tds. The caller's DBC lock is still held across this
+    // I/O, so other entry points block here rather than observing 'Connecting'.
     let provider = TdsConnectionProvider::new();
     let client = dbc
         .runtime

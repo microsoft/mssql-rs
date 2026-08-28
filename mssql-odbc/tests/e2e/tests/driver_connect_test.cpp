@@ -46,7 +46,9 @@ TEST_F(ODBCTest, DriverConnect_MissingServer) {
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
 
-// SQLDisconnect on a handle that was never connected returns error.
+// SQLDisconnect on a handle that was never connected returns 08003 — from the DM,
+// which answers this case itself and never calls the driver. The driver's own
+// answer for a DM-less caller is SQL_SUCCESS (see disconnect.rs unit tests).
 TEST_F(ODBCTest, Disconnect_NotConnected) {
     SQLHDBC hdbc = SQL_NULL_HDBC;
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
