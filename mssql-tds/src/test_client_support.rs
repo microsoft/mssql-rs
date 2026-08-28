@@ -181,6 +181,10 @@ impl NetworkReader for TokenReplayTransport {
 
 #[async_trait]
 impl TdsTransport for TokenReplayTransport {
+    fn as_writer_ref(&self) -> &dyn NetworkWriter {
+        self
+    }
+
     fn as_writer(&mut self) -> &mut dyn NetworkWriter {
         self
     }
@@ -511,6 +515,10 @@ pub(crate) mod byte_stream {
 
     #[async_trait]
     impl TdsTransport for ByteStreamTransport {
+        fn as_writer_ref(&self) -> &dyn NetworkWriter {
+            self
+        }
+
         fn as_writer(&mut self) -> &mut dyn NetworkWriter {
             self
         }

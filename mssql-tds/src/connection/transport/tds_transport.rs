@@ -18,6 +18,9 @@ use std::time::Duration;
 /// - `MockTransport` (in fuzzing mode) for testing without network I/O
 #[async_trait]
 pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::Debug {
+    /// Get a shared reference to the network writer.
+    fn as_writer_ref(&self) -> &dyn NetworkWriter;
+
     /// Get a mutable reference to the network writer.
     /// Used to create packet writers for sending messages to the server.
     fn as_writer(&mut self) -> &mut dyn NetworkWriter;

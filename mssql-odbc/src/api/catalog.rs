@@ -29,7 +29,8 @@
 //!   `Server` *parameter*, but msodbcsql overloads `CatalogName` to carry one:
 //!   `ValidateTableQualifier` (`sqlcdd.cpp` lines 264-278) splits the
 //!   argument on its first `.` into server/database whenever
-//!   `SQL_ATTR_METADATA_ID == SQL_FALSE` (always true here — see below), and
+//!   `SQL_ATTR_METADATA_ID == SQL_FALSE`. This driver currently remains in that
+//!   mode because its statement-attribute setter rejects `SQL_TRUE`, and
 //!   that split is what selects the `_ex` procs for five of the seven
 //!   functions (`SQLTables`, `SQLColumns`, `SQLStatistics`, `SQLPrimaryKeys`,
 //!   `SQLForeignKeys`; `sqlcdd.cpp` line 1512). Not implementing `_ex`
@@ -48,12 +49,11 @@
 //!   named `My.Db` (SQL Server permits dots in quoted identifiers) resolves
 //!   correctly through this implementation and is mis-parsed as a
 //!   server-qualified name by msodbcsql.
-//! - `SQL_SOPT_SS_NAME_SCOPE` (table-type-scoped catalog queries) — an
-//!   unimplemented statement option, so its non-default branch is unreachable.
+//! - `SQL_SOPT_SS_NAME_SCOPE` (table-type-scoped catalog queries) — stored and
+//!   readable, but not consulted by this catalog path.
 //! - `SQL_ATTR_METADATA_ID = SQL_TRUE` (identifier mode: literal `%`/`_` in a
-//!   pattern argument). This statement attribute isn't tracked anywhere in
-//!   this driver yet, so it is always effectively `SQL_FALSE` (pattern mode) —
-//!   the only reachable behavior, and the default/near-universal one
+//!   pattern argument). The statement-attribute setter returns `HYC00` until
+//!   this catalog path can honor it; dispatch therefore remains in pattern mode
 //!   (`@fUsePattern = 1` unconditionally below).
 
 use tracing::{debug, error};
@@ -764,8 +764,9 @@ fn sql_tables_w_safe(
         ];
         // `@fUsePattern` is Yukon+ only, sent for every 2.x/3.x app since this
         // driver targets Katmai+ (`g_fYukonPatternAsParamArr[fSQLTABLES] == TRUE`,
-        // `sqlcdd.cpp` line 113); `SQL_ATTR_METADATA_ID` is never TRUE (see
-        // module docs), so the value is always pattern mode.
+        // `sqlcdd.cpp` line 113). The statement setter rejects
+        // `SQL_ATTR_METADATA_ID = SQL_TRUE` until identifier matching is wired,
+        // so the value is always pattern mode.
         let named = vec![named_bit("fUsePattern", true)];
         (positional, Some(named))
     };
@@ -1714,8 +1715,7 @@ fn sql_procedures_w_safe(
         ];
         // `SQLProcedures` supports pattern arguments Yukon+
         // (`g_fYukonPatternAsParamArr[fSQLPROCEDURES] == TRUE`, `sqlcdd.cpp`
-        // line 122); see `SQLTablesW` for why `SQL_ATTR_METADATA_ID` never
-        // changes this to `false`.
+        // line 122); see `SQLTablesW` for why this remains pattern mode.
         let named = vec![named_bit("fUsePattern", true)];
         (positional, Some(named))
     };

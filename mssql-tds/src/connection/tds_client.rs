@@ -44,7 +44,7 @@ use std::num::NonZeroU32;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    core::{CancelHandle, TdsResult},
+    core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult},
     query::metadata::ColumnMetadata,
 };
 use std::sync::Arc;
@@ -902,6 +902,14 @@ impl TdsClient {
     /// value negotiated at login.
     pub fn packet_size(&self) -> u32 {
         self.negotiated_settings.session_settings.packet_size
+    }
+
+    /// Returns whether application traffic remains encrypted after login.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(
+            self.transport.as_writer_ref().get_encryption_setting(),
+            NegotiatedEncryptionSetting::Mandatory | NegotiatedEncryptionSetting::Strict
+        )
     }
 
     /// Returns the SQL Server version reported in the `LOGINACK` token, if the
@@ -6182,6 +6190,7 @@ mod tests {
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
+        encryption_setting: NegotiatedEncryptionSetting,
     }
 
     impl TestTransport {
@@ -6197,6 +6206,7 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
+                encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
 
@@ -6212,6 +6222,7 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
+                encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
 
@@ -6227,6 +6238,7 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
+                encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
 
@@ -6348,7 +6360,7 @@ mod tests {
             4096
         }
         fn get_encryption_setting(&self) -> crate::core::NegotiatedEncryptionSetting {
-            crate::core::NegotiatedEncryptionSetting::NoEncryption
+            self.encryption_setting
         }
         fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
             self.reset_mode = mode;
@@ -6374,6 +6386,10 @@ mod tests {
 
     #[async_trait]
     impl TdsTransport for TestTransport {
+        fn as_writer_ref(&self) -> &dyn NetworkWriter {
+            self
+        }
+
         fn as_writer(&mut self) -> &mut dyn NetworkWriter {
             self
         }
@@ -6490,6 +6506,24 @@ mod tests {
             client_context,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn encrypted_state_excludes_login_only_tls() {
+        for (setting, expected) in [
+            (NegotiatedEncryptionSetting::NoEncryption, false),
+            (NegotiatedEncryptionSetting::LoginOnly, false),
+            (NegotiatedEncryptionSetting::Mandatory, true),
+            (NegotiatedEncryptionSetting::Strict, true),
+        ] {
+            let mut transport = TestTransport::new();
+            transport.encryption_setting = setting;
+            assert_eq!(
+                create_test_client_with_transport(transport).is_encrypted(),
+                expected,
+                "{setting:?}"
+            );
+        }
     }
 
     #[test]

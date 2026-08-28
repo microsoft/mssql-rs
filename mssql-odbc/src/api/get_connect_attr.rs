@@ -6,22 +6,26 @@
 //! Reports the attributes `SQLSetConnectAttrW` accepts, so a set/get round-trip
 //! returns the configured value (matching msodbcsql, which answers
 //! `SQL_ATTR_ACCESS_MODE`, `SQL_ATTR_PACKET_SIZE` and the two timeouts at
-//! `sqlcmisc.cpp:3038-3391`). Any other attribute is unsupported and returns
-//! `HYC00` rather than claiming success without writing.
+//! `sqlcmisc.cpp:3038-3391`). `SQL_ATTR_CURRENT_CATALOG` is the one character
+//! attribute. Any other identifier returns `HY092` rather than claiming success
+//! without writing.
 
 use mssql_tds::connection::client_context::DEFAULT_CONNECT_TIMEOUT_SECS;
 use tracing::{debug, error};
 
+use super::current_catalog::get_current_catalog;
 use super::sqlstate::*;
+use crate::api::attributes::{AttrOp, AttrScope, unimplemented_attr_diag};
 use crate::api::odbc_types::{
     SQL_ATTR_ACCESS_MODE, SQL_ATTR_AUTOCOMMIT, SQL_ATTR_CONNECTION_DEAD,
-    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_LOGIN_TIMEOUT, SQL_ATTR_PACKET_SIZE,
-    SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_CD_FALSE, SQL_CD_TRUE,
-    SQL_COPT_SS_TXN_ISOLATION, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger,
-    SqlPointer, SqlReturn,
+    SQL_ATTR_CONNECTION_TIMEOUT, SQL_ATTR_CURRENT_CATALOG, SQL_ATTR_LOGIN_TIMEOUT,
+    SQL_ATTR_PACKET_SIZE, SQL_ATTR_TXN_ISOLATION, SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON,
+    SQL_CD_FALSE, SQL_CD_TRUE, SQL_COPT_SS_ENCRYPT, SQL_COPT_SS_INTEGRATED_SECURITY,
+    SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, SQL_COPT_SS_TXN_ISOLATION, SQL_EN_ON, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlInteger, SqlPointer, SqlReturn,
 };
 use crate::api::util::write_if_some;
-use crate::error::{free_errors, post_sql_error};
+use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 
@@ -88,9 +92,19 @@ fn sql_get_connect_attr_w_safe(
     dbc: &DbcHandle,
     attribute: SqlInteger,
     value_ptr: SqlPointer,
-    _buffer_length: SqlInteger,
-    _string_length_ptr: *mut SqlInteger,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
 ) -> SqlReturn {
+    // The only character attribute: it does its own locking and writes a
+    // length-delimited buffer rather than a fixed-width integer.
+    //
+    // SAFETY: the caller guarantees `value_ptr` is null or writable for
+    // `buffer_length` bytes, and `string_length_ptr` is null or writable for one
+    // `SQLINTEGER`.
+    if attribute == SQL_ATTR_CURRENT_CATALOG {
+        return unsafe { get_current_catalog(dbc, value_ptr, buffer_length, string_length_ptr) };
+    }
+
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLGetConnectAttrW: dbc mutex poisoned");
         return SQL_ERROR;
@@ -146,6 +160,43 @@ fn sql_get_connect_attr_w_safe(
             debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
             SQL_SUCCESS
         }
+        // The `SQL_COPT_SS_*` forms of Encrypt / TrustServerCertificate /
+        // Trusted_Connection. While connected this reports the resolved setting,
+        // whether it came from the attribute or the keyword -- measured: with no
+        // attribute set, `Encrypt=no` reads back 0.
+        //
+        // Before connect there is nothing to resolve, so an unset attribute falls
+        // back to the driver defaults (encryption on, no trust, no integrated
+        // auth). That pre-connect case is inferred from the defaults, not
+        // measured, unlike the post-connect behaviour above.
+        SQL_COPT_SS_ENCRYPT
+        | SQL_COPT_SS_TRUST_SERVER_CERTIFICATE
+        | SQL_COPT_SS_INTEGRATED_SECURITY => {
+            if value_ptr.is_null() {
+                error!(attribute, "SQLGetConnectAttrW: value pointer is null");
+                post_diag(&mut state, ERR_INVALID_NULL_POINTER);
+                return SQL_ERROR;
+            }
+            let settings = if state.connection_state == ConnectionState::Connected {
+                state.effective_vendor_settings.as_ref()
+            } else {
+                None
+            }
+            .unwrap_or(&state.vendor_overrides);
+            let value = match attribute {
+                SQL_COPT_SS_ENCRYPT => settings.encrypt.unwrap_or(SQL_EN_ON as u32),
+                SQL_COPT_SS_TRUST_SERVER_CERTIFICATE => {
+                    settings.trust_server_certificate.unwrap_or(0)
+                }
+                _ => settings.integrated_security.unwrap_or(0),
+            };
+            unsafe { write_if_some(value_ptr as *mut u32, value) };
+            debug!(
+                attribute,
+                value, "SQLGetConnectAttrW: vendor attribute returned"
+            );
+            SQL_SUCCESS
+        }
         SQL_ATTR_CONNECTION_DEAD => {
             if value_ptr.is_null() {
                 error!("SQLGetConnectAttrW: SQL_ATTR_CONNECTION_DEAD value pointer is null");
@@ -182,20 +233,18 @@ fn sql_get_connect_attr_w_safe(
             debug!(value, "SQLGetConnectAttrW: connection-dead returned");
             SQL_SUCCESS
         }
-        // Any other attribute is genuinely unsupported: surface HYC00 instead of
-        // claiming success while leaving the caller's buffer untouched.
-        // `SQL_ATTR_ANSI_APP` lands here deliberately — the Driver Manager sets
-        // it and ODBC defines no way to read it back.
+        // Any other identifier is not one this driver reports: surface a
+        // diagnostic rather than claiming success while leaving the caller's
+        // buffer untouched. Which diagnostic depends on whether msodbcsql
+        // recognizes the identifier *on the get path* — recognition is not
+        // symmetric. `SQL_ATTR_ANSI_APP` lands here deliberately (the Driver
+        // Manager sets it and ODBC defines no way to read it back), and so does
+        // `SQL_ATTR_QUERY_TIMEOUT`, which msodbcsql accepts on a connection but
+        // refuses to report back; both stay `HY092`. See `attributes.rs`.
         _ => {
-            error!(
-                attribute,
-                "SQLGetConnectAttrW: unsupported connection attribute"
-            );
-            post_sql_error(
+            post_diag(
                 &mut state,
-                SQLSTATE_HYC00,
-                0,
-                "Connection attribute not supported",
+                unimplemented_attr_diag(AttrScope::Dbc, AttrOp::Get, attribute),
             );
             SQL_ERROR
         }
@@ -206,10 +255,12 @@ fn sql_get_connect_attr_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_DEAD, SQL_CD_FALSE,
-        SQL_CD_TRUE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED, SQL_TXN_SS_SNAPSHOT,
+        DEFAULT_PACKET_SIZE, SQL_ATTR_ANSI_APP, SQL_ATTR_CONNECTION_DEAD, SQL_ATTR_QUERY_TIMEOUT,
+        SQL_CD_FALSE, SQL_CD_TRUE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED,
+        SQL_TXN_SS_SNAPSHOT,
     };
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
+    use crate::handles::dbc::VendorConnOverrides;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -269,19 +320,49 @@ mod tests {
     #[test]
     fn unsupported_attribute_returns_error() {
         let h = TestHandles::with_env_dbc();
-        // 1234 is an arbitrary unhandled attribute id -> HYC00, not silent
-        // success, matching the set-side.
+        // 99999 is not an attribute identifier in any namespace -> HY092, not
+        // silent success, matching the set-side and msodbcsql.
         let mut out: u32 = 0;
         let get = unsafe {
             sql_get_connect_attr_w(
                 h.dbc,
-                1234,
+                99999,
                 &mut out as *mut u32 as SqlPointer,
                 0,
                 std::ptr::null_mut(),
             )
         };
         assert_eq!(get, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` is settable on a connection but deliberately not
+    /// readable from one — msodbcsql answers `HY092`, and mssql-python reads the
+    /// timeout back from the statement handle, never the connection.
+    #[test]
+    fn query_timeout_is_write_only_on_a_connection() {
+        let h = TestHandles::with_env_dbc();
+        let set = unsafe {
+            sql_set_connect_attr_w(h.dbc, SQL_ATTR_QUERY_TIMEOUT, 17usize as SqlPointer, 0)
+        };
+        assert_eq!(set, SQL_SUCCESS);
+
+        let mut out: u32 = 0;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_QUERY_TIMEOUT,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
     }
 
     /// Reads an attribute back, asserting the call succeeded.
@@ -357,6 +438,30 @@ mod tests {
             )
         };
         assert_eq!(get, SQL_ERROR);
+    }
+
+    /// `SQL_COPT_SS_MARS_ENABLED` (1224) is readable from msodbcsql, so a
+    /// caller probing for MARS must get `HYC00` here rather than `HY092`.
+    /// Contrast `query_timeout_is_write_only_on_a_connection`: msodbcsql's
+    /// recognized set is not the same for the set and get paths, so the lookup
+    /// is keyed by operation as well as scope.
+    #[test]
+    fn attribute_known_to_msodbcsql_reports_not_implemented() {
+        let h = TestHandles::with_env_dbc();
+        let mut out: u32 = 0;
+        let get = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                1224,
+                &mut out as *mut u32 as SqlPointer,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get, SQL_ERROR);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
     #[test]
@@ -479,5 +584,82 @@ mod tests {
             )
         };
         assert_eq!(get, SQL_ERROR);
+    }
+
+    #[test]
+    fn vendor_attributes_read_back_the_value_the_set_side_stored() {
+        let h = TestHandles::with_env_dbc();
+        // 7 exercises the folding the set side applies: any non-zero encrypt
+        // value normalizes to on, so the get side must report the stored 1
+        // rather than the 7 the caller passed.
+        for (attribute, set_value, expected) in [
+            (SQL_COPT_SS_ENCRYPT, 0usize, 0u32),
+            (SQL_COPT_SS_ENCRYPT, 7, 1),
+            (SQL_COPT_SS_TRUST_SERVER_CERTIFICATE, 1, 1),
+            (SQL_COPT_SS_INTEGRATED_SECURITY, 1, 1),
+        ] {
+            let set =
+                unsafe { sql_set_connect_attr_w(h.dbc, attribute, set_value as SqlPointer, 0) };
+            assert_eq!(set, SQL_SUCCESS, "setting {attribute}");
+            assert_eq!(
+                get_u32(h.dbc, attribute),
+                expected,
+                "reading {attribute} back"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_attributes_report_driver_defaults_before_connect() {
+        // Nothing has resolved yet, so these come from the driver defaults:
+        // encryption on, no trust, no integrated auth.
+        let h = TestHandles::with_env_dbc();
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), SQL_EN_ON as u32);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_TRUST_SERVER_CERTIFICATE), 0);
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_INTEGRATED_SECURITY), 0);
+    }
+
+    #[test]
+    fn vendor_get_uses_effective_values_only_while_connected() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.effective_vendor_settings = Some(VendorConnOverrides {
+                encrypt: Some(0),
+                trust_server_certificate: Some(1),
+                integrated_security: Some(1),
+            });
+            state.connection_state = ConnectionState::Connected;
+        }
+        assert_eq!(get_u32(h.dbc, SQL_COPT_SS_ENCRYPT), 0);
+
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Disconnected;
+        assert_eq!(
+            get_u32(h.dbc, SQL_COPT_SS_ENCRYPT),
+            SQL_EN_ON as u32,
+            "a disconnected reusable handle reports its explicit override or default"
+        );
+    }
+
+    #[test]
+    fn vendor_attribute_null_pointer_is_rejected() {
+        let h = TestHandles::with_env_dbc();
+        for attribute in [
+            SQL_COPT_SS_ENCRYPT,
+            SQL_COPT_SS_TRUST_SERVER_CERTIFICATE,
+            SQL_COPT_SS_INTEGRATED_SECURITY,
+        ] {
+            let get = unsafe {
+                sql_get_connect_attr_w(
+                    h.dbc,
+                    attribute,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(get, SQL_ERROR, "null value pointer for {attribute}");
+        }
     }
 }

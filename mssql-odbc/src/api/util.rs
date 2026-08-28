@@ -3,7 +3,11 @@
 
 use std::slice;
 
-use crate::api::odbc_types::{SQL_NTS, SqlSmallInt, SqlWChar};
+use crate::api::odbc_types::{
+    SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlInteger, SqlReturn, SqlSmallInt, SqlWChar,
+};
+use crate::api::sqlstate::{ERR_STRING_RIGHT_TRUNCATION, post_diag};
+use crate::error::HasDiagnostics;
 
 /// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
 /// Shared by any RPC-backed result set (`SQLGetTypeInfo`, catalog functions)
@@ -82,7 +86,28 @@ pub(crate) unsafe fn copy_with_nul<T: Copy + Default>(
 /// - `ptr` must be readable for `length` `SQLWCHAR`s, or for all characters up to
 ///   and including the first NUL terminator when `length == SQL_NTS`.
 pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> String {
-    let slice = if length == SQL_NTS {
+    unsafe { read_utf16_long(ptr, SqlInteger::from(length)) }
+}
+
+/// [`read_utf16`] for entry points whose length argument is a `SQLINTEGER`
+/// rather than a `SQLSMALLINT`.
+///
+/// A length of zero reads nothing, so the pointer is never dereferenced — an
+/// application is entitled to pair a zero length with a placeholder pointer,
+/// and msodbcsql accepts that combination. A null pointer is likewise treated
+/// as an empty value rather than faulting: this is an FFI boundary, and a
+/// driver that aborts takes its host process down with it.
+///
+/// # Safety
+/// - `ptr` must be readable for `length` `SQLWCHAR`s, or up to and including the
+///   first NUL terminator when `length == SQL_NTS`.
+/// - `length` must be non-negative or exactly `SQL_NTS`; callers validate that
+///   first and report `HY090` otherwise.
+pub(crate) unsafe fn read_utf16_long(ptr: *const SqlWChar, length: SqlInteger) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let slice = if length == SqlInteger::from(SQL_NTS) {
         let mut len = 0usize;
         unsafe {
             while *ptr.add(len) != 0 {
@@ -91,9 +116,75 @@ pub(crate) unsafe fn read_utf16(ptr: *const SqlWChar, length: SqlSmallInt) -> St
         }
         unsafe { slice::from_raw_parts(ptr, len) }
     } else {
-        unsafe { slice::from_raw_parts(ptr, length as usize) }
+        match usize::try_from(length) {
+            Ok(0) | Err(_) => return String::new(),
+            Ok(len) => unsafe { slice::from_raw_parts(ptr, len) },
+        }
     };
     String::from_utf16_lossy(slice)
+}
+
+/// Read a character connection attribute, whose `StringLength` ODBC defines in
+/// **bytes** rather than characters (`SQLSetConnectAttr`, "Arguments").
+///
+/// The Driver Manager resolves `SQL_NTS` to a real byte count before the driver
+/// is called, so treating the value as a character count silently reads twice
+/// the intended number of `SQLWCHAR`s and appends garbage to the string. An odd
+/// count cannot describe whole `SQLWCHAR`s, so it rounds down.
+///
+/// # Safety
+/// - `ptr` must be readable for `byte_length` bytes, or up to and including the
+///   first NUL terminator when `byte_length == SQL_NTS`.
+/// - `byte_length` must be non-negative or exactly `SQL_NTS`.
+pub(crate) unsafe fn read_utf16_attr(ptr: *const SqlWChar, byte_length: SqlInteger) -> String {
+    if byte_length == SqlInteger::from(SQL_NTS) {
+        return unsafe { read_utf16_long(ptr, byte_length) };
+    }
+    unsafe {
+        read_utf16_long(
+            ptr,
+            byte_length / SqlInteger::try_from(size_of::<SqlWChar>()).unwrap_or(2),
+        )
+    }
+}
+
+/// Writes a string into a caller's character-attribute buffer following ODBC's
+/// convention for `SQLGetConnectAttr`-family output: `buffer_length` and
+/// `*string_length_ptr` are **byte** counts, the value is NUL-terminated inside
+/// the buffer, and `*string_length_ptr` always reports the full length the value
+/// needs — not the truncated length — so a caller can size a second call.
+///
+/// A null `value_ptr` is the documented length-query form and succeeds without
+/// writing. Truncation posts `01004` and returns `SQL_SUCCESS_WITH_INFO`,
+/// matching msodbcsql's `fCopyStrToBuffer` path (`sqlcmisc.cpp:3176`).
+///
+/// # Safety
+/// - `value_ptr`, if non-null, must be writable for `buffer_length` bytes.
+/// - `string_length_ptr`, if non-null, must be writable for one `SQLINTEGER`.
+pub(crate) unsafe fn write_wide_attr(
+    state: &mut impl HasDiagnostics,
+    value_ptr: *mut SqlWChar,
+    buffer_length: SqlInteger,
+    string_length_ptr: *mut SqlInteger,
+    value: &str,
+) -> SqlReturn {
+    let utf16: Vec<SqlWChar> = value.encode_utf16().collect();
+    let byte_len = utf16.len() * size_of::<SqlWChar>();
+    unsafe {
+        write_if_some(
+            string_length_ptr,
+            SqlInteger::try_from(byte_len).unwrap_or(SqlInteger::MAX),
+        );
+    }
+
+    // A negative buffer length is nonsensical for a write; treat it as no room
+    // rather than wrapping into a huge capacity.
+    let capacity = usize::try_from(buffer_length).unwrap_or(0) / size_of::<SqlWChar>();
+    if unsafe { copy_with_nul(value_ptr, capacity, &utf16) } {
+        post_diag(state, ERR_STRING_RIGHT_TRUNCATION);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+    SQL_SUCCESS
 }
 
 /// Rewrites ODBC `?` parameter markers to SQL Server named markers (`@P1`,
@@ -250,14 +341,104 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_with_nul, read_utf16, rewrite_param_markers, write_if_some};
-    use crate::api::odbc_types::{SQL_NTS, SqlWChar};
+    use super::{
+        copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long, rewrite_param_markers,
+        write_if_some,
+    };
+    use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
 
     #[test]
     fn rewrite_no_markers_is_unchanged() {
         let (out, n) = rewrite_param_markers("SELECT 1");
         assert_eq!(out, "SELECT 1");
         assert_eq!(n, 0);
+    }
+
+    /// The `SQLINTEGER`-width reader must agree with the `SQLSMALLINT` one on
+    /// every form: explicit counts, `SQL_NTS`, and the empty string.
+    #[test]
+    fn read_utf16_long_matches_the_narrow_reader() {
+        let buf: Vec<SqlWChar> = "master\0".encode_utf16().collect();
+        let ptr = buf.as_ptr();
+        for len in 0..=6i16 {
+            assert_eq!(
+                unsafe { read_utf16_long(ptr, SqlInteger::from(len)) },
+                unsafe { read_utf16(ptr, len) },
+                "length {len}"
+            );
+        }
+        assert_eq!(
+            unsafe { read_utf16_long(ptr, SqlInteger::from(SQL_NTS)) },
+            "master"
+        );
+    }
+
+    #[test]
+    fn read_utf16_long_reads_past_an_embedded_nul_when_given_a_count() {
+        // An explicit count is authoritative: an embedded NUL does not end it.
+        let buf: Vec<SqlWChar> = vec![b'a' as u16, 0, b'b' as u16];
+        let read = unsafe { read_utf16_long(buf.as_ptr(), 3) };
+        assert_eq!(read.chars().count(), 3);
+        // Whereas SQL_NTS stops at the first NUL.
+        assert_eq!(
+            unsafe { read_utf16_long(buf.as_ptr(), SqlInteger::from(SQL_NTS)) },
+            "a"
+        );
+    }
+
+    #[test]
+    fn read_utf16_attr_treats_the_length_as_bytes() {
+        let buf: Vec<SqlWChar> = "masterdb".encode_utf16().collect();
+        // 12 bytes is six characters, not twelve.
+        assert_eq!(unsafe { read_utf16_attr(buf.as_ptr(), 12) }, "master");
+        // An odd count rounds down to whole units rather than over-reading.
+        assert_eq!(unsafe { read_utf16_attr(buf.as_ptr(), 13) }, "master");
+        assert_eq!(unsafe { read_utf16_attr(buf.as_ptr(), 0) }, "");
+    }
+
+    #[test]
+    fn read_utf16_attr_still_honors_sql_nts() {
+        let buf: Vec<SqlWChar> = "master".encode_utf16().chain(std::iter::once(0)).collect();
+        assert_eq!(
+            unsafe { read_utf16_attr(buf.as_ptr(), SqlInteger::from(SQL_NTS)) },
+            "master"
+        );
+    }
+
+    /// A zero length reads nothing, so the pointer must never be dereferenced —
+    /// not even to form an empty slice, which still requires alignment and so
+    /// aborts the process under Rust's UB checks. msodbcsql accepts a
+    /// placeholder pointer with a zero length, and an ODBC driver that aborts
+    /// takes its host process down with it.
+    #[test]
+    fn zero_length_never_dereferences_the_pointer() {
+        let hostile = std::ptr::without_provenance::<SqlWChar>(1);
+        assert_eq!(unsafe { read_utf16_long(hostile, 0) }, "");
+        assert_eq!(unsafe { read_utf16_attr(hostile, 0) }, "");
+        // An odd byte count below one whole SQLWCHAR is also nothing to read.
+        assert_eq!(unsafe { read_utf16_attr(hostile, 1) }, "");
+    }
+
+    /// A null pointer is an empty value rather than a fault, for the same
+    /// reason.
+    #[test]
+    fn null_pointer_reads_as_empty() {
+        let null = std::ptr::null::<SqlWChar>();
+        assert_eq!(unsafe { read_utf16_long(null, 4) }, "");
+        assert_eq!(
+            unsafe { read_utf16_long(null, SqlInteger::from(SQL_NTS)) },
+            ""
+        );
+        assert_eq!(unsafe { read_utf16_attr(null, 8) }, "");
+    }
+
+    /// A negative length that is not `SQL_NTS` is a caller error the entry
+    /// points reject with `HY090`; the reader must not turn it into a huge
+    /// slice on the way there.
+    #[test]
+    fn negative_length_reads_as_empty() {
+        let buf: Vec<SqlWChar> = "master".encode_utf16().collect();
+        assert_eq!(unsafe { read_utf16_long(buf.as_ptr(), -7) }, "");
     }
 
     #[test]

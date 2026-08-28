@@ -59,8 +59,9 @@ endif()
 # ---------------------------------------------------------------------------
 # Unicode build mode (must come after googletest so the vendored gtest build
 # is not compiled with UNICODE/_UNICODE).
-# Windows defaults to ON because mssql-odbc phase-1 exports only wide (W)
-# entrypoints. Applies to odbc_test_lib and every test target defined below.
+# Windows defaults to ON because mssql-odbc exports wide (W) entrypoints. Unix
+# stays narrow to exercise Driver Manager ANSI routing, including pre-connect
+# attribute replay. Applies to odbc_test_lib and every test target below.
 # ---------------------------------------------------------------------------
 if(WIN32)
     set(_odbc_e2e_unicode_default ON)
@@ -137,3 +138,4 @@ add_odbc_test(row_count_test     tests/row_count_test.cpp)
 add_odbc_test(transaction_test   tests/transaction_test.cpp)
 add_odbc_test(session_recovery_test tests/session_recovery_test.cpp)
 add_odbc_test(connection_pool_test tests/connection_pool_test.cpp)
+add_odbc_test(attributes_test    tests/attributes_test.cpp)

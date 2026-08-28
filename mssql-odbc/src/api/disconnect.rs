@@ -125,6 +125,7 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     // Drop the TDS client (closes the connection) and clear connection-level cursor claim.
     state.client = None;
     state.active_stmt = None;
+    state.effective_vendor_settings = None;
     state.connection_state = ConnectionState::Disconnected;
 
     debug!("SQLDisconnect: disconnected successfully");
