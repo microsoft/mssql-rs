@@ -191,6 +191,24 @@ mod tests {
         }
     }
 
+    /// `SQLDriverConnectW` holds the DBC mutex until it publishes a final
+    /// state, so `Connecting` is not reachable through the public API. Drive it
+    /// directly to pin the guard's 08003 rather than leave it untested.
+    #[test]
+    fn disconnect_while_connecting_returns_connection_does_not_exist() {
+        let h = crate::test_support::TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Connecting;
+
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_ERROR);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
+        assert_eq!(state.connection_state, ConnectionState::Connecting);
+    }
+
     #[test]
     fn null_handle_returns_invalid_handle() {
         let ret = unsafe { sql_disconnect(SQL_NULL_HANDLE) };
