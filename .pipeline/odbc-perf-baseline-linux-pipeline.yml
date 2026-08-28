@@ -1,0 +1,25 @@
+# Fixed-baseline ODBC performance pipeline (dedicated perf lab)
+#
+# Builds the C++ benchmark harness once, builds candidate and pinned-baseline
+# mssql-odbc libraries, installs pinned Microsoft ODBC 18, and runs the same
+# harness through unixODBC against all three drivers on one dedicated host.
+
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: PerfTemplates
+      type: git
+      name: InternalDriverTools/PerfTest
+      ref: refs/heads/main
+
+extends:
+  template: v1/Perf.Test.Job.yml@PerfTemplates
+  parameters:
+    platform: linux
+    testRootDir: $(Build.SourcesDirectory)/mssql-rs
+    testScript: mssql-odbc-bench/perf-lab/run-benchmarks.sh
+    testScriptArgs: none
+    testResultsSubDir: results
+    testTimeoutMinutes: 180
