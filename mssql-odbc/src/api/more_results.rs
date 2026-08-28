@@ -57,6 +57,10 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         // A pure-DML batch queued one row count per statement; step through them
         // in memory (no cursor or connection) before falling back to the wire.
         if let Some(next) = stmt_state.pending_row_counts.pop_front() {
+            // A queued count is still a result set, so the batch ordinal has to
+            // advance with it: msodbcsql reports 1, 2, 3 across a pure-DML batch
+            // exactly as it does across a batch of SELECTs.
+            stmt_state.begin_result_set(Vec::new());
             stmt_state.row_count = next;
             debug!("SQLMoreResults: advanced to next DML result set");
             return SQL_SUCCESS;
@@ -111,7 +115,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
                 return SQL_ERROR;
             };
-            stmt_state.column_metadata = metadata;
+            stmt_state.begin_result_set(metadata);
             stmt_state.reset_row_stream();
             // Refresh the count for the newly-positioned result set (-1 for a SELECT).
             stmt_state.row_count = client.last_rows_affected();
@@ -143,7 +147,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
                 return SQL_ERROR;
             };
-            stmt_state.column_metadata.clear();
+            stmt_state.begin_result_set(Vec::new());
             // Surface this no-row statement's own affected-row count for
             // SQLRowCount now that we are positioned on it.
             stmt_state.row_count = client.last_rows_affected();
@@ -376,5 +380,32 @@ mod tests {
 
         // Queue drained and no cursor open -> end of batch.
         assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+    }
+
+    /// A queued DML count is a result set as far as the batch ordinal is
+    /// concerned. msodbcsql reports command 1, 2, 3 across a pure-DML batch
+    /// exactly as it does across three SELECTs, so stepping the queue without
+    /// advancing the ordinal would leave `SQL_SOPT_SS_CURRENT_COMMAND` stuck at
+    /// 1 while `SQLMoreResults` walked the batch.
+    #[test]
+    fn stepping_pending_dml_counts_advances_the_command_ordinal() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt.inner.lock().unwrap();
+            s.begin_batch(Vec::new());
+            s.pending_row_counts = VecDeque::from(vec![2, 1]);
+        }
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 1);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 2);
+
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 3);
+
+        // End of batch holds the final ordinal rather than advancing past it.
+        assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        assert_eq!(stmt.inner.lock().unwrap().current_command, 3);
     }
 }

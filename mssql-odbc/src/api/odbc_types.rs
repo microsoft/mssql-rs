@@ -59,12 +59,27 @@ pub const SQL_OV_ODBC3_80: u32 = 380;
 // of the UTF-16-LE-encoded token.
 pub const SQL_COPT_SS_ACCESS_TOKEN: SqlInteger = 1256;
 
+// msodbcsql-specific attribute forms of connection-string keywords. These are
+// applied pre-connect and, unlike SQL_ATTR_CURRENT_CATALOG, override the
+// matching keyword (see `handles::dbc::VendorConnOverrides`).
+pub const SQL_COPT_SS_INTEGRATED_SECURITY: SqlInteger = 1203;
+pub const SQL_COPT_SS_ENCRYPT: SqlInteger = 1223;
+pub const SQL_COPT_SS_TRUST_SERVER_CERTIFICATE: SqlInteger = 1228;
+
+// SQL_COPT_SS_ENCRYPT values. 0/1 are the historical off/on pair; 2 selects the
+// TDS 8.0 "strict" mode Driver 18 added. Measured: any other value is treated
+// as "on" rather than rejected.
+pub const SQL_EN_OFF: u64 = 0;
+pub const SQL_EN_ON: u64 = 1;
+pub const SQL_EN_STRICT: u64 = 2;
+
 // Standard ODBC connection attributes the Driver Manager commonly sets before
 // connecting. Accepted (currently ignored) so the DM handshake is not broken.
 pub const SQL_ATTR_ACCESS_MODE: SqlInteger = 101;
 pub const SQL_ATTR_AUTOCOMMIT: SqlInteger = 102;
 pub const SQL_ATTR_LOGIN_TIMEOUT: SqlInteger = 103;
 pub const SQL_ATTR_TXN_ISOLATION: SqlInteger = 108;
+pub const SQL_ATTR_CURRENT_CATALOG: SqlInteger = 109;
 pub const SQL_ATTR_PACKET_SIZE: SqlInteger = 112;
 pub const SQL_ATTR_CONNECTION_TIMEOUT: SqlInteger = 113;
 pub const SQL_ATTR_ANSI_APP: SqlInteger = 115;
@@ -492,17 +507,41 @@ pub const SQL_ATTR_READONLY: SqlLen = 0;
 pub const SQL_ATTR_READWRITE_UNKNOWN: SqlLen = 2;
 
 // ---- Statement attribute identifiers (SQLSetStmtAttr / SQLGetStmtAttr) ------
+pub const SQL_ATTR_CURSOR_SCROLLABLE: SqlInteger = -1;
+pub const SQL_ATTR_CURSOR_SENSITIVITY: SqlInteger = -2;
+pub const SQL_ATTR_QUERY_TIMEOUT: SqlInteger = 0;
+pub const SQL_ATTR_MAX_ROWS: SqlInteger = 1;
+pub const SQL_ATTR_NOSCAN: SqlInteger = 2;
+pub const SQL_ATTR_MAX_LENGTH: SqlInteger = 3;
+pub const SQL_ATTR_ASYNC_ENABLE: SqlInteger = 4;
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;
 pub const SQL_ATTR_CURSOR_TYPE: SqlInteger = 6;
 pub const SQL_ATTR_CONCURRENCY: SqlInteger = 7;
+pub const SQL_ATTR_KEYSET_SIZE: SqlInteger = 8;
+/// ODBC 2.x `SQL_ROWSET_SIZE`. Despite the name overlap it is *not* an alias of
+/// [`SQL_ATTR_ROW_ARRAY_SIZE`]: msodbcsql keeps the two in separate slots, so
+/// setting one leaves the other untouched.
+pub const SQL_ROWSET_SIZE: SqlInteger = 9;
+pub const SQL_ATTR_SIMULATE_CURSOR: SqlInteger = 10;
+pub const SQL_ATTR_RETRIEVE_DATA: SqlInteger = 11;
+pub const SQL_ATTR_USE_BOOKMARKS: SqlInteger = 12;
+pub const SQL_ATTR_ROW_NUMBER: SqlInteger = 14;
+pub const SQL_ATTR_ENABLE_AUTO_IPD: SqlInteger = 15;
+pub const SQL_ATTR_FETCH_BOOKMARK_PTR: SqlInteger = 16;
+pub const SQL_ATTR_PARAM_BIND_OFFSET_PTR: SqlInteger = 17;
 pub const SQL_ATTR_PARAM_BIND_TYPE: SqlInteger = 18;
+pub const SQL_ATTR_PARAM_OPERATION_PTR: SqlInteger = 19;
 pub const SQL_ATTR_PARAM_STATUS_PTR: SqlInteger = 20;
 pub const SQL_ATTR_PARAMS_PROCESSED_PTR: SqlInteger = 21;
 pub const SQL_ATTR_PARAMSET_SIZE: SqlInteger = 22;
 pub const SQL_ATTR_ROW_BIND_OFFSET_PTR: SqlInteger = 23;
+pub const SQL_ATTR_ROW_OPERATION_PTR: SqlInteger = 24;
 pub const SQL_ATTR_ROW_STATUS_PTR: SqlInteger = 25;
 pub const SQL_ATTR_ROWS_FETCHED_PTR: SqlInteger = 26;
 pub const SQL_ATTR_ROW_ARRAY_SIZE: SqlInteger = 27;
+/// Shared between the connection and statement scopes; only the statement form
+/// is recognized here.
+pub const SQL_ATTR_METADATA_ID: SqlInteger = 10014;
 
 /// `SQL_ATTR_ROW_BIND_TYPE` value selecting column-wise (array-of-columns)
 /// binding — the mode mssql-python uses.
@@ -515,6 +554,93 @@ pub const SQL_ROWSET_SIZE_DEFAULT: SqlULen = 1;
 pub const SQL_CURSOR_FORWARD_ONLY: SqlULen = 0;
 /// `SQL_ATTR_CONCURRENCY` value: read-only.
 pub const SQL_CONCUR_READ_ONLY: SqlULen = 1;
+/// `SQL_ATTR_CURSOR_SCROLLABLE` value: the cursor cannot scroll. Implied by
+/// [`SQL_CURSOR_FORWARD_ONLY`] — msodbcsql keeps the two in step, flipping the
+/// cursor type when scrollability is requested and vice versa.
+pub const SQL_NONSCROLLABLE: SqlULen = 0;
+/// `SQL_ATTR_CURSOR_SENSITIVITY` value reported for this driver's cursor.
+/// A request for `SQL_UNSPECIFIED` (0) resolves to this, matching msodbcsql,
+/// which answers `1` after a caller sets `0`.
+pub const SQL_INSENSITIVE: SqlULen = 1;
+/// `SQL_ATTR_SIMULATE_CURSOR` value msodbcsql reports and accepts; any other
+/// request is substituted for it and reported with `01S02`.
+pub const SQL_SC_UNIQUE: SqlULen = 2;
+/// `SQL_ATTR_RETRIEVE_DATA` default: data is retrieved on fetch.
+pub const SQL_RD_ON: SqlULen = 1;
+/// Value msodbcsql substitutes for any non-zero `SQL_ATTR_MAX_LENGTH` request,
+/// reporting `01S02`. The cap is cosmetic on both drivers: a value longer than
+/// this is still returned whole.
+pub const MSODBCSQL_MAX_LENGTH: SqlULen = 8000;
+/// Largest `SQL_ATTR_QUERY_TIMEOUT` msodbcsql accepts; larger requests are
+/// clamped to it and reported with `01S02` (`MAX_QUERY_TIMEOUT`,
+/// msodbcsql `sqlcmisc.cpp:3988`).
+pub const MAX_QUERY_TIMEOUT: u32 = 0xfffe;
+/// Maximum length in characters of a SQL Server identifier, and so of a
+/// database name accepted by `SQL_ATTR_CURRENT_CATALOG` (msodbcsql
+/// `SYSNAMELEN`, `tds/tds.h:69`).
+pub const SYSNAMELEN: usize = 128;
+/// Catalog name that means "leave the database alone". msodbcsql's
+/// `DEFAULT_STRING` (`sqlsrv.h:2065`), short-circuited in `ChangeDatabase`
+/// (`sqlcconn.cpp:4991`) so a connection string's `Database=(Default)` and the
+/// equivalent attribute are both no-ops rather than a lookup of a database
+/// literally named `(Default)`.
+pub const DEFAULT_CATALOG: &str = "(Default)";
+
+// SQL Server vendor statement attributes (`SQL_SOPT_SS_*`, 1225-1238). These
+// share their numeric range with the `SQL_COPT_SS_*` connection attributes, so
+// the two are only distinguishable by the handle scope they arrive on.
+//
+// Every default and accepted-value set below was measured against msodbcsql 18
+// rather than read out of the headers, because the headers document what the
+// constants mean, not which the driver actually honors. See
+// `docs/attributes_plan.md` §S6.
+
+/// Logging of text pointers. Accepts `SQL_TL_OFF` / `SQL_TL_ON` only.
+pub const SQL_SOPT_SS_TEXTPTR_LOGGING: SqlInteger = 1225;
+/// Ordinal of the command being processed within a batch. Get-only.
+pub const SQL_SOPT_SS_CURRENT_COMMAND: SqlInteger = 1226;
+/// Exposure of the hidden key columns of a browse-mode result set.
+pub const SQL_SOPT_SS_HIDDEN_COLUMNS: SqlInteger = 1227;
+/// Suppression of the `FOR BROWSE` metadata query.
+pub const SQL_SOPT_SS_NOBROWSETABLE: SqlInteger = 1228;
+/// Client-locale conversion of date, time, and money output.
+pub const SQL_SOPT_SS_REGIONALIZE: SqlInteger = 1229;
+/// Cursor behavior bit mask (fast-forward-only, autofetch, firehose).
+pub const SQL_SOPT_SS_CURSOR_OPTIONS: SqlInteger = 1230;
+/// Whether `SET NOCOUNT` is in effect. Get-only.
+pub const SQL_SOPT_SS_NOCOUNT_STATUS: SqlInteger = 1231;
+/// Deferred preparation: skip the server round trip until execute.
+pub const SQL_SOPT_SS_DEFER_PREPARE: SqlInteger = 1232;
+/// Query-notification subscription timeout, in seconds.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT: SqlInteger = 1233;
+/// Query-notification message text. String-valued.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT: SqlInteger = 1234;
+/// Query-notification service/broker options. String-valued.
+pub const SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS: SqlInteger = 1235;
+/// Table-valued-parameter column focus for descriptor binding.
+pub const SQL_SOPT_SS_PARAM_FOCUS: SqlInteger = 1236;
+/// Scope of the name matching used by the catalog functions.
+pub const SQL_SOPT_SS_NAME_SCOPE: SqlInteger = 1237;
+/// Always Encrypted column-encryption mode.
+pub const SQL_SOPT_SS_COLUMN_ENCRYPTION: SqlInteger = 1238;
+
+/// `SQL_SOPT_SS_TEXTPTR_LOGGING` default: msodbcsql reports text-pointer
+/// logging on before any set, unlike most vendor options which default off.
+pub const SQL_TL_ON: SqlULen = 1;
+/// Largest `SQL_SOPT_SS_CURSOR_OPTIONS` value msodbcsql accepts. The option is
+/// a three-bit mask (fast-forward-only, autofetch, firehose autofetch), so
+/// every combination through 7 is valid and 8 is the first rejected value.
+pub const SQL_CO_MAX: SqlULen = 7;
+/// `SQL_SOPT_SS_NOCOUNT_STATUS` value msodbcsql reports. Measured constant:
+/// it answers 1 whether the session has `SET NOCOUNT ON` or `OFF`.
+pub const SQL_NC_ON: SqlULen = 1;
+/// `SQL_SOPT_SS_DEFER_PREPARE` default: deferred preparation is on.
+pub const SQL_DP_ON: SqlULen = 1;
+/// `SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT` default, in seconds (five days).
+pub const SQL_QN_TIMEOUT_DEFAULT: SqlULen = 432_000;
+/// Largest `SQL_SOPT_SS_NAME_SCOPE` value msodbcsql accepts (`TABLE`,
+/// `TABLE_TYPE`, `EXTENDED`, `SPARSE_COLUMN_SET`).
+pub const SQL_SS_NAME_SCOPE_MAX: SqlULen = 3;
 
 // Per-row status codes written into a `SQL_ATTR_ROW_STATUS_PTR` array.
 pub const SQL_ROW_SUCCESS: SqlUSmallInt = 0;

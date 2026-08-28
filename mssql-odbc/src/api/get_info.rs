@@ -17,7 +17,7 @@ use crate::api::odbc_types::{
     SQL_TC_ALL, SQL_TXN_CAPABLE, SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT,
     SQL_TXN_READ_COMMITTED, SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
-use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, ERR_STRING_RIGHT_TRUNCATION, post_diag};
+use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, WARN_STRING_TRUNCATION, post_diag};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -261,7 +261,7 @@ fn write_wide_str(
     let cap_wchars = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
     let truncated = unsafe { copy_with_nul(info_value_ptr as *mut SqlWChar, cap_wchars, &utf16) };
     if truncated {
-        post_diag(state, ERR_STRING_RIGHT_TRUNCATION);
+        post_diag(state, WARN_STRING_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(
             state.diag_records[0].sql_state,
-            ERR_STRING_RIGHT_TRUNCATION.state
+            WARN_STRING_TRUNCATION.state
         );
     }
 

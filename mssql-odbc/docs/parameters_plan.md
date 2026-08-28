@@ -195,7 +195,7 @@ one task per phase.
 | P1 | [47365](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47365) | Code complete, unmerged | Parameter type model, conversion matrix, `SQL_C_DEFAULT` |
 | P2 | [47366](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47366) | Code complete | Safe C-buffer reader |
 | P3 | [47367](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47367) | Code complete | Quadrant A: integer C -> integer SQL |
-| P4 | [47368](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47368) | Not started | Quadrant B: character C -> character SQL |
+| P4 | [47368](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47368) | Code complete | Quadrant B: character C -> character SQL |
 | P5 | [47369](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47369) | Not started | Quadrants C and D: cross conversions, and the warning channel |
 | P6 | [47370](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47370) | Not started | Parity and e2e hardening |
 | P7 | [47371](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47371) | Not started | Cleanup and follow-up hooks |
@@ -228,7 +228,7 @@ SQLSTATE constant or a never-constructed enum variant fails the lint gate:
 
 - `ConvDirection` and the split of `Truncated` into `FractionalTruncation` /
   `StringTruncation` - land with P4/P5, which raise inbound truncation.
-- `SQLSTATE_22001` and its `DiagMsg` - same. `ERR_STRING_RIGHT_TRUNCATION`
+- `SQLSTATE_22001` and its `DiagMsg` - same. `WARN_STRING_TRUNCATION`
   (`01004`) already exists for the outbound path.
 
 #### P1 - Parameter type model and conversion matrix (code complete)
@@ -346,32 +346,152 @@ to a canonical `i128`, so there is no copy to skip.
 Signedness, the `22003` state and its message text, and the unaligned reads are
 all verified against msodbcsql source.
 
-#### P4 - Character C to character SQL (not started)
+#### P4 - Character C to character SQL (code complete)
 
-- Same-family and cross-family (`SQL_C_CHAR` -> `SQL_WVARCHAR` and the reverse),
-  transcoding UTF-8 <-> UTF-16.
-- Use `ColumnSize` to select `Varchar(_, n)` / `NVarchar(_, n)` / `Char` /
-  `NChar` versus the `Max` variants, applying the existing 8000 / 4000
-  thresholds.
-- Inbound truncation beyond the declared length is `22001`, not the benign
-  outbound `01004`.
-- Highest-risk phase: everything is `(n)varchar(max)` today, so declared lengths
-  have never applied. Verify against msodbcsql: `ColumnSize == 0`, and data
-  longer than `ColumnSize`.
-- Keep the documented UTF-8 `SQL_C_CHAR` divergence; do not add ANSI codepage
-  translation.
-- Decide what invalid UTF-8 input means. Today `bound_param_to_value` runs it
-  through `from_utf8_lossy`, so malformed bytes reach the server as U+FFFD.
-  Under a UTF-8 contract that is data loss the application is never told about;
-  `22018` (`ERR_INVALID_CHARACTER_VALUE`, already defined) is the candidate.
-- Collapse the narrow-text copies. `SQL_C_CHAR` -> `varchar` currently costs five
-  copies: the buffer read, `String::from_utf8`, `SqlString::from_utf8_string`
-  transcoding UTF-8 -> UTF-16 at double the size, `ColumnValues::String(v.clone())`
-  in `to_column_value_and_context`, then `serialize_string` decoding UTF-16 back
-  to UTF-8 before encoding to the collation codepage. Tagging the bytes
-  `EncodingType::Utf8` instead removes two of them, but `sql_string.rs` carries an
-  unresolved TODO saying UTF-8 decode "is weirdly encoded" and that UTF-16 decode
-  "works better", so this needs e2e evidence rather than a drive-by change.
+Twelve pairings: `SQL_C_CHAR` / `SQL_C_WCHAR` against each of `SQL_CHAR`,
+`SQL_VARCHAR`, `SQL_LONGVARCHAR`, `SQL_WCHAR`, `SQL_WVARCHAR`,
+`SQL_WLONGVARCHAR`. The six same-family ones were already in the matrix; P4 adds
+the six cross-family ones, which transcode UTF-8 <-> UTF-16. `varchar(max)` and
+`nvarchar(max)` are `SQL_VARCHAR` / `SQL_WVARCHAR` with
+`ColumnSize == SQL_PREC_UNLIMITED`, which `variable_length` folds into the `Max`
+variants. The declared type now comes from `ParameterType` + `ColumnSize` for
+values, not just typed NULLs, reusing the `SQL_PREC_*` constants; the duplicate
+`MAX_NARROW_LENGTH` / `MAX_WIDE_LENGTH` are gone.
+
+**Truncation** (`sqlcfunc.cpp:2854`, the `fCType == SQL_C_WCHAR || SQL_C_CHAR`
+arm of `ParamToSQLType`) raises `22001` only when the overflow holds a non-pad
+character; an overflow of trailing blanks is trimmed silently
+(`CheckTrailingChars` / `CheckTrailingWChars`, `:2957`). The checks at `:2630` /
+`:2653` are the `SQL_C_BINARY` arm, which pads with `'0'`.
+
+**The length is measured in msodbcsql's units, which approximate** (AB#47584).
+The exact count is unknowable at conversion time - `varchar(n)` bounds
+*collation* bytes, applied downstream by `serialize_string`. Every source is
+therefore measured in the UTF-16 units it holds or would produce (`cchDest =
+cbData/sizeof(WCHAR)`, *"Assumption: 1 WCHAR converts to 1 byte"*, `:2946`),
+whichever family it lands in. Counting transcoded UTF-8 would falsely reject
+values that fit: under a single-byte collation "cafe" with an acute accent is
+four collation bytes, not five.
+
+The unit is deliberately the same for both character C types, and this is where
+P4 parts company with msodbcsql. Three of its four arms already count UTF-16
+units - both wide-source arms, and the narrow-to-wide walk, which even counts an
+astral character as two (`:2935`). Only narrow-to-narrow counts source bytes
+(`cchDest = cbData`, `:2952`).
+
+That byte count is the wire length only while no client-side transcode happens,
+which is the ordinary case: TDS carries a collation with char data, so the bytes
+ship under a declared collation and the *server* converts.
+`DoCharToCharConversion` (`sqlcprot.h:4113`) enables the client-side conversion
+only for an encoding TDS cannot name - a UTF-8 client against a non-UTF-8 server,
+or the ISO-8859-x range - and translation is on by default (`SQL_XL_DEFAULT`).
+
+A UTF-8 `SQL_C_CHAR` is this driver's permanent state, so that predicate would
+always hold here. In that configuration msodbcsql transcodes but still measures
+the *pre-transcode* UTF-8 bytes, rejecting "cafe" with an acute accent from a
+`varchar(4)` that the four bytes it actually sends would fit. Copying the byte
+rule reproduced that defect and left the two C types disagreeing on one value -
+the same string was accepted as `SQL_C_WCHAR` and `22001` as `SQL_C_CHAR`. So it
+is not replicated, on the same footing as the narrow-to-wide off-by-one below.
+Holding both C types to UTF-16 units is what makes them agree; `char` counts
+would not, since an astral character is one `char` but two units.
+
+The residual error now runs one way only: the count errs low, never high. On a
+collation whose bytes outnumber the units counted - reachable on any `_UTF8`
+collation, not just a DBCS one - an over-long value passes here and
+`serialize_char_varchar_direct` rejects it as a `UsageError`, surfacing `HY000`
+rather than the `22001` the application should see. The `max` types and
+`text`/`ntext` carry no such check at all and send the over-long value, which is
+the worse outcome of the two. Routing either to `ERR_PARAM_STRING_TRUNCATION`
+needs a typed error out of `mssql-tds` - matching on the message text would be
+guesswork - so it belongs with AB#47584 rather than as a local patch.
+
+**This is a behavioural regression for a subset of inputs, not a pure
+improvement.** `SQL_C_CHAR` `"[three U+2615]"` into `varchar(3)` was a correct
+`22001` under the byte count; it is now accepted as three units and fails
+downstream as an opaque `HY000` - or, under a single-byte collation, each
+character is unmappable and becomes a seven-byte numeric character reference
+(`&#9749;`, AB#47598), so 21 bytes are offered to a `varchar(3)`. CJK and astral
+input bound with an exact character count is the shape that regresses. The trade
+was taken because over-rejection has no application workaround - the byte count
+is encoding-dependent and the application cannot know it - while under-rejection
+still errors, and because byte-counting *both* C types would have broken the
+wide arm, the one msodbcsql gets right. No option preserved both parity and
+self-consistency.
+
+Verified against msodbcsql source:
+
+- `text` / `ntext` carry no declared length but are still bounded by
+  `ColumnSize`: msodbcsql applies the bound whenever `!fIsVarMax` (`:2898`), and
+  `fIsVarMax` needs `cbColDef == 0` *and* a varmax type or `longToMax` (`:2577`),
+  which no `SQL_LONGVARCHAR` binding satisfies.
+- `SQL_LONGVARCHAR` / `SQL_WLONGVARCHAR` are sent as `varchar(max)` /
+  `nvarchar(max)`, still bounded by `ColumnSize`. msodbcsql declares `text` /
+  `ntext` by default - it sends `max` only under `SQL_COPT_SS_LONGASMAX`
+  (`sqlcprot.h:1838`), which defaults off (`sqlcconn.cpp:84`, `:4686`) - so this
+  matches its `LongAsMax` mode rather than its default. `text` / `ntext` cannot
+  be declared until `mssql-tds` stops serializing them in bulk-copy ROW format:
+  an RPC parameter currently carries a textptr/timestamp header and a stray
+  table-name byte, and the server answers 4002 (AB#47591). Restoring the true
+  declaration, with `SQL_COPT_SS_LONGASMAX` as the opt-in fallback, is AB#47592.
+  The attribute itself is unimplemented, so the long types currently get its
+  *result* unconditionally with no way to ask for either behaviour.
+- **Blank padding is left to the server.** msodbcsql pads client-side when
+  `SQL_COPT_SS_ANSI_NPW` is on and the value is shorter than the declared length
+  (`sqlcmisc.cpp:7472`, gated on `SQLBIGCHAR` / `SQLBIGBINARY` / `SQLNCHAR`).
+  This driver sends the actual length and lets the server pad, which
+  `DeclaredLengthReachesTheServer` shows is observationally equivalent -
+  `DATALENGTH` is 8 for a `char(8)` carrying three characters on both drivers.
+  The attribute is unimplemented.
+- **`ColumnSize` is a character count and msodbcsql agrees** - no divergence.
+  `SQLBindParameter` converts it to an internal byte count for the wide types
+  (`sqlcdesc.cpp:3311`, `cbColDef *= sizeof(WCHAR)`); every `/ sizeof(WCHAR)`
+  elsewhere undoes that. An earlier revision of this plan called it a deliberate
+  deviation - a misreading.
+- **`SQL_C_CHAR` is UTF-8 deliberately**, because the only supported consumer,
+  mssql-python, is UTF-8 native. msodbcsql reads the client code page
+  (`sqlcprot.h:2830`, `Localization.hpp:742`, `LocalizationImpl.hpp:386`,
+  consulted at `sqlcfunc.cpp:2913`), so the two agree on a UTF-8 locale and
+  differ on a default Windows one. The spec fixes no encoding for `SQL_C_CHAR`.
+  Code page support is AB#47565 (parameters) / AB#47564 (fetch); the
+  server-collation axis is already handled by `serialize_string`.
+- Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
+  its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
+  which is not in this source tree. `22018` is tracked with AB#47565.
+- Still `HYC00`: `SQL_SS_XML` and the binary types. The latter keeps
+  `DISABLED_DescribesMaxLengthParameters` parked.
+
+Deferred:
+
+- **The 2GB ceiling on `max` types is enforced nowhere, here or in msodbcsql.**
+  Conversion skips length checks for varmax (`:2862`), bind bounds the declared
+  `ColumnSize` rather than the data, and `CRPCPolicy::WriteChunk`
+  (`tds/tdsrpc.cpp:275`) reinterprets the low four bytes of a `SIZE_T` as the
+  chunk length then writes the full count. `serialize_string` has the same wrap
+  as an `as u32`, so a value at or past 4GB emits a header disagreeing with its
+  payload. Reaching it needs one bound parameter that large.
+- Narrow-text copies (AB#47576). `SQL_C_CHAR` -> `varchar` costs five: buffer
+  read, `String::from_utf8`, `SqlString::from_utf8_string` transcoding to UTF-16
+  at double size, `ColumnValues::String(v.clone())`, then `serialize_string`
+  decoding back to UTF-8 to encode to the collation code page. Tagging the bytes
+  `EncodingType::Utf8` removes two, but `sql_string.rs` carries an unresolved
+  TODO claiming UTF-8 decode "is weirdly encoded", so this needs e2e evidence.
+- P6: msodbcsql's narrow -> wide arm checks the running count *before*
+  incrementing (`:2928`), so it neither raises `22001` nor trims an over-long
+  value and then trips its own assert - `sqlcmisc.cpp:7451` for the sized types,
+  `:7288` for `ntext`. `NarrowToWideOverlongParamIs22001` is skipped under
+  `--compare-with-msodbcsql` for that reason.
+- P6: bound the 32-bit wire length fields in `mssql-tds`. Every
+  `write_u32_async(len as u32)` in `tds_value_serializer.rs` narrows silently -
+  the PLP chunk headers and the legacy `TEXT` / `NTEXT` / `IMAGE` totals. The
+  guard belongs at the top of each `serialize_*`, before any header byte reaches
+  the writer: that layer alone knows the encoded byte count, and failing after
+  the header is emitted leaves a half-written RPC that can cost the connection.
+
+Highest-risk phase - everything was `(n)varchar(max)` before, so declared lengths
+had never applied. The e2e suite now passes under `--compare-with-msodbcsql`,
+which confirms the server-side declaration assertions (`DATALENGTH`,
+`SQL_VARIANT_PROPERTY`) hold on both drivers.
 
 #### P5 - Cross conversions (not started)
 
@@ -383,6 +503,10 @@ all verified against msodbcsql source.
 #### P6 - Parity and e2e hardening (not started)
 
 - Parameter-numbered diagnostics.
+- A serialization failure after a packet has already flushed leaves the request
+  half-sent, and the server answers 4002 on the *next* command. Declaring real
+  lengths is what made it reachable, so P4 exposed it rather than caused it.
+  The retraction and its two e2e cases are tracked by AB#47687.
 - Run the e2e suite under `--compare-with-msodbcsql`; mark driver-specific
   assertions with `SKIP_IF_COMPARING_MSODBCSQL()`.
 - Add `Benefits-from-mock-tds:` notes where only the round-tripped value is
@@ -392,6 +516,26 @@ all verified against msodbcsql source.
   If that convention also holds for a bound buffer, `SQL_C_CHAR` with a null
   pointer and `*ind == 0` is NULL there and `HY009` here. Not settleable from
   the source; needs a `--compare-with-msodbcsql` run on that exact binding.
+- **`DecimalDigits` is validated at execute, not at bind.** `CheckSqlPrecScale`
+  lives up to its name: `SQLBindParameter` runs it (`sqlcdesc.cpp:3038`) and it
+  rejects a bad scale there, not later. `SQL_NUMERIC` / `SQL_DECIMAL` reject
+  scale > precision (`sqlcdesc.cpp:11529`), and the temporal types run
+  `CheckSqlScale` against `SCALE_DATETIME2` / `SCALE_TIME` /
+  `SCALE_DATETIMEOFFSET`, all 7 (`tds.h:273-278`). We apply the same rules with
+  the same `HY104` in `decimal_metadata` / `datetime_metadata`, only later -
+  the same divergence already accepted for `ColumnSize` in `fixed_length`.
+  Closing it means `parameter_column_size_is_valid` grows a scale argument, and
+  `MAX_DATETIME_SCALE` moves to `type_rules.rs` with it.
+- **`SQL_TYPE_DATE` accepts any `DecimalDigits`.** msodbcsql requires
+  `SCALE_DATE == 0` (`sqlcdesc.cpp:11641`); `typed_null` maps the type with no
+  metadata and never looks at the scale.
+- **No `SQL_TIMESTAMP` precision/scale correlation check.** msodbcsql requires
+  `ColumnSize == 19` for scale 0 and `20 + scale` otherwise - but it *repairs*
+  rather than rejects, tracing "invalid precision or scale value has been
+  corrected" and calling `FixupColumnSizeDecimalDigits` (`sqlcdesc.cpp:11571`);
+  its own comment says full validation would break back-compat. We neither
+  check nor repair, so a mismatched pair reaches the wire with a different
+  declaration than msodbcsql would send.
 
 #### P7 - Cleanup and hooks (not started)
 

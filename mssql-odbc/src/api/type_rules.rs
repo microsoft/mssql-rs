@@ -107,6 +107,11 @@ pub(crate) fn effective_param_c_type(c_type: SqlSmallInt, sql_type: SqlSmallInt)
     }
 }
 
+/// Whether `sql_type` is one of the UTF-16 character SQL types.
+pub(crate) fn is_wide_character_sql_type(sql_type: SqlSmallInt) -> bool {
+    matches!(sql_type, SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR)
+}
+
 /// Whether `ColumnSize` is legal for `sql_type` on a parameter binding.
 ///
 /// Mirrors msodbcsql's `CheckSqlPrecScale<TRUE>`
