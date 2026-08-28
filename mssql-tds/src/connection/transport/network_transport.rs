@@ -1803,6 +1803,69 @@ impl NetworkTransport {
         Ok(Some(value))
     }
 
+    pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        if pause_state.decryptor.is_some() {
+            return Ok(false);
+        }
+
+        let decoder = GenericDecoder::default();
+        let mut consumed = 0usize;
+        let outcome = {
+            let buffered = self.tds_read_buffer.get_buffered_slice();
+            let mut outcome = Ok(true);
+            while let Some(metadata) = pause_state
+                .metadata
+                .columns
+                .get(pause_state.next_column_index)
+            {
+                let col = pause_state.next_column_index;
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[col / 8] & (1 << (col % 8)) != 0)
+                {
+                    writer.write_null(col);
+                    pause_state.next_column_index += 1;
+                    continue;
+                }
+
+                let Some(remaining) = buffered.get(consumed..) else {
+                    outcome = Err(crate::error::Error::ProtocolError(
+                        "Buffered row decoder consumed past the available data".to_string(),
+                    ));
+                    break;
+                };
+                match decoder.try_decode_buffered_into(remaining, metadata, col, writer) {
+                    Ok(Some(used)) => {
+                        let Some(next) = consumed.checked_add(used) else {
+                            outcome = Err(crate::error::Error::ProtocolError(
+                                "Buffered row decoder byte count overflowed".to_string(),
+                            ));
+                            break;
+                        };
+                        consumed = next;
+                        pause_state.next_column_index += 1;
+                    }
+                    Ok(None) => {
+                        outcome = Ok(false);
+                        break;
+                    }
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            outcome
+        };
+        self.tds_read_buffer.consume_bytes(consumed)?;
+        outcome
+    }
+
     pub(crate) async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -3323,6 +3386,89 @@ pub(crate) mod tests {
             Some(ColumnValues::Int(expected))
         );
         assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_finishes_a_complete_row_without_continuation() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(expected.len()))
+            .unwrap()
+            .expect("complete buffered row header");
+        let mut writer = DefaultRowWriter::new(expected.len());
+
+        assert!(
+            reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_keeps_partial_column_for_async_continuation() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let second = expected[1].to_le_bytes();
+        let mut first_payload = vec![TokenType::Row as u8];
+        first_payload.extend_from_slice(&expected[0].to_le_bytes());
+        first_payload.extend_from_slice(&second[..2]);
+
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second_packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(&second_packet.append_bytes(&second[2..]).build());
+        let mut reader = create_network_transport_with_data(&stream);
+        reader.read_tds_packet().await.unwrap();
+
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(expected.len()))
+            .unwrap()
+            .expect("complete buffered row header");
+        let mut writer = DefaultRowWriter::new(expected.len());
+
+        assert!(
+            !reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(pause_state.next_column_index, 1);
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            2,
+            "the partial second value must remain buffered"
+        );
+
+        let result = reader
+            .resume_row_into(
+                pause_state,
+                None,
+                None,
+                ColumnPolicy::DecodeAll,
+                &mut writer,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

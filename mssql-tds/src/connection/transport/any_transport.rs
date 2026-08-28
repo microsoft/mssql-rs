@@ -173,6 +173,18 @@ impl AnyTransport {
         }
     }
 
+    pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        match self {
+            Self::Network(transport) => transport.try_read_buffered_row_into(pause_state, writer),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(false),
+        }
+    }
+
     pub(crate) async fn resume_row_into<W>(
         &mut self,
         pause_state: RowPauseState,
