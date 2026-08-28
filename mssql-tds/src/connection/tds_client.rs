@@ -1867,25 +1867,63 @@ impl TdsClient {
             return Withdrawal::ConnectionAlreadyDead;
         }
 
+        // Read before `resume` takes it: the server discards an ignored message
+        // whole, so a reset bit already on the wire has to ride a later request.
+        let carried_reset = message.reset_mode();
+
         let mut packet_writer = PacketWriter::resume(
-            message.with_write_timeout(Some(CANCEL_TIMEOUT_SECS)),
+            message
+                .with_write_timeout(Some(CANCEL_TIMEOUT_SECS))
+                .without_cancellation(),
             self.transport.as_writer(),
         );
-        let ignored = packet_writer.cancel_current_message().await;
+        // `PacketWriter` only checks its budget once a write returns, so the
+        // ignore packet needs a deadline of its own. Dropping a write future
+        // mid-flight is safe only because every path out of a failed withdrawal
+        // retires the transport, as `send_attention_and_wait` does.
+        let ignored =
+            tokio::time::timeout(CANCEL_TIMEOUT, packet_writer.cancel_current_message()).await;
         drop(packet_writer);
-        if let Err(error) = ignored {
-            return Withdrawal::Failed(error);
+        match ignored {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Withdrawal::Failed(error),
+            Err(_) => {
+                return Withdrawal::Failed(crate::error::Error::TimeoutError(
+                    crate::error::TimeoutErrorType::String(
+                        "Timed out sending the ignore packet".to_string(),
+                    ),
+                ));
+            }
         }
+
+        self.rearm_withdrawn_reset(carried_reset);
 
         // The server acknowledges an ignored message with a DONE. Leaving it
         // unread would desynchronize the next command.
-        let saved = self.remaining_request_timeout.replace(CANCEL_TIMEOUT);
+        let saved_timeout = self.remaining_request_timeout.replace(CANCEL_TIMEOUT);
+        let saved_cancel = self.cancel_handle.take();
         let drained = self.drain_stream().await;
-        self.remaining_request_timeout = saved;
+        self.cancel_handle = saved_cancel;
+        self.remaining_request_timeout = saved_timeout;
         match drained {
             Ok(_) => Withdrawal::Done,
             Err(error) => Withdrawal::Failed(error),
         }
+    }
+
+    /// Hands back the RESETCONNECTION bit a withdrawn message carried away.
+    ///
+    /// Packet #1 recorded the dispatch, but the server discards the whole
+    /// ignored message, reset included. Leaving that record set would make the
+    /// withdrawal's own DONE look like a request that ran without resetting, and
+    /// `observe_response_token` would condemn a connection that is still fine.
+    fn rearm_withdrawn_reset(&mut self, carried_reset: ResetConnectionMode) {
+        if carried_reset == ResetConnectionMode::None {
+            return;
+        }
+        let writer = self.transport.as_writer();
+        writer.take_reset_dispatched();
+        writer.set_reset_mode(carried_reset);
     }
 
     /// Closes the transport after a request could not be retracted.
@@ -6358,6 +6396,9 @@ mod tests {
         /// When set, the next (and every subsequent) `send` fails, simulating a
         /// mid-message wire failure. Shared so a test can flip it after setup.
         send_should_fail: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, `send` never returns, so a test can drive a write deadline
+        /// without a real stalled peer.
+        send_should_hang: Arc<std::sync::atomic::AtomicBool>,
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
@@ -6380,6 +6421,7 @@ mod tests {
                 packet_pos: 0,
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
                 receive_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -6419,12 +6461,22 @@ mod tests {
             &mut self,
             _context: &ParserContext,
             remaining_request_timeout: Option<Duration>,
-            _cancel_handle: Option<&CancelHandle>,
+            cancel_handle: Option<&CancelHandle>,
         ) -> TdsResult<Tokens> {
             self.receive_timeouts
                 .lock()
                 .unwrap()
                 .push(remaining_request_timeout);
+            // Mirrors the production readers, which run every read under the
+            // handle. Without this a cancelled read looks identical to a healthy
+            // one and tests cannot tell the two apart.
+            if let Some(handle) = cancel_handle
+                && handle.cancel_token.is_cancelled()
+            {
+                return Err(crate::error::Error::OperationCancelledError(
+                    "Request was cancelled".to_string(),
+                ));
+            }
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(tok);
             }
@@ -6514,6 +6566,12 @@ mod tests {
                 return Err(crate::error::Error::ConnectionClosed(
                     "injected send failure".to_string(),
                 ));
+            }
+            if self
+                .send_should_hang
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
             }
             self.sent.lock().unwrap().extend_from_slice(data);
             Ok(())
@@ -11353,11 +11411,21 @@ mod tests {
     /// Opens an RPC message with `payload_len` bytes and suspends it - the state
     /// a send site holds when serialization fails part-way.
     async fn suspend_message_with(client: &mut TdsClient, payload_len: usize) -> SuspendedMessage {
+        suspend_message_under(client, payload_len, None).await
+    }
+
+    /// As [`suspend_message_with`], but the message carries `cancel_handle` the
+    /// way a real request's writer does.
+    async fn suspend_message_under(
+        client: &mut TdsClient,
+        payload_len: usize,
+        cancel_handle: Option<&CancelHandle>,
+    ) -> SuspendedMessage {
         let mut writer = PacketWriter::new(
             PacketType::RpcRequest,
             client.transport.as_writer(),
             None,
-            None,
+            cancel_handle,
         );
         writer
             .write_async(&vec![0xABu8; payload_len])
@@ -11425,6 +11493,78 @@ mod tests {
         assert!(
             !client.is_connection_dead(),
             "a retracted request leaves the connection clean for reuse"
+        );
+    }
+
+    /// Packet #1 recorded the RESETCONNECTION dispatch, but the server discards
+    /// the whole ignored message, reset included. Unless the record is cleared
+    /// and the bit re-armed, the withdrawal's own DONE reads as a request that
+    /// ran without resetting and condemns a healthy connection.
+    #[tokio::test]
+    async fn retracting_hands_back_a_reset_the_server_discarded() {
+        let (mut client, _sent) = create_capturing_client(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
+        let message = suspend_message_with(&mut client, 10_000).await;
+        assert!(!message.nothing_sent(), "the reset must be on the wire");
+
+        client.retract_partial_request(message).await;
+
+        assert!(
+            !client.is_connection_dead(),
+            "withdrawing a reset-carrying request must not condemn the connection"
+        );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the discarded reset must ride the next request instead"
+        );
+    }
+
+    /// The retraction must not inherit the caller's cancellation. The request is
+    /// already over; a cancelled cleanup would strand the very message it exists
+    /// to withdraw.
+    #[tokio::test]
+    async fn retracting_ignores_a_cancel_fired_against_the_request() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let parent = CancelHandle::new();
+        let message = suspend_message_under(&mut client, 10_000, Some(&parent)).await;
+        client.cancel_handle = Some(parent.child_handle());
+        parent.cancel();
+
+        client.retract_partial_request(message).await;
+
+        let wire = sent.lock().unwrap().clone();
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "a fired cancel must not stop the ignore packet"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "the drain must still run, leaving the connection reusable"
+        );
+    }
+
+    /// `PacketWriter` only checks its budget once a write returns, so a stalled
+    /// peer would block the withdrawal forever. The deadline must fire, and the
+    /// transport must be retired rather than reused - dropping a write future
+    /// mid-flight is only safe because nothing writes to that stream again.
+    #[tokio::test(start_paused = true)]
+    async fn the_ignore_packet_gives_up_on_a_stalled_peer() {
+        let transport = TestTransport::new();
+        let hang = Arc::clone(&transport.send_should_hang);
+        let mut client = create_test_client_with_transport(transport);
+        let message = suspend_message_with(&mut client, 10_000).await;
+
+        hang.store(true, std::sync::atomic::Ordering::SeqCst);
+        client.retract_partial_request(message).await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a withdrawal that cannot be written must retire the transport"
         );
     }
 

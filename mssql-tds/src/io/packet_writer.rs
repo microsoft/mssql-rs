@@ -152,6 +152,21 @@ impl SuspendedMessage {
         self
     }
 
+    /// Detaches the request's cancellation from this message.
+    ///
+    /// A retraction runs *because* the request is already over. Letting the
+    /// caller's cancel abort it too would strand the half-sent message the
+    /// retraction exists to withdraw.
+    pub(crate) fn without_cancellation(mut self) -> Self {
+        self.cancel_handle = None;
+        self
+    }
+
+    /// The RESETCONNECTION mode this message took from the connection.
+    pub(crate) fn reset_mode(&self) -> ResetConnectionMode {
+        self.reset_mode
+    }
+
     /// Discards an unsent message, returning any RESETCONNECTION request it was
     /// carrying to `network_writer`.
     ///

@@ -923,12 +923,22 @@ TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectio
                                    ind, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
-    // Deliberately unasserted: this driver rejects the value, msodbcsql
-    // substitutes it and succeeds, leaving a cursor that must be drained here.
-    if (SQLExecute(stmt_) != SQL_ERROR) {
-        while (SQLFetch(stmt_) == SQL_SUCCESS) {
+    // msodbcsql substitutes the unmappable character and succeeds, leaving a
+    // cursor to drain. On our leg the rejection is the precondition for the
+    // recovery being tested, so assert it - otherwise a regression that stops
+    // failing would leave this test green without exercising any withdrawal.
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
+    const SQLRETURN rc = SQLExecute(stmt_);
+    if (comparing_msodbcsql) {
+        if (rc != SQL_ERROR) {
+            while (SQLFetch(stmt_) == SQL_SUCCESS) {
+            }
+            SQLCloseCursor(stmt_);
         }
-        SQLCloseCursor(stmt_);
+    } else {
+        ASSERT_EQ(SQL_ERROR, rc)
+            << "the over-long value must be rejected during serialization";
     }
 
     ExpectConnectionStillUsable();
