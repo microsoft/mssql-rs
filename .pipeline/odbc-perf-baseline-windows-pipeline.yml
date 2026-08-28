@@ -1,0 +1,35 @@
+# Fixed-baseline ODBC performance pipeline - WINDOWS (dedicated perf lab)
+#
+# Windows counterpart to odbc-perf-baseline-linux-pipeline.yml. The two
+# platforms have independent measurements and must not share regression ratios.
+
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: PerfTemplates
+      type: git
+      name: InternalDriverTools/PerfTest
+      ref: refs/heads/main
+
+extends:
+  template: v1/Perf.Test.Job.yml@PerfTemplates
+  parameters:
+    platform: windows
+    testRootDir: $(Build.SourcesDirectory)/mssql-rs
+    testScript: mssql-odbc-bench/perf-lab/run-benchmarks.ps1
+    testScriptArgs: none
+    testResultsSubDir: results
+    testTimeoutMinutes: 180
+    steps:
+      - bash: |
+          set -euo pipefail
+          report="$(Build.ArtifactStagingDirectory)/results/summary.md"
+          echo "=== ODBC benchmark comparison ==="
+          if [ -f "$report" ]; then
+            cat "$report"
+          else
+            echo "summary.md not found"
+          fi
+        displayName: 'Show ODBC benchmark comparison'

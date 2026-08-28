@@ -295,18 +295,17 @@ binaries keep the per-binary interleaving effective (see §2).
    any gate-tripping benchmark, and writes `results/comparison.txt` plus a
    `results/summary.md` that the lab surfaces on the run's Summary tab. SQL connection
    (`SQL_SERVER` / `SQL_PASSWORD`) is injected by the template. Linux and Windows are
-   **two separate platform definitions** (`perf-baseline-linux-pipeline.yml` /
-   `perf-baseline-windows-pipeline.yml`), each hard-coding its platform and selecting
-   the TDS or ODBC testScript with `benchmarkSuite`. Scheduled runs retain the `tds`
-   default; Windows and Linux numbers are not comparable.
+   **two separate pipeline definitions** (`perf-baseline-linux-pipeline.yml` /
+   `perf-baseline-windows-pipeline.yml`), each hard-coding its `platform`; Windows and
+   Linux numbers are not comparable and are scheduled and gated independently.
 
 ### Verification
 1. `cargo bench -p mssql-tds-bench` runs all scenarios against a real SQL Server.
 2. Swap the dependency to the baseline commit, run, and `critcmp base candidate` confirms
    identical scenario IDs compare.
 3. Deliberately slowing a candidate build flags a regression only on affected scenarios.
-4. An existing platform pipeline queued with `benchmarkSuite=tds` produces the
-   comparison artifact on a dedicated perf-lab VM; the PR-gate pipeline still passes.
+4. New pipeline dry-run produces the comparison artifact on a dedicated perf-lab VM; the
+   existing PR-gate pipeline still passes unchanged.
 
 ---
 

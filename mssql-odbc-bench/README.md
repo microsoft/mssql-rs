@@ -124,12 +124,6 @@ side by side. Each scenario's two driver legs run next to each other on the
 same dedicated host. Raw Google Benchmark JSON and the median comparison are
 written to the repository-level `results` directory.
 
-The existing platform definitions use
-`.pipeline/perf-baseline-linux-pipeline.yml` and
-`.pipeline/perf-baseline-windows-pipeline.yml`. Queue either definition manually
-with `benchmarkSuite=odbc`; their weekly scheduled runs retain the default
-`benchmarkSuite=tds`.
-
 The perf-lab scripts default to five repetitions and report regressions without
 failing the run while initial variance is established. Set
 `ODBC_BENCH_REPETITIONS` to change the sample count and
