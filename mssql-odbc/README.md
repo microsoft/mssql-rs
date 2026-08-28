@@ -97,6 +97,17 @@ layered impl: panic boundary (`ffi_entry!` macro) → unsafe shim (raw-pointer
 validation) → safe core (business logic). See the conventions file below for
 details.
 
+## Connection busy gate
+
+`SQLFetch`/`SQLFetchScroll`/`SQLGetData` release the connection's busy claim
+(`DbcState::active_stmt`) as soon as the wire is drained for the current
+statement, instead of holding it for the statement's whole cursor lifetime —
+matching msodbcsql's wire-state `FIsBusyReadingData` gate (see AB#47508).
+This costs a one-token read-ahead on ordinary fetches: no extra round trip,
+but returning row N can now wait on row N+1's header arriving. See
+`release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
+trade-off and why it was accepted as-is.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read

@@ -38,7 +38,7 @@ use crate::message::messages::ResetConnectionMode;
 use crate::query::metadata::ColumnMetadata;
 use crate::token::tokens::{
     ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeContainer, EnvChangeToken,
-    EnvChangeTokenSubType, InfoToken, Tokens,
+    EnvChangeTokenSubType, ErrorToken, InfoToken, Tokens,
 };
 
 /// An opaque, scripted TDS token produced by the constructor helpers in this
@@ -353,6 +353,21 @@ pub fn done_more_select_with_count(row_count: u64) -> ScriptedToken {
 /// severity RAISERROR).
 pub fn info(number: u32, severity: u8, message: &str) -> ScriptedToken {
     ScriptedToken(Tokens::Info(InfoToken {
+        number,
+        state: 1,
+        severity,
+        message: message.to_string(),
+        server_name: "test-server".to_string(),
+        proc_name: String::new(),
+        line_number: 1,
+    }))
+}
+
+/// A terminal SQL Server ERROR token (e.g. a constraint violation) — reading
+/// it ends the batch: the client drains any remaining tokens, marks the batch
+/// closed, and surfaces the error to the caller instead of a row.
+pub fn sql_error(number: u32, severity: u8, message: &str) -> ScriptedToken {
+    ScriptedToken(Tokens::Error(ErrorToken {
         number,
         state: 1,
         severity,
