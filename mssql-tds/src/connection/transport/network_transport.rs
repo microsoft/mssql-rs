@@ -3333,7 +3333,7 @@ pub(crate) mod tests {
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
         let mut first_payload = vec![TokenType::Row as u8];
         first_payload.extend_from_slice(&value[..2]);
-        let mut stream = first.append_bytes(&first_payload).build();
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
         stream.extend_from_slice(&second.append_bytes(&value[2..]).build());
         let mut reader = create_network_transport_with_data(&stream);
         reader.read_tds_packet().await.unwrap();
@@ -3427,7 +3427,10 @@ pub(crate) mod tests {
     async fn buffered_nbcrow_bitmap_miss_preserves_header_for_async_continuation() {
         let mut first = TestPacketBuilder::new(PacketType::TabularResult);
         let mut second = TestPacketBuilder::new(PacketType::TabularResult);
-        let mut stream = first.append_bytes(&[TokenType::NbcRow as u8, 0]).build();
+        let mut stream = first
+            .continuation()
+            .append_bytes(&[TokenType::NbcRow as u8, 0])
+            .build();
         stream.extend_from_slice(&second.append_bytes(&[0]).build());
         let mut reader = create_network_transport_with_data(&stream);
         reader.read_tds_packet().await.unwrap();

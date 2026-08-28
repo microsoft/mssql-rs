@@ -5204,10 +5204,37 @@ impl TdsClient {
     /// skipping any intervening columns (ODBC `SQLGetData`). Forward-only:
     /// `target` must be at or after the cursor's next undecoded column.
     ///
-    /// Returns [`CursorColumn::PlpStreaming`] for a PLP target,
-    /// [`CursorColumn::AlreadyConsumed`] for a backward target, and
-    /// [`CursorColumn::RowEnded`] when no row is positioned. Use this directly,
-    /// or after [`Self::try_read_row_column`] returns [`CursorPoll::Pending`].
+    /// Returns:
+    /// - [`CursorColumn::Value`] with the decoded value for non-PLP columns,
+    /// - [`CursorColumn::PlpStreaming`] when `target` is a PLP column whose
+    ///   bytes must be pulled via [`read_active_plp_chunk`](Self::read_active_plp_chunk),
+    /// - [`CursorColumn::AlreadyConsumed`] if `target` was already read or skipped
+    ///   while the row remains positioned,
+    /// - [`CursorColumn::RowEnded`] when no row is positioned.
+    ///
+    /// Use this directly, or after [`Self::try_read_row_column`] returns
+    /// [`CursorPoll::Pending`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `UsageError` when `target` is out of range **and** a row is
+    /// still positioned with unread columns (partially read). When no row is
+    /// positioned -- including after the final column has been read -- an
+    /// out-of-range or backward `target` yields [`CursorColumn::RowEnded`]
+    /// instead of an error.
+    ///
+    /// # Notes
+    ///
+    /// Reading the final column advances the cursor to idle, so a subsequent
+    /// backward or out-of-range request returns [`CursorColumn::RowEnded`]. A
+    /// caller that needs to distinguish "I rewound past the last column" from
+    /// "no row is positioned" must track the column it last read itself (as the
+    /// ODBC layer does).
+    ///
+    /// A `true` return from [`next_row_cursor`](Self::next_row_cursor) does not
+    /// guarantee `read_row_column(0)` yields a value: a zero-column row is
+    /// positioned with a column count of 0, so `read_row_column(0)` is
+    /// out-of-range and returns `UsageError`.
     // Avoid a span for every SQLGetData column; row and token events retain observability.
     pub async fn read_row_column(&mut self, target: usize) -> TdsResult<CursorColumn> {
         match std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle) {
@@ -7358,11 +7385,17 @@ mod tests {
         );
         assert_eq!(
             client.try_read_row_column(0).unwrap(),
-            CursorPoll::Ready(CursorColumn::Value(ColumnValues::Int(10)))
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(10),
+                variant_base: None,
+            })
         );
         assert_eq!(
             client.try_read_row_column(1).unwrap(),
-            CursorPoll::Ready(CursorColumn::Value(ColumnValues::Int(20)))
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(20),
+                variant_base: None,
+            })
         );
         assert_eq!(
             client.try_read_row_column(1).unwrap(),
@@ -7412,7 +7445,10 @@ mod tests {
         );
         assert_eq!(
             client.try_read_row_column(0).unwrap(),
-            CursorPoll::Ready(CursorColumn::Value(ColumnValues::Int(42)))
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(42),
+                variant_base: None,
+            })
         );
         assert_eq!(client.remaining_request_timeout, Some(Duration::ZERO));
     }
