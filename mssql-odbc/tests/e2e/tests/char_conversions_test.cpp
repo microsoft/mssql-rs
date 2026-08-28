@@ -506,6 +506,9 @@ TEST_F(CharConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues) {
 // Asserted rather than fixed because msodbcsql 18.6 declares `max` here too and
 // fails identically, so deriving the length from the data instead would be the
 // divergence (AB#47533).
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the RPC parameter was
+// declared varchar(max)/nvarchar(max) directly.
 TEST_F(CharConversionLiveTest, UnboundedColumnSizeIsMaxEvenForASmallValue) {
     const std::pair<SQLSMALLINT, SQLSMALLINT> cases[] = {
         {SQL_C_CHAR, SQL_VARCHAR},
