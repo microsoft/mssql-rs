@@ -24,6 +24,7 @@ pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
 /// Communication link failure — the connection to the server broke, so a
 /// connection pool must discard the connection rather than reuse it.
 pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
+pub(crate) const SQLSTATE_22001: [u8; 5] = *b"22001";
 pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
@@ -39,6 +40,7 @@ pub(crate) const SQLSTATE_HY009: [u8; 5] = *b"HY009";
 pub(crate) const SQLSTATE_HY010: [u8; 5] = *b"HY010";
 pub(crate) const SQLSTATE_HY011: [u8; 5] = *b"HY011";
 pub(crate) const SQLSTATE_HY016: [u8; 5] = *b"HY016";
+pub(crate) const SQLSTATE_HY017: [u8; 5] = *b"HY017";
 pub(crate) const SQLSTATE_HY020: [u8; 5] = *b"HY020";
 pub(crate) const SQLSTATE_HY021: [u8; 5] = *b"HY021";
 pub(crate) const SQLSTATE_HY024: [u8; 5] = *b"HY024";
@@ -86,6 +88,10 @@ pub(crate) const ERR_CONNECTION_BUSY: DiagMsg = DiagMsg {
     state: SQLSTATE_HY000,
     text: "Connection is busy with results for another command",
 };
+pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "A statement on this connection is unusable and did not receive the attribute",
+};
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
@@ -110,6 +116,17 @@ pub(crate) const ERR_INVALID_DESCRIPTOR_FIELD: DiagMsg = DiagMsg {
 pub(crate) const ERR_CANNOT_MODIFY_IRD: DiagMsg = DiagMsg {
     state: SQLSTATE_HY016,
     text: "Cannot modify an implementation row descriptor",
+};
+/// `SQLFreeHandle(SQL_HANDLE_DESC, ...)` on an implicitly-allocated
+/// descriptor, or `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC/APP_PARAM_DESC, ...)`
+/// given an implicitly-allocated descriptor other than the statement's own
+/// ARD/APD (i.e. another statement's ARD/APD, or this statement's own
+/// IRD/IPD). Matches the ODBC reference's HY017 entries for both functions —
+/// implicit descriptors are owned by their statement and can never be freed
+/// or reassigned as if they were explicit handles.
+pub(crate) const ERR_INVALID_USE_OF_AUTO_DESC: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY017,
+    text: "Invalid use of an automatically allocated descriptor handle",
 };
 /// `SQL_DESC_TYPE` set to the verbose `SQL_DATETIME` marker before a valid
 /// `SQL_DESC_DATETIME_INTERVAL_CODE` identifies which date/time member is
@@ -215,7 +232,14 @@ pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01S07,
     text: "Fractional truncation",
 };
-pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
+/// Inbound truncation of a bound parameter. Distinct from
+/// [`WARN_STRING_TRUNCATION`], which is the benign `01004` the fetch
+/// direction posts when a caller's buffer is too small.
+pub(crate) const ERR_PARAM_STRING_TRUNCATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_22001,
+    text: "String data, right truncation",
+};
+pub(crate) const WARN_STRING_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,
     text: "String data, right truncation",
 };
@@ -290,6 +314,55 @@ pub(crate) const WARN_ARRAY_SIZE_CHANGED: DiagMsg = DiagMsg {
     state: SQLSTATE_01S02,
     text: "Array size changed",
 };
+
+/// The same clamp applied to `SQL_ATTR_QUERY_TIMEOUT`.
+///
+/// msodbcsql posts the generic `IDS_01_S02` here rather than one of the
+/// timeout-specific strings (`sqlcmisc.cpp:3993`), so the text matches it
+/// verbatim.
+pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Option value changed",
+};
+
+/// Post a server-originated error under a caller-chosen SQLSTATE, keeping the
+/// native error number and the engine's message text.
+///
+/// `SQL_ATTR_CURRENT_CATALOG` needs this: msodbcsql overwrites whatever state
+/// the failed `USE` produced with `IDS_HY_024` (`sqlcmisc.cpp:1873-1875`), so a
+/// missing database surfaces as `HY024` + native 911 rather than the `08004`
+/// the error-number map would otherwise give.
+///
+/// The override applies **only** to errors the engine raised. A transport or
+/// protocol failure is not the server rejecting the value, so labelling a
+/// dropped connection mid-`USE` as `HY024` would send the caller hunting for a
+/// bad catalog name. Those take `HY000`, the general error state every other
+/// execution path ([`exec_common`](super::exec_common), [`fetch`](super::fetch))
+/// already uses for a failure that is not the engine's.
+pub(crate) fn post_tds_error_as(
+    state: &mut impl HasDiagnostics,
+    err: &TdsError,
+    forced_state: [u8; 5],
+) {
+    let TdsError::SqlServerError { diagnostics } = err else {
+        post_tds_error(state, err, SQLSTATE_HY000);
+        return;
+    };
+    if diagnostics.errors.is_empty() {
+        post_tds_error(state, err, SQLSTATE_HY000);
+        return;
+    }
+    for e in &diagnostics.errors {
+        let native = i32::try_from(e.number).unwrap_or(i32::MAX);
+        post_sql_error(
+            state,
+            forced_state,
+            native,
+            format!("{SERVER_DIAG_SUBSOURCE}{}", e.message),
+        );
+    }
+    post_tds_info_messages(state, &diagnostics.info_messages);
+}
 
 /// Post a driver-raised diagnostic (fixed SQLSTATE + canonical message) with
 /// native error 0. For server-originated errors use [`post_tds_error`].
@@ -706,6 +779,88 @@ mod tests {
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
         assert_eq!(s.records[0].native_error, 0);
+    }
+
+    /// Runs `post_tds_error_as` against a real [`DbcState`] — the only type the
+    /// driver instantiates it with — and returns what it posted.
+    fn post_as_on_dbc(err: &TdsError, forced: [u8; 5]) -> Vec<crate::error::DiagRecord> {
+        use crate::handles::dbc::DbcHandle;
+        use crate::handles::handle_from_raw;
+        use crate::test_support::TestHandles;
+
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        post_tds_error_as(&mut *state, err, forced);
+        state.diag_records.clone()
+    }
+
+    #[test]
+    fn post_tds_error_as_overrides_the_error_number_mapping() {
+        // 911 maps to 08004 by error number, but the catalog path forces
+        // HY024 the way msodbcsql does (`sqlcmisc.cpp:1873-1875`). The native
+        // number and the engine's text must survive the override.
+        assert_eq!(sqlstate_for_sql_error(911), Some(*b"08004"));
+        let err = TdsError::from_sql_errors(vec![sql_error(
+            911,
+            "Database 'nope' does not exist. Make sure that the name is entered correctly.",
+        )]);
+        let records = post_as_on_dbc(&err, SQLSTATE_HY024);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[0].native_error, 911);
+        assert!(records[0].message.ends_with(
+            "Database 'nope' does not exist. Make sure that the name is entered correctly."
+        ));
+    }
+
+    #[test]
+    fn post_tds_error_as_forces_every_error_then_appends_info_messages() {
+        use mssql_tds::error::SqlServerDiagnostics;
+        let diagnostics = SqlServerDiagnostics::new(
+            vec![sql_error(911, "no such db"), sql_error(5701, "context")],
+            vec![SqlInfoMessage {
+                message: "Changed database context to 'master'.".into(),
+                state: 1,
+                class: 10,
+                number: 5701,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }],
+        );
+        let records = post_as_on_dbc(&TdsError::from_sql_diagnostics(diagnostics), SQLSTATE_HY024);
+        assert_eq!(records.len(), 3);
+        // Every server error takes the forced state, in order.
+        assert_eq!(records[0].sql_state, SQLSTATE_HY024);
+        assert_eq!(records[1].sql_state, SQLSTATE_HY024);
+        // Info messages keep their own 01000 state and are appended last.
+        assert_eq!(records[2].sql_state, *b"01000");
+        assert_eq!(records[2].native_error, 5701);
+    }
+
+    #[test]
+    fn post_tds_error_as_does_not_force_the_state_on_a_transport_failure() {
+        // A dropped connection mid-`USE` is not the engine rejecting the
+        // catalog name, so it must not inherit HY024 — a caller would go
+        // hunting for a bad database name that was never the problem.
+        let records = post_as_on_dbc(
+            &TdsError::ProtocolError("bad packet".into()),
+            SQLSTATE_HY024,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(records[0].native_error, 0);
+        assert!(records[0].message.contains("bad packet"));
+    }
+
+    #[test]
+    fn post_tds_error_as_falls_back_when_the_error_list_is_empty() {
+        // No engine error to force the state onto, so the general default wins.
+        let records = post_as_on_dbc(&TdsError::from_sql_errors(vec![]), SQLSTATE_HY024);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(records[0].native_error, 0);
     }
 
     #[test]

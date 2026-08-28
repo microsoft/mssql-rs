@@ -113,7 +113,7 @@ enum RowIssue {
 impl RowIssue {
     fn post(self, stmt_state: &mut StmtState) {
         match self {
-            RowIssue::StringTruncated => post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION),
+            RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
             RowIssue::OutOfRange => post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE),
             RowIssue::Restricted => post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE),
@@ -542,6 +542,36 @@ fn fill_rowset(
     row_status_ptr: *mut SqlUSmallInt,
     row_bind_offset_ptr: *mut SqlULen,
 ) -> SqlReturn {
+    // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
+    // result set. Once that many have been returned the cursor stops without
+    // pulling another row, matching msodbcsql. The cursor deliberately stays
+    // open and the connection stays busy on this statement: the rest of the
+    // result set is still on the wire and SQLMoreResults / SQLCloseCursor
+    // drain it as usual.
+    let row_budget = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLFetchScroll: stmt mutex poisoned checking SQL_ATTR_MAX_ROWS");
+            return SQL_ERROR;
+        };
+        if stmt_state.max_rows_reached() {
+            // Measured: past the cap msodbcsql answers 24000 to both
+            // SQL_ATTR_ROW_NUMBER and SQLGetData, exactly as it does at the
+            // natural end of a result set, so the previous row has to stop
+            // being readable here rather than linger.
+            stmt_state.reset_row_stream();
+            drop(stmt_state);
+            unsafe { write_if_some(rows_fetched_ptr, 0) };
+            mark_no_rows(row_status_ptr, 0, row_array_size);
+            debug!("SQLFetchScroll: SQL_ATTR_MAX_ROWS reached; returning SQL_NO_DATA");
+            return SQL_NO_DATA;
+        }
+        row_budget(
+            stmt_state.max_rows,
+            stmt_state.rows_returned,
+            row_array_size,
+        )
+    };
+
     let dbc = stmt.parent_dbc();
 
     let mut client = {
@@ -607,7 +637,7 @@ fn fill_rowset(
         .is_some_and(|binding| binding.column_number as usize == column_count)
         && client.current_result_supports_row_into();
 
-    while rows_filled < row_array_size {
+    while rows_filled < row_budget {
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
         if can_write_complete_rows {
@@ -747,6 +777,10 @@ fn fill_rowset(
         return SQL_ERROR;
     };
 
+    // Charged even when the rowset ended in an error: the rows before it were
+    // still delivered to the application, so they count against the cap.
+    stmt_state.rows_returned += rows_filled;
+
     unsafe { write_if_some(rows_fetched_ptr, rows_filled) };
     mark_no_rows(row_status_ptr, rows_filled, row_array_size);
 
@@ -803,6 +837,19 @@ fn fill_rowset(
         return SQL_SUCCESS_WITH_INFO;
     }
     SQL_SUCCESS
+}
+
+/// How many rows this fetch may deliver.
+///
+/// `SQL_ATTR_MAX_ROWS = 0` is the ODBC default and means unlimited, so the whole
+/// rowset is available. Otherwise the cap is a row budget rather than a rowset
+/// boundary: measured against msodbcsql, a cap of 5 under a rowset of 4 yields
+/// 4 rows and then a *partial* rowset of 1, not two full rowsets or one.
+fn row_budget(max_rows: SqlULen, rows_returned: SqlULen, row_array_size: SqlULen) -> SqlULen {
+    if max_rows == 0 {
+        return row_array_size;
+    }
+    row_array_size.min(max_rows.saturating_sub(rows_returned))
 }
 
 /// Writes `SQL_ROW_NOROW` into the unused tail of the row status array.
@@ -1121,6 +1168,149 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { sql_fetch_scroll(ptr::null_mut(), SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    // ---- SQL_ATTR_MAX_ROWS ------------------------------------------------
+
+    /// Builds a statement whose cursor is open on a one-column result set that
+    /// has already yielded `rows_returned` rows under a `max_rows` cap.
+    fn stmt_at_max_rows(h: &TestHandles, max_rows: SqlULen, rows_returned: SqlULen) {
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut stmt_state = stmt_handle.inner.lock().unwrap();
+            stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
+            stmt_state.begin_result_set(int_columns(1));
+            stmt_state.max_rows = max_rows;
+            stmt_state.rows_returned = rows_returned;
+            // A statement that has already returned rows is positioned on the
+            // last one, which is what makes the cutoff's row-stream reset
+            // observable rather than vacuously true.
+            stmt_state.row_positioned = rows_returned > 0;
+        }
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut dbc_state = dbc_handle.inner.lock().unwrap();
+        dbc_state.client = Some(tds_client_from_tokens(vec![done_no_more()]));
+        dbc_state.active_stmt = Some(h.stmt);
+    }
+
+    /// The cap is reached, so the fetch must report end-of-data *without*
+    /// pulling a row — the scripted client holds no rows, so a fetch that got
+    /// past the cutoff would fail rather than silently pass.
+    #[test]
+    fn fetch_at_max_rows_returns_no_data_without_pulling() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 3, 3);
+
+        let mut rows_fetched: SqlULen = 99;
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.rows_fetched_ptr = &mut rows_fetched;
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA
+        );
+        assert_eq!(rows_fetched, 0, "the cutoff still reports its rowset size");
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        assert!(stmt_state.diag_records.is_empty(), "cap is not an error");
+        // The cursor stays open and the connection stays busy on this statement
+        // so the rest of the result set can still be drained.
+        assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+        // Measured on msodbcsql: past the cap the previous row stops being
+        // readable, so SQL_ATTR_ROW_NUMBER and SQLGetData both answer 24000 —
+        // the same state as the natural end of a result set.
+        assert!(!stmt_state.row_positioned);
+        drop(stmt_state);
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert!(dbc_state.client.is_some());
+        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+    }
+
+    /// One row below the cap the cutoff must not fire, so the fetch reaches the
+    /// wire. Asserted through the connection hand-back rather than the return
+    /// code: the cap path is the only one that leaves the statement owning the
+    /// connection, so `active_stmt` distinguishes the two paths without
+    /// depending on what the scripted result happens to answer.
+    #[test]
+    fn fetch_below_max_rows_is_not_cut_off() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 3, 2);
+
+        unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert_eq!(
+            dbc_state.active_stmt, None,
+            "the fetch reached the client rather than being cut off"
+        );
+    }
+
+    /// `SQL_ATTR_MAX_ROWS = 0` is the ODBC default and means unlimited, so a
+    /// row count far above it must not be treated as having reached a cap.
+    #[test]
+    fn fetch_with_max_rows_zero_is_unlimited() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 0, 1000);
+
+        unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert_eq!(
+            dbc_state.active_stmt, None,
+            "the fetch reached the client rather than being cut off"
+        );
+    }
+
+    /// The cap truncates a rowset rather than rounding to a rowset boundary.
+    /// Measured against msodbcsql: a cap of 5 with `SQL_ATTR_ROW_ARRAY_SIZE = 4`
+    /// over a 20-row result yields 4 rows, then 1, then SQL_NO_DATA.
+    #[test]
+    fn the_cap_truncates_a_rowset_rather_than_rounding_it() {
+        // Unlimited leaves the whole rowset available however many rows have
+        // already gone out.
+        assert_eq!(row_budget(0, 1000, 4), 4);
+        // Well inside the cap the rowset is untouched.
+        assert_eq!(row_budget(20, 0, 4), 4);
+        assert_eq!(row_budget(8, 4, 4), 4);
+        // The cap lands inside the rowset, so the fetch is cut short.
+        assert_eq!(row_budget(5, 4, 4), 1);
+        assert_eq!(row_budget(6, 4, 4), 2);
+        assert_eq!(row_budget(3, 0, 4), 3);
+        // A cap already spent yields nothing; `max_rows_reached` short-circuits
+        // before this, so the budget only has to stay total, not underflow.
+        assert_eq!(row_budget(5, 5, 4), 0);
+        assert_eq!(row_budget(5, 9, 4), 0);
+    }
+
+    /// The cap is per result set, so advancing onto a new one must restart the
+    /// budget; otherwise a spent cap would truncate every later result set.
+    #[test]
+    fn begin_result_set_restarts_the_max_rows_budget() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut stmt_state = stmt_handle.inner.lock().unwrap();
+
+        stmt_state.max_rows = 3;
+        stmt_state.rows_returned = 3;
+        assert!(stmt_state.max_rows_reached());
+
+        stmt_state.begin_result_set(int_columns(2));
+        assert_eq!(stmt_state.rows_returned, 0);
+        assert!(!stmt_state.max_rows_reached());
+        // The cap itself is a statement attribute and survives the new result
+        // set — only the count restarts.
+        assert_eq!(stmt_state.max_rows, 3);
     }
 
     /// The cursor is forward-only, so every other orientation is rejected

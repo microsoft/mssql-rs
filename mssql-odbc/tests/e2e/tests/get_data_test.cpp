@@ -252,6 +252,46 @@ TEST_F(GetDataLiveTest, NullColumn) {
     SQLCloseCursor(stmt_);
 }
 
+// AB#47507: a bare SELECT NULL is a nullable INT column with no CAST. When the
+// caller supplies no indicator, SQLGetData must fail with SQLSTATE 22002
+// rather than silently succeed and leave the target buffer untouched. This is
+// the exact regression reported: mssql-python fetches SQL_INTEGER columns via
+// SQL_C_SLONG with a null indicator and relies on the ODBC-mandated error to
+// detect NULL, falling back to None only when SQLGetData fails.
+TEST_F(GetDataLiveTest, NullColumnWithoutIndicatorReturns22002) {
+    ASSERT_SQL_OK(ExecDirect("SELECT NULL"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 7;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22002");
+    EXPECT_EQ(7, value) << "a NULL must not disturb the data slot";
+
+    SQLCloseCursor(stmt_);
+}
+
+// The same rule holds on the PLP arrival path: VARCHAR(MAX) NULL decodes via
+// the distinct SQL_PLP_NULL wire marker and RowWriter::write_null, not the
+// fixed/var-length NULL length prefix NullColumn above exercises. Both paths
+// must converge on the identical SQLGetData guard.
+TEST_F(GetDataLiveTest, PlpNullColumnWithoutIndicatorReturns22002) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS VARCHAR(MAX)) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR buf[16];
+    std::memset(buf, 'Z', sizeof(buf));
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), nullptr);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22002");
+    EXPECT_TRUE(std::all_of(buf, buf + sizeof(buf),
+                            [](SQLCHAR b) { return b == 'Z'; }))
+        << "a NULL must not disturb the data slot";
+
+    SQLCloseCursor(stmt_);
+}
+
 // A scalar column followed by a PLP column: the scalar is delivered in one shot,
 // then the PLP value streams to completion. Exercises the scalar→PLP transition
 // within a single row.

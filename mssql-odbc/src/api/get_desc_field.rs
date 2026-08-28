@@ -25,8 +25,7 @@ use crate::api::odbc_types::{
     SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
-    ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX, ERR_STRING_RIGHT_TRUNCATION,
-    post_diag,
+    ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{HasDiagnostics, free_errors};
@@ -291,7 +290,7 @@ impl FieldValue {
                 let truncated =
                     unsafe { copy_with_nul(value_ptr as *mut SqlWChar, buf_elements, &utf16) };
                 if truncated {
-                    post_diag(state, ERR_STRING_RIGHT_TRUNCATION);
+                    post_diag(state, WARN_STRING_TRUNCATION);
                     SQL_SUCCESS_WITH_INFO
                 } else {
                     SQL_SUCCESS

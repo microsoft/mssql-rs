@@ -14,6 +14,7 @@ use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
 use crate::handles::dbc::ConnectionState;
+use crate::handles::desc::DescHandle;
 use crate::handles::{HandleType, free_handle, handle_from_raw};
 
 /// Implementation of `SQLDisconnect`.
@@ -77,8 +78,6 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         return SQL_ERROR;
     };
 
-    // TODO: free user-allocated descriptors (once descriptor support is added)
-
     // Drop all child STMT handles.
     // Note: the DBC lock prevents any *new* SQLExecDirectW from taking the client (it needs
     // the DBC lock). However, a call that already took the client and is mid-execute() holds
@@ -98,9 +97,35 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     }
     state.statements.clear();
 
+    // Drop all explicitly-allocated DESC handles, after the statements: an
+    // explicit descriptor carries no back-pointer to whichever statements had
+    // it as their active ARD/APD, so dropping every STMT first (above) makes
+    // any such association moot rather than something to walk and reset here.
+    // Mirrors msodbcsql's `SQLDisconnect`, which frees the connection's
+    // descriptor-allocation-node list the same way, after its own statement
+    // loop (`sqlcconn.cpp:1313-1448`).
+    //
+    // Pops (rather than iterating then clearing) so a poisoned DESC mutex
+    // leaves only the not-yet-freed remainder in `state.descriptors`: a
+    // retried `SQLDisconnect` picks up where this one stopped instead of
+    // re-freeing entries this pass already dropped.
+    while let Some(desc_ptr) = state.descriptors.pop() {
+        // SAFETY: `desc_ptr` came from `handle_to_raw::<DescHandle>` and is
+        // still live (the DBC owns it). Acquire the DESC lock to serialize
+        // with any op still holding it, then drop the box.
+        let desc = unsafe { handle_from_raw::<DescHandle>(desc_ptr) };
+        let Ok(guard) = desc.inner.lock() else {
+            error!(?desc_ptr, "SQLDisconnect: desc mutex poisoned");
+            return SQL_ERROR;
+        };
+        drop(guard);
+        unsafe { free_handle::<DescHandle>(desc_ptr) };
+    }
+
     // Drop the TDS client (closes the connection) and clear connection-level cursor claim.
     state.client = None;
     state.active_stmt = None;
+    state.effective_vendor_settings = None;
     state.connection_state = ConnectionState::Disconnected;
 
     debug!("SQLDisconnect: disconnected successfully");
@@ -153,5 +178,68 @@ mod tests {
         let ret = unsafe { sql_disconnect(SQL_NULL_HANDLE) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
         // TODO: verify SQLSTATE HY009 via SQLGetDiagRec
+    }
+
+    /// `SQLDisconnect` must free any outstanding explicitly-allocated
+    /// descriptors (ODBC reference, "Freeing a Connection Handle": "Notice
+    /// that SQLDisconnect automatically drops any statements and descriptors
+    /// open on the connection"), leaving `DbcState::descriptors` empty so a
+    /// later `SQLFreeHandle(SQL_HANDLE_DBC)` doesn't trip its
+    /// "DM should have freed all explicit DESCs" debug_assert.
+    #[test]
+    fn disconnect_frees_outstanding_explicit_descriptors() {
+        use crate::api::odbc_types::SQL_HANDLE_DESC;
+        use crate::handles::dbc::ConnectionState;
+
+        let mut env: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    env,
+                    SQL_ATTR_ODBC_VERSION,
+                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
+            SQL_SUCCESS
+        );
+
+        // Simulate a connected DBC without a real TDS client — sufficient for
+        // this test, since `rollback_before_disconnect` no-ops when there is
+        // no client to roll back.
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+        dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+        let mut desc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+        assert_eq!(dbc_ref.inner.lock().unwrap().descriptors.len(), 1);
+
+        assert_eq!(unsafe { sql_disconnect(dbc) }, SQL_SUCCESS);
+        assert!(dbc_ref.inner.lock().unwrap().descriptors.is_empty());
+        // Deliberately not asserting on `desc`'s memory here: `free_handle`
+        // stamps `object_type = Invalid` before dropping the box, but reading
+        // it back through the now-dangling `desc` pointer is a use-after-free
+        // read — technically UB regardless of platform. It happened to read
+        // back correctly on Windows/Linux (the freed block wasn't reused
+        // before the read) but not on macOS, whose allocator reused it
+        // sooner. The connection no longer tracking the descriptor (checked
+        // above) is the real, safely-observable contract.
+
+        unsafe {
+            sql_free_handle(SQL_HANDLE_DBC, dbc);
+            sql_free_handle(SQL_HANDLE_ENV, env);
+        }
     }
 }

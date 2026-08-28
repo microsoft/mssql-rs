@@ -254,6 +254,14 @@ impl AnyTransport {
         }
     }
 
+    pub(crate) fn as_writer_ref(&self) -> &dyn NetworkWriter {
+        match self {
+            Self::Network(transport) => TdsTransport::as_writer_ref(transport),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.as_writer_ref(),
+        }
+    }
+
     pub(crate) fn reset_reader(&mut self) {
         match self {
             Self::Network(transport) => TdsTransport::reset_reader(transport),

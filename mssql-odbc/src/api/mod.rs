@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 pub(crate) mod alloc_handle;
+mod attributes;
 mod bind_col;
 mod bind_param;
 mod cancel;
@@ -9,6 +10,7 @@ mod catalog;
 mod close_cursor;
 mod col_attribute;
 mod connect;
+mod current_catalog;
 mod describe_col;
 mod describe_param;
 mod disconnect;

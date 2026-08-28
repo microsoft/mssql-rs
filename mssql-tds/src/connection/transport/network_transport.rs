@@ -2137,6 +2137,10 @@ impl TdsTokenStreamReader for NetworkTransport {
 
 #[async_trait]
 impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransport {
+    fn as_writer_ref(&self) -> &dyn NetworkWriter {
+        self
+    }
+
     fn as_writer(&mut self) -> &mut dyn NetworkWriter {
         self
     }

@@ -20,11 +20,17 @@ on perf VM" step log, fenced by `===== summary.md =====` markers, so triage need
 no artifact download. The same file is also published in the `perf-results`
 artifact and rendered on the run's Summary tab.
 
-The gate is already noise-hardened: a benchmark ≥10% slower trips it, is then
-re-measured 4× interleaved, and is only confirmed when it trips in ≥3 of those 4
-re-runs. Apparent *improvements* ≥10% get the same treatment, so an unreproduced
-win is reported as an artifact rather than a gain. Take the verdict line at face
-value; do not re-litigate a cleared benchmark from the first-pass numbers.
+The gate is already noise-hardened: a benchmark slower than the threshold
+(`BENCH_REGRESSION_RATIO`, default `1.05` = 5%) trips it, is then re-measured 4×
+interleaved, and is only confirmed when it trips in ≥3 of those 4 re-runs.
+Apparent *improvements* qualify for the same treatment at the same magnitude
+(`BENCH_IMPROVEMENT_VERIFY_RATIO` defaults to the regression threshold), but only
+the largest `BENCH_IMPROVEMENT_VERIFY_MAX` of them (default 3) are actually
+re-measured; any beyond that cap keep unverified first-pass numbers, and the
+summary reports how many it skipped. Treat only a *reproduced* win as real: one
+that was re-measured and did not reproduce is an artifact, and one that fell
+outside the cap is simply unverified. Take the verdict line at face value; do not
+re-litigate a cleared benchmark from the first-pass numbers.
 
 The Windows step log mangles the summary's UTF-8 (emoji, `±`, `µ`). The raw
 critcmp block is still readable, and the emoji bars are a pure function of Δ%, so
@@ -41,23 +47,26 @@ the table can be reconstructed from it when quoting Windows results elsewhere.
   validation, missing bench binaries, or invalid `BENCH_*` settings) — re-queue
   only if the phase looks transient; otherwise fix the code or config. Escalate
   if a retry also fails.
-- **Green** — check for verified improvements and for sub-gate drift, then apply
-  the lock-in rules below.
+- **Green** — check for verified improvements and for quorum-cleared drift, then
+  apply the lock-in rules below.
 
 ## Advancing the baseline
 
 Advancing makes the candidate's numbers the new floor: a later change that gives
 the gains back trips the gate instead of silently settling at the old level. That
 cuts both ways — a bump that carries an unaddressed slowdown legitimizes it, and
-the next 10% gate is then measured from the degraded point.
+the next gate is then measured from the degraded point.
 
 Bump only when **all** of the following hold:
 
 1. Both platforms are green at the **same** commit.
 2. That commit is an ancestor of GitHub `main`.
 3. At least one *verified* improvement (reproduced in ≥ quorum) on either platform.
-4. No benchmark on **either** platform is more than **5%** slower than baseline —
-   tighter than the 10% gate, so drift is investigated rather than absorbed.
+4. No benchmark on **either** platform is more than **5%** slower than baseline.
+   This is the gate's own magnitude, but applied with no quorum: a benchmark that
+   trips in only 1–2 of the 4 re-runs is cleared by the gate, yet its published
+   Δ% (the median of those re-runs) can still sit above 5%. Criterion 4 declines
+   to bake that drift into the floor, so it is investigated rather than absorbed.
 
 When (1)–(3) hold but (4) does not, report the win and the drift together; the
 drift is the finding, and the bump waits for it to be explained or fixed.

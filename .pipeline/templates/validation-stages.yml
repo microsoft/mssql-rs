@@ -104,7 +104,7 @@ stages:
       instanceId: build_arm
       expectedSentinels: build_arm,build_win_arm
       sqlImageTag: ${{ parameters.sqlImageTag }}
-      jobCondition: eq(variables['Build.Reason'], 'PullRequest')
+      jobCondition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'))
   - job: Build_Windows
     displayName: Build Windows
     pool:

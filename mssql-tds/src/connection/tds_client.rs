@@ -44,7 +44,7 @@ use std::num::NonZeroU32;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    core::{CancelHandle, TdsResult},
+    core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult},
     query::metadata::ColumnMetadata,
 };
 use std::sync::Arc;
@@ -935,6 +935,14 @@ impl TdsClient {
     /// value negotiated at login.
     pub fn packet_size(&self) -> u32 {
         self.negotiated_settings.session_settings.packet_size
+    }
+
+    /// Returns whether application traffic remains encrypted after login.
+    pub fn is_encrypted(&self) -> bool {
+        matches!(
+            self.transport.as_writer_ref().get_encryption_setting(),
+            NegotiatedEncryptionSetting::Mandatory | NegotiatedEncryptionSetting::Strict
+        )
     }
 
     /// Returns the SQL Server version reported in the `LOGINACK` token, if the
@@ -6536,6 +6544,7 @@ mod tests {
         known_dead: bool,
         sync_header_available: bool,
         sync_columns: VecDeque<ColumnValues>,
+        encryption_setting: NegotiatedEncryptionSetting,
     }
 
     impl TestTransport {
@@ -6553,6 +6562,7 @@ mod tests {
                 known_dead: false,
                 sync_header_available: false,
                 sync_columns: VecDeque::new(),
+                encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
 
@@ -6570,6 +6580,7 @@ mod tests {
                 known_dead: false,
                 sync_header_available: false,
                 sync_columns: VecDeque::new(),
+                encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
 
@@ -6587,6 +6598,7 @@ mod tests {
                 known_dead: false,
                 sync_header_available: false,
                 sync_columns: VecDeque::new(),
+                encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
 
@@ -6735,7 +6747,7 @@ mod tests {
             4096
         }
         fn get_encryption_setting(&self) -> crate::core::NegotiatedEncryptionSetting {
-            crate::core::NegotiatedEncryptionSetting::NoEncryption
+            self.encryption_setting
         }
         fn set_reset_mode(&mut self, mode: ResetConnectionMode) {
             self.reset_mode = mode;
@@ -6761,6 +6773,10 @@ mod tests {
 
     #[async_trait]
     impl TdsTransport for TestTransport {
+        fn as_writer_ref(&self) -> &dyn NetworkWriter {
+            self
+        }
+
         fn as_writer(&mut self) -> &mut dyn NetworkWriter {
             self
         }
@@ -6880,6 +6896,24 @@ mod tests {
             client_context,
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn encrypted_state_excludes_login_only_tls() {
+        for (setting, expected) in [
+            (NegotiatedEncryptionSetting::NoEncryption, false),
+            (NegotiatedEncryptionSetting::LoginOnly, false),
+            (NegotiatedEncryptionSetting::Mandatory, true),
+            (NegotiatedEncryptionSetting::Strict, true),
+        ] {
+            let mut transport = TestTransport::new();
+            transport.encryption_setting = setting;
+            assert_eq!(
+                create_test_client_with_transport(transport).is_encrypted(),
+                expected,
+                "{setting:?}"
+            );
+        }
     }
 
     #[test]
@@ -7349,6 +7383,52 @@ mod tests {
             1
         );
         assert_eq!(client.last_rows_affected(), -1);
+    }
+
+    /// AB#47535: a PRINT reached only *after* variable assignments. The
+    /// assignments' SQLSELECT-tagged DONE_COUNTs must collapse so the very first
+    /// result the caller sees is the PRINT's message-only result. Treating them
+    /// as update counts stops the batch on the DECLARE, so `execute` returns
+    /// `NoRows { rows_affected: Some(1) }` with no message and the ODBC layer
+    /// reports plain `SQL_SUCCESS` — the shape that hid PRINT output from
+    /// `mssql-python`'s `cursor.messages`.
+    ///
+    /// Observed token sequence for
+    /// `DECLARE @msg VARCHAR(MAX); SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047); PRINT @msg;`.
+    #[tokio::test]
+    async fn execute_surfaces_print_after_assignment_counts() {
+        let printed = "a".repeat(2047);
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Select, 1, true),
+            done_count(CurrentCommand::Select, 1, true),
+            info_token(0, 0, &printed),
+            done_no_more(),
+        ]);
+
+        let result = client
+            .execute(
+                "DECLARE @msg VARCHAR(MAX);\
+                 SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047);\
+                 PRINT @msg;"
+                    .to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            StatementResult::NoRows {
+                rows_affected: None
+            }
+        );
+        assert_eq!(client.last_rows_affected(), -1);
+        assert!(client.take_dml_result_counts().is_empty());
+
+        let messages = client.take_info_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message, printed);
+        assert_eq!(messages[0].number, 0);
     }
 
     /// A PRINT on its own statement surfaces as a message-only result (its DONE

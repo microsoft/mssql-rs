@@ -230,11 +230,13 @@ fn write_captured_column(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    // Codepage note: SQL_C_CHAR output is UTF-8. This diverges from msodbcsql,
-    // which converts character data to the client's Windows ANSI codepage. The
-    // divergence is intentional (this driver is codepage-agnostic and UTF-8
-    // native); callers that need ANSI must transcode. SQL_C_WCHAR is UTF-16LE on
-    // both drivers.
+    // Codepage note: SQL_C_CHAR output is UTF-8, unconditionally. msodbcsql
+    // instead converts to the client code page (`GetACP()` on Windows,
+    // `nl_langinfo(CODESET)` elsewhere), so the two agree on a UTF-8 locale and
+    // differ on a default Windows one. UTF-8 is chosen because the only
+    // supported consumer is mssql-python, which is UTF-8 native; the ODBC spec
+    // fixes no encoding for SQL_C_CHAR, so neither is more conformant. Client
+    // code page support is AB#47564. SQL_C_WCHAR is UTF-16LE on both drivers.
     // Check target type first — an unsupported type must not consume last_captured so the app can retry.
     // A zero-length SQL_C_BINARY read is a length/NULL probe rather than a data
     // read. mssql-python issues one on every sql_variant column to detect NULL
@@ -273,6 +275,17 @@ fn write_captured_column(
     };
 
     if matches!(value, ColumnValues::Null) {
+        // ODBC spec: "If [StrLen_or_IndPtr] is a null pointer, no length or
+        // indicator value is returned. This returns an error when the data
+        // being fetched is NULL" (SQLSTATE 22002). There is nowhere to report
+        // the NULL, and leaving the target buffer untouched would hand the
+        // caller whatever was already there. Mirrors the identical check in
+        // fetch_scroll.rs::deliver_bound for bound columns. Leave the value
+        // resident so a retry with a real indicator can still succeed.
+        if strlen_or_ind_ptr.is_null() {
+            post_diag(stmt_state, ERR_INDICATOR_REQUIRED);
+            return SQL_ERROR;
+        }
         unsafe { write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA) };
         // Only character targets get a terminator; a fixed-width target's
         // buffer is left untouched on NULL.
@@ -573,9 +586,8 @@ fn stream_active_plp_chunk(
         // varchar->SQL_C_WCHAR widening are not yet implemented; they return
         // HYC00 and are deferred to a follow-up change.
         //
-        // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8,
-        // which diverges from msodbcsql's Windows ANSI codepage conversion. This
-        // is intentional; SQL_C_WCHAR is UTF-16LE on both drivers.
+        // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8
+        // rather than the client code page msodbcsql uses (AB#47564).
         let encoding = stmt_state.active_plp.as_ref().map(|s| s.encoding);
         let compatible = matches!(
             (target_type, encoding),
@@ -767,8 +779,9 @@ fn stream_active_plp_chunk(
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         };
         match plp_encoding {
-            // varchar(max)/char/text — single-byte / codepage text. Codepage
-            // conversion will attach here in a follow-up.
+            // varchar(max)/char/text — single-byte / codepage text. Delivered
+            // verbatim today, so a non-UTF-8 server collation yields raw
+            // codepage bytes labelled UTF-8. Conversion attaches here: AB#47566.
             Some(PlpEncoding::SingleByteText) => copy_verbatim(),
             // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
             // stay distinct from SingleByteText (see above).
@@ -830,7 +843,7 @@ fn stream_active_plp_chunk(
         SQL_NO_TOTAL
     };
     unsafe { write_if_some(strlen_or_ind_ptr, remaining_indicator) };
-    post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+    post_diag(&mut stmt_state, WARN_STRING_TRUNCATION);
 
     SQL_SUCCESS_WITH_INFO
 }
@@ -901,7 +914,7 @@ fn write_string_result<T: Copy + Default>(
     unsafe { write_if_some(strlen_or_ind_ptr, byte_len) };
     let truncated = unsafe { copy_with_nul(target_value_ptr, buf_elements, src) };
     if truncated {
-        post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+        post_diag(stmt_state, WARN_STRING_TRUNCATION);
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
@@ -1540,6 +1553,157 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(out, -2_000_000);
         assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
+    }
+
+    /// AB#47507 regression: a NULL value with no indicator must be SQLSTATE
+    /// 22002, not a silent SQL_SUCCESS that leaves the caller's buffer
+    /// untouched.
+    #[test]
+    fn get_data_typed_null_without_indicator_reports_22002() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null);
+
+        let mut out: i32 = -1_066_579_696; // poisoned sentinel, must survive untouched
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(out, -1_066_579_696, "NULL must not disturb the data slot");
+        {
+            let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = sh.inner.lock().unwrap();
+            assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
+        }
+
+        // The value was not consumed: a retry with a real indicator still
+        // reports the NULL correctly.
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+    }
+
+    /// The same rule applies to character targets: a NULL with no indicator is
+    /// still 22002, even though a terminator could otherwise be written.
+    #[test]
+    fn get_data_char_null_without_indicator_reports_22002() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null);
+
+        let mut buf = [b'X'; 8];
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(buf, [b'X'; 8], "NULL must not disturb the data slot");
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_last_diag(&s.diag_records, ERR_INDICATOR_REQUIRED);
+    }
+
+    /// PR review follow-up: the 22002 early return must not disturb the
+    /// forward-only row cursor, or a later column in the same row becomes
+    /// unreachable. Drives `SELECT 1, NULL, 2` purely through `StmtState`
+    /// bookkeeping (manually re-seeding `last_captured` between calls the way
+    /// `resume_row_to_column` would), so it pins the accounting invariant
+    /// without needing a live decoder: column 2's 22002 must leave
+    /// `current_row_last_col` at column 1, so the forward-only gate still
+    /// admits column 3 afterward, and column 3 is not mistaken for an
+    /// already-consumed re-request of column 2.
+    #[test]
+    fn get_data_null_without_indicator_does_not_block_later_columns_in_the_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(3);
+            s.row_positioned = true;
+            s.last_captured = Some((1, ColumnValues::Int(1)));
+        }
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 1);
+
+        // Column 2 is NULL with no indicator: 22002, and must not advance the
+        // forward-only cursor past column 1.
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.last_captured = Some((2, ColumnValues::Null));
+        }
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                2,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        {
+            let s = stmt_handle.inner.lock().unwrap();
+            assert_eq!(
+                s.current_row_last_col, 1,
+                "a failed NULL column must not advance the forward-only cursor"
+            );
+        }
+
+        // Column 3 is still reachable: the forward-only gate admits it
+        // (current_row_last_col is still 1), and it is not treated as an
+        // already-captured re-request of column 2.
+        {
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.last_captured = Some((3, ColumnValues::Int(2)));
+        }
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                3,
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 2);
     }
 
     #[test]

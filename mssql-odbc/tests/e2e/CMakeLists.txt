@@ -59,8 +59,9 @@ endif()
 # ---------------------------------------------------------------------------
 # Unicode build mode (must come after googletest so the vendored gtest build
 # is not compiled with UNICODE/_UNICODE).
-# Windows defaults to ON because mssql-odbc phase-1 exports only wide (W)
-# entrypoints. Applies to odbc_test_lib and every test target defined below.
+# Windows defaults to ON because mssql-odbc exports wide (W) entrypoints. Unix
+# stays narrow to exercise Driver Manager ANSI routing, including pre-connect
+# attribute replay. Applies to odbc_test_lib and every test target below.
 # ---------------------------------------------------------------------------
 if(WIN32)
     set(_odbc_e2e_unicode_default ON)
@@ -123,10 +124,12 @@ add_odbc_test(num_result_cols_test tests/num_result_cols_test.cpp)
 add_odbc_test(get_diag_field_test tests/get_diag_field_test.cpp)
 add_odbc_test(get_desc_field_test tests/get_desc_field_test.cpp)
 add_odbc_test(set_desc_field_test tests/set_desc_field_test.cpp)
+add_odbc_test(alloc_free_desc_test tests/alloc_free_desc_test.cpp)
 add_odbc_test(driver_connect_test tests/driver_connect_test.cpp)
 add_odbc_test(exec_direct_test   tests/exec_direct_test.cpp)
 add_odbc_test(more_results_test  tests/more_results_test.cpp)
 add_odbc_test(execute_test       tests/execute_test.cpp)
+add_odbc_test(char_conversions_test tests/char_conversions_test.cpp)
 add_odbc_test(describe_param_test tests/describe_param_test.cpp)
 add_odbc_test(get_data_test      tests/get_data_test.cpp)
 add_odbc_test(get_type_info_test tests/get_type_info_test.cpp)
@@ -135,3 +138,4 @@ add_odbc_test(row_count_test     tests/row_count_test.cpp)
 add_odbc_test(transaction_test   tests/transaction_test.cpp)
 add_odbc_test(session_recovery_test tests/session_recovery_test.cpp)
 add_odbc_test(connection_pool_test tests/connection_pool_test.cpp)
+add_odbc_test(attributes_test    tests/attributes_test.cpp)
