@@ -1051,7 +1051,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Writes the value of the hostname of the client to the login packet.
     async fn write_hostname(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.user_input.workstation_id.len() as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.workstation_id) as i16)
             .await?
         {
             self.deferred_actions_indicator
@@ -1067,7 +1067,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
             TdsAuthenticationMethod::Password
         ) {
             if self
-                .write_metadata(self.model.user_input.user_name.len() as i16)
+                .write_metadata(utf16_code_units(&self.model.user_input.user_name) as i16)
                 .await?
             {
                 self.deferred_actions_indicator
@@ -1084,7 +1084,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     async fn write_password(&mut self) -> TdsResult<()> {
         if self.model.user_input.tds_authentication_method == TdsAuthenticationMethod::Password {
             if self
-                .write_metadata(self.model.user_input.password.len() as i16)
+                .write_metadata(utf16_code_units(&self.model.user_input.password) as i16)
                 .await?
             {
                 self.deferred_actions_indicator
@@ -1100,7 +1100,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Writes the value of the application name provided in the client context to the login packet.
     async fn write_app_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.user_input.application_name.len() as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.application_name) as i16)
             .await?
         {
             self.deferred_actions_indicator
@@ -1113,7 +1113,9 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Uses get_login_server_name() to get DataSource format (host,port) for TCP connections.
     async fn write_server_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.transport_context.get_login_server_name().len() as i16)
+            .write_metadata(
+                utf16_code_units(&self.model.transport_context.get_login_server_name()) as i16,
+            )
             .await?
         {
             self.deferred_actions_indicator
@@ -1143,7 +1145,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// This is also called the Client interface name.
     async fn write_library_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.user_input.library_name.len() as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.library_name) as i16)
             .await?
         {
             self.deferred_actions_indicator
@@ -1154,7 +1156,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     async fn write_language(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.user_input.language.len() as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.language) as i16)
             .await?
         {
             self.deferred_actions_indicator
@@ -1166,7 +1168,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Writes the value of the database name, which we are connecting to.
     async fn write_database(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.user_input.database.len() as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.database) as i16)
             .await?
         {
             self.deferred_actions_indicator
@@ -1221,7 +1223,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     async fn write_attach_db_file(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.user_input.attach_db_file.len() as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.attach_db_file) as i16)
             .await?
         {
             self.deferred_actions_indicator
@@ -1232,7 +1234,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     async fn write_change_password(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(self.model.user_input.change_password.len() as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.change_password) as i16)
             .await?
         {
             self.deferred_actions_indicator
@@ -1306,6 +1308,10 @@ trait SizedLoginItem {
     fn len_bytes(&self) -> i32;
 }
 
+fn utf16_code_units(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
 impl SizedLoginItem for TransportContext {
     fn len_bytes(&self) -> i32 {
         // Must match what get_login_server_name() returns for consistency
@@ -1316,7 +1322,7 @@ impl SizedLoginItem for TransportContext {
 
 impl SizedLoginItem for String {
     fn len_bytes(&self) -> i32 {
-        (self.len() * 2) as i32
+        (utf16_code_units(self) * 2) as i32
     }
 }
 
@@ -1457,6 +1463,14 @@ mod tests {
         features.insert(FeatureExtension::Json, Box::new(JsonFeature::default()));
         features.insert(FeatureExtension::Vector, Box::new(VectorFeature::default()));
         FeaturesRequest { features }
+    }
+
+    #[test]
+    fn application_name_length_uses_utf16_code_units() {
+        let application_name = "MSSQL \u{1f980}".to_string();
+
+        assert_eq!(utf16_code_units(&application_name), 8);
+        assert_eq!(application_name.len_bytes(), 16);
     }
 
     // ── FeaturesRequest::features() ──
