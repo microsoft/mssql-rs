@@ -551,6 +551,56 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
     }
 }
 
+// APP must reach the server in the TDS login packet, which APP_NAME() reports.
+// Regression coverage for AB#47534, where APP parsed cleanly but was dropped
+// before the login packet, so the server saw the driver's default name instead.
+TEST_F(DriverConnectLiveTest, AppKeywordReachesServerAppName) {
+    auto& cfg = ODBCTestConfig::Instance();
+    if (!cfg.HasSqlAuth()) {
+        GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
+                        "ODBC_TEST_PWD); see follow-up issue for capability gating";
+    }
+    const std::string kAppName = "AppKeywordE2E";
+    const std::string cs =
+        "Driver={" + cfg.Driver() + "}"
+        ";Server=" + cfg.Server() +
+        ";UID=" + cfg.Uid() +
+        ";PWD=" + cfg.Pwd() +
+        ";TrustServerCertificate=" + cfg.TrustCert() +
+        ";APP=" + kAppName;
+
+    SQLHDBC hdbc = SQL_NULL_HDBC;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc));
+
+    SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+    SQLRETURN rc = SQLDriverConnect(hdbc, nullptr,
+                                    const_cast<SQLTCHAR*>(connstr.c_str()),
+                                    static_cast<SQLSMALLINT>(connstr.size()),
+                                    outStr, 1024, &outLen, SQL_DRIVER_NOPROMPT);
+    ASSERT_TRUE(SQL_SUCCEEDED(rc)) << "rc=" << rc;
+    EXPECT_FALSE(ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, hdbc, "01S00"));
+
+    SQLHSTMT hstmt = SQL_NULL_HSTMT;
+    ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt));
+
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT APP_NAME()");
+    ASSERT_TRUE(SQL_SUCCEEDED(
+        SQLExecDirect(hstmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS)));
+    ASSERT_TRUE(SQL_SUCCEEDED(SQLFetch(hstmt)));
+
+    SQLTCHAR buf[256] = {};
+    SQLLEN ind = 0;
+    ASSERT_TRUE(SQL_SUCCEEDED(
+        SQLGetData(hstmt, 1, SQL_C_TCHAR, buf, sizeof(buf), &ind)));
+    EXPECT_EQ(kAppName, ODBCTestUtils::ToNarrow(SqlTString(buf)));
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLDisconnect(hdbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+}
+
 // mssql-odbc rejects an invalid value on a validated connection-string key with
 // HY024 at connect time. The reference msodbcsql driver is laxer: it treats an
 // invalid ApplicationIntent enum as a plain SQL_ERROR without HY024, and a
