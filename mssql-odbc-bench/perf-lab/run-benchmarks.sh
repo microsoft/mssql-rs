@@ -6,12 +6,20 @@
 
 set -euo pipefail
 set -E
+export LC_ALL=C
 trap 'rc=$?; echo "ERROR: ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND} exited ${rc}" >&2' ERR
 
 REPO_ROOT="$(pwd)"
 RESULTS_DIR="$REPO_ROOT/results"
+INITIAL_DIR="$RESULTS_DIR/initial"
+CONFIRM_DIR="$RESULTS_DIR/confirm"
+PLAN_FILE="$RESULTS_DIR/confirm-plan.txt"
+TELEMETRY_CSV="$RESULTS_DIR/cpu-telemetry.csv"
 BASELINE_FILE="$REPO_ROOT/mssql-odbc-bench/perf-lab/baseline-commit.txt"
 REFERENCE_VERSION_FILE="$REPO_ROOT/mssql-odbc-bench/perf-lab/msodbcsql-version.txt"
+# One shared snapshot query for both perf labs; do not fork a second copy.
+SQL_CONFIG_SQL="$REPO_ROOT/mssql-tds-bench/perf-lab/sql-config-dump.sql"
+COMPARE_SCRIPT="$REPO_ROOT/.pipeline/scripts/compare-odbc-benchmarks.py"
 HARNESS_BUILD_DIR="$REPO_ROOT/target/odbc-bench"
 CANDIDATE_TARGET_DIR="$REPO_ROOT/target/odbc-candidate"
 BASELINE_TARGET_DIR="$REPO_ROOT/target/odbc-baseline"
@@ -57,6 +65,54 @@ trap cleanup EXIT
 
 mkdir -p "$RESULTS_DIR"
 
+# Bracketed CPU frequency/utilization samples around every measured pass. If a
+# confirmation round disagrees with the initial pass, this is what says whether
+# the machine changed underneath the measurement or the driver did.
+echo "timestamp,label,avg_cur_freq_mhz,cpu_busy_pct,temp_c" > "$TELEMETRY_CSV"
+cpu_busy_percent() {
+    # /proc/stat is cumulative since boot, so a single read reports a lifetime
+    # average. Take a short delta instead so the number describes this pass.
+    local first second
+    first=$(awk '/^cpu /{ t = 0; for (i = 2; i <= NF; i++) t += $i; print t, $5; exit }' /proc/stat) ||
+        return 1
+    sleep 0.2
+    second=$(awk '/^cpu /{ t = 0; for (i = 2; i <= NF; i++) t += $i; print t, $5; exit }' /proc/stat) ||
+        return 1
+    awk -v a="$first" -v b="$second" 'BEGIN {
+        split(a, before, " ");
+        split(b, after, " ");
+        total = after[1] - before[1];
+        idle = after[2] - before[2];
+        if (total <= 0) exit 1;
+        printf "%.1f", (total - idle) * 100 / total
+    }'
+}
+
+cpu_sample() {
+    local label="$1" sum=0 count=0 file value freq_mhz="" busy="" zone reading temp_c=""
+    for file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+        [ -r "$file" ] || continue
+        value=$(cat "$file" 2>/dev/null) || continue
+        sum=$((sum + value))
+        count=$((count + 1))
+    done
+    if [ "$count" -gt 0 ]; then
+        freq_mhz=$((sum / count / 1000))
+    fi
+    if [ -r /proc/stat ]; then
+        busy=$(cpu_busy_percent 2>/dev/null) || busy=""
+    fi
+    for zone in /sys/class/thermal/thermal_zone*/temp; do
+        [ -r "$zone" ] || continue
+        reading=$(cat "$zone" 2>/dev/null) || continue
+        temp_c=$((reading / 1000))
+        break
+    done
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),${label},${freq_mhz},${busy},${temp_c}" \
+        >> "$TELEMETRY_CSV"
+    echo ">>> cpu[${label}] avgFreq=${freq_mhz}MHz busy=${busy}% temp=${temp_c}C"
+}
+
 : "${SQL_SERVER:?SQL_SERVER not set}"
 : "${SQL_PASSWORD:?SQL_PASSWORD not set}"
 
@@ -68,18 +124,65 @@ export ODBC_BENCH_TRUST_CERT="${ODBC_BENCH_TRUST_CERT:-Yes}"
 export ODBC_BENCH_ENCRYPT="${ODBC_BENCH_ENCRYPT:-Mandatory}"
 export ODBC_BENCH_PACKET_SIZE="${ODBC_BENCH_PACKET_SIZE:-32768}"
 
-REPETITIONS="${ODBC_BENCH_REPETITIONS:-5}"
-case "$REPETITIONS" in
-    ''|*[!0-9]*)
-        echo "ERROR: ODBC_BENCH_REPETITIONS must be a positive integer" >&2
+# --- Allocator tuning (steadier large rowset buffers) ---
+# Each retrieval allocates the bound rowset buffers for up to 600 columns by
+# 1024 rows, which is far past glibc's dynamic mmap threshold. Left alone, every
+# repetition re-mmaps and re-faults those pages, which is both slower and much
+# noisier than the driver difference we are trying to measure. Raise the mmap
+# threshold so the buffers come from the heap and stop trimming so they are
+# reused. The mmap threshold must be raised explicitly: setting only the trim
+# threshold disables glibc's dynamic mmap threshold and forces every large
+# allocation through mmap.
+export MALLOC_MMAP_THRESHOLD_="${MALLOC_MMAP_THRESHOLD_:-134217728}"  # 128 MB
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:--1}"          # never trim
+
+# --- No connection-churn network tuning here (deliberate) ---
+# mssql-tds-bench widens the ephemeral port range and enables TIME_WAIT reuse
+# because its concurrent_connects benchmark opens tens of thousands of
+# short-lived TCP connections. This harness opens ONE connection in OdbcSession,
+# holds it for the whole process, and measures only statement execution and
+# fetching, so there is no port pressure to relieve. The CPU/server diagnostics
+# and the large-buffer allocator control above do apply and are enabled.
+
+read_positive_int() {
+    # Parse tuning knobs once, in base 10, so "08" is neither an octal literal
+    # error nor silently a different number than the PowerShell runner reads.
+    local name="$1" value="$2" minimum="$3"
+    case "$value" in
+        ''|*[!0-9]*)
+            echo "ERROR: $name must be a positive integer (got: '$value')" >&2
+            exit 1
+            ;;
+    esac
+    value=$((10#$value))
+    if [ "$value" -lt "$minimum" ]; then
+        echo "ERROR: $name must be >= $minimum (got: $value)" >&2
         exit 1
-        ;;
-esac
-REPETITIONS=$((10#$REPETITIONS))
-if [ "$REPETITIONS" -lt 1 ]; then
-    echo "ERROR: ODBC_BENCH_REPETITIONS must be at least 1" >&2
+    fi
+    printf '%s' "$value"
+}
+
+REPETITIONS="$(read_positive_int ODBC_BENCH_REPETITIONS "${ODBC_BENCH_REPETITIONS:-5}" 1)"
+# Confirmation defaults match the fixed-baseline mssql-tds runner: four targeted
+# re-runs, reproduction required in a majority (3 of 4).
+CONFIRM_RUNS="$(read_positive_int ODBC_BENCH_CONFIRM_RUNS "${ODBC_BENCH_CONFIRM_RUNS:-4}" 1)"
+CONFIRM_QUORUM="$(
+    read_positive_int ODBC_BENCH_CONFIRM_QUORUM \
+        "${ODBC_BENCH_CONFIRM_QUORUM:-$((CONFIRM_RUNS / 2 + 1))}" 1
+)"
+if [ "$CONFIRM_QUORUM" -gt "$CONFIRM_RUNS" ]; then
+    echo "ERROR: ODBC_BENCH_CONFIRM_QUORUM must not exceed ODBC_BENCH_CONFIRM_RUNS" >&2
     exit 1
 fi
+IMPROVEMENT_MAX="$(
+    read_positive_int ODBC_BENCH_IMPROVEMENT_VERIFY_MAX \
+        "${ODBC_BENCH_IMPROVEMENT_VERIFY_MAX:-3}" 1
+)"
+REGRESSION_RATIO="${ODBC_BENCH_REGRESSION_RATIO:-1.05}"
+IMPROVEMENT_RATIO="${ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO:-$REGRESSION_RATIO}"
+# A confirmed candidate-vs-pinned-baseline regression fails the run by default;
+# set ODBC_BENCH_FAIL_ON_REGRESSION=0 to publish the report without gating.
+FAIL_ON_REGRESSION="${ODBC_BENCH_FAIL_ON_REGRESSION:-1}"
 
 ensure_packages() {
     # Perf images vary by pool, so install only tools the harness cannot run without.
@@ -93,6 +196,9 @@ ensure_packages() {
     [ -f /usr/include/sql.h ] || missing+=(unixodbc-dev)
     [ -f /usr/include/openssl/ssl.h ] || missing+=(libssl-dev)
     [ -f /etc/ssl/certs/ca-certificates.crt ] || missing+=(ca-certificates)
+    # Google Benchmark's comparator imports NumPy and SciPy unconditionally, so a
+    # private virtualenv needs to be creatable even when it is never used.
+    python3 -c 'import ensurepip, venv' >/dev/null 2>&1 || missing+=(python3-venv)
     [ ${#missing[@]} -eq 0 ] && return
 
     local sudo_command=()
@@ -103,6 +209,25 @@ ensure_packages() {
         apt-get install -y --no-install-recommends "${missing[@]}"
 }
 ensure_packages
+
+BENCH_PYTHON="$(command -v python3)"
+ensure_python_stats() {
+    # gbench/report.py imports numpy and scipy at module scope even with
+    # --no-utest, so the official comparator cannot run without them. Prefer an
+    # interpreter that already has them; otherwise build a private virtualenv so
+    # nothing is installed into the perf host's system Python.
+    if "$BENCH_PYTHON" -c 'import numpy, scipy' >/dev/null 2>&1; then
+        return 0
+    fi
+    local venv="$REPO_ROOT/target/odbc-bench-venv"
+    echo ">>> Provisioning NumPy/SciPy for Google Benchmark's comparator..."
+    if [ ! -x "$venv/bin/python" ] && ! python3 -m venv "$venv"; then
+        return 1
+    fi
+    "$venv/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+    "$venv/bin/python" -m pip install --quiet numpy scipy || return 1
+    BENCH_PYTHON="$venv/bin/python"
+}
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo ">>> Installing Rust toolchain..."
@@ -160,11 +285,46 @@ fi
 MICROSOFT_DRIVER="${microsoft_driver_paths[0]}"
 MICROSOFT_DRIVER_SHA256="$(sha256sum "$MICROSOFT_DRIVER" | cut -d' ' -f1)"
 
+# --- SQL Server configuration snapshot (validate the instance is tuned) ---
+# Memory, MAXDOP, cost threshold, affinity, tempdb placement, recovery, and
+# trace flags. Best-effort: sqlcmd is not guaranteed on a perf image, and a
+# missing snapshot must not cost a whole lab run.
+sqlcmd_bin="$(command -v sqlcmd || true)"
+if [ -z "$sqlcmd_bin" ] && [ -x /opt/mssql-tools18/bin/sqlcmd ]; then
+    sqlcmd_bin=/opt/mssql-tools18/bin/sqlcmd
+fi
+if [ -z "$sqlcmd_bin" ] && [ -x /opt/mssql-tools/bin/sqlcmd ]; then
+    sqlcmd_bin=/opt/mssql-tools/bin/sqlcmd
+fi
+if [ -n "$sqlcmd_bin" ] && [ -f "$SQL_CONFIG_SQL" ]; then
+    echo ">>> Capturing SQL Server configuration snapshot..."
+    "$sqlcmd_bin" -S "$ODBC_BENCH_SERVER" -U "$ODBC_BENCH_UID" -P "$ODBC_BENCH_PWD" \
+        -C -b -y 0 -Y 30 -i "$SQL_CONFIG_SQL" |
+        tee "$RESULTS_DIR/sql-config.txt" ||
+        echo ">>> SQL config snapshot skipped (query failed)."
+else
+    echo ">>> Skipping SQL config snapshot (sqlcmd or query file not found)."
+fi
+
 echo ">>> Building the fixed C++ benchmark harness..."
 cmake -S "$REPO_ROOT/mssql-odbc-bench" \
     -B "$HARNESS_BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release
 cmake --build "$HARNESS_BUILD_DIR" --config Release --parallel
+
+# The pinned Google Benchmark v1.9.1 checkout ships the comparator we report
+# with; using the copy from this build tree keeps the tool and the harness on
+# the same version.
+GBENCH_COMPARE="$HARNESS_BUILD_DIR/_deps/googlebenchmark-src/tools/compare.py"
+if [ ! -f "$GBENCH_COMPARE" ]; then
+    echo "ERROR: Google Benchmark comparator not found: $GBENCH_COMPARE" >&2
+    exit 1
+fi
+GBENCH_ARGS=(--gbench-compare "$GBENCH_COMPARE")
+if ! ensure_python_stats; then
+    echo "ERROR: NumPy/SciPy are required by Google Benchmark's compare.py" >&2
+    exit 1
+fi
 
 build_driver() {
     # Separate target directories keep the two Rust driver builds comparable and
@@ -237,6 +397,13 @@ fi
     echo "microsoft_driver_path=$MICROSOFT_DRIVER"
     echo "microsoft_driver_sha256=$MICROSOFT_DRIVER_SHA256"
     echo "repetitions=$REPETITIONS"
+    echo "regression_ratio=$REGRESSION_RATIO"
+    echo "confirm_runs=$CONFIRM_RUNS"
+    echo "confirm_quorum=$CONFIRM_QUORUM"
+    echo "gbench_compare=${GBENCH_ARGS[1]:-disabled}"
+    echo "bench_python=$BENCH_PYTHON"
+    echo "malloc_mmap_threshold=$MALLOC_MMAP_THRESHOLD_"
+    echo "malloc_trim_threshold=$MALLOC_TRIM_THRESHOLD_"
     echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     uname -a
     rustc -Vv
@@ -252,11 +419,15 @@ ODBC_BENCH_DRIVER="$CANDIDATE_DRIVER_NAME" \
 
 run_leg() {
     # A leg contains one driver/scenario sample file; ordering is interleaved above
-    # to reduce bias from machine or server drift during the run.
+    # to reduce bias from machine or server drift during the run. An empty scenario
+    # runs every workload in one process.
     local scenario="$1"
     local driver="$2"
     local output="$3"
-    echo ">>> Running $scenario with $driver..."
+    echo ">>> Running ${scenario:-all scenarios} with $driver..."
+    # Linux keeps the PacketSize spelling for every driver, including Microsoft
+    # ODBC: on Linux that driver rejects "Packet Size" (01S00) and accepts
+    # "PacketSize" (01S02). Windows uses the "Packet Size" spelling instead.
     ODBC_BENCH_DRIVER="$driver" \
         ODBC_BENCH_SCENARIO="$scenario" \
         ODBC_BENCH_PACKET_SIZE_KEYWORD="PacketSize" \
@@ -273,15 +444,16 @@ BASELINE_WIDE="$RESULTS_DIR/odbc-baseline-wide.json"
 MICROSOFT_NARROW="$RESULTS_DIR/odbc-microsoft-narrow.json"
 MICROSOFT_WIDE="$RESULTS_DIR/odbc-microsoft-wide.json"
 
+cpu_sample "initial-start"
 run_leg narrow "$CANDIDATE_DRIVER_NAME" "$CANDIDATE_NARROW"
 run_leg narrow "$MICROSOFT_DRIVER_NAME" "$MICROSOFT_NARROW"
 run_leg narrow "$BASELINE_DRIVER_NAME" "$BASELINE_NARROW"
 run_leg wide "$BASELINE_DRIVER_NAME" "$BASELINE_WIDE"
 run_leg wide "$MICROSOFT_DRIVER_NAME" "$MICROSOFT_WIDE"
 run_leg wide "$CANDIDATE_DRIVER_NAME" "$CANDIDATE_WIDE"
+cpu_sample "initial-end"
 
-compare_args=(
-    "$REPO_ROOT/.pipeline/scripts/compare-odbc-benchmarks.py"
+three_way_args=(
     --baseline "$BASELINE_NARROW"
     --baseline "$BASELINE_WIDE"
     --candidate "$CANDIDATE_NARROW"
@@ -292,16 +464,156 @@ compare_args=(
     --baseline-commit "$BASELINE_COMMIT"
     --reference-version "$MICROSOFT_VERSION"
     --repetitions "$REPETITIONS"
-    --output-dir "$RESULTS_DIR"
-    --regression-ratio "${ODBC_BENCH_REGRESSION_RATIO:-1.10}"
+    --regression-ratio "$REGRESSION_RATIO"
+    --improvement-ratio "$IMPROVEMENT_RATIO"
+    --improvement-max "$IMPROVEMENT_MAX"
+    "${GBENCH_ARGS[@]}"
 )
-if [ "${ODBC_BENCH_FAIL_ON_REGRESSION:-0}" = "1" ]; then
-    compare_args+=(--fail-on-regression)
+
+# --- Initial pass: five-sample medians pick what deserves re-measurement ---
+# The initial verdict never gates on its own; it only produces the plan.
+echo ">>> Comparing the initial three-driver pass..."
+"$BENCH_PYTHON" "$COMPARE_SCRIPT" \
+    "${three_way_args[@]}" \
+    --output-dir "$INITIAL_DIR" \
+    --plan-out "$PLAN_FILE" \
+    --no-summary \
+    --no-fail-on-regression
+
+scenario_for_benchmark() {
+    # The harness filters by scenario, not by benchmark id, so map each flagged
+    # benchmark back to the scenario file it came out of.
+    local id="$1"
+    if grep -qF "\"run_name\": \"$id\"" "$CANDIDATE_NARROW"; then
+        printf 'narrow'
+    elif grep -qF "\"run_name\": \"$id\"" "$CANDIDATE_WIDE"; then
+        printf 'wide'
+    else
+        echo "ERROR: cannot map benchmark '$id' to a scenario" >&2
+        return 1
+    fi
+}
+
+VERIFY_NAMES=()
+VERIFY_KINDS=()
+select_narrow=0
+select_wide=0
+while IFS=$'\t' read -r plan_kind plan_name plan_ratio; do
+    [ -n "${plan_name:-}" ] || continue
+    VERIFY_KINDS+=("$plan_kind")
+    VERIFY_NAMES+=("$plan_name")
+    echo ">>> Initial pass flagged $plan_kind: $plan_name (ratio $plan_ratio)"
+    plan_scenario="$(scenario_for_benchmark "$plan_name")"
+    case "$plan_scenario" in
+        narrow) select_narrow=1 ;;
+        wide) select_wide=1 ;;
+    esac
+done < "$PLAN_FILE"
+
+CONFIRMATION_ARGS=()
+if [ "${#VERIFY_NAMES[@]}" -gt 0 ]; then
+    # One process covers both scenarios; only narrow those legs when the other
+    # workload has nothing to confirm.
+    if [ "$select_narrow" -eq 1 ] && [ "$select_wide" -eq 1 ]; then
+        CONFIRM_SCENARIO=""
+    elif [ "$select_narrow" -eq 1 ]; then
+        CONFIRM_SCENARIO="narrow"
+    else
+        CONFIRM_SCENARIO="wide"
+    fi
+
+    echo ">>> Auto-confirm: re-measuring ${#VERIFY_NAMES[@]} benchmark(s) over" \
+        "$CONFIRM_RUNS round(s); a result counts only when it reproduces in" \
+        ">= $CONFIRM_QUORUM of $CONFIRM_RUNS."
+    for round in $(seq 1 "$CONFIRM_RUNS"); do
+        round_dir="$CONFIRM_DIR/round$round"
+        mkdir -p "$round_dir"
+        echo ">>> Confirmation round $round/$CONFIRM_RUNS..."
+        cpu_sample "confirm${round}-start"
+        # Keep each pair adjacent, and alternate which side runs first so a stable
+        # position effect cancels across the default four rounds.
+        if [ $((round % 2)) -eq 1 ]; then
+            run_leg "$CONFIRM_SCENARIO" "$CANDIDATE_DRIVER_NAME" "$round_dir/candidate.json"
+            run_leg "$CONFIRM_SCENARIO" "$BASELINE_DRIVER_NAME" "$round_dir/baseline.json"
+        else
+            run_leg "$CONFIRM_SCENARIO" "$BASELINE_DRIVER_NAME" "$round_dir/baseline.json"
+            run_leg "$CONFIRM_SCENARIO" "$CANDIDATE_DRIVER_NAME" "$round_dir/candidate.json"
+        fi
+        cpu_sample "confirm${round}-end"
+        "$BENCH_PYTHON" "$COMPARE_SCRIPT" \
+            --baseline "$round_dir/baseline.json" \
+            --candidate "$round_dir/candidate.json" \
+            --repetitions "$REPETITIONS" \
+            --regression-ratio "$REGRESSION_RATIO" \
+            --improvement-ratio "$IMPROVEMENT_RATIO" \
+            --output-dir "$round_dir" \
+            --ratios-out "$round_dir/ratios.txt" \
+            --no-summary \
+            --no-fail-on-regression \
+            "${GBENCH_ARGS[@]}" > "$round_dir/comparison.log"
+    done
+
+    for index in "${!VERIFY_NAMES[@]}"; do
+        name="${VERIFY_NAMES[$index]}"
+        kind="${VERIFY_KINDS[$index]}"
+        ratios=()
+        for round in $(seq 1 "$CONFIRM_RUNS"); do
+            value="$(
+                awk -F'\t' -v id="$name" '$1 == id { print $2; exit }' \
+                    "$CONFIRM_DIR/round$round/ratios.txt"
+            )"
+            [ -n "$value" ] && ratios+=("$value")
+        done
+        if [ "${#ratios[@]}" -ne "$CONFIRM_RUNS" ]; then
+            echo "ERROR: expected $CONFIRM_RUNS confirmation ratios for '$name';" \
+                "found ${#ratios[@]}" >&2
+            exit 1
+        fi
+        hits="$(
+            printf '%s\n' "${ratios[@]}" |
+                awk -v thr="$REGRESSION_RATIO" -v imp="$IMPROVEMENT_RATIO" -v kind="$kind" '
+                    kind == "regression" { if ($1 + 0 >= thr) count++; next }
+                    { if ($1 + 0 <= 1 / imp) count++ }
+                    END { print count + 0 }'
+        )"
+        regression_hits="$(
+            printf '%s\n' "${ratios[@]}" |
+                awk -v thr="$REGRESSION_RATIO" '
+                    $1 + 0 >= thr { count++ }
+                    END { print count + 0 }'
+        )"
+        # Median of the confirmation rounds only. The initial pass is excluded on
+        # purpose: a benchmark is re-measured because that pass was extreme, so
+        # letting it vote again would let the outlier under test decide its own
+        # verdict and could contradict a quorum that cleared it.
+        median="$(
+            printf '%s\n' "${ratios[@]}" | sort -n |
+                awk '{ v[NR] = $1 + 0 }
+                     END { if (NR % 2) printf "%.6f\n", v[(NR + 1) / 2];
+                           else printf "%.6f\n", (v[NR / 2] + v[NR / 2 + 1]) / 2 }'
+        )"
+        echo ">>> $name: reproduced $hits/$CONFIRM_RUNS in the initial direction," \
+            "regressed $regression_hits/$CONFIRM_RUNS, confirmation median $median"
+        CONFIRMATION_ARGS+=(
+            --confirmation "$name" "$hits" "$regression_hits" "$median"
+        )
+    done
 fi
-# Exit 2 means the comparison completed and the optional gate tripped. Delay that
-# exit until after summary.md is echoed so failed runs remain diagnosable from logs.
+
+final_args=(
+    "${three_way_args[@]}"
+    --output-dir "$RESULTS_DIR"
+    --confirm-runs "$CONFIRM_RUNS"
+    --confirm-quorum "$CONFIRM_QUORUM"
+    "${CONFIRMATION_ARGS[@]}"
+)
+if [ "$FAIL_ON_REGRESSION" != "1" ]; then
+    final_args+=(--no-fail-on-regression)
+fi
+# Exit 2 means the comparison completed and the gate tripped. Delay that exit
+# until after summary.md is echoed so failed runs remain diagnosable from logs.
 set +e
-python3 "${compare_args[@]}"
+"$BENCH_PYTHON" "$COMPARE_SCRIPT" "${final_args[@]}"
 compare_rc=$?
 set -e
 if [ "$compare_rc" -ne 0 ] && [ "$compare_rc" -ne 2 ]; then

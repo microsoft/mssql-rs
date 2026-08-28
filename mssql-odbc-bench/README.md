@@ -125,21 +125,98 @@ commit in `perf-lab/baseline-commit.txt`, and Microsoft ODBC Driver 18 from the
 version in `perf-lab/msodbcsql-version.txt`. Candidate and baseline order is
 reversed between workloads, with Microsoft ODBC between them. The result
 summary reports candidate changes relative to both comparison drivers; only
-the candidate-versus-mssql-odbc-baseline result participates in the optional
-regression gate. Raw Google Benchmark JSON and the median comparison are
-written to the repository-level `results` directory.
+the candidate-versus-mssql-odbc-baseline result participates in the regression
+gate. Raw Google Benchmark JSON and every comparison artifact are written to
+the repository-level `results` directory.
+
+### Gate and confirmation
+
+The default regression threshold is **5%** (`1.05`), matching the fixed-baseline
+`mssql-tds` runner, and a confirmed regression **fails the run by default**.
+
+The initial five-sample median is a screening pass, not the verdict. It selects
+the candidate-vs-baseline regressions plus at most three of the largest apparent
+improvements, and the runner then re-measures exactly those benchmarks with the
+candidate and the pinned baseline back-to-back for **four confirmation rounds**.
+The runners alternate which driver runs first to cancel stable position effects.
+A result counts only when it reproduces in at least **3 of 4** rounds. The
+headline wall-time change for a re-measured benchmark is the median of those
+four confirmation ratios; the initial pass that triggered the re-measurement is
+excluded so the outlier under test does not vote on its own verdict. Regression
+hits are tracked independently from the initial direction, so an apparent
+improvement that reverses into a 3-of-4 regression still fails the gate. Microsoft
+ODBC stays informational and never gates.
+
+The harness filters by scenario rather than by benchmark id, so the runner maps
+each flagged benchmark back to its scenario and runs one process covering all
+selected scenarios. Confirmation raw JSON, ratios, and per-round comparisons are
+kept under `results/confirm/round<N>/`; the pre-confirmation comparison is kept
+under `results/initial/`. Only the final report is written as `summary.md`.
+
+### Comparison engine
+
+Pairwise comparison is done by Google Benchmark's own `tools/compare.py` and
+`gbench.report`, taken from the pinned v1.9.1 checkout in the CMake build tree,
+so the tool and the harness stay on the same version. It is run twice — Rust
+baseline vs candidate and Microsoft vs candidate — and both its text and JSON
+outputs are retained. `.pipeline/scripts/compare-odbc-benchmarks.py` remains a
+thin policy/report wrapper: exact benchmark-set validation, the combined
+three-way report, custom throughput counters and pins, the gate, the
+confirmation overrides, and the Azure DevOps Markdown.
+
+The Mann-Whitney U test is disabled explicitly (`--no-utest`). Google Benchmark
+documents nine repetitions as the minimum for a meaningful U test and the lab
+runs five, so its p-values would be published without being trustworthy;
+reproduction is established by the confirmation rounds instead. The official
+Python code imports NumPy and SciPy at module scope even with `--no-utest`, so
+both runners provision them into a private virtualenv under `target/` when the
+host interpreter lacks them.
+
+### Noise controls
+
+Both runners capture a SQL Server configuration snapshot with sqlcmd (the shared
+`mssql-tds-bench/perf-lab/sql-config-dump.sql`) to `results/sql-config.txt`, and
+bracket the initial pass and every confirmation round with CPU
+frequency/utilization samples in `results/cpu-telemetry.csv`. Both honor
+`PERF_CLIENT_CPUS`/`BENCH_CPUS` for client CPU pinning.
+
+Large-buffer allocation is tuned per platform because each retrieval allocates
+bound rowset buffers for up to 600 columns by 1024 rows. Linux raises
+`MALLOC_MMAP_THRESHOLD_` and disables heap trimming so those buffers are reused
+instead of being re-mmapped and re-faulted every repetition. Windows has no
+environment-level equivalent, so it keeps the child off the debug heap
+(`_NO_DEBUG_HEAP`), raises the process priority class (inherited by every
+benchmark leg), and requests the High performance power scheme; priority and
+power scheme are restored when the run ends, as are process affinity and the
+prior `_NO_DEBUG_HEAP` environment state.
+
+Connection-churn network tuning is deliberately **not** applied. The
+`mssql-tds` runner widens the ephemeral port range and enables TIME_WAIT reuse
+for its `concurrent_connects` benchmark; this harness opens one connection in
+`OdbcSession`, holds it for the whole process, and measures only statement
+execution and fetching, so there is no port pressure to relieve.
+
+### Report
 
 The shared PerfTest template uploads `results/summary.md` to the Azure DevOps
 Summary tab. It starts with the gate verdict and a three-median wall-time table,
 then shows separate candidate-vs-baseline and candidate-vs-Microsoft diverging
-bar tables. Green means lower wall time and red means higher wall time. One
-square represents about five percentage points, capped at 20 squares so the
-expected 60-95% ODBC differences stay readable. Every row also states the exact
-wall-time change and comparator/candidate speedup factor. The runner echoes the
-same report to the step log and retains raw JSON, context, text comparison, and
-JSON comparison artifacts.
+bar tables, then an initial-vs-confirmed section listing what was flagged, how
+many rounds reproduced it, and the confirmed change. Green means lower wall time
+and red means higher wall time. One square represents about five percentage
+points, capped at 20 squares so the expected 60-95% ODBC differences stay
+readable. Every row also states the exact wall-time change and
+comparator/candidate speedup factor; `⟳` marks a re-measured benchmark. The
+runner echoes the same report to the step log.
 
-The perf-lab scripts default to five repetitions and report regressions without
-failing the run while initial variance is established. Set
-`ODBC_BENCH_REPETITIONS` to change the sample count and
-`ODBC_BENCH_FAIL_ON_REGRESSION=1` to make the 10% comparison threshold a gate.
+### Perf-lab environment
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ODBC_BENCH_REPETITIONS` | `5` | Samples per driver/workload |
+| `ODBC_BENCH_REGRESSION_RATIO` | `1.05` | Regression threshold |
+| `ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO` | regression ratio | Threshold for verifying apparent wins |
+| `ODBC_BENCH_IMPROVEMENT_VERIFY_MAX` | `3` | Cap on re-measured improvements |
+| `ODBC_BENCH_CONFIRM_RUNS` | `4` | Confirmation rounds |
+| `ODBC_BENCH_CONFIRM_QUORUM` | majority (`3`) | Rounds required to confirm |
+| `ODBC_BENCH_FAIL_ON_REGRESSION` | `1` | Set `0` to publish the report without gating |
