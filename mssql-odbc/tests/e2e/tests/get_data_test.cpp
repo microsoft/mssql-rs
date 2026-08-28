@@ -58,9 +58,15 @@ std::string ReadCharDataInChunks(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_siz
 // Encodes UTF-16 code units as UTF-8 without <codecvt> (deprecated), so a
 // fetched value can be compared against a plain string literal.
 //
-// Only a well-formed surrogate pair is combined. A lone or split surrogate is
-// passed through as-is rather than repaired, so a driver bug that splits a pair
-// across a chunk boundary shows up as a mismatch instead of being hidden here.
+// Only a well-formed surrogate pair is combined; a lone surrogate is passed
+// through as-is rather than repaired, so a genuinely malformed value is not
+// silently cleaned up here.
+//
+// This says nothing about chunk boundaries: the units arrive already flattened,
+// so a pair whose halves came from two SQLGetData calls is indistinguishable
+// from one delivered whole -- and correctly so, because splitting a pair across
+// calls is legal (SQL_C_WCHAR chunks in code units). Callers that need to see
+// boundaries take the per-call counts from ReadWCharDataInChunksAsUtf8.
 std::string Utf16ToUtf8(const std::u16string& units) {
     std::string out;
     for (size_t i = 0; i < units.size(); ++i) {
@@ -1303,11 +1309,11 @@ TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
 //
 // msodbcsql instead delivers one payload byte per call for the first shape --
 // 'a' as 0x61, 'e-acute' as 0xE9, CJK as 0x3F ('?') -- because it converts
-// SQL_C_CHAR to the client ANSI codepage, where every character is one byte
-// (and unrepresentable ones are best-fit away, losing data). mssql-odbc
-// delivers UTF-8, where a character is 1-4 bytes. Matching it needs an
-// unflushed-tail buffer in ActivePlpStream; tracked separately. Hence the skip
-// on the comparison leg.
+// SQL_C_CHAR to the client codepage, and the codepage measured here is
+// single-byte, so every character is one byte (and unrepresentable ones are
+// best-fit away, losing data). mssql-odbc delivers UTF-8, where a character is
+// 1-4 bytes. Matching it needs an unflushed-tail buffer in ActivePlpStream;
+// tracked separately. Hence the skip on the comparison leg.
 TEST_F(GetDataLiveTest, PlpSubMinimalBufferIsRejectedButProbeIsAnswered) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(

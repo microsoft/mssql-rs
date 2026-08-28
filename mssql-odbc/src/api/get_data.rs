@@ -243,11 +243,15 @@ fn write_captured_column(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    // Codepage note: SQL_C_CHAR output is UTF-8. This diverges from msodbcsql,
-    // which converts character data to the client's Windows ANSI codepage. The
-    // divergence is intentional (this driver is codepage-agnostic and UTF-8
-    // native); callers that need ANSI must transcode. SQL_C_WCHAR is UTF-16LE on
-    // both drivers.
+    // Codepage note: SQL_C_CHAR output is UTF-8, unconditionally. msodbcsql
+    // instead converts to the client codepage, which it derives per platform:
+    // `GetACP()` on Windows, `nl_langinfo(CODESET)` mapped to a codepage on
+    // Linux/macOS, defaulting to UTF-8 (`Sql/Common/include/Localization.hpp`,
+    // `LocalizationImpl.hpp`). So the two agree under a UTF-8 locale and
+    // diverge under any other -- notably on Windows, where the ANSI codepage is
+    // single-byte and unrepresentable characters are best-fit away. This
+    // driver is codepage-agnostic by design; callers wanting the client
+    // codepage must transcode. SQL_C_WCHAR is UTF-16LE on both drivers.
 
     // C-type legality (HY003) is settled by the caller before dispatch; what is
     // left here is whether this driver can deliver a value into a valid target.
@@ -650,9 +654,10 @@ fn stream_active_plp_chunk(
         // Binary columns have no delivery path yet and return HYC00
         // (AB#47239).
         //
-        // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8,
-        // which diverges from msodbcsql's Windows ANSI codepage conversion. This
-        // is intentional; SQL_C_WCHAR is UTF-16LE on both drivers.
+        // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8
+        // unconditionally, where msodbcsql converts to the client codepage it
+        // derives from the platform -- so the two agree under a UTF-8 locale and
+        // diverge under any other. SQL_C_WCHAR is UTF-16LE on both drivers.
         let stream = stmt_state.active_plp.as_ref();
         let encoding = stream.map(|s| s.encoding);
         // A narrow column can only be widened when its collation resolved to a
