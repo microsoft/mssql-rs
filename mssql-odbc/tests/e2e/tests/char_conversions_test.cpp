@@ -87,6 +87,37 @@ protected:
         }
         return std::string(reinterpret_cast<const char*>(buf));
     }
+
+    // serialize_string picks the code page from the collation's LCID alone, so
+    // only the LCID has to be Latin1 for U+65E5 to be unmappable. The parameter
+    // carries the *database* collation, which need not match the instance's.
+    bool DatabaseIsLatin1() {
+        EXPECT_SQL_OK(
+            Prepare("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation')"
+                    " AS VARCHAR(128))"),
+            SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        const std::string collation = GetColumnChar(1);
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        return collation.find("Latin1_General") != std::string::npos;
+    }
+
+    // A round trip on the same connection after a failed execute. A dead
+    // connection fails here (08S01) instead of returning the value.
+    //
+    // Any cursor the caller left open must be closed first: reusing the
+    // statement while one is live is 24000, which says nothing about the
+    // connection and would mask what this is checking.
+    void ExpectConnectionStillUsable() {
+        SQLCloseCursor(stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(Prepare("SELECT 'alive'"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("alive", GetColumnChar(1));
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
 };
 
 // The declared wire type follows ParameterType, not the C type that was bound,
@@ -831,4 +862,89 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSilentlyCorrupted) {
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("&#26085;", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+
+// ---------------------------------------------------------------------------
+// A value rejected part-way through a request must cost the request, not the
+// connection. The RPC is flushed in packets as it is built, so a rejection
+// after a flush leaves the server holding an incomplete message; unless it is
+// withdrawn (EOM | IGNORE, then its DONE consumed) the next command is read as
+// a continuation and the server answers 4002 - on a *later* statement than the
+// one that failed. See AB#47687.
+//
+// The two drivers reach that state from different points, because they order
+// conversion and sending differently: msodbcsql converts each parameter as the
+// RPC is written (`ParamToSQLType`, "pre-convert ... to catch errors and
+// truncations"), while this driver converts every parameter into RpcParameters
+// before a byte is serialized. So a conversion error strands msodbcsql
+// mid-message but never strands us; only a *serialization*-time rejection does.
+// Both cases are covered below.
+//
+// For the shared mechanism exercised on both drivers at once, see
+// SQLCancelAfterAFlushRetractsTheRequest in execute_test.cpp.
+// ---------------------------------------------------------------------------
+
+// Strands msodbcsql mid-message: parameter 1 is legal and larger than a packet,
+// and parameter 2 fails its conversion, so `ParamToSQLType` errors with bytes
+// already on the wire (its STATE_BATCH_PARTIALCMDSENT). This driver rejects
+// parameter 2 before serializing anything, so it takes the local-discard branch
+// instead. Both must leave the connection usable, which is what this asserts.
+TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUsable) {
+    ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
+
+    // ColumnSize 0 is the `max` spelling, so no length bound applies to this one.
+    std::vector<SQLCHAR> big(20000, 'a');
+    SQLLEN big_ind = static_cast<SQLLEN>(big.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 0, 0,
+                                   big.data(), big_ind, &big_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Ten characters into varchar(4), with a non-blank overflow, so neither
+    // driver may trim it silently.
+    AsciiParam overlong(SQL_C_CHAR, "abcdefghij");
+    ASSERT_SQL_OK(BindAscii(2, overlong, SQL_VARCHAR, 4), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+
+    ExpectConnectionStillUsable();
+}
+
+// Strands *this* driver mid-message, which msodbcsql cannot be made to do here:
+// the value passes our UTF-16 unit count at one unit, then expands to the eight
+// bytes of "&#26085;" inside serialize_string and is rejected against
+// varchar(1) - after parameter 1 has already flushed a packet. msodbcsql
+// measures the converted bytes first, substitutes the unmappable character to a
+// single byte, and sends the value without error. The connection invariant is
+// not driver-specific, so this runs under comparison; on msodbcsql it passes
+// without exercising any recovery.
+TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectionUsable) {
+    if (!DatabaseIsLatin1()) {
+        GTEST_SKIP() << "needs a Latin1 collation to make the value unmappable";
+    }
+
+    ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> big(20000, 'a');
+    SQLLEN big_ind = static_cast<SQLLEN>(big.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 0, 0,
+                                   big.data(), big_ind, &big_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR wide[] = {0x65E5};
+    SQLLEN ind = static_cast<SQLLEN>(sizeof(wide));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 1, 0, wide,
+                                   ind, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Deliberately unasserted: this driver rejects the value, msodbcsql
+    // substitutes it and succeeds. A success leaves a live cursor, which has to
+    // be drained here rather than left for the connection check to trip over.
+    if (SQLExecute(stmt_) != SQL_ERROR) {
+        while (SQLFetch(stmt_) == SQL_SUCCESS) {
+        }
+        SQLCloseCursor(stmt_);
+    }
+
+    ExpectConnectionStillUsable();
 }

@@ -141,9 +141,19 @@ impl SuspendedMessage {
         self.is_first_packet
     }
 
-    /// Discards an unsent message, returning any RESETCONNECTION request it was
-    /// carrying to `network_writer`.
+    /// Replaces the write timeout this message inherited from the request that
+    /// opened it.
     ///
+    /// Withdrawing a request must be bounded even when the request itself was
+    /// not, so the retraction paths swap in their own budget rather than
+    /// resuming under `None`.
+    pub(crate) fn with_write_timeout(mut self, max_timeout_sec: Option<u32>) -> Self {
+        self.max_timeout_sec = max_timeout_sec;
+        self
+    }
+
+    /// Discards an unsent message, returning any RESETCONNECTION request it was
+    /// carrying to `network_writer`.    ///
     /// [`PacketWriter::new`] consumes the connection's pending reset bit so it
     /// applies to exactly one message. Dropping a message that never reached the
     /// network would therefore swallow the reset: the transport no longer holds
@@ -849,6 +859,23 @@ pub(crate) mod tests {
             writer.get_cursor().position(),
             (PacketWriter::PACKET_HEADER_SIZE + 1) as u64
         );
+    }
+
+    /// A retraction must not inherit the write timeout of the request it is
+    /// withdrawing: that request may have had none, and blocking forever while
+    /// giving up a connection is the failure this bound exists to prevent.
+    #[test]
+    fn with_write_timeout_replaces_the_inherited_budget() {
+        let mut mock = MockNetworkWriter::new(16);
+        let writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let message = writer.suspend();
+        assert_eq!(
+            message.max_timeout_sec, None,
+            "a request without a timeout suspends with none"
+        );
+
+        let message = message.with_write_timeout(Some(120));
+        assert_eq!(message.max_timeout_sec, Some(120));
     }
 
     #[test]

@@ -448,6 +448,56 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// The same cancel once a chunk has crossed a packet boundary. This is the one
+// place both drivers reach the partial-send state from the same event, so it is
+// the parity case for the retraction itself: msodbcsql's BATCHCTX::Cancel takes
+// its STATE_BATCH_PARTIALCMDSENT arm (EOM | IGNORE, then FlushInputStream), and
+// this driver takes `cancel_streamed_write`. The test above cancels after seven
+// bytes, which never leaves the local buffer, so it only covers the discard
+// branch. See AB#47687.
+TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    // Larger than the default 8000-byte packet, so at least one packet of this
+    // request is on the wire before the cancel.
+    std::vector<char> chunk(20000, 'a');
+    ASSERT_SQL_OK(SQLPutData(stmt_, chunk.data(), static_cast<SQLLEN>(chunk.size())),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLUINTEGER dead = SQL_CD_TRUE;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead,
+                                    SQL_IS_UINTEGER, nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(SQL_CD_FALSE, dead)
+        << "a retracted request must not cost the connection";
+
+    // The withdrawal is only complete once the server's DONE has been consumed.
+    // If it were left unread the next command would pick it up as its own, so
+    // running a fresh statement to completion is what proves the retraction.
+    const char reuse[] = "after-cancel";
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(reuse), 12),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("after-cancel", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // A data-at-execution parameter may resolve to NULL: the first SQLPutData
 // carries SQL_NULL_DATA and no chunks follow, so the driver emits PLP_NULL.
 // Benefits-from-mock-tds: COALESCE only proves the server saw *a* NULL. A mock
