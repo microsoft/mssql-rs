@@ -1185,7 +1185,9 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
         ColumnValues::Json(j) => {
             String::from_utf8(j.bytes.clone()).map_err(|_| TextError::Malformed)
         }
-        ColumnValues::Uuid(u) => Ok(u.to_string()),
+        // msodbcsql renders a uniqueidentifier in upper case; uuid's Display is
+        // lower case.
+        ColumnValues::Uuid(u) => Ok(u.to_string().to_ascii_uppercase()),
         ColumnValues::Vector(vec) => Ok(format_vector(vec)),
         ColumnValues::Date(_)
         | ColumnValues::Time(_)
@@ -1909,6 +1911,18 @@ mod tests {
         assert_eq!(strip_sub_one_leading_zero("-1.5000".into()), "-1.5000");
         assert_eq!(strip_sub_one_leading_zero("0".into()), "0");
         assert_eq!(strip_sub_one_leading_zero("-0".into()), "-0");
+    }
+
+    /// Same reasoning as the strip rule: msodbcsql renders a uniqueidentifier
+    /// in upper case and `uuid`'s Display is lower case, so this is a one-word
+    /// change away from silently diverging again.
+    #[test]
+    fn guid_renders_in_upper_case() {
+        let g = uuid::Uuid::parse_str("0123abcd-4567-89ef-0123-456789abcdef").unwrap();
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Uuid(g)).ok().unwrap(),
+            "0123ABCD-4567-89EF-0123-456789ABCDEF"
+        );
     }
 
     /// Covers the wiring as well as the helper: a sub-one value has to arrive
