@@ -14,7 +14,7 @@ use crate::api::sqlstate::{ERR_INVALID_USE_OF_AUTO_DESC, SQLSTATE_HY000, post_di
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{
-    DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw,
+    DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw, is_live,
 };
 use mssql_tds::connection::tds_client::StatementId;
 
@@ -153,13 +153,23 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
 
 /// Mirrors msodbcsql's `SQLFreeStmt(SQL_DROP)` behavior.
 ///
-/// If the STMT is not found in the parent DBC's statement list, it was
-/// already dropped by `SQLDisconnect` — returns `SQL_SUCCESS` without
-/// calling `free_handle`.
+/// If the handle was already freed by an earlier `SQLDisconnect` cascading
+/// cleanup (`sql_disconnect_safe`), returns `SQL_SUCCESS` immediately without
+/// dereferencing it — that cleanup happens behind the Driver Manager's back,
+/// so an application legitimately holding this now-stale handle can still
+/// reach here (mssql-rs#400). If the STMT is somehow not found in the parent
+/// DBC's statement list despite still being live, it was already dropped by
+/// some other path — also returns `SQL_SUCCESS` without calling `free_handle`
+/// a second time.
 ///
 /// # Safety
 /// `handle` must be a live `StmtHandle` created by `alloc_stmt`.
 unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
+    if !is_live(handle) {
+        debug!(?handle, "SQLFreeHandle(STMT): handle already freed, no-op");
+        return SQL_SUCCESS;
+    }
+
     let stmt = unsafe { handle_from_raw::<StmtHandle>(handle) };
     debug_assert_eq!(
         stmt.object_type,
@@ -213,13 +223,22 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 /// several statements at once is a supported case, not an error: every one of
 /// them is reset, not just the first found.
 ///
-/// If the descriptor is not found in the parent DBC's descriptor list, it was
-/// already dropped by `SQLDisconnect` — returns `SQL_SUCCESS` without calling
-/// `free_handle` a second time, mirroring `free_stmt`'s identical guard.
+/// If the handle was already freed by an earlier `SQLDisconnect` cascading
+/// cleanup (`sql_disconnect_safe`), returns `SQL_SUCCESS` immediately without
+/// dereferencing it — mirrors `free_stmt`'s identical guard and the same
+/// reasoning (mssql-rs#400). If the descriptor is somehow not found in the
+/// parent DBC's descriptor list despite still being live, it was already
+/// dropped by some other path — also returns `SQL_SUCCESS` without calling
+/// `free_handle` a second time.
 ///
 /// # Safety
 /// `handle` must be a live `DescHandle` created by `alloc_desc`.
 unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
+    if !is_live(handle) {
+        debug!(?handle, "SQLFreeHandle(DESC): handle already freed, no-op");
+        return SQL_SUCCESS;
+    }
+
     let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
     debug_assert_eq!(
         desc.object_type,
@@ -501,6 +520,45 @@ mod tests {
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
+    /// Reproduces mssql-rs#400: freeing a stale STMT handle a second time —
+    /// standing in for the real scenario, where `SQLDisconnect` cascades-frees
+    /// it first and an application legitimately still holds the handle
+    /// afterward — must return `SQL_SUCCESS` without dereferencing it.
+    ///
+    /// Before the `is_live` guard, this would panic on the `debug_assert_eq!`
+    /// a few lines into `free_stmt`: nothing reallocates the freed memory in
+    /// this single-threaded test, so it still holds the `HandleType::Invalid`
+    /// tombstone `free_handle` stamped on the first free, which doesn't match
+    /// `HandleType::Stmt` — a panic `ffi_entry!` catches and reports as
+    /// `SQL_ERROR`. That return code (not a crash) was the only prior signal
+    /// something had gone wrong; on an allocator that reuses the block
+    /// instead of leaving the tombstone intact (observed on macOS in CI),
+    /// there would have been no signal at all. `is_live` now short-circuits
+    /// before any of that, so this never reaches the assert either way.
+    #[test]
+    fn free_stmt_twice_is_a_no_op_not_a_panic() {
+        let (env, dbc) = alloc_env_dbc();
+
+        let mut stmt: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) },
+            SQL_SUCCESS,
+            "freeing an already-freed STMT handle must no-op, not panic"
+        );
+
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
     /// Freeing a statement mid data-at-execution must drain the parked
     /// sequence rather than drop the handle with it intact. A dropped
     /// `DaeState` takes the connection's client with it, leaving the DBC with
@@ -597,6 +655,33 @@ mod tests {
 
         let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
         assert_eq!(ret, SQL_SUCCESS);
+
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    /// Reproduces mssql-rs#400 for descriptors: same scenario and reasoning
+    /// as `free_stmt_twice_is_a_no_op_not_a_panic`, but through `free_desc`'s
+    /// own `debug_assert_eq!` a few lines in.
+    #[test]
+    fn free_desc_twice_is_a_no_op_not_a_panic() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) },
+            SQL_SUCCESS,
+            "freeing an already-freed DESC handle must no-op, not panic"
+        );
 
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };

@@ -83,7 +83,14 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     // the DBC lock). However, a call that already took the client and is mid-execute() holds
     // no locks during I/O, so it can race here and access a STMT handle we are about to free.
     // TODO: fix with refcounted handle lifetimes so STMT handles cannot be freed while in use.
-    for &stmt_ptr in &state.statements {
+    //
+    // Pops (rather than iterating then clearing) so a poisoned STMT mutex
+    // leaves only the not-yet-freed remainder in `state.statements`: a
+    // retried `SQLDisconnect` — a reasonable response to the `SQL_ERROR` this
+    // returns — picks up where this one stopped instead of double-freeing the
+    // statements already dropped this pass (mssql-rs#401). Matches the
+    // descriptor loop directly below, which already does this.
+    while let Some(stmt_ptr) = state.statements.pop() {
         // SAFETY: `stmt_ptr` came from `handle_to_raw::<StmtHandle>` and is still
         // live (the DBC owns it). Acquire the STMT lock to serialize with any
         // op still holding it, then drop the box.
@@ -95,7 +102,6 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         drop(guard);
         unsafe { free_handle::<StmtHandle>(stmt_ptr) };
     }
-    state.statements.clear();
 
     // Drop all explicitly-allocated DESC handles, after the statements: an
     // explicit descriptor carries no back-pointer to whichever statements had
@@ -236,6 +242,91 @@ mod tests {
         // before the read) but not on macOS, whose allocator reused it
         // sooner. The connection no longer tracking the descriptor (checked
         // above) is the real, safely-observable contract.
+
+        unsafe {
+            sql_free_handle(SQL_HANDLE_DBC, dbc);
+            sql_free_handle(SQL_HANDLE_ENV, env);
+        }
+    }
+
+    /// Reproduces mssql-rs#401: a poisoned STMT mutex partway through the
+    /// statement-free loop must leave every *not-yet-processed* statement
+    /// untouched for a retry, not just stop and leave the whole original list
+    /// in place. The pop-then-free shape (matching the descriptor loop
+    /// directly below it) removes each pointer from `state.statements`
+    /// *before* attempting to free it, so a retried `SQLDisconnect` never
+    /// re-walks — and re-frees — a statement this pass already dropped.
+    #[test]
+    fn disconnect_retry_after_poisoned_stmt_mutex_does_not_double_free() {
+        use crate::api::odbc_types::SQL_HANDLE_STMT;
+        use crate::handles::dbc::ConnectionState;
+
+        let mut env: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    env,
+                    SQL_ATTR_ODBC_VERSION,
+                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
+            SQL_SUCCESS
+        );
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+        dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+        let mut stmt1: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt1) },
+            SQL_SUCCESS
+        );
+        let mut stmt2: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt2) },
+            SQL_SUCCESS
+        );
+
+        // Poison stmt2's mutex — the loop pops in LIFO order, so stmt2 (the
+        // more recently pushed) is attempted first and fails immediately,
+        // before stmt1 is ever touched.
+        let stmt2_ref = unsafe { handle_from_raw::<StmtHandle>(stmt2) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stmt2_ref.inner.lock().unwrap();
+            panic!("poison the stmt lock");
+        }));
+
+        assert_eq!(unsafe { sql_disconnect(dbc) }, SQL_ERROR);
+        {
+            let state = dbc_ref.inner.lock().unwrap();
+            // stmt2 was popped off (and so can no longer be double-freed by
+            // a retry) even though its own free could not proceed — a
+            // poisoned mutex can't be safely retried, so leaking it here is
+            // the same accepted trade-off the descriptor loop already makes.
+            // stmt1 was never reached and must still be tracked, untouched.
+            assert_eq!(state.statements, vec![stmt1]);
+            assert_eq!(state.connection_state, ConnectionState::Connected);
+        }
+
+        // Retry: connection_state is still Connected, so this is accepted
+        // and frees stmt1 exactly once. Before this fix, a retry here would
+        // re-walk the *original* two-element list collected before the first
+        // pass failed, re-freeing stmt1 a second time.
+        assert_eq!(unsafe { sql_disconnect(dbc) }, SQL_SUCCESS);
+        assert!(dbc_ref.inner.lock().unwrap().statements.is_empty());
+
+        // stmt2's box was deliberately never dropped (poisoned mutex —
+        // leaked, not freed); free it directly so this test doesn't leak.
+        unsafe { free_handle::<StmtHandle>(stmt2) };
 
         unsafe {
             sql_free_handle(SQL_HANDLE_DBC, dbc);
