@@ -1,6 +1,7 @@
 # Fixed-baseline ODBC performance pipeline - WINDOWS (dedicated perf lab)
 #
-# Windows counterpart to odbc-perf-baseline-linux-pipeline.yml. The two
+# Windows counterpart to odbc-perf-baseline-linux-pipeline.yml. It compares
+# candidate and pinned-baseline mssql-odbc with pinned Microsoft ODBC 18. The
 # platforms have independent measurements and must not share regression ratios.
 
 trigger: none
@@ -32,4 +33,4 @@ extends:
           else
             echo "summary.md not found"
           fi
-        displayName: 'Show ODBC benchmark comparison'
+        displayName: 'Show ODBC three-way comparison'

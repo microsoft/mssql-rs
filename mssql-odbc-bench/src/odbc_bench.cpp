@@ -756,6 +756,7 @@ Config Config::from_environment() {
 
 std::string Config::connection_string() const {
     std::ostringstream connection;
+    // The Rust and Microsoft drivers recognize different packet-size spellings.
     connection << "Driver=" << brace_connection_value(driver)
                << ";Server=" << brace_connection_value(server)
                << ";Database=" << brace_connection_value(database)
@@ -764,6 +765,7 @@ std::string Config::connection_string() const {
                << ";TrustServerCertificate="
                << brace_connection_value(trust_certificate)
                << ";Encrypt=" << brace_connection_value(encrypt)
+               << ";Packet Size=" << packet_size
                << ";PacketSize=" << packet_size << ';';
     return connection.str();
 }
@@ -967,6 +969,7 @@ public:
 
 private:
     void prepare_statement() {
+        // Microsoft ODBC leaves this unchanged on terminal SQL_NO_DATA.
         rows_fetched_ = 0;
         require_exact_success(
             SQLSetStmtAttr(session_.statement(), SQL_ATTR_ROW_BIND_TYPE,
@@ -1071,7 +1074,7 @@ private:
                         buffer.reset_indicators();
                     }
                 }
-                rows_fetched_ = std::numeric_limits<SQLULEN>::max();
+                rows_fetched_ = 0;
                 const SQLRETURN rc =
                     SQLFetchScroll(session_.statement(), SQL_FETCH_NEXT, 0);
                 if (rc == SQL_NO_DATA) {

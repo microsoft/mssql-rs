@@ -224,11 +224,13 @@ function Invoke-BenchmarkLeg {
 $RepoRoot = (Get-Location).Path
 $ResultsDir = Join-Path $RepoRoot 'results'
 $BaselineFile = Join-Path $RepoRoot 'mssql-odbc-bench\perf-lab\baseline-commit.txt'
+$ReferenceVersionFile = Join-Path $RepoRoot 'mssql-odbc-bench\perf-lab\msodbcsql-version.txt'
 $HarnessBuildDir = Join-Path $RepoRoot 'target\odbc-bench'
 $CandidateTargetDir = Join-Path $RepoRoot 'target\odbc-candidate'
 $BaselineTargetDir = Join-Path $RepoRoot 'target\odbc-baseline'
 $CandidateDriverName = 'MSSQL Rust ODBC Perf Candidate'
 $BaselineDriverName = 'MSSQL Rust ODBC Perf Baseline'
+$MicrosoftDriverName = 'ODBC Driver 18 for SQL Server'
 $script:OdbcInstRoot = 'HKLM:\Software\ODBC\ODBCINST.INI'
 $script:DriversRegKey = "$script:OdbcInstRoot\ODBC Drivers"
 $script:Repetitions = Get-PositiveIntEnv -Name 'ODBC_BENCH_REPETITIONS' -Default 5
@@ -287,6 +289,28 @@ if ($LASTEXITCODE -ne 0) {
     throw "Baseline commit $BaselineCommit is absent from the checkout"
 }
 
+if (-not (Test-Path -LiteralPath $ReferenceVersionFile)) {
+    throw "Reference version file not found: $ReferenceVersionFile"
+}
+$MicrosoftVersion = (Get-Content -LiteralPath $ReferenceVersionFile |
+    Where-Object { $_ -notmatch '^\s*(#|$)' } |
+    Select-Object -First 1).Trim()
+if ($MicrosoftVersion -notmatch '^[0-9]+(\.[0-9]+){3}$') {
+    throw "Invalid Microsoft ODBC version in $ReferenceVersionFile"
+}
+& (Join-Path $RepoRoot '.pipeline\scripts\install-msodbcsql.ps1') `
+    -Version $MicrosoftVersion
+$MicrosoftKey = "$script:OdbcInstRoot\$MicrosoftDriverName"
+if (-not (Test-Path -LiteralPath $MicrosoftKey)) {
+    throw "'$MicrosoftDriverName' was not registered after installation"
+}
+$MicrosoftDriver = (Get-ItemProperty -LiteralPath $MicrosoftKey -Name 'Driver').Driver
+if (-not $MicrosoftDriver -or -not (Test-Path -LiteralPath $MicrosoftDriver)) {
+    throw "Registered Microsoft ODBC driver path is invalid: $MicrosoftDriver"
+}
+$MicrosoftDriverInfo = (Get-Item -LiteralPath $MicrosoftDriver).VersionInfo
+$MicrosoftDriverSha256 = (Get-FileHash -LiteralPath $MicrosoftDriver -Algorithm SHA256).Hash
+
 $BaselineTempDir = Join-Path ([System.IO.Path]::GetTempPath()) "odbc-perf-$([System.Guid]::NewGuid().ToString('N'))"
 $BaselineTree = Join-Path $BaselineTempDir 'worktree'
 $CandidateState = $null
@@ -334,7 +358,13 @@ try {
     $BaselineDriver = Join-Path $BaselineTargetDir 'release\msodbcsql18.dll'
     $script:BenchExe = Join-Path $HarnessRuntimeDir 'mssql_odbc_bench.exe'
     $AdminExe = Join-Path $HarnessRuntimeDir 'mssql_odbc_bench_admin.exe'
-    foreach ($requiredFile in @($CandidateDriver, $BaselineDriver, $script:BenchExe, $AdminExe)) {
+    foreach ($requiredFile in @(
+            $CandidateDriver,
+            $BaselineDriver,
+            $MicrosoftDriver,
+            $script:BenchExe,
+            $AdminExe
+        )) {
         if (-not (Test-Path -LiteralPath $requiredFile)) {
             throw "Expected build output not found: $requiredFile"
         }
@@ -350,6 +380,10 @@ try {
     $context = @(
         "candidate_commit=$(& git rev-parse HEAD)",
         "baseline_commit=$BaselineCommit",
+        "microsoft_driver_version=$MicrosoftVersion",
+        "microsoft_driver_product_version=$($MicrosoftDriverInfo.ProductVersion)",
+        "microsoft_driver_path=$MicrosoftDriver",
+        "microsoft_driver_sha256=$MicrosoftDriverSha256",
         "repetitions=$script:Repetitions",
         "timestamp_utc=$([DateTime]::UtcNow.ToString('o'))",
         (& rustc -Vv | Out-String).TrimEnd(),
@@ -384,10 +418,14 @@ try {
     $baselineNarrow = Join-Path $ResultsDir 'odbc-baseline-narrow.json'
     $candidateWide = Join-Path $ResultsDir 'odbc-candidate-wide.json'
     $baselineWide = Join-Path $ResultsDir 'odbc-baseline-wide.json'
+    $microsoftNarrow = Join-Path $ResultsDir 'odbc-microsoft-narrow.json'
+    $microsoftWide = Join-Path $ResultsDir 'odbc-microsoft-wide.json'
 
     Invoke-BenchmarkLeg -Scenario 'narrow' -Driver $CandidateDriverName -Output $candidateNarrow
+    Invoke-BenchmarkLeg -Scenario 'narrow' -Driver $MicrosoftDriverName -Output $microsoftNarrow
     Invoke-BenchmarkLeg -Scenario 'narrow' -Driver $BaselineDriverName -Output $baselineNarrow
     Invoke-BenchmarkLeg -Scenario 'wide' -Driver $BaselineDriverName -Output $baselineWide
+    Invoke-BenchmarkLeg -Scenario 'wide' -Driver $MicrosoftDriverName -Output $microsoftWide
     Invoke-BenchmarkLeg -Scenario 'wide' -Driver $CandidateDriverName -Output $candidateWide
 
     $compareArguments = @(
@@ -396,6 +434,9 @@ try {
         '--baseline', $baselineWide,
         '--candidate', $candidateNarrow,
         '--candidate', $candidateWide,
+        '--reference', $microsoftNarrow,
+        '--reference', $microsoftWide,
+        '--reference-label', "Microsoft ODBC $MicrosoftVersion",
         '--output-dir', $ResultsDir,
         '--regression-ratio',
         $(if ($env:ODBC_BENCH_REGRESSION_RATIO) { $env:ODBC_BENCH_REGRESSION_RATIO } else { '1.10' })

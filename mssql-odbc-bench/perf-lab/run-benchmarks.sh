@@ -11,11 +11,13 @@ trap 'rc=$?; echo "ERROR: ${BASH_SOURCE[0]}:${LINENO}: ${BASH_COMMAND} exited ${
 REPO_ROOT="$(pwd)"
 RESULTS_DIR="$REPO_ROOT/results"
 BASELINE_FILE="$REPO_ROOT/mssql-odbc-bench/perf-lab/baseline-commit.txt"
+REFERENCE_VERSION_FILE="$REPO_ROOT/mssql-odbc-bench/perf-lab/msodbcsql-version.txt"
 HARNESS_BUILD_DIR="$REPO_ROOT/target/odbc-bench"
 CANDIDATE_TARGET_DIR="$REPO_ROOT/target/odbc-candidate"
 BASELINE_TARGET_DIR="$REPO_ROOT/target/odbc-baseline"
 CANDIDATE_DRIVER_NAME="MSSQL Rust ODBC Perf Candidate"
 BASELINE_DRIVER_NAME="MSSQL Rust ODBC Perf Baseline"
+MICROSOFT_DRIVER_NAME="ODBC Driver 18 for SQL Server"
 
 BASELINE_TEMP_DIR=""
 BASELINE_TREE=""
@@ -127,6 +129,34 @@ if ! git rev-parse --verify --quiet "${BASELINE_COMMIT}^{commit}" >/dev/null; th
     exit 1
 fi
 
+if [ ! -f "$REFERENCE_VERSION_FILE" ]; then
+    echo "ERROR: reference version file not found: $REFERENCE_VERSION_FILE" >&2
+    exit 1
+fi
+MICROSOFT_VERSION="$(
+    grep -vE '^[[:space:]]*(#|$)' "$REFERENCE_VERSION_FILE" |
+        head -n1 |
+        tr -d '[:space:]'
+)"
+if ! printf '%s' "$MICROSOFT_VERSION" |
+    grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
+    echo "ERROR: invalid Microsoft ODBC version in $REFERENCE_VERSION_FILE" >&2
+    exit 1
+fi
+"$REPO_ROOT/.pipeline/scripts/install-msodbcsql.sh" "$MICROSOFT_VERSION"
+MICROSOFT_PACKAGE_VERSION="$(dpkg-query -W -f='${Version}' msodbcsql18)"
+mapfile -t microsoft_driver_paths < <(
+    dpkg-query -L msodbcsql18 |
+        grep -E '/libmsodbcsql-[0-9.]+\.so\.[0-9.]+$' || true
+)
+if [ "${#microsoft_driver_paths[@]}" -ne 1 ]; then
+    echo "ERROR: expected one installed Microsoft ODBC shared library" >&2
+    printf '  %s\n' "${microsoft_driver_paths[@]}" >&2
+    exit 1
+fi
+MICROSOFT_DRIVER="${microsoft_driver_paths[0]}"
+MICROSOFT_DRIVER_SHA256="$(sha256sum "$MICROSOFT_DRIVER" | cut -d' ' -f1)"
+
 echo ">>> Building the fixed C++ benchmark harness..."
 cmake -S "$REPO_ROOT/mssql-odbc-bench" \
     -B "$HARNESS_BUILD_DIR" \
@@ -157,7 +187,8 @@ BASELINE_DRIVER="$BASELINE_TARGET_DIR/release/libmsodbcsql18.so"
 BENCH_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench"
 ADMIN_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench_admin"
 for required_file in \
-    "$CANDIDATE_DRIVER" "$BASELINE_DRIVER" "$BENCH_EXE" "$ADMIN_EXE"; do
+    "$CANDIDATE_DRIVER" "$BASELINE_DRIVER" "$MICROSOFT_DRIVER" \
+    "$BENCH_EXE" "$ADMIN_EXE"; do
     if [ ! -f "$required_file" ]; then
         echo "ERROR: expected build output not found: $required_file" >&2
         exit 1
@@ -177,6 +208,12 @@ Description=mssql-odbc baseline performance build
 Driver=$BASELINE_DRIVER
 Setup=$BASELINE_DRIVER
 UsageCount=1
+
+[$MICROSOFT_DRIVER_NAME]
+Description=Microsoft ODBC Driver $MICROSOFT_VERSION performance reference
+Driver=$MICROSOFT_DRIVER
+Setup=$MICROSOFT_DRIVER
+UsageCount=1
 EOF
 export ODBCSYSINI="$DRIVER_INI_DIR"
 
@@ -190,6 +227,10 @@ fi
 {
     echo "candidate_commit=$(git rev-parse HEAD)"
     echo "baseline_commit=$BASELINE_COMMIT"
+    echo "microsoft_driver_version=$MICROSOFT_VERSION"
+    echo "microsoft_driver_package=$MICROSOFT_PACKAGE_VERSION"
+    echo "microsoft_driver_path=$MICROSOFT_DRIVER"
+    echo "microsoft_driver_sha256=$MICROSOFT_DRIVER_SHA256"
     echo "repetitions=$REPETITIONS"
     echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     uname -a
@@ -221,10 +262,14 @@ CANDIDATE_NARROW="$RESULTS_DIR/odbc-candidate-narrow.json"
 BASELINE_NARROW="$RESULTS_DIR/odbc-baseline-narrow.json"
 CANDIDATE_WIDE="$RESULTS_DIR/odbc-candidate-wide.json"
 BASELINE_WIDE="$RESULTS_DIR/odbc-baseline-wide.json"
+MICROSOFT_NARROW="$RESULTS_DIR/odbc-microsoft-narrow.json"
+MICROSOFT_WIDE="$RESULTS_DIR/odbc-microsoft-wide.json"
 
 run_leg narrow "$CANDIDATE_DRIVER_NAME" "$CANDIDATE_NARROW"
+run_leg narrow "$MICROSOFT_DRIVER_NAME" "$MICROSOFT_NARROW"
 run_leg narrow "$BASELINE_DRIVER_NAME" "$BASELINE_NARROW"
 run_leg wide "$BASELINE_DRIVER_NAME" "$BASELINE_WIDE"
+run_leg wide "$MICROSOFT_DRIVER_NAME" "$MICROSOFT_WIDE"
 run_leg wide "$CANDIDATE_DRIVER_NAME" "$CANDIDATE_WIDE"
 
 compare_args=(
@@ -233,6 +278,9 @@ compare_args=(
     --baseline "$BASELINE_WIDE"
     --candidate "$CANDIDATE_NARROW"
     --candidate "$CANDIDATE_WIDE"
+    --reference "$MICROSOFT_NARROW"
+    --reference "$MICROSOFT_WIDE"
+    --reference-label "Microsoft ODBC $MICROSOFT_VERSION"
     --output-dir "$RESULTS_DIR"
     --regression-ratio "${ODBC_BENCH_REGRESSION_RATIO:-1.10}"
 )

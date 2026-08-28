@@ -74,8 +74,8 @@ Run a driver leg with standard Google Benchmark JSON output:
   --benchmark_out_format=json
 ```
 
-Change only `ODBC_BENCH_DRIVER` and the output path for the baseline leg. Both
-legs read the same tables:
+Change only `ODBC_BENCH_DRIVER` and the output path for other driver legs. Every
+leg reads the same tables:
 
 - `dbo.mssql_odbc_bench_narrow_2m_c15_mixed_fixed`
 - `dbo.mssql_odbc_bench_wide_10k_c600_mixed_fixed`
@@ -119,9 +119,13 @@ order-independent checksum, and representative values for every generated type.
 ## Dedicated perf lab
 
 `perf-lab/run-benchmarks.sh` and `perf-lab/run-benchmarks.ps1` build the harness
-once, then build and register candidate and pinned-baseline driver artifacts
-side by side. Each scenario's two driver legs run next to each other on the
-same dedicated host. Raw Google Benchmark JSON and the median comparison are
+once, then measure three drivers side by side: the candidate, the mssql-odbc
+commit in `perf-lab/baseline-commit.txt`, and Microsoft ODBC Driver 18 from the
+version in `perf-lab/msodbcsql-version.txt`. Candidate and baseline order is
+reversed between workloads, with Microsoft ODBC between them. The result
+summary reports candidate changes relative to both comparison drivers; only
+the candidate-versus-mssql-odbc-baseline result participates in the optional
+regression gate. Raw Google Benchmark JSON and the median comparison are
 written to the repository-level `results` directory.
 
 The perf-lab scripts default to five repetitions and report regressions without

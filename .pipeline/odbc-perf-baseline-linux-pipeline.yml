@@ -1,8 +1,8 @@
 # Fixed-baseline ODBC performance pipeline (dedicated perf lab)
 #
-# Builds the C++ benchmark harness once, builds the candidate and pinned-baseline
-# mssql-odbc shared libraries separately, and runs the same harness through
-# unixODBC against both drivers on one dedicated host.
+# Builds the C++ benchmark harness once, builds candidate and pinned-baseline
+# mssql-odbc libraries, installs pinned Microsoft ODBC 18, and runs the same
+# harness through unixODBC against all three drivers on one dedicated host.
 
 trigger: none
 pr: none
@@ -33,4 +33,4 @@ extends:
           else
             echo "summary.md not found"
           fi
-        displayName: 'Show ODBC benchmark comparison'
+        displayName: 'Show ODBC three-way comparison'
