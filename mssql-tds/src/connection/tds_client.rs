@@ -380,6 +380,16 @@ pub struct TdsClient {
     // Active PLP stream state when row decoding paused at a PLP target column.
     active_row_read_state: ActiveRowReadState,
 
+    /// Set by [`peek_past_current_row`](Self::peek_past_current_row) when it
+    /// finds another row: that row is fully positioned (its header has been
+    /// read) but not yet exposed to a caller, so the *next*
+    /// [`next_row_cursor`](Self::next_row_cursor) call must return it
+    /// directly instead of draining it as an abandoned row and reading past
+    /// it. Consumed (reset to `false`) the moment that next call runs, and
+    /// invalidated by anything that discards `active_row_read_state` first
+    /// (see `drain_active_row_if_needed`).
+    row_already_positioned: bool,
+
     /// Test-only: when `Some`, [`check_and_reconnect`](Self::check_and_reconnect)
     /// reports this as the elapsed recovery time and skips the transport, so
     /// budget-exhaustion paths are exercised without live reconnect timing.
@@ -435,6 +445,7 @@ impl TdsClient {
             cancel_handle: None,
             empty_metadata: Vec::new(),
             active_row_read_state: ActiveRowReadState::Idle,
+            row_already_positioned: false,
             #[cfg(test)]
             reconnect_elapsed_for_test: None,
             streamed_write_state: StreamedWriteState::Idle,
@@ -616,6 +627,8 @@ impl TdsClient {
         // metadata.
         self.clear_session_bound_caches();
         self.current_result_set_has_been_read_till_end = false;
+        self.active_row_read_state = ActiveRowReadState::Idle;
+        self.row_already_positioned = false;
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
 
@@ -5027,6 +5040,15 @@ impl TdsClient {
     /// than returned to the caller.
     #[instrument(skip(self), level = "info")]
     pub async fn next_row_cursor(&mut self) -> TdsResult<bool> {
+        // A previous `peek_past_current_row` already read this row's header
+        // off the wire and parked it in `active_row_read_state` — hand it
+        // over as-is instead of draining it (see `drain_active_row_if_needed`,
+        // which would otherwise treat an unread `RowPaused` as abandoned).
+        if self.row_already_positioned {
+            self.row_already_positioned = false;
+            return Ok(true);
+        }
+
         if self.current_metadata.is_none() {
             return Err(UsageError(
                 "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
@@ -5074,6 +5096,33 @@ impl TdsClient {
                 }
             }
         }
+    }
+
+    /// Peeks past the row just fully consumed to discover whether another
+    /// row follows, without losing it if one does. Callers (the ODBC busy
+    /// gate) use this once every column of the current row has been
+    /// delivered to learn — one call earlier than they otherwise would —
+    /// whether the wire is now idle for this statement, matching msodbcsql's
+    /// wire-state busy gate rather than holding the connection busy for the
+    /// statement's entire cursor lifetime.
+    ///
+    /// Returns `Ok(true)` if another row is now positioned: it is parked
+    /// exactly as [`next_row_cursor`](Self::next_row_cursor) parks any
+    /// positioned row, so the very next call to it returns this same row
+    /// immediately, without re-reading the wire. Returns `Ok(false)` if the
+    /// result set is now known exhausted — the same thing a later
+    /// `next_row_cursor` call would eventually report, just discovered now
+    /// because the wire happened to already have the answer.
+    ///
+    /// # Caller obligation
+    /// Only call this once every column of the row positioned before this
+    /// call has been read (all bound columns, or `SQLGetData` through the
+    /// last column) — like `next_row_cursor`, this discards anything left
+    /// unread on that row.
+    pub async fn peek_past_current_row(&mut self) -> TdsResult<bool> {
+        let has_row = self.next_row_cursor().await?;
+        self.row_already_positioned = has_row;
+        Ok(has_row)
     }
 
     /// Pulls column `target` (0-based) of the currently positioned row,
@@ -5212,6 +5261,10 @@ impl TdsClient {
         if matches!(self.active_row_read_state, ActiveRowReadState::Idle) {
             return Ok(());
         }
+
+        // Whatever is parked is being discarded now (as an abandoned row, not
+        // handed to a caller), so a stale peek can no longer be honored.
+        self.row_already_positioned = false;
 
         // Mixing the pull and push APIs is rare. Keep that large continuation
         // out of every ordinary row-fetch future, paying only on this recovery path.
@@ -5543,6 +5596,7 @@ impl TdsClient {
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
         self.active_row_read_state = ActiveRowReadState::Idle;
+        self.row_already_positioned = false;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
 
@@ -7400,6 +7454,118 @@ mod tests {
             ),
             "guard must not disturb the parked row state"
         );
+    }
+
+    #[tokio::test]
+    async fn peek_past_current_row_reports_end_of_set_and_releases_batch() {
+        // Every column of the current row has already been read (the caller's
+        // obligation), so `active_row_read_state` is `Idle` and the wire's next
+        // token is the terminating DONE — exactly what the ODBC busy gate uses
+        // to release a connection early instead of waiting for an explicit
+        // cursor close (AB#47508).
+        let transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        let has_more = client.peek_past_current_row().await.unwrap();
+
+        assert!(!has_more, "no more rows: the DONE carried no MORE flag");
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(!client.has_open_batch());
+        assert!(
+            !client.row_already_positioned,
+            "nothing was parked; the flag must stay clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_past_current_row_already_exhausted_touches_nothing() {
+        // Calling the peek when `next_row_cursor` would already short-circuit
+        // (end of set previously observed) must stay free: the ODBC layer
+        // calls this unconditionally after every fetch, so it must not cost an
+        // extra wire round trip when the answer is already known. An empty
+        // token queue makes any real transport read fail the test.
+        let transport = TestTransport::with_tokens(vec![]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = true;
+
+        let has_more = client.peek_past_current_row().await.unwrap();
+
+        assert!(!has_more);
+        assert!(!client.row_already_positioned);
+    }
+
+    #[tokio::test]
+    async fn next_row_cursor_returns_a_parked_row_without_reading_the_wire() {
+        // Simulates the outcome of a prior `peek_past_current_row` call that
+        // found another row: `active_row_read_state` already holds it and
+        // `row_already_positioned` marks it unclaimed. The very next
+        // `next_row_cursor` call must hand it back directly — not drain it as
+        // an abandoned row and not touch the transport — so an empty token
+        // queue still succeeds.
+        let transport = TestTransport::with_tokens(vec![]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.row_already_positioned = true;
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: Arc::new(ColMetadataToken::default()),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+
+        let has_row = client.next_row_cursor().await.unwrap();
+
+        assert!(has_row);
+        assert!(
+            !client.row_already_positioned,
+            "the parked row is claimed exactly once"
+        );
+        assert!(
+            matches!(
+                client.active_row_read_state,
+                ActiveRowReadState::RowPaused(_)
+            ),
+            "the parked row itself must still be there for read_row_column"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_row_cursor_drains_an_unclaimed_parked_row_as_abandoned() {
+        // If the caller moves on without ever consuming a parked row (no
+        // `read_row_column` call in between), a second `next_row_cursor` call
+        // must treat it like any other abandoned row: drain it and read the
+        // next thing on the wire, rather than returning it a second time.
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        // The drain resumes the parked row's remaining columns first; the mock
+        // reports that skip completing cleanly (nothing revealed yet), so the
+        // subsequent read genuinely comes from `receive_row_header` below —
+        // matching the two-step shape a real skip-then-read-next-token would
+        // have on the wire.
+        transport
+            .resume_results
+            .push_back(RowReadResult::RowWritten);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: Arc::new(ColMetadataToken::default()),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        // Deliberately NOT setting `row_already_positioned`: this row was
+        // positioned by ordinary means (or a peek already claimed and it is
+        // being abandoned unread), so the next call must drain it.
+
+        let has_row = client.next_row_cursor().await.unwrap();
+
+        assert!(!has_row, "the row was discarded; DONE was next on the wire");
+        assert!(client.current_result_set_has_been_read_till_end);
     }
 
     #[test]
