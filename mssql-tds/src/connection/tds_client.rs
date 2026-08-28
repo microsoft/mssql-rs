@@ -4097,6 +4097,8 @@ impl TdsClient {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
                 }
                 Tokens::DoneProc(done) if !done.has_more() && !done.has_error() => {
+                    self.remaining_request_timeout = None;
+                    self.cancel_handle = None;
                     self.execution_context.set_has_open_batch(false);
                     return Ok(());
                 }
@@ -9088,8 +9090,15 @@ mod tests {
             return_status(0),
             done_proc_final(),
         ]);
+        let cancel_handle = CancelHandle::new();
         let result = client
-            .execute_sp_executesql("INSERT INTO t VALUES (@P1)".to_string(), Vec::new(), ())
+            .execute_sp_executesql(
+                "INSERT INTO t VALUES (@P1)".to_string(),
+                Vec::new(),
+                ExecuteOptions::new()
+                    .timeout_secs(30)
+                    .cancel(&cancel_handle),
+            )
             .await
             .unwrap();
         assert!(matches!(result, StatementResult::NoRows { .. }));
@@ -9098,6 +9107,8 @@ mod tests {
             "only the RPC trailer followed, so nothing is left to navigate to"
         );
         assert_eq!(client.last_rows_affected(), 1);
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
     }
 
     /// The same look-ahead must not swallow a real second statement: a
