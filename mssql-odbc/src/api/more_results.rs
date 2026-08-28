@@ -60,9 +60,17 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // release_busy_if_row_exhausted), but that call had already
             // committed to delivering its own row successfully, so the
             // diagnostic was deferred here instead of being lost under that
-            // call's own success return.
+            // call's own success return. The same peek can also have
+            // stashed a trailing INFO message it had no success return to
+            // post under (`StmtState::pending_fetch_info`, set alongside
+            // `pending_fetch_error` when `row_delivered == false`) — surface
+            // it here too, since `SQL_ERROR` (unlike the sibling
+            // `SQL_NO_DATA` below) can carry extra diagnostic records, same
+            // principle as the analogous fast path in `fetch_scroll.rs`.
+            let pending_info = std::mem::take(&mut stmt_state.pending_fetch_info);
             reset_cursor_state(&mut stmt_state);
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+            post_tds_info_messages(&mut stmt_state, &pending_info);
             return SQL_ERROR;
         }
         if stmt_state.batch_exhausted {
@@ -499,6 +507,64 @@ mod tests {
             "must be taken so it cannot leak into a later call"
         );
         assert!(!ss.has_state(STMT_STATE_CURSOR_OPEN));
+    }
+
+    /// A prior fetch's read-ahead peek can find both a trailing SQL Server
+    /// error *and* a trailing INFO message on the way to the same
+    /// batch-ending token (see AB#47508's `release_busy_if_row_exhausted`,
+    /// which can stash `pending_fetch_error` and `pending_fetch_info`
+    /// together when `row_delivered == false`). This deferred-error fast
+    /// path returns `SQL_ERROR`, which — unlike the sibling `SQL_NO_DATA`
+    /// path below — can carry extra diagnostic records, so the stashed INFO
+    /// message must be surfaced alongside the error rather than silently
+    /// discarded by `reset_cursor_state`. Same principle as the analogous
+    /// fast path in `fetch_scroll.rs`.
+    #[test]
+    fn more_results_surfaces_a_pending_fetch_info_alongside_a_pending_fetch_error() {
+        use mssql_tds::error::SqlInfoMessage;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.set_state(STMT_STATE_CURSOR_OPEN);
+            ss.result_set_exhausted = true;
+            ss.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+            ss.pending_fetch_info = vec![SqlInfoMessage {
+                message: "trailing PRINT message".to_string(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }];
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
+
+        let ret = unsafe { sql_more_results(h.stmt) };
+
+        assert_eq!(ret, SQL_ERROR);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the deferred error must still be posted"
+        );
+        assert!(
+            ss.diag_records
+                .iter()
+                .any(|d| d.message.contains("trailing PRINT message")),
+            "the stashed INFO message must be surfaced alongside the deferred error"
+        );
+        assert!(
+            ss.pending_fetch_info.is_empty(),
+            "must be taken so it cannot leak into a later call"
+        );
     }
 
     /// **The blocking regression this tick fixes**, reproducing the
