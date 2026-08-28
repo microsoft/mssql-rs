@@ -11,7 +11,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE, ERR_INVALID_NULL_POINTER,
-    ERR_STRING_RIGHT_TRUNCATION, SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00,
+    SQLSTATE_08001, SQLSTATE_HY024, SQLSTATE_HY110, SQLSTATE_HYC00, WARN_STRING_TRUNCATION,
     post_diag, post_tds_error, post_tds_info_messages,
 };
 use crate::api::txn::apply_post_connect_txn_settings;
@@ -360,7 +360,7 @@ fn do_connect(
             post_diag(state, ERR_INVALID_CONNECTION_STRING_ATTRIBUTE);
         }
         if truncated {
-            post_diag(state, ERR_STRING_RIGHT_TRUNCATION);
+            post_diag(state, WARN_STRING_TRUNCATION);
         }
         SQL_SUCCESS_WITH_INFO
     } else {

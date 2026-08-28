@@ -24,6 +24,7 @@ pub(crate) const SQLSTATE_08007: [u8; 5] = *b"08007";
 /// Communication link failure — the connection to the server broke, so a
 /// connection pool must discard the connection rather than reuse it.
 pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
+pub(crate) const SQLSTATE_22001: [u8; 5] = *b"22001";
 pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
@@ -227,7 +228,14 @@ pub(crate) const WARN_FRACTIONAL_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01S07,
     text: "Fractional truncation",
 };
-pub(crate) const ERR_STRING_RIGHT_TRUNCATION: DiagMsg = DiagMsg {
+/// Inbound truncation of a bound parameter. Distinct from
+/// [`WARN_STRING_TRUNCATION`], which is the benign `01004` the fetch
+/// direction posts when a caller's buffer is too small.
+pub(crate) const ERR_PARAM_STRING_TRUNCATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_22001,
+    text: "String data, right truncation",
+};
+pub(crate) const WARN_STRING_TRUNCATION: DiagMsg = DiagMsg {
     state: SQLSTATE_01004,
     text: "String data, right truncation",
 };

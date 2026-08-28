@@ -28,7 +28,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_FIELD, ERR_INVALID_DESCRIPTOR_INDEX,
-    ERR_NOT_VARIANT_COLUMN, ERR_STRING_RIGHT_TRUNCATION, post_diag,
+    ERR_NOT_VARIANT_COLUMN, WARN_STRING_TRUNCATION, post_diag,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
@@ -200,7 +200,7 @@ fn sql_col_attribute_w_safe(
                 )
             };
             if truncated {
-                post_diag(&mut stmt_state, ERR_STRING_RIGHT_TRUNCATION);
+                post_diag(&mut stmt_state, WARN_STRING_TRUNCATION);
                 SQL_SUCCESS_WITH_INFO
             } else {
                 SQL_SUCCESS
@@ -847,7 +847,7 @@ mod tests {
         let s = sh.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
-            ERR_STRING_RIGHT_TRUNCATION.state
+            WARN_STRING_TRUNCATION.state
         );
     }
 

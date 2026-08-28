@@ -336,18 +336,19 @@ pub(super) unsafe fn build_named_params(
         };
 
         if let Some(indicator) = dae_indicator {
-            let placeholder_type = match dae_placeholder_type(bound_param.c_type) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(
-                        "{op}: parameter {} DAE type not streamable: {}",
-                        i + 1,
-                        e.diag().text
-                    );
-                    post_diag(stmt_state, e.diag());
-                    return Err(SQL_ERROR);
-                }
-            };
+            let placeholder_type =
+                match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(
+                            "{op}: parameter {} DAE type not streamable: {}",
+                            i + 1,
+                            e.diag().text
+                        );
+                        post_diag(stmt_state, e.diag());
+                        return Err(SQL_ERROR);
+                    }
+                };
             let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
             dae_params.push(DaeParam {
                 bound_index: i,
