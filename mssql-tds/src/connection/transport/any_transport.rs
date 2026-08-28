@@ -15,6 +15,7 @@ use crate::datatypes::row_writer::RowWriter;
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    TdsTokenStreamReader,
 };
 use crate::token::tokens::Tokens;
 
@@ -150,7 +151,9 @@ impl AnyTransport {
         context: &ParserContext,
     ) -> TdsResult<Option<RowPauseState>> {
         match self {
-            Self::Network(transport) => transport.try_receive_row_header(context),
+            Self::Network(transport) => {
+                TdsTokenStreamReader::try_receive_row_header(transport, context)
+            }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.try_receive_row_header(context),
         }
@@ -162,7 +165,9 @@ impl AnyTransport {
         target: usize,
     ) -> TdsResult<Option<ColumnValues>> {
         match self {
-            Self::Network(transport) => transport.try_read_buffered_column(pause_state, target),
+            Self::Network(transport) => {
+                TdsTokenStreamReader::try_read_buffered_column(transport, pause_state, target)
+            }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => transport.try_read_buffered_column(pause_state, target),
         }
