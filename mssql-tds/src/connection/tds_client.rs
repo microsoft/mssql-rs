@@ -1924,9 +1924,8 @@ impl TdsClient {
         if carried_reset == ResetConnectionMode::None {
             return;
         }
-        let writer = self.transport.as_writer();
-        writer.take_reset_dispatched();
-        writer.set_reset_mode(carried_reset);
+        // Also clears the dispatch record packet 1 left behind.
+        self.transport.as_writer().set_reset_mode(carried_reset);
     }
 
     /// Closes the transport after a request could not be retracted.

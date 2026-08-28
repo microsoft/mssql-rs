@@ -902,9 +902,10 @@ TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUs
 // Strands this driver: the value passes our UTF-16 unit count at one unit, then
 // expands to the eight bytes of "&#26085;" inside serialize_string and is
 // rejected against varchar(1) - after parameter 1 has flushed. msodbcsql
-// measures the converted bytes first and sends it without error, so under
-// comparison this passes without exercising any recovery.
+// measures the converted bytes first and sends it without error, so it never
+// reaches the partial-send state here and the case is skipped on that leg.
 TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectionUsable) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 collation to make the value unmappable";
     }
@@ -923,23 +924,8 @@ TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectio
                                    ind, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
-    // msodbcsql substitutes the unmappable character and succeeds, leaving a
-    // cursor to drain. On our leg the rejection is the precondition for the
-    // recovery being tested, so assert it - otherwise a regression that stops
-    // failing would leave this test green without exercising any withdrawal.
-    const char* target = std::getenv("ODBC_TEST_TARGET");
-    const bool comparing_msodbcsql = target && std::string(target) == "msodbcsql";
-    const SQLRETURN rc = SQLExecute(stmt_);
-    if (comparing_msodbcsql) {
-        if (rc != SQL_ERROR) {
-            while (SQLFetch(stmt_) == SQL_SUCCESS) {
-            }
-            SQLCloseCursor(stmt_);
-        }
-    } else {
-        ASSERT_EQ(SQL_ERROR, rc)
-            << "the over-long value must be rejected during serialization";
-    }
+    ASSERT_EQ(SQL_ERROR, SQLExecute(stmt_))
+        << "the over-long value must be rejected during serialization";
 
     ExpectConnectionStillUsable();
 }

@@ -397,15 +397,11 @@ impl<'a> PacketWriter<'a> {
         // to discard the message, so it is deliberately not recorded — treating
         // it as carrying the reset could condemn a healthy session.
         //
-        // This exemption assumes the ignored message is a single packet. For a
-        // multi-packet message, packet #1 already recorded the dispatch and a
-        // later ignore packet does not undo it: the server discards the whole
-        // message (reset included) while the client still believes the bit
-        // landed, so the next request settles it as "reset done" and an unreset
-        // session can go back to the pool. Latent today — `cancel_current_message`
-        // is the only ignore-packet emitter and is `#[cfg(test)]`-only. If that
-        // changes, the cancel path must clear the dispatch record *and* re-arm
-        // the mode so the bit rides the next request.
+        // Not recording is not enough on its own for a multi-packet message:
+        // packet #1 already recorded the dispatch, a later ignore packet does not
+        // undo it, and the server discards the whole message with the reset in
+        // it. Callers of `cancel_current_message` must hand the bit back —
+        // `TdsClient::rearm_withdrawn_reset` does so for both withdrawal paths.
         if reset_mode != ResetConnectionMode::None && !is_ignore_packet {
             self.network_writer.note_reset_dispatched();
         }
