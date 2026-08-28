@@ -162,6 +162,109 @@ Two details worth keeping in mind when extending this:
 - Export `SQLBindCol`, `SQLFetchScroll`, `SQLColAttributeW` (exact names incl. the `W` variant) so `ddbc_bindings.cpp` `GetFunctionPointer` succeeds.
 - Verify the full required symbol set is present and the driver loads under `mssql-python`.
 
+#### Symbol audit
+
+> **Superseded, and it is worth reading with that in mind.** [#361](https://github.com/microsoft/mssql-rs/pull/361) implemented data-at-execution parameters and exported real `SQLParamData` / `SQLPutData` (the driver now exports 45 `SQL*` symbols, not 37). All 39 required symbols are therefore present, `ddbc_bindings.cpp`'s composite check now evaluates *true*, and the latent throw analysed in Q2 no longer occurs. Nothing below needs acting on; it is kept because the reasoning — and the hypotheses it disproves — still describes how the DM and the `mssql-python` loader behave, which is what a future missing export would run into.
+
+Required set taken from every `GetFunctionPointer(handle, "…")` call in `ddbc_bindings.cpp`: **39 symbols**. At the time of the audit, **37 were exported and advertised**. Two were absent from both the export table and `supported_function_ids()`:
+
+| Symbol | Why it was absent |
+| --- | --- |
+| `SQLParamData` | Data-at-execution parameters were unimplemented (`ERR_DATA_AT_EXEC_NOT_IMPLEMENTED`) — since implemented by #361 |
+| `SQLPutData` | Same |
+
+`SQLSetDescFieldW` was the third gap when this audit was first run; [#345](https://github.com/microsoft/mssql-rs/pull/345) landed the descriptor field APIs and closed it.
+
+The audit ran independently on both platforms and agrees. On Linux: `nm -D` (unfiltered) plus a runtime `dlsym` probe through `ctypes` against the staged `libmsodbcsql18.so`. On Windows: `dumpbin /exports` on `target\debug\msodbcsql18.dll` (43 exports total) plus a runtime `GetProcAddress` probe over all 39 names, which resolves 37 and returns `NULL` for exactly these two. There is no platform-specific export list — the exports come from `#[unsafe(no_mangle)]` in `api/exports.rs` — so the two platforms could not have diverged, but it was worth confirming rather than assuming.
+
+#### Q1 — Does the Windows Driver Manager care? **No, on both counts that matter here.**
+
+Two separate questions, two separate answers.
+
+**Does the DM refuse to *load* a driver whose export table is incomplete? No.** With `SQLParamData`/`SQLPutData` absent, the Windows DM loads the DLL, dispatches `SQLDriverConnectW` to it, and runs the rest of the surface normally. The connect returns `SQL_SUCCESS_WITH_INFO` with the driver's own `5701`/`5703` informational records — i.e. the diagnostics came from the driver, not from the DM, which is what distinguishes "loaded and dispatched" from the DM's `IM003` "specified driver could not be loaded". The DM resolves entry points lazily and per-function; it has no minimum export set that it checks up front.
+
+**Does the DM refuse to *dispatch* an entry point missing from `SQLGetFunctions`? Yes** — confirmed here by controlled experiment rather than inherited from the P2/P3 incidents. `SQL_API_SQLCOLATTRIBUTE` was removed from `supported_function_ids()` and the driver rebuilt, leaving the `SQLColAttributeW` export in place and verified present in the export table. Before: `SQLGetFunctions` reports `supported=1` and `SQLColAttributeW` returns `SQL_SUCCESS`. After: `supported=0` and the same call returns `SQL_ERROR` with `[IM001] [Microsoft][ODBC Driver Manager] Driver does not support this function`, without the driver being entered. Only the advertisement changed, so the advertisement is the cause. The change was reverted; it is recorded here so nobody has to rediscover the rule a fourth time.
+
+**But for these two specifically, the DM never gets far enough to care.** The DM's *state* check runs before any entry-point lookup. `SQLParamData` and `SQLPutData` are legal only after the statement has entered the need-data state, and that state can only be entered by the **driver** returning `SQL_NEED_DATA` from `SQLExecute`/`SQLExecDirect`. Side by side, driving a real data-at-execution sequence (`SQLBindParameter` with `SQL_LEN_DATA_AT_EXEC(0)`, then `SQLExecute`):
+
+| Step | msodbcsql 18 | mssql-odbc |
+| --- | --- | --- |
+| `SQLGetFunctions(SQL_API_SQLPARAMDATA / SQLPUTDATA)` | `supported=1` | `supported=0` |
+| `SQLBindParameter` with the DAE indicator | `SQL_SUCCESS` | `SQL_SUCCESS` |
+| `SQLExecute` | `SQL_NEED_DATA` | `SQL_ERROR` + `HYC00` *Data-at-execution parameters not yet implemented* |
+| `SQLParamData` → `SQLPutData` → `SQLParamData` | `SQL_NEED_DATA` → `SQL_SUCCESS` → `SQL_SUCCESS`, row inserted | unreachable |
+| `SQLParamData` called out of sequence | `HY010` from the DM | `HY010` from the DM |
+
+Both drivers get `HY010` *Function sequence error* for an out-of-sequence call, because the DM answers that from its own state machine without consulting the driver. So there is no reachable call path on which the DM would look for a `SQLParamData` entry point in this driver: it would have to be handed a need-data state that this driver never produces.
+
+#### Q2 — Why the load gate does not fire. **Resolved: the module initializer swallows it.**
+
+The contradiction was real and the source reading was correct as far as it went. `ddbc_bindings.cpp` does gate on a composite check that includes `SQLParamData_ptr && SQLPutData_ptr`, `GetFunctionPointer` is a bare `dlsym`/`GetProcAddress`, and with this driver the check *does* evaluate false and *does* throw. Three things make that throw invisible:
+
+1. **The module initializer catches it.** `PYBIND11_MODULE(ddbc_bindings, m)` ends with `try { DriverLoader::getInstance().loadDriver(); } catch (const std::exception& e) { LOG("Module initialization: Failed to load ODBC driver - %s", e.what()); }` — deliberately, with the comment *"Log the error but don't throw - let the error happen when functions are called"*. So the driver is loaded at **import** time, and a load failure at import is logged and dropped.
+2. **The pointers are already populated when it throws.** `LoadDriverOrThrowException` assigns all 39 `_ptr` globals first and only then evaluates `success`. By the time the exception is raised, the 37 resolvable pointers are live. Nothing rolls them back.
+3. **Nothing ever retries.** Each wrapper re-enters the loader only when *its own* pointer is null — `if (!SQLPrepare_ptr) { DriverLoader::getInstance().loadDriver(); }` and 22 more like it. `DriverLoader` stores the failure in `m_loadError` and rethrows it on every subsequent call, but no wrapper guards on `SQLParamData_ptr` or `SQLPutData_ptr`, so no wrapper ever asks. The stored error stays latent for the life of the process.
+
+Net effect: the composite check is **advisory, not a gate**. It only becomes fatal if one of the 23 *guard* pointers is missing.
+
+Verified on Windows, against a `ddbc_bindings` built from `mssql-python` `main` source (same recipe as the Linux CI leg, so the released wheel's binary is not what is being tested), with the driver swapped into every reachable `mssql_python_odbc` copy and confirmed by hash:
+
+- **Driver as it stands** (`SQLParamData`/`SQLPutData` absent): imports, connects, `SELECT 1` returns `1`. `GetModuleFileNameW` on the mapped `msodbcsql18.dll` confirms it is our build and `GetProcAddress` in that same process confirms both symbols are `NULL`. `EnumProcessModules` shows exactly one `msodbcsql18.dll` mapped, ruling out a same-base-name collision quietly serving the real driver.
+- **Negative control** — additionally removed the `SQLProceduresW` export, which is in the composite check but is *not* a guard: still imports, connects and returns `1`. The check is not enforcing.
+- **Positive control** — additionally removed the `SQLPrepareW` export, which is in the composite check **and** is the guard on `SQLExecute_wrap`: connect still succeeds, then `cursor.execute()` raises `RuntimeError: Failed to load required function pointers from driver.` This is the stored `m_loadError` resurfacing, and it proves the check did fire at import and was swallowed there.
+
+Both controls were reverted.
+
+The same reasoning explains the Linux observation, and it is not platform-specific: the swallow is in portable C++ with no `#ifdef` around it. One genuine Windows-only difference exists but is unrelated — `LoadDriverOrThrowException` requires a co-located `mssql-auth.dll` and throws if it is missing, so a Windows swap must leave the rest of the `libs/windows/<arch>` tree intact.
+
+#### Recommendation: no stub exports. No code change.
+
+> **Resolved by implementation.** This recommendation ended by saying the symbols should be added "when data-at-execution is actually implemented" — [#361](https://github.com/microsoft/mssql-rs/pull/361) did exactly that, so both are now exported as real implementations rather than stubs. The recommendation was against *stubs*, and that still stands; the condition it named has simply been met.
+
+Adding `SQLParamData`/`SQLPutData` stubs that return `HYC00` would be unreachable code on both consumers:
+
+- **Through the Driver Manager**, the DM's need-data state check fires first, and only the driver can put the statement into that state. A driver that rejects DAE at `SQLExecute` can never be asked for these two.
+- **Through `mssql-python`**, which does not use a Driver Manager at all — it `LoadLibraryW`/`dlopen`s the driver and calls exports directly — all three `SQLParamData_ptr` call sites are inside `if (rc == SQL_NEED_DATA)` blocks, so a null pointer there is not dereferenced. Exercised end to end with a 100 KB `str` and a 100 KB `bytes` parameter, which is what `BindParameters` marks data-at-execution: both raise `NotSupportedError: Driver Error: Optional feature not implemented; DDBC Error: [Microsoft]Parameter conversion not yet implemented` and the process continues. That is the same class of answer a stub would have produced, sourced from the parameter layer instead.
+
+The honest signal is already being delivered. The correct outcome is that the symbols stay absent, and are added when data-at-execution is actually implemented (`ERR_DATA_AT_EXEC_NOT_IMPLEMENTED`, out of scope for this story).
+
+**What would change this.** If `mssql-python` ever adds a wrapper that guards on `SQLParamData_ptr`/`SQLPutData_ptr` — the same `if (!X_ptr) loadDriver()` shape the other 23 use — the latent `m_loadError` would resurface as *"Failed to load required function pointers from driver"* on an unrelated call, which is a bad diagnostic for a missing optional feature. That is the one scenario in which stubs become worth adding, and it is worth re-checking whenever the pinned `mssql-python` moves.
+
+#### Disproved hypotheses
+
+Recorded so they are not re-tried.
+
+| Hypothesis | Verdict |
+| --- | --- |
+| The Windows DM refuses to load a driver with an incomplete export table | **False.** It loads the DLL and dispatches connect, prepare, execute, fetch and `SQLColAttributeW` to it with two exports missing |
+| The Windows DM would refuse to dispatch `SQLParamData`/`SQLPutData` and that is why stubs are needed | **False, and the wrong question.** The DM's `HY010` state check precedes any entry-point lookup, and the state is unreachable without the driver's own `SQL_NEED_DATA` |
+| `mssql-python`'s composite check does not really include these two, or the shipped wheel differs from source | **False.** It includes them in both the released `v1.13.0` tag and `main`, and a source build behaves identically to the wheel |
+| `GetProcAddress`/`dlsym` is resolving them from somewhere else (dependency chain, an already-loaded same-named DLL) | **False.** `EnumProcessModules` shows one `msodbcsql18.dll`, it is ours by path, and both symbols are `NULL` in-process |
+| The Python shim `mssql_python/ddbc_bindings.py` diverts the load | **False.** It only selects the `cp<ver>-<arch>` extension file; the load happens in the extension's `PYBIND11_MODULE` initializer |
+| Per-user driver registration under `HKCU\SOFTWARE\ODBC\ODBCINST.INI` lets the Windows DM find a driver without admin | **False.** The DM answers `IM002`; only `HKLM` is consulted for driver registrations. A **user DSN** under `HKCU\SOFTWARE\ODBC\ODBC.INI` whose `Driver` value is the full DLL path does work, and is how the DM probes below were run without elevation |
+
+#### Reproducing the harness
+
+**Linux.** The CI templates do all of it — `.pipeline/scripts/clone-mssql-python.sh`, then `containerized-odbc-swap-build.sh` to stage `odbc-swap-drop/libmsodbcsql18.so`, then the container steps in `.pipeline/templates/test-mssql-python-odbc-template.yml`. Run locally it reproduces CI exactly: 42 files, 14 passed, 19 failed, 5 crashed.
+
+**Windows, Driver Manager probes.** `mssql-odbc/tests/e2e/run_e2e.ps1` is the Windows entry point for the C++ gtest suite and `-CompareWithMsodbcsql` is the parity leg, but it registers the driver in `HKLM` and so needs Administrator. Without elevation, the same side-by-side comparison can be driven through `odbc32.dll` from `ctypes`: create two user DSNs under `HKCU\SOFTWARE\ODBC\ODBC.INI` whose `Driver` values are the full paths to `target\debug\msodbcsql18.dll` and `C:\Windows\system32\msodbcsql18.dll`, list both in `HKCU\SOFTWARE\ODBC\ODBC.INI\ODBC Data Sources`, then connect with `DSN=<name>;SERVER=…` and every other keyword supplied explicitly so both legs see an identical connection string. **Declare full `argtypes` on every `odbc32` prototype** — `SQLRETURN` is a `SQLSMALLINT`, and leaving ctypes to guess makes the driver read past the end of the string arguments and produces convincing but fictitious `42000`/`07002` diagnostics.
+
+**Windows, `mssql-python`.** Build the bindings from source the way the Linux leg does (`mssql_python/pybind/build.bat x64`); it needs `CUSTOM_PYTHON_LIB_DIR` pointed at the base interpreter's `libs\` because a venv has no `python3xx.lib`. Then overwrite `mssql_python_odbc/libs/windows/x64/msodbcsql18.dll` in **every** copy the interpreter could resolve — the in-repo package wins on `sys.path` when pytest runs from the repo root, and the `site-packages` copy otherwise — leaving `mssql-auth.dll` and the rest of that directory in place.
+
+There is **no Windows equivalent of the Linux 42-file suite result yet.** A per-file runner over the same 42 files gets through `test_000_dependencies` (passed), `test_001_globals` (failed) and `test_002_types` (crashed) and then hangs indefinitely inside `test_003_connection`, which exercises connection pooling. The hang survives a per-file kill, so producing a comparable Windows count needs a runner that tree-kills a wedged pytest child. That is worth doing, but it is a testing-infrastructure task for P5 rather than a P4 blocker — none of the P4 conclusions rest on it.
+
+#### Unrelated observation
+
+Every `mssql-python` process using this driver prints, after its last statement completes and the connection closes:
+
+```
+thread '<unnamed>' panicked at library\std\src\thread\lifecycle.rs:247:14:
+threads should not terminate unexpectedly
+```
+
+It does not affect results — the process still exits 0 — and it does not appear when the same driver is driven through the Driver Manager, so it looks specific to teardown under direct `LoadLibraryW` loading. Out of scope for P4; needs its own triage.
+
+
 ### P5 — Testing & end-to-end validation — Task [46582](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46582)
 
 - Unit tests per conversion (`ColumnValues` → each `SQL_C_*` target; NULL / indicator / truncation).
@@ -191,5 +294,5 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | P1a — Mandatory source-type conversions | 47107 | Implemented (decimal, money and character sources into the numeric and date/time C targets; `01S07` on lossy numeric conversion, `22018` on an invalid character literal). |
 | P2 — SQLColAttributeW | 46579 | Implemented (common descriptor fields + `SQL_CA_SS_VARIANT_TYPE`, plus the `SQL_SS_VARIANT` type mapping and the zero-length `SQL_C_BINARY` probe the variant path depends on). Binary *delivery* remains unimplemented (Task 47239). |
 | P3 — SQLBindCol + SQLFetchScroll | 46580, 47359 | Implemented ([#322](https://github.com/microsoft/mssql-rs/pull/322)). Column-wise binding and forward-only block fetch, sharing P1's conversion core. 47359 was briefly split out to be worked in parallel and folded back in, since the fill loop cannot be exercised end to end without `SQLBindCol`. Bound PLP columns remain unimplemented (Task 47361). |
-| P4 — Exports & driver-load compat | 46581 | Partly done — `SQLColAttributeW` exported and advertised in P2; `SQLBindCol` and `SQLFetchScroll` in P3. Remaining: confirm the full symbol set loads under `mssql-python`. |
-| P5 — Testing & end-to-end | 46582 | Not started |
+| P4 — Exports & driver-load compat | 46581 | Implemented, no further code change required — `SQLColAttributeW` exported and advertised in P2; `SQLBindCol` and `SQLFetchScroll` in P3; `SQLSetDescFieldW` in [#345](https://github.com/microsoft/mssql-rs/pull/345). The audit found 37 of the 39 symbols `ddbc_bindings.cpp` resolves exported and advertised, with `SQLParamData` and `SQLPutData` absent as a known data-at-execution scope boundary; **[#361](https://github.com/microsoft/mssql-rs/pull/361) has since implemented data-at-execution and exported both**, so all 39 are now present and the composite check in `ddbc_bindings.cpp` passes. Both Windows questions were settled either way — the DM does **not** gate loading on export completeness, and it could never reach those two because only the driver can enter the need-data state — and the `mssql-python` contradiction was resolved: its composite check fired but its pybind module initializer caught and logged it, after the resolvable pointers were already populated. **Decision at the time: no stub exports**, which #361 superseded with real ones. See the P4 section for the evidence and for the one change in `mssql-python` that would reopen it. |
+| P5 — Testing & end-to-end | 46582 | In progress — the fetch type map is now covered end to end on both paths for the date/time, integer, bit, float, GUID, decimal, money and character families, against msodbcsql. That coverage found three divergences, all fixed: decimal and money rendered a leading zero below magnitude one where msodbcsql does not, and `SQLGetData` returned success for a NULL column read with no indicator, leaving the caller's buffer holding the previous row's value — msodbcsql answers 22002, as our own bound path already did. The `mssql-python` suite runs against a locally-swapped build on Linux and reproduces CI exactly (42 files: 14 passed, 19 failed, 5 crashed); the Windows equivalent is blocked on a pooling hang (Task 47510). Not yet covered: bound `SQL_C_BINARY` (Task 47239) and bound PLP/XML (Task 47361), both blocked on unimplemented delivery rather than on missing tests; and the fetch-path error semantics (22003 / 01S07 / 07006), which are unit-tested but have almost no parity coverage (Task 47678). |
