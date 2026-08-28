@@ -213,6 +213,11 @@ function Invoke-BenchmarkLeg {
     Write-Host ">>> Running $Scenario with $Driver..."
     $env:ODBC_BENCH_DRIVER = $Driver
     $env:ODBC_BENCH_SCENARIO = $Scenario
+    $env:ODBC_BENCH_PACKET_SIZE_KEYWORD = if ($Driver -eq $MicrosoftDriverName) {
+        'Packet Size'
+    } else {
+        'PacketSize'
+    }
     $arguments = @(
         "--benchmark_repetitions=$script:Repetitions",
         "--benchmark_out=$Output",

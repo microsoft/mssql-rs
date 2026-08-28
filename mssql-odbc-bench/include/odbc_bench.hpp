@@ -29,6 +29,7 @@ struct Config {
     std::string trust_certificate;
     std::string encrypt;
     std::string packet_size;
+    std::string packet_size_keyword;
     std::string scenario;
 
     static Config from_environment();

@@ -24,6 +24,7 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_TRUST_CERT` | `Yes` | `TrustServerCertificate` value |
 | `ODBC_BENCH_ENCRYPT` | `Mandatory` | `Encrypt` value |
 | `ODBC_BENCH_PACKET_SIZE` | `32768` | TDS packet size, 512–32768 |
+| `ODBC_BENCH_PACKET_SIZE_KEYWORD` | `PacketSize` | `PacketSize` or Microsoft driver spelling `Packet Size` |
 | `ODBC_BENCH_SCENARIO` | all | Run only `narrow` or `wide` |
 
 Missing required values, connection errors, absent/invalid tables, ODBC

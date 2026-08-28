@@ -714,6 +714,8 @@ Config Config::from_environment() {
     config.encrypt = environment_value_or("ODBC_BENCH_ENCRYPT", "Mandatory");
     config.packet_size =
         environment_value_or("ODBC_BENCH_PACKET_SIZE", "32768");
+    config.packet_size_keyword =
+        environment_value_or("ODBC_BENCH_PACKET_SIZE_KEYWORD", "PacketSize");
     config.scenario = environment_value("ODBC_BENCH_SCENARIO");
 
     std::vector<std::string> missing;
@@ -746,6 +748,11 @@ Config Config::from_environment() {
         throw std::runtime_error(
             "ODBC_BENCH_PACKET_SIZE must be between 512 and 32768");
     }
+    if (config.packet_size_keyword != "PacketSize" &&
+        config.packet_size_keyword != "Packet Size") {
+        throw std::runtime_error(
+            "ODBC_BENCH_PACKET_SIZE_KEYWORD must be PacketSize or Packet Size");
+    }
     if (!config.scenario.empty() && config.scenario != "narrow" &&
         config.scenario != "wide") {
         throw std::runtime_error(
@@ -756,7 +763,6 @@ Config Config::from_environment() {
 
 std::string Config::connection_string() const {
     std::ostringstream connection;
-    // The Rust and Microsoft drivers recognize different packet-size spellings.
     connection << "Driver=" << brace_connection_value(driver)
                << ";Server=" << brace_connection_value(server)
                << ";Database=" << brace_connection_value(database)
@@ -765,8 +771,7 @@ std::string Config::connection_string() const {
                << ";TrustServerCertificate="
                << brace_connection_value(trust_certificate)
                << ";Encrypt=" << brace_connection_value(encrypt)
-               << ";Packet Size=" << packet_size
-               << ";PacketSize=" << packet_size << ';';
+               << ';' << packet_size_keyword << '=' << packet_size << ';';
     return connection.str();
 }
 
