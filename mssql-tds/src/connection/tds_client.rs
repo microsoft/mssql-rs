@@ -1864,6 +1864,9 @@ impl TdsClient {
         // which here could swallow the server's answer to the half-written
         // request. msodbcsql's `FIsConnectionDead` is likewise a cached flag.
         if self.transport.connection_known_dead() {
+            // Dead or not, opening this message took the connection's one-shot
+            // reset arm; hand it back rather than swallowing it in a plain drop.
+            message.abandon(self.transport.as_writer());
             return Withdrawal::ConnectionAlreadyDead;
         }
 
@@ -11609,6 +11612,7 @@ mod tests {
     #[tokio::test]
     async fn retract_partial_request_skips_the_withdrawal_on_a_dead_connection() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        client.prepare_reset_connection(false);
         let message = suspend_message_with(&mut client, 10_000).await;
         let sent_before = sent.lock().unwrap().len();
         client.transport.mark_known_dead();
@@ -11619,6 +11623,11 @@ mod tests {
             sent.lock().unwrap().len(),
             sent_before,
             "no withdrawal may be attempted on a dead connection"
+        );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the skipped message must still hand back the reset arm it took"
         );
     }
 
