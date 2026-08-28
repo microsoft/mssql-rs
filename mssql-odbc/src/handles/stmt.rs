@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
+use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
@@ -102,6 +103,66 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// Set once a fetch has confirmed — possibly by peeking one token past
+    /// the row it just delivered — that no further rows exist for the
+    /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
+    /// set until an explicit close: this only means a later
+    /// `SQLFetch`/`SQLFetchScroll` can report `SQL_NO_DATA` without needing
+    /// the connection (another statement may have claimed it in the
+    /// meantime — the answer is already known and needs no more wire access).
+    /// Reset by [`StmtState::clear_exhaustion_state`] whenever a fresh
+    /// execute positions a new result (see also `SQLMoreResults`'s
+    /// `Rows`/`NoRows` arms, which reset it individually while landing on a
+    /// further result within the same batch).
+    pub(crate) result_set_exhausted: bool,
+    /// Set alongside `result_set_exhausted`, but only when the wire has
+    /// confirmed nothing remains anywhere in the batch — i.e. exactly when
+    /// `release_busy_if_row_exhausted` (`exec_common.rs`) actually released
+    /// the busy claim, not merely when the *current* result set ran out.
+    /// `result_set_exhausted` alone is insufficient here: it is also set when
+    /// a further result set is still pending (`DONE` carrying `MORE`), a case
+    /// where this statement still owns the connection and `SQLMoreResults`
+    /// must genuinely advance rather than fast-path.
+    ///
+    /// Lets `SQLMoreResults` report `SQL_NO_DATA` without touching the
+    /// connection at all once this is `true` — matching msodbcsql, whose
+    /// `SQLMoreResults` has no busy check of its own (`GetBatchCtxOrRecover`
+    /// just falls through to `SQL_NO_DATA_FOUND` once the batch context is
+    /// gone) and so is never blocked by a different statement that has since
+    /// claimed the connection. Reset by [`StmtState::clear_exhaustion_state`]
+    /// alongside `result_set_exhausted`.
+    pub(crate) batch_exhausted: bool,
+    /// A SQL Server error a read-ahead peek discovered past a row this
+    /// statement had already finished delivering to the caller (see
+    /// `release_busy_if_row_exhausted` in `exec_common.rs`). The call that
+    /// found it has already committed to a success return for the row it
+    /// delivered, so posting the diagnostic there would be silently lost —
+    /// no return code tells the caller to look. Stashed here instead, for
+    /// the next call that would otherwise short-circuit past the wire —
+    /// `SQLFetch`'s `result_set_exhausted` fast path, `SQLMoreResults`, or a
+    /// cursor close (`SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`, whose own
+    /// drain can no longer discover it on the wire because the peek already
+    /// consumed the terminating ERROR token) — to drain and fail on. The
+    /// connection-scoped close sweep (`SQLEndTran`/autocommit/isolation
+    /// change, `close_cursor_for_connection_op`) is the one exception: it
+    /// still posts this to the statement's diagnostics but does not fail its
+    /// own return, since that return code specifically means "the stream
+    /// failed to drain," which a stale diagnostic on an already-closed batch
+    /// does not make true. Cleared by [`StmtState::clear_exhaustion_state`],
+    /// since both it and `result_set_exhausted` describe facts about the
+    /// same now-superseded result set.
+    pub(crate) pending_fetch_error: Option<TdsError>,
+    /// Server INFO messages a read-ahead peek drained from the client when
+    /// `release_busy_if_row_exhausted` released the busy claim on a zero-row
+    /// fetch (`row_delivered == false`). `fill_rowset`'s own `SQL_NO_DATA`
+    /// can't carry `SQL_SUCCESS_WITH_INFO`, so these are stashed here instead
+    /// of posted immediately — for `SQLMoreResults`'s `batch_exhausted` fast
+    /// path or a cursor close to surface, exactly as the deferred-error
+    /// twin above. Both fast paths release the connection without the
+    /// caller re-touching the wire, so nothing else would ever drain them.
+    /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
+    /// `batch_exhausted`.
+    pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
@@ -684,6 +745,19 @@ impl StmtState {
         self.state_flags &= !mask;
     }
 
+    /// Clears everything AB#47508's read-ahead peek can leave behind, so a
+    /// fresh result set never inherits a previous one's exhaustion state or
+    /// deferred diagnostics. Called from every `finish_execute` terminal
+    /// branch and `close_cursor.rs`'s `reset_cursor_state` — folded into one
+    /// method so the invariant lives in a single place rather than four
+    /// call sites that could each independently drift or be missed.
+    pub(crate) fn clear_exhaustion_state(&mut self) {
+        self.result_set_exhausted = false;
+        self.batch_exhausted = false;
+        self.pending_fetch_error = None;
+        self.pending_fetch_info.clear();
+    }
+
     /// Binds, or rebinds, one column. A column can only be bound once, so an
     /// existing entry for the same column is replaced in place rather than
     /// shadowed.
@@ -887,6 +961,10 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                result_set_exhausted: false,
+                batch_exhausted: false,
+                pending_fetch_error: None,
+                pending_fetch_info: Vec::new(),
                 prepared: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
