@@ -503,11 +503,10 @@ which confirms the server-side declaration assertions (`DATALENGTH`,
 #### P6 - Parity and e2e hardening (not started)
 
 - Parameter-numbered diagnostics.
-- Pin that a late `HY000` from an over-long parameter leaves the connection
-  reusable. Only a value large enough - or one failing late enough - to have
-  already flushed a packet needs `cancel_current_message` and the DONE token
-  consumed; a short value never reaches a packet boundary, so a test using one
-  passes without exercising the recovery at all.
+- A serialization failure after a packet has already flushed leaves the request
+  half-sent, and the server answers 4002 on the *next* command. Declaring real
+  lengths is what made it reachable, so P4 exposed it rather than caused it.
+  The retraction and its two e2e cases are tracked by AB#47687.
 - Run the e2e suite under `--compare-with-msodbcsql`; mark driver-specific
   assertions with `SKIP_IF_COMPARING_MSODBCSQL()`.
 - Add `Benefits-from-mock-tds:` notes where only the round-tripped value is
