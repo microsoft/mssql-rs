@@ -917,7 +917,7 @@ fn stream_active_plp_chunk(
 /// surrogate are carried in `pending_byte` / `pending_high_surrogate` so that
 /// neither a split code unit nor a split surrogate pair corrupts the output.
 /// At end-of-stream any carried half is genuinely malformed and becomes U+FFFD.
-fn utf16le_chunk_to_utf8(
+pub(crate) fn utf16le_chunk_to_utf8(
     new_bytes: &[u8],
     reached_end: bool,
     pending_byte: &mut Option<u8>,

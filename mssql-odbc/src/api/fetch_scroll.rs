@@ -22,18 +22,21 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::error::Error as TdsError;
+use mssql_tds::query::metadata::PlpEncoding;
 
 use super::sqlstate::*;
 use crate::api::exec_common::release_busy_if_row_exhausted;
-use crate::api::get_data::{TextError, column_value_to_text, convert_typed_c, is_typed_c_target};
+use crate::api::get_data::{
+    TextError, column_value_to_text, convert_typed_c, is_typed_c_target, utf16le_chunk_to_utf8,
+};
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID,
     SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
     SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
     SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR,
-    SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NULL_DATA, SQL_ROW_ERROR, SQL_ROW_NOROW,
-    SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
-    SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL, SQL_NULL_DATA, SQL_ROW_ERROR,
+    SQL_ROW_NOROW, SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::conversion::error::{ConvError, ConvOk};
@@ -408,12 +411,20 @@ fn fill_rowset(
                 Ok(CursorColumn::Value { value, .. }) => unsafe {
                     deliver_bound(binding, rows_filled as usize, bind_offset, &value)
                 },
-                // A bound long/LOB column would have to be drained into the
-                // fixed buffer here; that path is owned by SQLGetData today, so
-                // report the row rather than deliver a wrong value (AB#47361).
-                // Abandoning the stream is safe: the next `read_row_column`
-                // finishes off a paused PLP value before it decodes anything.
-                Ok(CursorColumn::PlpStreaming { .. }) => RowOutcome::Error(RowIssue::Unsupported),
+                // A bound LOB is drained straight into the fixed buffer here.
+                // The stream has to be consumed either way to keep the row in
+                // sync, so the only choice is whether the bytes land in the
+                // caller's buffer or in a discard buffer.
+                Ok(CursorColumn::PlpStreaming { .. }) => unsafe {
+                    deliver_bound_plp(
+                        &mut client,
+                        &dbc.runtime,
+                        binding,
+                        rows_filled as usize,
+                        bind_offset,
+                        plp_encoding_for(stmt, column),
+                    )
+                },
                 // Reading ascending and once per column, neither of these is
                 // reachable; treat them as a row error rather than assuming.
                 Ok(CursorColumn::RowEnded) | Ok(CursorColumn::AlreadyConsumed) => {
@@ -621,6 +632,179 @@ unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
         return 0;
     }
     unsafe { ptr.read_unaligned() }
+}
+
+/// Wire read size when draining a bound PLP column. Bounds peak memory: the
+/// value itself is never materialized, only one chunk at a time.
+const PLP_BOUND_CHUNK: usize = 8 * 1024;
+
+/// Reads the PLP encoding declared for `column` (1-based) in the current
+/// result set.
+fn plp_encoding_for(stmt: &StmtHandle, column: usize) -> Option<PlpEncoding> {
+    let ss = stmt.inner.lock().ok()?;
+    ss.column_metadata.get(column - 1)?.plp_encoding()
+}
+
+/// Drains an active PLP (max/LOB) stream into a bound column's fixed buffer.
+///
+/// Unlike `SQLGetData`, which hands back one chunk per call and lets the caller
+/// come back for more, a bound column is filled once: everything past the
+/// buffer is discarded, but still read off the wire so the row stays in sync.
+/// Nothing larger than one chunk is ever held in memory, so a multi-gigabyte
+/// LOB delivered into a small buffer costs the buffer, not the value.
+///
+/// # Safety
+/// Same contract as `deliver_bound`.
+unsafe fn deliver_bound_plp(
+    client: &mut mssql_tds::connection::tds_client::TdsClient,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    binding: &ColumnBinding,
+    row_index: usize,
+    bind_offset: usize,
+    encoding: Option<PlpEncoding>,
+) -> RowOutcome {
+    let stride = element_stride(binding.target_type, binding.buffer_length);
+    let indicator = if binding.strlen_or_ind_ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            (binding.strlen_or_ind_ptr as *mut u8)
+                .add(bind_offset)
+                .cast::<SqlLen>()
+                .add(row_index)
+        }
+    };
+    let slot =
+        unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
+
+    // Same pairings SQLGetData supports. Binary delivery is still unimplemented
+    // (AB#47239), and varchar -> SQL_C_WCHAR widening with it.
+    let target = binding.target_type;
+    let compatible = matches!(
+        (target, encoding),
+        (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
+            | (SQL_C_CHAR, Some(PlpEncoding::SingleByteText))
+            | (SQL_C_CHAR, Some(PlpEncoding::Utf8Text))
+            | (SQL_C_CHAR, Some(PlpEncoding::Utf16Text))
+    );
+    if !compatible {
+        // The stream still has to be consumed, or the next column decodes from
+        // the middle of this value.
+        let _ = runtime.block_on(drain_plp_to_end(client));
+        return RowOutcome::Error(RowIssue::Unsupported);
+    }
+
+    let transcode = target == SQL_C_CHAR && matches!(encoding, Some(PlpEncoding::Utf16Text));
+    let buf_elements = char_buf_elements(target, stride);
+    // Room for the payload, less the terminator the copy always writes.
+    let capacity_elements = buf_elements.saturating_sub(1);
+
+    let mut out_bytes: Vec<u8> = Vec::new();
+    let mut out_units: Vec<u16> = Vec::new();
+    let mut pending_byte: Option<u8> = None;
+    let mut pending_high_surrogate: Option<u16> = None;
+    let mut truncated = false;
+    let mut wire_total: Option<u64>;
+    let mut scratch = vec![0u8; PLP_BOUND_CHUNK];
+
+    loop {
+        let chunk = match runtime.block_on(client.read_active_plp_chunk(&mut scratch)) {
+            Ok(c) => c,
+            Err(_) => return RowOutcome::Error(RowIssue::Restricted),
+        };
+        wire_total = chunk.known_total;
+
+        if target == SQL_C_WCHAR {
+            // Whole code units only; an odd tail is carried to the next chunk.
+            let mut bytes = Vec::with_capacity(chunk.read + 1);
+            if let Some(b) = pending_byte.take() {
+                bytes.push(b);
+            }
+            bytes.extend_from_slice(&scratch[..chunk.read]);
+            let even = bytes.len() & !1;
+            if even != bytes.len() {
+                pending_byte = Some(bytes[even]);
+            }
+            for pair in bytes[..even].chunks_exact(2) {
+                if out_units.len() < capacity_elements {
+                    out_units.push(u16::from_le_bytes([pair[0], pair[1]]));
+                } else {
+                    truncated = true;
+                }
+            }
+        } else if transcode {
+            let utf8 = utf16le_chunk_to_utf8(
+                &scratch[..chunk.read],
+                chunk.reached_end,
+                &mut pending_byte,
+                &mut pending_high_surrogate,
+            );
+            for b in utf8.as_bytes() {
+                if out_bytes.len() < capacity_elements {
+                    out_bytes.push(*b);
+                } else {
+                    truncated = true;
+                    break;
+                }
+            }
+        } else {
+            for b in &scratch[..chunk.read] {
+                if out_bytes.len() < capacity_elements {
+                    out_bytes.push(*b);
+                } else {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+
+        if chunk.reached_end {
+            break;
+        }
+    }
+
+    let produced_bytes = if target == SQL_C_WCHAR {
+        out_units.len() * std::mem::size_of::<SqlWChar>()
+    } else {
+        out_bytes.len()
+    };
+
+    // Matches msodbcsql, verified against it for each case: a value that fit
+    // reports exactly what was produced; a truncated one reports the full
+    // length when the target's units match the wire's, and SQL_NO_TOTAL when
+    // transcoding makes the wire byte count the wrong unit.
+    let reported = if !truncated {
+        produced_bytes as SqlLen
+    } else if transcode {
+        SQL_NO_TOTAL
+    } else {
+        wire_total.map_or(SQL_NO_TOTAL, |t| t as SqlLen)
+    };
+    unsafe { write_if_some(indicator, reported) };
+
+    if target == SQL_C_WCHAR {
+        unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &out_units) };
+    } else {
+        unsafe { copy_with_nul(slot, buf_elements, &out_bytes) };
+    }
+
+    if truncated {
+        RowOutcome::Info(RowIssue::StringTruncated)
+    } else {
+        RowOutcome::Success
+    }
+}
+
+/// Consumes whatever is left of the active PLP stream and discards it.
+async fn drain_plp_to_end(
+    client: &mut mssql_tds::connection::tds_client::TdsClient,
+) -> Result<(), TdsError> {
+    let mut sink = vec![0u8; PLP_BOUND_CHUNK];
+    loop {
+        if client.read_active_plp_chunk(&mut sink).await?.reached_end {
+            return Ok(());
+        }
+    }
 }
 
 /// Writes one column value into its bound buffer slot for row `row_index`.

@@ -394,10 +394,10 @@ TEST_F(FetchScrollLiveTest, SQLFetchHonoursTheRowsetSize) {
     SQLCloseCursor(stmt_);
 }
 
-// A bound LOB column cannot be delivered into a fixed buffer yet (AB#47361),
-// but its bytes still have to leave the wire. Abandoning the PLP stream mid
-// value left the row cursor inside the LOB, so the *next* column parsed payload
-// bytes as a length prefix -- which segfaulted the driver rather than failing
+// A bound LOB column is delivered into the fixed buffer (AB#47361), and its
+// bytes have to leave the wire either way. Abandoning the PLP stream mid value
+// left the row cursor inside the LOB, so the *next* column parsed payload bytes
+// as a length prefix -- which segfaulted the driver rather than failing
 // cleanly. The second bound column is the part that matters here.
 TEST_F(FetchScrollLiveTest, ABoundLobColumnDoesNotDesyncTheRow) {
     ExecDirect(
@@ -412,12 +412,10 @@ TEST_F(FetchScrollLiveTest, ABoundLobColumnDoesNotDesyncTheRow) {
     ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &n, sizeof(n), &nInd),
                   SQL_HANDLE_STMT, stmt_);
 
-    // The two drivers legitimately differ on the LOB itself: msodbcsql truncates
-    // it into the buffer, we report the row as unsupported for now. Neither is
-    // allowed to crash or to desynchronise the row, which is what this asserts.
-    SQLRETURN rc = SQLFetch(stmt_);
-    EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO || rc == SQL_ERROR)
-        << "unexpected rc " << rc;
+    // The LOB truncates into the buffer with 01004, and the column after it
+    // still arrives -- the desync this guards against would corrupt that one.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_EQ(4242, n) << "the column after the LOB must still decode";
 
     // The row stream has to be intact afterwards: a clean single-row result set
     // ends here rather than returning garbage or faulting.
@@ -561,5 +559,117 @@ TEST_F(FetchScrollLiveTest, AStaleOrdinalPastTheResultSetIsIgnored) {
     EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRecW(SQL_HANDLE_STMT, stmt_, 1, state,
                                           &native, msg, 256, &msgLen));
     EXPECT_EQ(static_cast<SQLLEN>(-999), ind);
+    SQLCloseCursor(stmt_);
+}
+
+// ---------------------------------------------------------------------------
+// Bound PLP (max/LOB) delivery — AB#47361.
+//
+// The indicator rule is the subtle part, and each case below was verified
+// against msodbcsql before being asserted: a value that fits reports exactly
+// what was produced; a truncated one reports the full length when the target's
+// units match the wire's, and SQL_NO_TOTAL when transcoding makes the wire byte
+// count the wrong unit to report.
+// ---------------------------------------------------------------------------
+
+TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxThatFitsReportsItsLength) {
+    ExecDirect("SELECT CAST(N'abcdefghij' AS NVARCHAR(MAX)) AS c1");
+
+    char buf[64] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_STREQ("abcdefghij", buf);
+    EXPECT_EQ(10, ind);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// Transcoding UTF-16 to a narrow target means the wire byte count is not the
+// delivered byte count, so the full length cannot be reported.
+TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToCharReportsNoTotal) {
+    ExecDirect("SELECT REPLICATE(CAST(N'x' AS NVARCHAR(MAX)), 5000) AS c1");
+
+    char buf[32] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(SQL_NO_TOTAL, ind);
+    EXPECT_EQ(31u, std::strlen(buf)) << "filled to capacity, less the terminator";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// Same source into a wide target: the units match the wire, so the full length
+// is knowable and is reported.
+TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToWcharReportsFullLength) {
+    ExecDirect("SELECT REPLICATE(CAST(N'x' AS NVARCHAR(MAX)), 5000) AS c1");
+
+    SQLWCHAR buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(10000, ind) << "5000 characters, two bytes each";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedReportsFullLength) {
+    ExecDirect("SELECT REPLICATE(CAST('y' AS VARCHAR(MAX)), 5000) AS c1");
+
+    char buf[32] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(5000, ind) << "same encoding, so the length is knowable";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// Non-ASCII, to prove the transcode is not a byte copy: each e-acute is two
+// UTF-16 bytes on the wire and two UTF-8 bytes delivered, and the surrogate
+// handling is shared with the SQLGetData path.
+TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
+    ExecDirect("SELECT CAST(REPLICATE(NCHAR(233), 4) AS NVARCHAR(MAX)) AS c1");
+
+    unsigned char buf[64] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(8, ind) << "four characters, two UTF-8 bytes each";
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(0xC3u, buf[i * 2]);
+        EXPECT_EQ(0xA9u, buf[i * 2 + 1]);
+    }
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// Bound binary delivery is unimplemented for every type, not just the max ones
+// (AB#47239), so this asserts our own answer rather than parity -- msodbcsql
+// delivers it.
+TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS c1");
+
+    unsigned char buf[32] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    // The stream still has to be drained even when the target is refused, or
+    // the next row would decode from inside this value.
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }
