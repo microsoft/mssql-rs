@@ -4086,11 +4086,29 @@ impl TdsClient {
     /// The `RETURNSTATUS` that precedes `DONEPROC` in every RPC response is
     /// absorbed exactly as the main loop absorbs it.
     async fn settle_rpc_terminator(&mut self, parser_context: &ParserContext) -> TdsResult<()> {
+        let result = self.settle_rpc_terminator_inner(parser_context).await;
+        if let Err(error) = &result {
+            self.execution_context.set_has_open_batch(false);
+            self.remaining_request_timeout = None;
+            self.cancel_handle = None;
+            self.retire_after_failed_drain(error);
+        }
+        result
+    }
+
+    async fn settle_rpc_terminator_inner(
+        &mut self,
+        parser_context: &ParserContext,
+    ) -> TdsResult<()> {
         loop {
             let token = self.next_response_token(parser_context).await?;
             match token {
                 Tokens::ReturnStatus(return_status) => {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
+                }
+                Tokens::ReturnValue(return_value_token) => {
+                    let return_value = self.finalize_return_value(return_value_token)?;
+                    self.push_return_value(return_value);
                 }
                 Tokens::DoneProc(done) if !done.has_more() && !done.has_error() => {
                     self.remaining_request_timeout = None;
@@ -6294,6 +6312,7 @@ mod tests {
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
+        receive_error: Option<crate::error::Error>,
         encryption_setting: NegotiatedEncryptionSetting,
     }
 
@@ -6310,6 +6329,7 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
+                receive_error: None,
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
@@ -6326,7 +6346,15 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
+                receive_error: None,
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
+            }
+        }
+
+        fn with_tokens_then_error(tokens: Vec<Tokens>, error: crate::error::Error) -> Self {
+            Self {
+                receive_error: Some(error),
+                ..Self::with_tokens(tokens)
             }
         }
 
@@ -6342,6 +6370,7 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 known_dead: false,
+                receive_error: None,
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
             }
         }
@@ -6369,6 +6398,9 @@ mod tests {
         ) -> TdsResult<Tokens> {
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(tok);
+            }
+            if let Some(error) = self.receive_error.take() {
+                return Err(error);
             }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
@@ -9106,6 +9138,69 @@ mod tests {
         assert_eq!(client.last_rows_affected(), 1);
         assert!(client.remaining_request_timeout.is_none());
         assert!(client.cancel_handle.is_none());
+    }
+
+    /// Output parameters belong to the RPC trailer and must be finalized before
+    /// the terminal `DONEPROC` closes the batch.
+    #[tokio::test]
+    async fn sp_executesql_output_parameters_close_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::ReturnValue(ae_return_value_token("@out1", ColumnValues::Int(7), None)),
+            Tokens::ReturnValue(ae_return_value_token("@out2", ColumnValues::Int(9), None)),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("SET @out1 = 7; SET @out2 = 9".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        let values = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].value, ColumnValues::Int(7));
+        assert_eq!(values[1].value, ColumnValues::Int(9));
+    }
+
+    /// Timeout and cancellation during look-ahead leave the response position
+    /// unknown, so the connection is retired and all request state is cleared.
+    #[tokio::test]
+    async fn sp_executesql_terminator_failure_retires_and_clears_request_state() {
+        let errors = [
+            crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                "test timeout".to_string(),
+            )),
+            crate::error::Error::OperationCancelledError("test cancellation".to_string()),
+        ];
+
+        for error in errors {
+            let transport = TestTransport::with_tokens_then_error(
+                vec![done_in_proc_count(CurrentCommand::Insert, 1)],
+                error,
+            );
+            let mut client = create_test_client_with_transport(transport);
+            client.recovery_context.session_recovery_negotiated = true;
+            let cancel_handle = CancelHandle::new();
+
+            let result = client
+                .execute_sp_executesql(
+                    "INSERT INTO t VALUES (@P1)".to_string(),
+                    Vec::new(),
+                    ExecuteOptions::new()
+                        .timeout_secs(30)
+                        .cancel(&cancel_handle),
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert!(!client.has_open_batch());
+            assert!(client.remaining_request_timeout.is_none());
+            assert!(client.cancel_handle.is_none());
+            assert!(client.transport.connection_known_dead());
+            assert!(!client.recovery_context.session_recovery_negotiated);
+        }
     }
 
     /// The same look-ahead must not swallow a real second statement: a
