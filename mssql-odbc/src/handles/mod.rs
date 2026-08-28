@@ -45,12 +45,40 @@ pub(crate) enum HandleType {
 /// genuine use-after-free once the memory has actually been reused —
 /// observed allocator-dependently on macOS in CI. See mssql-rs#400.
 ///
-/// Deliberately narrower than a full refcounted-handle-lifetime redesign
-/// (tracked separately, `disconnect.rs`'s existing TODO): this only
+/// # Known limitation: address reuse (ABA)
+///
+/// This registry answers "is *some* handle currently allocated at this
+/// address," not "is this *specific* allocation still the one at this
+/// address" — it cannot, since it only ever sees a bare `usize`, with
+/// nothing to distinguish one allocation from a different, later one that
+/// happens to land at the same freed address. So: free handle A, then
+/// allocate a brand-new handle B that the allocator happens to place at
+/// A's old address, and `is_live(A)` reports `true` again — not because A
+/// is somehow still valid, but because the registry cannot tell A and B
+/// apart. A caller still holding stale handle A would then have it
+/// dereferenced as if it were still A, corrupting or freeing B instead
+/// (flagged in review of #415; see
+/// `tests::is_live_cannot_distinguish_a_reused_address_from_the_original_allocation`
+/// for a direct demonstration). This does not make anything *worse* than
+/// before this registry existed — every stale-handle free unconditionally
+/// dereferenced with no check at all — it just means the improvement here
+/// is narrower than "safe against every stale handle": specifically, safe
+/// against the common case where nothing has reallocated at that address
+/// yet, which is what #400's reproduction and the CI failure that
+/// motivated it actually hit.
+///
+/// Actually closing this needs handle identity that survives address
+/// reuse — a generation-tracked indirection layer (handles as small stable
+/// indices into a slot table, not raw pointers) rather than a raw-address
+/// registry. That is squarely the same class of redesign as the existing
+/// refcounted-handle-lifetime TODO (`disconnect.rs`), tracked separately as
+/// mssql-rs#422 rather than attempted here.
+///
+/// Deliberately narrower than that redesign in a second way too: this only
 /// distinguishes "already freed" from "still live," not "live but
 /// concurrently being freed on another thread right now" — that TOCTOU
 /// window is the pre-existing, wider concurrent-use race this crate already
-/// documents and does not attempt to close here.
+/// documents and does not attempt to close here either.
 static LIVE_HANDLES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Returns whether `raw` currently refers to a handle that has been
@@ -165,5 +193,42 @@ mod tests {
     fn is_live_is_false_for_an_address_never_allocated() {
         let never_allocated = 0xDEAD_BEEF_usize as *mut c_void;
         assert!(!is_live(never_allocated));
+    }
+
+    /// Documents the registry's known ABA gap (see the doc comment on
+    /// `LIVE_HANDLES`): it tracks addresses, not allocation identity, so it
+    /// cannot tell an original allocation apart from an unrelated later one
+    /// that the allocator happens to place at the same now-freed address.
+    ///
+    /// Real OS-level address reuse can't be forced portably or
+    /// deterministically from a test, so this demonstrates the exact
+    /// consequence directly against the registry: free a handle, insert a
+    /// *different* handle's address into the registry at the same value
+    /// (standing in for the allocator reusing that address), and show
+    /// `is_live` reports the stale original as live again purely because the
+    /// address matches — not because the original allocation is in any way
+    /// still valid.
+    #[test]
+    fn is_live_cannot_distinguish_a_reused_address_from_the_original_allocation() {
+        let original = EnvHandle::new().expect("failed to create EnvHandle for test");
+        let raw = handle_to_raw(Box::new(original));
+
+        unsafe { free_handle::<EnvHandle>(raw) };
+        assert!(!is_live(raw), "freed handle must not be reported live");
+
+        // Stand in for the allocator handing the same address back out for
+        // an unrelated new allocation, without going through
+        // `handle_to_raw` (there is no portable way to force the real
+        // allocator to reuse this exact address deterministically).
+        LIVE_HANDLES
+            .lock()
+            .expect("registry mutex should not be poisoned in this test")
+            .insert(raw as usize);
+
+        assert!(
+            is_live(raw),
+            "registry cannot distinguish a reused address from the stale original: \
+             this is the documented ABA limitation, not a passing safety check"
+        );
     }
 }
