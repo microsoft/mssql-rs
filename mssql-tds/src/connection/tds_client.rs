@@ -4077,13 +4077,9 @@ impl TdsClient {
     ///
     /// Every `DONEINPROC` carries the MORE flag, because the RPC's own
     /// `DONEPROC` still follows it, so the flag alone cannot tell "another
-    /// statement result is coming" from "that was the last one". Without
-    /// resolving it here the ODBC layer would leave a 0-column cursor open on
-    /// every parameterized INSERT/UPDATE/DELETE — `sp_executesql` — and the next
-    /// execute on that statement would fail with 24000 even though nothing is
-    /// pending. msodbcsql draws the same distinction: a single parameterized
-    /// INSERT leaves the statement immediately re-executable, while a
-    /// two-statement parameterized batch reports 24000.
+    /// statement result is coming" from "that was the last one". Resolving that
+    /// ambiguity here lets every caller distinguish an exhausted RPC from one
+    /// with another result still available.
     ///
     /// Anything that is not the terminator is parked for the next read, so the
     /// look-ahead never consumes a result the caller has yet to navigate to.
@@ -9066,6 +9062,7 @@ mod tests {
         })
     }
 
+    /// The terminal `DONEPROC` that closes an RPC response.
     fn done_proc_final() -> Tokens {
         Tokens::DoneProc(DoneToken {
             status: DoneStatus::FINAL,
