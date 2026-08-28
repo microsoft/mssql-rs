@@ -202,6 +202,43 @@ TEST_F(TransactionLiveTest, RollbackDiscardsInsert) {
     EXPECT_EQ(0, RowCountOf("#rollback_t"));
 }
 
+// The batch-processing shape mssql-python's test suite uses: commit a batch,
+// roll the next one back, commit a third, and expect only the committed batches
+// to survive. It read back zero rows because the parameterized INSERTs — not
+// the transaction handling — failed with 24000 from the second execute onward,
+// so every batch ended in the caller's error path (AB#47531).
+TEST_F(TransactionLiveTest, CommitRollbackCommitKeepsOnlyCommittedBatches) {
+    Exec("CREATE TABLE #batch_t(id int, batch int)");
+    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT), SQL_HANDLE_DBC, dbc_);
+
+    SqlTString insert = ODBCTestUtils::ToSqlTStr("INSERT INTO #batch_t VALUES (?, ?)");
+    for (SQLINTEGER batch = 0; batch < 3; ++batch) {
+        const bool rollback = (batch == 1);
+        for (SQLINTEGER i = 0; i < 5; ++i) {
+            SCOPED_TRACE("batch " + std::to_string(batch) + " row " + std::to_string(i));
+            SQLINTEGER id = batch * 5 + i + 1;
+            SQLINTEGER batch_value = batch;
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0,
+                                           0, &id, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0,
+                                           0, &batch_value, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(insert.c_str()), SQL_NTS),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, rollback ? SQL_ROLLBACK : SQL_COMMIT),
+                      SQL_HANDLE_DBC, dbc_);
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(10, RowCountOf("#batch_t")) << "the two committed batches must both survive";
+    EXPECT_EQ(5, Scalar("SELECT COUNT(*) FROM #batch_t WHERE batch = 0"));
+    EXPECT_EQ(0, Scalar("SELECT COUNT(*) FROM #batch_t WHERE batch = 1"));
+    EXPECT_EQ(5, Scalar("SELECT COUNT(*) FROM #batch_t WHERE batch = 2"));
+}
+
 // A committed row is visible to a completely separate connection, proving the
 // commit reached the server rather than only clearing driver state.
 TEST_F(TransactionLiveTest, CommittedRowIsVisibleToAnotherConnection) {
