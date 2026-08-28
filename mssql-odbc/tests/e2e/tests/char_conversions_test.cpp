@@ -498,6 +498,33 @@ TEST_F(CharConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// ColumnSize 0 is `max` even for a value that would fit a bounded length, so the
+// parameter cannot be cast to sql_variant - sql_variant has no `max` member. The
+// application has to pass a real ColumnSize, which
+// CharParamDeclaresTheParameterType covers.
+//
+// Asserted rather than fixed because msodbcsql 18.6 declares `max` here too and
+// fails identically, so deriving the length from the data instead would be the
+// divergence (AB#47533).
+TEST_F(CharConversionLiveTest, UnboundedColumnSizeIsMaxEvenForASmallValue) {
+    const std::pair<SQLSMALLINT, SQLSMALLINT> cases[] = {
+        {SQL_C_CHAR, SQL_VARCHAR},
+        {SQL_C_WCHAR, SQL_WVARCHAR},
+    };
+    for (const auto& c : cases) {
+        ASSERT_SQL_OK(Prepare("SELECT CAST(? AS SQL_VARIANT)"), SQL_HANDLE_STMT,
+                      stmt_);
+
+        AsciiParam value(c.first, "abc");
+        ASSERT_SQL_OK(BindAscii(1, value, c.second, 0), SQL_HANDLE_STMT, stmt_);
+
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << "sql type " << c.second;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT,
+                      stmt_);
+    }
+}
+
 // A zero-length value is an empty string, not a NULL - only SQL_NULL_DATA in the
 // indicator means NULL. The fixed-length targets still pad out to ColumnSize,
 // which is the one case where an empty value has a non-zero DATALENGTH.
