@@ -17,11 +17,23 @@
 //! long value in chunks across repeated calls, whereas a bound column gets one
 //! shot at a fixed-size buffer and reports `01004` if the value does not fit.
 
+use std::borrow::Cow;
+
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
-use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::connection::tds_client::{BufferedRowPoll, CursorColumn, ResultSet};
+use mssql_tds::datatypes::column_values::{
+    ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
+    SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
+};
+use mssql_tds::datatypes::decoder::DecimalParts;
+use mssql_tds::datatypes::row_writer::RowWriter;
+use mssql_tds::datatypes::sql_json::SqlJson;
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+use mssql_tds::datatypes::sql_vector::SqlVector;
+use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::error::Error as TdsError;
+use uuid::Uuid;
 
 use super::sqlstate::*;
 use crate::api::exec_common::release_busy_if_row_exhausted;
@@ -32,11 +44,15 @@ use crate::api::odbc_types::{
     SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
     SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR,
     SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NULL_DATA, SQL_ROW_ERROR, SQL_ROW_NOROW,
-    SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
-    SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
+    SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlDateStruct,
+    SqlGuid, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlSsTime2Struct,
+    SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlULen, SqlUSmallInt, SqlWChar,
 };
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_with_nul, resolve_cursor_poll, write_if_some};
 use crate::conversion::error::{ConvError, ConvOk};
+use crate::conversion::fetch_convert::{
+    DateTimeParts, date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
+};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{
     ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
@@ -149,6 +165,279 @@ impl RowOutcome {
             _ => RowOutcome::Success,
         }
     }
+}
+
+struct BoundRowWriter<'a> {
+    bindings: &'a [ColumnBinding],
+    next_binding: usize,
+    row_index: usize,
+    bind_offset: usize,
+    outcome: RowOutcome,
+    last_column_read: usize,
+}
+
+// The ODBC call owns the bound buffers for the duration of the synchronous
+// fetch. Moving its decode future between runtime workers cannot make the
+// pointers concurrently accessible.
+unsafe impl Send for BoundRowWriter<'_> {}
+
+impl<'a> BoundRowWriter<'a> {
+    fn new(
+        bindings: &'a [ColumnBinding],
+        row_index: usize,
+        bind_offset: usize,
+    ) -> BoundRowWriter<'a> {
+        BoundRowWriter {
+            bindings,
+            next_binding: 0,
+            row_index,
+            bind_offset,
+            outcome: RowOutcome::Success,
+            last_column_read: 0,
+        }
+    }
+
+    fn take_binding(&mut self, col: usize) -> Option<ColumnBinding> {
+        let ordinal = col + 1;
+        while self
+            .bindings
+            .get(self.next_binding)
+            .is_some_and(|binding| usize::from(binding.column_number) < ordinal)
+        {
+            self.next_binding += 1;
+        }
+        let binding = *self.bindings.get(self.next_binding)?;
+        if usize::from(binding.column_number) != ordinal {
+            return None;
+        }
+        self.next_binding += 1;
+        self.last_column_read = ordinal;
+        Some(binding)
+    }
+
+    fn write_value(&mut self, col: usize, value: ColumnValues) {
+        let Some(binding) = self.take_binding(col) else {
+            return;
+        };
+        let delivered =
+            unsafe { deliver_bound(&binding, self.row_index, self.bind_offset, &value) };
+        self.outcome = self.outcome.merge(delivered);
+    }
+
+    fn write_exact<T, F>(&mut self, col: usize, target_type: SqlSmallInt, value: T, fallback: F)
+    where
+        T: Copy,
+        F: FnOnce() -> ColumnValues,
+    {
+        let Some(binding) = self.take_binding(col) else {
+            return;
+        };
+        let delivered = if binding.target_type == target_type {
+            unsafe { deliver_fixed_bound(&binding, self.row_index, self.bind_offset, value) }
+        } else {
+            unsafe { deliver_bound(&binding, self.row_index, self.bind_offset, &fallback()) }
+        };
+        self.outcome = self.outcome.merge(delivered);
+    }
+
+    fn write_temporal<T, P, C, V>(
+        &mut self,
+        col: usize,
+        target_type: SqlSmallInt,
+        parts: P,
+        convert: C,
+        value: V,
+    ) where
+        T: Copy,
+        P: FnOnce() -> Option<DateTimeParts>,
+        C: FnOnce(DateTimeParts) -> T,
+        V: FnOnce() -> ColumnValues,
+    {
+        let Some(binding) = self.take_binding(col) else {
+            return;
+        };
+        let delivered = if binding.target_type == target_type {
+            match parts() {
+                Some(parts) => unsafe {
+                    deliver_fixed_bound(&binding, self.row_index, self.bind_offset, convert(parts))
+                },
+                None => RowOutcome::Error(RowIssue::Restricted),
+            }
+        } else {
+            unsafe { deliver_bound(&binding, self.row_index, self.bind_offset, &value()) }
+        };
+        self.outcome = self.outcome.merge(delivered);
+    }
+}
+
+impl RowWriter for BoundRowWriter<'_> {
+    fn write_null(&mut self, col: usize) {
+        self.write_value(col, ColumnValues::Null);
+    }
+
+    fn write_bool(&mut self, col: usize, val: bool) {
+        self.write_exact(col, SQL_C_BIT, u8::from(val), || ColumnValues::Bit(val));
+    }
+
+    fn write_u8(&mut self, col: usize, val: u8) {
+        self.write_exact(col, SQL_C_UTINYINT, val, || ColumnValues::TinyInt(val));
+    }
+
+    fn write_i16(&mut self, col: usize, val: i16) {
+        self.write_exact(col, SQL_C_SSHORT, val, || ColumnValues::SmallInt(val));
+    }
+
+    fn write_i32(&mut self, col: usize, val: i32) {
+        self.write_exact(col, SQL_C_SLONG, val, || ColumnValues::Int(val));
+    }
+
+    fn write_i64(&mut self, col: usize, val: i64) {
+        self.write_exact(col, SQL_C_SBIGINT, val, || ColumnValues::BigInt(val));
+    }
+
+    fn write_f32(&mut self, col: usize, val: f32) {
+        self.write_exact(col, SQL_C_FLOAT, val, || ColumnValues::Real(val));
+    }
+
+    fn write_f64(&mut self, col: usize, val: f64) {
+        self.write_exact(col, SQL_C_DOUBLE, val, || ColumnValues::Float(val));
+    }
+
+    fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding: EncodingType) {
+        let Some(binding) = self.take_binding(col) else {
+            return;
+        };
+        let delivered = unsafe {
+            deliver_encoded_string(&binding, self.row_index, self.bind_offset, bytes, encoding)
+        };
+        self.outcome = self.outcome.merge(delivered);
+    }
+
+    fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>) {
+        self.write_value(col, ColumnValues::Bytes(bytes.into_owned()));
+    }
+
+    fn write_decimal(&mut self, col: usize, val: DecimalParts) {
+        self.write_value(col, ColumnValues::Decimal(val));
+    }
+
+    fn write_numeric(&mut self, col: usize, val: DecimalParts) {
+        self.write_value(col, ColumnValues::Numeric(val));
+    }
+
+    fn write_date(&mut self, col: usize, val: SqlDate) {
+        self.write_temporal(
+            col,
+            SQL_C_TYPE_DATE,
+            || Some(date_parts(&val)),
+            |parts| SqlDateStruct {
+                year: parts.year,
+                month: parts.month,
+                day: parts.day,
+            },
+            || ColumnValues::Date(val.clone()),
+        );
+    }
+
+    fn write_time(&mut self, col: usize, val: SqlTime) {
+        self.write_temporal(
+            col,
+            SQL_C_SS_TIME2,
+            || Some(time_parts(&val)),
+            |parts| SqlSsTime2Struct {
+                hour: parts.hour,
+                minute: parts.minute,
+                second: parts.second,
+                fraction: parts.fraction_ns,
+            },
+            || ColumnValues::Time(val.clone()),
+        );
+    }
+
+    fn write_datetime(&mut self, col: usize, val: SqlDateTime) {
+        self.write_value(col, ColumnValues::DateTime(val));
+    }
+
+    fn write_smalldatetime(&mut self, col: usize, val: SqlSmallDateTime) {
+        self.write_value(col, ColumnValues::SmallDateTime(val));
+    }
+
+    fn write_datetime2(&mut self, col: usize, val: SqlDateTime2) {
+        self.write_temporal(
+            col,
+            SQL_C_TYPE_TIMESTAMP,
+            || Some(datetime2_parts(&val)),
+            |parts| SqlTimestampStruct {
+                year: parts.year,
+                month: parts.month,
+                day: parts.day,
+                hour: parts.hour,
+                minute: parts.minute,
+                second: parts.second,
+                fraction: parts.fraction_ns,
+            },
+            || ColumnValues::DateTime2(val.clone()),
+        );
+    }
+
+    fn write_datetimeoffset(&mut self, col: usize, val: SqlDateTimeOffset) {
+        self.write_temporal(
+            col,
+            SQL_C_SS_TIMESTAMPOFFSET,
+            || datetimeoffset_parts(&val),
+            |parts| SqlSsTimestampoffsetStruct {
+                year: parts.year,
+                month: parts.month,
+                day: parts.day,
+                hour: parts.hour,
+                minute: parts.minute,
+                second: parts.second,
+                fraction: parts.fraction_ns,
+                timezone_hour: parts.tz_hour,
+                timezone_minute: parts.tz_minute,
+            },
+            || ColumnValues::DateTimeOffset(val.clone()),
+        );
+    }
+
+    fn write_money(&mut self, col: usize, val: SqlMoney) {
+        self.write_value(col, ColumnValues::Money(val));
+    }
+
+    fn write_smallmoney(&mut self, col: usize, val: SqlSmallMoney) {
+        self.write_value(col, ColumnValues::SmallMoney(val));
+    }
+
+    fn write_uuid(&mut self, col: usize, val: Uuid) {
+        let (data1, data2, data3, data4) = val.as_fields();
+        self.write_exact(
+            col,
+            SQL_C_GUID,
+            SqlGuid {
+                data1,
+                data2,
+                data3,
+                data4: *data4,
+            },
+            || ColumnValues::Uuid(val),
+        );
+    }
+
+    fn write_xml(&mut self, col: usize, val: SqlXml) {
+        self.write_value(col, ColumnValues::Xml(val));
+    }
+
+    fn write_json(&mut self, col: usize, val: SqlJson) {
+        self.write_value(col, ColumnValues::Json(val));
+    }
+
+    fn write_vector(&mut self, col: usize, val: SqlVector) {
+        self.write_value(col, ColumnValues::Vector(val));
+    }
+
+    fn write_variant_base_type(&mut self, _col: usize, _base: TdsDataType) {}
+
+    fn end_row(&mut self) {}
 }
 
 fn fetch_scroll_safe(
@@ -380,53 +669,102 @@ fn fill_rowset(
     // Read once per fetch, not once per bind, so an application can move the
     // whole rowset between calls by updating the pointed-to value.
     let bind_offset = unsafe { read_bind_offset(row_bind_offset_ptr) };
+    let can_write_complete_rows = bindings
+        .last()
+        .is_some_and(|binding| binding.column_number as usize == column_count)
+        && client.current_result_supports_row_into();
 
-    while rows_filled < row_budget {
-        match dbc.runtime.block_on(client.next_row_cursor()) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(e) => {
-                fetch_error = Some(e);
-                break;
-            }
-        }
-
+    for _ in row_slots(row_budget) {
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
-        for binding in bindings {
-            let column = binding.column_number as usize;
-            if column == 0 || column > column_count {
-                // msodbcsql skips a binding whose ordinal is past the end of
-                // this result set and reports nothing -- a binding left over
-                // from a wider one is not an error there, so it is not one
-                // here either.
-                continue;
-            }
-            let pulled = dbc.runtime.block_on(client.read_row_column(column - 1));
-            columns_read = column;
-            let result = match pulled {
-                Ok(CursorColumn::Value { value, .. }) => unsafe {
-                    deliver_bound(binding, rows_filled as usize, bind_offset, &value)
-                },
-                // A bound long/LOB column would have to be drained into the
-                // fixed buffer here; that path is owned by SQLGetData today, so
-                // report the row rather than deliver a wrong value (AB#47361).
-                // Abandoning the stream is safe: the next `read_row_column`
-                // finishes off a paused PLP value before it decodes anything.
-                Ok(CursorColumn::PlpStreaming { .. }) => RowOutcome::Error(RowIssue::Unsupported),
-                // Reading ascending and once per column, neither of these is
-                // reachable; treat them as a row error rather than assuming.
-                Ok(CursorColumn::RowEnded) | Ok(CursorColumn::AlreadyConsumed) => {
-                    RowOutcome::Error(RowIssue::Restricted)
+        if can_write_complete_rows {
+            let mut writer = BoundRowWriter::new(bindings, rows_filled as usize, bind_offset);
+            let result = match client.try_next_buffered_row_into(&mut writer) {
+                Ok(BufferedRowPoll::Complete) => Ok(()),
+                Ok(BufferedRowPoll::Partial) => {
+                    dbc.runtime.block_on(client.finish_row_into(&mut writer))
                 }
-                Err(e) => {
-                    fetch_error = Some(e);
-                    RowOutcome::Error(RowIssue::Restricted)
+                Ok(BufferedRowPoll::Exhausted) => break,
+                Ok(BufferedRowPoll::Pending) => {
+                    let cursor_poll = client.try_next_row_cursor();
+                    match resolve_cursor_poll(cursor_poll, || {
+                        dbc.runtime.block_on(client.next_row_cursor())
+                    }) {
+                        Ok(true) => match client.try_finish_row_into(&mut writer) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => dbc.runtime.block_on(client.finish_row_into(&mut writer)),
+                            Err(error) => Err(error),
+                        },
+                        Ok(false) => break,
+                        Err(error) => {
+                            fetch_error = Some(error);
+                            break;
+                        }
+                    }
                 }
+                Err(error) => Err(error),
             };
-            outcome = outcome.merge(result);
-            if fetch_error.is_some() {
-                break;
+            if let Err(error) = result {
+                fetch_error = Some(error);
+                outcome = outcome.merge(RowOutcome::Error(RowIssue::Restricted));
+            } else {
+                columns_read = writer.last_column_read;
+                outcome = outcome.merge(writer.outcome);
+            }
+        } else {
+            let cursor_poll = client.try_next_row_cursor();
+            match resolve_cursor_poll(cursor_poll, || {
+                dbc.runtime.block_on(client.next_row_cursor())
+            }) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    fetch_error = Some(error);
+                    break;
+                }
+            }
+
+            for binding in bindings {
+                let column = binding.column_number as usize;
+                if column == 0 || column > column_count {
+                    // msodbcsql skips a binding whose ordinal is past the end of
+                    // this result set and reports nothing -- a binding left over
+                    // from a wider one is not an error there, so it is not one
+                    // here either.
+                    continue;
+                }
+                let target = column - 1;
+                let cursor_poll = client.try_read_row_column(target);
+                let pulled = resolve_cursor_poll(cursor_poll, || {
+                    dbc.runtime.block_on(client.read_row_column(target))
+                });
+                columns_read = column;
+                let result = match pulled {
+                    Ok(CursorColumn::Value { value, .. }) => unsafe {
+                        deliver_bound(binding, rows_filled as usize, bind_offset, &value)
+                    },
+                    // A bound long/LOB column would have to be drained into the
+                    // fixed buffer here; that path is owned by SQLGetData today, so
+                    // report the row rather than deliver a wrong value (AB#47361).
+                    // Abandoning the stream is safe: the next `read_row_column`
+                    // finishes off a paused PLP value before it decodes anything.
+                    Ok(CursorColumn::PlpStreaming { .. }) => {
+                        RowOutcome::Error(RowIssue::Unsupported)
+                    }
+                    // Reading ascending and once per column, neither of these is
+                    // reachable; treat them as a row error rather than assuming.
+                    Ok(CursorColumn::RowEnded) | Ok(CursorColumn::AlreadyConsumed) => {
+                        RowOutcome::Error(RowIssue::Restricted)
+                    }
+                    Err(e) => {
+                        fetch_error = Some(e);
+                        RowOutcome::Error(RowIssue::Restricted)
+                    }
+                };
+                outcome = outcome.merge(result);
+                if fetch_error.is_some() {
+                    break;
+                }
             }
         }
         last_column_read = columns_read;
@@ -568,6 +906,10 @@ fn row_budget(max_rows: SqlULen, rows_returned: SqlULen, row_array_size: SqlULen
     row_array_size.min(max_rows.saturating_sub(rows_returned))
 }
 
+fn row_slots(row_budget: SqlULen) -> std::ops::Range<SqlULen> {
+    0..row_budget
+}
+
 /// Writes `SQL_ROW_NOROW` into the unused tail of the row status array.
 fn mark_no_rows(row_status_ptr: *mut SqlUSmallInt, from: SqlULen, row_array_size: SqlULen) {
     if row_status_ptr.is_null() {
@@ -621,6 +963,90 @@ unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
         return 0;
     }
     unsafe { ptr.read_unaligned() }
+}
+
+unsafe fn deliver_encoded_string(
+    binding: &ColumnBinding,
+    row_index: usize,
+    bind_offset: usize,
+    bytes: Cow<'_, [u8]>,
+    encoding: EncodingType,
+) -> RowOutcome {
+    let direct_char = binding.target_type == SQL_C_CHAR
+        && (matches!(encoding, EncodingType::Utf8) && std::str::from_utf8(&bytes).is_ok()
+            || matches!(encoding, EncodingType::LcidBased(_)) && bytes.is_ascii());
+    let direct_wchar = binding.target_type == SQL_C_WCHAR
+        && matches!(encoding, EncodingType::Utf16)
+        && bytes.len().is_multiple_of(2)
+        && std::char::decode_utf16(
+            bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
+        )
+        .all(|unit| unit.is_ok());
+
+    if !direct_char && !direct_wchar {
+        return unsafe {
+            deliver_bound(
+                binding,
+                row_index,
+                bind_offset,
+                &ColumnValues::String(SqlString::new(bytes.into_owned(), encoding)),
+            )
+        };
+    }
+
+    let stride = element_stride(binding.target_type, binding.buffer_length);
+    let indicator = if binding.strlen_or_ind_ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            (binding.strlen_or_ind_ptr as *mut u8)
+                .add(bind_offset)
+                .cast::<SqlLen>()
+                .add(row_index)
+        }
+    };
+    let slot =
+        unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
+
+    if direct_char {
+        unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+        return if unsafe { copy_with_nul(slot, stride, &bytes) } {
+            RowOutcome::Info(RowIssue::StringTruncated)
+        } else {
+            RowOutcome::Success
+        };
+    }
+
+    let source_len = bytes.len() / 2;
+    unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+    if slot.is_null() {
+        return RowOutcome::Success;
+    }
+    let buf_elements = char_buf_elements(binding.target_type, stride);
+    if buf_elements == 0 {
+        return if source_len == 0 {
+            RowOutcome::Success
+        } else {
+            RowOutcome::Info(RowIssue::StringTruncated)
+        };
+    }
+    let destination = slot.cast::<SqlWChar>();
+    let copy_len = source_len.min(buf_elements - 1);
+    for (index, chunk) in bytes.chunks_exact(2).take(copy_len).enumerate() {
+        unsafe {
+            destination
+                .add(index)
+                .write_unaligned(u16::from_le_bytes([chunk[0], chunk[1]]))
+        };
+    }
+    unsafe { destination.add(copy_len).write_unaligned(0) };
+    if copy_len < source_len {
+        RowOutcome::Info(RowIssue::StringTruncated)
+    } else {
+        RowOutcome::Success
+    }
 }
 
 /// Writes one column value into its bound buffer slot for row `row_index`.
@@ -717,6 +1143,33 @@ unsafe fn deliver_bound(
             return RowOutcome::Info(RowIssue::StringTruncated);
         }
     }
+    RowOutcome::Success
+}
+
+unsafe fn deliver_fixed_bound<T: Copy>(
+    binding: &ColumnBinding,
+    row_index: usize,
+    bind_offset: usize,
+    value: T,
+) -> RowOutcome {
+    let stride = element_stride(binding.target_type, binding.buffer_length);
+    let indicator = if binding.strlen_or_ind_ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            (binding.strlen_or_ind_ptr as *mut u8)
+                .add(bind_offset)
+                .cast::<SqlLen>()
+                .add(row_index)
+        }
+    };
+    if !binding.target_value_ptr.is_null() {
+        let slot =
+            unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
+        unsafe { slot.cast::<T>().write_unaligned(value) };
+    }
+    let size = SqlLen::try_from(std::mem::size_of::<T>()).unwrap_or(SqlLen::MAX);
+    unsafe { write_if_some(indicator, size) };
     RowOutcome::Success
 }
 
@@ -898,6 +1351,14 @@ mod tests {
         // before this, so the budget only has to stay total, not underflow.
         assert_eq!(row_budget(5, 5, 4), 0);
         assert_eq!(row_budget(5, 9, 4), 0);
+    }
+
+    #[test]
+    fn max_rows_bounds_the_whole_row_dispatch_loop() {
+        let budget = row_budget(5, 4, 4);
+        let dispatches = row_slots(budget).count();
+
+        assert_eq!(dispatches, 1);
     }
 
     /// The cap is per result set, so advancing onto a new one must restart the
@@ -1215,6 +1676,71 @@ mod tests {
         }
         assert_eq!(buf, [10, 20, 30, 0]);
         assert_eq!(ind[0], 4);
+    }
+
+    #[test]
+    fn bound_row_writer_delivers_borrowed_character_data() {
+        let mut narrow = [0u8; 8];
+        let mut narrow_ind = [0 as SqlLen; 1];
+        let narrow_binding = binding(
+            1,
+            SQL_C_CHAR,
+            narrow.as_mut_ptr() as SqlPointer,
+            narrow.len() as SqlLen,
+            narrow_ind.as_mut_ptr(),
+        );
+        let mut wide = [0u16; 8];
+        let mut wide_ind = [0 as SqlLen; 1];
+        let wide_binding = binding(
+            2,
+            SQL_C_WCHAR,
+            wide.as_mut_ptr() as SqlPointer,
+            std::mem::size_of_val(&wide) as SqlLen,
+            wide_ind.as_mut_ptr(),
+        );
+        let bindings = [narrow_binding, wide_binding];
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+
+        writer.write_string(0, Cow::Borrowed(b"hello"), EncodingType::Utf8);
+        writer.write_string(1, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
+
+        assert_eq!(&narrow[..6], b"hello\0");
+        assert_eq!(narrow_ind[0], 5);
+        assert_eq!(&wide[..3], &[b'h' as u16, b'i' as u16, 0]);
+        assert_eq!(wide_ind[0], 4);
+        assert!(matches!(writer.outcome, RowOutcome::Success));
+        assert_eq!(writer.last_column_read, 2);
+    }
+
+    #[test]
+    fn bound_row_writer_skips_unbound_columns_without_losing_ordinal() {
+        let mut first = [0i32; 1];
+        let mut third = [0i32; 1];
+        let bindings = [
+            binding(
+                1,
+                SQL_C_SLONG,
+                first.as_mut_ptr() as SqlPointer,
+                0,
+                ptr::null_mut(),
+            ),
+            binding(
+                3,
+                SQL_C_SLONG,
+                third.as_mut_ptr() as SqlPointer,
+                0,
+                ptr::null_mut(),
+            ),
+        ];
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+
+        writer.write_i32(0, 10);
+        writer.write_i32(1, 20);
+        writer.write_i32(2, 30);
+
+        assert_eq!(first[0], 10);
+        assert_eq!(third[0], 30);
+        assert_eq!(writer.last_column_read, 3);
     }
 
     /// NULL is reported through the indicator; the data slot is left alone for

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::core::{CancelHandle, TdsResult};
+use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream, decrypt_encrypted_column};
 use crate::datatypes::row_writer::{DiscardRowWriter, RowWriter, write_column_value};
 use crate::io::packet_reader::TdsPacketReader;
@@ -192,6 +193,27 @@ impl PlpPauseState {
 #[async_trait]
 #[cfg(not(fuzzing))]
 pub(crate) trait TdsTokenStreamReader {
+    /// Attempts to read a complete row header from bytes already buffered by the
+    /// transport. Returns `None` without consuming bytes when async I/O or an
+    /// unsupported synchronous parser is required.
+    fn try_receive_row_header(
+        &mut self,
+        _context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        Ok(None)
+    }
+
+    /// Attempts to decode `target` from bytes already buffered by the transport.
+    /// Returns `None` without consuming bytes when async I/O or an unsupported
+    /// synchronous decoder is required.
+    fn try_read_buffered_column(
+        &mut self,
+        _pause_state: &RowPauseState,
+        _target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        Ok(None)
+    }
+
     async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -253,6 +275,21 @@ pub(crate) trait TdsTokenStreamReader {
 #[async_trait]
 #[cfg(fuzzing)]
 pub trait TdsTokenStreamReader {
+    fn try_receive_row_header(
+        &mut self,
+        _context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        Ok(None)
+    }
+
+    fn try_read_buffered_column(
+        &mut self,
+        _pause_state: &RowPauseState,
+        _target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        Ok(None)
+    }
+
     async fn receive_token(
         &mut self,
         context: &ParserContext,
