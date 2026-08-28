@@ -449,12 +449,10 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
 }
 
 // The same cancel once a chunk has crossed a packet boundary. This is the one
-// place both drivers reach the partial-send state from the same event, so it is
-// the parity case for the retraction itself: msodbcsql's BATCHCTX::Cancel takes
-// its STATE_BATCH_PARTIALCMDSENT arm (EOM | IGNORE, then FlushInputStream), and
-// this driver takes `cancel_streamed_write`. The test above cancels after seven
-// bytes, which never leaves the local buffer, so it only covers the discard
-// branch. See AB#47687.
+// event that strands *both* drivers, so it is the parity case for the
+// retraction: msodbcsql takes BATCHCTX::Cancel's STATE_BATCH_PARTIALCMDSENT arm
+// and this driver takes `cancel_streamed_write`. The test above cancels after
+// seven bytes, which never leave the local buffer. AB#47687.
 TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
@@ -469,8 +467,8 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
 
-    // Larger than the default 8000-byte packet, so at least one packet of this
-    // request is on the wire before the cancel.
+    // Larger than the default 8000-byte packet, so a packet is on the wire
+    // before the cancel.
     std::vector<char> chunk(20000, 'a');
     ASSERT_SQL_OK(SQLPutData(stmt_, chunk.data(), static_cast<SQLLEN>(chunk.size())),
                   SQL_HANDLE_STMT, stmt_);
@@ -484,9 +482,8 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
     EXPECT_EQ(SQL_CD_FALSE, dead)
         << "a retracted request must not cost the connection";
 
-    // The withdrawal is only complete once the server's DONE has been consumed.
-    // If it were left unread the next command would pick it up as its own, so
-    // running a fresh statement to completion is what proves the retraction.
+    // An unconsumed DONE would be picked up by this execute, so completing a
+    // second sequence is what proves the withdrawal finished.
     const char reuse[] = "after-cancel";
     ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));

@@ -63,16 +63,24 @@ const SYNTHETIC_POSITIONAL_PARAM_PREFIX: &str = "ce_pos_";
 /// it, even if the socket is still readable.
 const FATAL_ERROR_SEVERITY: u8 = 20;
 
-/// Wall-clock budget for withdrawing a request, deliberately independent of the
-/// request's own timeout.
+/// Budget for withdrawing a request, independent of the request's own timeout.
 ///
-/// A request may legitimately run without one - ODBC's `SQL_ATTR_QUERY_TIMEOUT`
-/// defaults to 0, which leaves `remaining_request_timeout` as `None` - but
-/// giving up the connection must not inherit that. Without a bound, a server
-/// that never answers the withdrawal blocks the caller forever while it holds
-/// the connection, which is worse than the dead connection being recovered
-/// from. msodbcsql draws the same line with `DEFAULT_CANCEL_TIMEOUT`.
-const CANCEL_TIMEOUT: Duration = Duration::from_secs(120);
+/// `remaining_request_timeout` is `None` whenever `SQL_ATTR_QUERY_TIMEOUT` is 0,
+/// and inheriting that would block the caller forever on a server that never
+/// acknowledges the withdrawal. Matches msodbcsql's `DEFAULT_CANCEL_TIMEOUT`.
+const CANCEL_TIMEOUT_SECS: u32 = 120;
+
+/// Derived rather than converted, so the budget cannot degrade to unbounded.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(CANCEL_TIMEOUT_SECS as u64);
+
+enum Withdrawal {
+    /// Ignore packet sent and the server's DONE consumed.
+    Done,
+    /// Nothing attempted: no stream left to resynchronize, so not an error.
+    ConnectionAlreadyDead,
+    /// Neither complete nor retracted; the transport must go.
+    Failed(crate::error::Error),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::connection) enum CommandTimeoutBudget {
@@ -1812,29 +1820,24 @@ impl TdsClient {
             return;
         }
 
-        if let Err(error) = self.withdraw_sent_message(context.message).await {
-            warn!(%error, "Failed to withdraw a cancelled streamed write");
-            self.abort_streamed_write().await;
-            return;
+        match self.withdraw_sent_message(context.message).await {
+            Withdrawal::Done | Withdrawal::ConnectionAlreadyDead => {
+                self.execution_context.set_has_open_batch(false);
+            }
+            Withdrawal::Failed(error) => {
+                warn!(%error, "Failed to withdraw a cancelled streamed write");
+                self.abort_streamed_write().await;
+            }
         }
-
-        self.execution_context.set_has_open_batch(false);
     }
 
     /// Retracts a request whose serialization failed part-way, so the failure
     /// costs the request rather than the connection.
     ///
-    /// Same state-aware handling as
+    /// Without it the server holds a truncated message and answers 4002 on the
+    /// *next* command. Same handling as
     /// [`cancel_streamed_write`](Self::cancel_streamed_write), for the ordinary
-    /// (non-data-at-execution) path: a message that never reached the network is
-    /// dropped locally, one that did is closed with `EOM | IGNORE` and the DONE
-    /// it is answered with is consumed. Without this the server reads a
-    /// truncated stream and answers 4002 on the *next* command.
-    ///
-    /// Serialization can fail after a flush whenever a value is rejected late -
-    /// a declared length the encoded bytes exceed, or a length field that does
-    /// not fit its wire width - and an earlier parameter has already filled a
-    /// packet.
+    /// (non-data-at-execution) path.
     async fn retract_partial_request(&mut self, message: SuspendedMessage) {
         if message.nothing_sent() {
             // Not a plain drop: re-arm the RESETCONNECTION bit this message took.
@@ -1843,54 +1846,52 @@ impl TdsClient {
             return;
         }
 
-        if let Err(error) = self.withdraw_sent_message(message).await {
-            warn!(%error, "Failed to withdraw a partially sent request");
-            self.abort_partial_request().await;
-            return;
+        match self.withdraw_sent_message(message).await {
+            Withdrawal::Done | Withdrawal::ConnectionAlreadyDead => {
+                self.execution_context.set_has_open_batch(false);
+            }
+            Withdrawal::Failed(error) => {
+                warn!(%error, "Failed to withdraw a partially sent request");
+                self.abort_partial_request().await;
+            }
         }
-
-        self.execution_context.set_has_open_batch(false);
     }
 
     /// Closes an already-sent message with `EOM | IGNORE` and consumes the DONE
     /// the server answers it with, both under [`CANCEL_TIMEOUT`].
-    ///
-    /// Shared by the two retraction paths so neither can inherit the request's
-    /// (possibly absent) timeout and block indefinitely on a server that never
-    /// acknowledges the withdrawal.
-    async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> TdsResult<()> {
-        // A dead socket cannot carry the withdrawal, and attempting it would
-        // only surface a write error the caller must translate back into the
-        // same abort. msodbcsql skips the same way (`RemoveAllCommands` guards
-        // on `FIsConnectionDead`).
-        if self.transport.is_connection_dead() {
-            return Err(crate::error::Error::ProtocolError(
-                "connection is dead; a partially sent request cannot be withdrawn".to_string(),
-            ));
+    async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> Withdrawal {
+        // Cached read, not `is_connection_dead`: that one `try_read`s a byte,
+        // which here could swallow the server's answer to the half-written
+        // request. msodbcsql's `FIsConnectionDead` is likewise a cached flag.
+        if self.transport.connection_known_dead() {
+            return Withdrawal::ConnectionAlreadyDead;
         }
 
-        let budget_secs = u32::try_from(CANCEL_TIMEOUT.as_secs()).ok();
         let mut packet_writer = PacketWriter::resume(
-            message.with_write_timeout(budget_secs),
+            message.with_write_timeout(Some(CANCEL_TIMEOUT_SECS)),
             self.transport.as_writer(),
         );
         let ignored = packet_writer.cancel_current_message().await;
         drop(packet_writer);
-        ignored?;
+        if let Err(error) = ignored {
+            return Withdrawal::Failed(error);
+        }
 
         // The server acknowledges an ignored message with a DONE. Leaving it
-        // unread would desynchronize the next command on this connection.
+        // unread would desynchronize the next command.
         let saved = self.remaining_request_timeout.replace(CANCEL_TIMEOUT);
         let drained = self.drain_stream().await;
         self.remaining_request_timeout = saved;
-        drained.map(|_| ())
+        match drained {
+            Ok(_) => Withdrawal::Done,
+            Err(error) => Withdrawal::Failed(error),
+        }
     }
 
-    /// Closes the transport after a partially sent request could not be
-    /// retracted. RESETCONNECTION applies to a later request and cannot
-    /// terminate an incomplete one, so the socket is the only thing left to
-    /// discard. Clearing the open-batch flag lets the next
-    /// [`check_and_reconnect`](Self::check_and_reconnect) recover the session.
+    /// Closes the transport after a request could not be retracted.
+    /// RESETCONNECTION applies to a later request and cannot terminate an
+    /// incomplete one, so the socket is all that is left to discard. Clearing
+    /// the open-batch flag lets the next `check_and_reconnect` recover.
     async fn abort_partial_request(&mut self) {
         self.execution_context.set_has_open_batch(false);
         self.abort_pending_prepare_capture();
@@ -1903,7 +1904,8 @@ impl TdsClient {
     /// Marks the streamed parameter currently open for data as SQL NULL.
     ///
     /// Call this instead of [`write_streamed_chunk`](Self::write_streamed_chunk)
-    /// when a data-at-execution parameter resolves to NULL (the ODBC    /// `SQLPutData(SQL_NULL_DATA)` case). No bytes are written now; when the
+    /// when a data-at-execution parameter resolves to NULL (the ODBC
+    /// `SQLPutData(SQL_NULL_DATA)` case). No bytes are written now; when the
     /// parameter is closed with [`end_streamed_param`](Self::end_streamed_param)
     /// the driver emits `PLP_NULL` instead of an unknown-length opener +
     /// terminator. Mirrors msodbcsql, which writes `VARMAX_LENGTH_NULL` with no
@@ -11348,9 +11350,8 @@ mod tests {
         ));
     }
 
-    /// Opens an RPC message and writes `payload_len` bytes into it, returning it
-    /// suspended — the state a send site is left holding when serialization
-    /// fails part-way through a request.
+    /// Opens an RPC message with `payload_len` bytes and suspends it - the state
+    /// a send site holds when serialization fails part-way.
     async fn suspend_message_with(client: &mut TdsClient, payload_len: usize) -> SuspendedMessage {
         let mut writer = PacketWriter::new(
             PacketType::RpcRequest,
@@ -11365,11 +11366,15 @@ mod tests {
         writer.suspend()
     }
 
-    /// A request that never reached the network is dropped locally: the server
-    /// never learned it existed, so telling it to ignore one would be a lie.
+    /// Dropped locally, and `abandon` rather than `drop` because opening the
+    /// message consumed the connection's pending RESETCONNECTION bit.
     #[tokio::test]
     async fn retract_partial_request_before_first_packet_discards_locally() {
         let (mut client, sent) = create_capturing_client(vec![]);
+        client
+            .transport
+            .as_writer()
+            .set_reset_mode(ResetConnectionMode::Reset);
         let message = suspend_message_with(&mut client, 16).await;
         assert!(message.nothing_sent());
 
@@ -11379,6 +11384,11 @@ mod tests {
             sent.lock().unwrap().is_empty(),
             "a request the server never saw must not be retracted over the wire"
         );
+        assert_eq!(
+            client.transport.as_writer().take_reset_mode(),
+            ResetConnectionMode::Reset,
+            "the abandoned message must hand its reset back to the connection"
+        );
         assert!(
             !client.is_connection_dead(),
             "abandoning an unsent request must leave the connection reusable"
@@ -11386,9 +11396,7 @@ mod tests {
     }
 
     /// Once a packet is on the wire the server is mid-message, so the request is
-    /// closed with EOM | IGNORE and the DONE it answers with is consumed. Without
-    /// this the next command is read as a continuation and the server answers
-    /// 4002.
+    /// closed with EOM | IGNORE and its DONE consumed.
     #[tokio::test]
     async fn retract_partial_request_after_partial_send_ignores_and_drains() {
         use crate::message::messages::PacketStatusFlags;
@@ -11452,16 +11460,15 @@ mod tests {
         );
     }
 
-    /// A dead socket cannot carry the withdrawal. Attempting it would only
-    /// surface a write error that maps back to the same abort, so the guard
-    /// skips straight there — matching msodbcsql's `FIsConnectionDead` check in
-    /// `RemoveAllCommands`.
+    /// The liveness check is the cached flag, never the socket-polling
+    /// `is_connection_dead`: this runs with a half-written message outstanding,
+    /// where a `try_read` probe could swallow the server's answer to it.
     #[tokio::test]
     async fn retract_partial_request_skips_the_withdrawal_on_a_dead_connection() {
         let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
         let message = suspend_message_with(&mut client, 10_000).await;
         let sent_before = sent.lock().unwrap().len();
-        client.transport.close_transport().await.unwrap();
+        client.transport.mark_known_dead();
 
         client.retract_partial_request(message).await;
 
@@ -11470,7 +11477,47 @@ mod tests {
             sent_before,
             "no withdrawal may be attempted on a dead connection"
         );
-        assert!(client.is_connection_dead());
+    }
+
+    /// Drives a real send site, so removing the retraction from
+    /// `execute_sp_executesql` cannot leave the suite green. Parameter 1 flushes
+    /// a packet; parameter 2 is rejected by `serialize_string` after it.
+    #[tokio::test]
+    async fn a_send_site_retracts_when_serialization_fails_after_a_flush() {
+        use crate::message::messages::PacketStatusFlags;
+
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let big = RpcParameter::new(
+            Some("@big".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarcharMax(Some(SqlString::from_utf8_string("a".repeat(20_000)))),
+        );
+        let overlong = RpcParameter::new(
+            Some("@bad".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(SqlString::from_utf8_string("abcdefghij".to_string())),
+                1,
+            ),
+        );
+
+        let result = client
+            .execute_sp_executesql("SELECT @big, @bad".to_string(), vec![big, overlong], ())
+            .await;
+
+        assert!(result.is_err(), "the over-long value must be rejected");
+
+        let wire = sent.lock().unwrap().clone();
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "the half-sent request must be withdrawn, not dropped"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a withdrawn request leaves the connection reusable"
+        );
     }
 
     /// The retraction runs on its own budget, so a request that had a timeout

@@ -153,7 +153,8 @@ impl SuspendedMessage {
     }
 
     /// Discards an unsent message, returning any RESETCONNECTION request it was
-    /// carrying to `network_writer`.    ///
+    /// carrying to `network_writer`.
+    ///
     /// [`PacketWriter::new`] consumes the connection's pending reset bit so it
     /// applies to exactly one message. Dropping a message that never reached the
     /// network would therefore swallow the reset: the transport no longer holds

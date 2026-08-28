@@ -104,11 +104,9 @@ protected:
     }
 
     // A round trip on the same connection after a failed execute. A dead
-    // connection fails here (08S01) instead of returning the value.
-    //
-    // Any cursor the caller left open must be closed first: reusing the
-    // statement while one is live is 24000, which says nothing about the
-    // connection and would mask what this is checking.
+    // connection fails here (08S01) instead of returning the value. Any cursor
+    // the caller left open is closed first, since reusing the statement with one
+    // live is 24000 and would mask that.
     void ExpectConnectionStillUsable() {
         SQLCloseCursor(stmt_);
         ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
@@ -866,30 +864,21 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSilentlyCorrupted) {
 
 
 // ---------------------------------------------------------------------------
-// A value rejected part-way through a request must cost the request, not the
-// connection. The RPC is flushed in packets as it is built, so a rejection
-// after a flush leaves the server holding an incomplete message; unless it is
-// withdrawn (EOM | IGNORE, then its DONE consumed) the next command is read as
-// a continuation and the server answers 4002 - on a *later* statement than the
-// one that failed. See AB#47687.
+// A value rejected after a packet has flushed leaves the server holding an
+// incomplete message. Unless it is withdrawn (EOM | IGNORE, then its DONE
+// consumed) the next command is read as a continuation and answered 4002 - on a
+// *later* statement than the one that failed. AB#47687.
 //
-// The two drivers reach that state from different points, because they order
-// conversion and sending differently: msodbcsql converts each parameter as the
-// RPC is written (`ParamToSQLType`, "pre-convert ... to catch errors and
-// truncations"), while this driver converts every parameter into RpcParameters
-// before a byte is serialized. So a conversion error strands msodbcsql
-// mid-message but never strands us; only a *serialization*-time rejection does.
-// Both cases are covered below.
-//
-// For the shared mechanism exercised on both drivers at once, see
-// SQLCancelAfterAFlushRetractsTheRequest in execute_test.cpp.
+// The drivers are stranded by different events: msodbcsql converts each
+// parameter as the RPC is written, this driver converts all of them first. So a
+// conversion error strands msodbcsql, and only a serialization-time rejection
+// strands us. One test each below; for the mechanism exercised on both at once,
+// see SQLCancelAfterAFlushRetractsTheRequest in execute_test.cpp.
 // ---------------------------------------------------------------------------
 
-// Strands msodbcsql mid-message: parameter 1 is legal and larger than a packet,
-// and parameter 2 fails its conversion, so `ParamToSQLType` errors with bytes
-// already on the wire (its STATE_BATCH_PARTIALCMDSENT). This driver rejects
-// parameter 2 before serializing anything, so it takes the local-discard branch
-// instead. Both must leave the connection usable, which is what this asserts.
+// Strands msodbcsql: parameter 2 fails `ParamToSQLType` with parameter 1 already
+// on the wire. This driver rejects it before serializing, so it takes the
+// local-discard branch. Both must end with a usable connection.
 TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUsable) {
     ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
 
@@ -910,14 +899,11 @@ TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUs
     ExpectConnectionStillUsable();
 }
 
-// Strands *this* driver mid-message, which msodbcsql cannot be made to do here:
-// the value passes our UTF-16 unit count at one unit, then expands to the eight
-// bytes of "&#26085;" inside serialize_string and is rejected against
-// varchar(1) - after parameter 1 has already flushed a packet. msodbcsql
-// measures the converted bytes first, substitutes the unmappable character to a
-// single byte, and sends the value without error. The connection invariant is
-// not driver-specific, so this runs under comparison; on msodbcsql it passes
-// without exercising any recovery.
+// Strands this driver: the value passes our UTF-16 unit count at one unit, then
+// expands to the eight bytes of "&#26085;" inside serialize_string and is
+// rejected against varchar(1) - after parameter 1 has flushed. msodbcsql
+// measures the converted bytes first and sends it without error, so under
+// comparison this passes without exercising any recovery.
 TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectionUsable) {
     if (!DatabaseIsLatin1()) {
         GTEST_SKIP() << "needs a Latin1 collation to make the value unmappable";
@@ -938,8 +924,7 @@ TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectio
                   SQL_HANDLE_STMT, stmt_);
 
     // Deliberately unasserted: this driver rejects the value, msodbcsql
-    // substitutes it and succeeds. A success leaves a live cursor, which has to
-    // be drained here rather than left for the connection check to trip over.
+    // substitutes it and succeeds, leaving a cursor that must be drained here.
     if (SQLExecute(stmt_) != SQL_ERROR) {
         while (SQLFetch(stmt_) == SQL_SUCCESS) {
         }
