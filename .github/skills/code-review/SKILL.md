@@ -18,7 +18,10 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
 
 1. Read the PR title/description to understand intent. Flag if the description is
    missing or doesn't match the diff. This repo requires a linked GitHub issue or
-   Azure DevOps work item — flag a PR that has neither.
+   Azure DevOps work item — flag a PR that has neither. Resolving an `AB#` reference
+   is worth it when you can: it catches a PR that drifts from what its work item
+   asked, or one still open against a closed item. See step 6 for how to reach ADO
+   without stalling an unattended run.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -117,6 +120,34 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    - notes in the body that it came from an unattended run, so the author knows the
      findings were not checked by a human first.
    - never merges, and never resolves a thread it did not open.
+   - treats every interactive authentication path as unavailable, and prefers a tool
+     that fails loudly over one that waits politely.
+
+   That last point has teeth. **Do not call the Azure DevOps MCP server**
+   (`mcp.dev.azure.com` — `repo_pull_request`, `pipelines_build`, work-item tools) from
+   an unattended run. It authenticates through browser-based OAuth, and once the token
+   lapses it does not fail — it blocks on a browser nobody will open, while the run
+   still reports itself as running. A scheduled reviewer here wedged for sixteen hours
+   that way, within a minute of resolving an `AB#` reference, twice. Enterprise policy
+   sets `bypass-permissions mode DISABLED`, so an agent cannot approve its way past the
+   prompt either. Reach ADO through the `az` CLI, which uses the existing `az login`
+   session:
+
+   ```powershell
+   az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --only-show-errors   # preflight, once per run
+   az boards work-item show --id <n> --org https://dev.azure.com/sqlclientdrivers --only-show-errors -o json
+   ```
+
+   Wrap each call in a timeout and check the exit code — an expired *refresh* token is
+   the failure that would otherwise prompt. First timeout or auth error marks ADO
+   unavailable for the rest of the run; do not retry per PR. Never run `az login` or
+   `az devops login` unattended, which are the commands that open a browser.
+
+   **Fail open.** ADO is context, not a gate: it confirms a PR does what its work item
+   asked. When it is unreachable, take an `AB#<number>` at face value as satisfying the
+   linked-work-item requirement in step 1 and review normally. Report the skipped
+   cross-check in the run log, not in the PR — a reviewer's infrastructure trouble is
+   not the author's problem.
 7. Ground yourself in reference code and public/private documentation/specifications.
    If you don't know the codebase, or which references to use, ask for context before
    reviewing.
