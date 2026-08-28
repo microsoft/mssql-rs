@@ -3343,8 +3343,11 @@ impl TdsClient {
         let message = packet_writer.suspend();
         if let Err(e) = serialize_result {
             drop(rpc);
-            self.retract_partial_request(message).await;
+            // Before the retraction, not after: it drains, and a RETURNVALUE read
+            // with the capture still armed would record a handle for an execute
+            // that never ran.
             self.abort_pending_prepare_capture();
+            self.retract_partial_request(message).await;
             self.report_issued_id(issued_id, statement_id);
             return Err(e);
         }
