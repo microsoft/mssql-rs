@@ -6,7 +6,7 @@ use std::slice;
 use crate::api::odbc_types::{
     SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlInteger, SqlReturn, SqlSmallInt, SqlWChar,
 };
-use crate::api::sqlstate::{ERR_STRING_RIGHT_TRUNCATION, post_diag};
+use crate::api::sqlstate::{WARN_STRING_TRUNCATION, post_diag};
 use crate::error::HasDiagnostics;
 
 /// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
@@ -181,7 +181,7 @@ pub(crate) unsafe fn write_wide_attr(
     // rather than wrapping into a huge capacity.
     let capacity = usize::try_from(buffer_length).unwrap_or(0) / size_of::<SqlWChar>();
     if unsafe { copy_with_nul(value_ptr, capacity, &utf16) } {
-        post_diag(state, ERR_STRING_RIGHT_TRUNCATION);
+        post_diag(state, WARN_STRING_TRUNCATION);
         return SQL_SUCCESS_WITH_INFO;
     }
     SQL_SUCCESS
