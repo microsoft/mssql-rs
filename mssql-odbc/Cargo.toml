@@ -55,5 +55,10 @@ mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
 # Matches the version mssql-tds resolves (workspace lock: 1.x) so the `Uuid`
 # type in tests is the same crate instance as `ColumnValues::Uuid`.
 uuid = "1"
+# Real TCP-level TDS server for tests that need actual row bytes on the wire
+# (the scripted `test_client_support` transport carries no row data — see
+# AB#47530). Lets a test drive the full SQLExecDirect -> SQLFetch/SQLFetchScroll
+# path against genuine COLMETADATA/ROW tokens instead of only DONE tokens.
+mssql-mock-tds = { path = "../mssql-mock-tds" }
 
 [build-dependencies]

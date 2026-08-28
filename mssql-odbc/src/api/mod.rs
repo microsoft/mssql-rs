@@ -30,6 +30,8 @@ mod get_env_attr;
 mod get_functions;
 mod get_info;
 mod get_type_info;
+#[cfg(test)]
+mod live_mock_tests;
 mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;

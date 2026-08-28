@@ -168,6 +168,18 @@ Two details worth keeping in mind when extending this:
 - Integration tests against SQL Server (Docker) exercising every type via the ODBC C ABI, both bound (`SQLFetchScroll`) and row-by-row (`SQLGetData`) paths.
 - End-to-end: run the `mssql-python` test suite against a locally-swapped `mssql-odbc` build.
 
+`src/api/live_mock_tests.rs` covers part of the second bullet without a Docker
+dependency: it drives `SQLExecDirect` → `SQLFetch` / `SQLBindCol` +
+`SQLFetchScroll` against `mssql-mock-tds` (a real TCP-level TDS server), so
+real `ColMetadata`/`ROW` bytes flow through the fill loop instead of only the
+scripted `test_client_support` tokens (which carry no row bytes). It reproduces
+the statement-handle-reuse pattern `mssql-python` uses — repeated
+execute/fetch/`SQLFreeStmt(SQL_CLOSE)` cycles with rows left undrained, and a
+prepared plan superseded by `SQLExecDirect` — investigating AB#47530 ("block
+fetch returns zero rows"), which did not reproduce against current `main`.
+Still open: real SQL Server (the mock only supports integer/`NVARCHAR`/NULL
+types), and the actual `mssql-python` suite end-to-end.
+
 ## Scope boundary — batch insert
 
 §4.8 also covers **batch insert** (`executemany` via `SQL_ATTR_PARAMSET_SIZE` array binding), which is a **write** path and out of scope for this story. It is tracked separately as User Story [46576](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46576) (`mssql-odbc | Batch insert (executemany array binding)`), with dependencies on Parameter completeness ([46373](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46373)), Descriptors ([46374](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46374)), Connection & statement attributes ([46377](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46377)), and Streaming ([46378](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46378)).
@@ -192,4 +204,4 @@ Both of those landed with the fetch rework in [#153](https://github.com/microsof
 | P2 — SQLColAttributeW | 46579 | Implemented (common descriptor fields + `SQL_CA_SS_VARIANT_TYPE`, plus the `SQL_SS_VARIANT` type mapping and the zero-length `SQL_C_BINARY` probe the variant path depends on). Binary *delivery* remains unimplemented (Task 47239). |
 | P3 — SQLBindCol + SQLFetchScroll | 46580, 47359 | Implemented ([#322](https://github.com/microsoft/mssql-rs/pull/322)). Column-wise binding and forward-only block fetch, sharing P1's conversion core. 47359 was briefly split out to be worked in parallel and folded back in, since the fill loop cannot be exercised end to end without `SQLBindCol`. Bound PLP columns remain unimplemented (Task 47361). |
 | P4 — Exports & driver-load compat | 46581 | Partly done — `SQLColAttributeW` exported and advertised in P2; `SQLBindCol` and `SQLFetchScroll` in P3. Remaining: confirm the full symbol set loads under `mssql-python`. |
-| P5 — Testing & end-to-end | 46582 | Not started |
+| P5 — Testing & end-to-end | 46582 | Partly started — mock-server-backed live tests added for the fetch mechanism (see P5 section); Docker/SQL Server integration and the real `mssql-python` suite run are still pending |
