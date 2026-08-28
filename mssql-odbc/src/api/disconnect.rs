@@ -52,8 +52,20 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         };
         free_errors(&mut state);
 
+        // Disconnecting a never-connected DBC is a no-op, matching msodbcsql
+        // (verified: SQL_SUCCESS when called directly). MS Learn marks 08003
+        // here `(DM)`, so under a Driver Manager this is unreachable — the DM
+        // answers 08003 itself. Only a DM-less caller that dlopen's the driver
+        // reaches it, cleaning up after a failed SQLDriverConnectW.
+        if state.connection_state == ConnectionState::Disconnected {
+            debug!("SQLDisconnect: not connected, nothing to do");
+            return SQL_SUCCESS;
+        }
+
+        // A connect is still in flight on this handle, so there is nothing to
+        // tear down yet and the client is owned by the connecting thread.
         if state.connection_state != ConnectionState::Connected {
-            error!("SQLDisconnect: not connected");
+            error!("SQLDisconnect: connect still in progress");
             post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
             return SQL_ERROR;
         }
@@ -162,10 +174,14 @@ mod tests {
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        // Disconnect without connecting — should error
+        // Disconnect without connecting — a no-op, not an error. A DM-less
+        // caller cleaning up after a failed SQLDriverConnectW lands here.
         let ret = unsafe { sql_disconnect(dbc) };
-        assert_eq!(ret, SQL_ERROR);
-        // TODO: verify SQLSTATE 08003 via SQLGetDiagRec
+        assert_eq!(ret, SQL_SUCCESS);
+
+        // Repeating it stays a no-op rather than becoming an error.
+        let ret = unsafe { sql_disconnect(dbc) };
+        assert_eq!(ret, SQL_SUCCESS);
 
         unsafe {
             sql_free_handle(SQL_HANDLE_DBC, dbc);
