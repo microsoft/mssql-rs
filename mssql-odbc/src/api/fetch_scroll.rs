@@ -34,7 +34,7 @@ use crate::api::odbc_types::{
     SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_with_nul, resolve_cursor_poll, write_if_some};
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{
@@ -315,7 +315,10 @@ fn fill_rowset(
     let bind_offset = unsafe { read_bind_offset(row_bind_offset_ptr) };
 
     while rows_filled < row_array_size {
-        match dbc.runtime.block_on(client.next_row_cursor()) {
+        let cursor_poll = client.try_next_row_cursor();
+        match resolve_cursor_poll(cursor_poll, || {
+            dbc.runtime.block_on(client.next_row_cursor())
+        }) {
             Ok(true) => {}
             Ok(false) => break,
             Err(e) => {
@@ -335,7 +338,11 @@ fn fill_rowset(
                 // here either.
                 continue;
             }
-            let pulled = dbc.runtime.block_on(client.read_row_column(column - 1));
+            let target = column - 1;
+            let cursor_poll = client.try_read_row_column(target);
+            let pulled = resolve_cursor_poll(cursor_poll, || {
+                dbc.runtime.block_on(client.read_row_column(target))
+            });
             columns_read = column;
             let result = match pulled {
                 Ok(CursorColumn::Value { value, .. }) => unsafe {
