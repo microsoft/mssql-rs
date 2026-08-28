@@ -116,9 +116,9 @@ TEST_F(ExecDirectLiveTest, InvalidSql) {
 }
 
 // AB#47532: a server error with no entry in the error-number→SQLSTATE map takes
-// its state from the TDS severity class, not from a fixed HY000. Severity 11-18
-// is a user-correctable error, so it reports 42000 and wrappers can classify it
-// as a programming error. None of the error numbers below is in the map — nor in
+// its state from the TDS severity class, not from a fixed HY000. In msodbcsql's
+// compatibility tiers, severity 11-18 reports 42000, which wrappers classify as
+// a programming error. None of the error numbers below is in the map — nor in
 // msodbcsql's — so these tests only pass through the severity tier.
 TEST_F(ExecDirectLiveTest, SyntaxErrorReports42000) {
     // Error 102/156, severity 15.

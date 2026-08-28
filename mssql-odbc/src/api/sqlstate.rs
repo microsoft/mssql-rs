@@ -523,9 +523,8 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
 /// Highest TDS severity class that is purely informational — msodbcsql's
 /// `EX_MAXISEVERITY` (`tds.h:603`).
 const SEVERITY_MAX_INFO: i32 = 10;
-/// Highest TDS severity class the user can correct — msodbcsql's
-/// `MAXUSEVERITY` (`tds.h:612`). Above it the failure is a system or resource
-/// condition the application cannot fix by changing its statement.
+/// Upper boundary of msodbcsql's `42000` compatibility tier —
+/// `MAXUSEVERITY` (`tds.h:612`).
 const SEVERITY_MAX_USER: i32 = 18;
 
 /// SQLSTATE for a server message whose error number has no entry in
