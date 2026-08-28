@@ -20,7 +20,8 @@ use crate::handles::{HandleType, free_handle, handle_from_raw};
 /// Implementation of `SQLDisconnect`.
 ///
 /// # Safety
-/// - `connection_handle` must be a valid `DbcHandle` previously connected via `SQLDriverConnectW`.
+/// - `connection_handle` must be a valid `DbcHandle` allocated by
+///   `SQLAllocHandle(SQL_HANDLE_DBC, ...)`.
 pub(crate) unsafe fn sql_disconnect(connection_handle: SqlHandle) -> SqlReturn {
     debug!(?connection_handle, "SQLDisconnect called");
     crate::ffi_entry!("SQLDisconnect", unsafe {
@@ -62,8 +63,9 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
             return SQL_SUCCESS;
         }
 
-        // A connect is still in flight on this handle, so there is nothing to
-        // tear down yet and the client is owned by the connecting thread.
+        // Defensive guard only: SQLDriverConnectW holds this mutex from setting
+        // Connecting until it publishes Connected or Disconnected, so a
+        // concurrent disconnect blocks and always observes a final state.
         if state.connection_state != ConnectionState::Connected {
             error!("SQLDisconnect: connect still in progress");
             post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
