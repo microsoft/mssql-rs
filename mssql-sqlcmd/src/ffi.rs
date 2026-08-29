@@ -10,6 +10,10 @@
 //! changes hands, so the two halves can be linked into one binary without
 //! agreeing on anything but `argv`.
 //!
+//! The native tool's entry point is `main(char**)` on Unix but `wmain(WCHAR**)`
+//! on Windows, so the pair is mirrored as `*_w` taking UTF-16. Both narrow to
+//! the same `Vec<String>` and share every decision from there.
+//!
 //! What is claimed is deliberately narrow: the go-sqlcmd subcommand verbs, and
 //! the long options that have no short form in the ODBC option string. A
 //! command line the ODBC tool could have parsed is never taken.
@@ -85,6 +89,65 @@ pub unsafe extern "C" fn sqlcmd_modern_main(argc: c_int, argv: *const *const c_c
     }
 }
 
+/// UTF-16 counterpart of [`collect`], for the `wmain` the Windows tool uses.
+///
+/// # Safety
+/// `argv` must point to `argc` NUL-terminated wide strings.
+#[cfg(windows)]
+unsafe fn collect_wide(argc: c_int, argv: *const *const u16) -> Option<Vec<String>> {
+    if argv.is_null() || argc < 1 {
+        return None;
+    }
+
+    let mut args = Vec::with_capacity((argc as usize).saturating_sub(1));
+    for i in 1..argc as isize {
+        // SAFETY: the caller guarantees `argc` valid entries.
+        let p = unsafe { *argv.offset(i) };
+        if p.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        // SAFETY: the caller guarantees the run is NUL-terminated.
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` units were just walked, so the slice is in bounds.
+        let units = unsafe { std::slice::from_raw_parts(p, len) };
+        args.push(String::from_utf16(units).ok()?);
+    }
+    Some(args)
+}
+
+/// Wide counterpart of [`sqlcmd_modern_claims`].
+///
+/// # Safety
+/// `argv` must point to `argc` NUL-terminated wide strings, as `wmain`
+/// receives them.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlcmd_modern_claims_w(argc: c_int, argv: *const *const u16) -> c_int {
+    // SAFETY: forwarding the caller's own guarantee.
+    match unsafe { collect_wide(argc, argv) } {
+        Some(args) => c_int::from(claims(&args)),
+        None => 0,
+    }
+}
+
+/// Wide counterpart of [`sqlcmd_modern_main`].
+///
+/// # Safety
+/// `argv` must point to `argc` NUL-terminated wide strings, as `wmain`
+/// receives them.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlcmd_modern_main_w(argc: c_int, argv: *const *const u16) -> c_int {
+    // SAFETY: forwarding the caller's own guarantee.
+    match unsafe { collect_wide(argc, argv) } {
+        Some(args) => crate::run(args),
+        None => crate::exitcode::FAILURE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +185,36 @@ mod tests {
     fn null_argv_is_not_claimed() {
         // SAFETY: deliberately passing null to exercise the guard.
         assert_eq!(unsafe { sqlcmd_modern_claims(1, std::ptr::null()) }, 0);
+        #[cfg(windows)]
+        // SAFETY: deliberately passing null to exercise the guard.
+        assert_eq!(unsafe { sqlcmd_modern_claims_w(1, std::ptr::null()) }, 0);
+    }
+
+    /// The wide entry point must reach the same verdict as the narrow one, or
+    /// Windows and Unix would route the same command line differently.
+    #[cfg(windows)]
+    #[test]
+    fn wide_argv_is_read_the_same_as_narrow() {
+        fn wide(v: &[&str]) -> (Vec<Vec<u16>>, Vec<*const u16>) {
+            let owned: Vec<Vec<u16>> = v
+                .iter()
+                .map(|s| s.encode_utf16().chain(std::iter::once(0)).collect())
+                .collect();
+            let ptrs = owned.iter().map(|w| w.as_ptr()).collect();
+            (owned, ptrs)
+        }
+
+        for (line, expected) in [
+            (["sqlcmd", "-S", "host", "--vertical"].as_slice(), 1),
+            (["sqlcmd", "config", "view"].as_slice(), 1),
+            (["sqlcmd", "-S", "host", "-Q", "SELECT 1"].as_slice(), 0),
+            (["sqlcmd", "--server", "host"].as_slice(), 0),
+        ] {
+            let (_owned, ptrs) = wide(line);
+            // SAFETY: `ptrs` holds one NUL-terminated string per entry, kept
+            // alive by `_owned` for the duration of the call.
+            let got = unsafe { sqlcmd_modern_claims_w(ptrs.len() as c_int, ptrs.as_ptr()) };
+            assert_eq!(got, expected, "{line:?}");
+        }
     }
 }
