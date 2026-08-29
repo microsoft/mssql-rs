@@ -670,22 +670,21 @@ mod query_result_reads {
         connection
             .execute(
                 "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
         let mut values = Vec::new();
         loop {
-            if let Some(resultset) = connection.get_current_resultset() {
-                while let Some(row) = resultset.next_row().await.unwrap() {
+            if connection.on_rows() {
+                while let Some(row) = connection.next_row().await.unwrap() {
                     if let ColumnValues::Int(v) = row[0] {
                         values.push(v);
                     }
                 }
             }
-            if !connection.move_to_next().await.unwrap() {
+            if !connection.advance_to_rows().await.unwrap() {
                 break;
             }
         }
@@ -714,18 +713,17 @@ mod query_result_reads {
         connection
             .execute(
                 "SELECT 1 AS a; RAISERROR('boom', 16, 1); SELECT 2 AS b;".to_string(),
-                None,
-                None,
+                (),
             )
             .await
             .unwrap();
 
         let mut hit_error = false;
         loop {
-            if let Some(resultset) = connection.get_current_resultset() {
-                while let Ok(Some(_)) = resultset.next_row().await {}
+            if connection.on_rows() {
+                while let Ok(Some(_)) = connection.next_row().await {}
             }
-            match connection.move_to_next().await {
+            match connection.advance_to_rows().await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(SqlServerError { .. }) => {
