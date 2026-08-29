@@ -4083,42 +4083,59 @@ impl TdsClient {
     ///
     /// Anything that is not the terminator is parked for the next read, so the
     /// look-ahead never consumes a result the caller has yet to navigate to.
-    /// The `RETURNSTATUS` that precedes `DONEPROC` in every RPC response is
-    /// absorbed exactly as the main loop absorbs it.
+    /// The response-tail control tokens that precede `DONEPROC` are absorbed
+    /// exactly as the main loop absorbs them.
     async fn settle_rpc_terminator(&mut self, parser_context: &ParserContext) -> TdsResult<()> {
-        let result = self.settle_rpc_terminator_inner(parser_context).await;
-        if let Err(error) = &result {
-            self.execution_context.set_has_open_batch(false);
-            self.remaining_request_timeout = None;
-            self.cancel_handle = None;
-            self.retire_after_failed_drain(error);
-        }
-        result
-    }
-
-    async fn settle_rpc_terminator_inner(
-        &mut self,
-        parser_context: &ParserContext,
-    ) -> TdsResult<()> {
+        let mut processing_error = None;
         loop {
-            let token = self.next_response_token(parser_context).await?;
+            let token = match self.next_response_token(parser_context).await {
+                Ok(token) => token,
+                Err(error) => {
+                    self.execution_context.set_has_open_batch(false);
+                    self.remaining_request_timeout = None;
+                    self.cancel_handle = None;
+                    self.retire_after_failed_drain(&error);
+                    return Err(error);
+                }
+            };
             match token {
                 Tokens::ReturnStatus(return_status) => {
                     self.last_return_status = ReturnStatus::Received(return_status.value);
                 }
                 Tokens::ReturnValue(return_value_token) => {
-                    let return_value = self.finalize_return_value(return_value_token)?;
-                    self.push_return_value(return_value);
+                    match self.finalize_return_value(return_value_token) {
+                        Ok(return_value) => self.push_return_value(return_value),
+                        Err(error) => {
+                            processing_error.get_or_insert(error);
+                        }
+                    };
+                }
+                Tokens::EnvChange(env_change) => {
+                    if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.on_reset_connection_ack();
+                    }
+                    if let Err(error) = self
+                        .execution_context
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)
+                    {
+                        processing_error.get_or_insert(error);
+                    }
+                }
+                Tokens::SessionState(session_state) => {
+                    if let Err(error) = self.recovery_context.process_session_state(&session_state)
+                    {
+                        processing_error.get_or_insert(error);
+                    }
                 }
                 Tokens::DoneProc(done) if !done.has_more() && !done.has_error() => {
                     self.remaining_request_timeout = None;
                     self.cancel_handle = None;
                     self.execution_context.set_has_open_batch(false);
-                    return Ok(());
+                    return processing_error.map_or(Ok(()), Err);
                 }
                 other => {
                     self.parked_token = Some(Box::new(other));
-                    return Ok(());
+                    return processing_error.map_or(Ok(()), Err);
                 }
             }
         }
@@ -9162,6 +9179,68 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].value, ColumnValues::Int(7));
         assert_eq!(values[1].value, ColumnValues::Int(9));
+    }
+
+    /// Session-state control tokens can appear in the RPC response tail and
+    /// must be applied without keeping the batch open.
+    #[tokio::test]
+    async fn sp_executesql_session_state_trailer_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::SessionState(SessionStateToken {
+                sequence_number: u32::MAX,
+                status: 0,
+                states: Vec::new(),
+            }),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("SET NOCOUNT ON".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        assert!(
+            client
+                .recovery_context
+                .session_state_table
+                .master_recovery_disabled
+        );
+    }
+
+    /// A fully parsed output parameter that cannot be decrypted is a command
+    /// error, not a transport or synchronization failure.
+    #[tokio::test]
+    async fn sp_executesql_output_decryption_error_does_not_retire_connection() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            done_proc_final(),
+        ]);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let result = client
+            .execute_sp_executesql(
+                "SET @out = 7".to_string(),
+                Vec::new(),
+                ExecuteOptions::new().column_encryption(ExecutionColumnEncryptionSetting::Enabled),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
     }
 
     /// Timeout and cancellation during look-ahead leave the response position
