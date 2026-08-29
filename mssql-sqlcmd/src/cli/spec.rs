@@ -131,6 +131,16 @@ pub fn by_short(c: char) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.short == c)
 }
 
+/// Whether `name` is a long option with no short form a user could type.
+///
+/// These are the options go-sqlcmd added, so they are exactly the ones the
+/// ODBC tool has no spelling for. When this implementation is linked into the
+/// native binary, that makes them safe to claim: nothing written against ODBC
+/// `sqlcmd` can be using them.
+pub fn is_long_only(name: &str) -> bool {
+    by_long(name).is_some_and(|s| !is_typeable(s.short))
+}
+
 /// Long names are matched without regard to case.
 ///
 /// go-sqlcmd's parser is case-sensitive and it spells one flag `--login-timeOut`
