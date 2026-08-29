@@ -1381,6 +1381,7 @@ impl ClientContext {
 mod tests {
     use super::*;
     use crate::core::Version;
+    use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::features::jsonfeature::JsonFeature;
     use crate::message::features::vectorfeature::VectorFeature;
     use crate::token::fed_auth_info::{FedAuthInfoToken, SspiToken};
@@ -1388,6 +1389,8 @@ mod tests {
     use crate::token::tokens::{
         EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, ErrorToken, SqlCollation,
     };
+    use byteorder::{LittleEndian, ReadBytesExt};
+    use futures::executor::block_on;
 
     // ── FeatureExtension::as_u8 ──
 
@@ -1466,11 +1469,31 @@ mod tests {
     }
 
     #[test]
-    fn application_name_length_uses_utf16_code_units() {
-        let application_name = "MSSQL \u{1f980}".to_string();
+    fn application_name_metadata_uses_utf16_code_units() {
+        let context = ClientContext {
+            application_name: "MSSQL \u{1f980}".to_string(),
+            connect_retry_count: 0,
+            ..ClientContext::default()
+        };
+        let transport_context = context.transport_context.clone();
+        let model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let mut serializer = Serializer::new(&model, &mut packet_writer);
 
-        assert_eq!(utf16_code_units(&application_name), 8);
-        assert_eq!(application_name.len_bytes(), 16);
+        block_on(serializer.write_app_name()).unwrap();
+        assert_eq!(
+            serializer.content_next_offset,
+            FIXED_LOGIN_RECORD_LENGTH + 16
+        );
+
+        let mut payload = packet_writer.get_payload();
+        payload.set_position(PacketWriter::PACKET_HEADER_SIZE as u64);
+        let app_offset = payload.read_u16::<LittleEndian>().unwrap();
+        let app_length = payload.read_u16::<LittleEndian>().unwrap();
+
+        assert_eq!(app_offset, FIXED_LOGIN_RECORD_LENGTH as u16);
+        assert_eq!(app_length, 8);
     }
 
     // ── FeaturesRequest::features() ──
