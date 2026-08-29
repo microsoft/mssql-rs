@@ -1187,10 +1187,10 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
         }
         // msodbcsql renders a uniqueidentifier in upper case; uuid's Display is
         // lower case.
-        ColumnValues::Uuid(u) => Ok(u
-            .hyphenated()
-            .encode_upper(&mut uuid::Uuid::encode_buffer())
-            .to_string()),
+        ColumnValues::Uuid(u) => {
+            let mut buffer = [0; 36];
+            Ok(u.hyphenated().encode_upper(&mut buffer).to_string())
+        }
         ColumnValues::Vector(vec) => Ok(format_vector(vec)),
         ColumnValues::Date(_)
         | ColumnValues::Time(_)

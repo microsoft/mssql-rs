@@ -115,6 +115,43 @@ TEST_F(ExecDirectLiveTest, InvalidSql) {
     EXPECT_SQL_ERROR(rc);
 }
 
+// AB#47532: a server error with no entry in the error-number→SQLSTATE map takes
+// its state from the TDS severity class, not from a fixed HY000. In msodbcsql's
+// compatibility tiers, severity 11-18 reports 42000, which wrappers classify as
+// a programming error. None of the error numbers below is in the map — nor in
+// msodbcsql's — so these tests only pass through the severity tier.
+TEST_F(ExecDirectLiveTest, SyntaxErrorReports42000) {
+    // Error 102/156, severity 15.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT * FROM");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+}
+
+TEST_F(ExecDirectLiveTest, ConversionErrorReports42000) {
+    // Error 257, severity 16 — implicit varchar→varbinary conversion.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "DECLARE @b VARBINARY(10); SET @b = 'not binary';");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+}
+
+TEST_F(ExecDirectLiveTest, RaiseErrorSeverity16Reports42000) {
+    // Native 50000 — RAISERROR's generic user-message number. It is deliberately
+    // absent from the map (it carries no fixed semantic), so only severity can
+    // classify it.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("RAISERROR(N'boom', 16, 1);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+
+    SQLINTEGER native = 0;
+    std::string message = GetDiagMessageForRecord(stmt_, 1, &native);
+    EXPECT_EQ(50000, native);
+    EXPECT_NE(std::string::npos, message.find("boom"));
+}
+
 // Re-executing on the same STMT requires closing the cursor first.
 // SQLExecDirectW leaves an open cursor for result-bearing queries; the caller
 // must call SQLCloseCursor (or SQLFreeStmt(SQL_CLOSE)) before re-executing.
