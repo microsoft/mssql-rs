@@ -1,0 +1,80 @@
+# Flags that were previously parsed but ignored, now wired.
+
+# `SESSIONPROPERTY` returns `sql_variant`, which the driver decodes to its base
+# type without the variant wrapper, so the column comes out a different width.
+# Casting keeps these cases about `-I` rather than about variant rendering.
+
+[[case]]
+name = "quoted identifiers on"
+connect = true
+args = ["-C", "-I", "-Q", "SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int) AS qi"]
+
+[[case]]
+name = "quoted identifiers off by default"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int) AS qi"]
+
+[[case]]
+name = "error level hides lower severities"
+connect = true
+args = ["-C", "-m", "17", "-i", "in.sql"]
+files = { "in.sql" = "RAISERROR('low', 10, 1)\nRAISERROR('high', 18, 1)\nGO\n" }
+
+[[case]]
+name = "error level minus one shows everything"
+connect = true
+args = ["-C", "-m", "-1", "-i", "in.sql"]
+files = { "in.sql" = "PRINT 'note'\nSELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "severity threshold below the error sets the exit code"
+connect = true
+args = ["-C", "-V", "11", "-Q", "RAISERROR('boom', 16, 1)"]
+
+[[case]]
+name = "severity threshold above the error leaves the exit code alone"
+connect = true
+args = ["-C", "-V", "17", "-Q", "RAISERROR('boom', 16, 1)"]
+
+# State 127 ends the session whatever the severity, and outranks -b and -V.
+[[case]]
+name = "message state 127 ends the session"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 16, 127)"]
+
+[[case]]
+name = "message state 127 ends it even below the error level"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 11, 127)"]
+
+[[case]]
+name = "message state 127 abandons the rest of the batch"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 16, 127) SELECT 1 AS after"]
+
+[[case]]
+name = "message state 127 outranks a severity threshold"
+connect = true
+args = ["-C", "-V", "17", "-Q", "RAISERROR('boom', 16, 127)"]
+
+[[case]]
+name = "an ordinary state leaves the session running"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 16, 1) SELECT 1 AS after"]
+
+[[case]]
+name = "a recursive include is refused"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = ":r loop.sql\nGO\n", "loop.sql" = ":r loop.sql\nSELECT 1 AS a\n" }
+skip_reason = "The reference recurses until it runs out of stack rather than refusing; we refuse and say so, which is a deliberate improvement."
+
+[[case]]
+name = "xml mode prints the document alone"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = ":xml on\nSELECT 1 AS a FOR XML RAW\nGO\n" }
+unix_skip_reason = """\
+The Linux reference answers `:xml on` with \"XML mode is currently unavailable in \
+the Linux version.\"; ours works there. Supporting more than the reference is not \
+a defect worth removing."""

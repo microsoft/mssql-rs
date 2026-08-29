@@ -36,7 +36,9 @@ use crate::{
         ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
     },
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
+    token::tokens::{
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeTokenSubType, Tokens,
+    },
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -292,14 +294,16 @@ pub struct TdsClient {
     count_map: HashMap<CurrentCommand, u64>,
     /// Rows affected by the most recent statement; see [`last_rows_affected`](Self::last_rows_affected).
     last_rows_affected: i64,
-    /// Per-statement affected-row counts captured (in order) from every counted
-    /// DONE token seen since the last COLMETADATA or command start, excluding
-    /// `SQLSELECT`-tagged counts (see
-    /// [`last_rows_affected`](Self::last_rows_affected)). For a pure-DML batch
-    /// (`UPDATE; DELETE; INSERT`) this holds one entry per statement so the ODBC
-    /// layer can surface each as its own result set via
-    /// [`take_dml_result_counts`](Self::take_dml_result_counts).
+    /// Per-statement affected-row counts captured (in order) from every counted DONE token.
     dml_result_counts: Vec<i64>,
+    /// Row counts from each DONE token of the current request, in arrival order.
+    done_row_counts: Vec<Option<u64>>,
+    /// When set, errors in a batch are collected while later results are read.
+    defer_batch_errors: bool,
+    /// Errors collected under [`Self::defer_batch_errors`], in arrival order.
+    pending_errors: Vec<SqlErrorInfo>,
+    /// An ERROR token has been collected whose closing DONE has not arrived.
+    unreported_error: bool,
 
     pub(in crate::connection) return_values: Vec<ReturnValue>,
     info_messages: Vec<SqlInfoMessage>,
@@ -427,6 +431,10 @@ impl TdsClient {
             count_map: HashMap::new(),
             last_rows_affected: -1,
             dml_result_counts: Vec::new(),
+            done_row_counts: Vec::new(),
+            defer_batch_errors: false,
+            pending_errors: Vec::new(),
+            unreported_error: false,
             return_values: Vec::new(),
             info_messages: Vec::new(),
             prepared_param_encryption: HashMap::new(),
@@ -574,6 +582,9 @@ impl TdsClient {
                         info_messages,
                         &session_state_tokens,
                     )?;
+                    self.done_row_counts.clear();
+                    self.pending_errors.clear();
+                    self.unreported_error = false;
 
                     self.recovery_context.recovery_count += 1;
                     info!(
@@ -3589,21 +3600,10 @@ impl TdsClient {
     /// Drains all remaining tokens from the stream until a terminal DONE token.
     /// Collects any ERROR tokens encountered and returns them.
     ///
-    /// A statement-scoped error (for example lock timeout 1222) does not abort
-    /// the batch, so the server keeps streaming any result sets that follow it.
-    /// A trailing row-returning result set must therefore be consumed through
-    /// the row-decoding path: ROW/NBCROW tokens carry no length prefix and can
-    /// only be parsed with the preceding COLMETADATA in the parser context.
-    /// Skipping that step would leave unparsed row bytes in the transport and
-    /// corrupt the connection for reuse.
+    /// A statement-scoped error does not abort the batch, so subsequent result
+    /// sets must be consumed through the row-decoding path before reuse.
     pub(in crate::connection) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
-        // A COLMETADATA reached at the top level of the drain must be parsed with
-        // the same Always Encrypted awareness as advance_to_result_boundary: when
-        // column encryption is negotiated the token carries a CEK-table prefix
-        // (empty or not) before the first column, and reading it with
-        // ParserContext::None would misinterpret those bytes and desynchronize the
-        // stream — the very corruption this drain exists to prevent.
         let parser_context = ParserContext::ColumnEncryption(
             self.negotiated_settings.is_column_encryption_supported(),
         );
@@ -3632,9 +3632,7 @@ impl TdsClient {
                     }
                 }
                 Tokens::ColMetadata(colmetadata) => {
-                    // A row-returning result set began. Consume its rows via the
-                    // row-decoding path; the trailing DONE tells us whether the
-                    // batch continues.
+                    // Consume rows so the trailing DONE can determine whether the batch continues.
                     let batch_ended = self
                         .drain_result_set_rows(Arc::new(colmetadata), &mut collected_errors)
                         .await?;
@@ -3831,7 +3829,7 @@ impl TdsClient {
                         done.has_more()
                     );
 
-                    if done.has_error() {
+                    if done.has_error() && !self.consumed_pending_error() {
                         return Err(crate::error::Error::ProtocolError(
                             "Server reported error in DONE token without preceding ERROR token"
                                 .to_string(),
@@ -3841,6 +3839,7 @@ impl TdsClient {
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
+                    self.record_done_row_count(&done);
                     self.current_result_set_has_been_read_till_end = true;
 
                     let is_last = !done.has_more();
@@ -3956,13 +3955,13 @@ impl TdsClient {
                 }
                 Tokens::Error(error_token) => {
                     info!(?error_token);
+                    if self.defer_batch_errors {
+                        self.pending_errors.push(SqlErrorInfo::from(&error_token));
+                        self.unreported_error = true;
+                        continue;
+                    }
                     let mut all_errors = vec![self.record_error_token(&error_token)];
                     let drain_result = self.drain_stream().await;
-                    // Reset batch state before propagating: the error terminates
-                    // the batch regardless of whether the drain fully consumed
-                    // it, so a subsequent `next_row` / `advance` must not pass
-                    // the `maybe_has_unread_rows` guard and read a stream we have
-                    // given up on (mirrors `handle_row_read_token`).
                     self.execution_context.set_has_open_batch(false);
                     self.current_result_set_has_been_read_till_end = true;
                     self.current_metadata = None;
@@ -5377,7 +5376,7 @@ impl TdsClient {
             Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
                 info!("done while get_next_row: {:?}", done);
 
-                if done.has_error() {
+                if done.has_error() && !self.consumed_pending_error() {
                     return Err(crate::error::Error::ProtocolError(
                         "Server reported error in DONE token without preceding ERROR token"
                             .to_string(),
@@ -5386,6 +5385,7 @@ impl TdsClient {
 
                 let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                 *count = count.saturating_add(done.row_count);
+                self.record_done_row_count(&done);
 
                 self.current_result_set_has_been_read_till_end = true;
                 if !done.has_more() {
@@ -5419,12 +5419,13 @@ impl TdsClient {
             }
             Tokens::Error(error_token) => {
                 info!(?error_token);
+                if self.defer_batch_errors {
+                    self.pending_errors.push(SqlErrorInfo::from(&error_token));
+                    self.unreported_error = true;
+                    return Ok(None);
+                }
                 let mut all_errors = vec![self.record_error_token(&error_token)];
                 let drain_result = self.drain_stream().await;
-                // Reset batch state before propagating: the error terminates the
-                // batch regardless of whether the drain fully consumed it, so a
-                // subsequent `close_query` / `advance` does not block trying to
-                // read a stream we have given up on.
                 self.execution_context.set_has_open_batch(false);
                 self.current_result_set_has_been_read_till_end = true;
                 self.current_metadata = None;
@@ -5432,9 +5433,6 @@ impl TdsClient {
                     Ok(drain_errors) => all_errors.extend(drain_errors),
                     Err(e) => {
                         warn!(error = ?e, "Drain after statement error failed; retiring the connection");
-                        // Mirrors the ERROR arm in `advance_to_result_boundary`:
-                        // the SQL error still surfaces, but a stream we gave up on
-                        // must not be handed back to a pool as `SqlServerError`.
                         self.retire_after_failed_drain(&e);
                     }
                 }
@@ -5458,6 +5456,39 @@ impl TdsClient {
         }
     }
 
+    /// Whether the DONE token now being handled is the one closing a statement
+    /// whose ERROR token was already collected.
+    ///
+    /// A DONE carrying the error flag is normally a protocol violation, because
+    /// the ERROR token that explains it should have ended the batch. Under
+    /// [`set_defer_batch_errors`](Self::set_defer_batch_errors) that token was
+    /// collected instead, so the flag is expected exactly once per error.
+    fn consumed_pending_error(&mut self) -> bool {
+        std::mem::take(&mut self.unreported_error)
+    }
+
+    /// Collects mid-batch errors instead of ending the batch at the first one.
+    ///
+    /// A batch such as `SELECT 1; RAISERROR('boom', 16, 1); SELECT 2` normally
+    /// returns the error and abandons the rest, so the second result set is
+    /// unreachable. With deferral on, iteration follows the DONE tokens'
+    /// `has_more` flag to the end and the errors are retrieved with
+    /// [`take_pending_errors`](Self::take_pending_errors). Tools that mirror a
+    /// server-side batch — `sqlcmd` and friends — need this to interleave rows
+    /// and messages the way the server sent them.
+    ///
+    /// Errors that end the batch outright still surface as `Err`; only those
+    /// the server continued past are deferred.
+    pub fn set_defer_batch_errors(&mut self, defer: bool) {
+        self.defer_batch_errors = defer;
+    }
+
+    /// Takes the errors collected under
+    /// [`set_defer_batch_errors`](Self::set_defer_batch_errors), in arrival order.
+    pub fn take_pending_errors(&mut self) -> Vec<SqlErrorInfo> {
+        std::mem::take(&mut self.pending_errors)
+    }
+
     /// Returns a clone of all [`ReturnValue`]s collected during the current
     /// batch — output parameters and UDF return values.
     ///
@@ -5466,6 +5497,21 @@ impl TdsClient {
     /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
+    }
+
+    /// Row counts reported by each statement of the current or most recent
+    /// command, in arrival order, leaving the log empty.
+    ///
+    /// `None` marks a statement that completed without reporting a count, which
+    /// is what `SET NOCOUNT ON` produces; that is deliberately distinct from
+    /// `Some(0)`, which means the statement ran and affected no rows.
+    pub fn take_done_row_counts(&mut self) -> Vec<Option<u64>> {
+        std::mem::take(&mut self.done_row_counts)
+    }
+
+    fn record_done_row_count(&mut self, done: &DoneToken) {
+        self.done_row_counts
+            .push(done.has_count().then_some(done.row_count));
     }
 
     /// Returns the informational (INFO-token) messages captured from the
@@ -5515,17 +5561,12 @@ impl TdsClient {
     fn begin_command(&mut self) {
         self.settle_abandoned_reset_verification();
         self.info_messages.clear();
-        // Clear output parameters / return values from the previous command so a
-        // fully-navigated prior RPC does not leave `get_return_values()` /
-        // `retrieve_output_params()` reporting stale values for this new command.
         self.return_values.clear();
-        // Every execution RPC path (plain batch, sp_executesql, sp_execute,
-        // sp_prepexec, stored proc) funnels through here, so reset the
-        // affected-row count for the new command. A prior DML count must not
-        // leak into `SQLRowCount` when this command reports none (DDL /
-        // `SET NOCOUNT ON` / SELECT).
         self.last_rows_affected = -1;
         self.dml_result_counts.clear();
+        self.done_row_counts.clear();
+        self.pending_errors.clear();
+        self.unreported_error = false;
     }
 
     /// The live server handle the client holds for `statement_id`, if any.
@@ -5880,6 +5921,7 @@ impl TdsClient {
                     let count = self.count_map.entry(done.cur_cmd).or_insert(0);
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
+                    self.record_done_row_count(&done);
 
                     if !done.has_more() {
                         info!("No more rows for current command: {:?}", done.cur_cmd);

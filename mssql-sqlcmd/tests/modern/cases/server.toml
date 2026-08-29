@@ -1,0 +1,150 @@
+# Subcommands that reach a server or a container runtime.
+#
+# `needs_server` cases run only when SQLCMD_DIFF_CONNECT is set.
+# `needs_container` cases run only when SQLCMD_DIFF_CONTAINERS=1, because each
+# one pulls or starts a SQL Server image and costs minutes.
+
+# --- query -------------------------------------------------------------------
+
+[[case]]
+name = "query without a context"
+steps = [["query", "--text", "SELECT 1 AS a"]]
+
+[[case]]
+name = "query runs the text it is given"
+needs_server = true
+steps = [
+    ["config", "add-endpoint", "--name", "ep1", "--address", "{address}", "--port", "{port}"],
+    ["config", "add-user", "--name", "u1", "--username", "{user}", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["query", "--text", "SELECT 1 AS a"],
+]
+
+[[case]]
+name = "query accepts the text as a positional argument"
+needs_server = true
+steps = [
+    ["config", "add-endpoint", "--name", "ep1", "--address", "{address}", "--port", "{port}"],
+    ["config", "add-user", "--name", "u1", "--username", "{user}", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["query", "SELECT 2 AS b"],
+]
+
+[[case]]
+name = "query takes the text under either flag name"
+needs_server = true
+steps = [
+    ["config", "add-endpoint", "--name", "ep1", "--address", "{address}", "--port", "{port}"],
+    ["config", "add-user", "--name", "u1", "--username", "{user}", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["query", "--query", "SELECT 3 AS c"],
+]
+
+[[case]]
+name = "query honours the database flag"
+needs_server = true
+steps = [
+    ["config", "add-endpoint", "--name", "ep1", "--address", "{address}", "--port", "{port}"],
+    ["config", "add-user", "--name", "u1", "--username", "{user}", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["query", "--database", "master", "--text", "SELECT DB_NAME() AS d"],
+]
+
+[[case]]
+name = "query renders types go-sqlcmd's way"
+needs_server = true
+steps = [
+    ["config", "add-endpoint", "--name", "ep1", "--address", "{address}", "--port", "{port}"],
+    ["config", "add-user", "--name", "u1", "--username", "{user}", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["query", "--text", "SELECT CAST(3.14 AS float) AS f, CAST(1 AS bigint) AS b"],
+]
+
+[[case]]
+name = "query reports a server error"
+needs_server = true
+steps = [
+    ["config", "add-endpoint", "--name", "ep1", "--address", "{address}", "--port", "{port}"],
+    ["config", "add-user", "--name", "u1", "--username", "{user}", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["query", "--text", "SELECT * FROM no_such_table_here"],
+]
+
+# --- container lifecycle -----------------------------------------------------
+
+[[case]]
+name = "create refuses without the eula"
+steps = [["create", "mssql"]]
+
+[[case]]
+name = "listing the image tags"
+steps = [["create", "mssql", "get-tags"]]
+
+[[case]]
+name = "listing the image tags by alias"
+steps = [["create", "mssql", "gt"]]
+
+[[case]]
+name = "start when the context has no container"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1"],
+    ["start"],
+]
+
+[[case]]
+name = "stop when the context has no container"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1"],
+    ["stop"],
+]
+
+[[case]]
+name = "delete when the context has no container"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1"],
+    ["delete", "--yes"],
+]
+
+# The container cases below each start a real SQL Server. Their output carries
+# a generated password, a chosen port and the config path, none of which the two
+# runs can agree on, so they are compared on the lines whose shape is fixed.
+
+[[case]]
+name = "create then query then delete"
+needs_container = true
+only_lines_starting = "("
+steps = [
+    ["create", "mssql", "--accept-eula", "--tag", "2022-latest"],
+    ["query", "--text", "SELECT 1 AS a"],
+    ["delete", "--yes"],
+]
+
+[[case]]
+name = "create leaves a context that names its container"
+needs_container = true
+only_lines_starting = "  name:"
+steps = [
+    ["create", "mssql", "--accept-eula", "--tag", "2022-latest"],
+    ["config", "get-contexts", "--detailed"],
+]
+
+[[case]]
+name = "stop then start a created container"
+needs_container = true
+steps = [
+    ["create", "mssql", "--accept-eula", "--tag", "2022-latest"],
+    ["stop"],
+    ["start"],
+]
+
+[[case]]
+name = "delete removes the context"
+needs_container = true
+steps = [
+    ["create", "mssql", "--accept-eula", "--tag", "2022-latest"],
+    ["delete", "--yes"],
+    ["config", "get-contexts"],
+]

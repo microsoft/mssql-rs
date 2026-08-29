@@ -1,0 +1,233 @@
+# go-sqlcmd's subcommand CLI, compared against the real binary.
+#
+# Each case is a sequence of invocations run in order against a fresh config
+# file; only the last one's output is compared. That lets a case set up the
+# state it needs without a separate fixture format.
+#
+# `--sqlconfig` is appended automatically, so no case names a path.
+
+[[case]]
+name = "an empty config lists no contexts"
+steps = [["config", "get-contexts"]]
+
+[[case]]
+name = "an empty config lists no endpoints"
+steps = [["config", "get-endpoints"]]
+
+[[case]]
+name = "an empty config lists no users"
+steps = [["config", "get-users"]]
+
+[[case]]
+name = "viewing an empty config"
+steps = [["config", "view"]]
+
+[[case]]
+name = "adding an endpoint"
+steps = [["config", "add-endpoint", "--name", "ep1", "--address", "localhost", "--port", "1433"]]
+
+[[case]]
+name = "an endpoint takes default name address and port"
+steps = [["config", "add-endpoint"]]
+
+[[case]]
+name = "a duplicate endpoint name gets a number"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-endpoint", "--name", "ep1"],
+]
+
+[[case]]
+name = "a duplicated endpoint keeps both entries"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "view"],
+]
+
+[[case]]
+name = "adding a user"
+steps = [["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"]]
+
+[[case]]
+name = "a basic user needs the encryption flag"
+steps = [["config", "add-user", "--name", "u1", "--username", "sa"]]
+
+[[case]]
+name = "adding a context makes it current"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+]
+
+[[case]]
+name = "a context naming an absent endpoint is refused"
+steps = [["config", "add-context", "--name", "c", "--endpoint", "missing"]]
+
+[[case]]
+name = "a context naming an absent user is refused"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-context", "--name", "c", "--endpoint", "ep1", "--user", "missing"],
+]
+
+[[case]]
+name = "listing contexts"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["config", "get-contexts"],
+]
+
+[[case]]
+name = "listing contexts in detail"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["config", "get-contexts", "--detailed"],
+]
+
+[[case]]
+name = "listing endpoints"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "get-endpoints"],
+]
+
+[[case]]
+name = "listing endpoints in detail"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "get-endpoints", "--detailed"],
+]
+
+[[case]]
+name = "naming one endpoint prints it alone"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "get-endpoints", "ep1"],
+]
+
+[[case]]
+name = "listing users"
+steps = [
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "get-users"],
+]
+
+[[case]]
+name = "listing users in detail shows the stored password"
+steps = [
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "get-users", "--detailed"],
+]
+
+[[case]]
+name = "the current context"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1"],
+    ["config", "current-context"],
+]
+
+[[case]]
+name = "viewing a populated config redacts the password"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["config", "view"],
+]
+
+[[case]]
+name = "viewing raw shows the password"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["config", "view", "--raw"],
+]
+
+[[case]]
+name = "connection strings for the current context"
+# The reference emits its five formats out of a Go map, so their order varies
+# between runs and is not something to match.
+unordered = true
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["config", "connection-strings"],
+]
+
+[[case]]
+name = "connection strings without a context"
+steps = [["config", "connection-strings"]]
+
+[[case]]
+name = "switching context"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1"],
+    ["config", "use-context", "ctx1"],
+]
+
+[[case]]
+name = "switching to a context that does not exist"
+steps = [["config", "use-context", "nope"]]
+
+[[case]]
+name = "deleting a context"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["config", "delete-context", "ctx1"],
+]
+
+[[case]]
+name = "deleting a context takes its endpoint and user with it"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "add-context", "--name", "ctx1", "--endpoint", "ep1", "--user", "u1"],
+    ["config", "delete-context", "ctx1"],
+    ["config", "view"],
+]
+
+[[case]]
+name = "deleting a context that does not exist"
+steps = [["config", "delete-context", "nope"]]
+
+[[case]]
+name = "deleting an endpoint"
+steps = [
+    ["config", "add-endpoint", "--name", "ep1"],
+    ["config", "delete-endpoint", "ep1"],
+]
+
+[[case]]
+name = "deleting an endpoint that does not exist"
+steps = [["config", "delete-endpoint", "nope"]]
+
+[[case]]
+name = "deleting a user"
+steps = [
+    ["config", "add-user", "--name", "u1", "--username", "sa", "--password-encryption", "none"],
+    ["config", "delete-user", "u1"],
+]
+
+[[case]]
+name = "deleting a user that does not exist"
+steps = [["config", "delete-user", "nope"]]
+
+[[case]]
+name = "start without a context"
+steps = [["start"]]
+
+[[case]]
+name = "stop without a context"
+steps = [["stop"]]

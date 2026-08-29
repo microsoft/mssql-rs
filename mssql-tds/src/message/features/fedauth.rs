@@ -101,13 +101,20 @@ impl FedAuthFeature {
             TdsAuthenticationMethod::ActiveDirectoryDeviceCodeFlow => {
                 Ok(active_directory_device_code_flow)
             }
-            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity => {
-                Ok(active_directory_managed_identity)
-            }
+            TdsAuthenticationMethod::ActiveDirectoryManagedIdentity
+            | TdsAuthenticationMethod::ActiveDirectoryMSI => Ok(active_directory_managed_identity),
             TdsAuthenticationMethod::ActiveDirectoryWorkloadIdentity => {
                 Ok(active_directory_workload_identity)
             }
-            TdsAuthenticationMethod::ActiveDirectoryDefault => {
+            // Every remaining flow resolves to a bearer token out of band, so
+            // the server is told the same thing as for any other non-password
+            // credential.
+            TdsAuthenticationMethod::ActiveDirectoryDefault
+            | TdsAuthenticationMethod::ActiveDirectoryAzCli
+            | TdsAuthenticationMethod::ActiveDirectoryAzureDeveloperCli
+            | TdsAuthenticationMethod::ActiveDirectoryAzurePipelines
+            | TdsAuthenticationMethod::ActiveDirectoryEnvironment
+            | TdsAuthenticationMethod::ActiveDirectoryClientAssertion => {
                 Ok(active_directory_token_credential)
             }
             _ => Err(crate::error::Error::ProtocolError(format!(

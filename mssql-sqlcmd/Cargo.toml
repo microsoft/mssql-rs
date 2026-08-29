@@ -1,0 +1,43 @@
+[package]
+name = "mssql-sqlcmd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "mssql_sqlcmd"
+path = "src/lib.rs"
+# rlib: the standalone binary and the tests link against it as a normal crate.
+# staticlib: the archive the native ODBC sqlcmd links, so both CLIs end up in
+# one executable with no second artifact to ship.
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "sqlcmd"
+path = "src/main.rs"
+
+[dependencies]
+thiserror = "2.0.17"
+mssql-tds = { path = "../mssql-tds" }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
+encoding_rs = "0.8"
+# `create mssql get-tags` reads the container registry's tag catalogue. Same
+# version and features as the driver already uses, so nothing new is vendored.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "form"] }
+serde_json = "1.0"
+# Entra ID sign-in for `-G` and `--authentication-method`. The azure SDK only
+# ships a rustls-based reqwest transport by default, which drags in the
+# vulnerable `ring` crate; disable those defaults and force native-tls, matching
+# mssql-odbc and mssql-tds.
+async-trait = "0.1"
+azure_identity = { version = "1.0", default-features = false, features = ["tokio"] }
+azure_core = { version = "1.1", default-features = false, features = ["reqwest"] }
+url = "2"
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.13"
+toml = "0.9"

@@ -1,0 +1,47 @@
+# Lexical behaviour of the option grammar: prefixes, attachment, and the
+# diagnostics emitted when a token cannot be read as an option.
+
+[[case]]
+name = "help via dash"
+args = ["-?"]
+unix_skip_reason = """\
+The Linux reference prints a different usage block: it omits -L, -z, -f, -v, -A \
+and -j, which it does not implement but we do, and adds -D and -J, which it does \
+and we do not. Matching it byte for byte would mean printing a list of options \
+that misdescribes this build, so ours stays accurate instead."""
+
+[[case]]
+name = "help via slash"
+args = ["/?"]
+
+[[case]]
+name = "unknown option reports the whole token"
+args = ["-BOGUS"]
+
+[[case]]
+name = "unknown digit keeps its prefix"
+args = ["-9"]
+
+[[case]]
+name = "bare dash"
+args = ["-"]
+
+[[case]]
+name = "bare slash"
+args = ["/"]
+
+[[case]]
+name = "value option at end of line"
+args = ["-S"]
+
+[[case]]
+name = "value option followed by another option"
+args = ["-S", "-Q", "select 1"]
+
+[[case]]
+name = "junk attached to a flag"
+args = ["-eXYZ"]
+
+[[case]]
+name = "invalid suffix on -N"
+args = ["-Nx", "-Q", "select 1"]

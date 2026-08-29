@@ -1,0 +1,178 @@
+# Cases that reach a real server. They connect to the local default instance
+# with `-C`, so `SQLCMD_DIFF_SERVER` only has to be set to something non-empty
+# to say "a server is reachable here".
+
+[[case]]
+name = "integer and string columns"
+connect = true
+args = ["-C", "-Q", "SELECT 1 AS a, 'hi' AS b"]
+
+[[case]]
+name = "every column is null"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(NULL AS int) AS a, CAST(NULL AS varchar(10)) AS b, CAST(NULL AS char(4)) AS c"]
+
+[[case]]
+name = "exact numeric types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(1.5 AS decimal(10,3)) AS a, CAST(1.5 AS numeric(38,10)) AS b, CAST(12 AS decimal(5,0)) AS c"]
+
+[[case]]
+name = "approximate numeric types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(3.14 AS float) AS a, CAST(3.14 AS real) AS b, CAST(1 AS float) AS c, CAST(1e300 AS float) AS d"]
+
+[[case]]
+name = "money types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(1.5 AS money) AS a, CAST(-1.5 AS smallmoney) AS b, CAST(0 AS money) AS c"]
+
+# `sql_variant` prints at a flat 8000 columns, so `-y` is set here only to keep
+# the captured output a sane size. The width rule is exercised by the `-y 0`
+# case below, which lets the real width through.
+[[case]]
+name = "sql_variant carries its base type's value"
+connect = true
+args = ["-C", "-y", "30", "-Q", "SELECT CAST(1 AS sql_variant) AS a, CAST('abc' AS sql_variant) AS b, CAST(CAST(1.5 AS money) AS sql_variant) AS c"]
+
+[[case]]
+name = "sql_variant ignores the variable-width cap"
+connect = true
+args = ["-C", "-y", "10", "-Q", "SELECT CAST(CAST(1 AS bigint) AS sql_variant) AS a"]
+
+[[case]]
+name = "a null sql_variant"
+connect = true
+args = ["-C", "-y", "30", "-Q", "SELECT CAST(NULL AS sql_variant) AS a"]
+
+[[case]]
+name = "integer family"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(1 AS bit) AS a, CAST(2 AS tinyint) AS b, CAST(3 AS smallint) AS c, CAST(4 AS int) AS d, CAST(5 AS bigint) AS e"]
+
+[[case]]
+name = "date and time types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST('2024-01-02' AS date) AS a, CAST('12:34:56.1234567' AS time) AS b, CAST('2024-01-02 12:34:56' AS datetime) AS c, CAST('2024-01-02 12:34' AS smalldatetime) AS d"]
+
+[[case]]
+name = "high precision date types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST('2024-01-02 12:34:56.1234567' AS datetime2) AS a, CAST('2024-01-02 12:34:56.1234567 +05:30' AS datetimeoffset) AS b"]
+
+[[case]]
+name = "reduced scale date types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST('12:34:56' AS time(0)) AS a, CAST('2024-01-02 12:34:56.123' AS datetime2(3)) AS b"]
+
+[[case]]
+name = "binary and guid types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(0xDEADBEEF AS varbinary(10)) AS a, CAST(0xAB AS binary(4)) AS b, CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier) AS c"]
+
+[[case]]
+name = "character types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST('hi' AS char(6)) AS a, CAST('hi' AS varchar(20)) AS b, CAST('hi' AS nchar(6)) AS c, CAST('hi' AS nvarchar(20)) AS d"]
+
+[[case]]
+name = "large object types"
+connect = true
+args = ["-C", "-Q", "SELECT CAST('hi' AS varchar(max)) AS a, CAST('<a/>' AS xml) AS b"]
+
+[[case]]
+name = "a column name wider than its type"
+connect = true
+args = ["-C", "-Q", "SELECT CAST(1 AS bit) AS a_very_long_column_name"]
+
+[[case]]
+name = "two result sets"
+connect = true
+args = ["-C", "-Q", "SELECT 1 AS a SELECT 2 AS b, 'x' AS c"]
+
+[[case]]
+name = "a select returning no rows"
+connect = true
+args = ["-C", "-Q", "SELECT 1 AS a WHERE 1 = 0"]
+
+[[case]]
+name = "print output"
+connect = true
+args = ["-C", "-Q", "PRINT 'hello'"]
+
+[[case]]
+name = "print interleaved with a select"
+connect = true
+args = ["-C", "-Q", "PRINT 'before' SELECT 1 AS a PRINT 'after'"]
+
+[[case]]
+name = "raiserror"
+connect = true
+args = ["-C", "-Q", "RAISERROR('boom', 16, 1)"]
+
+[[case]]
+name = "a statement that does not compile"
+connect = true
+args = ["-C", "-Q", "SELEC 1"]
+
+[[case]]
+name = "set nocount suppresses the row count"
+connect = true
+args = ["-C", "-Q", "SET NOCOUNT ON SELECT 1 AS a"]
+
+# --- -R, the client's regional settings ---------------------------------------
+#
+# Only ODBC implements this; go-sqlcmd accepts the flag and ignores it. What the
+# text looks like depends on the machine's locale, which is exactly why these
+# are differential rather than golden: on en-US Windows `1234.56` renders as
+# `$1,234.56`, in the Linux `C` locale as `1235`.
+[[case]]
+name = "regional money"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS money) AS v"]
+
+[[case]]
+name = "regional smallmoney"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(12.34 AS smallmoney) AS v"]
+
+[[case]]
+name = "regional decimal"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS decimal(10,2)) AS v"]
+
+[[case]]
+name = "regional numeric"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS numeric(10,4)) AS v"]
+
+[[case]]
+name = "regional date"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST('2026-03-04' AS date) AS v"]
+
+[[case]]
+name = "regional datetime"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST('2026-03-04 13:45:06' AS datetime) AS v"]
+
+[[case]]
+name = "regional smalldatetime"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST('2026-03-04 13:45' AS smalldatetime) AS v"]
+
+# `-R` deliberately leaves these alone, in both tools.
+[[case]]
+name = "regional leaves int alone"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234567 AS int) AS v"]
+
+[[case]]
+name = "regional leaves float alone"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT CAST(1234.56 AS float) AS v"]
+
+[[case]]
+name = "regional leaves text alone"
+connect = true
+args = ["-C", "-R", "-h", "-1", "-Q", "SELECT 'plain text' AS v"]

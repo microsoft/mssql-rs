@@ -1,0 +1,41 @@
+# Options that cannot be combined, and options that may only appear once.
+
+[[case]]
+name = "list servers with another option"
+args = ["-L", "-S", "x"]
+
+[[case]]
+name = "trusted connection with a user name"
+args = ["-E", "-U", "sa", "-Q", "select 1"]
+
+[[case]]
+name = "trusted connection with a password"
+args = ["-E", "-P", "secret", "-Q", "select 1"]
+
+[[case]]
+name = "trusted connection with a password change"
+args = ["-E", "-z", "new", "-Q", "select 1"]
+
+[[case]]
+name = "trim columns with variable type width"
+args = ["-W", "-y", "10", "-Q", "select 1"]
+
+[[case]]
+name = "trim columns with fixed type width"
+args = ["-W", "-Y", "10", "-Q", "select 1"]
+
+[[case]]
+name = "input file with an exiting query"
+args = ["-i", "x.sql", "-Q", "select 1"]
+
+[[case]]
+name = "input file with an initial query"
+args = ["-i", "x.sql", "-q", "select 1"]
+
+[[case]]
+name = "unlimited variable width with an explicit header interval"
+args = ["-y", "0", "-h", "5", "-Q", "select 1"]
+
+[[case]]
+name = "output file given twice"
+args = ["-o", "a.txt", "-o", "b.txt", "-Q", "select 1"]

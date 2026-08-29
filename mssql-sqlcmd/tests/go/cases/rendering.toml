@@ -1,0 +1,132 @@
+# Every case here runs against the real go-sqlcmd binary and against our build
+# with `--compat go`. Connection arguments are added by the harness.
+
+[[case]]
+name = "integer and string columns"
+args = ["-Q", "SELECT 1 AS a, 'hi' AS b"]
+
+[[case]]
+name = "two rows"
+args = ["-Q", "SELECT 1 AS a UNION ALL SELECT 2"]
+
+[[case]]
+name = "no rows"
+args = ["-Q", "SELECT 1 AS a WHERE 1 = 0"]
+
+[[case]]
+name = "nulls"
+args = ["-Q", "SELECT CAST(NULL AS int) AS a, CAST(NULL AS varchar(10)) AS b"]
+
+# go-sqlcmd prints the shortest text that reads back as the same value, where
+# ODBC prints a fixed number of significant digits.
+[[case]]
+name = "float"
+args = ["-Q", "SELECT CAST(3.14 AS float) AS f"]
+
+[[case]]
+name = "float with no fraction"
+args = ["-Q", "SELECT CAST(1 AS float) AS f"]
+
+[[case]]
+name = "real"
+args = ["-Q", "SELECT CAST(3.14 AS real) AS r"]
+
+# go-sqlcmd keeps the leading zero on money below one, and sizes the column
+# differently from ODBC.
+[[case]]
+name = "money"
+args = ["-Q", "SELECT CAST(1.5 AS money) AS m"]
+
+[[case]]
+name = "smallmoney"
+args = ["-Q", "SELECT CAST(1.5 AS smallmoney) AS m"]
+
+[[case]]
+name = "decimal"
+args = ["-Q", "SELECT CAST(1.5 AS decimal(10,3)) AS d"]
+
+[[case]]
+name = "bigint"
+args = ["-Q", "SELECT CAST(5 AS bigint) AS b"]
+
+[[case]]
+name = "bit"
+args = ["-Q", "SELECT CAST(1 AS bit) AS b"]
+
+# go-sqlcmd prints a GUID in lower case; ODBC upper.
+[[case]]
+name = "uniqueidentifier"
+args = ["-Q", "SELECT CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier) AS g"]
+
+[[case]]
+name = "varbinary"
+args = ["-Q", "SELECT CAST(0xDEADBEEF AS varbinary(10)) AS v"]
+
+[[case]]
+name = "datetime"
+args = ["-Q", "SELECT CAST('2024-01-02 12:34:56' AS datetime) AS d"]
+
+[[case]]
+name = "datetime2"
+args = ["-Q", "SELECT CAST('2024-01-02 12:34:56.1234567' AS datetime2) AS d"]
+
+[[case]]
+name = "time"
+args = ["-Q", "SELECT CAST('12:34:56.1234567' AS time) AS t"]
+
+[[case]]
+name = "datetimeoffset"
+args = ["-Q", "SELECT CAST('2024-01-02 12:34:56.1234567 +05:30' AS datetimeoffset) AS d"]
+
+[[case]]
+name = "varchar max"
+args = ["-Q", "SELECT CAST('hi' AS varchar(max)) AS v"]
+
+[[case]]
+name = "print output"
+args = ["-Q", "PRINT 'hello'"]
+
+[[case]]
+name = "raiserror"
+args = ["-Q", "RAISERROR('boom', 16, 1)"]
+
+# go-sqlcmd singularises a count of one.
+[[case]]
+name = "one row affected"
+args = ["-Q", "SELECT 1 AS a"]
+
+[[case]]
+name = "set nocount suppresses the count"
+args = ["-Q", "SET NOCOUNT ON SELECT 1 AS a"]
+
+[[case]]
+name = "column separator"
+args = ["-s", "|", "-Q", "SELECT 1 AS a, 'xy' AS b"]
+
+[[case]]
+name = "trim column padding"
+args = ["-W", "-Q", "SELECT 1 AS a, CAST('cd' AS char(10)) AS b"]
+
+[[case]]
+name = "headers suppressed"
+args = ["-h", "-1", "-Q", "SELECT 1 AS a"]
+
+[[case]]
+name = "large object width capped"
+args = ["-y", "10", "-Q", "SELECT CAST('abcdefghijklmnop' AS varchar(max)) AS b"]
+
+[[case]]
+name = "vertical layout"
+args = ["--vertical", "-Q", "SELECT 1 AS id, 'Alice' AS name"]
+
+[[case]]
+name = "vertical pads names to the longest"
+args = ["--vertical", "-Q", "SELECT 1 AS a, 2 AS longer"]
+
+[[case]]
+name = "ascii layout"
+args = ["--ascii", "-Q", "SELECT 1 AS id, 'Alice' AS name UNION ALL SELECT 22, 'Bob'"]
+
+[[case]]
+name = "ascii layout with a custom separator"
+args = ["--ascii", "-s", "#", "-Q", "SELECT 1 AS a"]
