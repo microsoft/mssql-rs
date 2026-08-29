@@ -1,0 +1,181 @@
+# Layout switches and exit-code paths.
+
+[[case]]
+name = "a custom column separator"
+connect = true
+args = ["-C", "-s", "|", "-Q", "SELECT 1 AS a, 'xy' AS b"]
+
+[[case]]
+name = "an empty column separator"
+connect = true
+args = ["-C", "-s", "", "-Q", "SELECT 1 AS a, 'xy' AS b"]
+
+[[case]]
+name = "trim column padding"
+connect = true
+args = ["-C", "-W", "-Q", "SELECT 1 AS a, CAST('cd' AS char(10)) AS b"]
+
+[[case]]
+name = "trim with two character columns"
+connect = true
+args = ["-C", "-W", "-Q", "SELECT CAST('ab' AS char(10)) AS colone, CAST('cd' AS char(10)) AS coltwo"]
+
+[[case]]
+name = "repeat the heading every two rows"
+connect = true
+args = ["-C", "-h", "2", "-Q", "SELECT 1 AS a UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5"]
+
+[[case]]
+name = "suppress the heading"
+connect = true
+args = ["-C", "-h", "-1", "-Q", "SELECT 1 AS a"]
+
+[[case]]
+name = "wrap at a narrow screen width"
+connect = true
+args = ["-C", "-w", "30", "-Q", "SELECT 1 AS aaa, REPLICATE('x', 40) AS b"]
+
+[[case]]
+name = "cap the large object width"
+connect = true
+args = ["-C", "-y", "10", "-Q", "SELECT CAST('abcdefghijklmnop' AS varchar(max)) AS b"]
+
+[[case]]
+name = "the large object cap leaves sized columns alone"
+connect = true
+args = ["-C", "-y", "10", "-Q", "SELECT CAST('abcdefghijklmnop' AS varchar(100)) AS b"]
+
+[[case]]
+name = "cap the sized column width"
+connect = true
+args = ["-C", "-Y", "5", "-Q", "SELECT CAST('abcdefgh' AS char(8)) AS b"]
+
+[[case]]
+name = "the sized cap leaves numbers alone"
+connect = true
+args = ["-C", "-Y", "3", "-Q", "SELECT CAST(123456 AS int) AS b"]
+
+[[case]]
+name = "an unlimited large object width turns the heading off"
+connect = true
+args = ["-C", "-y", "0", "-Q", "SELECT CAST(REPLICATE('x', 40) AS varchar(max)) AS b"]
+
+[[case]]
+name = "control characters pass through untouched"
+connect = true
+args = ["-C", "-Q", "SELECT 'a' + CHAR(9) + CHAR(9) + 'b' AS a"]
+
+[[case]]
+name = "remove control characters"
+connect = true
+args = ["-C", "-k", "-Q", "SELECT 'a' + CHAR(9) + CHAR(9) + 'b' AS a"]
+
+[[case]]
+name = "one space per control character"
+connect = true
+args = ["-C", "-k1", "-Q", "SELECT 'a' + CHAR(9) + CHAR(9) + 'b' AS a"]
+
+[[case]]
+name = "one space per run of control characters"
+connect = true
+args = ["-C", "-k2", "-Q", "SELECT 'a' + CHAR(9) + CHAR(9) + 'b' AS a"]
+
+[[case]]
+name = "errors to stderr"
+connect = true
+args = ["-C", "-r0", "-i", "in.sql"]
+files = { "in.sql" = "RAISERROR('boom', 16, 1)\nSELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "rows before a mid-batch error are still rendered"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nRAISERROR('boom', 16, 1)\nSELECT 2 AS b\nGO\n" }
+
+[[case]]
+name = "two errors in one batch"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = "RAISERROR('one', 16, 1)\nRAISERROR('two', 16, 1)\nSELECT 3 AS c\nGO\n" }
+
+[[case]]
+name = "a conversion error part way through a result set"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = "SELECT CAST(v AS int) AS n FROM (VALUES('10'),('abc')) t(v)\nGO\n" }
+
+[[case]]
+name = "errors and notices to stderr"
+connect = true
+args = ["-C", "-r1", "-i", "in.sql"]
+files = { "in.sql" = "PRINT 'note'\nSELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "abort on error"
+connect = true
+args = ["-C", "-b", "-i", "in.sql"]
+files = { "in.sql" = "RAISERROR('boom', 16, 1)\nGO\nSELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "abort on error leaves a clean run alone"
+connect = true
+args = ["-C", "-b", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "exit with a query result"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nGO\n:exit(SELECT 42)\n" }
+
+[[case]]
+name = "exit immediately"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\n:exit\n" }
+
+[[case]]
+name = "exit after running the cache"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\n:exit()\n" }
+
+[[case]]
+name = "exit on a query returning no rows"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = ":exit(SELECT 1 WHERE 1 = 0)\n" }
+
+[[case]]
+name = "quit stops the script"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nGO\n:quit\nSELECT 2 AS b\nGO\n" }
+
+[[case]]
+name = "on error exit stops at the first failure"
+connect = true
+args = ["-C", "-i", "in.sql"]
+files = { "in.sql" = ":on error exit\nRAISERROR('boom', 16, 1)\nGO\nSELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "a custom batch terminator"
+connect = true
+args = ["-C", "-c", "END", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nEND\n" }
+
+[[case]]
+name = "select into a database that does not exist"
+connect = true
+args = ["-C", "-d", "no_such_database_here", "-Q", "SELECT 1 AS a"]
+unix_skip_reason = """\
+A real gap, not a reference quirk. The login failure carries two errors and the \
+Linux reference reports \"Cannot open database\" before \"Login failed\"; we \
+report them the other way round, which is the order mssql-tds surfaces them in. \
+Windows happens to agree with us. Closing it means ordering the login response's \
+errors in the driver."""
+
+[[case]]
+name = "results written to an output file"
+connect = true
+args = ["-C", "-o", "out.txt", "-Q", "SELECT 1 AS a"]

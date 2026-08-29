@@ -1,0 +1,155 @@
+# Behaviour beyond rendering: batches, variables, exit codes, error handling.
+
+[[case]]
+name = "two batches separated by go"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nGO\nSELECT 2 AS b\nGO\n" }
+
+[[case]]
+name = "go with a repeat count"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 7 AS a\nGO 3\n" }
+
+[[case]]
+name = "a trailing batch with no terminator still runs"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\n" }
+
+[[case]]
+name = "go inside a string literal is not a terminator"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT '\nGO\n' AS a\nGO\n" }
+
+[[case]]
+name = "variable substitution from the command line"
+args = ["-v", "N=42", "-i", "in.sql"]
+files = { "in.sql" = "SELECT $(N) AS a\nGO\n" }
+
+[[case]]
+name = "setvar then use"
+args = ["-i", "in.sql"]
+files = { "in.sql" = ":setvar N 5\nSELECT $(N) AS a\nGO\n" }
+
+[[case]]
+name = "disabling substitution leaves the reference alone"
+args = ["-x", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS [$(nope)]\nGO\n" }
+
+[[case]]
+name = "reset discards the statement cache"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\n:reset\nSELECT 2 AS b\nGO\n" }
+
+[[case]]
+name = "read a file into the statement cache"
+args = ["-i", "in.sql"]
+files = { "in.sql" = ":r other.sql\nGO\n", "other.sql" = "SELECT 9 AS a\n" }
+
+[[case]]
+name = "echo the input back"
+args = ["-e", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "input arrives on stdin"
+stdin = "SELECT 1 AS a\nGO\n"
+
+[[case]]
+name = "two input files run in order"
+args = ["-i", "one.sql", "-i", "two.sql"]
+files = { "one.sql" = "SELECT 1 AS a\nGO\n", "two.sql" = "SELECT 2 AS b\nGO\n" }
+
+[[case]]
+name = "abort on error"
+args = ["-b", "-i", "in.sql"]
+files = { "in.sql" = "RAISERROR('boom', 16, 1)\nGO\nSELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "exit with a query result"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nGO\n:exit(SELECT 42)\n" }
+
+[[case]]
+name = "exit immediately"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\n:exit\n" }
+
+[[case]]
+name = "quit stops the script"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nGO\n:quit\nSELECT 2 AS b\nGO\n" }
+
+[[case]]
+name = "on error exit stops at the first failure"
+args = ["-i", "in.sql"]
+files = { "in.sql" = ":on error exit\nRAISERROR('boom', 16, 1)\nGO\nSELECT 1 AS a\nGO\n" }
+
+[[case]]
+name = "a custom batch terminator"
+args = ["-c", "END", "-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\nEND\n" }
+
+[[case]]
+name = "a syntax error"
+args = ["-Q", "SELEC 1"]
+
+[[case]]
+name = "two result sets"
+args = ["-Q", "SELECT 1 AS a SELECT 2 AS b, 'x' AS c"]
+
+[[case]]
+name = "print interleaved with a select"
+args = ["-Q", "PRINT 'before' SELECT 1 AS a PRINT 'after'"]
+
+[[case]]
+name = "severity threshold sets the exit code"
+args = ["-V", "11", "-Q", "RAISERROR('boom', 16, 1)"]
+
+# go-sqlcmd returns 80 after a state-127 message, where ODBC returns 1.
+[[case]]
+name = "message state 127 ends the session"
+args = ["-Q", "RAISERROR('boom', 16, 127)"]
+
+[[case]]
+name = "message state 127 abandons the rest of the batch"
+args = ["-Q", "RAISERROR('boom', 16, 127) SELECT 1 AS after"]
+
+[[case]]
+name = "error level hides lower severities"
+args = ["-m", "17", "-i", "in.sql"]
+files = { "in.sql" = "RAISERROR('low', 10, 1)\nRAISERROR('high', 18, 1)\nGO\n" }
+
+[[case]]
+name = "repeat the heading every two rows"
+args = ["-h", "2", "-Q", "SELECT 1 AS a UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5"]
+
+[[case]]
+name = "remove control characters"
+args = ["-k", "-Q", "SELECT 'a' + CHAR(9) + CHAR(9) + 'b' AS a"]
+
+[[case]]
+name = "one space per control character"
+args = ["-k1", "-Q", "SELECT 'a' + CHAR(9) + CHAR(9) + 'b' AS a"]
+
+[[case]]
+name = "errors to stderr"
+args = ["-r0", "-Q", "RAISERROR('boom', 16, 1)"]
+
+[[case]]
+name = "fixed type width"
+args = ["-Y", "5", "-Q", "SELECT CAST('abcdefgh' AS char(8)) AS b"]
+
+[[case]]
+name = "listvar"
+args = ["-i", "in.sql"]
+files = { "in.sql" = ":setvar FOO bar\n:listvar\n" }
+
+[[case]]
+name = "list color names every scheme"
+args = ["-i", "in.sql"]
+files = { "in.sql" = ":list color\n" }
+
+[[case]]
+name = "bare list is not list color"
+args = ["-i", "in.sql"]
+files = { "in.sql" = "SELECT 1 AS a\n:list\n" }
