@@ -56,6 +56,26 @@ pub(crate) struct ActivePlpStream {
     pub(crate) pending_units: Vec<u16>,
 }
 
+impl ActivePlpStream {
+    /// Opens a stream for `column`. Every carry field starts empty, so a call
+    /// site names only what identifies the stream — and a carry field added
+    /// later cannot break an initializer written in parallel.
+    pub(crate) fn new(
+        column: usize,
+        encoding: PlpEncoding,
+        narrow_to_wide: Option<Decoder>,
+    ) -> Self {
+        Self {
+            column,
+            encoding,
+            pending_byte: None,
+            pending_high_surrogate: None,
+            narrow_to_wide,
+            pending_units: Vec::new(),
+        }
+    }
+}
+
 impl std::fmt::Debug for ActivePlpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `encoding_rs::Decoder` is not Debug; report whether one is active.

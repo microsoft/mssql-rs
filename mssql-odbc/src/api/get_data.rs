@@ -688,14 +688,7 @@ fn stream_active_plp_chunk(
             } else {
                 None
             };
-            stmt_state.active_plp = Some(ActivePlpStream {
-                column: col_index,
-                encoding,
-                pending_byte: None,
-                pending_high_surrogate: None,
-                narrow_to_wide,
-                pending_units: Vec::new(),
-            });
+            stmt_state.active_plp = Some(ActivePlpStream::new(col_index, encoding, narrow_to_wide));
             stmt_state.current_row_last_col = col_index;
         }
 
@@ -2629,12 +2622,7 @@ mod tests {
             let mut s = stmt_handle.inner.lock().unwrap();
             s.column_metadata = int_columns(1);
             s.current_row_last_col = 1; // the only column, otherwise fully delivered.
-            s.active_plp = Some(ActivePlpStream {
-                column: 1,
-                encoding: PlpEncoding::SingleByteText,
-                pending_byte: None,
-                pending_high_surrogate: None,
-            });
+            s.active_plp = Some(ActivePlpStream::new(1, PlpEncoding::SingleByteText, None));
         }
         h.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
