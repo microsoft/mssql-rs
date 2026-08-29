@@ -3,7 +3,7 @@
 
 //! Running a batch and rendering whatever comes back.
 
-use mssql_tds::connection::tds_client::{ResultSet, ResultSetClient, TdsClient};
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, TdsClient};
 use mssql_tds::core::CancelHandle;
 use mssql_tds::error::Error as TdsError;
 
@@ -100,7 +100,10 @@ pub async fn run(
     let started = std::time::Instant::now();
     outcome.packet_size = client.packet_size();
 
-    if let Err(error) = client.execute(sql.to_string(), timeout, cancel).await {
+    let mut execute_options = ExecuteOptions::new();
+    execute_options.timeout = timeout;
+    execute_options.cancel = cancel;
+    if let Err(error) = client.execute(sql.to_string(), execute_options).await {
         drain_messages(client, &mut outcome);
         record_error(&error, &mut outcome);
         outcome.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -118,7 +121,7 @@ pub async fn run(
         }
         report_counts(client, &mut outcome, style);
 
-        match client.move_to_next().await {
+        match client.advance_to_rows().await {
             Ok(true) => continue,
             Ok(false) => break,
             Err(error) => {

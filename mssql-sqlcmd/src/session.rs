@@ -282,7 +282,7 @@ impl Session {
                     "OFF"
                 };
                 let _ = client
-                    .execute(format!("SET QUOTED_IDENTIFIER {setting}"), None, None)
+                    .execute(format!("SET QUOTED_IDENTIFIER {setting}"), ())
                     .await;
                 let _ = client.close_query().await;
                 let _ = client.take_info_messages();
