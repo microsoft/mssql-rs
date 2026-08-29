@@ -18,7 +18,10 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
 
 1. Read the PR title/description to understand intent. Flag if the description is
    missing or doesn't match the diff. This repo requires a linked GitHub issue or
-   Azure DevOps work item — flag a PR that has neither.
+   Azure DevOps work item — flag a PR that has neither. Resolving an `AB#` reference
+   is worth it when you can: it catches a PR that drifts from what its work item
+   asked, or one still open against a closed item. See step 6 for handling ADO in an
+   unattended run.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -117,6 +120,18 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    - notes in the body that it came from an unattended run, so the author knows the
      findings were not checked by a human first.
    - never merges, and never resolves a thread it did not open.
+   - treats every interactive authentication path as unavailable, and prefers a tool
+     that fails loudly over one that waits politely. The Azure DevOps MCP server is the
+     known trap: its OAuth flow blocks on a browser nobody will open, and the run keeps
+     reporting itself as healthy while it hangs. Use whatever non-interactive ADO access
+     you have instead, bound it with a timeout, and mark ADO unavailable for the rest of
+     the run on the first failure rather than retrying per PR.
+
+   **Fail open.** ADO is context, not a gate: it confirms a PR does what its work item
+   asked. When it is unreachable, take an `AB#<number>` at face value as satisfying the
+   linked-work-item requirement in step 1 and review normally. Report the skipped
+   cross-check in the run log, not in the PR — a reviewer's infrastructure trouble is
+   not the author's problem.
 7. Ground yourself in reference code and public/private documentation/specifications.
    If you don't know the codebase, or which references to use, ask for context before
    reviewing.

@@ -461,4 +461,106 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert!(stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN));
     }
+
+    /// A statement handle reused for a new execute after its previous cursor
+    /// was fetched to exhaustion (AB#47508's `result_set_exhausted` flag) must
+    /// not carry that flag — or a stale `pending_fetch_error` from that same
+    /// previous result set — into the new result set. Otherwise the very
+    /// first `SQLFetch` on the fresh cursor would wrongly report
+    /// `SQL_NO_DATA`, or worse, wrongly fail with an error left over from an
+    /// entirely different, already-finished query.
+    #[test]
+    fn exec_direct_row_returning_clears_a_stale_exhausted_flag() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::error::Error as TdsError;
+        use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![col_metadata_empty()]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.result_set_exhausted = true;
+            ss.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
+        }
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".to_string());
+
+        assert_eq!(ret, SQL_SUCCESS);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(!ss.result_set_exhausted);
+        assert!(ss.pending_fetch_error.is_none());
+    }
+
+    /// **Blocking, found in review**: `finish_execute`'s pure-DML branch (no
+    /// result set, wire fully drained) was the only one of its three
+    /// terminal branches that did not reset `result_set_exhausted`,
+    /// `batch_exhausted`, `pending_fetch_error`, and `pending_fetch_info` —
+    /// the sibling "statement-wise navigation" and "row-returning" branches
+    /// both do. Reusing a statement handle for a pure-DML re-execute after
+    /// those were left stale by a previous query (e.g. a zero-row fetch that
+    /// exhausted the whole batch and stashed a trailing INFO message) let
+    /// that stale state leak forward: `SQLMoreResults`'s `batch_exhausted`
+    /// fast path would post the *previous* query's INFO message — and a
+    /// stale `pending_fetch_error` would fail — as if they belonged to the
+    /// brand new query.
+    #[test]
+    fn exec_direct_pure_dml_clears_stale_exhausted_and_pending_info() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // No COLMETADATA at all, terminal DONE: a pure-DML, last/only
+        // statement in the batch — routes to finish_execute's third branch.
+        let client = tds_client_from_tokens(vec![done_no_more()]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            // As if a previous query's zero-row fetch exhausted the whole
+            // batch and stashed a trailing INFO message and error
+            // (release_busy_if_row_exhausted), left over on the reused handle.
+            ss.result_set_exhausted = true;
+            ss.batch_exhausted = true;
+            ss.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
+            ss.pending_fetch_info = vec![SqlInfoMessage {
+                message: "previous query's PRINT output".to_string(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }];
+        }
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "UPDATE t1 SET x = 1".to_string());
+
+        assert_eq!(ret, SQL_SUCCESS);
+        let ss = stmt.inner.lock().unwrap();
+        assert!(!ss.result_set_exhausted);
+        assert!(
+            !ss.batch_exhausted,
+            "must not fast-path this new query's SQLMoreResults to SQL_NO_DATA"
+        );
+        assert!(ss.pending_fetch_error.is_none());
+        assert!(
+            ss.pending_fetch_info.is_empty(),
+            "the previous query's INFO message must not leak onto the new query"
+        );
+    }
 }

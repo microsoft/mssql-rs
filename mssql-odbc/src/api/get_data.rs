@@ -5,17 +5,20 @@
 
 use tracing::{debug, error};
 
+use std::sync::MutexGuard;
+
 use super::odbc_types::{
     SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA,
     SQL_NO_TOTAL, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer,
     SqlReturn, SqlSmallInt, SqlUSmallInt,
 };
 use super::sqlstate::*;
+use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::odbc_types::SqlWChar;
 use crate::api::type_rules::{canonical_c_type, is_valid_c_type};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN};
+use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
 use mssql_tds::encoding_rs::{self, Decoder};
@@ -191,7 +194,7 @@ fn sql_get_data_safe(
         .is_some_and(|(c, _)| *c == col_index);
 
     if already_captured {
-        return write_captured_column(
+        let rc = write_captured_column(
             &mut stmt_state,
             col_index,
             target_type,
@@ -199,6 +202,7 @@ fn sql_get_data_safe(
             buffer_length,
             strlen_or_ind_ptr,
         );
+        return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
     }
 
     // Resume the decoder to the requested column then write output.
@@ -225,14 +229,72 @@ fn sql_get_data_safe(
             true,
         );
     }
-    write_captured_column(
+    let rc = write_captured_column(
         &mut reopened_stmt_state,
         col_index,
         target_type,
         target_value_ptr,
         buffer_length,
         strlen_or_ind_ptr,
-    )
+    );
+    finish_get_data(stmt, statement_handle, reopened_stmt_state, col_index, rc)
+}
+
+/// After `SQLGetData` finishes delivering `col_index`, peeks one token past
+/// the current row if that was the result set's last column — mirroring
+/// `fetch_scroll.rs`'s bound-column fetch path. Safe here because every
+/// column has now been read (whether via `SQLBindCol` earlier or
+/// `SQLGetData` just now), so nothing remains on the wire for this row that
+/// a later `SQLGetData` call could still legitimately retrieve. Releases the
+/// connection's busy claim immediately if the peek confirms no more rows
+/// follow, instead of waiting for this cursor to be explicitly closed
+/// (matches msodbcsql's wire-state busy gate; see AB#47508).
+///
+/// Out of scope for now: a column still mid-PLP-stream (`active_plp` set) is
+/// excluded even when `col_index` is the last column, since the stream may
+/// not have reached the wire's end yet; the peek only runs once it completes
+/// naturally on a later `SQLGetData` call.
+///
+/// `ready` alone decides whether to peek — there is no separate `rc ==
+/// SQL_ERROR` bail. Every `write_captured_column` path that returns
+/// `SQL_ERROR` deliberately leaves `current_row_last_col` unadvanced (a
+/// truncated read, an unconvertible type, a malformed payload — all keep the
+/// column resident and re-readable), so `ready` already reads false for
+/// every current error outcome. That also makes this correct for a future
+/// error outcome that legitimately does finish delivering the column (e.g. a
+/// NULL surfaced through an error indicator): `ready` still reflects the true
+/// delivery state instead of a blanket rc check overriding it.
+fn finish_get_data(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    stmt_state: MutexGuard<'_, StmtState>,
+    col_index: usize,
+    rc: SqlReturn,
+) -> SqlReturn {
+    let ready = stmt_state.current_row_last_col == col_index
+        && col_index == stmt_state.column_metadata.len()
+        && stmt_state.active_plp.is_none();
+    drop(stmt_state);
+    if !ready {
+        return rc;
+    }
+
+    let dbc = stmt.parent_dbc();
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        return rc;
+    };
+    if dbc_state.active_stmt != Some(statement_handle) {
+        return rc;
+    }
+    let Some(client) = dbc_state.client.take() else {
+        return rc;
+    };
+    drop(dbc_state);
+    // A row's column was genuinely captured to reach this point (`ready`
+    // requires it), so a row was always delivered here — unlike
+    // `fetch_scroll.rs`'s zero-row fetch case.
+    release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, true);
+    rc
 }
 
 fn write_captured_column(
@@ -488,6 +550,11 @@ fn resume_row_to_column(
             }
             return SQL_ERROR;
         };
+
+        // Claim while still holding this lock — see the identical fix and
+        // its rationale in more_results.rs's client-take site (AB#47508's
+        // early release can have already left this `None`).
+        dbc_state.active_stmt = Some(statement_handle);
 
         client
     };
@@ -1321,6 +1388,39 @@ fn xml_to_text(bytes: &[u8]) -> Result<String, TextError> {
     String::from_utf16(&units).map_err(|_| TextError::Malformed)
 }
 
+/// Drops the leading zero from a value whose magnitude is below one.
+///
+/// msodbcsql renders these as `.5000` / `-.0001`, not `0.5000` / `-0.0001`, and
+/// applications that compare the rendered text see the difference. It strips
+/// unconditionally, so an exact zero renders `.0000` too.
+///
+/// Decimal and money reach that result through separate code, which is why both
+/// were verified rather than one assumed to follow the other:
+/// - `sqlccnvt.cpp` `numerictostring` — the digit loop breaks on
+///   `number.data[0] == 0 && i <= 0`, so it stops once the scale is satisfied
+///   and never emits an integer-part digit for a sub-one value.
+/// - `sqlccnvt.cpp` `BigintToChar`, called with `scale = 4` for money — loops
+///   while `value != 0 || cch <= scale` and emits the separator at
+///   `cch == scale`, arriving at the same shape.
+///
+/// `Real` and `Float` are deliberately **not** stripped. Float rendering goes
+/// through `DoubleToChar`, which has an explicit "put in leading zero before
+/// decimal point" branch, so msodbcsql really does render `0.5` for `FLOAT` and
+/// `.5000` for `DECIMAL`. The asymmetry is the parity-correct answer, not an
+/// oversight — removing it to make the two consistent would create a divergence.
+///
+/// Applied here rather than in `mssql-tds`'s formatters because this is the ODBC
+/// parity contract, not a general property of number formatting.
+fn strip_sub_one_leading_zero(s: String) -> String {
+    if let Some(rest) = s.strip_prefix("0.") {
+        format!(".{rest}")
+    } else if let Some(rest) = s.strip_prefix("-0.") {
+        format!("-.{rest}")
+    } else {
+        s
+    }
+}
+
 pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
     match v {
         ColumnValues::TinyInt(x) => Ok(x.to_string()),
@@ -1330,9 +1430,15 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
         ColumnValues::Real(x) => Ok(x.to_string()),
         ColumnValues::Float(x) => Ok(x.to_string()),
         ColumnValues::Bit(x) => Ok(if *x { "1".into() } else { "0".into() }),
-        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => Ok(d.to_decimal_string()),
-        ColumnValues::Money(m) => Ok(money_scaled_to_string(money_scaled(m.lsb_part, m.msb_part))),
-        ColumnValues::SmallMoney(m) => Ok(money_scaled_to_string(i64::from(m.int_val))),
+        ColumnValues::Decimal(d) | ColumnValues::Numeric(d) => {
+            Ok(strip_sub_one_leading_zero(d.to_decimal_string()))
+        }
+        ColumnValues::Money(m) => Ok(strip_sub_one_leading_zero(money_scaled_to_string(
+            money_scaled(m.lsb_part, m.msb_part),
+        ))),
+        ColumnValues::SmallMoney(m) => Ok(strip_sub_one_leading_zero(money_scaled_to_string(
+            i64::from(m.int_val),
+        ))),
         // `SqlString::to_utf8_string` unwraps on its UTF-8 branch; decode fallibly.
         ColumnValues::String(s) => sql_string_to_text(s).ok_or(TextError::Malformed),
         ColumnValues::Xml(x) => xml_to_text(&x.bytes),
@@ -1361,6 +1467,7 @@ mod tests {
     use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP};
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NULL_HANDLE};
     use crate::error::diag::DiagRecord;
+    use crate::handles::DbcHandle;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::int_columns;
 
@@ -2217,6 +2324,57 @@ mod tests {
         assert_last_diag(&s.diag_records, ERR_RESTRICTED_DATA_TYPE);
     }
 
+    /// The strip rule is only otherwise verified by the e2e parity suite, which
+    /// needs a live SQL Server and msodbcsql installed. Pinned here so a refactor
+    /// of `column_value_to_text` cannot drop it and still look green.
+    #[test]
+    fn sub_one_values_render_without_the_leading_zero() {
+        assert_eq!(strip_sub_one_leading_zero("0.5000".into()), ".5000");
+        assert_eq!(strip_sub_one_leading_zero("-0.0001".into()), "-.0001");
+        // msodbcsql strips unconditionally, so an exact zero loses its digit too.
+        assert_eq!(strip_sub_one_leading_zero("0.0000".into()), ".0000");
+
+        // At or above one, scale 0, and a bare integer are untouched.
+        assert_eq!(strip_sub_one_leading_zero("123.4500".into()), "123.4500");
+        assert_eq!(strip_sub_one_leading_zero("-1.5000".into()), "-1.5000");
+        assert_eq!(strip_sub_one_leading_zero("0".into()), "0");
+        assert_eq!(strip_sub_one_leading_zero("-0".into()), "-0");
+    }
+
+    /// Covers the wiring as well as the helper: a sub-one value has to arrive
+    /// stripped through the real decimal and money arms, not just through a
+    /// hand-built string.
+    #[test]
+    fn sub_one_decimal_and_money_render_stripped() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+
+        let d = ColumnValues::Numeric(DecimalParts::from_string("0.4500", 5, 4).unwrap());
+        assert_eq!(column_value_to_text(&d).ok().unwrap(), ".4500");
+
+        let neg = ColumnValues::Decimal(DecimalParts::from_string("-0.0001", 5, 4).unwrap());
+        assert_eq!(column_value_to_text(&neg).ok().unwrap(), "-.0001");
+
+        // 0.5 in money's fixed 4-digit scale is 5000.
+        let m = ColumnValues::Money(mssql_tds::datatypes::column_values::SqlMoney::from(5000i32));
+        assert_eq!(column_value_to_text(&m).ok().unwrap(), ".5000");
+    }
+
+    /// Float is the deliberate exception: msodbcsql's `DoubleToChar` writes the
+    /// leading zero, so stripping here would create a divergence.
+    #[test]
+    fn sub_one_float_keeps_its_leading_zero() {
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Float(0.5))
+                .ok()
+                .unwrap(),
+            "0.5"
+        );
+        assert_eq!(
+            column_value_to_text(&ColumnValues::Real(0.5)).ok().unwrap(),
+            "0.5"
+        );
+    }
+
     #[test]
     fn get_data_decimal_renders_as_text() {
         use mssql_tds::datatypes::decoder::DecimalParts;
@@ -2334,5 +2492,181 @@ mod tests {
             .unwrap();
         let last = s.diag_records.last().unwrap();
         assert_eq!(&last.sql_state, b"22018");
+    }
+
+    /// Delivering the sole column of a single-column result must release the
+    /// connection's busy claim right away — the statement's cursor stays
+    /// open, but nothing on the wire remains for a later `SQLGetData` on this
+    /// row to protect, so the peek is safe. This is the point of AB#47508's
+    /// fix: msodbcsql's busy gate tracks the wire, not the statement's cursor
+    /// lifetime.
+    #[test]
+    fn get_data_releases_busy_after_delivering_the_lone_column() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt_handle.inner.lock().unwrap().column_metadata = int_columns(1);
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            mssql_tds::test_client_support::col_metadata_empty(),
+            mssql_tds::test_client_support::done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    /// The mirror image: column 1 of a *two*-column result is not the last
+    /// column, so a trailing `SQLGetData` call could still legitimately
+    /// retrieve column 2. The busy claim must stay exactly as it was — and
+    /// since no DBC client is configured at all here, a peek attempt would
+    /// fail loudly rather than silently succeed, so `SQL_SUCCESS` below is
+    /// itself proof the peek was correctly skipped.
+    #[test]
+    fn get_data_keeps_busy_when_a_trailing_column_remains() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Null); // int_columns(2) by default
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().active_stmt = Some(h.stmt);
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    /// `finish_get_data` must decide whether to peek from delivery state
+    /// (`current_row_last_col`/`column_metadata`/`active_plp`) alone, never
+    /// from `rc`. Every *current* `write_captured_column` error path leaves
+    /// `current_row_last_col` unadvanced, so this combination cannot happen
+    /// today — but a future caller can legitimately finish delivering the
+    /// column while still reporting `SQL_ERROR` (e.g. a NULL surfaced through
+    /// an error-style indicator), and the busy-release optimization must not
+    /// silently skip that case.
+    #[test]
+    fn finish_get_data_releases_busy_purely_on_delivery_state_even_when_rc_is_sql_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata = int_columns(1);
+            s.current_row_last_col = 1; // as if column 1 (the only column) was just fully delivered.
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            mssql_tds::test_client_support::col_metadata_empty(),
+            mssql_tds::test_client_support::done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        let rc = finish_get_data(stmt_handle, h.stmt, stmt_state, 1, SQL_ERROR);
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    /// The PLP scope limit (see the doc comment above `finish_get_data`):
+    /// even when the last column of the last row was just delivered, a
+    /// column still mid-PLP-stream (`active_plp` set) must NOT be peeked
+    /// past — the stream may not have reached the wire's end yet, so the
+    /// busy claim must be retained exactly as-is until the PLP stream
+    /// completes naturally on a later `SQLGetData` call.
+    #[test]
+    fn finish_get_data_keeps_busy_while_a_plp_stream_is_still_active() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.column_metadata = int_columns(1);
+            s.current_row_last_col = 1; // the only column, otherwise fully delivered.
+            s.active_plp = Some(ActivePlpStream {
+                column: 1,
+                encoding: PlpEncoding::SingleByteText,
+                pending_byte: None,
+                pending_high_surrogate: None,
+            });
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // A real, positioned client: if the PLP guard were missing, `ready`
+        // would wrongly read true and the peek below would actually run
+        // (and succeed, since the scripted stream is well-formed) — the
+        // claim retention this test checks would then fail for real,
+        // not just because there was nothing to peek with.
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            mssql_tds::test_client_support::col_metadata_empty(),
+            mssql_tds::test_client_support::done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        let rc = finish_get_data(stmt_handle, h.stmt, stmt_state, 1, SQL_SUCCESS);
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(
+            dbc.inner.lock().unwrap().active_stmt,
+            Some(h.stmt),
+            "an active PLP stream must retain the busy claim, not release it"
+        );
+        assert!(dbc.inner.lock().unwrap().client.is_some());
+        assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
 }

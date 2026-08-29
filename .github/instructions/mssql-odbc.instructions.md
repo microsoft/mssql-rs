@@ -161,9 +161,14 @@ authoritative parity reference for this crate. Its source lives in the
     `mssql_tds::TdsError` bubbling up from the protocol layer. For
     `TdsError::SqlServerError` it fans out to one record per server-reported
     error, mapping each error number to a SQLSTATE via the static
-    `SERVER_ERROR_TO_SQL_STATE_MAP`; for other variants it posts a single
-    record using `default_sqlstate`. Pick `08001` for connect-time
-    failures and `HY000` for execution/fetch failures.
+    `SERVER_ERROR_TO_SQL_STATE_MAP` and falling back to the message's TDS
+    severity class when the number is unmapped (`> 18` → `HY000`, `> 10` →
+    `42000`, else `01000`, matching msodbcsql's `sqlcerr.cpp:1385-1401`); for
+    other variants it posts a single record using `default_sqlstate`. Pick
+    `08001` for connect-time failures and `HY000` for execution/fetch
+    failures. Do not add rows to `SERVER_ERROR_TO_SQL_STATE_MAP` to correct a
+    single error's SQLSTATE — entries there are a permanent compatibility
+    commitment, and the severity fallback already covers unmapped errors.
   Never hand-roll `post_sql_error` over a `TdsError` — you lose the
   per-server-error fan-out and the SQLSTATE mapping.
 - Every ODBC entry point must clear the handle's diagnostic records at API

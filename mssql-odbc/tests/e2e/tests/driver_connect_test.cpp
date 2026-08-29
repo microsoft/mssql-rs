@@ -46,7 +46,9 @@ TEST_F(ODBCTest, DriverConnect_MissingServer) {
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
 
-// SQLDisconnect on a handle that was never connected returns error.
+// SQLDisconnect on a handle that was never connected returns 08003 — from the DM,
+// which answers this case itself and never calls the driver. The driver's own
+// answer for a DM-less caller is SQL_SUCCESS (see disconnect.rs unit tests).
 TEST_F(ODBCTest, Disconnect_NotConnected) {
     SQLHDBC hdbc = SQL_NULL_HDBC;
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
@@ -229,6 +231,44 @@ TEST_F(DriverConnectLiveTest, BadCredentials) {
                           SQL_DRIVER_NOPROMPT);
     EXPECT_SQL_ERROR(rc);
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "28000");
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+}
+
+// A failed connect leaves the handle allocated but not connected, and both this
+// driver and msodbcsql report SQL_ERROR / 08003 if it is then disconnected --
+// verified against both, so it is the ODBC-correct answer rather than a quirk.
+//
+// Recorded because it is a live hazard for wrappers: a destructor that
+// disconnects while unwinding from the connect failure, and that raises on the
+// disconnect result, throws a second time and aborts the process. The fix
+// belongs in the caller (suppress errors on the unwind path), not here -- this
+// test exists so nobody "fixes" the driver to return success and calls it
+// parity.
+TEST_F(DriverConnectLiveTest, DisconnectAfterFailedConnectReportsNotConnected) {
+    SQLHDBC hdbc = SQL_NULL_HDBC;
+    SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_ENV, env_);
+
+    auto& cfg = ODBCTestConfig::Instance();
+    std::string bad = "Driver={" + cfg.Driver() + "}"
+                      ";Server=" + cfg.Server() +
+                      ";UID=nonexistent_user_xyz;PWD=wrong_password_123" +
+                      ";TrustServerCertificate=Yes";
+    SqlTString connstr = ODBCTestUtils::ToSqlTStr(bad);
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+
+    rc = SQLDriverConnect(hdbc, nullptr,
+                          const_cast<SQLTCHAR*>(connstr.c_str()),
+                          static_cast<SQLSMALLINT>(connstr.size()),
+                          outStr, 1024, &outLen,
+                          SQL_DRIVER_NOPROMPT);
+    ASSERT_SQL_ERROR(rc);
+
+    rc = SQLDisconnect(hdbc);
+    EXPECT_SQL_ERROR(rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, hdbc, "08003");
 
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
 }
