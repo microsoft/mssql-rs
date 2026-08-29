@@ -9377,6 +9377,10 @@ mod tests {
             client.has_open_batch(),
             "a plain batch's DONE_MORE always means another statement result"
         );
+        assert!(
+            client.parked_token.is_none(),
+            "a plain batch's DONE_MORE needs no look-ahead"
+        );
     }
 
     /// `next_rowset` collapses no-row results, but a no-row result can also be
