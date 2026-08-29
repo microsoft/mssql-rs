@@ -556,8 +556,9 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
 // before the login packet, so the server saw the driver's default name instead.
 TEST_F(DriverConnectLiveTest, AppKeywordReachesServerAppName) {
     const std::string kAppName = "AppKeywordE2E";
-    SqlTString connstr = ODBCTestUtils::BuildConnectionString();
-    connstr += ODBCTestUtils::ToSqlTStr(";APP=" + kAppName);
+    SqlTString connstr =
+        ODBCTestUtils::ToSqlTStr("APP=" + kAppName + ";") +
+        ODBCTestUtils::BuildConnectionString();
 
     SQLHDBC hdbc = SQL_NULL_HDBC;
     ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc));

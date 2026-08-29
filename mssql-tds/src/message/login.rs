@@ -1199,7 +1199,8 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         let sspi_len = self.model.sspi_token.as_ref().map_or(0, |t| t.len());
 
         if sspi_len == 0 {
-            // No SSPI token - write offset and zero length
+            // ibSSPI is ignored when cbSSPI is zero, so avoid a running offset
+            // that may exceed u16 after a long token.
             self.payload_writer.write_u16_async(0).await?;
             self.payload_writer.write_u16_async(0).await?;
             return Ok(());
@@ -1264,6 +1265,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     async fn write_metadata(&mut self, char_length: u16) -> TdsResult<bool> {
         if char_length == 0 {
+            // Empty LOGIN7 fields ignore their offsets.
             self.payload_writer.write_u16_async(0).await?;
             self.payload_writer.write_u16_async(0).await?;
             return Ok(false);
@@ -1367,6 +1369,7 @@ impl SizedLoginItem for ClientContext {
         client_context_item_length += self.language.len_bytes();
         client_context_item_length += self.database.len_bytes();
         client_context_item_length += self.attach_db_file.len_bytes();
+        client_context_item_length += self.change_password.len_bytes();
 
         client_context_item_length += self.calculate_byte_length_for_authentication();
         client_context_item_length
@@ -1590,14 +1593,21 @@ mod tests {
         block_on(serializer.write_sspi_short()).unwrap();
         block_on(serializer.write_attach_db_file()).unwrap();
         block_on(serializer.write_change_password()).unwrap();
+        block_on(serializer.write_cb_sspi_long()).unwrap();
 
         assert_eq!(serializer.content_next_offset, 70_094);
         let mut payload = packet_writer.get_payload();
-        payload.set_position((PacketWriter::PACKET_HEADER_SIZE + 4) as u64);
+        payload.set_position(PacketWriter::PACKET_HEADER_SIZE as u64);
+        assert_eq!(
+            payload.read_u16::<LittleEndian>().unwrap(),
+            FIXED_LOGIN_RECORD_LENGTH as u16
+        );
+        assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), u16::MAX);
         assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
         assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
         assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
         assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
+        assert_eq!(payload.read_u32::<LittleEndian>().unwrap(), 70_000);
     }
 
     // ── FeaturesRequest::features() ──
