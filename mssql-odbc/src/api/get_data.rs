@@ -1071,21 +1071,36 @@ fn widen_into_pending(
     out_units: usize,
 ) -> usize {
     // Decode onto the tail of `pending` rather than into the caller's buffer.
-    // `n` input bytes yield at most `n + 1` code units, so the reserved tail
-    // never fills. That matters for more than tidiness: a decoder that hits
-    // `OutputFull` can return having consumed nothing (`encoding_rs::GBK` does
-    // exactly that with one unit of room), and the caller's buffer may
-    // legitimately be that small. Reusing `pending`'s capacity also keeps a
-    // chunk loop from allocating a scratch buffer per call.
+    // The decoder is asked for its own worst-case bound, so the output slice
+    // cannot be short and `OutputFull` cannot arise -- which matters because
+    // the consumed-byte count is discarded below, so a short slice would drop
+    // wire bytes silently. `max_utf16_buffer_length` also accounts for a
+    // partial sequence already held by the decoder, which a fixed constant
+    // could not. `None` means the length would overflow `usize`, unreachable
+    // here since the read is bounded by the caller's buffer.
+    //
+    // Decoding into `pending` rather than the caller's buffer is deliberate
+    // beyond avoiding a per-call allocation: a decoder that hits `OutputFull`
+    // can return having consumed nothing (`encoding_rs::GBK` does exactly that
+    // with one unit of room), and the caller's buffer may legitimately be that
+    // small.
     //
     // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
     // must not be used afterwards. Once the wire is exhausted there is nothing
     // left to feed it, so later calls only drain what is already decoded.
     if !(payload.is_empty() && reached_end) {
         let base = pending.len();
-        pending.resize(base + payload.len() + 2, 0);
-        let (_, _, written, _) =
+        let headroom = decoder
+            .max_utf16_buffer_length(payload.len())
+            .unwrap_or_else(|| payload.len().saturating_add(2));
+        pending.resize(base + headroom, 0);
+        let (result, _, written, _) =
             decoder.decode_to_utf16(payload, &mut pending[base..], reached_end);
+        debug_assert_eq!(
+            result,
+            encoding_rs::CoderResult::InputEmpty,
+            "widening output slice was too short, so input bytes were dropped"
+        );
         pending.truncate(base + written);
     }
     out_units.min(pending.len())
