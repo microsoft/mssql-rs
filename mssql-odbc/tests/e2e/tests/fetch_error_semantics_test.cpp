@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // fetch_error_semantics_test.cpp  –  E2E parity for the fetch path's *error*
-// semantics: 22003 (out of range), 01S07 (fractional truncation) and 07006
-// (restricted conversion).
+// semantics: 22003 (out of range), 01S07 (fractional truncation), 07006
+// (restricted conversion) and 22018 (unconvertible character data).
 //
 // AB#47678. The P5 type-coverage work proved the fetch type map is wired up,
 // but the range and truncation rules were unit-tested only: a grep for these
@@ -54,7 +54,7 @@ protected:
 // ---------------------------------------------------------------------------
 
 TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeIsOutOfRange) {
-    FetchOne("SELECT CAST(2147483648 AS BIGINT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(2147483648 AS BIGINT) AS c1"));
 
     SQLINTEGER v = 4242;
     SQLLEN ind = 0;
@@ -67,7 +67,7 @@ TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeIsOutOfRange) {
 // The same value fits an unsigned target of the same width, so it succeeds --
 // the pair is what shows the range check is signedness-aware.
 TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeFitsUlong) {
-    FetchOne("SELECT CAST(2147483648 AS BIGINT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(2147483648 AS BIGINT) AS c1"));
 
     SQLUINTEGER v = 0;
     SQLLEN ind = 0;
@@ -77,7 +77,7 @@ TEST_F(FetchErrorSemanticsLiveTest, BigintAboveSlongRangeFitsUlong) {
 }
 
 TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeIsOutOfRange) {
-    FetchOne("SELECT CAST(128 AS INT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(128 AS INT) AS c1"));
 
     signed char v = 77;
     SQLLEN ind = 0;
@@ -88,7 +88,7 @@ TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeIsOutOfRange) {
 }
 
 TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeFitsUtinyint) {
-    FetchOne("SELECT CAST(128 AS INT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(128 AS INT) AS c1"));
 
     unsigned char v = 0;
     SQLLEN ind = 0;
@@ -100,7 +100,7 @@ TEST_F(FetchErrorSemanticsLiveTest, IntAboveSignedByteRangeFitsUtinyint) {
 
 // A negative value into any unsigned target is out of range, however small.
 TEST_F(FetchErrorSemanticsLiveTest, NegativeIntoUnsignedIsOutOfRange) {
-    FetchOne("SELECT CAST(-1 AS INT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(-1 AS INT) AS c1"));
 
     SQLUINTEGER v = 31337;
     SQLLEN ind = 0;
@@ -117,7 +117,7 @@ TEST_F(FetchErrorSemanticsLiveTest, NegativeIntoUnsignedIsOutOfRange) {
 // ---------------------------------------------------------------------------
 
 TEST_F(FetchErrorSemanticsLiveTest, FloatFractionIntoIntegerTargetTruncates) {
-    FetchOne("SELECT CAST(1234.99 AS FLOAT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(1234.99 AS FLOAT) AS c1"));
 
     SQLINTEGER v = 0;
     SQLLEN ind = 0;
@@ -130,7 +130,7 @@ TEST_F(FetchErrorSemanticsLiveTest, FloatFractionIntoIntegerTargetTruncates) {
 // Truncating toward zero puts this in range for an unsigned target, so it is a
 // truncation rather than a range error even though the source is negative.
 TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoUnsignedTruncates) {
-    FetchOne("SELECT CAST(-0.01 AS FLOAT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(-0.01 AS FLOAT) AS c1"));
 
     unsigned char v = 9;
     SQLLEN ind = 0;
@@ -144,7 +144,7 @@ TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoUnsignedTruncates) 
 // "this is treated specially" and answers 22003 where the unsigned integers
 // answer 01S07.
 TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoBitIsOutOfRange) {
-    FetchOne("SELECT CAST(-0.01 AS FLOAT) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST(-0.01 AS FLOAT) AS c1"));
 
     unsigned char v = 9;
     SQLLEN ind = 0;
@@ -160,7 +160,7 @@ TEST_F(FetchErrorSemanticsLiveTest, SmallNegativeFractionIntoBitIsOutOfRange) {
 // ---------------------------------------------------------------------------
 
 TEST_F(FetchErrorSemanticsLiveTest, DateIntoNumericTargetIsRestricted) {
-    FetchOne("SELECT CAST('1996-01-01' AS DATE) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('1996-01-01' AS DATE) AS c1"));
 
     SQLINTEGER v = 0;
     SQLLEN ind = 0;
@@ -169,8 +169,20 @@ TEST_F(FetchErrorSemanticsLiveTest, DateIntoNumericTargetIsRestricted) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(FetchErrorSemanticsLiveTest, UnconvertibleCharacterDataIsInvalidCharacterValue) {
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('abc' AS VARCHAR(10)) AS c1"));
+
+    SQLINTEGER v = 4242;
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_SLONG, &v, sizeof(v), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+    EXPECT_EQ(4242, v) << "a conversion failure must not write a partial value";
+    SQLCloseCursor(stmt_);
+}
+
 TEST_F(FetchErrorSemanticsLiveTest, DatetimeIntoFloatTargetIsRestricted) {
-    FetchOne("SELECT CAST('1996-01-01 12:00:00' AS DATETIME) AS c1");
+    ASSERT_NO_FATAL_FAILURE(
+        FetchOne("SELECT CAST('1996-01-01 12:00:00' AS DATETIME) AS c1"));
 
     double v = 0;
     SQLLEN ind = 0;
@@ -186,7 +198,8 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeIntoFloatTargetIsRestricted) {
 // ---------------------------------------------------------------------------
 
 TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithTimeIntoDateTargetTruncates) {
-    FetchOne("SELECT CAST('1996-01-01 01:00:00.010' AS DATETIME) AS c1");
+    ASSERT_NO_FATAL_FAILURE(
+        FetchOne("SELECT CAST('1996-01-01 01:00:00.010' AS DATETIME) AS c1"));
 
     SQL_DATE_STRUCT d{};
     SQLLEN ind = 0;
@@ -199,7 +212,8 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithTimeIntoDateTargetTruncates) {
 }
 
 TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithZeroTimeIntoDateTargetIsClean) {
-    FetchOne("SELECT CAST('1996-01-01 00:00:00' AS DATETIME) AS c1");
+    ASSERT_NO_FATAL_FAILURE(
+        FetchOne("SELECT CAST('1996-01-01 00:00:00' AS DATETIME) AS c1"));
 
     SQL_DATE_STRUCT d{};
     SQLLEN ind = 0;
@@ -218,7 +232,7 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithZeroTimeIntoDateTargetIsClean) {
 // ---------------------------------------------------------------------------
 
 TEST_F(FetchErrorSemanticsLiveTest, ABufferOneByteShortTruncatesAndReportsFullLength) {
-    FetchOne("SELECT CAST('abcdefghij' AS VARCHAR(10)) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('abcdefghij' AS VARCHAR(10)) AS c1"));
 
     char buf[10] = {};  // 10 data bytes need 11 with the terminator
     SQLLEN ind = 0;
@@ -230,7 +244,7 @@ TEST_F(FetchErrorSemanticsLiveTest, ABufferOneByteShortTruncatesAndReportsFullLe
 }
 
 TEST_F(FetchErrorSemanticsLiveTest, ABufferThatExactlyFitsSucceeds) {
-    FetchOne("SELECT CAST('abcdefghij' AS VARCHAR(10)) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('abcdefghij' AS VARCHAR(10)) AS c1"));
 
     char buf[11] = {};  // 10 data bytes + terminator
     SQLLEN ind = 0;
@@ -251,8 +265,8 @@ TEST_F(FetchErrorSemanticsLiveTest, ARangeErrorIsARowErrorInABlockFetch) {
                             "ORDER BY c1"),
                   SQL_HANDLE_STMT, stmt_);
 
-    signed char v[2] = {0, 0};
-    SQLUSMALLINT status[2] = {0, 0};
+    signed char v[2] = {42, 42};
+    SQLUSMALLINT status[2] = {SQL_ROW_NOROW, SQL_ROW_NOROW};
     SQLLEN ind[2] = {0, 0};
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE, reinterpret_cast<SQLPOINTER>(2),
                                  0),
@@ -263,7 +277,10 @@ TEST_F(FetchErrorSemanticsLiveTest, ARangeErrorIsARowErrorInABlockFetch) {
                   SQL_HANDLE_STMT, stmt_);
 
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
     EXPECT_EQ(1, static_cast<int>(v[0])) << "the in-range row still delivers";
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[0]);
+    EXPECT_EQ(42, static_cast<int>(v[1])) << "a range failure must not write a partial value";
     EXPECT_EQ(SQL_ROW_ERROR, status[1]) << "300 does not fit a signed byte";
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
@@ -276,13 +293,44 @@ TEST_F(FetchErrorSemanticsLiveTest, ARangeErrorIsARowErrorInABlockFetch) {
 // rendering divergence, which no unit test could have reached.
 // ---------------------------------------------------------------------------
 
-TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBraces) {
-    FetchOne("SELECT CAST('0123ABCD-4567-89EF-0123-456789ABCDEF' AS UNIQUEIDENTIFIER) AS c1");
+TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDataChar) {
+    ASSERT_NO_FATAL_FAILURE(
+        FetchOne("SELECT CAST('0123ABCD-4567-89EF-0123-456789ABCDEF' AS UNIQUEIDENTIFIER) AS c1"));
 
     char buf[64] = {};
     SQLLEN ind = 0;
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
+    EXPECT_STREQ("0123ABCD-4567-89EF-0123-456789ABCDEF", buf);
+    EXPECT_EQ(36, ind);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDataWchar) {
+    ASSERT_NO_FATAL_FAILURE(
+        FetchOne("SELECT CAST('0123ABCD-4567-89EF-0123-456789ABCDEF' AS UNIQUEIDENTIFIER) AS c1"));
+
+    SQLWCHAR buf[37] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    constexpr char expected[] = "0123ABCD-4567-89EF-0123-456789ABCDEF";
+    for (size_t i = 0; i < sizeof(expected); ++i) {
+        EXPECT_EQ(static_cast<SQLWCHAR>(expected[i]), buf[i]);
+    }
+    EXPECT_EQ(72, ind);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaBoundFetchChar) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST('0123ABCD-4567-89EF-0123-456789ABCDEF' AS UNIQUEIDENTIFIER) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+
+    char buf[37] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_STREQ("0123ABCD-4567-89EF-0123-456789ABCDEF", buf);
     EXPECT_EQ(36, ind);
     SQLCloseCursor(stmt_);
@@ -295,7 +343,7 @@ TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBraces) {
 // ---------------------------------------------------------------------------
 
 TEST_F(FetchErrorSemanticsLiveTest, DatetimeAtItsLowerBoundDecodes) {
-    FetchOne("SELECT CAST('1753-01-01' AS DATETIME) AS c1");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('1753-01-01' AS DATETIME) AS c1"));
 
     SQL_TIMESTAMP_STRUCT ts{};
     SQLLEN ind = 0;
