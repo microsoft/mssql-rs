@@ -555,24 +555,13 @@ TEST_F(DriverConnectLiveTest, NewConnectionAttributesParity) {
 // Regression coverage for AB#47534, where APP parsed cleanly but was dropped
 // before the login packet, so the server saw the driver's default name instead.
 TEST_F(DriverConnectLiveTest, AppKeywordReachesServerAppName) {
-    auto& cfg = ODBCTestConfig::Instance();
-    if (!cfg.HasSqlAuth()) {
-        GTEST_SKIP() << "Requires SQL auth (ODBC_TEST_SERVER + ODBC_TEST_UID + "
-                        "ODBC_TEST_PWD); see follow-up issue for capability gating";
-    }
     const std::string kAppName = "AppKeywordE2E";
-    const std::string cs =
-        "Driver={" + cfg.Driver() + "}"
-        ";Server=" + cfg.Server() +
-        ";UID=" + cfg.Uid() +
-        ";PWD=" + cfg.Pwd() +
-        ";TrustServerCertificate=" + cfg.TrustCert() +
-        ";APP=" + kAppName;
+    SqlTString connstr = ODBCTestUtils::BuildConnectionString();
+    connstr += ODBCTestUtils::ToSqlTStr(";APP=" + kAppName);
 
     SQLHDBC hdbc = SQL_NULL_HDBC;
     ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_DBC, env_, &hdbc));
 
-    SqlTString connstr = ODBCTestUtils::ToSqlTStr(cs);
     SQLTCHAR outStr[1024] = {};
     SQLSMALLINT outLen = 0;
     SQLRETURN rc = SQLDriverConnect(hdbc, nullptr,

@@ -55,6 +55,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- `mssql-tds`: LOGIN7 now encodes Unicode field lengths as UTF-16 code units
+  and rejects oversized records instead of producing malformed packets. This
+  fixes login failures with non-ASCII usernames, passwords, database names,
+  hostnames, and application names across all bindings.
+
 - `mssql-tds`: `TdsClient::language()` now returns the language negotiated at
   login (from the server's `ENVCHANGE`) instead of always returning an empty
   string, matching its documentation.
@@ -137,4 +142,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   rejected as a protocol error. Such a packet is malformed — it neither carries
   payload nor terminates a message — but was previously consumed as a
   zero-length packet. Empty end-of-message packets remain legal.
-

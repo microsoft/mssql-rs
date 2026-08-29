@@ -34,6 +34,7 @@ use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
 use tracing::{Level, debug, event, info, trace};
 
 pub(crate) const FIXED_LOGIN_RECORD_LENGTH: i32 = 94;
+const MAX_LOGIN_RECORD_LENGTH: usize = 128 * 1024 - 1;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutingInfo {
@@ -806,15 +807,15 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Calculate the length of the login record.
     /// This includes the fixed length of the login record, the length of the variable length fields,
     /// and the length of the feature extension data.
-    fn calculate_login_record_length(&self) -> (i32, i32) {
-        let mut login_record_length = FIXED_LOGIN_RECORD_LENGTH;
+    fn calculate_login_record_length(&self) -> TdsResult<(i32, i32)> {
+        let mut login_record_length = FIXED_LOGIN_RECORD_LENGTH as usize;
         login_record_length += self.model.user_input.len_bytes();
         login_record_length += self.model.transport_context.len_bytes();
         login_record_length += 4; // Feature extension offset size.
 
         // Add SSPI token length if present
         if let Some(sspi_token) = &self.model.sspi_token {
-            login_record_length += sspi_token.len() as i32;
+            login_record_length += sspi_token.len();
         }
 
         // We write the feature extension at the end of the login record. This is not necessary, but makes reading
@@ -822,11 +823,17 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         // for the feature extension.
         let feature_extension_offset = login_record_length;
         login_record_length += self.features_request.len_bytes();
-        (login_record_length, feature_extension_offset)
+        if login_record_length > MAX_LOGIN_RECORD_LENGTH {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "LOGIN7 record length {login_record_length} exceeds the maximum of {MAX_LOGIN_RECORD_LENGTH} bytes"
+            )));
+        }
+        Ok((login_record_length as i32, feature_extension_offset as i32))
     }
 
     pub(crate) async fn serialize(&mut self) -> TdsResult<()> {
-        let (login_record_length, feature_extension_offset) = self.calculate_login_record_length();
+        let (login_record_length, feature_extension_offset) =
+            self.calculate_login_record_length()?;
         trace!(login_record_length);
         self.payload_writer
             .write_i32_async(login_record_length)
@@ -1051,7 +1058,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Writes the value of the hostname of the client to the login packet.
     async fn write_hostname(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.model.user_input.workstation_id) as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.workstation_id)?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1067,7 +1074,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
             TdsAuthenticationMethod::Password
         ) {
             if self
-                .write_metadata(utf16_code_units(&self.model.user_input.user_name) as i16)
+                .write_metadata(utf16_code_units(&self.model.user_input.user_name)?)
                 .await?
             {
                 self.deferred_actions_indicator
@@ -1084,7 +1091,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     async fn write_password(&mut self) -> TdsResult<()> {
         if self.model.user_input.tds_authentication_method == TdsAuthenticationMethod::Password {
             if self
-                .write_metadata(utf16_code_units(&self.model.user_input.password) as i16)
+                .write_metadata(utf16_code_units(&self.model.user_input.password)?)
                 .await?
             {
                 self.deferred_actions_indicator
@@ -1100,7 +1107,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Writes the value of the application name provided in the client context to the login packet.
     async fn write_app_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.model.user_input.application_name) as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.application_name)?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1113,9 +1120,9 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Uses get_login_server_name() to get DataSource format (host,port) for TCP connections.
     async fn write_server_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(
-                utf16_code_units(&self.model.transport_context.get_login_server_name()) as i16,
-            )
+            .write_metadata(utf16_code_units(
+                &self.model.transport_context.get_login_server_name(),
+            )?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1127,7 +1134,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     async fn write_feature_ext(&mut self) -> TdsResult<()> {
         // The offset at which to read the feature extension length.
         self.payload_writer
-            .write_i16_async(self.content_next_offset as i16)
+            .write_u16_async(self.current_offset()?)
             .await?;
 
         // Length of the size of feature extension offset data, which is a DWORD.
@@ -1145,7 +1152,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// This is also called the Client interface name.
     async fn write_library_name(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.model.user_input.library_name) as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.library_name)?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1156,7 +1163,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     async fn write_language(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.model.user_input.language) as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.language)?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1168,7 +1175,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     /// Writes the value of the database name, which we are connecting to.
     async fn write_database(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.model.user_input.database) as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.database)?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1194,15 +1201,15 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         if sspi_len == 0 {
             // No SSPI token - write offset and zero length
             self.payload_writer
-                .write_i16_async(self.content_next_offset as i16)
+                .write_u16_async(self.current_offset()?)
                 .await?;
-            self.payload_writer.write_i16_async(0).await?;
+            self.payload_writer.write_u16_async(0).await?;
             return Ok(());
         }
 
         // Write offset
         self.payload_writer
-            .write_i16_async(self.content_next_offset as i16)
+            .write_u16_async(self.current_offset()?)
             .await?;
 
         if sspi_len <= 0xFFFF {
@@ -1223,7 +1230,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     async fn write_attach_db_file(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.model.user_input.attach_db_file) as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.attach_db_file)?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1234,7 +1241,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     async fn write_change_password(&mut self) -> TdsResult<()> {
         if self
-            .write_metadata(utf16_code_units(&self.model.user_input.change_password) as i16)
+            .write_metadata(utf16_code_units(&self.model.user_input.change_password)?)
             .await?
         {
             self.deferred_actions_indicator
@@ -1257,22 +1264,29 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         Ok(())
     }
 
-    async fn write_metadata(&mut self, char_length: i16) -> TdsResult<bool> {
+    async fn write_metadata(&mut self, char_length: u16) -> TdsResult<bool> {
+        let offset = self.current_offset()?;
         if char_length == 0 {
-            self.payload_writer
-                .write_i16_async(self.content_next_offset as i16)
-                .await?;
-            self.payload_writer.write_i16_async(0).await?;
+            self.payload_writer.write_u16_async(offset).await?;
+            self.payload_writer.write_u16_async(0).await?;
             return Ok(false);
         }
 
-        self.payload_writer
-            .write_i16_async(self.content_next_offset as i16)
-            .await?;
-        self.payload_writer.write_i16_async(char_length).await?;
+        self.payload_writer.write_u16_async(offset).await?;
+        self.payload_writer.write_u16_async(char_length).await?;
 
-        self.content_next_offset += (char_length * 2) as i32;
+        self.content_next_offset += i32::from(char_length) * 2;
         Ok(true)
+    }
+
+    fn current_offset(&self) -> TdsResult<u16> {
+        u16::try_from(self.content_next_offset).map_err(|_| {
+            crate::error::Error::ProtocolError(format!(
+                "LOGIN7 field offset {} exceeds the maximum of {} bytes",
+                self.content_next_offset,
+                u16::MAX
+            ))
+        })
     }
 }
 
@@ -1305,15 +1319,20 @@ enum LoginDeferredPayload {
 
 /// Trait to calculate the size of the fields for the login records in bytes.
 trait SizedLoginItem {
-    fn len_bytes(&self) -> i32;
+    fn len_bytes(&self) -> usize;
 }
 
-fn utf16_code_units(value: &str) -> usize {
-    value.encode_utf16().count()
+fn utf16_code_units(value: &str) -> TdsResult<u16> {
+    u16::try_from(value.encode_utf16().count()).map_err(|_| {
+        crate::error::Error::ProtocolError(format!(
+            "LOGIN7 string exceeds the maximum of {} UTF-16 code units",
+            u16::MAX
+        ))
+    })
 }
 
 impl SizedLoginItem for TransportContext {
-    fn len_bytes(&self) -> i32 {
+    fn len_bytes(&self) -> usize {
         // Must match what get_login_server_name() returns for consistency
         // with write_server_name() which serializes get_login_server_name()
         self.get_login_server_name().len_bytes()
@@ -1321,16 +1340,16 @@ impl SizedLoginItem for TransportContext {
 }
 
 impl SizedLoginItem for String {
-    fn len_bytes(&self) -> i32 {
-        (utf16_code_units(self) * 2) as i32
+    fn len_bytes(&self) -> usize {
+        self.encode_utf16().count() * 2
     }
 }
 
 impl SizedLoginItem for FeaturesRequest {
-    fn len_bytes(&self) -> i32 {
-        let mut length = 0;
+    fn len_bytes(&self) -> usize {
+        let mut length = 0usize;
         for feature in self.get_requested_features() {
-            length += feature.data_length();
+            length += feature.data_length() as usize;
         }
 
         length += 1; // Feature extension terminator.
@@ -1340,7 +1359,7 @@ impl SizedLoginItem for FeaturesRequest {
 }
 
 impl SizedLoginItem for ClientContext {
-    fn len_bytes(&self) -> i32 {
+    fn len_bytes(&self) -> usize {
         // Do not consider the length of the transport context. That
         // may be overridden by the redirected endpoint.
         let mut client_context_item_length = 0;
@@ -1362,7 +1381,7 @@ impl ClientContext {
     /// For TdsAuthenticationMethod::SSPI, the username and password are not sent (they're empty),
     /// and the SSPI token length is calculated separately in LoginRequestModel.
     /// FedAuth or AccessToken authentication is accounted for, in the Feature extension data.
-    fn calculate_byte_length_for_authentication(&self) -> i32 {
+    fn calculate_byte_length_for_authentication(&self) -> usize {
         let mut length = 0;
         if matches!(
             self.tds_authentication_method,
@@ -1494,6 +1513,66 @@ mod tests {
 
         assert_eq!(app_offset, FIXED_LOGIN_RECORD_LENGTH as u16);
         assert_eq!(app_length, 8);
+    }
+
+    #[test]
+    fn database_metadata_uses_utf16_code_units() {
+        let context = ClientContext {
+            database: "caf\u{e9}".to_string(),
+            connect_retry_count: 0,
+            ..ClientContext::default()
+        };
+        let transport_context = context.transport_context.clone();
+        let model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let mut serializer = Serializer::new(&model, &mut packet_writer);
+
+        block_on(serializer.write_database()).unwrap();
+        assert_eq!(
+            serializer.content_next_offset,
+            FIXED_LOGIN_RECORD_LENGTH + 8
+        );
+
+        let mut payload = packet_writer.get_payload();
+        payload.set_position(PacketWriter::PACKET_HEADER_SIZE as u64);
+        assert_eq!(
+            payload.read_u16::<LittleEndian>().unwrap(),
+            FIXED_LOGIN_RECORD_LENGTH as u16
+        );
+        assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 4);
+    }
+
+    #[test]
+    fn login_rejects_oversized_string_and_record() {
+        let context = ClientContext {
+            application_name: "a".repeat(usize::from(u16::MAX) + 1),
+            connect_retry_count: 0,
+            ..ClientContext::default()
+        };
+        let transport_context = context.transport_context.clone();
+        let model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let mut serializer = Serializer::new(&model, &mut packet_writer);
+
+        let field_error = block_on(serializer.write_app_name()).unwrap_err();
+        assert!(field_error.to_string().contains("65535 UTF-16 code units"));
+
+        let context = ClientContext {
+            application_name: "a".repeat(65_000),
+            database: "b".repeat(1_000),
+            connect_retry_count: 0,
+            ..ClientContext::default()
+        };
+        let transport_context = context.transport_context.clone();
+        let model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+        let mut mock = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let serializer = Serializer::new(&model, &mut packet_writer);
+
+        let record_error = serializer.calculate_login_record_length().unwrap_err();
+        assert!(record_error.to_string().contains("131071 bytes"));
     }
 
     // ── FeaturesRequest::features() ──
