@@ -1138,7 +1138,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
             .await?;
 
         // Length of the size of feature extension offset data, which is a DWORD.
-        self.payload_writer.write_i16_async(4).await?;
+        self.payload_writer.write_u16_async(4).await?;
 
         self.content_next_offset += size_of::<i32>() as i32;
 
@@ -1200,9 +1200,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
         if sspi_len == 0 {
             // No SSPI token - write offset and zero length
-            self.payload_writer
-                .write_u16_async(self.current_offset()?)
-                .await?;
+            self.payload_writer.write_u16_async(0).await?;
             self.payload_writer.write_u16_async(0).await?;
             return Ok(());
         }
@@ -1265,13 +1263,13 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
     }
 
     async fn write_metadata(&mut self, char_length: u16) -> TdsResult<bool> {
-        let offset = self.current_offset()?;
         if char_length == 0 {
-            self.payload_writer.write_u16_async(offset).await?;
+            self.payload_writer.write_u16_async(0).await?;
             self.payload_writer.write_u16_async(0).await?;
             return Ok(false);
         }
 
+        let offset = self.current_offset()?;
         self.payload_writer.write_u16_async(offset).await?;
         self.payload_writer.write_u16_async(char_length).await?;
 
@@ -1573,6 +1571,33 @@ mod tests {
 
         let record_error = serializer.calculate_login_record_length().unwrap_err();
         assert!(record_error.to_string().contains("131071 bytes"));
+    }
+
+    #[test]
+    fn empty_fields_do_not_reject_long_sspi_offset() {
+        let context = ClientContext {
+            connect_retry_count: 0,
+            tds_authentication_method: TdsAuthenticationMethod::SSPI,
+            ..ClientContext::default()
+        };
+        let transport_context = context.transport_context.clone();
+        let mut model = LoginRequestModel::from_context(&context, false, &transport_context, None);
+        model.sspi_token = Some(vec![0; 70_000]);
+        let mut mock = MockNetworkWriter::new(131_072);
+        let mut packet_writer = PacketWriter::new(PacketType::Login7, &mut mock, None, None);
+        let mut serializer = Serializer::new(&model, &mut packet_writer);
+
+        block_on(serializer.write_sspi_short()).unwrap();
+        block_on(serializer.write_attach_db_file()).unwrap();
+        block_on(serializer.write_change_password()).unwrap();
+
+        assert_eq!(serializer.content_next_offset, 70_094);
+        let mut payload = packet_writer.get_payload();
+        payload.set_position((PacketWriter::PACKET_HEADER_SIZE + 4) as u64);
+        assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
+        assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
+        assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
+        assert_eq!(payload.read_u16::<LittleEndian>().unwrap(), 0);
     }
 
     // ── FeaturesRequest::features() ──
