@@ -7,6 +7,14 @@ publish = false
 [lints]
 workspace = true
 
+[lib]
+name = "mssql_sqlcmd"
+path = "src/lib.rs"
+# rlib: the standalone binary and the tests link against it as a normal crate.
+# staticlib: the archive the native ODBC sqlcmd links, so both CLIs end up in
+# one executable with no second artifact to ship.
+crate-type = ["rlib", "staticlib"]
+
 [[bin]]
 name = "sqlcmd"
 path = "src/main.rs"
