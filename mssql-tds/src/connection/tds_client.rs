@@ -9210,6 +9210,31 @@ mod tests {
         );
     }
 
+    /// Environment changes in the RPC response tail must update connection
+    /// state without keeping the batch open.
+    #[tokio::test]
+    async fn sp_executesql_env_change_trailer_closes_the_batch() {
+        use crate::token::tokens::{EnvChangeToken, EnvChangeTokenSubType};
+
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::BeginTransaction,
+                change_type: (0u64, 42u64).into(),
+            }),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("BEGIN TRANSACTION".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        assert_eq!(client.execution_context.get_transaction_descriptor(), 42);
+    }
+
     /// A fully parsed output parameter that cannot be decrypted is a command
     /// error, not a transport or synchronization failure.
     #[tokio::test]
