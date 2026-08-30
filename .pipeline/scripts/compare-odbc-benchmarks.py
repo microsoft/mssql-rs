@@ -490,6 +490,19 @@ def diverging_bar_table(results, change_key, ratio_key, mark_confirmed=False):
     return lines
 
 
+def add_section_spacing(lines):
+    """Keep Azure DevOps from visually collapsing adjacent report sections."""
+    spaced = []
+    for line in lines:
+        if line.startswith("### "):
+            while spaced and spaced[-1] == "":
+                spaced.pop()
+            spaced.extend(["", "<br>", "", line])
+        else:
+            spaced.append(line)
+    return spaced
+
+
 def confirmation_section(
     results,
     threshold,
@@ -835,7 +848,7 @@ def summary_markdown(
             "The gate is based on median complete-result wall time. Throughput "
             "counters come from the candidate samples."
         )
-    return "\n".join(lines) + "\n"
+    return "\n".join(add_section_spacing(lines)) + "\n"
 
 
 def parse_args():
