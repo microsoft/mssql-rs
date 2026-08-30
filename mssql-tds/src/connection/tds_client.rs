@@ -230,7 +230,10 @@ pub enum CursorColumn {
     RowEnded,
 }
 
-/// Result of a non-blocking pull-cursor attempt.
+/// Result of a non-blocking pull-cursor attempt on concrete [`TdsClient`].
+///
+/// This polling surface is not part of [`ResultSet`]; synchronous bindings use
+/// it directly and continue with the matching async client method on `Pending`.
 #[derive(Debug, PartialEq)]
 pub enum CursorPoll<T> {
     /// The operation completed entirely from bytes already buffered by the
@@ -242,7 +245,22 @@ pub enum CursorPoll<T> {
     Pending,
 }
 
-/// Result of attempting to decode the next row entirely from transport-buffered bytes.
+impl<T> CursorPoll<T> {
+    /// Returns a buffered result immediately or invokes `fallback` once when
+    /// asynchronous continuation is required.
+    pub fn resolve<E>(self, fallback: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        match self {
+            Self::Ready(value) => Ok(value),
+            Self::Pending => fallback(),
+        }
+    }
+}
+
+/// Result of a concrete [`TdsClient`] attempt to decode the next row from
+/// transport-buffered bytes.
+///
+/// `Pending` is non-destructive. `Partial` has written a prefix, so callers must
+/// reuse the same writer with [`TdsClient::finish_row_into`].
 #[derive(Debug, PartialEq)]
 pub enum BufferedRowPoll {
     /// A complete row was written.
@@ -5203,11 +5221,13 @@ impl TdsClient {
     /// this returns a [`UsageError`] rather than silently draining and skipping
     /// that row; a fully-consumed or absent row is accepted.
     ///
-    /// Uses `receive_row_into` to decode ROW/NBCROW tokens directly through
-    /// `decode_into`, bypassing the intermediate `RowToken { all_values }`.
-    /// Concrete writers stay concrete through the production transport and
-    /// decode chain. [`ResultSet::next_row_into`] provides the same operation
-    /// through statically dispatched trait calls.
+    /// Buffered, unencrypted, non-PLP rows are decoded synchronously first.
+    /// Incomplete rows continue asynchronously with the same writer; other
+    /// unsupported buffered shapes use `receive_row_into`. All paths bypass the
+    /// intermediate `RowToken { all_values }`. Concrete writers stay concrete
+    /// through the production transport and decode chain.
+    /// [`ResultSet::next_row_into`] provides the same operation through
+    /// statically dispatched trait calls.
     // `#[instrument]` adds enough state to exceed the 4096 B budget once the
     // lazy timeout future is inlined. Successful rows still emit `Row Received`.
     pub async fn next_row_into<W>(&mut self, writer: &mut W) -> TdsResult<bool>
@@ -5242,6 +5262,27 @@ impl TdsClient {
                      advance the cursor with next_row_cursor before using the push row API"
                         .to_string(),
                 ));
+            }
+        }
+
+        match self.try_next_buffered_row_into(writer) {
+            Ok(BufferedRowPoll::Complete) => {
+                info!("Row Received");
+                return Ok(true);
+            }
+            Ok(BufferedRowPoll::Partial) => {
+                if let Err(error) = self.finish_row_into(writer).await {
+                    self.abort_pending_prepare_capture();
+                    return Err(error);
+                }
+                info!("Row Received");
+                return Ok(true);
+            }
+            Ok(BufferedRowPoll::Exhausted) => return Ok(false),
+            Ok(BufferedRowPoll::Pending) => {}
+            Err(error) => {
+                self.abort_pending_prepare_capture();
+                return Err(error);
             }
         }
 
@@ -8002,6 +8043,30 @@ mod tests {
     }
 
     #[test]
+    fn cursor_poll_resolves_ready_without_fallback() {
+        let mut calls = 0;
+        let value = CursorPoll::Ready(7).resolve::<()>(|| {
+            calls += 1;
+            Ok(9)
+        });
+
+        assert_eq!(value, Ok(7));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn cursor_poll_resolves_pending_with_one_fallback() {
+        let mut calls = 0;
+        let value = CursorPoll::Pending.resolve::<()>(|| {
+            calls += 1;
+            Ok(9)
+        });
+
+        assert_eq!(value, Ok(9));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
     fn sync_cursor_attempt_reads_buffered_header_and_columns_in_order() {
         let metadata = int_column_metadata(2);
         let mut transport = TestTransport::new();
@@ -8065,6 +8130,31 @@ mod tests {
             client.active_row_read_state,
             ActiveRowReadState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn next_row_into_uses_buffered_dispatch() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(expected.len()));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert!(client.next_row_into(&mut writer).await.unwrap());
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

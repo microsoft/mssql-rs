@@ -344,6 +344,7 @@ pub(crate) struct DateTimeParts {
     pub has_tz: bool,
 }
 
+/// Converts a TDS `date` into normalized calendar fields.
 pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
     let (year, month, day) = civil_from_days_since_0001(i64::from(date.get_days()));
     DateTimeParts {
@@ -355,6 +356,7 @@ pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
     }
 }
 
+/// Converts a TDS `time` into normalized clock fields.
 pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
     let (hour, minute, second, fraction_ns) = hms_from_ticks_100ns(time.time_nanoseconds);
     DateTimeParts {
@@ -368,6 +370,7 @@ pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
     }
 }
 
+/// Converts a TDS `datetime2` into normalized calendar and clock fields.
 pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
     let (year, month, day) = civil_from_days_since_0001(i64::from(datetime.days));
     let mut parts = time_parts(&datetime.time);
@@ -378,6 +381,9 @@ pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
     parts
 }
 
+/// Converts a UTC TDS `datetimeoffset` value to its represented local time.
+///
+/// Returns `None` when applying the offset falls outside the TDS date range.
 pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateTimeParts> {
     // The wire value is UTC; ODBC returns the local wall clock obtained by
     // applying the stored offset.

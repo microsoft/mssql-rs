@@ -48,7 +48,7 @@ use crate::api::odbc_types::{
     SqlGuid, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlSsTime2Struct,
     SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlULen, SqlUSmallInt, SqlWChar,
 };
-use crate::api::util::{copy_with_nul, resolve_cursor_poll, write_if_some};
+use crate::api::util::{copy_with_nul, write_if_some};
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
     DateTimeParts, date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
@@ -687,8 +687,8 @@ fn fill_rowset(
                 Ok(BufferedRowPoll::Exhausted) => break,
                 Ok(BufferedRowPoll::Pending) => {
                     let cursor_poll = client.try_next_row_cursor();
-                    match resolve_cursor_poll(cursor_poll, || {
-                        dbc.runtime.block_on(client.next_row_cursor())
+                    match cursor_poll.and_then(|poll| {
+                        poll.resolve(|| dbc.runtime.block_on(client.next_row_cursor()))
                     }) {
                         Ok(true) => match client.try_finish_row_into(&mut writer) {
                             Ok(true) => Ok(()),
@@ -713,9 +713,9 @@ fn fill_rowset(
             }
         } else {
             let cursor_poll = client.try_next_row_cursor();
-            match resolve_cursor_poll(cursor_poll, || {
-                dbc.runtime.block_on(client.next_row_cursor())
-            }) {
+            match cursor_poll
+                .and_then(|poll| poll.resolve(|| dbc.runtime.block_on(client.next_row_cursor())))
+            {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
@@ -735,8 +735,8 @@ fn fill_rowset(
                 }
                 let target = column - 1;
                 let cursor_poll = client.try_read_row_column(target);
-                let pulled = resolve_cursor_poll(cursor_poll, || {
-                    dbc.runtime.block_on(client.read_row_column(target))
+                let pulled = cursor_poll.and_then(|poll| {
+                    poll.resolve(|| dbc.runtime.block_on(client.read_row_column(target)))
                 });
                 columns_read = column;
                 let result = match pulled {

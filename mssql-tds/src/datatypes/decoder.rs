@@ -294,16 +294,19 @@ pub(crate) struct GenericDecoder {
     string_decoder: StringDecoder,
 }
 
+/// Non-consuming-on-failure reader for values already buffered by the transport.
 struct BufferedSlice<'a> {
     bytes: &'a [u8],
     position: usize,
 }
 
 impl<'a> BufferedSlice<'a> {
+    /// Starts reading at the beginning of `bytes`.
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
     }
 
+    /// Reads a fixed-size byte array and advances only when it is complete.
     fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
         let end = self.position.checked_add(N)?;
         let value = self.bytes.get(self.position..end)?.try_into().ok()?;
@@ -311,10 +314,12 @@ impl<'a> BufferedSlice<'a> {
         Some(value)
     }
 
+    /// Copies a complete variable-size value from the buffered bytes.
     fn take_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
         self.take_slice(len).map(<[u8]>::to_vec)
     }
 
+    /// Borrows a complete variable-size value from the buffered bytes.
     fn take_slice(&mut self, len: usize) -> Option<&'a [u8]> {
         let end = self.position.checked_add(len)?;
         let value = self.bytes.get(self.position..end)?;
@@ -322,44 +327,54 @@ impl<'a> BufferedSlice<'a> {
         Some(value)
     }
 
+    /// Reads one byte.
     fn byte(&mut self) -> Option<u8> {
         self.take().map(|[value]| value)
     }
 
+    /// Reads a little-endian signed 16-bit integer.
     fn i16(&mut self) -> Option<i16> {
         self.take().map(i16::from_le_bytes)
     }
 
+    /// Reads a little-endian unsigned 16-bit integer.
     fn u16(&mut self) -> Option<u16> {
         self.take().map(u16::from_le_bytes)
     }
 
+    /// Reads a little-endian unsigned 24-bit integer.
     fn u24(&mut self) -> Option<u32> {
         let [b0, b1, b2] = self.take()?;
         Some(u32::from_le_bytes([b0, b1, b2, 0]))
     }
 
+    /// Reads a little-endian signed 32-bit integer.
     fn i32(&mut self) -> Option<i32> {
         self.take().map(i32::from_le_bytes)
     }
 
+    /// Reads a little-endian unsigned 32-bit integer.
     fn u32(&mut self) -> Option<u32> {
         self.take().map(u32::from_le_bytes)
     }
 
+    /// Reads a little-endian unsigned 40-bit integer.
     fn u40(&mut self) -> Option<u64> {
         let [b0, b1, b2, b3, b4] = self.take()?;
         Some(u64::from_le_bytes([b0, b1, b2, b3, b4, 0, 0, 0]))
     }
 
+    /// Reads a little-endian signed 64-bit integer.
     fn i64(&mut self) -> Option<i64> {
         self.take().map(i64::from_le_bytes)
     }
 
+    /// Reads a little-endian 32-bit floating-point value.
     fn f32(&mut self) -> Option<f32> {
         self.take().map(f32::from_le_bytes)
     }
 
+    /// Reads a little-endian 64-bit floating-point value.
     fn f64(&mut self) -> Option<f64> {
         self.take().map(f64::from_le_bytes)
     }
@@ -1007,6 +1022,10 @@ impl GenericDecoder {
         Ok(Some((value, reader.position)))
     }
 
+    /// Decodes one complete non-PLP column directly into `writer`.
+    ///
+    /// Returns the consumed byte count, or `None` without writing when the
+    /// buffered value is incomplete or requires the async decoder.
     pub(crate) fn try_decode_buffered_into<W: RowWriter + ?Sized>(
         &self,
         bytes: &[u8],
