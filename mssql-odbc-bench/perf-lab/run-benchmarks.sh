@@ -134,7 +134,7 @@ export ODBC_BENCH_UID="${ODBC_BENCH_UID:-${DB_USERNAME:-sa}}"
 export ODBC_BENCH_PWD="${ODBC_BENCH_PWD:-$SQL_PASSWORD}"
 export ODBC_BENCH_TRUST_CERT="${ODBC_BENCH_TRUST_CERT:-Yes}"
 export ODBC_BENCH_ENCRYPT="${ODBC_BENCH_ENCRYPT:-Mandatory}"
-export ODBC_BENCH_PACKET_SIZE="${ODBC_BENCH_PACKET_SIZE:-32767}"
+export ODBC_BENCH_PACKET_SIZE="${ODBC_BENCH_PACKET_SIZE:-16384}"
 
 # --- Allocator tuning (steadier large rowset buffers) ---
 # Each retrieval allocates the bound rowset buffers for up to 600 columns by
