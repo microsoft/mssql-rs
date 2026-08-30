@@ -255,7 +255,7 @@ binaries keep the per-binary interleaving effective (see §2).
 - Bulk insert (default 10,000 rows, override via `BENCH_BULK_ROWS`) via the `BulkCopy` builder, over batch sizes 500 / 5,000.
 
 ### mssql-tds-specific
-- Packet-size sensitivity (4096 / 8192 / 32768) on large reads — measures reassembly overhead.
+- Packet-size sensitivity (4096 / 8192 / 32767) on large reads — measures reassembly overhead.
 - Zero-copy `next_row` row-iteration throughput at large row counts.
 
 ---
@@ -391,6 +391,35 @@ Only candidate vs the pinned Rust baseline can fail the gate; Microsoft is an
 informational reference. The scripts also echo the report to the step log and
 retain raw JSON, context, and comparison artifacts.
 
+The workload catalog is shaped by what `mssql-python` actually does to the
+driver, not by what is convenient to write:
+
+- **Bound rowsets at 1, 64, and 1000.** `Cursor.arraysize` defaults to 1, so an
+  unconfigured `fetchmany()` binds a one-row rowset; `fetchall()` caps its
+  computed batch at 1000. A round 1024 is a size no consumer asks for.
+- **A bind/fetch/unbind lifecycle workload.** `fetchmany()` does not bind once
+  and drain — every call re-describes, rebinds, sets the row-array size, fetches
+  one rowset, resets the size, and unbinds. Paired against the plain bound
+  workload on the same table and cadence, it isolates that per-call cost.
+- **Row-at-a-time `SQLGetData`.** One LOB or `sql_variant` column moves the
+  *whole* result off the bound path, so there are four such workloads: ordinary
+  inline values, `MAX` text past one 8192-byte chunk (three continuation calls
+  per value), a small `MAX` column dragging fifteen fixed columns with it, and
+  the `sql_variant` probe → `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` → typed
+  read sequence.
+- **Nullable inline variable width, separate from MAX/PLP.** They are different
+  driver paths — one fills a bound buffer, the other streams — so they are
+  measured separately. `VARBINARY` is deliberately absent: binary delivery is
+  still unimplemented in `mssql-odbc` (AB#47239), so including it would fail two
+  legs and pass the third.
+
+Every workload is a C++ call into the driver through the ODBC Driver Manager.
+`mssql-python` is a workload-shape reference only — the source of the rowset
+sizes, the bind/unbind cadence, and the `SQLGetData` sequences. Its own
+performance, including Arrow conversion, is out of scope, and no Python package
+is loaded inside a measurement. That keeps a change attributable to the driver
+without an interpreter, a pybind11 layer, and an Arrow builder in the path.
+
 The gate uses the same 5% threshold and the same auto-confirm contract as the
 fixed-baseline `mssql-tds` runner. The initial five-sample median only screens:
 it selects the candidate-vs-baseline regressions and up to three of the largest
@@ -401,7 +430,9 @@ those four rounds, and the headline change is the median of the four confirmatio
 ratios — the initial pass that triggered the re-measurement is excluded so the
 outlier under test does not vote on its own verdict. Regression-direction hits
 are counted independently, so an apparent improvement that reverses into a
-3-of-4 regression still fails the run by default.
+3-of-4 regression still fails the run by default. Confirmation re-measures whole
+scenarios rather than single benchmarks, so a flagged id costs one paired re-run
+of its own leg per round.
 
 The pairwise math is Google Benchmark's own `tools/compare.py` and
 `gbench.report` from the pinned v1.9.1 checkout in the CMake build tree, run once
@@ -411,7 +442,11 @@ exact benchmark-set validation, the combined three-way report, custom counters
 and pins, the gate, the confirmation overrides, and the Azure DevOps Markdown.
 The Mann-Whitney U test is disabled explicitly because five repetitions are well
 below the nine that Google Benchmark documents as meaningful for it; the
-confirmation rounds establish reproduction instead.
+confirmation rounds establish reproduction instead. Its policy is covered offline
+by `.pipeline/scripts/test_compare_odbc_benchmarks.py`, which drives the whole
+workload catalog through synthetic legs: three-way and legacy two-way reports,
+mismatched benchmark sets, confirmed and unconfirmed regressions, an apparent
+improvement that reverses, and the plan/ratio outputs the runners consume.
 
 Both runners apply the same noise controls as the `mssql-tds` lab: a SQL Server
 configuration snapshot from the shared `sql-config-dump.sql`, CPU

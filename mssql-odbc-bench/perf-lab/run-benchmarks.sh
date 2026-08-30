@@ -27,6 +27,11 @@ CANDIDATE_DRIVER_NAME="MSSQL Rust ODBC Perf Candidate"
 BASELINE_DRIVER_NAME="MSSQL Rust ODBC Perf Baseline"
 MICROSOFT_DRIVER_NAME="ODBC Driver 18 for SQL Server"
 
+# Scenario catalog. The C++ harness filters its workloads by scenario, and every
+# downstream step - ordering, comparison, confirmation - iterates this list, so a
+# new scenario needs no other change here.
+SCENARIOS=(narrow wide rowset varwidth getdata)
+
 BASELINE_TEMP_DIR=""
 BASELINE_TREE=""
 DRIVER_INI_DIR=""
@@ -43,11 +48,18 @@ cleanup() {
     if [ "$TABLE_CLEANUP_ARMED" -eq 1 ] && [ -x "$ADMIN_EXE" ] &&
        [ -n "$DRIVER_INI_DIR" ]; then
         echo ">>> Removing ODBC benchmark tables..."
-        ODBCSYSINI="$DRIVER_INI_DIR" \
+        if ! ODBCSYSINI="$DRIVER_INI_DIR" \
             ODBC_BENCH_DRIVER="$CANDIDATE_DRIVER_NAME" \
             ODBC_BENCH_SCENARIO="" \
-            "$ADMIN_EXE" cleanup ||
-            echo "WARNING: benchmark table cleanup failed" >&2
+            "$ADMIN_EXE" cleanup; then
+            echo "WARNING: candidate cleanup failed; retrying with Microsoft ODBC" >&2
+            ODBCSYSINI="$DRIVER_INI_DIR" \
+                ODBC_BENCH_DRIVER="$MICROSOFT_DRIVER_NAME" \
+                ODBC_BENCH_SCENARIO="" \
+                ODBC_BENCH_PACKET_SIZE_KEYWORD="PacketSize" \
+                "$ADMIN_EXE" cleanup ||
+                echo "WARNING: benchmark table cleanup failed with both drivers" >&2
+        fi
     fi
 
     if [ -n "$BASELINE_TREE" ]; then
@@ -122,11 +134,11 @@ export ODBC_BENCH_UID="${ODBC_BENCH_UID:-${DB_USERNAME:-sa}}"
 export ODBC_BENCH_PWD="${ODBC_BENCH_PWD:-$SQL_PASSWORD}"
 export ODBC_BENCH_TRUST_CERT="${ODBC_BENCH_TRUST_CERT:-Yes}"
 export ODBC_BENCH_ENCRYPT="${ODBC_BENCH_ENCRYPT:-Mandatory}"
-export ODBC_BENCH_PACKET_SIZE="${ODBC_BENCH_PACKET_SIZE:-32768}"
+export ODBC_BENCH_PACKET_SIZE="${ODBC_BENCH_PACKET_SIZE:-32767}"
 
 # --- Allocator tuning (steadier large rowset buffers) ---
 # Each retrieval allocates the bound rowset buffers for up to 600 columns by
-# 1024 rows, which is far past glibc's dynamic mmap threshold. Left alone, every
+# 1000 rows, which is far past glibc's dynamic mmap threshold. Left alone, every
 # repetition re-mmaps and re-faults those pages, which is both slower and much
 # noisier than the driver difference we are trying to measure. Raise the mmap
 # threshold so the buffers come from the heap and stop trimming so they are
@@ -396,6 +408,8 @@ fi
     echo "microsoft_driver_package=$MICROSOFT_PACKAGE_VERSION"
     echo "microsoft_driver_path=$MICROSOFT_DRIVER"
     echo "microsoft_driver_sha256=$MICROSOFT_DRIVER_SHA256"
+    echo "packet_size=$ODBC_BENCH_PACKET_SIZE"
+    echo "packet_size_verified_by_harness=true"
     echo "repetitions=$REPETITIONS"
     echo "regression_ratio=$REGRESSION_RATIO"
     echo "confirm_runs=$CONFIRM_RUNS"
@@ -418,13 +432,12 @@ ODBC_BENCH_DRIVER="$CANDIDATE_DRIVER_NAME" \
     "$ADMIN_EXE" setup
 
 run_leg() {
-    # A leg contains one driver/scenario sample file; ordering is interleaved above
-    # to reduce bias from machine or server drift during the run. An empty scenario
-    # runs every workload in one process.
+    # A leg contains one driver/scenario sample file; ordering is interleaved
+    # below to reduce bias from machine or server drift during the run.
     local scenario="$1"
     local driver="$2"
     local output="$3"
-    echo ">>> Running ${scenario:-all scenarios} with $driver..."
+    echo ">>> Running $scenario with $driver..."
     # Linux keeps the PacketSize spelling for every driver, including Microsoft
     # ODBC: on Linux that driver rejects "Packet Size" (01S00) and accepts
     # "PacketSize" (01S02). Windows uses the "Packet Size" spelling instead.
@@ -437,29 +450,43 @@ run_leg() {
         --benchmark_out_format=json
 }
 
-CANDIDATE_NARROW="$RESULTS_DIR/odbc-candidate-narrow.json"
-BASELINE_NARROW="$RESULTS_DIR/odbc-baseline-narrow.json"
-CANDIDATE_WIDE="$RESULTS_DIR/odbc-candidate-wide.json"
-BASELINE_WIDE="$RESULTS_DIR/odbc-baseline-wide.json"
-MICROSOFT_NARROW="$RESULTS_DIR/odbc-microsoft-narrow.json"
-MICROSOFT_WIDE="$RESULTS_DIR/odbc-microsoft-wide.json"
+CANDIDATE_FILES=()
+BASELINE_FILES=()
+MICROSOFT_FILES=()
+for scenario in "${SCENARIOS[@]}"; do
+    CANDIDATE_FILES+=("$RESULTS_DIR/odbc-candidate-$scenario.json")
+    BASELINE_FILES+=("$RESULTS_DIR/odbc-baseline-$scenario.json")
+    MICROSOFT_FILES+=("$RESULTS_DIR/odbc-microsoft-$scenario.json")
+done
 
 cpu_sample "initial-start"
-run_leg narrow "$CANDIDATE_DRIVER_NAME" "$CANDIDATE_NARROW"
-run_leg narrow "$MICROSOFT_DRIVER_NAME" "$MICROSOFT_NARROW"
-run_leg narrow "$BASELINE_DRIVER_NAME" "$BASELINE_NARROW"
-run_leg wide "$BASELINE_DRIVER_NAME" "$BASELINE_WIDE"
-run_leg wide "$MICROSOFT_DRIVER_NAME" "$MICROSOFT_WIDE"
-run_leg wide "$CANDIDATE_DRIVER_NAME" "$CANDIDATE_WIDE"
+for index in "${!SCENARIOS[@]}"; do
+    scenario="${SCENARIOS[$index]}"
+    # Alternate which Rust driver runs first per scenario, with Microsoft ODBC
+    # between them, so a stable position effect does not favour one side.
+    if [ $((index % 2)) -eq 0 ]; then
+        run_leg "$scenario" "$CANDIDATE_DRIVER_NAME" "${CANDIDATE_FILES[$index]}"
+        run_leg "$scenario" "$MICROSOFT_DRIVER_NAME" "${MICROSOFT_FILES[$index]}"
+        run_leg "$scenario" "$BASELINE_DRIVER_NAME" "${BASELINE_FILES[$index]}"
+    else
+        run_leg "$scenario" "$BASELINE_DRIVER_NAME" "${BASELINE_FILES[$index]}"
+        run_leg "$scenario" "$MICROSOFT_DRIVER_NAME" "${MICROSOFT_FILES[$index]}"
+        run_leg "$scenario" "$CANDIDATE_DRIVER_NAME" "${CANDIDATE_FILES[$index]}"
+    fi
+done
 cpu_sample "initial-end"
 
-three_way_args=(
-    --baseline "$BASELINE_NARROW"
-    --baseline "$BASELINE_WIDE"
-    --candidate "$CANDIDATE_NARROW"
-    --candidate "$CANDIDATE_WIDE"
-    --reference "$MICROSOFT_NARROW"
-    --reference "$MICROSOFT_WIDE"
+three_way_args=()
+for index in "${!SCENARIOS[@]}"; do
+    three_way_args+=(--baseline "${BASELINE_FILES[$index]}")
+done
+for index in "${!SCENARIOS[@]}"; do
+    three_way_args+=(--candidate "${CANDIDATE_FILES[$index]}")
+done
+for index in "${!SCENARIOS[@]}"; do
+    three_way_args+=(--reference "${MICROSOFT_FILES[$index]}")
+done
+three_way_args+=(
     --reference-label "Microsoft ODBC $MICROSOFT_VERSION"
     --baseline-commit "$BASELINE_COMMIT"
     --reference-version "$MICROSOFT_VERSION"
@@ -481,68 +508,69 @@ echo ">>> Comparing the initial three-driver pass..."
     --no-fail-on-regression
 
 scenario_for_benchmark() {
-    # The harness filters by scenario, not by benchmark id, so map each flagged
-    # benchmark back to the scenario file it came out of.
+    # Confirmation re-runs whole scenarios, not single benchmarks, so each
+    # flagged id has to be mapped back to the leg it came out of.
     local id="$1"
-    if grep -qF "\"run_name\": \"$id\"" "$CANDIDATE_NARROW"; then
-        printf 'narrow'
-    elif grep -qF "\"run_name\": \"$id\"" "$CANDIDATE_WIDE"; then
-        printf 'wide'
-    else
-        echo "ERROR: cannot map benchmark '$id' to a scenario" >&2
-        return 1
-    fi
+    local index
+    for index in "${!SCENARIOS[@]}"; do
+        if grep -qF "\"run_name\": \"$id\"" "${CANDIDATE_FILES[$index]}"; then
+            printf '%s' "${SCENARIOS[$index]}"
+            return 0
+        fi
+    done
+    echo "ERROR: cannot map benchmark '$id' to a scenario" >&2
+    return 1
 }
 
 VERIFY_NAMES=()
 VERIFY_KINDS=()
-select_narrow=0
-select_wide=0
+CONFIRM_SCENARIOS=()
 while IFS=$'\t' read -r plan_kind plan_name plan_ratio; do
     [ -n "${plan_name:-}" ] || continue
     VERIFY_KINDS+=("$plan_kind")
     VERIFY_NAMES+=("$plan_name")
     echo ">>> Initial pass flagged $plan_kind: $plan_name (ratio $plan_ratio)"
     plan_scenario="$(scenario_for_benchmark "$plan_name")"
-    case "$plan_scenario" in
-        narrow) select_narrow=1 ;;
-        wide) select_wide=1 ;;
-    esac
+    already_selected=0
+    for selected in ${CONFIRM_SCENARIOS[@]+"${CONFIRM_SCENARIOS[@]}"}; do
+        [ "$selected" = "$plan_scenario" ] && already_selected=1
+    done
+    [ "$already_selected" -eq 0 ] && CONFIRM_SCENARIOS+=("$plan_scenario")
 done < "$PLAN_FILE"
 
 CONFIRMATION_ARGS=()
 if [ "${#VERIFY_NAMES[@]}" -gt 0 ]; then
-    # One process covers both scenarios; only narrow those legs when the other
-    # workload has nothing to confirm.
-    if [ "$select_narrow" -eq 1 ] && [ "$select_wide" -eq 1 ]; then
-        CONFIRM_SCENARIO=""
-    elif [ "$select_narrow" -eq 1 ]; then
-        CONFIRM_SCENARIO="narrow"
-    else
-        CONFIRM_SCENARIO="wide"
-    fi
-
-    echo ">>> Auto-confirm: re-measuring ${#VERIFY_NAMES[@]} benchmark(s) over" \
-        "$CONFIRM_RUNS round(s); a result counts only when it reproduces in" \
-        ">= $CONFIRM_QUORUM of $CONFIRM_RUNS."
+    echo ">>> Auto-confirm: re-measuring ${#VERIFY_NAMES[@]} benchmark(s) across" \
+        "${#CONFIRM_SCENARIOS[@]} scenario(s) over $CONFIRM_RUNS round(s); a result" \
+        "counts only when it reproduces in >= $CONFIRM_QUORUM of $CONFIRM_RUNS."
     for round in $(seq 1 "$CONFIRM_RUNS"); do
         round_dir="$CONFIRM_DIR/round$round"
         mkdir -p "$round_dir"
         echo ">>> Confirmation round $round/$CONFIRM_RUNS..."
         cpu_sample "confirm${round}-start"
-        # Keep each pair adjacent, and alternate which side runs first so a stable
-        # position effect cancels across the default four rounds.
-        if [ $((round % 2)) -eq 1 ]; then
-            run_leg "$CONFIRM_SCENARIO" "$CANDIDATE_DRIVER_NAME" "$round_dir/candidate.json"
-            run_leg "$CONFIRM_SCENARIO" "$BASELINE_DRIVER_NAME" "$round_dir/baseline.json"
-        else
-            run_leg "$CONFIRM_SCENARIO" "$BASELINE_DRIVER_NAME" "$round_dir/baseline.json"
-            run_leg "$CONFIRM_SCENARIO" "$CANDIDATE_DRIVER_NAME" "$round_dir/candidate.json"
-        fi
+        round_args=()
+        for scenario in "${CONFIRM_SCENARIOS[@]}"; do
+            # Keep each pair adjacent, and alternate which side runs first so a
+            # stable position effect cancels across the default four rounds.
+            if [ $((round % 2)) -eq 1 ]; then
+                run_leg "$scenario" "$CANDIDATE_DRIVER_NAME" \
+                    "$round_dir/candidate-$scenario.json"
+                run_leg "$scenario" "$BASELINE_DRIVER_NAME" \
+                    "$round_dir/baseline-$scenario.json"
+            else
+                run_leg "$scenario" "$BASELINE_DRIVER_NAME" \
+                    "$round_dir/baseline-$scenario.json"
+                run_leg "$scenario" "$CANDIDATE_DRIVER_NAME" \
+                    "$round_dir/candidate-$scenario.json"
+            fi
+            round_args+=(
+                --baseline "$round_dir/baseline-$scenario.json"
+                --candidate "$round_dir/candidate-$scenario.json"
+            )
+        done
         cpu_sample "confirm${round}-end"
         "$BENCH_PYTHON" "$COMPARE_SCRIPT" \
-            --baseline "$round_dir/baseline.json" \
-            --candidate "$round_dir/candidate.json" \
+            "${round_args[@]}" \
             --repetitions "$REPETITIONS" \
             --regression-ratio "$REGRESSION_RATIO" \
             --improvement-ratio "$IMPROVEMENT_RATIO" \

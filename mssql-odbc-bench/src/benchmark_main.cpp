@@ -31,6 +31,10 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
     state.counters["execute_ms"] = metrics.execute_seconds * 1000.0;
     state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
     state.counters["fetch_ms"] = metrics.fetch_seconds * 1000.0;
+    // Zero for the bound modes. On the row-at-a-time workloads it is the number of
+    // driver round trips the consumer's access pattern forced, which is the thing
+    // that actually differs between drivers there.
+    state.counters["get_data_calls"] = static_cast<double>(metrics.get_data_calls);
     state.SetItemsProcessed(static_cast<std::int64_t>(metrics.rows));
     state.SetBytesProcessed(static_cast<std::int64_t>(metrics.logical_bytes));
 }
