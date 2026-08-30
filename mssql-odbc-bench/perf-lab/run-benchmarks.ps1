@@ -337,15 +337,14 @@ function Initialize-BenchmarkPython {
 
 function Invoke-BenchmarkLeg {
     # Keep one raw JSON file per driver/scenario and use the packet-size spelling
-    # accepted by that driver. An empty scenario runs every workload in one process.
+    # accepted by that driver.
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Scenario,
         [Parameter(Mandatory)][string]$Driver,
         [Parameter(Mandatory)][string]$Output
     )
 
-    $label = if ($Scenario) { $Scenario } else { 'all scenarios' }
-    Write-Host ">>> Running $label with $Driver..."
+    Write-Host ">>> Running $Scenario with $Driver..."
     $env:ODBC_BENCH_DRIVER = $Driver
     $env:ODBC_BENCH_SCENARIO = $Scenario
     # Windows Microsoft ODBC accepts the spaced spelling; the Rust driver and the
@@ -380,8 +379,8 @@ function Invoke-Comparator {
 }
 
 function Get-BenchmarkScenario {
-    # The harness filters by scenario, not by benchmark id, so map each flagged
-    # benchmark back to the scenario file it came out of.
+    # Confirmation re-runs whole scenarios, not single benchmarks, so each flagged
+    # id has to be mapped back to the leg it came out of.
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][hashtable]$ScenarioFiles)
 
     foreach ($scenario in $ScenarioFiles.Keys) {
@@ -462,6 +461,11 @@ $BaselineTargetDir = Join-Path $RepoRoot 'target\odbc-baseline'
 $CandidateDriverName = 'MSSQL Rust ODBC Perf Candidate'
 $BaselineDriverName = 'MSSQL Rust ODBC Perf Baseline'
 $script:MicrosoftDriverName = 'ODBC Driver 18 for SQL Server'
+
+# Scenario catalog. The C++ harness filters its workloads by scenario, and every
+# downstream step - ordering, comparison, confirmation - iterates this list, so a
+# new scenario needs no other change here.
+$Scenarios = @('narrow', 'wide', 'rowset', 'varwidth', 'getdata')
 $script:OdbcInstRoot = 'HKLM:\Software\ODBC\ODBCINST.INI'
 $script:DriversRegKey = "$script:OdbcInstRoot\ODBC Drivers"
 $script:Repetitions = Get-PositiveIntEnv -Name 'ODBC_BENCH_REPETITIONS' -Default 5
@@ -496,7 +500,7 @@ if (-not $env:ODBC_BENCH_UID) {
 if (-not $env:ODBC_BENCH_PWD) { $env:ODBC_BENCH_PWD = $env:SQL_PASSWORD }
 if (-not $env:ODBC_BENCH_TRUST_CERT) { $env:ODBC_BENCH_TRUST_CERT = 'Yes' }
 if (-not $env:ODBC_BENCH_ENCRYPT) { $env:ODBC_BENCH_ENCRYPT = 'Mandatory' }
-if (-not $env:ODBC_BENCH_PACKET_SIZE) { $env:ODBC_BENCH_PACKET_SIZE = '32768' }
+if (-not $env:ODBC_BENCH_PACKET_SIZE) { $env:ODBC_BENCH_PACKET_SIZE = '32767' }
 
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 
@@ -505,7 +509,7 @@ $script:TelemetryCsv = Join-Path $ResultsDir 'cpu-telemetry.csv'
     Set-Content -Path $script:TelemetryCsv -Encoding utf8
 
 # --- Large-buffer and scheduling controls (Windows equivalents) ---
-# Each retrieval allocates bound rowset buffers for up to 600 columns by 1024
+# Each retrieval allocates bound rowset buffers for up to 600 columns by 1000
 # rows. glibc's MALLOC_MMAP_THRESHOLD_/MALLOC_TRIM_THRESHOLD_ used by the Linux
 # runner have no Windows counterpart that a parent process can set, so the
 # Windows side targets the same goal - stable large-allocation cost and stable
@@ -690,6 +694,8 @@ try {
         "microsoft_driver_product_version=$($MicrosoftDriverInfo.ProductVersion)",
         "microsoft_driver_path=$MicrosoftDriver",
         "microsoft_driver_sha256=$MicrosoftDriverSha256",
+        "packet_size=$($env:ODBC_BENCH_PACKET_SIZE)",
+        "packet_size_verified_by_harness=true",
         "repetitions=$script:Repetitions",
         "regression_ratio=$(Format-Invariant $RegressionRatio 'F4')",
         "confirm_runs=$ConfirmRuns",
@@ -752,29 +758,37 @@ try {
         Write-Warning "Could not set the High performance power scheme: $($_.Exception.Message)"
     }
 
-    $candidateNarrow = Join-Path $ResultsDir 'odbc-candidate-narrow.json'
-    $baselineNarrow = Join-Path $ResultsDir 'odbc-baseline-narrow.json'
-    $candidateWide = Join-Path $ResultsDir 'odbc-candidate-wide.json'
-    $baselineWide = Join-Path $ResultsDir 'odbc-baseline-wide.json'
-    $microsoftNarrow = Join-Path $ResultsDir 'odbc-microsoft-narrow.json'
-    $microsoftWide = Join-Path $ResultsDir 'odbc-microsoft-wide.json'
+    $candidateFiles = @{}
+    $baselineFiles = @{}
+    $microsoftFiles = @{}
+    foreach ($scenario in $Scenarios) {
+        $candidateFiles[$scenario] = Join-Path $ResultsDir "odbc-candidate-$scenario.json"
+        $baselineFiles[$scenario] = Join-Path $ResultsDir "odbc-baseline-$scenario.json"
+        $microsoftFiles[$scenario] = Join-Path $ResultsDir "odbc-microsoft-$scenario.json"
+    }
 
     Write-CpuSample 'initial-start'
-    Invoke-BenchmarkLeg -Scenario 'narrow' -Driver $CandidateDriverName -Output $candidateNarrow
-    Invoke-BenchmarkLeg -Scenario 'narrow' -Driver $script:MicrosoftDriverName -Output $microsoftNarrow
-    Invoke-BenchmarkLeg -Scenario 'narrow' -Driver $BaselineDriverName -Output $baselineNarrow
-    Invoke-BenchmarkLeg -Scenario 'wide' -Driver $BaselineDriverName -Output $baselineWide
-    Invoke-BenchmarkLeg -Scenario 'wide' -Driver $script:MicrosoftDriverName -Output $microsoftWide
-    Invoke-BenchmarkLeg -Scenario 'wide' -Driver $CandidateDriverName -Output $candidateWide
+    for ($index = 0; $index -lt $Scenarios.Count; $index++) {
+        $scenario = $Scenarios[$index]
+        # Alternate which Rust driver runs first per scenario, with Microsoft ODBC
+        # between them, so a stable position effect does not favour one side.
+        if ($index % 2 -eq 0) {
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $candidateFiles[$scenario]
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:MicrosoftDriverName -Output $microsoftFiles[$scenario]
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $baselineFiles[$scenario]
+        } else {
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $baselineFiles[$scenario]
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:MicrosoftDriverName -Output $microsoftFiles[$scenario]
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $candidateFiles[$scenario]
+        }
+    }
     Write-CpuSample 'initial-end'
 
-    $threeWayArguments = @(
-        '--baseline', $baselineNarrow,
-        '--baseline', $baselineWide,
-        '--candidate', $candidateNarrow,
-        '--candidate', $candidateWide,
-        '--reference', $microsoftNarrow,
-        '--reference', $microsoftWide,
+    $threeWayArguments = @()
+    foreach ($scenario in $Scenarios) { $threeWayArguments += @('--baseline', $baselineFiles[$scenario]) }
+    foreach ($scenario in $Scenarios) { $threeWayArguments += @('--candidate', $candidateFiles[$scenario]) }
+    foreach ($scenario in $Scenarios) { $threeWayArguments += @('--reference', $microsoftFiles[$scenario]) }
+    $threeWayArguments += @(
         '--reference-label', "Microsoft ODBC $MicrosoftVersion",
         '--baseline-commit', $BaselineCommit,
         '--reference-version', $MicrosoftVersion,
@@ -797,7 +811,8 @@ try {
         throw "Initial ODBC benchmark comparison failed (exit $initialExit)"
     }
 
-    $scenarioFiles = @{ narrow = $candidateNarrow; wide = $candidateWide }
+    $scenarioFiles = @{}
+    foreach ($scenario in $Scenarios) { $scenarioFiles[$scenario] = $candidateFiles[$scenario] }
     $plan = @()
     foreach ($line in Get-Content -LiteralPath $PlanFile) {
         if (-not $line.Trim()) { continue }
@@ -813,37 +828,36 @@ try {
 
     $confirmationArguments = @()
     if ($plan.Count -gt 0) {
-        # One process covers both scenarios; only narrow those legs when the other
-        # workload has nothing to confirm.
-        $selected = @($plan | ForEach-Object { $_.Scenario } | Sort-Object -Unique)
-        $confirmScenario = if ($selected.Count -eq 1) { $selected[0] } else { '' }
+        # Confirmation re-measures whole scenarios, so only the legs that actually
+        # produced a flagged benchmark are re-run.
+        $confirmScenarios = @($plan | ForEach-Object { $_.Scenario } | Sort-Object -Unique)
 
-        Write-Host ((">>> Auto-confirm: re-measuring {0} benchmark(s) over {1} round(s); " +
-                "a result counts only when it reproduces in >= {2} of {1}.") -f
-            $plan.Count, $ConfirmRuns, $ConfirmQuorum)
+        Write-Host ((">>> Auto-confirm: re-measuring {0} benchmark(s) across {1} scenario(s) " +
+                "over {2} round(s); a result counts only when it reproduces in >= {3} of {2}.") -f
+            $plan.Count, $confirmScenarios.Count, $ConfirmRuns, $ConfirmQuorum)
         $roundRatios = @()
         for ($round = 1; $round -le $ConfirmRuns; $round++) {
             $roundDir = Join-Path $ConfirmDir "round$round"
             New-Item -ItemType Directory -Force -Path $roundDir | Out-Null
             Write-Host ">>> Confirmation round $round/$ConfirmRuns..."
             Write-CpuSample "confirm$round-start"
-            # Keep each pair adjacent, and alternate which side runs first so a
-            # stable position effect cancels across the default four rounds.
-            if ($round % 2 -eq 1) {
-                Invoke-BenchmarkLeg -Scenario $confirmScenario -Driver $CandidateDriverName `
-                    -Output (Join-Path $roundDir 'candidate.json')
-                Invoke-BenchmarkLeg -Scenario $confirmScenario -Driver $BaselineDriverName `
-                    -Output (Join-Path $roundDir 'baseline.json')
-            } else {
-                Invoke-BenchmarkLeg -Scenario $confirmScenario -Driver $BaselineDriverName `
-                    -Output (Join-Path $roundDir 'baseline.json')
-                Invoke-BenchmarkLeg -Scenario $confirmScenario -Driver $CandidateDriverName `
-                    -Output (Join-Path $roundDir 'candidate.json')
+            $roundArguments = @()
+            foreach ($scenario in $confirmScenarios) {
+                $roundCandidate = Join-Path $roundDir "candidate-$scenario.json"
+                $roundBaseline = Join-Path $roundDir "baseline-$scenario.json"
+                # Keep each pair adjacent, and alternate which side runs first so a
+                # stable position effect cancels across the default four rounds.
+                if ($round % 2 -eq 1) {
+                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $roundCandidate
+                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $roundBaseline
+                } else {
+                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $roundBaseline
+                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $roundCandidate
+                }
+                $roundArguments += @('--baseline', $roundBaseline, '--candidate', $roundCandidate)
             }
             Write-CpuSample "confirm$round-end"
-            $roundArguments = @(
-                '--baseline', (Join-Path $roundDir 'baseline.json'),
-                '--candidate', (Join-Path $roundDir 'candidate.json'),
+            $roundArguments += @(
                 '--repetitions', [string]$script:Repetitions,
                 '--regression-ratio', (Format-Invariant $RegressionRatio),
                 '--improvement-ratio', (Format-Invariant $ImprovementRatio),
@@ -924,7 +938,24 @@ try {
         Write-Host '>>> Removing ODBC benchmark tables...'
         $env:ODBC_BENCH_DRIVER = $CandidateDriverName
         $env:ODBC_BENCH_SCENARIO = ''
-        Invoke-CleanupNative -Description 'Benchmark table cleanup' -Command { & $AdminExe cleanup }
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $AdminExe cleanup
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning 'Candidate cleanup failed; retrying with Microsoft ODBC'
+                $env:ODBC_BENCH_DRIVER = $script:MicrosoftDriverName
+                $env:ODBC_BENCH_PACKET_SIZE_KEYWORD = 'Packet Size'
+                & $AdminExe cleanup
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning 'Benchmark table cleanup failed with both drivers'
+                }
+            }
+        } catch {
+            Write-Warning "Benchmark table cleanup failed: $($_.Exception.Message)"
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
     }
     if ($BaselineRegistrationAttempted) {
         try { Restore-DriverRegistration -State $BaselineState } catch { Write-Warning $_ }
