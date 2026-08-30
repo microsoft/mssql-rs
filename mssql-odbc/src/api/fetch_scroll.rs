@@ -131,7 +131,7 @@ impl RowIssue {
 }
 
 /// The per-row outcome recorded in the row status array.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RowOutcome {
     Success,
     Info(RowIssue),
@@ -674,7 +674,7 @@ fn fill_rowset(
         .is_some_and(|binding| binding.column_number as usize == column_count)
         && client.current_result_supports_row_into();
 
-    for _ in row_slots(row_budget) {
+    dispatch_rows(row_budget, |_| {
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
         if can_write_complete_rows {
@@ -684,7 +684,7 @@ fn fill_rowset(
                 Ok(BufferedRowPoll::Partial) => {
                     dbc.runtime.block_on(client.finish_row_into(&mut writer))
                 }
-                Ok(BufferedRowPoll::Exhausted) => break,
+                Ok(BufferedRowPoll::Exhausted) => return false,
                 Ok(BufferedRowPoll::Pending) => {
                     let cursor_poll = client.try_next_row_cursor();
                     match cursor_poll.and_then(|poll| {
@@ -695,10 +695,10 @@ fn fill_rowset(
                             Ok(false) => dbc.runtime.block_on(client.finish_row_into(&mut writer)),
                             Err(error) => Err(error),
                         },
-                        Ok(false) => break,
+                        Ok(false) => return false,
                         Err(error) => {
                             fetch_error = Some(error);
-                            break;
+                            return false;
                         }
                     }
                 }
@@ -717,10 +717,10 @@ fn fill_rowset(
                 .and_then(|poll| poll.resolve(|| dbc.runtime.block_on(client.next_row_cursor())))
             {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => return false,
                 Err(error) => {
                     fetch_error = Some(error);
-                    break;
+                    return false;
                 }
             }
 
@@ -773,10 +773,8 @@ fn fill_rowset(
         worst = worst.merge(outcome);
         rows_filled += 1;
 
-        if fetch_error.is_some() {
-            break;
-        }
-    }
+        fetch_error.is_none()
+    });
 
     // A zero-row end of set returns SQL_NO_DATA, which cannot carry
     // SQL_SUCCESS_WITH_INFO, so anything drained here would be posted under a
@@ -906,8 +904,14 @@ fn row_budget(max_rows: SqlULen, rows_returned: SqlULen, row_array_size: SqlULen
     row_array_size.min(max_rows.saturating_sub(rows_returned))
 }
 
-fn row_slots(row_budget: SqlULen) -> std::ops::Range<SqlULen> {
-    0..row_budget
+/// Calls `dispatch` for consecutive row slots until the budget is spent or the
+/// callback reports that no later row should be attempted.
+fn dispatch_rows(row_budget: SqlULen, mut dispatch: impl FnMut(SqlULen) -> bool) {
+    for row in 0..row_budget {
+        if !dispatch(row) {
+            break;
+        }
+    }
 }
 
 /// Writes `SQL_ROW_NOROW` into the unused tail of the row status array.
@@ -965,6 +969,13 @@ unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
     unsafe { ptr.read_unaligned() }
 }
 
+/// Writes already-encoded character data into one bound row slot.
+///
+/// # Safety
+///
+/// The binding's target and indicator pointers, after applying `bind_offset`
+/// and `row_index`, must be valid for their declared slot sizes. The writable
+/// target slot must not overlap `bytes`.
 unsafe fn deliver_encoded_string(
     binding: &ColumnBinding,
     row_index: usize,
@@ -1146,6 +1157,13 @@ unsafe fn deliver_bound(
     RowOutcome::Success
 }
 
+/// Writes one exact fixed-width value and its byte-count indicator.
+///
+/// # Safety
+///
+/// The binding's target pointer, after applying `bind_offset` and `row_index`,
+/// must be null or writable for `T`; its displaced indicator pointer must be
+/// null or writable for one `SqlLen`.
 unsafe fn deliver_fixed_bound<T: Copy>(
     binding: &ColumnBinding,
     row_index: usize,
@@ -1356,9 +1374,15 @@ mod tests {
     #[test]
     fn max_rows_bounds_the_whole_row_dispatch_loop() {
         let budget = row_budget(5, 4, 4);
-        let dispatches = row_slots(budget).count();
+        let mut buffered_rows = vec![10, 20, 30];
+        let mut delivered = Vec::new();
+        dispatch_rows(budget, |_| {
+            delivered.push(buffered_rows.remove(0));
+            true
+        });
 
-        assert_eq!(dispatches, 1);
+        assert_eq!(delivered, vec![10]);
+        assert_eq!(buffered_rows, vec![20, 30]);
     }
 
     /// The cap is per result set, so advancing onto a new one must restart the
@@ -1741,6 +1765,171 @@ mod tests {
         assert_eq!(first[0], 10);
         assert_eq!(third[0], 30);
         assert_eq!(writer.last_column_read, 3);
+    }
+
+    #[test]
+    fn bound_row_writer_matches_established_conversion_path() {
+        macro_rules! check {
+            ($target:expr, $target_rust_type:ty, $column_value:expr, $write:expr) => {{
+                let value = $column_value;
+                let mut direct_data = [0xA5_u8; 256];
+                let mut baseline_data = direct_data;
+                let mut direct_ind = [0xA5_u8; 32];
+                let mut baseline_ind = direct_ind;
+                let direct_binding = binding(
+                    1,
+                    $target,
+                    unsafe { direct_data.as_mut_ptr().add(1) }.cast(),
+                    64,
+                    unsafe { direct_ind.as_mut_ptr().add(1) }.cast(),
+                );
+                let baseline_binding = binding(
+                    1,
+                    $target,
+                    unsafe { baseline_data.as_mut_ptr().add(1) }.cast(),
+                    64,
+                    unsafe { baseline_ind.as_mut_ptr().add(1) }.cast(),
+                );
+                let bindings = [direct_binding];
+                let mut writer = BoundRowWriter::new(&bindings, 1, 1);
+
+                $write(&mut writer);
+                let expected = unsafe { deliver_bound(&baseline_binding, 1, 1, &value) };
+                let slot_offset = 2 + element_stride($target, 64);
+                let direct_value = unsafe {
+                    direct_data
+                        .as_ptr()
+                        .add(slot_offset)
+                        .cast::<$target_rust_type>()
+                        .read_unaligned()
+                };
+                let baseline_value = unsafe {
+                    baseline_data
+                        .as_ptr()
+                        .add(slot_offset)
+                        .cast::<$target_rust_type>()
+                        .read_unaligned()
+                };
+
+                assert_eq!(writer.outcome, expected);
+                assert_eq!(direct_value, baseline_value);
+                assert_eq!(direct_ind, baseline_ind);
+            }};
+        }
+
+        check!(
+            SQL_C_BIT,
+            u8,
+            ColumnValues::Bit(true),
+            |w: &mut BoundRowWriter<'_>| w.write_bool(0, true)
+        );
+        check!(
+            SQL_C_UTINYINT,
+            u8,
+            ColumnValues::TinyInt(0xFE),
+            |w: &mut BoundRowWriter<'_>| w.write_u8(0, 0xFE)
+        );
+        check!(
+            SQL_C_SSHORT,
+            i16,
+            ColumnValues::SmallInt(-1234),
+            |w: &mut BoundRowWriter<'_>| w.write_i16(0, -1234)
+        );
+        check!(
+            SQL_C_SLONG,
+            i32,
+            ColumnValues::Int(-123_456),
+            |w: &mut BoundRowWriter<'_>| w.write_i32(0, -123_456)
+        );
+        check!(
+            SQL_C_SBIGINT,
+            i64,
+            ColumnValues::BigInt(-9_876_543_210),
+            |w: &mut BoundRowWriter<'_>| w.write_i64(0, -9_876_543_210)
+        );
+        check!(
+            SQL_C_FLOAT,
+            f32,
+            ColumnValues::Real(12.5),
+            |w: &mut BoundRowWriter<'_>| w.write_f32(0, 12.5)
+        );
+        check!(
+            SQL_C_DOUBLE,
+            f64,
+            ColumnValues::Float(-42.25),
+            |w: &mut BoundRowWriter<'_>| w.write_f64(0, -42.25)
+        );
+
+        let date = SqlDate::create(738_000).unwrap();
+        check!(
+            SQL_C_TYPE_DATE,
+            SqlDateStruct,
+            ColumnValues::Date(date.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_date(0, date.clone())
+        );
+        let time = SqlTime {
+            time_nanoseconds: 45_296_123_456_700,
+            scale: 7,
+        };
+        check!(
+            SQL_C_SS_TIME2,
+            SqlSsTime2Struct,
+            ColumnValues::Time(time.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_time(0, time.clone())
+        );
+        let datetime2 = SqlDateTime2 {
+            days: 738_000,
+            time: time.clone(),
+        };
+        check!(
+            SQL_C_TYPE_TIMESTAMP,
+            SqlTimestampStruct,
+            ColumnValues::DateTime2(datetime2.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_datetime2(0, datetime2.clone())
+        );
+        let datetimeoffset = SqlDateTimeOffset {
+            datetime2: datetime2.clone(),
+            offset: -420,
+        };
+        check!(
+            SQL_C_SS_TIMESTAMPOFFSET,
+            SqlSsTimestampoffsetStruct,
+            ColumnValues::DateTimeOffset(datetimeoffset.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_datetimeoffset(0, datetimeoffset.clone())
+        );
+        let uuid = Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+        check!(
+            SQL_C_GUID,
+            SqlGuid,
+            ColumnValues::Uuid(uuid),
+            |w: &mut BoundRowWriter<'_>| w.write_uuid(0, uuid)
+        );
+
+        let decimal = DecimalParts::new(true, 18, 4, 1_234_500);
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::Decimal(decimal),
+            |w: &mut BoundRowWriter<'_>| w.write_decimal(0, decimal)
+        );
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::Numeric(decimal),
+            |w: &mut BoundRowWriter<'_>| w.write_numeric(0, decimal)
+        );
+        check!(
+            SQL_C_SBIGINT,
+            i64,
+            ColumnValues::Int(-123_456),
+            |w: &mut BoundRowWriter<'_>| w.write_i32(0, -123_456)
+        );
+        check!(
+            SQL_C_SSHORT,
+            i16,
+            ColumnValues::BigInt(i64::MAX),
+            |w: &mut BoundRowWriter<'_>| w.write_i64(0, i64::MAX)
+        );
     }
 
     /// NULL is reported through the indicator; the data slot is left alone for
