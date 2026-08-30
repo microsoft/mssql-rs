@@ -4678,9 +4678,10 @@ mod test {
             // Run decode()
             let mut reader1 = ByteReader::new(bytes.clone());
             let expected = decoder.decode(&mut reader1, metadata).await.unwrap();
+            let consumed = reader1.pos;
 
             // Run decode_into()
-            let mut reader2 = ByteReader::new(bytes);
+            let mut reader2 = ByteReader::new(bytes.clone());
             let mut writer = DefaultRowWriter::new(1);
             decoder
                 .decode_into(&mut reader2, metadata, 0, &mut writer)
@@ -4693,6 +4694,45 @@ mod test {
                 "decode_into mismatch for {:?}",
                 metadata.data_type
             );
+            assert_eq!(reader2.pos, consumed);
+
+            if let Some((value, used)) = decoder.try_decode_buffered(&bytes, metadata).unwrap() {
+                assert_eq!(value, expected, "buffered value mismatch");
+                assert_eq!(used, consumed, "buffered value consumed wrong width");
+                assert_eq!(
+                    decoder
+                        .try_decode_buffered(&bytes[..bytes.len() - 1], metadata)
+                        .unwrap(),
+                    None,
+                    "buffered value accepted one-byte-short input"
+                );
+            }
+
+            let mut buffered_writer = DefaultRowWriter::new(1);
+            if let Some(used) = decoder
+                .try_decode_buffered_into(&bytes, metadata, 0, &mut buffered_writer)
+                .unwrap()
+            {
+                assert_eq!(
+                    buffered_writer.take_row()[0],
+                    expected,
+                    "buffered writer mismatch"
+                );
+                assert_eq!(used, consumed, "buffered writer consumed wrong width");
+                let mut short_writer = DefaultRowWriter::new(1);
+                assert_eq!(
+                    decoder
+                        .try_decode_buffered_into(
+                            &bytes[..bytes.len() - 1],
+                            metadata,
+                            0,
+                            &mut short_writer,
+                        )
+                        .unwrap(),
+                    None,
+                    "buffered writer accepted one-byte-short input"
+                );
+            }
             expected
         }
 
