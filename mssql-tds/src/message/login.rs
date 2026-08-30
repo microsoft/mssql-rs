@@ -824,7 +824,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
         let feature_extension_offset = login_record_length;
         login_record_length += self.features_request.len_bytes();
         if login_record_length > MAX_LOGIN_RECORD_LENGTH {
-            return Err(crate::error::Error::ProtocolError(format!(
+            return Err(crate::error::Error::UsageError(format!(
                 "LOGIN7 record length {login_record_length} exceeds the maximum of {MAX_LOGIN_RECORD_LENGTH} bytes"
             )));
         }
@@ -1081,8 +1081,8 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                     .push(LoginDeferredPayload::UserName);
             }
         } else {
-            self.payload_writer.write_i16_async(0).await?;
-            self.payload_writer.write_i16_async(0).await?;
+            self.payload_writer.write_u16_async(0).await?;
+            self.payload_writer.write_u16_async(0).await?;
         }
         Ok(())
     }
@@ -1098,8 +1098,8 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
                     .push(LoginDeferredPayload::Password);
             }
         } else {
-            self.payload_writer.write_i16_async(0).await?;
-            self.payload_writer.write_i16_async(0).await?;
+            self.payload_writer.write_u16_async(0).await?;
+            self.payload_writer.write_u16_async(0).await?;
         }
         Ok(())
     }
@@ -1281,7 +1281,7 @@ impl<'a, 'n, 'context> Serializer<'a, 'n, 'context> {
 
     fn current_offset(&self) -> TdsResult<u16> {
         u16::try_from(self.content_next_offset).map_err(|_| {
-            crate::error::Error::ProtocolError(format!(
+            crate::error::Error::UsageError(format!(
                 "LOGIN7 field offset {} exceeds the maximum of {} bytes",
                 self.content_next_offset,
                 u16::MAX
@@ -1324,7 +1324,7 @@ trait SizedLoginItem {
 
 fn utf16_code_units(value: &str) -> TdsResult<u16> {
     u16::try_from(value.encode_utf16().count()).map_err(|_| {
-        crate::error::Error::ProtocolError(format!(
+        crate::error::Error::UsageError(format!(
             "LOGIN7 string exceeds the maximum of {} UTF-16 code units",
             u16::MAX
         ))
@@ -1545,6 +1545,20 @@ mod tests {
     }
 
     #[test]
+    fn record_length_accounts_for_change_password() {
+        let base = ClientContext {
+            connect_retry_count: 0,
+            ..ClientContext::default()
+        };
+        let with_change_password = ClientContext {
+            change_password: "abcd".to_string(),
+            ..base.clone()
+        };
+
+        assert_eq!(with_change_password.len_bytes(), base.len_bytes() + 8);
+    }
+
+    #[test]
     fn login_rejects_oversized_string_and_record() {
         let context = ClientContext {
             application_name: "a".repeat(usize::from(u16::MAX) + 1),
@@ -1558,6 +1572,7 @@ mod tests {
         let mut serializer = Serializer::new(&model, &mut packet_writer);
 
         let field_error = block_on(serializer.write_app_name()).unwrap_err();
+        assert!(matches!(field_error, crate::error::Error::UsageError(_)));
         assert!(field_error.to_string().contains("65535 UTF-16 code units"));
 
         let context = ClientContext {
@@ -1573,6 +1588,7 @@ mod tests {
         let serializer = Serializer::new(&model, &mut packet_writer);
 
         let record_error = serializer.calculate_login_record_length().unwrap_err();
+        assert!(matches!(record_error, crate::error::Error::UsageError(_)));
         assert!(record_error.to_string().contains("131071 bytes"));
     }
 

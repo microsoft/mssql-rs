@@ -115,6 +115,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-odbc`: the `APP` connection-string keyword is now sent as the TDS login
+  application name. It was recognized but ignored, so `APP_NAME()` reported the
+  default `TDSX Rust Client` value without warning that `APP` had been dropped.
+
+- `mssql-tds`: LOGIN7 record sizing now includes the optional change-password
+  value, preventing a caller-supplied value from making the declared packet
+  length shorter than the serialized payload.
+
 - `mssql-tds`: idle connection resiliency (transparent session recovery) now
   works end to end. The client-side gate that authorizes a reconnect is now set
   from the server's `FEATUREEXTACK` acknowledgment — previously it was only ever
