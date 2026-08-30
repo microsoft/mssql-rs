@@ -181,7 +181,16 @@ impl AnyTransport {
         match self {
             Self::Network(transport) => transport.try_read_buffered_row_into(pause_state, writer),
             #[cfg(any(test, feature = "test-util", fuzzing))]
-            Self::Dynamic(_) => Ok(false),
+            Self::Dynamic(transport) => {
+                let Some(row) = transport.try_read_buffered_test_row(pause_state)? else {
+                    return Ok(false);
+                };
+                for value in row {
+                    writer.write_i32(pause_state.next_column_index, value);
+                    pause_state.next_column_index += 1;
+                }
+                Ok(true)
+            }
         }
     }
 

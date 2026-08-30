@@ -1217,7 +1217,8 @@ mod tests {
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::test_client_support::{
-        col_metadata_empty, done_no_more, int_columns, tds_client_from_tokens,
+        col_metadata_empty, done_no_more, int_columns, tds_client_from_int_rows,
+        tds_client_from_tokens,
     };
 
     fn binding(
@@ -1373,16 +1374,105 @@ mod tests {
 
     #[test]
     fn max_rows_bounds_the_whole_row_dispatch_loop() {
-        let budget = row_budget(5, 4, 4);
-        let mut buffered_rows = vec![10, 20, 30];
-        let mut delivered = Vec::new();
-        dispatch_rows(budget, |_| {
-            delivered.push(buffered_rows.remove(0));
-            true
-        });
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut values = [0_i32; 4];
+        let mut indicators = [0 as SqlLen; 4];
+        let mut statuses = [SQL_ROW_NOROW; 4];
+        let mut rows_fetched = 0;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+            state.max_rows = 5;
+            state.rows_returned = 4;
+            state.row_array_size = 4;
+            state.rows_fetched_ptr = &mut rows_fetched;
+            state.row_status_ptr = statuses.as_mut_ptr();
+            state.set_binding(binding(
+                1,
+                SQL_C_SLONG,
+                values.as_mut_ptr().cast(),
+                0,
+                indicators.as_mut_ptr(),
+            ));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT buffered rows".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
 
-        assert_eq!(delivered, vec![10]);
-        assert_eq!(buffered_rows, vec![20, 30]);
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(rows_fetched, 1);
+        assert_eq!(values, [10, 0, 0, 0]);
+        assert_eq!(
+            statuses,
+            [SQL_ROW_SUCCESS, SQL_ROW_NOROW, SQL_ROW_NOROW, SQL_ROW_NOROW]
+        );
+        assert_eq!(stmt.inner.lock().unwrap().rows_returned, 5);
+
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.max_rows = 0;
+            state.rows_returned = 0;
+            state.row_array_size = 1;
+        }
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            values[0], 20,
+            "the capped fetch consumed only the first row"
+        );
+    }
+
+    #[test]
+    fn partial_binding_uses_the_column_cursor_path() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(2));
+            state.set_binding(binding(
+                1,
+                SQL_C_SLONG,
+                (&mut value as *mut i32).cast(),
+                0,
+                &mut indicator,
+            ));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10, 20]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT partial binding".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 10);
+        assert_eq!(indicator, 4);
     }
 
     /// The cap is per result set, so advancing onto a new one must restart the
@@ -1867,6 +1957,12 @@ mod tests {
             ColumnValues::Date(date.clone()),
             |w: &mut BoundRowWriter<'_>| w.write_date(0, date.clone())
         );
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::Date(date.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_date(0, date.clone())
+        );
         let time = SqlTime {
             time_nanoseconds: 45_296_123_456_700,
             scale: 7,
@@ -1874,6 +1970,12 @@ mod tests {
         check!(
             SQL_C_SS_TIME2,
             SqlSsTime2Struct,
+            ColumnValues::Time(time.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_time(0, time.clone())
+        );
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
             ColumnValues::Time(time.clone()),
             |w: &mut BoundRowWriter<'_>| w.write_time(0, time.clone())
         );
@@ -1887,6 +1989,12 @@ mod tests {
             ColumnValues::DateTime2(datetime2.clone()),
             |w: &mut BoundRowWriter<'_>| w.write_datetime2(0, datetime2.clone())
         );
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::DateTime2(datetime2.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_datetime2(0, datetime2.clone())
+        );
         let datetimeoffset = SqlDateTimeOffset {
             datetime2: datetime2.clone(),
             offset: -420,
@@ -1897,10 +2005,22 @@ mod tests {
             ColumnValues::DateTimeOffset(datetimeoffset.clone()),
             |w: &mut BoundRowWriter<'_>| w.write_datetimeoffset(0, datetimeoffset.clone())
         );
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::DateTimeOffset(datetimeoffset.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_datetimeoffset(0, datetimeoffset.clone())
+        );
         let uuid = Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
         check!(
             SQL_C_GUID,
             SqlGuid,
+            ColumnValues::Uuid(uuid),
+            |w: &mut BoundRowWriter<'_>| w.write_uuid(0, uuid)
+        );
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
             ColumnValues::Uuid(uuid),
             |w: &mut BoundRowWriter<'_>| w.write_uuid(0, uuid)
         );
@@ -1930,6 +2050,126 @@ mod tests {
             ColumnValues::BigInt(i64::MAX),
             |w: &mut BoundRowWriter<'_>| w.write_i64(0, i64::MAX)
         );
+        check!(
+            SQL_C_SLONG,
+            i32,
+            ColumnValues::Null,
+            |w: &mut BoundRowWriter<'_>| w.write_null(0)
+        );
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::Bytes(vec![1, 2, 3]),
+            |w: &mut BoundRowWriter<'_>| w.write_bytes(0, Cow::Borrowed(&[1, 2, 3]))
+        );
+        let datetime = SqlDateTime {
+            days: 45_000,
+            time: 12_345,
+        };
+        check!(
+            SQL_C_TYPE_TIMESTAMP,
+            SqlTimestampStruct,
+            ColumnValues::DateTime(datetime.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_datetime(0, datetime.clone())
+        );
+        let smalldatetime = SqlSmallDateTime {
+            days: 45_000,
+            time: 754,
+        };
+        check!(
+            SQL_C_TYPE_TIMESTAMP,
+            SqlTimestampStruct,
+            ColumnValues::SmallDateTime(smalldatetime.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_smalldatetime(0, smalldatetime.clone())
+        );
+        let money = SqlMoney {
+            lsb_part: 123_450,
+            msb_part: 0,
+        };
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::Money(money.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_money(0, money.clone())
+        );
+        let smallmoney = SqlSmallMoney { int_val: -123_450 };
+        check!(
+            SQL_C_CHAR,
+            [u8; 64],
+            ColumnValues::SmallMoney(smallmoney.clone()),
+            |w: &mut BoundRowWriter<'_>| w.write_smallmoney(0, smallmoney.clone())
+        );
+    }
+
+    #[test]
+    fn bound_row_writer_ignores_values_without_a_matching_binding() {
+        let mut value = 0_i32;
+        let bindings = [binding(
+            1,
+            SQL_C_SLONG,
+            (&mut value as *mut i32).cast(),
+            0,
+            ptr::null_mut(),
+        )];
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+
+        writer.write_i32(1, 42);
+        writer.write_string(2, Cow::Borrowed(b"unused"), EncodingType::Utf8);
+        writer.write_xml(3, SqlXml::from("<unused/>".to_string()));
+        writer.write_json(4, SqlJson::new(b"{}".to_vec()));
+        writer.write_vector(5, SqlVector::try_from_f32(vec![1.0]).unwrap());
+        writer.write_variant_base_type(2, TdsDataType::Int4);
+        writer.end_row();
+
+        assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn bound_row_writer_covers_encoded_string_fallback_and_truncation() {
+        let mut invalid = [0_u8; 8];
+        let invalid_binding = binding(
+            1,
+            SQL_C_CHAR,
+            invalid.as_mut_ptr().cast(),
+            invalid.len() as SqlLen,
+            ptr::null_mut(),
+        );
+        let bindings = [invalid_binding];
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        writer.write_string(0, Cow::Borrowed(&[0xFF]), EncodingType::Utf8);
+        assert_eq!(
+            writer.outcome,
+            RowOutcome::Error(RowIssue::InvalidCharacter)
+        );
+
+        let mut probe = [0_u16; 1];
+        let mut probe_indicator = 0;
+        let probe_binding = binding(
+            1,
+            SQL_C_WCHAR,
+            probe.as_mut_ptr().cast(),
+            0,
+            &mut probe_indicator,
+        );
+        let bindings = [probe_binding];
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        writer.write_string(0, Cow::Borrowed(b"h\0"), EncodingType::Utf16);
+        assert_eq!(writer.outcome, RowOutcome::Info(RowIssue::StringTruncated));
+        assert_eq!(probe_indicator, 2);
+
+        let mut truncated = [0_u16; 2];
+        let truncated_binding = binding(
+            1,
+            SQL_C_WCHAR,
+            truncated.as_mut_ptr().cast(),
+            std::mem::size_of_val(&truncated) as SqlLen,
+            ptr::null_mut(),
+        );
+        let bindings = [truncated_binding];
+        let mut writer = BoundRowWriter::new(&bindings, 0, 0);
+        writer.write_string(0, Cow::Borrowed(b"h\0i\0"), EncodingType::Utf16);
+        assert_eq!(truncated, [u16::from(b'h'), 0]);
+        assert_eq!(writer.outcome, RowOutcome::Info(RowIssue::StringTruncated));
     }
 
     /// NULL is reported through the indicator; the data slot is left alone for
