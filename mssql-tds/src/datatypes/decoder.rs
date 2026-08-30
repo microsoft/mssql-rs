@@ -4666,6 +4666,157 @@ mod test {
             assert_eq!(used, bytes.len());
         }
 
+        #[test]
+        fn buffered_decoders_reject_invalid_or_incomplete_values() {
+            let decoder = GenericDecoder::default();
+            let plp = ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                data_type: TdsDataType::BigVarBinary,
+                type_info: TypeInfo::partial_len(TdsDataType::BigVarBinary, usize::MAX, None)
+                    .unwrap(),
+                column_name: String::new(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            };
+            assert_eq!(decoder.try_decode_buffered(&[], &plp).unwrap(), None);
+            let mut writer = DefaultRowWriter::new(1);
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&[], &plp, 0, &mut writer)
+                    .unwrap(),
+                None
+            );
+
+            let invalid = [
+                (vec![3, 0, 0, 0], varlen_metadata(TdsDataType::IntN, 8)),
+                (
+                    vec![5, 0, 0, 0, 0, 0],
+                    varlen_metadata(TdsDataType::MoneyN, 8),
+                ),
+                (vec![15], varlen_metadata(TdsDataType::Guid, 16)),
+                (
+                    vec![4, 0, 0, 0, 0],
+                    scale_metadata(TdsDataType::DateTimeOffsetN, 10, 7),
+                ),
+            ];
+            for (bytes, metadata) in invalid {
+                assert!(decoder.try_decode_buffered(&bytes, &metadata).is_err());
+                let mut writer = DefaultRowWriter::new(1);
+                assert!(
+                    decoder
+                        .try_decode_buffered_into(&bytes, &metadata, 0, &mut writer)
+                        .is_err()
+                );
+            }
+
+            let incomplete = [
+                (vec![0; 7], fixed_metadata(TdsDataType::Int8, 8)),
+                (vec![0; 3], fixed_metadata(TdsDataType::Money, 8)),
+                (vec![0; 3], fixed_metadata(TdsDataType::DateTim4, 4)),
+                (vec![0; 7], fixed_metadata(TdsDataType::DateTime, 8)),
+                (vec![4, 0, 0], varlen_metadata(TdsDataType::IntN, 4)),
+                (vec![8, 0, 0, 0, 0], varlen_metadata(TdsDataType::MoneyN, 8)),
+                (vec![2, 0, b'a'], varlen_metadata(TdsDataType::NVarChar, 10)),
+                (
+                    vec![2, 0, 1],
+                    varlen_metadata(TdsDataType::BigVarBinary, 10),
+                ),
+            ];
+            for (bytes, metadata) in incomplete {
+                assert_eq!(
+                    decoder.try_decode_buffered(&bytes, &metadata).unwrap(),
+                    None
+                );
+                let mut writer = DefaultRowWriter::new(1);
+                assert_eq!(
+                    decoder
+                        .try_decode_buffered_into(&bytes, &metadata, 0, &mut writer)
+                        .unwrap(),
+                    None
+                );
+            }
+
+            let missing_scale = varlen_metadata(TdsDataType::TimeN, 5);
+            assert!(
+                decoder
+                    .try_decode_buffered(&[3, 1, 0, 0], &missing_scale)
+                    .is_err()
+            );
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(&[3, 1, 0, 0], &missing_scale, 0, &mut writer,)
+                    .is_err()
+            );
+
+            let invalid_decimal = varlen_metadata(TdsDataType::DecimalN, 9);
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(
+                        &[5, 1, 1, 0, 0, 0],
+                        &invalid_decimal,
+                        0,
+                        &mut writer,
+                    )
+                    .is_err()
+            );
+            let invalid_precision = precision_scale_metadata(TdsDataType::DecimalN, 9, 39, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(
+                        &[5, 1, 1, 0, 0, 0],
+                        &invalid_precision,
+                        0,
+                        &mut writer,
+                    )
+                    .is_err()
+            );
+            let oversized_decimal = precision_scale_metadata(TdsDataType::DecimalN, 21, 38, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            assert!(
+                decoder
+                    .try_decode_buffered_into(&[21, 1], &oversized_decimal, 0, &mut writer,)
+                    .is_err()
+            );
+
+            let unsupported = fixed_metadata(TdsDataType::SsVariant, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&[0; 4], &unsupported, 0, &mut writer)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn buffered_decoders_cover_wide_nullable_values() {
+            let int = varlen_metadata(TdsDataType::IntN, 8);
+            let mut int_wire = vec![8];
+            int_wire.extend_from_slice(&i64::MIN.to_le_bytes());
+            assert_eq!(
+                assert_decode_equivalence(int_wire, &int).await,
+                ColumnValues::BigInt(i64::MIN)
+            );
+
+            let time = scale_metadata(TdsDataType::TimeN, 5, 7);
+            assert_eq!(
+                assert_decode_equivalence(vec![0], &time).await,
+                ColumnValues::Null
+            );
+
+            let numeric = precision_scale_metadata(TdsDataType::NumericN, 9, 18, 4);
+            let mut numeric_wire = vec![9, 1];
+            numeric_wire.extend_from_slice(&1_234_500_u64.to_le_bytes());
+            assert!(matches!(
+                assert_decode_equivalence(numeric_wire, &numeric).await,
+                ColumnValues::Numeric(_)
+            ));
+        }
+
         /// Runs both decode() and decode_into() on the same bytes and asserts
         /// that decode_into via DefaultRowWriter produces the same ColumnValues
         /// as decode().

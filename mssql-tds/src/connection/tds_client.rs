@@ -8158,6 +8158,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn next_row_into_continues_a_partial_buffered_row() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let second = expected[1].to_le_bytes();
+        let mut first_payload = vec![0xff, TokenType::Row as u8];
+        first_payload.extend_from_slice(&expected[0].to_le_bytes());
+        first_payload.extend_from_slice(&second[..2]);
+        let mut first = TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut second_packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(&second_packet.append_bytes(&second[2..]).build());
+        let mut transport = create_network_transport_with_data(&stream);
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(expected.len()));
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert!(client.next_row_into(&mut writer).await.unwrap());
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn buffered_row_poll_parks_only_an_incomplete_row() {
         let expected = [0x1234_5678_i32, -42_i32];
         let second = expected[1].to_le_bytes();
@@ -8284,6 +8313,7 @@ mod tests {
     fn row_writer_finish_is_limited_to_non_plp_results() {
         let mut client = create_test_client();
         assert!(!client.current_result_supports_row_into());
+        assert!(!client.buffered_row_support());
 
         client.current_metadata = Some(int_column_metadata(1));
         assert!(client.current_result_supports_row_into());
@@ -8311,6 +8341,131 @@ mod tests {
         }));
         assert!(!client.current_result_supports_row_into());
         assert!(!client.buffered_row_support());
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Pending
+        );
+    }
+
+    #[test]
+    fn buffered_cursor_edge_states_preserve_the_async_fallback_contract() {
+        let mut client = create_test_client();
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert!(client.try_next_row_cursor().is_err());
+        assert!(client.try_next_buffered_row_into(&mut writer).is_err());
+
+        let metadata = int_column_metadata(2);
+        client.current_metadata = Some(Arc::clone(&metadata));
+        client.current_result_set_has_been_read_till_end = true;
+        assert_eq!(
+            client.try_next_row_cursor().unwrap(),
+            CursorPoll::Ready(false)
+        );
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Exhausted
+        );
+
+        client.current_result_set_has_been_read_till_end = false;
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 1,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_next_row_cursor().unwrap(), CursorPoll::Pending);
+        assert_eq!(
+            client.try_next_buffered_row_into(&mut writer).unwrap(),
+            BufferedRowPoll::Pending
+        );
+        assert_eq!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::AlreadyConsumed)
+        );
+        assert!(client.try_read_row_column(2).is_err());
+        assert_eq!(client.try_read_row_column(1).unwrap(), CursorPoll::Pending);
+        assert!(!client.try_finish_row_into(&mut writer).unwrap());
+
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+        assert!(!client.try_finish_row_into(&mut writer).unwrap());
+        client.cancel_handle = None;
+
+        client.active_row_read_state = ActiveRowReadState::Idle;
+        assert!(client.try_finish_row_into(&mut writer).is_err());
+
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(3),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        assert_eq!(client.try_read_row_column(1).unwrap(), CursorPoll::Pending);
+    }
+
+    #[tokio::test]
+    async fn finish_row_into_rejects_non_resumable_state() {
+        let mut client = create_test_client();
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        assert!(client.finish_row_into(&mut writer).await.is_err());
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn finish_row_into_handles_transport_outcomes() {
+        fn paused() -> RowPauseState {
+            RowPauseState {
+                next_column_index: 0,
+                metadata: int_column_metadata(1),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+
+        let mut complete_transport = TestTransport::new();
+        complete_transport
+            .resume_results
+            .push_back(RowReadResult::RowWritten);
+        let mut complete = create_test_client_with_transport(complete_transport);
+        complete.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        complete.remaining_request_timeout = Some(Duration::from_secs(1));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+        complete.finish_row_into(&mut writer).await.unwrap();
+        assert!(matches!(
+            complete.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        let mut paused_transport = TestTransport::new();
+        paused_transport
+            .resume_results
+            .push_back(RowReadResult::RowPaused(paused()));
+        let mut still_paused = create_test_client_with_transport(paused_transport);
+        still_paused.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        assert!(still_paused.finish_row_into(&mut writer).await.is_err());
+        assert!(matches!(
+            still_paused.active_row_read_state,
+            ActiveRowReadState::RowPaused(_)
+        ));
+
+        let mut token_transport = TestTransport::new();
+        token_transport
+            .resume_results
+            .push_back(RowReadResult::Token(done_no_more()));
+        let mut token = create_test_client_with_transport(token_transport);
+        token.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        assert!(token.finish_row_into(&mut writer).await.is_err());
+
+        let mut failed = create_test_client();
+        failed.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
+        assert!(failed.finish_row_into(&mut writer).await.is_err());
     }
 
     // ── PLP streaming lifecycle contract tests ──

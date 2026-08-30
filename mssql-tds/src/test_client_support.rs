@@ -52,6 +52,8 @@ pub struct ScriptedToken(Tokens);
 #[derive(Debug)]
 struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
+    pending_rows: VecDeque<VecDeque<i32>>,
+    active_row: Option<VecDeque<i32>>,
     reset_mode: ResetConnectionMode,
     reset_dispatched: bool,
     known_dead: bool,
@@ -61,15 +63,72 @@ impl TokenReplayTransport {
     fn new(tokens: Vec<Tokens>) -> Self {
         Self {
             pending_tokens: VecDeque::from(tokens),
+            pending_rows: VecDeque::new(),
+            active_row: None,
             reset_mode: ResetConnectionMode::None,
             reset_dispatched: false,
             known_dead: false,
         }
     }
+
+    fn with_int_rows(metadata: Tokens, rows: Vec<Vec<i32>>) -> Self {
+        let done = Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        });
+        let mut transport = Self::new(vec![metadata, done]);
+        transport.pending_rows = rows.into_iter().map(VecDeque::from).collect();
+        transport
+    }
+
+    fn position_int_row(&mut self, context: &ParserContext) -> TdsResult<Option<RowPauseState>> {
+        let Some(row) = self.pending_rows.pop_front() else {
+            return Ok(None);
+        };
+        let ParserContext::ColumnMetadata(metadata, decryptor) = context else {
+            return Err(crate::error::Error::ProtocolError(
+                "Expected column metadata while positioning a scripted row".to_string(),
+            ));
+        };
+        self.active_row = Some(row);
+        Ok(Some(RowPauseState {
+            next_column_index: 0,
+            metadata: std::sync::Arc::clone(metadata),
+            nbc_null_bitmap: None,
+            decryptor: decryptor.clone(),
+        }))
+    }
 }
 
 #[async_trait]
 impl TdsTokenStreamReader for TokenReplayTransport {
+    fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        self.position_int_row(context)
+    }
+
+    fn try_read_buffered_column(
+        &mut self,
+        _pause_state: &RowPauseState,
+        _target: usize,
+    ) -> TdsResult<Option<crate::datatypes::column_values::ColumnValues>> {
+        Ok(self
+            .active_row
+            .as_mut()
+            .and_then(VecDeque::pop_front)
+            .map(crate::datatypes::column_values::ColumnValues::Int))
+    }
+
+    fn try_read_buffered_test_row(
+        &mut self,
+        _pause_state: &mut RowPauseState,
+    ) -> TdsResult<Option<Vec<i32>>> {
+        Ok(self.active_row.take().map(VecDeque::into))
+    }
+
     async fn receive_token(
         &mut self,
         _context: &ParserContext,
@@ -101,10 +160,13 @@ impl TdsTokenStreamReader for TokenReplayTransport {
     // `RowHeader::Token`, never `Positioned`.
     async fn receive_row_header(
         &mut self,
-        _context: &ParserContext,
+        context: &ParserContext,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<RowHeader> {
+        if let Some(row) = self.position_int_row(context)? {
+            return Ok(RowHeader::Positioned(row));
+        }
         if let Some(tok) = self.pending_tokens.pop_front() {
             return Ok(RowHeader::Token(tok));
         }
@@ -218,6 +280,28 @@ impl TdsTransport for TokenReplayTransport {
 pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
     let tokens: Vec<Tokens> = tokens.into_iter().map(|t| t.0).collect();
     let transport = AnyTransport::dynamic(TokenReplayTransport::new(tokens));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let execution_context = ExecutionContext::new();
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+        Vec::new(),
+    )
+}
+
+/// Builds a client that first returns integer-column metadata and then replays
+/// the supplied rows through the buffered cursor APIs.
+pub fn tds_client_from_int_rows(rows: Vec<Vec<i32>>) -> TdsClient {
+    let width = rows.first().map_or(0, Vec::len);
+    let metadata = Tokens::ColMetadata(ColMetadataToken {
+        column_count: u16::try_from(width).unwrap_or(u16::MAX),
+        columns: int_columns(width),
+        cek_table: Vec::new(),
+    });
+    let transport = AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows));
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");
@@ -376,6 +460,23 @@ pub fn sql_error(number: u32, severity: u8, message: &str) -> ScriptedToken {
         proc_name: String::new(),
         line_number: 1,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffered_rows_require_column_metadata_context() {
+        let metadata = Tokens::ColMetadata(ColMetadataToken::default());
+        let mut transport = TokenReplayTransport::with_int_rows(metadata, vec![vec![1]]);
+
+        assert!(
+            transport
+                .position_int_row(&ParserContext::None(()))
+                .is_err()
+        );
+    }
 }
 
 // ── Byte-level replay harness (test-only) ──────────────────────────────────

@@ -214,6 +214,14 @@ pub(crate) trait TdsTokenStreamReader {
         Ok(None)
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    fn try_read_buffered_test_row(
+        &mut self,
+        _pause_state: &mut RowPauseState,
+    ) -> TdsResult<Option<Vec<i32>>> {
+        Ok(None)
+    }
+
     async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -287,6 +295,13 @@ pub trait TdsTokenStreamReader {
         _pause_state: &RowPauseState,
         _target: usize,
     ) -> TdsResult<Option<ColumnValues>> {
+        Ok(None)
+    }
+
+    fn try_read_buffered_test_row(
+        &mut self,
+        _pause_state: &mut RowPauseState,
+    ) -> TdsResult<Option<Vec<i32>>> {
         Ok(None)
     }
 
