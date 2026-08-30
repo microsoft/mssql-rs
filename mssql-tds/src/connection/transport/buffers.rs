@@ -215,10 +215,17 @@ impl TdsReadBuffer {
         self.buffer_length += new_packet_size - 8;
     }
 
+    /// Returns the remaining allocation from the current position, including
+    /// capacity beyond `buffer_length`. Fixed-width readers use this only after
+    /// `do_we_have_enough_data` proves the requested bytes are valid.
     pub(crate) fn get_slice(&self) -> &[u8] {
         &self.working_buffer[self.buffer_position..]
     }
 
+    /// Returns only bytes received from the wire and not yet consumed.
+    ///
+    /// Sync-first decoders must use this bounded view so unused or stale bytes
+    /// after `buffer_length` cannot make an incomplete value appear complete.
     pub(crate) fn get_buffered_slice(&self) -> &[u8] {
         &self.working_buffer[self.buffer_position..self.buffer_length]
     }
