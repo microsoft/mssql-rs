@@ -223,6 +223,13 @@ def format_speedup(ratio):
     return f"{1.0 / ratio:.2f}x"
 
 
+def format_time_multiple(ratio):
+    """State how many times as long the candidate took when it is slower."""
+    if ratio >= 1.0:
+        return f"{ratio:.2f}x as long"
+    return f"{1.0 / ratio:.2f}x less time"
+
+
 def format_wall_time_change(change_percent):
     """Name the wall-time direction explicitly; 'percent faster' is ambiguous."""
     if change_percent < -0.005:
@@ -617,7 +624,23 @@ def summary_markdown(
             "mssql-odbc baseline."
         )
 
-    lines = ["# ODBC performance comparison", "", f"**{verdict}**", ""]
+    lines = [
+        "# ODBC performance comparison",
+        "",
+        "This report contains two separate comparisons:",
+        "",
+        "1. **Regression gate — candidate vs pinned mssql-odbc baseline.** "
+        "This compares the current Rust driver with the pinned older Rust driver "
+        "and can fail the run.",
+    ]
+    if reference_paths:
+        lines.append(
+            f"2. **Reference gap — candidate vs {reference_label}.** This shows "
+            "the performance gap to the production Microsoft driver. "
+            "**Informational means it does not fail this regression run; it does "
+            "not mean the difference is insignificant.**"
+        )
+    lines.extend(["", f"**Regression-gate verdict: {verdict}**", ""])
     if reference_paths:
         lines.extend(
             [
@@ -625,7 +648,8 @@ def summary_markdown(
                 "",
                 (
                     f"| Benchmark | Pinned mssql-odbc baseline | "
-                    f"{reference_label} | Candidate | Candidate rows/s | "
+                    f"{reference_label} (non-gating reference) | Candidate | "
+                    "Candidate rows/s | "
                     "Candidate cells/s |"
                 ),
                 "|---|---:|---:|---:|---:|---:|",
@@ -673,18 +697,29 @@ def summary_markdown(
         lines.extend(
             [
                 "",
-                f"### Candidate vs {reference_label}",
+                f"### Reference gap: candidate vs {reference_label} (non-gating)",
                 "",
                 (
                     "_🟩 lower wall time · 🟥 higher wall time · "
                     f"1 square ≈ {BAR_PERCENT_PER_SQUARE:.0f} percentage points · "
                     f"capped at {BAR_MAX_SQUARES} squares. Speedup factor is "
-                    f"{reference_label} wall time / candidate wall time. This "
-                    "comparison is informational and never gates the run._"
+                    f"{reference_label} wall time / candidate wall time._"
                 ),
                 "",
             ]
         )
+        lines.append(
+            "**How to read this table:** red means the candidate took longer than "
+            "the Microsoft driver—not that it regressed from the pinned Rust "
+            "baseline. For this run:"
+        )
+        for result in results:
+            lines.append(
+                f"- `{result['name']}`: candidate took "
+                f"**{format_time_multiple(result['candidate_vs_reference_ratio'])}** "
+                f"({format_wall_time_change(result['candidate_vs_reference_change_percent'])})."
+            )
+        lines.append("")
         lines.extend(
             diverging_bar_table(
                 results,
@@ -792,7 +827,8 @@ def summary_markdown(
         lines.append(
             f"Only candidate vs pinned mssql-odbc baseline controls the "
             f"{(threshold - 1.0) * 100:.0f}% regression gate, and only after "
-            "confirmation. Microsoft ODBC results are informational."
+            f"confirmation. The {reference_label} comparison quantifies the "
+            "non-gating reference gap."
         )
     else:
         lines.append(

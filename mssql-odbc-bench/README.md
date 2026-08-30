@@ -199,7 +199,9 @@ execution and fetching, so there is no port pressure to relieve.
 ### Report
 
 The shared PerfTest template uploads `results/summary.md` to the Azure DevOps
-Summary tab. It starts with the gate verdict and a three-median wall-time table,
+Summary tab. It starts by distinguishing the regression-gating Rust-baseline
+comparison from the non-gating Microsoft-driver reference gap, then shows the
+gate verdict and a three-median wall-time table,
 then shows separate candidate-vs-baseline and candidate-vs-Microsoft diverging
 bar tables, then an initial-vs-confirmed section listing what was flagged, how
 many rounds reproduced it, and the confirmed change. Green means lower wall time
@@ -207,7 +209,9 @@ and red means higher wall time. One square represents about five percentage
 points, capped at 20 squares so the expected 60-95% ODBC differences stay
 readable. Every row also states the exact wall-time change and
 comparator/candidate speedup factor; `⟳` marks a re-measured benchmark. The
-runner echoes the same report to the step log.
+Microsoft section explains that “informational” means it cannot fail this run,
+not that the gap is insignificant. The runner echoes the same report to the step
+log.
 
 ### Perf-lab environment
 
