@@ -289,9 +289,16 @@ TEST_F(CharConversionLiveTest, OverlongCharParamIs22001) {
 // The narrow -> wide direction, split out because msodbcsql gets it wrong: its
 // per-character walk reads the running count before incrementing it
 // (sqlcfunc.cpp:2926, cchDest++ at :2931), so exactly one character of overflow
-// escapes the check. Both exits from that arm then break past the shared trim at
-// :2955, and in a retail build the over-long value is not rejected but silently
-// widened on the wire by stMaxLen = max(*pstMaxLen, stLen) (sqlcmisc.cpp:7458).
+// escapes the check. Measured against retail 18.05.0002: "abcd" into a
+// wvarchar(3) returns SQL_SUCCESS with no diagnostic and the server receives
+// nvarchar(3) holding "abc" - silently truncated. "abcde" is two characters
+// over and is correctly rejected, and the narrow -> narrow control rejects at
+// four, which is what pins the off-by-one to this arm.
+//
+// Not widened on the wire: an earlier revision of this comment claimed
+// stMaxLen = max(*pstMaxLen, stLen) (sqlcmisc.cpp:7458) sends more characters
+// than declared. SQL_VARIANT_PROPERTY 'MaxLength' reports 6 bytes, i.e.
+// nvarchar(3), the declared size. Only the debug assert reproduces from source.
 TEST_F(CharConversionLiveTest, NarrowToWideOverlongParamIs22001) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -321,12 +328,15 @@ TEST_F(CharConversionLiveTest, NarrowToWideOverlongParamIs22001) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// Blank overflow on the narrow -> wide path is trimmed here and not there. The
-// walk at sqlcfunc.cpp:2926 never fires on a blank, and both of its exits skip
-// the trim at :2955, so msodbcsql sends all six characters as nvarchar(6) after
-// widening at sqlcmisc.cpp:7458. Same rule as
-// OverflowingBlanksAreTrimmedSilently, which msodbcsql does honour because that
-// binding is narrow -> narrow and reaches :2955.
+// Blank overflow on the narrow -> wide path is trimmed, and retail 18.05.0002
+// agrees: it also returns "abc" as nvarchar(3), so this is not a behavioral
+// divergence on that build. The skip is retained only because the case has not
+// been measured against the build CI actually compares against - retail
+// 18.6.2.1, pinned by msodbcsqlVersion - and debug 18.06.0002 aborts on
+// assert(*pstMaxLen >= stLen) (sqlcmisc.cpp:7458) rather than answering. Measure
+// 18.6.2.1 and drop the skip if it matches. Note all six characters reach
+// DescribeRPCParam untrimmed yet retail still declares nvarchar(3), so the
+// fallthrough at :7459 does not describe what the retail binary does.
 TEST_F(CharConversionLiveTest, NarrowToWideOverflowingBlanksAreTrimmed) {
     SKIP_IF_COMPARING_MSODBCSQL();
 

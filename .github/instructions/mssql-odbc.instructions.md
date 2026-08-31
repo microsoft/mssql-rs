@@ -28,6 +28,16 @@ authoritative parity reference for this crate. Its source lives in the
 - When reporting a parity finding, cite the msodbcsql source (file + what it does),
   and state explicitly whether the decision **matches**, **exceeds**, or **diverges
   from** msodbcsql so the trade-off is visible.
+- **A behavioral parity claim needs a measurement, not just a source reading, and
+  must name the build.** Record the driver's `SQL_DRIVER_VER`; retail and debug
+  msodbcsql have been observed to disagree with each other and with the source on
+  the same binding. CI compares against retail 18.6.2.1, pinned by
+  `msodbcsqlVersion` (`.pipeline/validation-pipeline.yml`) and installed by
+  `.pipeline/scripts/install-msodbcsql.ps1`; a measurement against any other
+  build settles what that build does, not what the compare leg will do. A
+  `SKIP_IF_COMPARING_MSODBCSQL()` is itself such a claim - it deletes the only
+  check that could contradict the comment above it - so add or keep one only
+  against a compare run that actually fails.
 - **This driver targets ODBC 3.x only.** That scopes out support for ODBC 2.x
   *applications* — deprecated 2.x entry points, 2.x-only attribute values, and
   the paths msodbcsql keeps for them. The Driver Manager maps a 2.x application
@@ -116,6 +126,32 @@ authoritative parity reference for this crate. Its source lives in the
     break the wide arm that msodbcsql gets right. Exactness needs the collation at
     this layer. Signed off by Theekshna Kotian (product owner) on 2026-08-27.
     Tracked in AB#47584.
+  - **An integer parameter bound to a character type is length-checked.**
+    msodbcsql length-checks no integer C type (`odbc/sqlcfunc.cpp:2586`, `:2854`,
+    `:3165`, `:3177`); what it does instead is undefined per build. Binding
+    `12345` as `SQL_C_SLONG` to a `SQL_VARCHAR` of `ColumnSize` 3: retail
+    18.05.0002 returns `SQL_SUCCESS` with no diagnostic and sends `varchar(3)`
+    holding `"123"`, debug 18.06.0002 aborts on
+    `assert(*pstMaxLen > 0 && *pstMaxLen >= stLen)` (`odbc/sqlcmisc.cpp:7458`),
+    retail 18.6.2.1 hangs in `SQLExecute`. This driver reports `22001`. The
+    fallthrough at `:7459` reads as *widening* the declaration and no measured
+    build does that, so do not re-derive this one from source.
+    `IntegerParamTooWideForColumnSizeIs22001` and
+    `NegativeSignCountsAgainstColumnSize` carry `SKIP_IF_COMPARING_MSODBCSQL()`.
+    Signed off by Theekshna Kotian (product owner) on 2026-08-28. Tracked in
+    AB#47369.
+  - **A `SQL_C_WCHAR` buffer of nothing but blanks bound to an integer type is
+    `22018`; msodbcsql answers `HY000`** (retail 18.05.0002). The only input on
+    this path where the two differ - the same blanks as `SQL_C_CHAR`, a
+    zero-length wide buffer, and every other invalid literal in either width
+    answer `22018` on both, so `CharParamInvalidLiteralIs22018` and
+    `LocaleFormattedNumbersAreRejected` run unskipped. Mechanism not established;
+    only the state is evidence. Do not generalise it - `CVT_ERROR` =
+    `IDS_22_005` otherwise resolves to `22018` through the `std_error` branch of
+    `SQL_DIAG_SQLSTATE` (`odbc/sqlcerr.cpp:990`) and
+    `cli_common/src/clntcomn.cpp:1015`, not the server-keyed table at
+    `odbc/sqlcstr.cpp:136`. `BlankOnlyWideLiteralIs22018` carries
+    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369.
 
 ## No panics
 

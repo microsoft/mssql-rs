@@ -21,6 +21,14 @@ pub(crate) enum NumericSource {
         mantissa: i128,
         scale: u32,
     },
+    /// A decimal literal with more digits than an exact `i128` mantissa holds.
+    /// `approx` serves float targets; integer targets need only the integer part
+    /// and whether anything non-zero was dropped, which survives any length.
+    WideDecimal {
+        approx: f64,
+        int_part: i128,
+        fraction_dropped: bool,
+    },
     Float(f64),
 }
 
@@ -31,6 +39,7 @@ impl NumericSource {
             NumericSource::Scaled { mantissa, scale } => {
                 *mantissa as f64 / 10f64.powi(*scale as i32)
             }
+            NumericSource::WideDecimal { approx, .. } => *approx,
             NumericSource::Float(f) => *f,
         }
     }
@@ -40,6 +49,7 @@ impl NumericSource {
         match self {
             NumericSource::Int(v) => *v < 0,
             NumericSource::Scaled { mantissa, .. } => *mantissa < 0,
+            NumericSource::WideDecimal { approx, .. } => *approx < 0.0,
             NumericSource::Float(f) => *f < 0.0,
         }
     }
@@ -57,6 +67,11 @@ impl NumericSource {
                 };
                 Some((mantissa / divisor, mantissa % divisor != 0))
             }
+            NumericSource::WideDecimal {
+                int_part,
+                fraction_dropped,
+                ..
+            } => Some((int_part, fraction_dropped)),
             NumericSource::Float(f) => {
                 if !f.is_finite() || !(-1.7e38..=1.7e38).contains(&f) {
                     return None;
@@ -100,6 +115,104 @@ pub(crate) fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
 /// as [`ConvError::OutOfRange`] rather than wrapping.
 pub(crate) fn narrow_i128<T: TryFrom<i128>>(v: i128) -> Result<T, ConvError> {
     T::try_from(v).map_err(|_| ConvError::OutOfRange)
+}
+
+/// Interprets text as a number, for either direction (fetch & params).
+///
+/// Both directions must agree on what counts as a number, because msodbcsql
+/// answers the question once: `Convert` dispatches a character source to
+/// `ConvertToFixed`, whose `case SQL_C_CHAR` arm runs `CharToBigint`
+/// (`sqlccnvt.cpp:5088`). `SQL_C_CHAR` and `SQL_CHAR` are both `1`, so a
+/// character *column* and a character *application buffer* enter that arm
+/// indistinguishably - the same parser serves `SQLGetData` and
+/// `SQLBindParameter`.
+///
+/// Severity is the caller's business, not this function's: a dropped fraction is
+/// a `01S07` warning outbound and a `22001` error inbound, so callers take
+/// [`NumericSource::to_i128_truncating`]'s flag and decide.
+///
+/// Only exponent forms go through `f64`, so a literal carrying more significant
+/// digits than a double holds still reports its fraction - `CharToBigint` walks
+/// the digits one at a time and flags any non-zero one past the scale
+/// (`sqlccnvt.cpp:7823`) however long the literal is.
+pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError> {
+    // An embedded NUL ends the number. `CharToBigint` loops
+    // `while (len < srclen && charstr[len] != '\0')` (`sqlccnvt.cpp:7800`), so an
+    // application that passes `strlen + 1` as the length still parses.
+    //
+    // A *leading* NUL diverges: that loop exits at once leaving `*pValue = 0`
+    // and `CVT_NO_ERROR`, where the empty remainder is `22018` here. Left as an
+    // error - a length-prefixed buffer starting with NUL carries no number, and
+    // msodbcsql itself reports `22018` for the same buffer under `SQL_NTS`.
+    let text = text.split('\0').next().unwrap_or("");
+
+    // Only blanks are padding. `CharToBigint` trims `' '` alone
+    // (`sqlccnvt.cpp:7777`) and treats every other non-digit as invalid, so a
+    // tab, an interior blank or a non-breaking space is an error. Checked
+    // explicitly because `parse_decimal_literal` applies `str::trim`, which
+    // would strip the whole Unicode whitespace set first.
+    let trimmed = text.trim_matches(' ');
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(ConvError::InvalidCharacterValue);
+    }
+
+    if let Some(source) = parse_decimal_literal(trimmed) {
+        return Ok(source);
+    }
+
+    // `parse_decimal_literal` gives up once the digits overflow an exact
+    // mantissa, but the fraction still has to be reported rather than rounded
+    // away by `f64`.
+    if let Some(source) = parse_wide_decimal(trimmed) {
+        return Ok(source);
+    }
+
+    // Exponent forms, and integers too wide for an exact mantissa, fall back to
+    // `f64` - msodbcsql splits to `CharToDouble` on an `e`/`E`
+    // (`sqlccnvt.cpp:5088`).
+    match trimmed.parse::<f64>() {
+        Ok(f) if f.is_finite() => Ok(NumericSource::Float(f)),
+        // Rust folds overflow into `Ok(inf)`, but msodbcsql's `VarR8FromStr`
+        // reports `DISP_E_OVERFLOW` -> 22003 and keeps the cast error for text
+        // that is not a number at all. Digits present means it was numeric.
+        Ok(_) if trimmed.bytes().any(|b| b.is_ascii_digit()) => Err(ConvError::OutOfRange),
+        // "inf" / "infinity" / "nan" parse in Rust but are not SQL literals.
+        _ => Err(ConvError::InvalidCharacterValue),
+    }
+}
+
+/// A plain decimal whose digits exceed an exact mantissa. Keeps the `f64`
+/// approximation for float targets and the integer part plus a dropped-fraction
+/// flag for integer targets, because `f64` alone would round the fraction away
+/// and report nothing. `None` when the integer part itself overflows, which
+/// leaves the `f64` fallback to report `22003`.
+fn parse_wide_decimal(text: &str) -> Option<NumericSource> {
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (int_digits, frac_digits) = body.split_once('.')?;
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    if !int_digits
+        .bytes()
+        .chain(frac_digits.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let int_part: i128 = if int_digits.is_empty() {
+        0
+    } else {
+        int_digits.parse().ok()?
+    };
+    let approx: f64 = text.parse().ok()?;
+    Some(NumericSource::WideDecimal {
+        approx,
+        int_part: if negative { -int_part } else { int_part },
+        fraction_dropped: frac_digits.bytes().any(|b| b != b'0'),
+    })
 }
 
 #[cfg(test)]
@@ -147,6 +260,27 @@ mod tests {
         assert_eq!(parse_decimal_literal("abc"), None);
         assert_eq!(parse_decimal_literal(""), None);
         assert_eq!(parse_decimal_literal("-"), None);
+    }
+
+    /// A literal past an exact mantissa still has to reach a float target at
+    /// full precision. Reducing it to an integer-plus-sentinel serves the
+    /// integer path but would hand `SQL_C_DOUBLE` about 1.1 for this value.
+    #[test]
+    fn a_wide_decimal_keeps_its_value_for_float_targets() {
+        let wide = "1.234567890123456789012345678901234567890";
+        let source = parse_numeric_text(wide).unwrap();
+        assert!(
+            (source.as_f64() - 1.234_567_890_123_456_7).abs() < 1e-15,
+            "got {}",
+            source.as_f64()
+        );
+        assert_eq!(source.to_i128_truncating(), Some((1, true)));
+        assert!(!source.is_negative());
+
+        let negative = parse_numeric_text("-0.500000000000000000000000000000000000000001").unwrap();
+        assert!((negative.as_f64() + 0.5).abs() < 1e-15);
+        assert_eq!(negative.to_i128_truncating(), Some((0, true)));
+        assert!(negative.is_negative());
     }
 
     #[test]
