@@ -8,18 +8,21 @@ use std::sync::Mutex;
 use tracing::error;
 
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
+use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
 use super::desc::{DescHandle, DescKind};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
-use crate::api::odbc_types::{SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt};
+use crate::api::odbc_types::{
+    self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
+};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
+use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
-#[derive(Debug)]
 pub(crate) struct ActivePlpStream {
     /// 1-based column ordinal being streamed.
     pub(crate) column: usize,
@@ -32,6 +35,59 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
+    /// Incremental decoder for the narrow-text -> `SQL_C_WCHAR` widening path
+    /// (`varchar(max)`/`json` delivered as UTF-16LE). `None` for every other
+    /// combination.
+    ///
+    /// A decoder rather than a byte carry because the column's codepage can be
+    /// multi-byte (`lcid_to_encoding` reaches SHIFT_JIS, GBK, BIG5, EUC-KR and
+    /// UTF-8), so a chunk boundary can split one character across two reads.
+    /// `encoding_rs::Decoder` already holds that partial sequence internally,
+    /// which keeps the boundary rule in one place instead of one per codepage.
+    pub(crate) narrow_to_wide: Option<Decoder>,
+    /// Code units already decoded on a previous call that did not fit the
+    /// caller's buffer, delivered before any further wire bytes.
+    ///
+    /// The decoder writes into a scratch area sized for its own needs rather
+    /// than the caller's, because some decoders refuse to emit anything with
+    /// less than two units of room (`encoding_rs::GBK` returns `OutputFull`
+    /// having consumed nothing). Holding the surplus here lets a caller ask for
+    /// one character at a time without stalling the stream.
+    pub(crate) pending_units: Vec<u16>,
+}
+
+impl ActivePlpStream {
+    /// Opens a stream for `column`. Every carry field starts empty, so a call
+    /// site names only what identifies the stream — and a carry field added
+    /// later cannot break an initializer written in parallel.
+    pub(crate) fn new(
+        column: usize,
+        encoding: PlpEncoding,
+        narrow_to_wide: Option<Decoder>,
+    ) -> Self {
+        Self {
+            column,
+            encoding,
+            pending_byte: None,
+            pending_high_surrogate: None,
+            narrow_to_wide,
+            pending_units: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ActivePlpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `encoding_rs::Decoder` is not Debug; report whether one is active.
+        f.debug_struct("ActivePlpStream")
+            .field("column", &self.column)
+            .field("encoding", &self.encoding)
+            .field("pending_byte", &self.pending_byte)
+            .field("pending_high_surrogate", &self.pending_high_surrogate)
+            .field("narrow_to_wide", &self.narrow_to_wide.is_some())
+            .field("pending_units", &self.pending_units.len())
+            .finish()
+    }
 }
 
 /// An application buffer bound to a result-set column by `SQLBindCol`.
@@ -79,11 +135,14 @@ pub(crate) struct StmtHandle {
     /// the permanent implicit allocations (cf. msodbcsql's embedded `lpstmt->ARD`
     /// / `cmdp.APD`, `sqlcfunc.cpp`). Set once in `new()`, freed in `Drop`, never
     /// reassigned — hence sound as plain fields outside `inner`, same set-once
-    /// rationale as `parent_dbc`. Do NOT repurpose them into the mutable *active*
-    /// ARD/APD association that `SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC / APP_PARAM_DESC)`
-    /// swaps (msodbcsql's separate `pARD`/`pAPD`); that path is still a stub, and
-    /// when implemented its active pointer belongs in `StmtState` behind `inner`
-    /// (concurrent set/get would otherwise race). IRD/IPD are never swappable.
+    /// rationale as `parent_dbc`. These are NOT the mutable *active* ARD/APD
+    /// association `SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC / APP_PARAM_DESC)`
+    /// swaps (msodbcsql's separate `pARD`/`pAPD`) — that association lives in
+    /// `StmtState::active_ard`/`active_apd` behind `inner`, since concurrent
+    /// set/get would otherwise race. A `None` active slot means "use the
+    /// implicit descriptor here"; `Some(explicit_desc)` means an explicitly
+    /// allocated descriptor has been associated instead. IRD/IPD are never
+    /// swappable, so they have no `active_*` counterpart.
     pub(crate) ard: *mut c_void,
     pub(crate) apd: *mut c_void,
     pub(crate) ird: *mut c_void,
@@ -97,6 +156,66 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// Set once a fetch has confirmed — possibly by peeking one token past
+    /// the row it just delivered — that no further rows exist for the
+    /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
+    /// set until an explicit close: this only means a later
+    /// `SQLFetch`/`SQLFetchScroll` can report `SQL_NO_DATA` without needing
+    /// the connection (another statement may have claimed it in the
+    /// meantime — the answer is already known and needs no more wire access).
+    /// Reset by [`StmtState::clear_exhaustion_state`] whenever a fresh
+    /// execute positions a new result (see also `SQLMoreResults`'s
+    /// `Rows`/`NoRows` arms, which reset it individually while landing on a
+    /// further result within the same batch).
+    pub(crate) result_set_exhausted: bool,
+    /// Set alongside `result_set_exhausted`, but only when the wire has
+    /// confirmed nothing remains anywhere in the batch — i.e. exactly when
+    /// `release_busy_if_row_exhausted` (`exec_common.rs`) actually released
+    /// the busy claim, not merely when the *current* result set ran out.
+    /// `result_set_exhausted` alone is insufficient here: it is also set when
+    /// a further result set is still pending (`DONE` carrying `MORE`), a case
+    /// where this statement still owns the connection and `SQLMoreResults`
+    /// must genuinely advance rather than fast-path.
+    ///
+    /// Lets `SQLMoreResults` report `SQL_NO_DATA` without touching the
+    /// connection at all once this is `true` — matching msodbcsql, whose
+    /// `SQLMoreResults` has no busy check of its own (`GetBatchCtxOrRecover`
+    /// just falls through to `SQL_NO_DATA_FOUND` once the batch context is
+    /// gone) and so is never blocked by a different statement that has since
+    /// claimed the connection. Reset by [`StmtState::clear_exhaustion_state`]
+    /// alongside `result_set_exhausted`.
+    pub(crate) batch_exhausted: bool,
+    /// A SQL Server error a read-ahead peek discovered past a row this
+    /// statement had already finished delivering to the caller (see
+    /// `release_busy_if_row_exhausted` in `exec_common.rs`). The call that
+    /// found it has already committed to a success return for the row it
+    /// delivered, so posting the diagnostic there would be silently lost —
+    /// no return code tells the caller to look. Stashed here instead, for
+    /// the next call that would otherwise short-circuit past the wire —
+    /// `SQLFetch`'s `result_set_exhausted` fast path, `SQLMoreResults`, or a
+    /// cursor close (`SQLCloseCursor` / `SQLFreeStmt(SQL_CLOSE)`, whose own
+    /// drain can no longer discover it on the wire because the peek already
+    /// consumed the terminating ERROR token) — to drain and fail on. The
+    /// connection-scoped close sweep (`SQLEndTran`/autocommit/isolation
+    /// change, `close_cursor_for_connection_op`) is the one exception: it
+    /// still posts this to the statement's diagnostics but does not fail its
+    /// own return, since that return code specifically means "the stream
+    /// failed to drain," which a stale diagnostic on an already-closed batch
+    /// does not make true. Cleared by [`StmtState::clear_exhaustion_state`],
+    /// since both it and `result_set_exhausted` describe facts about the
+    /// same now-superseded result set.
+    pub(crate) pending_fetch_error: Option<TdsError>,
+    /// Server INFO messages a read-ahead peek drained from the client when
+    /// `release_busy_if_row_exhausted` released the busy claim on a zero-row
+    /// fetch (`row_delivered == false`). `fill_rowset`'s own `SQL_NO_DATA`
+    /// can't carry `SQL_SUCCESS_WITH_INFO`, so these are stashed here instead
+    /// of posted immediately — for `SQLMoreResults`'s `batch_exhausted` fast
+    /// path or a cursor close to surface, exactly as the deferred-error
+    /// twin above. Both fast paths release the connection without the
+    /// caller re-touching the wire, so nothing else would ever drain them.
+    /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
+    /// `batch_exhausted`.
+    pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
@@ -180,22 +299,185 @@ pub(crate) struct StmtState {
     /// Staying empty is a legal state: an unbound `SQLFetchScroll` still
     /// advances the rowset and reports counts, it just delivers no data.
     pub(crate) bindings: Vec<ColumnBinding>,
+    /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
+    /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
+    /// an explicitly-allocated descriptor associated by
+    /// `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC, ...)`. A raw pointer, not an
+    /// owned handle — the DBC owns explicit descriptors, so freeing one resets
+    /// every statement referencing it back to `None` (`free_handle::free_desc`).
+    pub(crate) active_ard: Option<*mut c_void>,
+    /// The active application parameter descriptor for
+    /// `SQL_ATTR_APP_PARAM_DESC`. See [`Self::active_ard`].
+    pub(crate) active_apd: Option<*mut c_void>,
     /// Statement lifecycle/status flags used for ODBC API state checks.
     pub(crate) state_flags: u32,
     /// The data-at-execution sequence in progress, if any. `Some` is exactly
     /// the ODBC "Need Data" state — see [`StmtState::needs_data`].
     pub(crate) dae: Option<DaeState>,
+    /// `SQL_ATTR_QUERY_TIMEOUT` in seconds; `0` (the ODBC default) means no
+    /// timeout. Seeded at allocation from the parent connection's
+    /// [`DbcState::stmt_query_timeout`].
+    ///
+    /// Stored and reported only — enforcement against a running query is
+    /// tracked separately (AB#46385), so a non-zero value does not yet cancel
+    /// anything. msodbcsql does enforce it and answers `HYT00` on expiry.
+    pub(crate) query_timeout: u32,
+    /// `SQL_ATTR_MAX_ROWS`: cap on the number of rows returned from each result
+    /// set; `0` (the ODBC default) means no cap.
+    ///
+    /// Unlike the rest of the S4 attributes this one is genuinely enforced.
+    /// msodbcsql stops the cursor at the cap — a `SELECT TOP 10` under
+    /// `MAX_ROWS = 3` yields exactly three rows — so merely storing the value
+    /// would quietly hand the application seven rows it asked not to receive.
+    pub(crate) max_rows: SqlULen,
+    /// Rows already handed to the application from the current result set.
+    /// Counted solely to enforce [`Self::max_rows`], and restarted by
+    /// [`Self::begin_result_set`] because the cap is per result set.
+    pub(crate) rows_returned: SqlULen,
+    /// Statement attributes msodbcsql accepts and round-trips but that have no
+    /// effect on this driver's forward-only, read-only cursor.
+    pub(crate) inert_attrs: InertStmtAttrs,
+    /// SQL Server vendor statement attributes (`SQL_SOPT_SS_*`), which unlike
+    /// the inert set validate their value before storing it.
+    pub(crate) vendor_attrs: VendorStmtAttrs,
+    /// Query-notification message text (`SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT`)
+    /// and options (`..._OPTIONS`). The only two string-valued statement
+    /// attributes, so they sit beside [`Self::vendor_attrs`] rather than in it.
+    /// Stored and round-tripped; query notifications themselves are a separate
+    /// feature.
+    pub(crate) qn_msgtext: String,
+    pub(crate) qn_options: String,
+    /// Ordinal of the command being processed within the current batch, which
+    /// is what `SQL_SOPT_SS_CURRENT_COMMAND` reports: `0` before execute, then
+    /// one per result set begun. msodbcsql holds the final value once the batch
+    /// is exhausted rather than advancing past it.
+    pub(crate) current_command: SqlULen,
 }
 
-/// One data-at-execution parameter: which binding it refers to and how many
-/// bytes the application promised for it.
+/// Statement attributes msodbcsql stores and round-trips without acting on,
+/// paired with the default it reports before any set.
 ///
-/// Keeping the pair together means a parameter can never be described by an
-/// index with no matching length, which two parallel `Vec`s cannot rule out.
+/// Every entry was measured against msodbcsql 18 rather than taken from the
+/// ODBC headers, because several defaults are driver choices rather than
+/// specification values: `SQL_ATTR_SIMULATE_CURSOR` reports `SQL_SC_UNIQUE`,
+/// `SQL_ROWSET_SIZE` reports 1, and `SQL_ATTR_CURSOR_SENSITIVITY` reports
+/// `SQL_INSENSITIVE` even though the header default is `SQL_UNSPECIFIED`.
+/// See `docs/attributes_plan.md` §8.
+const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
+    (
+        odbc_types::SQL_ATTR_CURSOR_SENSITIVITY,
+        odbc_types::SQL_INSENSITIVE,
+    ),
+    (odbc_types::SQL_ATTR_NOSCAN, 0),
+    (odbc_types::SQL_ATTR_MAX_LENGTH, 0),
+    (odbc_types::SQL_ATTR_ASYNC_ENABLE, 0),
+    (odbc_types::SQL_ATTR_KEYSET_SIZE, 0),
+    (odbc_types::SQL_ROWSET_SIZE, 1),
+    (
+        odbc_types::SQL_ATTR_SIMULATE_CURSOR,
+        odbc_types::SQL_SC_UNIQUE,
+    ),
+    (odbc_types::SQL_ATTR_RETRIEVE_DATA, odbc_types::SQL_RD_ON),
+    (odbc_types::SQL_ATTR_USE_BOOKMARKS, 0),
+    (odbc_types::SQL_ATTR_ENABLE_AUTO_IPD, 0),
+    (odbc_types::SQL_ATTR_FETCH_BOOKMARK_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAM_BIND_TYPE, 0),
+    (odbc_types::SQL_ATTR_PARAM_OPERATION_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAM_STATUS_PTR, 0),
+    (odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR, 0),
+    (odbc_types::SQL_ATTR_ROW_OPERATION_PTR, 0),
+    (odbc_types::SQL_ATTR_METADATA_ID, 0),
+];
+
+/// Values for the [`INERT_STMT_ATTRS`] identifiers, positionally aligned with
+/// that table.
+///
+/// A flat array keyed by a linear scan is deliberate: the set is small and
+/// fixed, and holding the identifiers and their defaults in one auditable
+/// table keeps a measured default from drifting away from the attribute it
+/// belongs to, which nineteen separate struct fields would invite.
+#[derive(Debug, Clone)]
+pub(crate) struct InertStmtAttrs([SqlULen; INERT_STMT_ATTRS.len()]);
+
+impl Default for InertStmtAttrs {
+    fn default() -> Self {
+        let mut values = [0; INERT_STMT_ATTRS.len()];
+        for (slot, (_, default)) in values.iter_mut().zip(INERT_STMT_ATTRS) {
+            *slot = *default;
+        }
+        Self(values)
+    }
+}
+
+impl InertStmtAttrs {
+    /// The identifiers this store covers, in table order. Test-only: it exists
+    /// so a new entry cannot be added without an asserted msodbcsql default.
+    #[cfg(test)]
+    pub(crate) fn identifiers() -> impl Iterator<Item = SqlInteger> {
+        INERT_STMT_ATTRS.iter().map(|(id, _)| *id)
+    }
+
+    fn index_of(attribute: SqlInteger) -> Option<usize> {
+        INERT_STMT_ATTRS.iter().position(|(id, _)| *id == attribute)
+    }
+
+    /// Returns whether `attribute` belongs to this store without changing it.
+    pub(crate) fn contains(&self, attribute: SqlInteger) -> bool {
+        Self::index_of(attribute).is_some()
+    }
+
+    /// Returns the stored value, or `None` when `attribute` is not one of the
+    /// inert identifiers.
+    pub(crate) fn get(&self, attribute: SqlInteger) -> Option<SqlULen> {
+        Self::index_of(attribute).map(|i| self.0[i])
+    }
+
+    /// Stores `value`, returning whether `attribute` is an inert identifier.
+    pub(crate) fn set(&mut self, attribute: SqlInteger, value: SqlULen) -> bool {
+        match Self::index_of(attribute) {
+            Some(i) => {
+                self.0[i] = value;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Reads the byte offset `SQL_ATTR_PARAM_BIND_OFFSET_PTR` currently points
+    /// at, or 0 when the application has not set one.
+    ///
+    /// The attribute holds a *pointer to* the offset rather than the offset
+    /// itself, so the application can move every binding by writing one
+    /// `SQLLEN` between executions. It is therefore read at execute time, not
+    /// at set time.
+    ///
+    /// # Safety
+    /// When set, the pointer must address a live `SQLLEN` for the duration of
+    /// the execution, per the `SQLSetStmtAttr` contract. ODBC does not require
+    /// application pointers to be aligned.
+    pub(crate) unsafe fn param_bind_offset(&self) -> isize {
+        let ptr = self
+            .get(odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR)
+            .unwrap_or(0) as *const odbc_types::SqlLen;
+        if ptr.is_null() {
+            return 0;
+        }
+        unsafe { ptr.read_unaligned() }
+    }
+}
+
+/// One data-at-execution parameter: which binding it refers to, the token
+/// `SQLParamData` returns, and how many bytes the application promised for it.
+///
+/// Keeping these fields together means the execution-time token and declared
+/// length cannot drift away from the binding they describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DaeParam {
     /// 0-based index into [`StmtState::bound_params`].
     pub(crate) bound_index: usize,
+    /// `ParameterValuePtr` with the execution's bind offset already applied.
+    pub(crate) value_ptr: SqlPointer,
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
@@ -325,6 +607,165 @@ impl DaeState {
     }
 }
 
+/// How msodbcsql validates a vendor statement attribute's value.
+///
+/// Each rule was established by sweeping the value space against msodbcsql 18
+/// and recording where it flipped from success to `HY024`, not by reading the
+/// documented constants — two attributes accept values the headers do not name,
+/// and two reject every value the headers do name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ValueRule {
+    /// Accepts exactly these values.
+    OneOf(&'static [SqlULen]),
+    /// Accepts any value in this inclusive range.
+    Range(SqlULen, SqlULen),
+    /// Recognized, but refuses every value. Both attributes in this class name
+    /// features the driver does not implement (table-valued parameters, Always
+    /// Encrypted), and msodbcsql itself refuses them here too — including their
+    /// documented "off" value, and including `SQL_SOPT_SS_COLUMN_ENCRYPTION` on
+    /// a connection opened with `ColumnEncryption=Enabled`.
+    Rejected,
+    /// Reported by the get path but not settable. Set is left to fall through
+    /// to the identifier-rejection path, because msodbcsql answers `HY092`
+    /// ("invalid attribute identifier") rather than `HY024` for these.
+    GetOnly,
+}
+
+/// Vendor statement attributes, their msodbcsql defaults, and the values
+/// msodbcsql accepts for each.
+///
+/// Held as one table for the same reason as [`INERT_STMT_ATTRS`]: the default
+/// and the accept rule are both measurements, and keeping them adjacent to the
+/// identifier stops one from drifting without the other.
+const VENDOR_STMT_ATTRS: &[(SqlInteger, SqlULen, ValueRule)] = &[
+    (
+        odbc_types::SQL_SOPT_SS_TEXTPTR_LOGGING,
+        odbc_types::SQL_TL_ON,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_CURRENT_COMMAND,
+        0,
+        ValueRule::GetOnly,
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_HIDDEN_COLUMNS,
+        0,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_NOBROWSETABLE,
+        0,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_REGIONALIZE,
+        0,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_CURSOR_OPTIONS,
+        0,
+        ValueRule::Range(0, odbc_types::SQL_CO_MAX),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_NOCOUNT_STATUS,
+        odbc_types::SQL_NC_ON,
+        ValueRule::GetOnly,
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_DEFER_PREPARE,
+        odbc_types::SQL_DP_ON,
+        ValueRule::OneOf(&[0, 1]),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT,
+        odbc_types::SQL_QN_TIMEOUT_DEFAULT,
+        // Zero is rejected, unlike most ODBC timeouts where it means "no limit",
+        // and the ceiling is i32::MAX rather than the full SQLULEN width:
+        // msodbcsql answers HY024 from 2^31 upwards on 64-bit.
+        ValueRule::Range(1, i32::MAX as SqlULen),
+    ),
+    (odbc_types::SQL_SOPT_SS_PARAM_FOCUS, 0, ValueRule::Rejected),
+    (
+        odbc_types::SQL_SOPT_SS_NAME_SCOPE,
+        0,
+        ValueRule::Range(0, odbc_types::SQL_SS_NAME_SCOPE_MAX),
+    ),
+    (
+        odbc_types::SQL_SOPT_SS_COLUMN_ENCRYPTION,
+        0,
+        ValueRule::Rejected,
+    ),
+];
+
+/// Values for the [`VENDOR_STMT_ATTRS`] identifiers, positionally aligned with
+/// that table.
+#[derive(Debug, Clone)]
+pub(crate) struct VendorStmtAttrs([SqlULen; VENDOR_STMT_ATTRS.len()]);
+
+impl Default for VendorStmtAttrs {
+    fn default() -> Self {
+        let mut values = [0; VENDOR_STMT_ATTRS.len()];
+        for (slot, (_, default, _)) in values.iter_mut().zip(VENDOR_STMT_ATTRS) {
+            *slot = *default;
+        }
+        Self(values)
+    }
+}
+
+impl VendorStmtAttrs {
+    /// The identifiers this store covers, in table order. Test-only: it exists
+    /// so a new entry cannot be added without an asserted msodbcsql default.
+    #[cfg(test)]
+    pub(crate) fn identifiers() -> impl Iterator<Item = SqlInteger> {
+        VENDOR_STMT_ATTRS.iter().map(|(id, _, _)| *id)
+    }
+
+    fn index_of(attribute: SqlInteger) -> Option<usize> {
+        VENDOR_STMT_ATTRS
+            .iter()
+            .position(|(id, _, _)| *id == attribute)
+    }
+
+    /// Whether `attribute` is a vendor attribute the set path owns.
+    ///
+    /// False for the get-only identifiers, so they fall through to the
+    /// identifier-rejection path and answer `HY092` rather than `HY024`.
+    pub(crate) fn is_settable(attribute: SqlInteger) -> bool {
+        Self::index_of(attribute)
+            .is_some_and(|i| !matches!(VENDOR_STMT_ATTRS[i].2, ValueRule::GetOnly))
+    }
+
+    /// Returns the stored value, or `None` when `attribute` is not a vendor
+    /// statement attribute.
+    pub(crate) fn get(&self, attribute: SqlInteger) -> Option<SqlULen> {
+        Self::index_of(attribute).map(|i| self.0[i])
+    }
+
+    /// Validates `value` against the attribute's measured rule, storing it and
+    /// returning `true` on success.
+    ///
+    /// A rejected value leaves the previous one in place, which is what
+    /// msodbcsql does — a failed set is not a reset. Callers are expected to
+    /// have checked [`Self::is_settable`]; anything else is reported as
+    /// rejected rather than silently accepted.
+    pub(crate) fn set(&mut self, attribute: SqlInteger, value: SqlULen) -> bool {
+        let Some(i) = Self::index_of(attribute) else {
+            return false;
+        };
+        let accepted = match VENDOR_STMT_ATTRS[i].2 {
+            ValueRule::OneOf(allowed) => allowed.contains(&value),
+            ValueRule::Range(lo, hi) => (lo..=hi).contains(&value),
+            ValueRule::Rejected | ValueRule::GetOnly => false,
+        };
+        if accepted {
+            self.0[i] = value;
+        }
+        accepted
+    }
+}
+
 /// A prepared statement bundled with the marker count of its rewritten SQL, so
 /// the two can only be set together (the count is a property of the rewritten
 /// `@P1..@Pn` text and must always agree with it).
@@ -357,6 +798,19 @@ impl StmtState {
         self.state_flags &= !mask;
     }
 
+    /// Clears everything AB#47508's read-ahead peek can leave behind, so a
+    /// fresh result set never inherits a previous one's exhaustion state or
+    /// deferred diagnostics. Called from every `finish_execute` terminal
+    /// branch and `close_cursor.rs`'s `reset_cursor_state` — folded into one
+    /// method so the invariant lives in a single place rather than four
+    /// call sites that could each independently drift or be missed.
+    pub(crate) fn clear_exhaustion_state(&mut self) {
+        self.result_set_exhausted = false;
+        self.batch_exhausted = false;
+        self.pending_fetch_error = None;
+        self.pending_fetch_info.clear();
+    }
+
     /// Binds, or rebinds, one column. A column can only be bound once, so an
     /// existing entry for the same column is replaced in place rather than
     /// shadowed.
@@ -381,6 +835,42 @@ impl StmtState {
     /// Drops every column binding — `SQLFreeStmt(SQL_UNBIND)`.
     pub(crate) fn clear_bindings(&mut self) {
         self.bindings.clear();
+    }
+
+    /// Makes `metadata` the current result set, restarting the
+    /// `SQL_ATTR_MAX_ROWS` budget and advancing the batch command ordinal.
+    ///
+    /// The cap is per result set, so every path that advances onto a new one
+    /// must come through here; assigning `column_metadata` directly would leave
+    /// a spent budget in place and truncate the next result set.
+    ///
+    /// This is the *advance* form, for `SQLMoreResults`. The first result set of
+    /// a new execution goes through [`Self::begin_batch`] instead, so that the
+    /// command ordinal restarts rather than climbing across executions.
+    pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
+        self.column_metadata = metadata;
+        self.rows_returned = 0;
+        self.current_command += 1;
+    }
+
+    /// Makes `metadata` the first result set of a new execution.
+    ///
+    /// Identical to [`Self::begin_result_set`] except that the batch command
+    /// ordinal restarts, so `SQL_SOPT_SS_CURRENT_COMMAND` answers 1 on the
+    /// first result set of every execution. msodbcsql restarts it per execute
+    /// and holds the final value across `SQLCloseCursor` /
+    /// `SQLFreeStmt(SQL_CLOSE)`, so a statement handle reused for a second
+    /// query reports 1 again rather than continuing to climb.
+    pub(crate) fn begin_batch(&mut self, metadata: Vec<ColumnMetadata>) {
+        self.current_command = 0;
+        self.begin_result_set(metadata);
+    }
+
+    /// Whether `SQL_ATTR_MAX_ROWS` has already been satisfied for the current
+    /// result set, meaning the cursor must report end-of-data without pulling
+    /// another row.
+    pub(crate) fn max_rows_reached(&self) -> bool {
+        self.max_rows != 0 && self.rows_returned >= self.max_rows
     }
 
     /// Clears all row-stream state (cursor invalidated, no PLP in progress).
@@ -456,10 +946,12 @@ impl StmtState {
 
     /// The application's `ParameterValuePtr` for the open DAE parameter — the
     /// token `SQLParamData` hands back so the application knows which parameter
-    /// to supply. Null when no parameter is open or its binding is gone.
+    /// to supply. Null when no parameter is open.
     pub(crate) fn dae_current_value_ptr(&self) -> SqlPointer {
-        self.dae_current_bound_param()
-            .map_or(std::ptr::null_mut(), |param| param.parameter_value_ptr)
+        self.dae
+            .as_ref()
+            .and_then(DaeState::current_param)
+            .map_or(std::ptr::null_mut(), |param| param.value_ptr)
     }
 
     /// The bound C type of the open DAE parameter, which `SQLPutData` needs to
@@ -491,17 +983,41 @@ unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 
 impl StmtHandle {
-    pub(crate) fn new(parent_dbc: *mut c_void) -> Self {
+    /// `query_timeout` is the parent connection's current
+    /// [`DbcState::stmt_query_timeout`](crate::handles::dbc::DbcState); a
+    /// statement starts at the connection-level default rather than always at
+    /// zero (msodbcsql `sqlcfunc.cpp:173`).
+    pub(crate) fn new(parent_dbc: *mut c_void, query_timeout: u32) -> Self {
         Self {
             object_type: HandleType::Stmt,
             parent_dbc,
-            ard: handle_to_raw(Box::new(DescHandle::new(DescKind::AppRow))),
-            apd: handle_to_raw(Box::new(DescHandle::new(DescKind::AppParam))),
-            ird: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpRow))),
-            ipd: handle_to_raw(Box::new(DescHandle::new(DescKind::ImpParam))),
+            ard: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::AppRow,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
+            apd: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::AppParam,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
+            ird: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::ImpRow,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
+            ipd: handle_to_raw(Box::new(DescHandle::new(
+                DescKind::ImpParam,
+                SQL_DESC_ALLOC_AUTO,
+                parent_dbc,
+            ))),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                result_set_exhausted: false,
+                batch_exhausted: false,
+                pending_fetch_error: None,
+                pending_fetch_info: Vec::new(),
                 prepared: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
@@ -521,8 +1037,18 @@ impl StmtHandle {
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 row_bind_offset_ptr: std::ptr::null_mut(),
                 bindings: Vec::new(),
+                active_ard: None,
+                active_apd: None,
                 state_flags: 0,
                 dae: None,
+                query_timeout,
+                max_rows: 0,
+                rows_returned: 0,
+                inert_attrs: InertStmtAttrs::default(),
+                vendor_attrs: VendorStmtAttrs::default(),
+                qn_msgtext: String::new(),
+                qn_options: String::new(),
+                current_command: 0,
             }),
         }
     }
@@ -578,7 +1104,7 @@ mod tests {
     /// Runs `f` against a fresh statement's state. The handle owns descriptor
     /// allocations it frees on drop, so it has to outlive the borrow.
     fn with_state(f: impl FnOnce(&mut StmtState)) {
-        let handle = StmtHandle::new(std::ptr::null_mut());
+        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
         let mut state = handle.inner.lock().unwrap();
         f(&mut state);
     }

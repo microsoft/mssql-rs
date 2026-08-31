@@ -55,6 +55,163 @@ std::string ReadCharDataInChunks(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_siz
     return value;
 }
 
+// Encodes UTF-16 code units as UTF-8 without <codecvt> (deprecated), so a
+// fetched value can be compared against a plain string literal.
+//
+// Only a well-formed surrogate pair is combined; a lone surrogate is passed
+// through as-is rather than repaired, so a genuinely malformed value is not
+// silently cleaned up here.
+//
+// This says nothing about chunk boundaries: the units arrive already flattened,
+// so a pair whose halves came from two SQLGetData calls is indistinguishable
+// from one delivered whole -- and correctly so, because splitting a pair across
+// calls is legal (SQL_C_WCHAR chunks in code units). Callers that need to see
+// boundaries take the per-call counts from ReadWCharDataInChunksAsUtf8.
+std::string Utf16ToUtf8(const std::u16string& units) {
+    std::string out;
+    for (size_t i = 0; i < units.size(); ++i) {
+        char32_t cp = units[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < units.size() && units[i + 1] >= 0xDC00 &&
+            units[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (units[i + 1] - 0xDC00);
+            ++i;
+        }
+        if (cp < 0x80) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
+}
+
+// Streams one SQL_C_WCHAR column across as many SQLGetData calls as it takes,
+// using a small buffer, and returns the assembled value as UTF-8 so it can be
+// compared against a plain string literal.
+//
+// Chunks are appended up to the terminator rather than by the indicator: on a
+// transcoding path the indicator is SQL_NO_TOTAL (wire bytes are not delivered
+// code units), so the terminator is the only length signal an application has.
+//
+// When `per_call_units` is given, it receives the code units delivered by each
+// SQLGetData call, so a caller can assert on the chunk boundaries the assembled
+// value hides.
+std::string ReadWCharDataInChunksAsUtf8(SQLHSTMT stmt, SQLUSMALLINT col, size_t buf_bytes,
+                                        std::vector<size_t>* per_call_units = nullptr) {
+    std::u16string units;
+    std::vector<SQLCHAR> buf(buf_bytes, 0);
+    int guard = 0;
+    while (true) {
+        const size_t units_before = units.size();
+        std::fill(buf.begin(), buf.end(), 0);
+        SQLLEN ind = 0;
+        SQLRETURN rc = SQLGetData(stmt, col, SQL_C_WCHAR, buf.data(),
+                                  static_cast<SQLLEN>(buf.size()), &ind);
+        EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
+            << "SQLGetData failed rc=" << rc;
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+            break;
+        }
+        // The byte buffer is deliberately untyped -- that is the shape an ODBC
+        // application passes -- so each code unit is copied out rather than read
+        // through a SQLWCHAR* alias, which would be an unaligned load.
+        for (size_t i = 0; i + sizeof(SQLWCHAR) <= buf_bytes; i += sizeof(SQLWCHAR)) {
+            SQLWCHAR unit = 0;
+            std::memcpy(&unit, buf.data() + i, sizeof(unit));
+            if (unit == 0) {
+                break;
+            }
+            units.push_back(static_cast<char16_t>(unit));
+        }
+        if (per_call_units != nullptr) {
+            per_call_units->push_back(units.size() - units_before);
+        }
+        if (rc == SQL_SUCCESS) {
+            break;
+        }
+        EXPECT_LT(++guard, 100000) << "PLP stream made no forward progress";
+        if (guard >= 100000) {
+            break;
+        }
+    }
+    return Utf16ToUtf8(units);
+}
+
+// Fetches column `col` the way a driver-agnostic client library does when it
+// sizes its buffer from SQLDescribeCol: describe first, compute
+// `(ColumnSize + 1) * sizeof(SQLWCHAR)`, read into that, and fall back to
+// streaming when the value did not fit.
+//
+// This is mssql-python's `SQLGetData_wrap` shape (ddbc_bindings.cpp, the
+// SQL_WCHAR/SQL_WVARCHAR/SQL_WLONGVARCHAR branch), and it is the shape that
+// AB#47506 broke: for any MAX / XML / computed-string column SQLDescribeCol
+// reports ColumnSize 0, so the computed buffer is exactly 2 bytes -- room for
+// the null terminator and no payload at all.
+//
+// Returns the assembled value as UTF-8. Sets `*first_rc` / `*first_ind` to the
+// return code and indicator of that first sized read, which is where the
+// regression showed up.
+std::string FetchLikeDescribeColClient(SQLHSTMT stmt, SQLUSMALLINT col,
+                                       SQLRETURN* first_rc = nullptr,
+                                       SQLLEN* first_ind = nullptr) {
+    // SQLTCHAR, not SQLWCHAR: the suite builds in the platform default TCHAR
+    // mode, so SQLDescribeCol resolves to the narrow entry point here. Only the
+    // column name is affected, and it is not used.
+    SQLTCHAR name[256] = {};
+    SQLSMALLINT name_len = 0, data_type = 0, dec_digits = 0, nullable = 0;
+    SQLULEN column_size = 0;
+    SQLRETURN rc =
+        SQLDescribeCol(stmt, col, name, static_cast<SQLSMALLINT>(sizeof(name) / sizeof(SQLTCHAR)),
+                       &name_len, &data_type, &column_size, &dec_digits, &nullable);
+    EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) << "SQLDescribeCol rc=" << rc;
+
+    // A client cannot size a buffer from an unbounded column, so it asks for the
+    // minimum and reads the indicator. buffer_length is in bytes.
+    const size_t buf_units = static_cast<size_t>(column_size) + 1;
+    std::vector<SQLWCHAR> buf(buf_units, 0);
+    SQLLEN ind = 0;
+    rc = SQLGetData(stmt, col, SQL_C_WCHAR, buf.data(),
+                    static_cast<SQLLEN>(buf_units * sizeof(SQLWCHAR)), &ind);
+    if (first_rc != nullptr) {
+        *first_rc = rc;
+    }
+    if (first_ind != nullptr) {
+        *first_ind = ind;
+    }
+    EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
+        << "sized read rc=" << rc << " (buffer " << buf_units * sizeof(SQLWCHAR) << " bytes)";
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        return "<error>";
+    }
+    if (ind == SQL_NULL_DATA) {
+        return "<null>";
+    }
+
+    std::u16string units;
+    if (rc == SQL_SUCCESS) {
+        for (size_t i = 0; i < buf_units && buf[i] != 0; ++i) {
+            units.push_back(static_cast<char16_t>(buf[i]));
+        }
+    } else {
+        // Truncated: the indicator gave the length (or SQL_NO_TOTAL), so the
+        // client re-reads the column through its streaming path. This only works
+        // if the sized read left the value intact.
+        return ReadWCharDataInChunksAsUtf8(stmt, col, 8192);
+    }
+
+    return Utf16ToUtf8(units);
+}
+
 }  // namespace
 
 // ===================================================================
@@ -85,6 +242,15 @@ protected:
     SQLRETURN ExecDirect(const std::string& sql) {
         SqlTString s = ODBCTestUtils::ToSqlTStr(sql);
         return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
+    }
+
+    // The native `json` type is not on every supported target. Probe rather
+    // than parse a version string, so the check reflects what the server will
+    // actually accept.
+    bool ServerSupportsNativeJson() {
+        const bool ok = SQL_SUCCEEDED(ExecDirect("SELECT CAST(N'{}' AS JSON)"));
+        SQLCloseCursor(stmt_);
+        return ok;
     }
 
     // Read one column as a narrow string via a single SQLGetData call.
@@ -249,6 +415,46 @@ TEST_F(GetDataLiveTest, NullColumn) {
     EXPECT_EQ(SQL_NULL_DATA, ind);
 
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLCloseCursor(stmt_);
+}
+
+// AB#47507: a bare SELECT NULL is a nullable INT column with no CAST. When the
+// caller supplies no indicator, SQLGetData must fail with SQLSTATE 22002
+// rather than silently succeed and leave the target buffer untouched. This is
+// the exact regression reported: mssql-python fetches SQL_INTEGER columns via
+// SQL_C_SLONG with a null indicator and relies on the ODBC-mandated error to
+// detect NULL, falling back to None only when SQLGetData fails.
+TEST_F(GetDataLiveTest, NullColumnWithoutIndicatorReturns22002) {
+    ASSERT_SQL_OK(ExecDirect("SELECT NULL"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 7;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22002");
+    EXPECT_EQ(7, value) << "a NULL must not disturb the data slot";
+
+    SQLCloseCursor(stmt_);
+}
+
+// The same rule holds on the PLP arrival path: VARCHAR(MAX) NULL decodes via
+// the distinct SQL_PLP_NULL wire marker and RowWriter::write_null, not the
+// fixed/var-length NULL length prefix NullColumn above exercises. Both paths
+// must converge on the identical SQLGetData guard.
+TEST_F(GetDataLiveTest, PlpNullColumnWithoutIndicatorReturns22002) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS VARCHAR(MAX)) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR buf[16];
+    std::memset(buf, 'Z', sizeof(buf));
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), nullptr);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22002");
+    EXPECT_TRUE(std::all_of(buf, buf + sizeof(buf),
+                            [](SQLCHAR b) { return b == 'Z'; }))
+        << "a NULL must not disturb the data slot";
+
     SQLCloseCursor(stmt_);
 }
 
@@ -549,13 +755,8 @@ TEST_F(GetDataLiveTest, NvarcharMaxWideRoundTrip) {
 // supported type still returns the value. Before the P1a source-type
 // conversions this pairing was simply unimplemented and reported HYC00.
 //
-// TODO(convergence): this skip is temporary. msodbcsql implements this
-// conversion and its CVT_CAST_ERROR carries the "Invalid character value for
-// cast specification" message, so it very likely agrees, but the constant is
-// spelled IDS_22_005 in its source and that has not been confirmed against a
-// live run. Confirm against a live msodbcsql run, then drop the skip so this
-// compares on both legs; if the two do not agree, record the difference in the
-// "Known divergences from msodbcsql" table in docs/typed-columnar-fetch-plan.md.
+// msodbcsql consumes the column after the failed conversion and returns
+// SQL_NO_DATA from the follow-up call.
 TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
@@ -808,52 +1009,609 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
     SQLCloseCursor(stmt_);
 }
 
-// A PLP read into a buffer too small to hold even one whole character plus the
-// null terminator must fail deterministically with HY090 rather than spin
-// forever making zero-length reads. buffer_length 2 leaves one payload byte
-// once the terminator is reserved, which cannot hold a complete multibyte unit.
+
+// A buffer with room for the terminator but no payload is a length probe, not a
+// caller error. It must report the available length with 01004 and leave the
+// value re-readable, so the application can size a real buffer and fetch again.
 //
-// This is a truncate-vs-reject policy difference, not purely an encoding one:
-// on a UTF-8 client locale both drivers deliver SQL_C_CHAR as UTF-8, so both
-// face the same variable-width (1-4 byte) character problem. On a sub-minimal
-// buffer the reference msodbcsql driver returns SQL_SUCCESS_WITH_INFO/01004
-// (truncation) and expects the app to keep calling, whereas mssql-odbc rejects
-// with HY090 to guarantee forward progress and never split a multibyte unit.
-// TODO(convergence): mssql-odbc will eventually adopt the msodbcsql
-// truncate-and-continue contract for sub-minimal buffers (deliver whole bytes
-// that fit and carry the unflushed UTF-8 tail across calls), at which point this
-// HY090 rejection goes away and the assertion can run on both legs. Until then
-// it is mssql-odbc-specific — skip it on the msodbcsql comparison leg.
-TEST_F(GetDataLiveTest, PlpZeroCapacityBufferDoesNotSpin) {
+// AB#47506: this is not a hypothetical shape. `SQLDescribeCol` reports
+// ColumnSize 0 for a MAX column, so a caller sizing its buffer as
+// `(ColumnSize + 1) * sizeof(SQLWCHAR)` gets exactly 2 bytes. mssql-python does
+// that for every NVARCHAR(MAX) column, which is why rejecting the probe with
+// HY090 failed every such fetch -- including short values nowhere near a chunk
+// boundary.
+//
+// Runs on both legs: msodbcsql answers the probe the same way.
+TEST_F(GetDataLiveTest, PlpLengthProbeBufferReportsLengthAndKeepsValue) {
+    // Spelled as NCHAR() rather than a UTF-8 literal: ExecDirect widens the
+    // narrow SQL text byte by byte, so a multi-byte literal would reach the
+    // server as one character per UTF-8 byte.
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(N'Hello ' + NCHAR(0xD83D) + NCHAR(0xDE04) AS NVARCHAR(MAX)) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // 2 bytes: room for the terminator only. 7 chars -> 8 UTF-16 code units
+    // (the emoji is a surrogate pair) -> 16 wire bytes.
+    SQLWCHAR probe[1] = {0xFFFF};
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_WCHAR, probe, sizeof(probe), &ind);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(16, ind) << "probe must report the bytes available";
+    EXPECT_EQ(0, probe[0]) << "a zero-payload probe writes only the terminator";
+
+    // The probe consumed nothing: the value is still fully readable.
+    const std::string expected = "Hello \xF0\x9F\x98\x84";
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 8192));
+
+    SQLCloseCursor(stmt_);
+}
+
+// AB#47506: a varchar(max)/json column requested as SQL_C_WCHAR used to be
+// rejected with HYC00 on the first streamed chunk, because the PLP delivery
+// gate had no narrow-wire -> wide-target arm. mssql-python fetches every
+// character column with its default charCtype of SQL_C_WCHAR, so this rejected
+// every varchar(max) column it read.
+//
+// ASCII content keeps the wire bytes 1:1 with code units, so a framing error
+// shows up as a shifted or dropped character rather than a decode artifact.
+TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip) {
+    const std::string expected = RepeatToken("0123456789", 3000);  // 30000 chars
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST('0123456789' AS VARCHAR(MAX)), 3000) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 1024));
+
+    SQLCloseCursor(stmt_);
+}
+
+// The widening decodes through the column's own collation, so a non-ASCII
+// CP1252 value must come back as the original characters and not as raw bytes
+// zero-extended into code units. A 26-byte buffer delivers 12 characters per
+// call, so the value is reassembled over hundreds of continuations.
+TEST_F(GetDataLiveTest, VarcharMaxCp1252ToWcharChunkedRoundTrip) {
+    // UTF-8 spelling of "café René Größe naïve " — the expected decoded value.
+    const std::string token = "caf\xC3\xA9 Ren\xC3\xA9 Gr\xC3\xB6\xC3\x9F"
+                              "e na\xC3\xAF"
+                              "ve ";
+    const std::string expected = RepeatToken(token, 400);
+    // NCHAR() rather than a UTF-8 literal: the fixture widens narrow SQL text
+    // byte by byte, so a multi-byte literal would reach the server as one
+    // character per UTF-8 byte.
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Ren' + NCHAR(0xE9) "
+                   "+ N' Gr' + NCHAR(0xF6) + NCHAR(0xDF) + N'e na' + NCHAR(0xEF) + N've ' "
+                   "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 26));
+
+    SQLCloseCursor(stmt_);
+}
+
+// The pinning case for the chunk-boundary carry. Under a Chinese_PRC collation
+// the wire encoding is GBK, where each CJK character is two bytes. A 30-byte
+// buffer makes the driver read an odd number of wire bytes per call, so a
+// character is split across the boundary on most calls; its two halves must be
+// rejoined rather than each becoming U+FFFD.
+//
+// Skipped on the msodbcsql leg because the two drivers disagree about the
+// conversion itself, not the chunking. mssql-odbc decodes the wire bytes through
+// the column's own collation (GBK here), so the value round-trips. msodbcsql on
+// Linux converts through the client locale instead: with a UTF-8 locale and no
+// GBK support it best-fits every CJK character to '?', so the measured result is
+// "????????abc..." -- silent data loss. Asserting the round-trip on that leg
+// would only re-report a divergence this driver is deliberately on the right
+// side of.
+TEST_F(GetDataLiveTest, VarcharMaxDbcsToWcharSplitsCharacterAcrossChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+                              "abc";  // 你好世界abc
+    const std::string expected = RepeatToken(token, 400);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) "
+                   "+ NCHAR(0x754C) + N'abc' "
+                   "COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 30));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A UTF-8 collation puts 1-4 byte sequences on the wire for the same column
+// type, and an astral character has to survive both the UTF-8 chunk boundary
+// and the surrogate-pair encode on the way out.
+TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToWcharChunkedRoundTrip) {
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
+                              "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
+    const std::string expected = RepeatToken(token, 300);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + N'caf' "
+                   "+ NCHAR(0xE9) + NCHAR(0xD83D) + NCHAR(0xDE00) "
+                   "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 300) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 30));
+
+    SQLCloseCursor(stmt_);
+}
+
+// Chunking must be invisible to the caller: the same column read in one call
+// and in many must produce the same value.
+TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkSizeDoesNotChangeValue) {
+    const char* kQuery =
+        "SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Ren' + NCHAR(0xE9) "
+        "+ N' Gr' + NCHAR(0xF6) + NCHAR(0xDF) + N'e na' + NCHAR(0xEF) + N've ' "
+        "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1";
+
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string one_shot = ReadWCharDataInChunksAsUtf8(stmt_, 1, 65536);
+    SQLCloseCursor(stmt_);
+
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string chunked = ReadWCharDataInChunksAsUtf8(stmt_, 1, 34);
+    SQLCloseCursor(stmt_);
+
+    EXPECT_FALSE(one_shot.empty());
+    EXPECT_EQ(one_shot, chunked);
+}
+
+// The smallest buffer the widening path must serve: 4 bytes is one SQLWCHAR of
+// payload plus the terminator, so the driver delivers exactly one character per
+// call. Verified against msodbcsql, which drains the same value the same way.
+//
+// This is the boundary where sizing the decode by the caller's capacity breaks
+// down. Some decoders refuse to emit anything with a single code unit of room —
+// `encoding_rs::GBK` returns OutputFull having consumed nothing — so the DBCS
+// case below is the one that actually pins the behaviour; the ASCII case is here
+// to separate "one character per call" from "multi-byte character handling".
+TEST_F(GetDataLiveTest, VarcharMaxToWcharSingleCharacterBuffer) {
+    const std::string expected = RepeatToken("0123456789", 20);  // 200 chars
+    ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('0123456789' AS VARCHAR(MAX)), 20) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 4));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A DBCS column into a one-character buffer. Each character is two wire bytes
+// and one code unit, so it fits, but only if the decode is not confined to the
+// caller's buffer.
+//
+// Skipped on the msodbcsql leg for the same reason as
+// VarcharMaxDbcsToWcharSplitsCharacterAcrossChunks: msodbcsql on Linux best-fits
+// the CJK characters to '?' rather than decoding the column's GBK collation.
+TEST_F(GetDataLiveTest, VarcharMaxDbcsToWcharSingleCharacterBuffer) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+                              "abc";  // 你好世界abc
+    const std::string expected = RepeatToken(token, 40);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) "
+                   "+ NCHAR(0x754C) + N'abc' "
+                   "COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 40) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 4));
+
+    SQLCloseCursor(stmt_);
+}
+
+// `json` is the other narrow PLP type that widens to SQL_C_WCHAR, and it takes a
+// different route to the decoder than `varchar(max)` does: it is UTF-8 on the
+// wire and carries no collation, so the encoding is chosen from PlpEncoding
+// rather than from the column collation. Deriving it through `get_encoding_type`
+// would unwrap the absent collation and panic across the FFI boundary, which is
+// UB -- so this covers the branch that avoids that.
+//
+// Non-ASCII and a small buffer are both deliberate: they force multi-byte
+// sequences to straddle chunk boundaries on the no-collation path.
+TEST_F(GetDataLiveTest, JsonToWcharChunkedRoundTrip) {
+    if (!ServerSupportsNativeJson()) {
+        GTEST_SKIP() << "server has no native json type";
+    }
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
+                              "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
+    const std::string expected = "{\"k\":\"" + RepeatToken(token, 200) + "\"}";
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'{\"k\":\"' + REPLICATE(CAST(NCHAR(0x4F60) "
+                             "+ NCHAR(0x597D) + N'caf' + NCHAR(0xE9) + NCHAR(0xD83D) "
+                             "+ NCHAR(0xDE00) AS NVARCHAR(MAX)), 200) + N'\"}' AS JSON) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 30));
+
+    SQLCloseCursor(stmt_);
+}
+
+// The same json value through a length probe: ColumnSize is 0 for json exactly
+// as it is for a MAX column, so mssql-python sends the same 2-byte buffer here.
+TEST_F(GetDataLiveTest, JsonLengthProbeReportsTruncationAndKeepsValue) {
+    if (!ServerSupportsNativeJson()) {
+        GTEST_SKIP() << "server has no native json type";
+    }
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(N'{\"k\":\"' + NCHAR(0xE9) + N'\"}' AS JSON) AS c1"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR probe[1] = {0xFFFF};
+    SQLLEN ind = 0;
+    const SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_WCHAR, probe, sizeof(probe), &ind);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+    EXPECT_EQ(0, probe[0]) << "a zero-payload buffer still gets its terminator";
+
+    // Nothing was consumed: the value reads back whole.
+    EXPECT_EQ("{\"k\":\"\xC3\xA9\"}", ReadWCharDataInChunksAsUtf8(stmt_, 1, 64));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A two-code-unit buffer is the tightest one an astral character fits in, so it
+// is where the widening read is most likely to consume wire bytes without being
+// able to emit anything.
+//
+// What that has to guarantee is forward progress, not surrogate atomicity: every
+// truncated call must carry a non-empty payload, because an application reading
+// to the terminator cannot tell an empty chunk apart from a stream that has
+// stopped advancing. A surrogate pair may still span two calls -- SQL_C_WCHAR
+// chunking is in code units, and the UTF-16 passthrough path splits on the same
+// rule -- so it is the assembled value, not the chunk boundaries, that has to
+// round-trip.
+TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
+                              "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
+    const std::string expected = RepeatToken(token, 60);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + N'caf' "
+                   "+ NCHAR(0xE9) + NCHAR(0xD83D) + NCHAR(0xDE00) "
+                   "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 60) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<size_t> per_call;
+    EXPECT_EQ(expected, ReadWCharDataInChunksAsUtf8(stmt_, 1, 6, &per_call));
+
+    // Only the final call, which reports SQL_SUCCESS, may deliver nothing.
+    ASSERT_FALSE(per_call.empty());
+    for (size_t i = 0; i + 1 < per_call.size(); ++i) {
+        EXPECT_GT(per_call[i], 0u) << "truncated call " << i << " delivered an empty payload";
+    }
+
+    SQLCloseCursor(stmt_);
+}
+
+// The two shapes either side of the probe boundary, which differ by one byte of
+// payload room.
+//
+// A buffer with payload room too small to carry one whole character cannot make
+// progress: the conservative read sizing rounds it to zero, so returning
+// truncation would let an application looping on an unchanged buffer spin
+// forever. That is HY090, not a probe.
+//
+// A buffer with no payload room at all is a probe, and is answered.
+//
+// msodbcsql instead delivers one payload byte per call for the first shape --
+// 'a' as 0x61, 'e-acute' as 0xE9, CJK as 0x3F ('?') -- because it converts
+// SQL_C_CHAR to the client codepage, and the codepage measured here is
+// single-byte, so every character is one byte (and unrepresentable ones are
+// best-fit away, losing data). mssql-odbc delivers UTF-8, where a character is
+// 1-4 bytes. Matching it needs an unflushed-tail buffer in ActivePlpStream;
+// tracked separately. Hence the skip on the comparison leg.
+TEST_F(GetDataLiveTest, PlpSubMinimalBufferIsRejectedButProbeIsAnswered) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'abcd' AS NVARCHAR(MAX)), 50) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    SQLCHAR tiny[2] = {0};
+    // 2 bytes for SQL_C_CHAR: one payload byte once the terminator is reserved,
+    // which cannot hold a complete transcoded character.
+    SQLCHAR tiny[2] = {0xFF, 0xFF};
     SQLLEN ind = 0;
     SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, tiny, sizeof(tiny), &ind);
-    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_EQ(SQL_ERROR, rc) << "a buffer that cannot make progress must not report truncation";
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
+
+    // The rejection consumed nothing, so the value still reads back in full.
+    EXPECT_EQ(RepeatToken("abcd", 50), ReadCharDataInChunks(stmt_, 1, 8192));
 
     SQLCloseCursor(stmt_);
 
-    // buffer_length 1 (room for the NUL only) is the portable length-probe shape
-    // applications actually send, and it exercises the non-transcode PLP branch
-    // (varchar(max) -> SQL_C_CHAR) where max_read collapses to 0 directly rather
-    // than through the UTF-16 sizing above. It must also be rejected with HY090,
-    // never spun on.
+    // buffer_length 1 (room for the NUL only) is the portable length-probe
+    // shape, and it exercises the non-transcode PLP branch (varchar(max) ->
+    // SQL_C_CHAR) where the payload capacity collapses to 0 directly.
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    SQLCHAR one[1] = {0};
+    SQLCHAR one[1] = {0xFF};
     SQLLEN ind1 = 0;
     SQLRETURN rc1 = SQLGetData(stmt_, 1, SQL_C_CHAR, one, sizeof(one), &ind1);
-    EXPECT_EQ(SQL_ERROR, rc1);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc1);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    EXPECT_EQ(RepeatToken("abc", 200), ReadCharDataInChunks(stmt_, 1, 8192));
+
+    SQLCloseCursor(stmt_);
+}
+
+// The same boundary on the widening path (varchar(max) -> SQL_C_WCHAR), where
+// the read is sized from output code units rather than byte capacity.
+//
+// 2 bytes is the probe: room for the terminator, no code unit. 1 byte cannot
+// hold even the terminator, and 3 bytes has a spare byte that no whole code
+// unit fits in -- neither can make progress, so both are HY090 rather than a
+// truncation an application would retry forever.
+TEST_F(GetDataLiveTest, WidenedPlpRejectsBuffersThatCannotHoldACodeUnit) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    for (SQLLEN len : {SQLLEN{1}, SQLLEN{3}}) {
+        ASSERT_SQL_OK(
+            ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1"),
+            SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        unsigned char buf[4];
+        std::memset(buf, 0xFF, sizeof(buf));
+        SQLLEN ind = 0;
+        EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, len, &ind))
+            << "buffer_length=" << len;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
+
+        // The rejection consumed nothing: the value still reads back whole.
+        EXPECT_EQ(RepeatToken("abc", 200), ReadWCharDataInChunksAsUtf8(stmt_, 1, 8192));
+        SQLCloseCursor(stmt_);
+    }
+
+    // 2 bytes is the probe shape and must still be answered.
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR probe[1] = {0xFFFF};
+    SQLLEN probe_ind = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_WCHAR, probe, sizeof(probe), &probe_ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(0, probe[0]) << "a zero-payload buffer still gets its terminator";
+    EXPECT_EQ(RepeatToken("abc", 200), ReadWCharDataInChunksAsUtf8(stmt_, 1, 8192));
+
+    SQLCloseCursor(stmt_);
+}
+
+// An invalid TargetType is a property of the request, so it must report HY003
+// whether the column is delivered from the captured value or from an open PLP
+// stream. Before this was hoisted ahead of the dispatch, the PLP path reached
+// its own compatibility gate first and reported HYC00 instead.
+TEST_F(GetDataLiveTest, InvalidTargetTypeOnPlpStreamReportsHy003) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST('abc' AS VARCHAR(MAX)), 200) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Open the stream with a legitimate partial read first, so the next call
+    // takes the PLP continuation path rather than the captured-value path.
+    SQLCHAR buf[8] = {0};
+    SQLLEN ind = 0;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind));
+
+    SQLCHAR out[16] = {0};
+    SQLLEN ind2 = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, 9999, out, sizeof(out), &ind2));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY003");
+
+    SQLCloseCursor(stmt_);
+}
+
+// ===================================================================
+// AB#47506 regression: columns whose SQLDescribeCol ColumnSize is 0.
+//
+// A client that sizes its fetch buffer as `(ColumnSize + 1) * sizeof(SQLWCHAR)`
+// -- which is what mssql-python does -- computes a 2-byte buffer for any such
+// column: room for the null terminator and no payload. Rejecting that request
+// broke every fetch of a MAX, XML, or computed-string column, including values
+// only a few characters long.
+//
+// Each case below mirrors a specific mssql-python test that failed. They run on
+// both legs: msodbcsql answers these the same way.
+// ===================================================================
+
+// tests/test_004_cursor.py::test_emoji_round_trip -- NVARCHAR(MAX) holding
+// short strings with astral characters, ZWJ sequences and combining marks.
+TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNvarcharMaxEmoji) {
+    struct Case {
+        const char* sql_literal;
+        const char* expected_utf8;
+    };
+    // Spelled as NCHAR() so the payload does not depend on the source file
+    // encoding surviving the compiler and the ODBC driver manager.
+    const Case cases[] = {
+        // "Hello " + U+1F604
+        {"N'Hello ' + NCHAR(0xD83D) + NCHAR(0xDE04)", "Hello \xF0\x9F\x98\x84"},
+        // "Accented " + e-acute u-diaeresis n-tilde c-cedilla
+        {"N'Accented ' + NCHAR(0xE9) + NCHAR(0xFC) + NCHAR(0xF1) + NCHAR(0xE7)",
+         "Accented \xC3\xA9\xC3\xBC\xC3\xB1\xC3\xA7"},
+        // "Chinese: " + U+4E2D U+6587
+        {"N'Chinese: ' + NCHAR(0x4E2D) + NCHAR(0x6587)", "Chinese: \xE4\xB8\xAD\xE6\x96\x87"},
+        // U+1F468 ZWJ U+1F469 -- a ZWJ sequence, two surrogate pairs plus U+200D
+        {"NCHAR(0xD83D) + NCHAR(0xDC68) + NCHAR(0x200D) + NCHAR(0xD83D) + NCHAR(0xDC69)",
+         "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9"},
+    };
+
+    for (const auto& c : cases) {
+        const std::string query =
+            std::string("SELECT CAST(") + c.sql_literal + " AS NVARCHAR(MAX)) AS content";
+        ASSERT_SQL_OK(ExecDirect(query), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLRETURN first_rc = SQL_SUCCESS;
+        SQLLEN first_ind = 0;
+        const std::string got = FetchLikeDescribeColClient(stmt_, 1, &first_rc, &first_ind);
+
+        // The sized read must report truncation with a usable length, never fail.
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, first_rc) << "literal: " << c.sql_literal;
+        EXPECT_GT(first_ind, 0) << "indicator must give the byte count to re-fetch with";
+        EXPECT_EQ(std::string(c.expected_utf8), got) << "literal: " << c.sql_literal;
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// tests/test_015_pyformat_parameters.py::test_unicode_single_param -- a bound
+// parameter echoed straight back, so the result column has no declared width.
+TEST_F(GetDataLiveTest, DescribeColSizedFetchOnBoundParameterEcho) {
+    // "Hello " + U+4E16 U+754C + " " + U+1F30D
+    const std::string expected = "Hello \xE4\xB8\x96\xE7\x95\x8C \xF0\x9F\x8C\x8D";
+    const std::vector<SQLWCHAR> param = {'H',    'e',    'l',    'l',    'o',   ' ',
+                                         0x4E16, 0x754C, ' ',    0xD83C, 0xDF0D};
+    SQLLEN param_len = static_cast<SQLLEN>(param.size() * sizeof(SQLWCHAR));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   param.size(), 0,
+                                   const_cast<SQLWCHAR*>(param.data()), param_len, &param_len),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(ExecDirect("SELECT ?"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, FetchLikeDescribeColClient(stmt_, 1));
+
+    SQLCloseCursor(stmt_);
+}
+
+// tests/test_017_spatial_types.py::test_geography_as_text and
+// ::test_geometry_as_text -- STAsText() converts the UDT server-side, so the
+// column is nvarchar with no declared width. The UDT itself never crosses the
+// wire, which is why these are in scope even though UDT fetch is not.
+TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSpatialAsText) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT geography::STGeomFromText('POINT(-122.34900 47.65100)', 4326)"
+                   ".STAsText() AS wkt"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string geography = FetchLikeDescribeColClient(stmt_, 1);
+    EXPECT_EQ(0u, geography.rfind("POINT", 0)) << "got: " << geography;
+    EXPECT_NE(std::string::npos, geography.find("-122.349"));
+    EXPECT_NE(std::string::npos, geography.find("47.651"));
+    SQLCloseCursor(stmt_);
+
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT geometry::STGeomFromText('POINT(100 200)', 0).STAsText() AS wkt"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string geometry = FetchLikeDescribeColClient(stmt_, 1);
+    EXPECT_EQ(0u, geometry.rfind("POINT", 0)) << "got: " << geometry;
+    EXPECT_NE(std::string::npos, geometry.find("100"));
+    EXPECT_NE(std::string::npos, geometry.find("200"));
+    SQLCloseCursor(stmt_);
+}
+
+// tests/test_018_polars_pandas_integration.py::test_all_types_are_isclass and
+// tests/test_024_bulkcopy_arrow.py::test_xml -- an XML column, both directly and
+// through CAST(... AS NVARCHAR(MAX)). The isclass test reads cursor.description
+// for many columns but still has to fetchall() at the end, which is where it
+// died.
+TEST_F(GetDataLiveTest, DescribeColSizedFetchOnXmlColumn) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('<r/>' AS XML) AS x"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("<r/>", FetchLikeDescribeColClient(stmt_, 1));
+    SQLCloseCursor(stmt_);
+
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(CAST('<r a=\"1\">hi</r>' AS XML) AS NVARCHAR(MAX)) AS x"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string xml = FetchLikeDescribeColClient(stmt_, 1);
+    EXPECT_NE(std::string::npos, xml.find("hi")) << "got: " << xml;
+    SQLCloseCursor(stmt_);
+}
+
+// The same client shape over a value far larger than one chunk, so the probe is
+// followed by a real multi-call stream rather than a single follow-up read.
+TEST_F(GetDataLiveTest, DescribeColSizedFetchOnLargeNvarcharMax) {
+    const std::string expected = RepeatToken("0123456789", 3000);  // 30000 chars
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'0123456789' AS NVARCHAR(MAX)), 3000) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN first_rc = SQL_SUCCESS;
+    SQLLEN first_ind = 0;
+    const std::string got = FetchLikeDescribeColClient(stmt_, 1, &first_rc, &first_ind);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, first_rc);
+    EXPECT_EQ(60000, first_ind) << "indicator must report the whole value, not the chunk";
+    EXPECT_EQ(expected, got);
+
+    SQLCloseCursor(stmt_);
+}
+
+// A sized column takes the other branch: the computed buffer has real room, so
+// the value arrives in one call with SQL_SUCCESS. This is why the bug never
+// showed up on ordinary columns.
+TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSizedColumnIsSingleCall) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(N'Hello ' + NCHAR(0xD83D) + NCHAR(0xDE04) AS NVARCHAR(50)) AS c"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN first_rc = SQL_ERROR;
+    SQLLEN first_ind = 0;
+    const std::string got = FetchLikeDescribeColClient(stmt_, 1, &first_rc, &first_ind);
+    EXPECT_EQ(SQL_SUCCESS, first_rc) << "a sized column must not need a second call";
+    EXPECT_EQ(16, first_ind);
+    EXPECT_EQ("Hello \xF0\x9F\x98\x84", got);
+
+    SQLCloseCursor(stmt_);
+}
+
+// tests/test_004_cursor.py::test_varbinarymax_insert_fetch_null -- the NULL leg
+// of the varbinary(max) test. A NULL MAX column must report SQL_NULL_DATA on the
+// probe rather than failing; binary *data* delivery is still unimplemented
+// (AB#47239), which is why only the NULL case is covered here.
+TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS NVARCHAR(MAX)) AS c1"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN first_rc = SQL_ERROR;
+    SQLLEN first_ind = 0;
+    EXPECT_EQ("<null>", FetchLikeDescribeColClient(stmt_, 1, &first_rc, &first_ind));
+    EXPECT_EQ(SQL_SUCCESS, first_rc);
+    EXPECT_EQ(SQL_NULL_DATA, first_ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// tests/test_004_cursor.py::test_varbinarymax_insert_fetch_null -- the read that
+// actually failed. mssql-python fetches a nullable varbinary(max) with a real
+// SQL_C_BINARY buffer, not the zero-length probe, so the request reaches the
+// target-type check. Binary *data* delivery is still unimplemented (AB#47239);
+// a NULL carries no data, so it must be answered rather than rejected.
+//
+// The nonzero buffer is the point of this test: with a zero-length buffer the
+// read is admitted as a length probe and the NULL gate is never consulted.
+TEST_F(GetDataLiveTest, NullVarbinaryMaxToBinaryTargetReportsNull) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS VARBINARY(MAX)) AS c1"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    unsigned char buf[8];
+    std::memset(buf, 0xAA, sizeof(buf));
+    SQLLEN ind = 0;
+    EXPECT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_NULL_DATA, ind);
 
     SQLCloseCursor(stmt_);
 }
@@ -934,4 +1692,3 @@ TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
 
     SQLCloseCursor(stmt_);
 }
-

@@ -118,6 +118,38 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
     }
 }
 
+/// Sets a connection attribute through the Unix ANSI entry point.
+///
+/// unixODBC converts character-valued attributes set before driver selection to
+/// ANSI, then replays them through this symbol when the driver is loaded.
+/// `SQLSetConnectAttr` is the standard ANSI entry point, so the symbol is
+/// exported on every non-Windows target; the replay behavior motivating the
+/// conversion was measured with unixODBC.
+///
+/// # Safety
+/// - `connection_handle` must be a valid DBC handle.
+/// - `attribute` must be a valid connection attribute identifier.
+/// - `value_ptr` validity depends on the attribute type.
+/// - `string_length` is used only for string-type attributes.
+#[cfg(not(windows))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetConnectAttr(
+    connection_handle: SqlHandle,
+    attribute: SqlInteger,
+    value_ptr: SqlPointer,
+    string_length: SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::set_connect_attr::sql_set_connect_attr(
+            connection_handle,
+            attribute,
+            value_ptr,
+            string_length,
+        )
+    }
+}
+
 /// Retrieves a statement attribute.
 ///
 /// # Safety
@@ -331,7 +363,8 @@ pub unsafe extern "C" fn SQLDriverConnectW(
 /// Disconnects from the data source associated with a connection handle.
 ///
 /// # Safety
-/// - `connection_handle` must be a valid DBC handle that is currently connected.
+/// - `connection_handle` must be a valid DBC handle allocated by
+///   `SQLAllocHandle(SQL_HANDLE_DBC, ...)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();

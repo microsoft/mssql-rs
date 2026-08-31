@@ -38,7 +38,7 @@ use crate::message::messages::ResetConnectionMode;
 use crate::query::metadata::ColumnMetadata;
 use crate::token::tokens::{
     ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeContainer, EnvChangeToken,
-    EnvChangeTokenSubType, InfoToken, Tokens,
+    EnvChangeTokenSubType, ErrorToken, InfoToken, Tokens,
 };
 
 /// An opaque, scripted TDS token produced by the constructor helpers in this
@@ -181,6 +181,10 @@ impl NetworkReader for TokenReplayTransport {
 
 #[async_trait]
 impl TdsTransport for TokenReplayTransport {
+    fn as_writer_ref(&self) -> &dyn NetworkWriter {
+        self
+    }
+
     fn as_writer(&mut self) -> &mut dyn NetworkWriter {
         self
     }
@@ -359,6 +363,21 @@ pub fn info(number: u32, severity: u8, message: &str) -> ScriptedToken {
     }))
 }
 
+/// A terminal SQL Server ERROR token (e.g. a constraint violation) — reading
+/// it ends the batch: the client drains any remaining tokens, marks the batch
+/// closed, and surfaces the error to the caller instead of a row.
+pub fn sql_error(number: u32, severity: u8, message: &str) -> ScriptedToken {
+    ScriptedToken(Tokens::Error(ErrorToken {
+        number,
+        state: 1,
+        severity,
+        message: message.to_string(),
+        server_name: "test-server".to_string(),
+        proc_name: String::new(),
+        line_number: 1,
+    }))
+}
+
 // ── Byte-level replay harness (test-only) ──────────────────────────────────
 //
 // Unlike [`TokenReplayTransport`], which replays pre-parsed [`Tokens`], this
@@ -511,6 +530,10 @@ pub(crate) mod byte_stream {
 
     #[async_trait]
     impl TdsTransport for ByteStreamTransport {
+        fn as_writer_ref(&self) -> &dyn NetworkWriter {
+            self
+        }
+
         fn as_writer(&mut self) -> &mut dyn NetworkWriter {
             self
         }

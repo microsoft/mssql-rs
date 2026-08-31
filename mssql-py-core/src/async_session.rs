@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use mssql_tds::core::CancelHandle;
 
@@ -24,12 +24,19 @@ pub(crate) struct CursorCloseClaim {
     pub(crate) drain_previous: bool,
 }
 
+/// Exclusive ownership granted while one cursor row is being read.
+#[derive(Debug)]
+pub(crate) struct FetchClaim {
+    pub(crate) operation_id: OperationId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimError {
     Closing,
     Closed,
     Broken,
     Busy,
+    NoResultSet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,8 +50,8 @@ pub(crate) enum ConnectionLifecycle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationPhase {
     Executing,
-    // TODO: Release Fetching ownership when async fetch exhausts the results.
     Fetching,
+    FetchingRow,
     Closing,
 }
 
@@ -75,6 +82,46 @@ pub(crate) struct AsyncConnectionState {
     inner: Mutex<AsyncSessionState>,
 }
 
+/// Releases an operation claim and poisons the session if interrupted.
+pub(crate) struct SessionOperationGuard {
+    session_state: Arc<AsyncConnectionState>,
+    operation_id: OperationId,
+    completed: bool,
+}
+
+impl SessionOperationGuard {
+    pub(crate) fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
+        Self {
+            session_state,
+            operation_id,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn finish_execute(&mut self, has_open_batch: bool) {
+        self.session_state
+            .finish_execute(self.operation_id, has_open_batch);
+        self.completed = true;
+    }
+
+    pub(crate) fn settle(&mut self, has_open_batch: bool) {
+        if has_open_batch {
+            self.session_state.mark_broken();
+        }
+        self.session_state.release_operation(self.operation_id);
+        self.completed = true;
+    }
+}
+
+impl Drop for SessionOperationGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.session_state.mark_broken();
+            self.session_state.release_operation(self.operation_id);
+        }
+    }
+}
+
 impl AsyncConnectionState {
     pub(crate) fn new() -> Self {
         Self {
@@ -93,6 +140,15 @@ impl AsyncConnectionState {
 
     pub(crate) fn allocate_operation_id(&self) -> OperationId {
         self.next_operation_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn ensure_open(&self) -> Result<(), ClaimError> {
+        match self.lock().lifecycle {
+            ConnectionLifecycle::Open => Ok(()),
+            ConnectionLifecycle::Closing => Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => Err(ClaimError::Broken),
+        }
     }
 
     pub(crate) fn claim_execute(&self, cursor_id: CursorId) -> Result<ExecuteClaim, ClaimError> {
@@ -159,6 +215,27 @@ impl AsyncConnectionState {
         Ok(operation_id)
     }
 
+    pub(crate) fn claim_fetch(&self, cursor_id: CursorId) -> Result<FetchClaim, ClaimError> {
+        let mut state = self.lock();
+        match state.lifecycle {
+            ConnectionLifecycle::Open => {}
+            ConnectionLifecycle::Closing => return Err(ClaimError::Closing),
+            ConnectionLifecycle::Closed => return Err(ClaimError::Closed),
+            ConnectionLifecycle::Broken => return Err(ClaimError::Broken),
+        }
+
+        let Some(active) = state.active_operation.as_mut() else {
+            return Err(ClaimError::NoResultSet);
+        };
+        if active.cursor_id != Some(cursor_id) || active.phase != OperationPhase::Fetching {
+            return Err(ClaimError::Busy);
+        }
+        active.phase = OperationPhase::FetchingRow;
+        Ok(FetchClaim {
+            operation_id: active.operation_id,
+        })
+    }
+
     pub(crate) fn claim_cursor_close(
         &self,
         cursor_id: CursorId,
@@ -207,6 +284,37 @@ impl AsyncConnectionState {
             active.phase = OperationPhase::Fetching;
         } else {
             state.active_operation = None;
+        }
+    }
+
+    pub(crate) fn finish_fetch(
+        &self,
+        operation_id: OperationId,
+        has_row: bool,
+        has_open_batch: bool,
+    ) {
+        let mut state = self.lock();
+        let Some(active) = state.active_operation.as_mut() else {
+            return;
+        };
+        if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
+            return;
+        }
+
+        if has_row || has_open_batch {
+            active.phase = OperationPhase::Fetching;
+        } else {
+            state.active_operation = None;
+        }
+    }
+
+    pub(crate) fn restore_fetch(&self, operation_id: OperationId) {
+        let mut state = self.lock();
+        if let Some(active) = state.active_operation.as_mut()
+            && active.operation_id == operation_id
+            && active.phase == OperationPhase::FetchingRow
+        {
+            active.phase = OperationPhase::Fetching;
         }
     }
 
@@ -331,6 +439,53 @@ mod tests {
     }
 
     #[test]
+    fn fetch_requires_owned_results_and_rejects_concurrent_work() {
+        let state = AsyncConnectionState::new();
+        assert_eq!(state.claim_fetch(1).unwrap_err(), ClaimError::NoResultSet);
+
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+
+        assert_eq!(state.claim_fetch(1).unwrap_err(), ClaimError::Busy);
+        assert_eq!(state.claim_fetch(2).unwrap_err(), ClaimError::Busy);
+        assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
+
+        state.finish_fetch(fetch.operation_id, true, true);
+        assert_eq!(
+            state.lock().active_operation.as_ref().unwrap().phase,
+            OperationPhase::Fetching
+        );
+    }
+
+    #[test]
+    fn fetch_exhaustion_releases_only_a_finished_batch() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+
+        let current_result_end = state.claim_fetch(1).unwrap();
+        state.finish_fetch(current_result_end.operation_id, false, true);
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
+
+        let batch_end = state.claim_fetch(1).unwrap();
+        state.finish_fetch(batch_end.operation_id, false, false);
+        assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn failed_awaitable_construction_restores_fetch_ownership() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+
+        state.restore_fetch(fetch.operation_id);
+
+        assert!(state.claim_fetch(1).is_ok());
+    }
+
+    #[test]
     fn cursor_close_can_drain_its_results_but_not_another_cursor() {
         let state = AsyncConnectionState::new();
         let execute = state.claim_execute(1).unwrap();
@@ -367,16 +522,20 @@ mod tests {
         let state = AsyncConnectionState::new();
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert_eq!(state.ensure_open(), Ok(()));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closing);
+        assert_eq!(state.ensure_open(), Err(ClaimError::Closing));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closing);
         state.mark_closed();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
+        assert_eq!(state.ensure_open(), Err(ClaimError::Closed));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Closed);
         state.mark_broken();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
+        assert_eq!(state.ensure_open(), Err(ClaimError::Broken));
         state.begin_close();
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
     }

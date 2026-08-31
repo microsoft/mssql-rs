@@ -19,11 +19,12 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::CursorColumn;
+use mssql_tds::connection::tds_client::{CursorColumn, ResultSet};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::error::Error as TdsError;
 
 use super::sqlstate::*;
+use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{TextError, column_value_to_text, convert_typed_c, is_typed_c_target};
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID,
@@ -97,7 +98,7 @@ enum RowIssue {
 impl RowIssue {
     fn post(self, stmt_state: &mut StmtState) {
         match self {
-            RowIssue::StringTruncated => post_diag(stmt_state, ERR_STRING_RIGHT_TRUNCATION),
+            RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
             RowIssue::OutOfRange => post_diag(stmt_state, ERR_NUMERIC_OUT_OF_RANGE),
             RowIssue::Restricted => post_diag(stmt_state, ERR_RESTRICTED_DATA_TYPE),
@@ -206,6 +207,42 @@ fn fetch_scroll_safe(
             return SQL_ERROR;
         }
 
+        // A previous fetch already confirmed (possibly via a peek past the
+        // last row it delivered) that this cursor has no more rows. The
+        // answer is already known and needs no connection access at all —
+        // report it even if another statement currently owns the connection.
+        if stmt_state.result_set_exhausted {
+            let rows_fetched_ptr = stmt_state.rows_fetched_ptr;
+            let row_status_ptr = stmt_state.row_status_ptr;
+            let row_array_size = stmt_state.row_array_size;
+            // That same peek can have found a trailing SQL Server error
+            // instead of a clean end of set (see
+            // `release_busy_if_row_exhausted`): the call that found it had
+            // already committed to delivering its own row successfully, so
+            // the diagnostic was deferred here, to the call that would have
+            // hit it directly without the peek's read-ahead. This branch's
+            // `SQL_ERROR` (unlike the sibling `SQL_NO_DATA` below) can carry
+            // extra diagnostic records, so any INFO message stashed
+            // alongside it (`StmtState::pending_fetch_info`) is surfaced here
+            // too — this closes the cursor, so `SQLCloseCursor`/
+            // `SQLFreeStmt(SQL_CLOSE)` can no longer reach it afterward.
+            let rc = if let Some(e) = stmt_state.pending_fetch_error.take() {
+                stmt_state.reset_row_stream();
+                stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+                post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
+                let pending_info = std::mem::take(&mut stmt_state.pending_fetch_info);
+                post_tds_info_messages(&mut stmt_state, &pending_info);
+                SQL_ERROR
+            } else {
+                SQL_NO_DATA
+            };
+            drop(stmt_state);
+            unsafe { write_if_some(rows_fetched_ptr, 0) };
+            mark_no_rows(row_status_ptr, 0, row_array_size);
+            debug!(?rc, "SQLFetchScroll: result set already known exhausted");
+            return rc;
+        }
+
         let bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
         // The buffers in that snapshot belong to the application, and the fill
         // loop writes through them after this lock is released. Claiming the
@@ -253,6 +290,36 @@ fn fill_rowset(
     row_status_ptr: *mut SqlUSmallInt,
     row_bind_offset_ptr: *mut SqlULen,
 ) -> SqlReturn {
+    // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
+    // result set. Once that many have been returned the cursor stops without
+    // pulling another row, matching msodbcsql. The cursor deliberately stays
+    // open and the connection stays busy on this statement: the rest of the
+    // result set is still on the wire and SQLMoreResults / SQLCloseCursor
+    // drain it as usual.
+    let row_budget = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLFetchScroll: stmt mutex poisoned checking SQL_ATTR_MAX_ROWS");
+            return SQL_ERROR;
+        };
+        if stmt_state.max_rows_reached() {
+            // Measured: past the cap msodbcsql answers 24000 to both
+            // SQL_ATTR_ROW_NUMBER and SQLGetData, exactly as it does at the
+            // natural end of a result set, so the previous row has to stop
+            // being readable here rather than linger.
+            stmt_state.reset_row_stream();
+            drop(stmt_state);
+            unsafe { write_if_some(rows_fetched_ptr, 0) };
+            mark_no_rows(row_status_ptr, 0, row_array_size);
+            debug!("SQLFetchScroll: SQL_ATTR_MAX_ROWS reached; returning SQL_NO_DATA");
+            return SQL_NO_DATA;
+        }
+        row_budget(
+            stmt_state.max_rows,
+            stmt_state.rows_returned,
+            row_array_size,
+        )
+    };
+
     let dbc = stmt.parent_dbc();
 
     let mut client = {
@@ -314,7 +381,7 @@ fn fill_rowset(
     // whole rowset between calls by updating the pointed-to value.
     let bind_offset = unsafe { read_bind_offset(row_bind_offset_ptr) };
 
-    while rows_filled < row_array_size {
+    while rows_filled < row_budget {
         match dbc.runtime.block_on(client.next_row_cursor()) {
             Ok(true) => {}
             Ok(false) => break,
@@ -385,29 +452,50 @@ fn fill_rowset(
     };
 
     // Hand the connection back before touching the statement, mirroring
-    // SQLFetch's lock order.
-    {
+    // SQLFetch's lock order. A failed protocol read leaves the connection
+    // with no usable cursor, so it stops being busy with this statement
+    // outright. Otherwise, release the busy claim the moment the wire is
+    // actually idle rather than only once this cursor is explicitly closed
+    // (matches msodbcsql's wire-state busy gate; see AB#47508) — safe to
+    // check now when either the wire already reported end-of-set (the loop
+    // broke via a natural `Ok(false)`, which only happens after
+    // `next_row_cursor` has itself drained the previous row, so nothing is
+    // left unread to protect), or every column of the row just filled was
+    // read, so a peek cannot discard a column a following `SQLGetData`
+    // could still legitimately retrieve. A block fetch (`row_array_size !=
+    // 1`) never leaves a row positioned for `SQLGetData` regardless (see the
+    // mixed-access comment below), so it is always safe to check there.
+    let peek_is_safe =
+        !client.maybe_has_unread_rows() || row_array_size != 1 || last_column_read == column_count;
+
+    if fetch_error.is_some() {
         let Ok(mut dbc_state) = dbc.inner.lock() else {
             error!("SQLFetchScroll: dbc mutex poisoned returning client");
             return SQL_ERROR;
         };
         dbc_state.client = Some(client);
-        // A failed protocol read leaves the connection with no usable cursor,
-        // so it stops being busy with this statement; otherwise it stays busy
-        // until SQLMoreResults or a cursor close, matching SQLFetch.
-        if fetch_error.is_some() {
-            if dbc_state.active_stmt == Some(statement_handle) {
-                dbc_state.active_stmt = None;
-            }
-        } else {
-            dbc_state.active_stmt = Some(statement_handle);
+        if dbc_state.active_stmt == Some(statement_handle) {
+            dbc_state.active_stmt = None;
         }
+    } else if peek_is_safe {
+        release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, rows_filled > 0);
+    } else {
+        let Ok(mut dbc_state) = dbc.inner.lock() else {
+            error!("SQLFetchScroll: dbc mutex poisoned returning client");
+            return SQL_ERROR;
+        };
+        dbc_state.client = Some(client);
+        dbc_state.active_stmt = Some(statement_handle);
     }
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFetchScroll: stmt mutex poisoned recording rowset");
         return SQL_ERROR;
     };
+
+    // Charged even when the rowset ended in an error: the rows before it were
+    // still delivered to the application, so they count against the cap.
+    stmt_state.rows_returned += rows_filled;
 
     unsafe { write_if_some(rows_fetched_ptr, rows_filled) };
     mark_no_rows(row_status_ptr, rows_filled, row_array_size);
@@ -465,6 +553,19 @@ fn fill_rowset(
         return SQL_SUCCESS_WITH_INFO;
     }
     SQL_SUCCESS
+}
+
+/// How many rows this fetch may deliver.
+///
+/// `SQL_ATTR_MAX_ROWS = 0` is the ODBC default and means unlimited, so the whole
+/// rowset is available. Otherwise the cap is a row budget rather than a rowset
+/// boundary: measured against msodbcsql, a cap of 5 under a rowset of 4 yields
+/// 4 rows and then a *partial* rowset of 1, not two full rowsets or one.
+fn row_budget(max_rows: SqlULen, rows_returned: SqlULen, row_array_size: SqlULen) -> SqlULen {
+    if max_rows == 0 {
+        return row_array_size;
+    }
+    row_array_size.min(max_rows.saturating_sub(rows_returned))
 }
 
 /// Writes `SQL_ROW_NOROW` into the unused tail of the row status array.
@@ -644,7 +745,9 @@ mod tests {
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{
+        col_metadata_empty, done_no_more, int_columns, tds_client_from_tokens,
+    };
 
     fn binding(
         column_number: SqlUSmallInt,
@@ -672,6 +775,149 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { sql_fetch_scroll(ptr::null_mut(), SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    // ---- SQL_ATTR_MAX_ROWS ------------------------------------------------
+
+    /// Builds a statement whose cursor is open on a one-column result set that
+    /// has already yielded `rows_returned` rows under a `max_rows` cap.
+    fn stmt_at_max_rows(h: &TestHandles, max_rows: SqlULen, rows_returned: SqlULen) {
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut stmt_state = stmt_handle.inner.lock().unwrap();
+            stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
+            stmt_state.begin_result_set(int_columns(1));
+            stmt_state.max_rows = max_rows;
+            stmt_state.rows_returned = rows_returned;
+            // A statement that has already returned rows is positioned on the
+            // last one, which is what makes the cutoff's row-stream reset
+            // observable rather than vacuously true.
+            stmt_state.row_positioned = rows_returned > 0;
+        }
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut dbc_state = dbc_handle.inner.lock().unwrap();
+        dbc_state.client = Some(tds_client_from_tokens(vec![done_no_more()]));
+        dbc_state.active_stmt = Some(h.stmt);
+    }
+
+    /// The cap is reached, so the fetch must report end-of-data *without*
+    /// pulling a row — the scripted client holds no rows, so a fetch that got
+    /// past the cutoff would fail rather than silently pass.
+    #[test]
+    fn fetch_at_max_rows_returns_no_data_without_pulling() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 3, 3);
+
+        let mut rows_fetched: SqlULen = 99;
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt_handle.inner.lock().unwrap();
+            s.rows_fetched_ptr = &mut rows_fetched;
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA
+        );
+        assert_eq!(rows_fetched, 0, "the cutoff still reports its rowset size");
+
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_state = stmt_handle.inner.lock().unwrap();
+        assert!(stmt_state.diag_records.is_empty(), "cap is not an error");
+        // The cursor stays open and the connection stays busy on this statement
+        // so the rest of the result set can still be drained.
+        assert!(stmt_state.has_state(STMT_STATE_CURSOR_OPEN));
+        // Measured on msodbcsql: past the cap the previous row stops being
+        // readable, so SQL_ATTR_ROW_NUMBER and SQLGetData both answer 24000 —
+        // the same state as the natural end of a result set.
+        assert!(!stmt_state.row_positioned);
+        drop(stmt_state);
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert!(dbc_state.client.is_some());
+        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+    }
+
+    /// One row below the cap the cutoff must not fire, so the fetch reaches the
+    /// wire. Asserted through the connection hand-back rather than the return
+    /// code: the cap path is the only one that leaves the statement owning the
+    /// connection, so `active_stmt` distinguishes the two paths without
+    /// depending on what the scripted result happens to answer.
+    #[test]
+    fn fetch_below_max_rows_is_not_cut_off() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 3, 2);
+
+        unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert_eq!(
+            dbc_state.active_stmt, None,
+            "the fetch reached the client rather than being cut off"
+        );
+    }
+
+    /// `SQL_ATTR_MAX_ROWS = 0` is the ODBC default and means unlimited, so a
+    /// row count far above it must not be treated as having reached a cap.
+    #[test]
+    fn fetch_with_max_rows_zero_is_unlimited() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_at_max_rows(&h, 0, 1000);
+
+        unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+
+        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_state = dbc_handle.inner.lock().unwrap();
+        assert_eq!(
+            dbc_state.active_stmt, None,
+            "the fetch reached the client rather than being cut off"
+        );
+    }
+
+    /// The cap truncates a rowset rather than rounding to a rowset boundary.
+    /// Measured against msodbcsql: a cap of 5 with `SQL_ATTR_ROW_ARRAY_SIZE = 4`
+    /// over a 20-row result yields 4 rows, then 1, then SQL_NO_DATA.
+    #[test]
+    fn the_cap_truncates_a_rowset_rather_than_rounding_it() {
+        // Unlimited leaves the whole rowset available however many rows have
+        // already gone out.
+        assert_eq!(row_budget(0, 1000, 4), 4);
+        // Well inside the cap the rowset is untouched.
+        assert_eq!(row_budget(20, 0, 4), 4);
+        assert_eq!(row_budget(8, 4, 4), 4);
+        // The cap lands inside the rowset, so the fetch is cut short.
+        assert_eq!(row_budget(5, 4, 4), 1);
+        assert_eq!(row_budget(6, 4, 4), 2);
+        assert_eq!(row_budget(3, 0, 4), 3);
+        // A cap already spent yields nothing; `max_rows_reached` short-circuits
+        // before this, so the budget only has to stay total, not underflow.
+        assert_eq!(row_budget(5, 5, 4), 0);
+        assert_eq!(row_budget(5, 9, 4), 0);
+    }
+
+    /// The cap is per result set, so advancing onto a new one must restart the
+    /// budget; otherwise a spent cap would truncate every later result set.
+    #[test]
+    fn begin_result_set_restarts_the_max_rows_budget() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut stmt_state = stmt_handle.inner.lock().unwrap();
+
+        stmt_state.max_rows = 3;
+        stmt_state.rows_returned = 3;
+        assert!(stmt_state.max_rows_reached());
+
+        stmt_state.begin_result_set(int_columns(2));
+        assert_eq!(stmt_state.rows_returned, 0);
+        assert!(!stmt_state.max_rows_reached());
+        // The cap itself is a statement attribute and survives the new result
+        // set — only the count restarts.
+        assert_eq!(stmt_state.max_rows, 3);
     }
 
     /// The cursor is forward-only, so every other orientation is rejected
@@ -706,6 +952,214 @@ mod tests {
             s.diag_records.last().unwrap().sql_state,
             ERR_INVALID_CURSOR_STATE.state
         );
+    }
+
+    /// A cursor already known exhausted (set by a prior fetch's peek past its
+    /// last row) reports SQL_NO_DATA without ever touching the connection —
+    /// not even to discover it has no client at all. This is what lets the
+    /// answer stay correct regardless of what else is happening on the DBC.
+    #[test]
+    fn exhausted_cursor_fast_path_never_touches_the_connection() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+        }
+        // DBC is left disconnected with no client at all: if the fast path
+        // reached for the connection this would fail with a different
+        // SQLSTATE (not connected / no active client) instead of SQL_NO_DATA.
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_NO_DATA);
+    }
+
+    /// A prior fetch's read-ahead peek can have discovered a trailing SQL
+    /// Server error instead of a clean end of set (see AB#47508's
+    /// `release_busy_if_row_exhausted`), deferred via `pending_fetch_error`
+    /// since that fetch call had already committed to delivering its own
+    /// row successfully. The next `SQLFetch`/`SQLFetchScroll` — the call
+    /// that would have hit this error directly without the peek's
+    /// read-ahead — must drain and report it instead of silently reporting
+    /// `SQL_NO_DATA`, and must not need the connection to do so.
+    #[test]
+    fn exhausted_cursor_fast_path_surfaces_a_pending_fetch_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+        }
+        // Same as the sibling test: no connection is configured at all, so a
+        // fallthrough to the normal fetch path would fail differently.
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert!(
+            s.diag_records
+                .iter()
+                .any(|d| d.message.contains("simulated trailing SQL Server error")),
+            "the deferred error must be posted, not silently dropped as SQL_NO_DATA"
+        );
+        assert!(
+            s.pending_fetch_error.is_none(),
+            "must be taken so it cannot leak into a later call"
+        );
+        assert!(
+            !s.has_state(STMT_STATE_CURSOR_OPEN),
+            "matches the ordinary fetch-error tail: the cursor cannot be resumed after this"
+        );
+    }
+
+    /// The deferred-error fast path above closes the cursor before
+    /// returning, so `SQLCloseCursor`/`SQLFreeStmt(SQL_CLOSE)` can no longer
+    /// reach a `StmtState::pending_fetch_info` stashed alongside the error by
+    /// the same peek (see AB#47508's `release_busy_if_row_exhausted`, which
+    /// can set both together — a trailing INFO message read on the way to a
+    /// batch-ending SQL Server error). Since this branch's `SQL_ERROR` can
+    /// carry extra diagnostic records (unlike the sibling `SQL_NO_DATA`), the
+    /// stashed message must be surfaced here rather than silently discarded.
+    #[test]
+    fn exhausted_cursor_fast_path_surfaces_a_pending_fetch_info_alongside_the_error() {
+        use mssql_tds::error::SqlInfoMessage;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        open_cursor(&h);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.result_set_exhausted = true;
+            s.pending_fetch_error = Some(TdsError::ProtocolError(
+                "simulated trailing SQL Server error".to_string(),
+            ));
+            s.pending_fetch_info = vec![SqlInfoMessage {
+                message: "trailing PRINT message".to_string(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }];
+        }
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(rc, SQL_ERROR);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert!(
+            s.diag_records
+                .iter()
+                .any(|d| d.message.contains("trailing PRINT message")),
+            "the stashed INFO message must be surfaced alongside the deferred error"
+        );
+        assert!(
+            s.pending_fetch_info.is_empty(),
+            "must be taken so it cannot leak into a later call"
+        );
+    }
+
+    /// Given the *consequence* of AB#47508's fix (a cursor whose fetch has
+    /// already released the busy claim and marked its result set
+    /// exhausted — the two post-conditions `release_busy_if_row_exhausted`
+    /// produces, taken as a precondition here since driving a real
+    /// one-row `fill_rowset` fetch through this crate's downstream
+    /// scripted-token test harness cannot itself produce a positioned row,
+    /// see `real_zero_row_fetch_through_fill_rowset_releases_active_stmt`
+    /// below for the closest achievable real-fetch equivalent): statement B
+    /// must then be able to claim the connection without seeing "Connection
+    /// is busy with results for another command", and A must still be able
+    /// to report SQL_NO_DATA afterward — including while B is actively
+    /// using the connection.
+    #[test]
+    fn one_statements_exhausted_cursor_does_not_block_another_statements_execute() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let stmt_b = h.alloc_extra_stmt();
+        h.mark_dbc_connected();
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(tds_client_from_tokens(vec![]));
+            // active_stmt is None: statement A's fetch already released it.
+        }
+        {
+            let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut sa = stmt_a.inner.lock().unwrap();
+            sa.set_state(STMT_STATE_CURSOR_OPEN);
+            sa.result_set_exhausted = true;
+        }
+
+        let stmt_b_handle = unsafe { handle_from_raw::<StmtHandle>(stmt_b) };
+        let claimed = crate::api::exec_common::claim_connection(dbc, stmt_b_handle, stmt_b, "test");
+        assert!(
+            claimed.is_ok(),
+            "statement B must claim the connection instead of seeing HY000 busy"
+        );
+
+        // Put B's claim in place, as the real execute path would, then confirm
+        // A can still report SQL_NO_DATA without contending for the connection.
+        dbc.inner.lock().unwrap().active_stmt = Some(stmt_b);
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        assert_eq!(
+            rc, SQL_NO_DATA,
+            "A's exhausted cursor must not contend with B's active claim"
+        );
+    }
+
+    /// The real-fetch counterpart to the test above: drives an actual
+    /// zero-row result set (`SELECT ... WHERE 1=0`) through `sql_fetch_scroll`
+    /// → `fill_rowset` → the real `peek_is_safe` branch →
+    /// `release_busy_if_row_exhausted`, and observes `active_stmt` become
+    /// `None` as a *produced effect* of that real code path rather than a
+    /// hand-set precondition. Fails on `main`, which has no early-release
+    /// logic at all.
+    ///
+    /// This is the closest equivalent this crate's test harness can drive:
+    /// [`mssql_tds::test_client_support`]'s scripted-token replay has no real
+    /// row bytes (see its module doc), so `next_row_cursor` can only ever
+    /// return `Ok(false)`/`Err` for it, never `Ok(true)` positioned on an
+    /// actual row — a genuine *one*-row variant of this test is not
+    /// reachable from mssql-odbc today without extending that harness (in
+    /// `mssql-tds`) with a "positioned row" scripted-token variant.
+    #[test]
+    fn real_zero_row_fetch_through_fill_rowset_releases_active_stmt() {
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut s = stmt.inner.lock().unwrap();
+            s.set_state(STMT_STATE_CURSOR_OPEN);
+            s.column_metadata = int_columns(1);
+        }
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_tokens(vec![col_metadata_empty(), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1 WHERE 1=0;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+
+        assert_eq!(rc, SQL_NO_DATA);
+        assert!(
+            dbc.inner.lock().unwrap().active_stmt.is_none(),
+            "a real fetch through fill_rowset that finds the result set \
+             already exhausted must release active_stmt itself (AB#47508) — \
+             this never happens on main"
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
     /// Row-wise binding is not implemented, and reporting HYC00 is better than

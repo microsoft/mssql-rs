@@ -18,7 +18,10 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
 
 1. Read the PR title/description to understand intent. Flag if the description is
    missing or doesn't match the diff. This repo requires a linked GitHub issue or
-   Azure DevOps work item — flag a PR that has neither.
+   Azure DevOps work item — flag a PR that has neither. Resolving an `AB#` reference
+   is worth it when you can: it catches a PR that drifts from what its work item
+   asked, or one still open against a closed item. See step 6 for handling ADO in an
+   unattended run.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -117,6 +120,18 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    - notes in the body that it came from an unattended run, so the author knows the
      findings were not checked by a human first.
    - never merges, and never resolves a thread it did not open.
+   - treats every interactive authentication path as unavailable, and prefers a tool
+     that fails loudly over one that waits politely. The Azure DevOps MCP server is the
+     known trap: its OAuth flow blocks on a browser nobody will open, and the run keeps
+     reporting itself as healthy while it hangs. Use whatever non-interactive ADO access
+     you have instead, bound it with a timeout, and mark ADO unavailable for the rest of
+     the run on the first failure rather than retrying per PR.
+
+   **Fail open.** ADO is context, not a gate: it confirms a PR does what its work item
+   asked. When it is unreachable, take an `AB#<number>` at face value as satisfying the
+   linked-work-item requirement in step 1 and review normally. Report the skipped
+   cross-check in the run log, not in the PR — a reviewer's infrastructure trouble is
+   not the author's problem.
 7. Ground yourself in reference code and public/private documentation/specifications.
    If you don't know the codebase, or which references to use, ask for context before
    reviewing.
@@ -244,6 +259,12 @@ the rule exists and do not need re-deriving. Last reviewed 2026-08.
   ```bash
   gh issue list --state all --search "row decode perf"
   ```
+- **"This allocates redundantly": read the signature first.** `String::from_utf8_lossy`
+  returns `Cow<'_, str>` and borrows on the valid path — it allocates only to repair
+  malformed input, so "drop the throwaway `String`" is a no-op. Nor are the lossy
+  converters symmetric: `from_utf16_lossy` takes `&[u16]`, has no borrowing form, and
+  genuinely allocates, so one is not precedent for the other. A redundant *scan* is
+  often the real cost, and is a different finding. Retracted twice on one PR.
 - **Repo conventions**: a real convention finding cites the file and line that
   mandates it. Verify against `.github/PULL_REQUEST_TEMPLATE.md`,
   `CONTRIBUTING.md` / `AGENTS.md` / `.github/copilot-instructions.md`, and actual
@@ -262,6 +283,30 @@ the rule exists and do not need re-deriving. Last reviewed 2026-08.
   example, already tracked by a TODO in `disconnect.rs` — is a legitimate deferral,
   because fixing it in one path and not the others is worse than scheduling it as its
   own change.
+
+## Where Reviews Have Failed to Look
+
+The counterpart to the list above: not findings that were raised and were wrong, but
+places a careful pass never examined. Each entry names the spot, not the PR.
+
+- **A documented residual failure still needs its blast radius traced.** When a PR
+  accepts "this now fails later as `HY000` instead of `22001`", the review question is
+  not only which SQLSTATE surfaces but what the failure *costs* — connection,
+  statement, or transaction. In `mssql-tds` that turns on whether `PacketWriter` has
+  flushed: `SqlType::serialize` writes the RPC type metadata preamble before
+  `TdsValueSerializer::serialize_value` (`datatypes/sqltypes.rs`), so bytes exist in
+  the writer, but nothing reaches the wire until `handle_overflow_if_needed` observes
+  `position() >= max_payload_size` (`io/packet_writer.rs`). Below that threshold the
+  message is abandoned by dropping the writer; above it, recovery needs
+  `cancel_current_message` plus consuming the server's DONE token, as that method's
+  own doc comment states. A test written with a short value pins only the benign
+  regime and leaves the risky one uncovered.
+- **Worked examples in `docs/*.md` are checkable claims, not commentary.** Byte
+  counts, code points and expansion arithmetic in a design doc are load-bearing for
+  whoever picks up the deferred work, and cost seconds to verify. One revision called
+  `&#9749;` (U+2615) an "eight-byte numeric character reference" and totalled three of
+  them as 24 bytes offered to a `varchar(3)`; it is seven bytes, so 21. The 8 belonged
+  to the five-digit `&#26085;` (U+65E5) example nearby.
 
 ## Reviewing Alongside Other Reviewers
 

@@ -73,6 +73,49 @@ authoritative parity reference for this crate. Its source lives in the
     — an ANSI-transfer default this driver has no equivalent for, since its
     `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
     type would silently corrupt data. Tracked in AB#47365.
+  - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
+    writes the client code page. msodbcsql uses the client code page -
+    `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
+    (`odbc/sqlcprot.h:2830`), which is `GetACP()` on Windows
+    (`Common/include/Localization.hpp:742`) and `nl_langinfo(CODESET)` elsewhere
+    (`LocalizationImpl.hpp:386`); the parameter path reads it directly at
+    `sqlcfunc.cpp:2913`. The two therefore agree under a UTF-8 locale and differ
+    on a default Windows one. Taken because mssql-python, the only supported
+    consumer, is UTF-8 native; the ODBC "C Data Types" appendix fixes no encoding
+    for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
+    consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
+    AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
+  - **Parameter length is measured in UTF-16 units for both character C types.**
+    msodbcsql counts UTF-16 units in three of its four arms - both wide-source
+    arms, and the narrow-to-wide walk, which counts an astral character as two
+    (`odbc/sqlcfunc.cpp:2935`) - but counts source bytes for narrow-to-narrow
+    (`cchDest = cbData`, `:2952`). That byte count is the wire length only while
+    no client-side transcode happens: TDS carries a collation with char data, so
+    the bytes normally ship under a declared collation and the server converts.
+    `DoCharToCharConversion` (`odbc/sqlcprot.h:4113`) enables client-side
+    conversion for an encoding TDS cannot name - a UTF-8 client against a
+    non-UTF-8 server, or the ISO-8859-x range - and translation is on by default
+    (`SQL_XL_DEFAULT`). In that configuration msodbcsql transcodes yet still
+    measures the *pre-transcode* UTF-8 bytes, so it rejects a four-character
+    accented string from a `varchar(4)` that the four bytes it actually sends
+    would fit, while accepting the same value as `SQL_C_WCHAR`. Because this
+    driver's `SQL_C_CHAR` is always UTF-8, copying the byte rule made that
+    latent msodbcsql defect unconditional. The uniform unit is therefore taken
+    to stop the two C types disagreeing on one value, not to match msodbcsql -
+    it is a divergence in the configuration closest to this driver, on the same
+    footing as the narrow-to-wide off-by-one at `sqlcfunc.cpp:2926` that is also
+    deliberately not replicated. The count still errs low against a `_UTF8` or
+    DBCS collation: a bounded `char`/`varchar` surfaces `HY000` from
+    `serialize_char_varchar_direct` rather than `22001`, and the `max` and
+    `text`/`ntext` types carry no check at all and send the over-long value.
+    **This regresses a subset of inputs rather than being a pure win** - three
+    U+2615 into `varchar(3)` was a correct `22001` and is now an opaque failure,
+    so CJK and astral input bound with an exact character count is the shape that
+    suffers. Taken because over-rejection has no application workaround while
+    under-rejection still errors, and because byte-counting both C types would
+    break the wide arm that msodbcsql gets right. Exactness needs the collation at
+    this layer. Signed off by Theekshna Kotian (product owner) on 2026-08-27.
+    Tracked in AB#47584.
 
 ## No panics
 
@@ -118,9 +161,14 @@ authoritative parity reference for this crate. Its source lives in the
     `mssql_tds::TdsError` bubbling up from the protocol layer. For
     `TdsError::SqlServerError` it fans out to one record per server-reported
     error, mapping each error number to a SQLSTATE via the static
-    `SERVER_ERROR_TO_SQL_STATE_MAP`; for other variants it posts a single
-    record using `default_sqlstate`. Pick `08001` for connect-time
-    failures and `HY000` for execution/fetch failures.
+    `SERVER_ERROR_TO_SQL_STATE_MAP` and falling back to the message's TDS
+    severity class when the number is unmapped (`> 18` → `HY000`, `> 10` →
+    `42000`, else `01000`, matching msodbcsql's `sqlcerr.cpp:1385-1401`); for
+    other variants it posts a single record using `default_sqlstate`. Pick
+    `08001` for connect-time failures and `HY000` for execution/fetch
+    failures. Do not add rows to `SERVER_ERROR_TO_SQL_STATE_MAP` to correct a
+    single error's SQLSTATE — entries there are a permanent compatibility
+    commitment, and the severity fallback already covers unmapped errors.
   Never hand-roll `post_sql_error` over a `TdsError` — you lose the
   per-server-error fan-out and the SQLSTATE mapping.
 - Every ODBC entry point must clear the handle's diagnostic records at API

@@ -14,8 +14,8 @@ use std::ffi::c_void;
 use crate::api::alloc_handle::sql_alloc_handle;
 use crate::api::free_handle::sql_free_handle;
 use crate::api::odbc_types::{
-    SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NULL_HANDLE,
-    SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle,
+    SQL_ATTR_ODBC_VERSION, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
+    SQL_NULL_HANDLE, SQL_OV_ODBC3_80, SQL_SUCCESS, SqlHandle, SqlReturn,
 };
 use crate::api::set_env_attr::sql_set_env_attr;
 use crate::handles::dbc::ConnectionState;
@@ -42,6 +42,7 @@ pub(crate) struct TestHandles {
     pub(crate) dbc: SqlHandle,
     pub(crate) stmt: SqlHandle,
     extra_stmts: Vec<SqlHandle>,
+    extra_descs: Vec<SqlHandle>,
 }
 
 impl TestHandles {
@@ -70,6 +71,7 @@ impl TestHandles {
             dbc: SQL_NULL_HANDLE,
             stmt: SQL_NULL_HANDLE,
             extra_stmts: Vec::new(),
+            extra_descs: Vec::new(),
         }
     }
 
@@ -110,6 +112,66 @@ impl TestHandles {
         assert!(!stmt.is_null());
         self.extra_stmts.push(stmt);
         stmt
+    }
+
+    /// Allocate an explicit descriptor (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`)
+    /// under the same DBC. The returned handle is tracked and freed on drop,
+    /// before the DBC. Marks the DBC connected first (idempotent) so tests get
+    /// a realistic connected-session baseline — not required by `alloc_desc`
+    /// itself, which doesn't gate on connection state.
+    pub(crate) fn alloc_explicit_desc(&mut self) -> SqlHandle {
+        self.mark_dbc_connected();
+        let mut desc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, self.dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+        assert!(!desc.is_null());
+        self.extra_descs.push(desc);
+        desc
+    }
+
+    /// Frees one statement previously returned by `alloc_extra_stmt` ahead of
+    /// `Drop`, and stops tracking it so `Drop` does not free it again.
+    pub(crate) fn free_extra_stmt(&mut self, stmt: SqlHandle) -> SqlReturn {
+        let ret = unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
+        self.extra_stmts.retain(|&s| s != stmt);
+        ret
+    }
+
+    /// Frees one explicit descriptor previously returned by
+    /// `alloc_explicit_desc` ahead of `Drop`, and stops tracking it so `Drop`
+    /// does not free it again.
+    pub(crate) fn free_explicit_desc(&mut self, desc: SqlHandle) -> SqlReturn {
+        let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
+        self.extra_descs.retain(|&d| d != desc);
+        ret
+    }
+
+    /// Allocates a second, independent connection under the same ENV, with
+    /// one explicit descriptor already allocated on it — for
+    /// cross-connection rejection tests. Both are freed by
+    /// [`OtherConnection`]'s own `Drop`, before this `TestHandles`'s ENV.
+    pub(crate) fn alloc_other_connection(&self) -> OtherConnection {
+        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, self.env, &mut dbc) },
+            SQL_SUCCESS
+        );
+        // Connects the DBC (though `alloc_desc` no longer requires it — see
+        // its doc comment) so this mirrors a realistic connected-session
+        // cross-connection scenario; same technique as `mark_dbc_connected`.
+        unsafe { handle_from_raw::<DbcHandle>(dbc) }
+            .inner
+            .lock()
+            .unwrap()
+            .connection_state = ConnectionState::Connected;
+        let mut desc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+        OtherConnection { dbc, desc }
     }
 
     /// Force the DBC into the `Connected` state without establishing a real
@@ -160,12 +222,33 @@ impl Drop for TestHandles {
             if !self.stmt.is_null() {
                 sql_free_handle(SQL_HANDLE_STMT, self.stmt);
             }
+            for desc in self.extra_descs.drain(..) {
+                sql_free_handle(SQL_HANDLE_DESC, desc);
+            }
             if !self.dbc.is_null() {
                 sql_free_handle(SQL_HANDLE_DBC, self.dbc);
             }
             if !self.env.is_null() {
                 sql_free_handle(SQL_HANDLE_ENV, self.env);
             }
+        }
+    }
+}
+
+/// A second, independent connection (with one explicit descriptor already
+/// allocated on it) returned by [`TestHandles::alloc_other_connection`], for
+/// cross-connection rejection tests. Frees the descriptor, then the DBC, on
+/// drop.
+pub(crate) struct OtherConnection {
+    dbc: SqlHandle,
+    pub(crate) desc: SqlHandle,
+}
+
+impl Drop for OtherConnection {
+    fn drop(&mut self) {
+        unsafe {
+            sql_free_handle(SQL_HANDLE_DESC, self.desc);
+            sql_free_handle(SQL_HANDLE_DBC, self.dbc);
         }
     }
 }

@@ -6,6 +6,7 @@
 #include "odbc_test_fixture.h"
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 // ===================================================================
@@ -447,6 +448,53 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// The same cancel once a chunk has crossed a packet boundary. This is the one
+// event that strands *both* drivers, so it is the parity case for the
+// retraction: msodbcsql takes BATCHCTX::Cancel's STATE_BATCH_PARTIALCMDSENT arm
+// and this driver takes `cancel_streamed_write`. The test above cancels after
+// seven bytes, which never leave the local buffer. AB#47687.
+TEST_F(PrepareExecuteLiveTest, SQLCancelAfterAFlushRetractsTheRequest) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    // Larger than the default 8000-byte packet, so a packet is on the wire
+    // before the cancel.
+    std::vector<char> chunk(20000, 'a');
+    ASSERT_SQL_OK(SQLPutData(stmt_, chunk.data(), static_cast<SQLLEN>(chunk.size())),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLUINTEGER dead = SQL_CD_TRUE;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead,
+                                    SQL_IS_UINTEGER, nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(SQL_CD_FALSE, dead)
+        << "a retracted request must not cost the connection";
+
+    // An unconsumed DONE would be picked up by this execute, so completing a
+    // second sequence is what proves the withdrawal finished.
+    const char reuse[] = "after-cancel";
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(reuse), sizeof(reuse) - 1),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("after-cancel", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // A data-at-execution parameter may resolve to NULL: the first SQLPutData
 // carries SQL_NULL_DATA and no chunks follow, so the driver emits PLP_NULL.
 // Benefits-from-mock-tds: COALESCE only proves the server saw *a* NULL. A mock
@@ -646,6 +694,71 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
 
     EXPECT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Streaming writes SQLPutData chunks to the wire untranscoded - a UTF-8
+// sequence can straddle two calls - so the streamed type must be the one the C
+// buffer already holds. A cross-family binding is therefore refused at execute
+// rather than declared nvarchar and sent as UTF-8. The materialized path does
+// transcode it, so the two paths deliberately differ until AB#47590 lands.
+//
+// msodbcsql supports the pairing, hence the skip.
+TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_WVARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    // The refusal happens while building the parameter list, before any RPC is
+    // opened, so no streaming sequence is left half-started: the statement takes
+    // a new binding without an intervening SQLCancel.
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLCHAR> value = {'o', 'k', '\0'};
+    SQLLEN value_ind = SQL_NTS;
+    ASSERT_SQL_OK(BindChar(1, value, value_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("ok", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The same-family long pairing still streams. Its placeholder is varchar(max),
+// which is also what the materialized path now declares for SQL_LONGVARCHAR
+// until text/ntext can be sent (AB#47592), so the two agree.
+//
+// ColumnSize must be a real length: 0 is the `max` sentinel for SQL_VARCHAR but
+// invalid for the long types on both drivers (HY104), as
+// ZeroColumnSizeIsRejectedForFixedLengthCharTypes pins. The streamed path does
+// not enforce it either way (AB#47590).
+TEST_F(PrepareExecuteLiveTest, LongVarcharDataAtExecutionStreams) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 8000, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+    const char chunk[] = "streamed";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 8),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("streamed", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // A wide-character parameter binds as nvarchar and round-trips.

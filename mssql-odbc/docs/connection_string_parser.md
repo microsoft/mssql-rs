@@ -158,6 +158,7 @@ pass both keys directly; mssql-python collapses the group to a single canonical
 | `HostnameInCertificate` | `EncryptionOptions::host_name_in_cert` | verbatim |
 | `ServerCertificate` | `EncryptionOptions::server_certificate` (path) | verbatim path |
 | `ServerSPN` | `ClientContext::server_spn` | verbatim |
+| `APP` | `ClientContext::application_name` | verbatim |
 | `ApplicationIntent` | `ClientContext::application_intent` | `ReadOnly` / `ReadWrite` |
 | `MultiSubnetFailover` | `ClientContext::multi_subnet_failover` | `Yes` / `No` |
 | `IpAddressPreference` | `ClientContext::ipaddress_preference` | `IPv4First` / `IPv6First` / `UsePlatformDefault`; unknown → `IPv4First` |
@@ -195,8 +196,10 @@ Whole-value, case-insensitive, exact match (not prefix, not `y`/`1`):
   mssql-tds. An empty value is a recognized reset.
 
 Pass-through string keys (`Server`/`Addr`/`Address`, `Database`, `UID`, `PWD`,
-`ServerSPN`, `HostnameInCertificate`, `ServerCertificate`) are stored verbatim with
-no value validation, exactly as msodbcsql does.
+`APP`, `ServerSPN`, `HostnameInCertificate`, `ServerCertificate`) are stored verbatim
+with no value validation, exactly as msodbcsql does. (msodbcsql additionally rejects
+an `APP` longer than 128 characters; per-key length caps are an intentional non-goal
+here — see below.)
 
 ## Keys we recognize but do not act on
 

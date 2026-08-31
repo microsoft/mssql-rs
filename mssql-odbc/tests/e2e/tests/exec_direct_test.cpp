@@ -115,6 +115,43 @@ TEST_F(ExecDirectLiveTest, InvalidSql) {
     EXPECT_SQL_ERROR(rc);
 }
 
+// AB#47532: a server error with no entry in the error-number→SQLSTATE map takes
+// its state from the TDS severity class, not from a fixed HY000. In msodbcsql's
+// compatibility tiers, severity 11-18 reports 42000, which wrappers classify as
+// a programming error. None of the error numbers below is in the map — nor in
+// msodbcsql's — so these tests only pass through the severity tier.
+TEST_F(ExecDirectLiveTest, SyntaxErrorReports42000) {
+    // Error 102/156, severity 15.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT * FROM");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+}
+
+TEST_F(ExecDirectLiveTest, ConversionErrorReports42000) {
+    // Error 257, severity 16 — implicit varchar→varbinary conversion.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "DECLARE @b VARBINARY(10); SET @b = 'not binary';");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+}
+
+TEST_F(ExecDirectLiveTest, RaiseErrorSeverity16Reports42000) {
+    // Native 50000 — RAISERROR's generic user-message number. It is deliberately
+    // absent from the map (it carries no fixed semantic), so only severity can
+    // classify it.
+    SqlTString sql = ODBCTestUtils::ToSqlTStr("RAISERROR(N'boom', 16, 1);");
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+
+    SQLINTEGER native = 0;
+    std::string message = GetDiagMessageForRecord(stmt_, 1, &native);
+    EXPECT_EQ(50000, native);
+    EXPECT_NE(std::string::npos, message.find("boom"));
+}
+
 // Re-executing on the same STMT requires closing the cursor first.
 // SQLExecDirectW leaves an open cursor for result-bearing queries; the caller
 // must call SQLCloseCursor (or SQLFreeStmt(SQL_CLOSE)) before re-executing.
@@ -181,6 +218,33 @@ TEST_F(ExecDirectLiveTest, InfoMessagesSurfaceAsDiagnostics) {
     // No more statements.
     rc = SQLMoreResults(stmt_);
     EXPECT_EQ(SQL_NO_DATA, rc);
+}
+
+// AB#47535: a PRINT reached only after variable assignments must still surface
+// its message on SQLExecDirect itself. The assignments carry a SQLSELECT-tagged
+// DONE_COUNT; when those were treated as update counts the batch stopped on the
+// assignment and SQLExecDirect returned plain SQL_SUCCESS, so callers that only
+// read diagnostics on SQL_SUCCESS_WITH_INFO (mssql-python's cursor.messages)
+// saw nothing at all.
+TEST_F(ExecDirectLiveTest, PrintAfterAssignmentsSurfacesOnExecute) {
+    SqlTString sql = ODBCTestUtils::ToSqlTStr(
+        "DECLARE @msg VARCHAR(MAX);"
+        " SET @msg = REPLICATE(CAST('a' AS VARCHAR(MAX)), 2047);"
+        " PRINT @msg;");
+
+    SQLRETURN rc = SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+
+    SQLINTEGER native = 0;
+    std::string message = GetDiagMessageForRecord(stmt_, 1, &native);
+    EXPECT_EQ(0, native);
+    EXPECT_NE(std::string::npos, message.find("aaaaaaaaaa"));
+
+    // The assignments produced no navigable result of their own.
+    SQLLEN row_count = 0;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(-1, row_count);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
 }
 
 TEST_F(ExecDirectLiveTest, FetchOnFreshStatementReturnsHy010) {

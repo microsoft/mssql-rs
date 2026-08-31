@@ -48,12 +48,51 @@ pub(crate) struct DbcHandle {
 unsafe impl Send for DbcHandle {}
 unsafe impl Sync for DbcHandle {}
 
+/// Pre-connect values from the `SQL_COPT_SS_*` attributes that duplicate a
+/// connection-string keyword.
+///
+/// mssql-python applies `attrs_before` unfiltered at connect, so a caller can
+/// configure the same setting through either path. Measured against msodbcsql
+/// 18, the two paths do not rank the same way:
+///
+/// - The vendor attributes here **override** the keyword. `Encrypt=no` in the
+///   string plus `SQL_COPT_SS_ENCRYPT=1` connects encrypted, and the reverse
+///   pairing connects unencrypted; `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE=0`
+///   overrides `TrustServerCertificate=yes` hard enough to fail the handshake.
+/// - `SQL_ATTR_CURRENT_CATALOG` is the opposite: the `Database=` keyword wins
+///   and the attribute is only a fallback (see `driver_connect`).
+///
+/// So this is deliberately not a general "attributes beat keywords" rule -- it
+/// is per attribute, and each field here was confirmed by observing the
+/// resulting session in `sys.dm_exec_connections` rather than by reading a
+/// header.
+///
+/// Values are normalized on the way in, matching msodbcsql: setting any of
+/// these to an out-of-range `7` and reading it back post-connect returns `1`,
+/// so the driver stores the effective value rather than the caller's input.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct VendorConnOverrides {
+    /// `SQL_COPT_SS_ENCRYPT` (1223): `0` no, `1` yes, `2` strict.
+    pub(crate) encrypt: Option<u32>,
+    /// `SQL_COPT_SS_TRUST_SERVER_CERTIFICATE` (1228): `0` or `1`.
+    pub(crate) trust_server_certificate: Option<u32>,
+    /// `SQL_COPT_SS_INTEGRATED_SECURITY` (1203): `0` or `1`.
+    pub(crate) integrated_security: Option<u32>,
+}
+
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
     pub(crate) diag_records: Vec<DiagRecord>,
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
     pub(crate) statements: Vec<*mut c_void>,
+    /// Explicitly-allocated DESC handles (`SQLAllocHandle(SQL_HANDLE_DESC, ...)`),
+    /// owned by this connection independent of any one statement. A statement
+    /// references one by raw pointer in `StmtState::active_ard`/`active_apd`
+    /// once associated (`SQLSetStmtAttrW`); freeing an entry here
+    /// (`SQLFreeHandle(SQL_HANDLE_DESC)`) resets every statement referencing
+    /// it back to its own implicit descriptor first.
+    pub(crate) descriptors: Vec<*mut c_void>,
     /// The STMT handle that currently has an open cursor, if any.
     /// Set when SQLExecDirect succeeds; cleared by SQLCloseCursor /
     /// SQLFreeStmt(SQL_CLOSE). Used to enforce the non-MARS rule that only
@@ -67,6 +106,15 @@ pub(crate) struct DbcState {
     /// Login timeout in seconds set via `SQL_ATTR_LOGIN_TIMEOUT`. Applied to the
     /// TDS login deadline at connect time. `Some(0)` means wait indefinitely.
     pub(crate) login_timeout: Option<u32>,
+    /// Pre-connect overrides from the `SQL_COPT_SS_*` attribute forms of
+    /// connection-string keywords. `None` means "the caller did not set this
+    /// attribute", which is what lets the keyword stand.
+    pub(crate) vendor_overrides: VendorConnOverrides,
+    /// Effective vendor settings for the current connected session. Kept
+    /// separate from [`vendor_overrides`](Self::vendor_overrides) so a keyword
+    /// resolved by one connection is never reused as an explicit attribute on
+    /// the next connection attempt.
+    pub(crate) effective_vendor_settings: Option<VendorConnOverrides>,
     /// `SQL_ATTR_ACCESS_MODE`. Stored so a set/get round-trip agrees; the driver
     /// does not yet vary its behaviour on it.
     pub(crate) access_mode: u32,
@@ -115,6 +163,19 @@ pub(crate) struct DbcState {
     /// driver-begun *piggyback* transactions that carry no user work. Only this
     /// flag blocks `SQLDisconnect` (25000) and `SQL_ATTR_TXN_ISOLATION` (HY011).
     pub(crate) local_tran_started: bool,
+    /// `SQL_ATTR_CURRENT_CATALOG`. Before connecting this holds the requested
+    /// initial database (the connection string's `Database=` keyword wins if
+    /// both are given, matching msodbcsql); afterwards the live name comes from
+    /// the TDS client's ENVCHANGE tracking, so this is only the pre-connect
+    /// seed and the fallback answer for a disconnected `SQLGetConnectAttr`.
+    pub(crate) current_catalog: Option<String>,
+    /// Connection-level default for `SQL_ATTR_QUERY_TIMEOUT`, inherited by
+    /// statements allocated afterwards.
+    ///
+    /// `SQLSetConnectAttr` accepts statement options and both fans the value out
+    /// to the connection's existing statements and records it here for future
+    /// ones (msodbcsql `sqlcmisc.cpp:2879-2922`, `sqlcfunc.cpp:173`).
+    pub(crate) stmt_query_timeout: u32,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -125,6 +186,7 @@ impl std::fmt::Debug for DbcState {
             .field("diag_records", &self.diag_records)
             .field("connection_state", &self.connection_state)
             .field("statements", &self.statements)
+            .field("descriptors", &self.descriptors)
             .field("active_stmt", &self.active_stmt)
             .field("client", &self.client)
             .field(
@@ -135,6 +197,8 @@ impl std::fmt::Debug for DbcState {
             .field("autocommit", &self.autocommit)
             .field("txn_isolation", &self.txn_isolation)
             .field("local_tran_started", &self.local_tran_started)
+            .field("current_catalog", &self.current_catalog)
+            .field("stmt_query_timeout", &self.stmt_query_timeout)
             .finish()
     }
 }
@@ -158,9 +222,12 @@ impl DbcHandle {
                 diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
+                descriptors: Vec::new(),
                 active_stmt: None,
                 client: None,
                 access_token: None,
+                vendor_overrides: VendorConnOverrides::default(),
+                effective_vendor_settings: None,
                 login_timeout: None,
                 access_mode: SQL_MODE_READ_WRITE,
                 connection_timeout: 0,
@@ -170,6 +237,8 @@ impl DbcHandle {
                 local_tran_started: false,
                 server_isolation_unknown: false,
                 reset_generation: 0,
+                current_catalog: None,
+                stmt_query_timeout: 0,
             }),
         }
     }
@@ -191,5 +260,29 @@ impl DbcHandle {
 impl HasObjectType for DbcHandle {
     fn object_type_mut(&mut self) -> &mut HandleType {
         &mut self.object_type
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::handles::handle_from_raw;
+    use crate::test_support::TestHandles;
+
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_token_and_reports_the_attribute_state() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut state = dbc.inner.lock().unwrap();
+        state.access_token = Some("super-secret-jwt".into());
+        state.current_catalog = Some("reporting".into());
+        state.stmt_query_timeout = 30;
+
+        let rendered = format!("{:?}", *state);
+        assert!(!rendered.contains("super-secret-jwt"));
+        assert!(rendered.contains("<REDACTED>"));
+        assert!(rendered.contains("current_catalog: Some(\"reporting\")"));
+        assert!(rendered.contains("stmt_query_timeout: 30"));
     }
 }
