@@ -478,6 +478,28 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
     EXPECT_EQ("7", ExecuteAndReadBack());
 }
 
+// The cross-family pairings are bindable now, so a data-at-execution indicator
+// on one is refused at execute rather than at bind: the DAE indicator is only
+// read when the parameter list is built. Streaming would have to write the C
+// buffer's bytes to the wire untranscoded, which cannot serve an integer wire
+// type, so the pairing stays materialize-only (AB#47590).
+TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
+    for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN ind = SQL_DATA_AT_EXEC;
+        SQLCHAR token = 0;
+        // The bind itself is accepted - that is the change from before.
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c_type, SQL_INTEGER,
+                                       0, 0, &token, 0, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << "c type " << c_type;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+        ResetParams();
+    }
+}
+
 // Binary stays outside the character/integer composition, so neither direction
 // gains a binary pairing.
 TEST_F(CrossConversionLiveTest, BinaryPairingsStayRejectedAtBind) {

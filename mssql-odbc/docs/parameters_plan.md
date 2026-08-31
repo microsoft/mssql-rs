@@ -93,6 +93,13 @@ transparent reconnects.
 - **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
   `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` as PLP
   `(n)varchar(max)` / `varbinary(max)`, matching msodbcsql sequencing.
+  Cross-family pairings are **not** streamable: the chunks go to the wire
+  untranscoded, which cannot serve an integer wire type. Since P5 made those
+  pairings bindable, the refusal moved from `SQLBindParameter` to execute - the
+  DAE indicator is only read while building the parameter list - so an
+  application gets `HYC00` from `SQLExecute` after setting up its
+  `SQLParamData` loop rather than at bind. Pinned by
+  `CrossFamilyDataAtExecutionIsRejectedAtExecute`.
 
 ## `mssql-tds` prepared API
 

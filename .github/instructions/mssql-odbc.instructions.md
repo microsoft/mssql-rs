@@ -151,7 +151,9 @@ authoritative parity reference for this crate. Its source lives in the
     `SQL_DIAG_SQLSTATE` (`odbc/sqlcerr.cpp:990`) and
     `cli_common/src/clntcomn.cpp:1015`, not the server-keyed table at
     `odbc/sqlcstr.cpp:136`. `BlankOnlyWideLiteralIs22018` carries
-    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369.
+    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
+    outstanding 18.6.2.1 measurements land - keep the running record there
+    rather than growing this file per build.
 
 ## No panics
 

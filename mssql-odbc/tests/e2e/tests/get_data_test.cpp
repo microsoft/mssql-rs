@@ -1693,6 +1693,24 @@ TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
     SQLCloseCursor(stmt_);
 }
 
+// An embedded NUL ends the number on this side too. The column value is real
+// data whose length is authoritative, but the parser is the one msodbcsql uses
+// in both directions - CharToBigint's loop stops at the NUL whichever way the
+// data moves (sqlccnvt.cpp:7800) - so "1\0 2" reads as 1 rather than 22018.
+TEST_F(GetDataLiveTest, EmbeddedNulEndsANumericColumn) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(CHAR(49) + CHAR(0) + CHAR(50) AS VARCHAR(8))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER out = 0;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &out, sizeof(out), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, out);
+
+    SQLCloseCursor(stmt_);
+}
+
 // A character column holding more digits than an exact i128 mantissa still
 // reaches a float target at full precision. The parser is shared with the
 // parameter direction, which reduces such a literal to an integer part plus a

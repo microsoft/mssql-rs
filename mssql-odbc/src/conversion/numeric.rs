@@ -24,8 +24,11 @@ pub(crate) enum NumericSource {
     /// A decimal literal with more digits than an exact `i128` mantissa holds.
     /// `approx` serves float targets; integer targets need only the integer part
     /// and whether anything non-zero was dropped, which survives any length.
+    /// `negative` is kept separately because `int_part` cannot hold the sign of
+    /// `-0.something` and `approx` can underflow to `-0.0`.
     WideDecimal {
         approx: f64,
+        negative: bool,
         int_part: i128,
         fraction_dropped: bool,
     },
@@ -49,7 +52,12 @@ impl NumericSource {
         match self {
             NumericSource::Int(v) => *v < 0,
             NumericSource::Scaled { mantissa, .. } => *mantissa < 0,
-            NumericSource::WideDecimal { approx, .. } => *approx < 0.0,
+            NumericSource::WideDecimal {
+                negative,
+                int_part,
+                fraction_dropped,
+                ..
+            } => *negative && (*int_part != 0 || *fraction_dropped),
             NumericSource::Float(f) => *f < 0.0,
         }
     }
@@ -84,11 +92,14 @@ impl NumericSource {
 
 /// Parses a plain decimal literal (`-12.34`, `+7`, `.5`) into an exact
 /// [`NumericSource::Scaled`]. Exponent forms are left to the `f64` fallback.
-pub(crate) fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
-    let t = text.trim();
-    let (negative, body) = match t.strip_prefix('-') {
+///
+/// Private, and deliberately does not trim: `parse_numeric_text` has already
+/// applied the blanks-only rule, and `str::trim` here would silently re-admit
+/// the whole Unicode whitespace set that rule exists to reject.
+fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
+    let (negative, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
     };
     let (int_digits, frac_digits) = match body.split_once('.') {
         Some((i, f)) => (i, f),
@@ -210,6 +221,7 @@ fn parse_wide_decimal(text: &str) -> Option<NumericSource> {
     let approx: f64 = text.parse().ok()?;
     Some(NumericSource::WideDecimal {
         approx,
+        negative,
         int_part: if negative { -int_part } else { int_part },
         fraction_dropped: frac_digits.bytes().any(|b| b != b'0'),
     })
@@ -236,11 +248,11 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_decimal_literal(" .5 "),
-            Some(NumericSource::Scaled {
+            parse_numeric_text(" .5 ").unwrap(),
+            NumericSource::Scaled {
                 mantissa: 5,
                 scale: 1
-            })
+            }
         );
         // A leading zero in the fraction is absorbed into the mantissa while
         // scale still counts both digits.
@@ -260,6 +272,42 @@ mod tests {
         assert_eq!(parse_decimal_literal("abc"), None);
         assert_eq!(parse_decimal_literal(""), None);
         assert_eq!(parse_decimal_literal("-"), None);
+    }
+
+    /// A NUL ends the number in both directions, because `CharToBigint`'s loop
+    /// stops there whichever way the data moves (`sqlccnvt.cpp:7800`). On a
+    /// bound buffer that forgives an application passing `strlen + 1`; on a
+    /// fetched column it means an embedded NUL truncates rather than rejecting.
+    #[test]
+    fn a_nul_ends_the_number_in_either_direction() {
+        assert_eq!(
+            parse_numeric_text("-42\u{0}").unwrap().to_i128_truncating(),
+            Some((-42, false))
+        );
+        assert_eq!(
+            parse_numeric_text("1\u{0}2").unwrap().to_i128_truncating(),
+            Some((1, false))
+        );
+        // Nothing before the NUL is no number at all.
+        assert_eq!(
+            parse_numeric_text("\u{0}12"),
+            Err(ConvError::InvalidCharacterValue)
+        );
+    }
+
+    /// The sign of a wide literal cannot come from `approx`: a magnitude below
+    /// `f64::MIN_POSITIVE` underflows to `-0.0`, and `-0.0 < 0.0` is false, so
+    /// `SQL_C_BIT` would write 0 instead of reporting an out-of-range negative.
+    #[test]
+    fn a_wide_decimal_keeps_its_sign_through_underflow() {
+        let tiny = format!("-0.{}{}", "0".repeat(400), "9".repeat(39));
+        let source = parse_numeric_text(&tiny).unwrap();
+        assert_eq!(source.as_f64(), -0.0, "precondition: underflows");
+        assert!(source.is_negative());
+
+        // A negative zero is not negative: nothing non-zero survives it.
+        let zero = format!("-0.{}", "0".repeat(40));
+        assert!(!parse_numeric_text(&zero).unwrap().is_negative());
     }
 
     /// A literal past an exact mantissa still has to reach a float target at
