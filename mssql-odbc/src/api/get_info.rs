@@ -268,7 +268,6 @@ fn write_wide_str(
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn driver_name() -> &'static str {
     env!("MSSQL_ODBC_ARTIFACT")
 }
