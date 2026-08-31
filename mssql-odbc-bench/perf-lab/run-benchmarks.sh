@@ -26,8 +26,8 @@ BASELINE_TARGET_DIR="$REPO_ROOT/target/odbc-baseline"
 CANDIDATE_DRIVER_NAME="MSSQL Rust ODBC Perf Candidate"
 BASELINE_DRIVER_NAME="MSSQL Rust ODBC Perf Baseline"
 MICROSOFT_DRIVER_NAME="ODBC Driver 18 for SQL Server"
-NUMPY_VERSION="2.4.6"
-SCIPY_VERSION="1.18.0"
+NUMPY_VERSION="2.2.6"
+SCIPY_VERSION="1.15.3"
 
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a

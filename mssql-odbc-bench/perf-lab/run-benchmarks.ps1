@@ -462,8 +462,8 @@ $BaselineTargetDir = Join-Path $RepoRoot 'target\odbc-baseline'
 $CandidateDriverName = 'MSSQL Rust ODBC Perf Candidate'
 $BaselineDriverName = 'MSSQL Rust ODBC Perf Baseline'
 $script:MicrosoftDriverName = 'ODBC Driver 18 for SQL Server'
-$script:NumpyVersion = '2.4.6'
-$script:ScipyVersion = '1.18.0'
+$script:NumpyVersion = '2.2.6'
+$script:ScipyVersion = '1.15.3'
 
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
