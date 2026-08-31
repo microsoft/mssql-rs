@@ -1732,4 +1732,3 @@ TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
 
     SQLCloseCursor(stmt_);
 }
-
