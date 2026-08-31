@@ -888,9 +888,9 @@ mod tests {
     }
 
     #[test]
-    fn int_out_of_range_for_smallint() {
-        let mut out: i16 = 0;
-        let mut ind: SqlLen = 0;
+    fn int_out_of_range_for_smallint_leaves_outputs_unchanged() {
+        let mut out: i16 = 42;
+        let mut ind: SqlLen = -99;
         let err = conv(
             &ColumnValues::Int(40000),
             SQL_C_SSHORT,
@@ -899,6 +899,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConvError::OutOfRange);
+        assert_eq!(out, 42);
+        assert_eq!(ind, -99);
     }
 
     #[test]

@@ -21,6 +21,21 @@
 #include <cstring>
 #include <string>
 
+#ifndef SQL_C_SS_TIME2
+#define SQL_C_TYPES_EXTENDED 0x04000L
+#define SQL_C_SS_TIME2 (SQL_C_TYPES_EXTENDED + 0)
+
+typedef struct tagSS_TIME2_STRUCT {
+    SQLUSMALLINT hour;
+    SQLUSMALLINT minute;
+    SQLUSMALLINT second;
+    SQLUINTEGER fraction;
+} SQL_SS_TIME2_STRUCT;
+#endif
+
+static_assert(sizeof(SQL_SS_TIME2_STRUCT) == 12,
+              "SQL_SS_TIME2_STRUCT layout does not match the msodbcsql ABI");
+
 class FetchErrorSemanticsLiveTest : public ODBCTest {
 protected:
     void SetUp() override {
@@ -224,6 +239,21 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithZeroTimeIntoDateTargetIsClean) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(FetchErrorSemanticsLiveTest, DatetimeoffsetIntoSsTime2Succeeds) {
+    ASSERT_NO_FATAL_FAILURE(FetchOne(
+        "SELECT CAST('2023-01-01 12:34:56.1234567 +05:30' AS DATETIMEOFFSET(7)) AS c1"));
+
+    SQL_SS_TIME2_STRUCT t{};
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SS_TIME2, &t, sizeof(t), &ind));
+    EXPECT_LE(t.hour, 23);
+    EXPECT_LE(t.minute, 59);
+    EXPECT_EQ(56, t.second);
+    EXPECT_EQ(123456700u, t.fraction);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(t)), ind);
+    SQLCloseCursor(stmt_);
+}
+
 // ---------------------------------------------------------------------------
 // 01004 — the value was delivered but did not fit. The indicator carries the
 // *untruncated* length, which is how a caller sizes a second buffer, and the
@@ -312,8 +342,7 @@ TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaGetDat
 
     SQLWCHAR buf[37] = {};
     SQLLEN ind = 0;
-    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
-                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind));
     constexpr char expected[] = "0123ABCD-4567-89EF-0123-456789ABCDEF";
     for (size_t i = 0; i < sizeof(expected); ++i) {
         EXPECT_EQ(static_cast<SQLWCHAR>(expected[i]), buf[i]);
@@ -330,7 +359,7 @@ TEST_F(FetchErrorSemanticsLiveTest, GuidRendersAsUppercaseWithoutBracesViaBoundF
     char buf[37] = {};
     SQLLEN ind = 0;
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
     EXPECT_STREQ("0123ABCD-4567-89EF-0123-456789ABCDEF", buf);
     EXPECT_EQ(36, ind);
     SQLCloseCursor(stmt_);
