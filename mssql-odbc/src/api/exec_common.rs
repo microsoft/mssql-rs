@@ -24,6 +24,7 @@ use crate::api::odbc_types::{
 use crate::conversion::param_convert::{
     ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
 };
+use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
@@ -412,29 +413,57 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
 /// reading `StmtState::bound_params` exactly as it did before AB#47437.
 ///
-/// A poisoned APD or IPD mutex snapshots as "every parameter unbound" rather
-/// than failing the call outright: `build_named_params` already turns that
-/// into an accurate `07002` for any statement with markers.
-pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Vec<Option<BoundParam>> {
+/// `Err(SQL_ERROR)` on a poisoned STMT/env/APD/IPD mutex: the caller posts a
+/// diagnostic against the statement and fails the execute outright, rather
+/// than silently snapshotting "every parameter unbound" — which used to let
+/// a zero-marker statement execute successfully despite the internal
+/// failure, and reported a misleading `07002` for one with markers.
+pub(super) fn snapshot_bound_params(
+    stmt: &StmtHandle,
+) -> Result<Vec<Option<BoundParam>>, SqlReturn> {
+    // Read before the STMT lock below, matching bind_param.rs's own
+    // parent-before-child lock ordering for the same lookup.
+    let odbc_version = {
+        let env = stmt.parent_dbc().parent_env();
+        let Ok(env_state) = env.inner.lock() else {
+            error!("snapshotting parameters: env mutex poisoned");
+            return Err(SQL_ERROR);
+        };
+        env_state.odbc_version
+    };
+
     let (apd, ipd) = {
         let Ok(stmt_state) = stmt.inner.lock() else {
-            error!("snapshotting parameters: stmt mutex poisoned; treating as unbound");
-            return Vec::new();
+            error!("snapshotting parameters: stmt mutex poisoned");
+            return Err(SQL_ERROR);
         };
         (stmt_state.effective_apd(stmt), stmt.ipd)
     };
 
+    // `apd` can be an explicit descriptor resolved under the STMT lock,
+    // already dropped by now — re-check liveness right before dereferencing
+    // to narrow (not fully close) the race against a concurrent
+    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor. `ipd` is
+    // always `stmt.ipd`, freed only with the statement itself.
+    if crate::handles::live_type(apd) != Some(crate::handles::HandleType::Desc) {
+        error!("snapshotting parameters: apd freed concurrently");
+        return Err(SQL_ERROR);
+    }
     let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
     let Ok(apd_state) = apd_desc.inner.lock() else {
-        error!("snapshotting parameters: apd mutex poisoned; treating as unbound");
-        return Vec::new();
+        error!("snapshotting parameters: apd mutex poisoned");
+        return Err(SQL_ERROR);
     };
     let ipd_desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
     let Ok(ipd_state) = ipd_desc.inner.lock() else {
-        error!("snapshotting parameters: ipd mutex poisoned; treating as unbound");
-        return Vec::new();
+        error!("snapshotting parameters: ipd mutex poisoned");
+        return Err(SQL_ERROR);
     };
-    BoundParam::all_from_descriptor_states(&apd_state, &ipd_state)
+    Ok(BoundParam::all_from_descriptor_states(
+        &apd_state,
+        &ipd_state,
+        odbc_version,
+    ))
 }
 
 /// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
@@ -479,9 +508,15 @@ pub(super) unsafe fn build_named_params(
         let name = format!("@P{}", i + 1);
 
         // Check for a data-at-execution indicator before dereferencing the
-        // value buffer: DAE params carry no value at bind time.
-        let dae_indicator = if !bound_param.strlen_or_ind_ptr.is_null() {
-            let ind = unsafe { bound_param.strlen_or_ind_ptr.read_unaligned() };
+        // value buffer: DAE params carry no value at bind time. Read from
+        // `octet_length_ptr`, not `strlen_or_ind_ptr`: per ODBC's "Deferred
+        // Fields" spec, SQL_DESC_OCTET_LENGTH_PTR carries the length or a DAE
+        // sentinel, while SQL_DESC_INDICATOR_PTR carries only SQL_NULL_DATA
+        // status. `SQLBindParameter` writes the same pointer to both, so this
+        // is unchanged for the common case; `SQLSetDescFieldW`/`SQLSetDescRec`
+        // can set them independently.
+        let dae_indicator = if !bound_param.octet_length_ptr.is_null() {
+            let ind = unsafe { bound_param.octet_length_ptr.read_unaligned() };
             is_data_at_exec_indicator(ind).then_some(ind)
         } else {
             None
@@ -574,8 +609,18 @@ pub(super) fn finish_execute(
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
-        populate_ird(stmt, &metadata);
         return_client_busy(dbc, client);
+        if populate_ird(stmt, &metadata).is_err() {
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error refreshing result-set metadata",
+                );
+            }
+            return SQL_ERROR;
+        }
         return if has_server_info {
             SQL_SUCCESS_WITH_INFO
         } else {
@@ -610,8 +655,18 @@ pub(super) fn finish_execute(
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
-        populate_ird(stmt, &metadata);
         return_client_idle(dbc, statement_handle, client);
+        if populate_ird(stmt, &metadata).is_err() {
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error refreshing result-set metadata",
+                );
+            }
+            return SQL_ERROR;
+        }
         return if has_server_info {
             SQL_SUCCESS_WITH_INFO
         } else {
@@ -634,8 +689,18 @@ pub(super) fn finish_execute(
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
     drop(stmt_state);
-    populate_ird(stmt, &metadata);
     return_client_busy(dbc, client);
+    if populate_ird(stmt, &metadata).is_err() {
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error refreshing result-set metadata",
+            );
+        }
+        return SQL_ERROR;
+    }
     if has_server_info {
         SQL_SUCCESS_WITH_INFO
     } else {
@@ -1054,7 +1119,51 @@ mod tests {
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: ind as *mut SqlLen,
+            octet_length_ptr: ind as *mut SqlLen,
         }
+    }
+
+    /// The narrow race `snapshot_bound_params`'s liveness check guards
+    /// against: `effective_apd` resolves an explicit descriptor under the
+    /// STMT lock, which is dropped before the descriptor is actually locked
+    /// and read. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes
+    /// in that window, the stale pointer must fail cleanly (`Err`), not
+    /// dereference freed memory. Reassociating the APD and then freeing it
+    /// reproduces the state that window leaves behind — `active_apd` still
+    /// points at the freed handle, since only a *subsequent* `SQLBindCol`/
+    /// `SQLBindParameter`-family call re-resolves it via `free_desc`'s
+    /// association reset.
+    #[test]
+    fn snapshot_bound_params_fails_cleanly_on_a_freed_apd() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_apd = h.alloc_explicit_desc();
+        unsafe {
+            crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                h.stmt,
+                crate::api::odbc_types::SQL_ATTR_APP_PARAM_DESC,
+                explicit_apd as crate::api::odbc_types::SqlPointer,
+                0,
+            )
+        };
+        {
+            // Directly clears the tracked association without going through
+            // `free_desc`'s association-reset walk, so `active_apd` is left
+            // dangling exactly as it would be mid-race — `h.free_explicit_desc`
+            // goes through the real `SQLFreeHandle` path, which already resets
+            // the association and would defeat the point of this test.
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.active_apd = None;
+        }
+        unsafe {
+            crate::handles::free_handle::<DescHandle>(explicit_apd);
+        }
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut ss = stmt.inner.lock().unwrap();
+            ss.active_apd = Some(explicit_apd);
+        }
+        assert!(snapshot_bound_params(stmt).is_err());
     }
 
     #[test]
@@ -1151,6 +1260,7 @@ mod tests {
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
         }));
         state
             .bound_params
@@ -1187,6 +1297,7 @@ mod tests {
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+            octet_length_ptr: &mut ind as *mut SqlLen,
         }));
 
         let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
@@ -1219,6 +1330,7 @@ mod tests {
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
         }));
 
         let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
@@ -1247,6 +1359,7 @@ mod tests {
             parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+            octet_length_ptr: &mut ind as *mut SqlLen,
         }));
 
         let ret = unsafe { build_named_params(&mut state, 1, "test") };
@@ -1294,6 +1407,7 @@ mod tests {
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
+            octet_length_ptr: inds.as_mut_ptr(),
         }));
 
         // `SQL_C_LONG` is not streamable, so reaching the DAE branch is
@@ -1341,6 +1455,7 @@ mod tests {
             parameter_value_ptr: value.as_mut_ptr().cast(),
             buffer_length: value.len() as SqlLen,
             strlen_or_ind_ptr: indicator_storage.as_mut_ptr(),
+            octet_length_ptr: indicator_storage.as_mut_ptr(),
         }));
 
         let built = unsafe { build_named_params(&mut state, 1, "test") }
@@ -1373,6 +1488,7 @@ mod tests {
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
+            octet_length_ptr: inds.as_mut_ptr(),
         }));
 
         let built = unsafe { build_named_params(&mut state, 1, "test") }

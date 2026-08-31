@@ -24,6 +24,8 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
 use crate::handles::{DescHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 
+use super::set_desc_field::datetime_interval_code_for;
+
 const DESCRIBE_PARAMETERS_PROC: &str = "sp_describe_undeclared_parameters";
 
 const PARAMETER_ORDINAL: usize = 0;
@@ -312,6 +314,7 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
             continue;
         };
         record.concise_type = description.data_type;
+        record.datetime_interval_code = datetime_interval_code_for(description.data_type);
         record.scale = description.decimal_digits;
         record.nullable = description.nullable;
         if parameter_size_is_precision(description.data_type) {

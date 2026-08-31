@@ -447,7 +447,7 @@ fn concise_type_for_datetime_code(code: SqlSmallInt) -> Option<SqlSmallInt> {
 /// (`SQL_INTERVAL_YEAR..SQL_INTERVAL_MINUTE_TO_SECOND`) is not modeled here:
 /// SQL Server has no interval SQL type, so no concise interval value can
 /// reach a descriptor record through this driver's execution path.
-pub(super) fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
+pub(crate) fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
     let code = match concise_type {
         SQL_TYPE_DATE => SQL_CODE_DATE,
         SQL_TYPE_TIME => SQL_CODE_TIME,

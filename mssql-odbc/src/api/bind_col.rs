@@ -120,6 +120,21 @@ fn sql_bind_col_safe(
             return SQL_ERROR;
         }
 
+        // A descriptor record number is an SQLSMALLINT: reject an ordinal
+        // that can't be represented as one before it ever reaches
+        // `bind_ard_column`, which would otherwise grow the ARD to
+        // `column_number`'s full width and then silently truncate the write
+        // to record 32767 via `as`/`unwrap_or(SqlSmallInt::MAX)` — binding
+        // the wrong column while still reporting success.
+        if column_number > SqlUSmallInt::try_from(SqlSmallInt::MAX).unwrap_or(SqlUSmallInt::MAX) {
+            error!(
+                column_number,
+                "SQLBindCol: column number exceeds the maximum descriptor record number"
+            );
+            post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+            return SQL_ERROR;
+        }
+
         // A null TargetValuePtr unbinds the column whatever the indicator says.
         // msodbcsql never inspects the indicator here (`sqlcdesc.cpp` UnbindParam)
         // and has no indicator-only binding, so keeping one bound would both consume
@@ -127,7 +142,18 @@ fn sql_bind_col_safe(
         if target_value_ptr.is_null() {
             let ard = stmt_state.effective_ard(stmt);
             drop(stmt_state);
-            unbind_ard_column(ard, column_number);
+            let Ok(()) = unbind_ard_column(ard, column_number) else {
+                error!("SQLBindCol: ard mutex poisoned; unbind failed");
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error unbinding column",
+                    );
+                }
+                return SQL_ERROR;
+            };
             debug!(column_number, "SQLBindCol: column unbound");
             return SQL_SUCCESS;
         }
@@ -168,9 +194,15 @@ fn sql_bind_col_safe(
         target_value_ptr,
         buffer_length,
         strlen_or_ind_ptr,
+        // SQLBindCol's one StrLen_or_Ind argument feeds both descriptor
+        // fields at once (matches msodbcsql's `pIndValue = pcbValue =
+        // pcbValue`, sqlcdesc.cpp) — SQL_DESC_INDICATOR_PTR and
+        // SQL_DESC_OCTET_LENGTH_PTR only diverge when set independently via
+        // SQLSetDescFieldW/SQLSetDescRec.
+        octet_length_ptr: strlen_or_ind_ptr,
     };
     let Ok(()) = bind_ard_column(ard, binding) else {
-        error!("SQLBindCol: ard mutex poisoned");
+        error!("SQLBindCol: ard mutex poisoned or missing record after growth");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
                 &mut stmt_state,
@@ -186,47 +218,65 @@ fn sql_bind_col_safe(
 }
 
 /// Writes `binding` into `ard`'s record at `binding.column_number`, growing
-/// the record list first if that ordinal doesn't exist yet. `Err(())` only on
-/// a poisoned ARD mutex — the caller decides how to report that against the
-/// statement, since bind errors are always posted to the STMT handle, never
-/// the descriptor.
+/// the record list first if that ordinal doesn't exist yet. `Err(())` if
+/// `ard` is no longer a live descriptor (freed by a concurrent
+/// `SQLFreeHandle(SQL_HANDLE_DESC)` on the explicit descriptor between
+/// `effective_ard` resolving it and this call locking it — a narrow race this
+/// check does not fully close, but converts from a raw-pointer dereference of
+/// freed memory into a clean `SQL_ERROR` in the overwhelming majority of
+/// timings), a poisoned ARD mutex, or a missing record after growth — the
+/// caller decides how to report that against the statement, since bind
+/// errors are always posted to the STMT handle, never the descriptor.
+/// `binding.column_number` must already fit `SqlSmallInt` (`sql_bind_col_safe`
+/// rejects an out-of-range ordinal before this is ever called), so the
+/// conversion here is not expected to fail in practice — but this still
+/// reports it as an error rather than panicking or silently truncating to the
+/// wrong record.
 fn bind_ard_column(ard: SqlHandle, binding: ColumnBinding) -> Result<(), ()> {
+    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
+        return Err(());
+    }
     let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
     let Ok(mut desc_state) = desc.inner.lock() else {
         return Err(());
     };
+    let record_number = SqlSmallInt::try_from(binding.column_number).map_err(|_| ())?;
     let target_count = desc_state
         .records
         .len()
         .max(usize::from(binding.column_number));
     desc_state.set_record_count(target_count, desc.kind);
-    let record = desc_state
-        .record_mut(SqlSmallInt::try_from(binding.column_number).unwrap_or(SqlSmallInt::MAX))
-        .expect("just grew the record list to include this column_number");
+    let record = desc_state.record_mut(record_number).ok_or(())?;
     binding.write_to_record(record);
     Ok(())
 }
 
 /// Unbinds `column_number` on `ard` by nulling its record's `SQL_DESC_DATA_PTR`
 /// — this driver's "unbound" signal (`ColumnBinding::from_record`). A no-op,
-/// not an error, if no record exists yet at that ordinal (never bound) or the
-/// ARD's mutex is poisoned: unbinding is best-effort cleanup, not something
-/// `SQLBindCol` can meaningfully fail on the way a genuine bind can.
-fn unbind_ard_column(ard: SqlHandle, column_number: SqlUSmallInt) {
+/// not an error, if no record exists yet at that ordinal (never bound): that
+/// is not something `SQLBindCol` can meaningfully fail on the way a genuine
+/// bind can. `Err(())` if `ard` is no longer a live descriptor (see
+/// `bind_ard_column`'s identical concurrent-free note) or its mutex is
+/// poisoned — the caller decides how to report that against the statement,
+/// since bind/unbind errors are always posted to the STMT handle, never a
+/// descriptor: reporting `SQL_SUCCESS` here would tell the application an
+/// unbind happened when it didn't, and a stale bound column would keep
+/// writing through a possibly-freed application buffer on the next fetch.
+fn unbind_ard_column(ard: SqlHandle, column_number: SqlUSmallInt) -> Result<(), ()> {
+    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
+        return Err(());
+    }
     let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
     let Ok(mut desc_state) = desc.inner.lock() else {
-        error!(
-            column_number,
-            "SQLBindCol: ard mutex poisoned; unbind dropped"
-        );
-        return;
+        return Err(());
     };
     let Ok(record_number) = SqlSmallInt::try_from(column_number) else {
-        return;
+        return Ok(());
     };
     if let Some(record) = desc_state.record_mut(record_number) {
         record.data_ptr = std::ptr::null_mut();
     }
+    Ok(())
 }
 
 /// Implements `SQLFreeStmt(SQL_UNBIND)`: drops every column binding.
@@ -269,12 +319,32 @@ fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {
         stmt_state.effective_ard(stmt)
     };
 
-    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
-    if let Ok(mut desc_state) = desc.inner.lock() {
-        desc_state.set_record_count(0, desc.kind);
-    } else {
-        error!("SQLFreeStmt(SQL_UNBIND): ard mutex poisoned; unbind dropped");
+    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
+        error!("SQLFreeStmt(SQL_UNBIND): ard freed concurrently; unbind failed");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error unbinding columns",
+            );
+        }
+        return SQL_ERROR;
     }
+    let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+    let Ok(mut desc_state) = desc.inner.lock() else {
+        error!("SQLFreeStmt(SQL_UNBIND): ard mutex poisoned; unbind failed");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error unbinding columns",
+            );
+        }
+        return SQL_ERROR;
+    };
+    desc_state.set_record_count(0, desc.kind);
     debug!("SQLFreeStmt(SQL_UNBIND): all column bindings released");
     SQL_SUCCESS
 }
@@ -720,5 +790,38 @@ mod tests {
             "must fall back to the implicit ARD, not error or touch freed memory"
         );
         assert_eq!(bindings_len(&h), 1);
+    }
+
+    /// The narrow race `bind_ard_column`'s liveness check guards against:
+    /// `effective_ard` resolves an explicit descriptor under the STMT lock,
+    /// which is dropped before the descriptor is actually locked and
+    /// written. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes in
+    /// that window, the stale pointer must fail cleanly (`Err`), not
+    /// dereference freed memory. Calling the helper directly with an
+    /// already-freed handle reproduces the state that window leaves behind.
+    #[test]
+    fn bind_ard_column_fails_cleanly_on_a_freed_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_ard = h.alloc_explicit_desc();
+        assert_eq!(h.free_explicit_desc(explicit_ard), SQL_SUCCESS);
+
+        let binding = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_SLONG,
+            target_value_ptr: 0x1 as SqlPointer,
+            buffer_length: 4,
+            strlen_or_ind_ptr: ptr::null_mut(),
+            octet_length_ptr: ptr::null_mut(),
+        };
+        assert!(bind_ard_column(explicit_ard, binding).is_err());
+    }
+
+    /// Same race, same guard, for `unbind_ard_column`.
+    #[test]
+    fn unbind_ard_column_fails_cleanly_on_a_freed_descriptor() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_ard = h.alloc_explicit_desc();
+        assert_eq!(h.free_explicit_desc(explicit_ard), SQL_SUCCESS);
+        assert!(unbind_ard_column(explicit_ard, 1).is_err());
     }
 }

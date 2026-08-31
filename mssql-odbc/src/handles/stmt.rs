@@ -15,6 +15,7 @@ use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
+use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -106,25 +107,33 @@ pub(crate) struct ColumnBinding {
     pub(crate) target_value_ptr: SqlPointer,
     /// Capacity of one element of `target_value_ptr`, in bytes.
     pub(crate) buffer_length: SqlLen,
-    /// Receives the length/indicator for each row, or null if the application
-    /// does not want one.
+    /// Receives the NULL indicator for each row, or null if the application
+    /// does not want one. Independent of `octet_length_ptr` per the ODBC
+    /// "Deferred Fields" spec, though `SQLBindCol` writes the same pointer to
+    /// both — see [`Self::write_to_record`].
     pub(crate) strlen_or_ind_ptr: *mut SqlLen,
+    /// Receives the returned data's length for each row, or null if the
+    /// application does not want length information for this column
+    /// (`SQL_DESC_OCTET_LENGTH_PTR`).
+    pub(crate) octet_length_ptr: *mut SqlLen,
 }
 
 impl ColumnBinding {
     /// Writes this binding's fields into `record`, the ARD shape `SQLBindCol`
     /// leaves behind (AB#47437: the ARD is the storage `SQLBindCol` and
     /// `SQLSetDescFieldW` share, not a separate copy). `SQL_DESC_INDICATOR_PTR`
-    /// and `SQL_DESC_OCTET_LENGTH_PTR` both receive the same
-    /// `strlen_or_ind_ptr` — the standard ODBC simplified-binding convention,
-    /// where `SQLBindCol`'s one `StrLen_or_Ind` argument feeds both
-    /// descriptor fields at once.
+    /// and `SQL_DESC_OCTET_LENGTH_PTR` both receive the same pointer here —
+    /// `SQLBindCol`'s one `StrLen_or_Ind` argument feeds both descriptor
+    /// fields at once — but they stay two independent fields on the record,
+    /// since `SQLSetDescFieldW`/`SQLSetDescRec` can set them to different
+    /// buffers.
     pub(crate) fn write_to_record(&self, record: &mut DescRecord) {
         record.concise_type = self.target_type;
+        record.datetime_interval_code = datetime_interval_code_for(self.target_type);
         record.data_ptr = self.target_value_ptr;
         record.octet_length = self.buffer_length;
         record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
-        record.octet_length_ptr = self.strlen_or_ind_ptr as SqlPointer;
+        record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
     }
 
     /// Reconstructs the binding an ARD record represents, or `None` when
@@ -142,6 +151,7 @@ impl ColumnBinding {
             target_value_ptr: record.data_ptr,
             buffer_length: record.octet_length,
             strlen_or_ind_ptr: record.indicator_ptr as *mut SqlLen,
+            octet_length_ptr: record.octet_length_ptr as *mut SqlLen,
         })
     }
 
@@ -1133,6 +1143,7 @@ mod tests {
             target_value_ptr: 0x1 as SqlPointer,
             buffer_length: 0,
             strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
         }
     }
 

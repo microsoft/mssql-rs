@@ -43,7 +43,17 @@ pub(crate) unsafe fn sql_get_desc_rec_w(
 ) -> SqlReturn {
     debug!(
         ?descriptor_handle,
-        record_number, buffer_length, "SQLGetDescRecW called",
+        record_number,
+        ?name,
+        buffer_length,
+        ?string_length_ptr,
+        ?type_ptr,
+        ?sub_type_ptr,
+        ?length_ptr,
+        ?precision_ptr,
+        ?scale_ptr,
+        ?nullable_ptr,
+        "SQLGetDescRecW called",
     );
     crate::ffi_entry!("SQLGetDescRecW", unsafe {
         sql_get_desc_rec_w_impl(

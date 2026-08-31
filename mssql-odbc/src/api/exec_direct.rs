@@ -18,6 +18,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
 use crate::error::free_errors;
+use crate::error::post_sql_error;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
@@ -90,7 +91,18 @@ fn sql_exec_direct_w_safe(
     // rationale). Not applied to `stmt_state.bound_params` until the
     // early-return checks below have passed, so a rejected re-entry during
     // an active DAE sequence can't clobber that sequence's own snapshot.
-    let bound_params = snapshot_bound_params(stmt);
+    let Ok(bound_params) = snapshot_bound_params(stmt) else {
+        error!("SQLExecDirectW: failed to snapshot parameter bindings");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error reading parameter bindings",
+            );
+        }
+        return SQL_ERROR;
+    };
 
     // Check STMT state, gather parameter values, and reset prior context.
     let (named_params, rewritten_sql, marker_count) = {

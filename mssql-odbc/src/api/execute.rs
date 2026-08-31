@@ -253,7 +253,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // early-return check below has passed: a statement already mid-DAE-
     // sequence must keep that sequence's own frozen snapshot if this call
     // turns out to be a rejected re-entry rather than a real new execute.
-    let bound_params = snapshot_bound_params(stmt);
+    let bound_params = snapshot_bound_params(stmt)?;
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecute: stmt mutex poisoned");

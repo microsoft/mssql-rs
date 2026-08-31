@@ -166,6 +166,23 @@ fn sql_bind_parameter_safe(
             post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
             return SQL_ERROR;
         }
+
+        // A descriptor record number is an SQLSMALLINT (07009's own
+        // representation): reject an ordinal that can't be represented as
+        // one before it ever reaches `bind_param_records`, which would
+        // otherwise grow the APD/IPD to `parameter_number`'s full width and
+        // then silently truncate the write to record 32767 via `as`/
+        // `unwrap_or(SqlSmallInt::MAX)` — binding the wrong parameter while
+        // still reporting success.
+        if parameter_number > SqlUSmallInt::try_from(SqlSmallInt::MAX).unwrap_or(SqlUSmallInt::MAX)
+        {
+            error!(
+                parameter_number,
+                "SQLBindParameter: parameter number exceeds the maximum descriptor record number"
+            );
+            post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+            return SQL_ERROR;
+        }
         match classify_parameter_sql_type(parameter_type) {
             SqlTypeSupport::Supported => {}
             SqlTypeSupport::NotImplemented => {
@@ -261,9 +278,15 @@ fn sql_bind_parameter_safe(
         parameter_value_ptr,
         buffer_length,
         strlen_or_ind_ptr,
+        // SQLBindParameter's one StrLen_or_IndPtr argument feeds both
+        // descriptor fields at once (matches msodbcsql's `pIndValue =
+        // pcbValue = pcbValue`, sqlcdesc.cpp) — SQL_DESC_INDICATOR_PTR and
+        // SQL_DESC_OCTET_LENGTH_PTR only diverge when set independently via
+        // SQLSetDescFieldW/SQLSetDescRec.
+        octet_length_ptr: strlen_or_ind_ptr,
     };
     let Ok(()) = bind_param_records(apd, stmt.ipd, parameter_number, bound) else {
-        error!("SQLBindParameter: apd/ipd mutex poisoned");
+        error!("SQLBindParameter: failed writing to apd/ipd (poisoned mutex or missing record)");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
                 &mut stmt_state,
@@ -281,9 +304,14 @@ fn sql_bind_parameter_safe(
 
 /// Writes `bound` into `apd`'s and `ipd`'s records at `parameter_number`,
 /// growing either record list first if that ordinal doesn't exist yet on it.
-/// `Err(())` only on a poisoned mutex (either descriptor) — the caller
-/// decides how to report that against the statement, since bind errors are
-/// always posted to the STMT handle, never a descriptor.
+/// `Err(())` on a poisoned mutex (either descriptor) or a missing record
+/// after growth — the caller decides how to report that against the
+/// statement, since bind errors are always posted to the STMT handle, never
+/// a descriptor. `parameter_number` must already fit `SqlSmallInt`
+/// (`sql_bind_parameter_safe` rejects an out-of-range ordinal before this is
+/// ever called), so the conversion here is not expected to fail in practice —
+/// but this still reports it as an error rather than panicking or silently
+/// truncating to the wrong record.
 ///
 /// Always locks `apd` before `ipd`: the only place in this crate that holds
 /// two DESC locks at once, so this order must stay the only order, matching
@@ -294,6 +322,15 @@ fn bind_param_records(
     parameter_number: SqlUSmallInt,
     bound: BoundParam,
 ) -> Result<(), ()> {
+    // `apd` can be an explicit descriptor `effective_apd` resolved under the
+    // STMT lock, already dropped by the time this runs — re-check liveness
+    // right before dereferencing to narrow (not fully close) the race against
+    // a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor.
+    // `ipd` is always `stmt.ipd`, freed only with the statement itself, so it
+    // needs no equivalent check.
+    if crate::handles::live_type(apd) != Some(HandleType::Desc) {
+        return Err(());
+    }
     let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
     let Ok(mut apd_state) = apd_desc.inner.lock() else {
         return Err(());
@@ -303,18 +340,15 @@ fn bind_param_records(
         return Err(());
     };
 
+    let record_number = SqlSmallInt::try_from(parameter_number).map_err(|_| ())?;
+
     let target_count = apd_state.records.len().max(usize::from(parameter_number));
     apd_state.set_record_count(target_count, apd_desc.kind);
     let target_count = ipd_state.records.len().max(usize::from(parameter_number));
     ipd_state.set_record_count(target_count, ipd_desc.kind);
 
-    let record_number = SqlSmallInt::try_from(parameter_number).unwrap_or(SqlSmallInt::MAX);
-    let apd_record = apd_state
-        .record_mut(record_number)
-        .expect("just grew the record list to include this parameter_number");
-    let ipd_record = ipd_state
-        .record_mut(record_number)
-        .expect("just grew the record list to include this parameter_number");
+    let apd_record = apd_state.record_mut(record_number).ok_or(())?;
+    let ipd_record = ipd_state.record_mut(record_number).ok_or(())?;
     bound.write_to_records(apd_record, ipd_record);
     Ok(())
 }
@@ -358,12 +392,36 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
         stmt_state.effective_apd(stmt)
     };
 
-    let desc = unsafe { handle_from_raw::<DescHandle>(apd) };
-    if let Ok(mut desc_state) = desc.inner.lock() {
-        desc_state.set_record_count(0, desc.kind);
-    } else {
-        error!("SQLFreeStmt(SQL_RESET_PARAMS): apd mutex poisoned; reset dropped");
+    // `apd` can be an explicit descriptor resolved under the STMT lock,
+    // already dropped by now — re-check liveness right before dereferencing
+    // to narrow the race against a concurrent
+    // `SQLFreeHandle(SQL_HANDLE_DESC)` on that same descriptor.
+    if crate::handles::live_type(apd) != Some(HandleType::Desc) {
+        error!("SQLFreeStmt(SQL_RESET_PARAMS): apd freed concurrently; reset failed");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error resetting parameter bindings",
+            );
+        }
+        return SQL_ERROR;
     }
+    let desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let Ok(mut desc_state) = desc.inner.lock() else {
+        error!("SQLFreeStmt(SQL_RESET_PARAMS): apd mutex poisoned; reset failed");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error resetting parameter bindings",
+            );
+        }
+        return SQL_ERROR;
+    };
+    desc_state.set_record_count(0, desc.kind);
     debug!("SQLFreeStmt(SQL_RESET_PARAMS): parameter bindings released");
     SQL_SUCCESS
 }
@@ -385,7 +443,11 @@ mod tests {
         let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
         let apd_state = apd.inner.lock().unwrap();
         let ipd_state = ipd.inner.lock().unwrap();
-        BoundParam::all_from_descriptor_states(&apd_state, &ipd_state)
+        BoundParam::all_from_descriptor_states(
+            &apd_state,
+            &ipd_state,
+            crate::handles::OdbcVersion::Odbc3_80,
+        )
     }
 
     /// `SQL_DESC_COUNT` on `h`'s implicit APD.
@@ -937,5 +999,33 @@ mod tests {
             "must fall back to the implicit APD, not error or touch freed memory"
         );
         assert_eq!(apd_record_count(&h), 1);
+    }
+
+    /// The narrow race `bind_param_records`'s liveness check guards against:
+    /// `effective_apd` resolves an explicit descriptor under the STMT lock,
+    /// which is dropped before the descriptor is actually locked and
+    /// written. If a concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` completes in
+    /// that window, the stale pointer must fail cleanly (`Err`), not
+    /// dereference freed memory. Calling the helper directly with an
+    /// already-freed handle reproduces the state that window leaves behind.
+    #[test]
+    fn bind_param_records_fails_cleanly_on_a_freed_apd() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_apd = h.alloc_explicit_desc();
+        assert_eq!(h.free_explicit_desc(explicit_apd), SQL_SUCCESS);
+
+        let mut buf = 0i32;
+        let bound = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: crate::api::odbc_types::SQL_INTEGER,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: &mut buf as *mut i32 as SqlPointer,
+            buffer_length: 4,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        };
+        assert!(bind_param_records(explicit_apd, h.ipd(), 1, bound).is_err());
     }
 }

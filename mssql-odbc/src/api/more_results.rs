@@ -23,6 +23,7 @@ use crate::api::sqlstate::{
     post_tds_info_messages,
 };
 use crate::error::free_errors;
+use crate::error::post_sql_error;
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -109,7 +110,17 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             stmt_state.row_count = next;
             debug!("SQLMoreResults: advanced to next DML result set");
             drop(stmt_state);
-            populate_ird(stmt, &[]);
+            if populate_ird(stmt, &[]).is_err() {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
+            }
             return SQL_SUCCESS;
         }
         stmt_state.has_state(STMT_STATE_CURSOR_OPEN)
@@ -182,7 +193,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            populate_ird(stmt, &metadata);
+            let ird_ok = populate_ird(stmt, &metadata).is_ok();
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 // Explicitly (re-)claim: AB#47508's early release can have left
@@ -190,6 +201,17 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 // exhaustion without an explicit close, so this cannot just
                 // assume it is still `Some(statement_handle)`.
                 dbc_state.active_stmt = Some(statement_handle);
+            }
+            if !ird_ok {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
             }
             debug!("SQLMoreResults: advanced to next result set");
             if has_server_info {
@@ -229,11 +251,22 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            populate_ird(stmt, &[]);
+            let ird_ok = populate_ird(stmt, &[]).is_ok();
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 // Explicitly (re-)claim — see the `Rows` arm above.
                 dbc_state.active_stmt = Some(statement_handle);
+            }
+            if !ird_ok {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error refreshing result-set metadata",
+                    );
+                }
+                return SQL_ERROR;
             }
             debug!("SQLMoreResults: advanced to a no-row statement result");
             if has_server_info {

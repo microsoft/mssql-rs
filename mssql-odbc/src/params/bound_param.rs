@@ -6,7 +6,9 @@ use std::ffi::c_void;
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
 };
-use crate::api::type_rules::parameter_size_is_precision;
+use crate::api::set_desc_field::datetime_interval_code_for;
+use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
+use crate::handles::OdbcVersion;
 use crate::handles::desc::{DescRecord, DescState};
 
 /// A bound parameter — the lightweight equivalent of msodbcsql's implicit
@@ -45,6 +47,15 @@ pub(crate) struct BoundParam {
     /// Pointer to the application's length/indicator buffer (read at execute
     /// time). May be null.
     pub(crate) strlen_or_ind_ptr: *mut SqlLen,
+    /// Pointer to the application's octet-length/data-at-execution buffer,
+    /// independent of `strlen_or_ind_ptr` per the ODBC "Deferred Fields" spec
+    /// (`SQL_DESC_OCTET_LENGTH_PTR` carries the length or a DAE sentinel;
+    /// `SQL_DESC_INDICATOR_PTR` carries only `SQL_NULL_DATA` status).
+    /// `SQLBindParameter` writes the same pointer to both — see
+    /// [`Self::write_to_records`] — but `SQLSetDescFieldW`/`SQLSetDescRec`
+    /// can set them independently. Null means "assume NUL-terminated" for a
+    /// character parameter.
+    pub(crate) octet_length_ptr: *mut SqlLen,
 }
 
 impl BoundParam {
@@ -65,6 +76,9 @@ impl BoundParam {
         if !self.strlen_or_ind_ptr.is_null() {
             self.strlen_or_ind_ptr = self.strlen_or_ind_ptr.wrapping_byte_offset(offset);
         }
+        if !self.octet_length_ptr.is_null() {
+            self.octet_length_ptr = self.octet_length_ptr.wrapping_byte_offset(offset);
+        }
         self
     }
 
@@ -75,21 +89,27 @@ impl BoundParam {
     /// and `SetIPDRec` (IPD) on every call, so a rebind fully overwrites both
     /// records rather than leaving fields from a previous, differently-shaped
     /// binding behind. `SQL_DESC_INDICATOR_PTR` and `SQL_DESC_OCTET_LENGTH_PTR`
-    /// both receive `strlen_or_ind_ptr` — the same simplified-binding
-    /// convention `ColumnBinding::write_to_record` uses for columns.
+    /// both receive the same pointer here — `SQLBindParameter`'s one
+    /// `StrLen_or_IndPtr` argument feeds both descriptor fields at once,
+    /// mirroring msodbcsql's `lpbindinfo->pIndValue = lpbindinfo->pcbValue =
+    /// pcbValue` (`sqlcdesc.cpp`) — but they stay two independent fields on
+    /// the record, since `SQLSetDescFieldW`/`SQLSetDescRec` can set them to
+    /// different buffers.
     pub(crate) fn write_to_records(
         &self,
         apd_record: &mut DescRecord,
         ipd_record: &mut DescRecord,
     ) {
         apd_record.concise_type = self.c_type;
+        apd_record.datetime_interval_code = datetime_interval_code_for(self.c_type);
         apd_record.data_ptr = self.parameter_value_ptr;
         apd_record.octet_length = self.buffer_length;
         apd_record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
-        apd_record.octet_length_ptr = self.strlen_or_ind_ptr as SqlPointer;
+        apd_record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
 
         ipd_record.parameter_type = self.input_output_type;
         ipd_record.concise_type = self.sql_type;
+        ipd_record.datetime_interval_code = datetime_interval_code_for(self.sql_type);
         ipd_record.scale = self.decimal_digits;
         if parameter_size_is_precision(self.sql_type) {
             ipd_record.precision =
@@ -102,20 +122,24 @@ impl BoundParam {
     }
 
     /// Reconstructs the binding an APD/IPD record pair represents, or `None`
-    /// when the APD's `SQL_DESC_CONCISE_TYPE` is still `SQL_C_DEFAULT` — this
-    /// driver's "unbound" convention for a *parameter* record, whether the
-    /// record was never touched or only grown as a gap by binding a higher
-    /// ordinal first.
+    /// when the record was never touched: `DescRecord::default_for` pairs a
+    /// growth placeholder's `SQL_C_DEFAULT` concise type with a null
+    /// `SQL_DESC_DATA_PTR`, and that pairing is the actual "unbound" signal.
+    ///
+    /// `SQL_C_DEFAULT` alone cannot mean "unbound": it is also a valid value
+    /// `SQLSetDescFieldW`/`SQLSetDescRec` can write to `SQL_DESC_CONCISE_TYPE`
+    /// intentionally, asking the driver to resolve the C type from the
+    /// paired IPD's SQL type at execute time, exactly as
+    /// `sql_bind_parameter_safe` resolves it before ever writing to the APD.
+    /// A non-null `data_ptr` alongside `SQL_C_DEFAULT` means exactly that
+    /// case, so it is resolved here the same way, via
+    /// [`resolve_default_c_type`], rather than reported as unbound.
     ///
     /// Unlike `ColumnBinding::from_record`'s ARD-side null-`SQL_DESC_DATA_PTR`
-    /// check, a parameter record cannot key "unbound" off a null value
+    /// check, a parameter record cannot key "unbound" *only* off a null value
     /// pointer: `SQLBindParameter` legitimately accepts a null
     /// `ParameterValuePtr` for a data-at-execution parameter, so that would
-    /// misreport every DAE binding as unbound. `SQL_C_DEFAULT` works instead
-    /// because `sql_bind_parameter_safe` always resolves it to a concrete C
-    /// type before writing — the same reasoning `default_c_type_is_resolved_before_storage`
-    /// already relies on — so a real `concise_type` in storage always means a
-    /// real bind happened, from either API.
+    /// misreport every DAE binding as unbound.
     ///
     /// A missing IPD record (an APD-only binding set up through
     /// `SQLSetDescFieldW` without ever touching IPD) defaults to
@@ -124,8 +148,9 @@ impl BoundParam {
     pub(crate) fn from_records(
         apd_record: &DescRecord,
         ipd_record: Option<&DescRecord>,
+        odbc_version: OdbcVersion,
     ) -> Option<Self> {
-        if apd_record.concise_type == SQL_C_DEFAULT {
+        if apd_record.concise_type == SQL_C_DEFAULT && apd_record.data_ptr.is_null() {
             return None;
         }
         let (input_output_type, sql_type, column_size, decimal_digits) = match ipd_record {
@@ -141,15 +166,21 @@ impl BoundParam {
             ),
             None => (SQL_PARAM_INPUT, 0, 0, 0),
         };
+        let c_type = if apd_record.concise_type == SQL_C_DEFAULT {
+            resolve_default_c_type(sql_type, odbc_version).unwrap_or(apd_record.concise_type)
+        } else {
+            apd_record.concise_type
+        };
         Some(Self {
             input_output_type,
-            c_type: apd_record.concise_type,
+            c_type,
             sql_type,
             column_size,
             decimal_digits,
             parameter_value_ptr: apd_record.data_ptr,
             buffer_length: apd_record.octet_length,
             strlen_or_ind_ptr: apd_record.indicator_ptr as *mut SqlLen,
+            octet_length_ptr: apd_record.octet_length_ptr as *mut SqlLen,
         })
     }
 
@@ -162,12 +193,15 @@ impl BoundParam {
     pub(crate) fn all_from_descriptor_states(
         apd_state: &DescState,
         ipd_state: &DescState,
+        odbc_version: OdbcVersion,
     ) -> Vec<Option<Self>> {
         apd_state
             .records
             .iter()
             .enumerate()
-            .map(|(i, apd_record)| Self::from_records(apd_record, ipd_state.records.get(i)))
+            .map(|(i, apd_record)| {
+                Self::from_records(apd_record, ipd_state.records.get(i), odbc_version)
+            })
             .collect()
     }
 }
@@ -177,6 +211,8 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_PARAM_INPUT, SQL_VARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
+
+    const ODBC_VERSION: OdbcVersion = OdbcVersion::Odbc3_80;
 
     fn param(value: *mut c_void, ind: *mut SqlLen) -> BoundParam {
         BoundParam {
@@ -188,6 +224,7 @@ mod tests {
             parameter_value_ptr: value,
             buffer_length: 8,
             strlen_or_ind_ptr: ind,
+            octet_length_ptr: ind,
         }
     }
 
@@ -275,13 +312,14 @@ mod tests {
 
     /// A freshly-grown record (never bound, just a gap created by binding a
     /// higher ordinal first) has `SQL_C_DEFAULT` as its APD concise type —
-    /// `DescRecord::default_for`'s own placeholder — and must read as
-    /// unbound.
+    /// `DescRecord::default_for`'s own placeholder — paired with a null
+    /// `data_ptr`, and must read as unbound.
     #[test]
     fn from_records_treats_default_c_type_as_unbound() {
         let apd_record = DescRecord::default_for(DescKind::AppParam);
         assert_eq!(apd_record.concise_type, SQL_C_DEFAULT);
-        assert!(BoundParam::from_records(&apd_record, None).is_none());
+        assert!(apd_record.data_ptr.is_null());
+        assert!(BoundParam::from_records(&apd_record, None, ODBC_VERSION).is_none());
     }
 
     /// A data-at-execution parameter legitimately has a null
@@ -304,11 +342,57 @@ mod tests {
             parameter_type: SQL_PARAM_INPUT,
             ..DescRecord::default_for(DescKind::ImpParam)
         };
-        let bound =
-            BoundParam::from_records(&apd_record, Some(&ipd_record)).expect("DAE param is bound");
+        let bound = BoundParam::from_records(&apd_record, Some(&ipd_record), ODBC_VERSION)
+            .expect("DAE param is bound");
         assert!(bound.parameter_value_ptr.is_null());
         assert_eq!(bound.c_type, SQL_C_CHAR);
         assert_eq!(bound.sql_type, SQL_VARCHAR);
+    }
+
+    /// `SQL_C_DEFAULT` is a valid value `SQLSetDescFieldW`/`SQLSetDescRec` can
+    /// write to `SQL_DESC_CONCISE_TYPE` intentionally — it means "resolve the
+    /// C type from the paired IPD's SQL type", exactly what
+    /// `sql_bind_parameter_safe` itself does before ever writing to the APD.
+    /// A non-null `data_ptr` alongside `SQL_C_DEFAULT` must therefore resolve
+    /// to a real binding, not read as the growth-placeholder "unbound" case.
+    #[test]
+    fn from_records_resolves_sql_c_default_from_the_paired_ipd_when_a_data_pointer_is_set() {
+        let mut buf = 0i32;
+        let apd_record = DescRecord {
+            concise_type: SQL_C_DEFAULT,
+            data_ptr: &raw mut buf as SqlPointer,
+            ..DescRecord::default_for(DescKind::AppParam)
+        };
+        let ipd_record = DescRecord {
+            concise_type: crate::api::odbc_types::SQL_INTEGER,
+            parameter_type: SQL_PARAM_INPUT,
+            ..DescRecord::default_for(DescKind::ImpParam)
+        };
+        let bound = BoundParam::from_records(&apd_record, Some(&ipd_record), ODBC_VERSION)
+            .expect("SQL_C_DEFAULT with a data pointer is bound, not unbound");
+        assert_eq!(bound.c_type, crate::api::odbc_types::SQL_C_SLONG);
+    }
+
+    /// `SQL_DESC_INDICATOR_PTR` and `SQL_DESC_OCTET_LENGTH_PTR` are
+    /// independent fields (ODBC "Deferred Fields"): a descriptor-driven bind
+    /// that sets them to different buffers must round-trip both, not
+    /// silently collapse to one.
+    #[test]
+    fn from_records_preserves_independent_indicator_and_octet_length_pointers() {
+        let mut indicator: SqlLen = 0;
+        let mut octet_length: SqlLen = 3;
+        let mut buf = [0u8; 8];
+        let apd_record = DescRecord {
+            concise_type: SQL_C_CHAR,
+            data_ptr: buf.as_mut_ptr().cast(),
+            indicator_ptr: (&raw mut indicator).cast(),
+            octet_length_ptr: (&raw mut octet_length).cast(),
+            ..DescRecord::default_for(DescKind::AppParam)
+        };
+        let bound = BoundParam::from_records(&apd_record, None, ODBC_VERSION)
+            .expect("a real data pointer is bound");
+        assert_eq!(bound.strlen_or_ind_ptr, &raw mut indicator);
+        assert_eq!(bound.octet_length_ptr, &raw mut octet_length);
     }
 
     /// `all_from_descriptor_states` pairs each APD record with its IPD twin
@@ -332,7 +416,7 @@ mod tests {
             .records
             .push(DescRecord::default_for(DescKind::AppParam));
 
-        let params = BoundParam::all_from_descriptor_states(&apd_state, &ipd_state);
+        let params = BoundParam::all_from_descriptor_states(&apd_state, &ipd_state, ODBC_VERSION);
         assert_eq!(params.len(), 2);
         assert!(params[0].is_some());
         assert!(params[1].is_none());
