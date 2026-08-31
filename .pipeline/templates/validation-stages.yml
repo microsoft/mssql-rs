@@ -104,18 +104,6 @@ stages:
       expectedSentinels: build_arm,build_win_arm
       sqlImageTag: ${{ parameters.sqlImageTag }}
       jobCondition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'))
-  - job: Test_Benchmark_Policy
-    displayName: Test ODBC benchmark comparison policy
-    pool:
-      name: ${{ parameters.utilPoolName }}
-      demands:
-        - imageOverride -equals RUST-UBUSLIM
-    steps:
-      - bash: |
-          set -euo pipefail
-          python3 -m unittest discover -s .pipeline/scripts \
-            -p 'test_compare_odbc_benchmarks.py' -v
-        displayName: Run comparator policy tests
   - job: Build_Windows
     displayName: Build Windows
     pool:
@@ -262,6 +250,11 @@ stages:
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
+      - bash: |
+          set -euo pipefail
+          python3 -m unittest discover -s .pipeline/scripts \
+            -p 'test_compare_odbc_benchmarks.py' -v
+        displayName: Test ODBC benchmark comparison policy
       - template: build-template-container.yml
         parameters:
           architecture: x64
