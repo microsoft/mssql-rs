@@ -120,14 +120,14 @@ TEST_F(GetDescFieldLiveTest, ReadsBackValueSetBySetDescField) {
 
 // IRD supports GET on the common record fields (via the same field-access
 // model as ARD/APD/IPD) even though every SET on it is rejected — see
-// set_desc_field_test.cpp's IrdRejectsFieldWrite. This driver's IRD storage
-// is independent of the live result set: reconciling it against a prepared
-// statement's real column metadata is AB#47437, not this PR (see
-// handles/desc.rs's module docs), so record 1 does not exist here even once
-// prepared. msodbcsql fully implements that wiring already and reports the
-// real column type for a one-column "SELECT 1" — a genuine, intentional
-// scope-boundary divergence, not a bug, so this only asserts on the Rust
-// leg.
+// set_desc_field_test.cpp's IrdRejectsFieldWrite. Since AB#47437, the IRD is
+// populated from the live result set after a real execute (api::ird's
+// populate_ird, wired into finish_execute/SQLMoreResults) — see
+// PrepareExecuteLiveTest.ImpRowDescMatchesDescribeColAfterExecute in
+// execute_test.cpp — but SQLPrepare alone never touches the server
+// (prepare.rs: "No network I/O happens"), so a merely-prepared statement's
+// IRD stays empty exactly as it did before AB#47437. This test's
+// SQL_NO_DATA assertion did not change; only this explanation of why did.
 //
 // The statement must be prepared first: unixODBC's Driver Manager gates
 // SQLGetDescField on an IRD to statements past STATE_S1 ("allocated, not
