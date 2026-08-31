@@ -500,7 +500,7 @@ if (-not $env:ODBC_BENCH_UID) {
 if (-not $env:ODBC_BENCH_PWD) { $env:ODBC_BENCH_PWD = $env:SQL_PASSWORD }
 if (-not $env:ODBC_BENCH_TRUST_CERT) { $env:ODBC_BENCH_TRUST_CERT = 'Yes' }
 if (-not $env:ODBC_BENCH_ENCRYPT) { $env:ODBC_BENCH_ENCRYPT = 'Mandatory' }
-if (-not $env:ODBC_BENCH_PACKET_SIZE) { $env:ODBC_BENCH_PACKET_SIZE = '32767' }
+if (-not $env:ODBC_BENCH_PACKET_SIZE) { $env:ODBC_BENCH_PACKET_SIZE = '16192' }
 
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 

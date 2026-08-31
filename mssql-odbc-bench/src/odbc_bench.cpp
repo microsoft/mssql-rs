@@ -36,6 +36,9 @@ constexpr SQLSMALLINT kSqlCSSsTimestampOffset = 0x4001;
 constexpr SQLUSMALLINT kSqlCaSsVariantType = 1215;
 constexpr std::size_t kPatternSize = 15;
 constexpr SQLLEN kIndicatorSentinel = -777;
+// The encrypted Linux and Windows labs confirmed that Microsoft ODBC 18.6.2.1,
+// the candidate, and the pinned Rust baseline all honor and report 16192 exactly.
+constexpr char kDefaultPacketSize[] = "16192";
 // One NULL in every seven rows for a nullable column, offset per column so no two
 // columns go NULL on the same rows. Realistic sparsity without making the payload
 // dominated by NULLs.
@@ -865,7 +868,7 @@ Config Config::from_environment() {
         environment_value_or("ODBC_BENCH_TRUST_CERT", "Yes");
     config.encrypt = environment_value_or("ODBC_BENCH_ENCRYPT", "Mandatory");
     config.packet_size =
-        environment_value_or("ODBC_BENCH_PACKET_SIZE", "32767");
+        environment_value_or("ODBC_BENCH_PACKET_SIZE", kDefaultPacketSize);
     config.packet_size_keyword =
         environment_value_or("ODBC_BENCH_PACKET_SIZE_KEYWORD", "PacketSize");
     config.scenario = environment_value("ODBC_BENCH_SCENARIO");

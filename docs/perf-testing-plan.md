@@ -255,7 +255,7 @@ binaries keep the per-binary interleaving effective (see §2).
 - Bulk insert (default 10,000 rows, override via `BENCH_BULK_ROWS`) via the `BulkCopy` builder, over batch sizes 500 / 5,000.
 
 ### mssql-tds-specific
-- Packet-size sensitivity (4096 / 8192 / 32767) on large reads — measures reassembly overhead.
+- Packet-size sensitivity (4096 / 8192 / 16192) on large reads — measures reassembly overhead.
 - Zero-copy `next_row` row-iteration throughput at large row counts.
 
 ---

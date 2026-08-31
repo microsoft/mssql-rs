@@ -23,7 +23,7 @@ Manager; the harness never links to the Rust driver.
 | `ODBC_BENCH_PWD` | `SQL_PASSWORD`, then required | SQL login password |
 | `ODBC_BENCH_TRUST_CERT` | `Yes` | `TrustServerCertificate` value |
 | `ODBC_BENCH_ENCRYPT` | `Mandatory` | `Encrypt` value |
-| `ODBC_BENCH_PACKET_SIZE` | `32767` | TDS packet size, 512–32767; set through both ODBC attribute and connection keyword, then read back |
+| `ODBC_BENCH_PACKET_SIZE` | `16192` | Cross-platform encrypted-lab value honored exactly by Microsoft ODBC 18.6.2.1 and both Rust builds; set through both ODBC attribute and connection keyword, then read back |
 | `ODBC_BENCH_PACKET_SIZE_KEYWORD` | `PacketSize` | `PacketSize` or Microsoft driver spelling `Packet Size` |
 | `ODBC_BENCH_SCENARIO` | all | Run only `narrow`, `wide`, `rowset`, `varwidth`, or `getdata` |
 
