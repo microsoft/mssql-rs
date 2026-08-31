@@ -589,13 +589,8 @@ TEST_F(GetDataLiveTest, NvarcharMaxWideRoundTrip) {
 // supported type still returns the value. Before the P1a source-type
 // conversions this pairing was simply unimplemented and reported HYC00.
 //
-// TODO(convergence): this skip is temporary. msodbcsql implements this
-// conversion and its CVT_CAST_ERROR carries the "Invalid character value for
-// cast specification" message, so it very likely agrees, but the constant is
-// spelled IDS_22_005 in its source and that has not been confirmed against a
-// live run. Confirm against a live msodbcsql run, then drop the skip so this
-// compares on both legs; if the two do not agree, record the difference in the
-// "Known divergences from msodbcsql" table in docs/typed-columnar-fetch-plan.md.
+// msodbcsql consumes the column after the failed conversion and returns
+// SQL_NO_DATA from the follow-up call.
 TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
@@ -974,4 +969,3 @@ TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
 
     SQLCloseCursor(stmt_);
 }
-
