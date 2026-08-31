@@ -1692,3 +1692,26 @@ TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
 
     SQLCloseCursor(stmt_);
 }
+
+// A character column holding more digits than an exact i128 mantissa still
+// reaches a float target at full precision. The parser is shared with the
+// parameter direction, which reduces such a literal to an integer part plus a
+// dropped-fraction flag (param_cross_conversions_test.cpp,
+// WideDecimalLiteralReportsTruncation); routing that reduction to a double would
+// yield about 1.1 here.
+TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('1.234567890123456789012345678901234567890'"
+                             " AS VARCHAR(64))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    double out = 0.0;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_DOUBLE, &out, sizeof(out), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_NEAR(out, 1.2345678901234567, 1e-15);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(double)), ind);
+
+    SQLCloseCursor(stmt_);
+}
+

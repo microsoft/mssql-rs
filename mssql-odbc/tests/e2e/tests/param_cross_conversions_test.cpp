@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
-// cross_conversions_test.cpp  -  E2E tests for cross-family parameter
+// param_cross_conversions_test.cpp  -  E2E tests for cross-family parameter
 // conversion: an integer C type bound against a character ParameterType, and a
 // character C type bound against an integer ParameterType.
 //
-// Same-family character conversions live in char_conversions_test.cpp, and
+// Same-family character conversions live in param_char_conversions_test.cpp, and
 // statement lifecycle in execute_test.cpp.
 //
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
@@ -458,28 +458,14 @@ TEST_F(CrossConversionLiveTest, BlankOnlyWideLiteralIs22018) {
 
 // A literal with more digits than an exact i128 mantissa. The parser reduces it
 // to an integer part plus a dropped-fraction flag for integer targets, so the
-// full value has to survive separately for float targets - both directions are
-// asserted here because one shared parser serves them.
-TEST_F(CrossConversionLiveTest, WideDecimalLiteralKeepsPrecisionAndReportsTruncation) {
-    const char* wide = "1.234567890123456789012345678901234567890";
-
-    // Fetch direction: a character column read as SQL_C_DOUBLE.
-    ASSERT_SQL_OK(Prepare("SELECT CAST('1.234567890123456789012345678901234567890'"
-                          " AS VARCHAR(64))"),
-                  SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    double d = 0.0;
-    SQLLEN dind = 0;
-    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_DOUBLE, &d, sizeof(d), &dind),
-                  SQL_HANDLE_STMT, stmt_);
-    EXPECT_NEAR(d, 1.2345678901234567, 1e-15);
-    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-
-    // Parameter direction: the same literal to an integer target is 22001, the
-    // fraction being reported rather than rounded away.
+// fraction is reported rather than rounded away. The fetch direction shares that
+// parser and is asserted by WideDecimalColumnKeepsPrecisionForADoubleTarget in
+// get_data_test.cpp.
+TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(BindText(SQL_C_CHAR, wide, SQL_INTEGER), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindText(SQL_C_CHAR, "1.234567890123456789012345678901234567890",
+                           SQL_INTEGER),
+                  SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
     ResetParams();

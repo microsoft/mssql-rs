@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
-// char_conversions_test.cpp  -  E2E tests for character parameter conversion:
+// param_char_conversions_test.cpp  -  E2E tests for character parameter conversion:
 // SQL_C_CHAR / SQL_C_WCHAR bound against char, varchar, text and their wide
 // counterparts. Covers the declared wire type, ColumnSize semantics, truncation
 // and its blank exemption, encoding, and the indicator/terminator rules.
