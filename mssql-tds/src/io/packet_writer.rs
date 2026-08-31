@@ -102,6 +102,11 @@ pub struct PacketWriter<'a> {
     /// the first-packet callback, so it still reads `true` on error paths where
     /// the bytes are already gone.
     any_packet_flushed: bool,
+    /// Whether the final packet of this message reached the network. Like
+    /// `any_packet_flushed`, set with the flush rather than after the checks that
+    /// follow it, so a budget expiry on the last packet cannot make a message the
+    /// server holds in full look incomplete.
+    message_complete: bool,
     start_time: Instant,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
@@ -133,6 +138,7 @@ pub(crate) struct SuspendedMessage {
     packet_size: usize,
     is_first_packet: bool,
     any_packet_flushed: bool,
+    message_complete: bool,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
     reset_mode: ResetConnectionMode,
@@ -149,6 +155,13 @@ impl SuspendedMessage {
     /// then tripped either would still read as unsent.
     pub(crate) fn nothing_sent(&self) -> bool {
         !self.any_packet_flushed
+    }
+
+    /// `true` when the final packet reached the network, so the server holds the
+    /// whole request and will answer it. Such a message cannot be withdrawn: an
+    /// `EOM | IGNORE` would open a second one rather than retract this one.
+    pub(crate) fn message_complete(&self) -> bool {
+        self.message_complete
     }
 
     /// Replaces the write timeout this message inherited from the request that
@@ -233,6 +246,7 @@ impl<'a> PacketWriter<'a> {
             packet_size,
             is_first_packet: true,
             any_packet_flushed: false,
+            message_complete: false,
             start_time: Instant::now(),
             max_timeout_sec: effective_timeout,
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
@@ -267,6 +281,7 @@ impl<'a> PacketWriter<'a> {
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
             any_packet_flushed: self.any_packet_flushed,
+            message_complete: self.message_complete,
             max_timeout_sec: self.max_timeout_sec,
             cancel_handle: self.cancel_handle,
             reset_mode: self.reset_mode,
@@ -295,6 +310,7 @@ impl<'a> PacketWriter<'a> {
             packet_size: state.packet_size,
             is_first_packet: state.is_first_packet,
             any_packet_flushed: state.any_packet_flushed,
+            message_complete: state.message_complete,
             start_time: Instant::now(),
             max_timeout_sec: state.max_timeout_sec,
             cancel_handle: state.cancel_handle,
@@ -413,6 +429,7 @@ impl<'a> PacketWriter<'a> {
         // Set before anything that can fail below: once these bytes are on the
         // wire the server is mid-message, whatever this call returns.
         self.any_packet_flushed = true;
+        self.message_complete = is_last_packet && !is_ignore_packet;
 
         // The header just written reached the wire, so any reset bit it carried
         // is now the server's to acknowledge. An ignore packet asks the server

@@ -1613,12 +1613,16 @@ impl TdsClient {
                 .await
         }
         .await;
+        let message = packet_writer.suspend();
         if let Err(error) = serialization_result {
-            drop(packet_writer);
-            self.abort_streamed_write().await;
+            drop(rpc);
+            // The prefix runs every materialized parameter through the same
+            // checks as the non-streamed sites, so this is retractable rather
+            // than a reason to discard the connection.
+            self.streamed_write_state = StreamedWriteState::Idle;
+            self.retract_partial_request(message).await;
             return Err(error);
         }
-        let message = packet_writer.suspend();
 
         self.streamed_write_state = StreamedWriteState::Active(Box::new(StreamedWriteContext {
             message,
@@ -1863,6 +1867,25 @@ impl TdsClient {
         if message.nothing_sent() {
             // Not a plain drop: re-arm the RESETCONNECTION bit this message took.
             message.abandon(self.transport.as_writer());
+            self.execution_context.set_has_open_batch(false);
+            return;
+        }
+
+        if message.message_complete() {
+            // The server has the whole request and will answer it, so there is
+            // nothing to withdraw - an `EOM | IGNORE` would open a second message
+            // and leave its DONE for the next command. Cancel with an attention
+            // instead, which is msodbcsql's `STATE_BATCH_CMDSENT` arm. The
+            // transport marks itself dead if the attention goes unacknowledged.
+            //
+            // Dropped rather than abandoned: this message carried its reset bit
+            // all the way out and `note_reset_dispatched` recorded it, so the
+            // acknowledgement is already being tracked. Re-arming would send it
+            // twice.
+            drop(message);
+            let _ = self
+                .send_attention_with_timeout(Duration::from_secs(ATTENTION_TIMEOUT_SECONDS))
+                .await;
             self.execution_context.set_has_open_batch(false);
             return;
         }
@@ -2175,11 +2198,13 @@ impl TdsClient {
                     }
                 }
             }
-            // Terminator or next-parameter header write failed mid-message: drop
-            // the half-written message and abort rather than leave it resumable.
+            // Terminator or next-parameter header write failed mid-message:
+            // withdraw it rather than leaving it resumable or discarding the
+            // connection for a failure that cost only the request.
             Err(e) => {
-                drop(packet_writer);
-                self.abort_streamed_write().await;
+                let message = packet_writer.suspend();
+                self.streamed_write_state = StreamedWriteState::Idle;
+                self.retract_partial_request(message).await;
                 Err(e)
             }
         }
@@ -6447,6 +6472,9 @@ mod tests {
         /// When set, `send` never returns, so a test can drive a write deadline
         /// without a real stalled peer.
         send_should_hang: Arc<std::sync::atomic::AtomicBool>,
+        /// Attentions requested, so a test can tell the cancel-a-sent-request
+        /// path from the withdraw-a-partial-one path.
+        attentions: Arc<std::sync::atomic::AtomicUsize>,
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
@@ -6470,6 +6498,7 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
                 receive_timeouts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -6611,6 +6640,10 @@ mod tests {
                 .send_should_fail
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
+                // `NetworkTransport::send` retires the transport on a write
+                // failure; a mock that did not would let tests treat a broken
+                // socket as reusable.
+                self.known_dead = true;
                 return Err(crate::error::Error::ConnectionClosed(
                     "injected send failure".to_string(),
                 ));
@@ -6670,6 +6703,8 @@ mod tests {
             Ok(())
         }
         async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+            self.attentions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(false)
         }
         fn is_connection_dead(&self) -> bool {
@@ -10943,7 +10978,7 @@ mod tests {
             StreamedWriteState::Idle
         ));
         assert!(
-            client.is_connection_dead(),
+            client.transport.connection_known_dead(),
             "a failed final send must make the connection non-reusable"
         );
     }
@@ -11613,6 +11648,43 @@ mod tests {
         assert!(
             client.is_connection_dead(),
             "a withdrawal that cannot be written must retire the transport"
+        );
+    }
+
+    /// A budget expiry on the *last* packet leaves the server holding the whole
+    /// request, so there is nothing to withdraw. Sending `EOM | IGNORE` there
+    /// would open a second message and leave its DONE for the next command;
+    /// the request has to be cancelled with an attention instead.
+    #[tokio::test]
+    async fn a_complete_message_is_cancelled_rather_than_withdrawn() {
+        let transport = TestTransport::new();
+        let attentions = Arc::clone(&transport.attentions);
+        let sent = Arc::clone(&transport.sent);
+        let mut client = create_test_client_with_transport(transport);
+
+        let mut writer = PacketWriter::new(
+            PacketType::RpcRequest,
+            client.transport.as_writer(),
+            None,
+            None,
+        );
+        writer.write_async(&[0xABu8; 16]).await.unwrap();
+        writer.finalize().await.unwrap();
+        let message = writer.suspend();
+        assert!(message.message_complete(), "finalize sent the last packet");
+        let sent_before = sent.lock().unwrap().len();
+
+        client.retract_partial_request(message).await;
+
+        assert_eq!(
+            attentions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a request the server has in full must be cancelled, not withdrawn"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            sent_before,
+            "no second message may be opened to withdraw the first"
         );
     }
 
