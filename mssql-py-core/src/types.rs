@@ -14,6 +14,7 @@ use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::error::Error;
+use mssql_tds::message::parameters::rpc_parameters::RpcTypeMetadata;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{
@@ -181,6 +182,24 @@ impl ParameterHint {
                 | InputSqlType::DateTimeOffset
         )
         .then_some(self.scale)
+    }
+
+    /// Precision and scale carried separately for SQL types whose NULL value
+    /// cannot hold declaration metadata.
+    pub(crate) fn rpc_type_metadata(self) -> Option<RpcTypeMetadata> {
+        match self.sql_type {
+            InputSqlType::Numeric | InputSqlType::Decimal => Some(RpcTypeMetadata {
+                precision: Some(Self::effective_numeric_precision(self.size) as u8),
+                scale: Some(self.scale),
+            }),
+            InputSqlType::Time | InputSqlType::DateTime | InputSqlType::DateTimeOffset => {
+                Some(RpcTypeMetadata {
+                    precision: None,
+                    scale: Some(self.scale),
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -452,8 +471,8 @@ fn unsupported_udt_parameter() -> Error {
 /// Constructs the typed NULL required when inference has no Python value.
 ///
 /// Variable-length types may promote to `MAX`; fixed-width types reject sizes
-/// beyond SQL Server limits. NULL numeric and temporal hints are accepted only
-/// when their metadata matches the value-free [`SqlType`] defaults.
+/// beyond SQL Server limits. Numeric and temporal precision/scale travel on the
+/// containing RPC parameter because a NULL [`SqlType`] has no value metadata.
 pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
     let size = hint.size.max(1);
     Ok(match hint.sql_type {
@@ -465,15 +484,6 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
         InputSqlType::Real => SqlType::Real(None),
         InputSqlType::Float => SqlType::Float(None),
         InputSqlType::Numeric | InputSqlType::Decimal => {
-            // TODO(mssql-tds): Carry NULL precision and scale independently of
-            // the optional value so py-core can preserve non-default metadata.
-            let precision = ParameterHint::effective_numeric_precision(hint.size);
-            if precision != 18 || hint.scale != 10 {
-                return Err(Error::UsageError(format!(
-                    "NULL numeric parameters currently require precision 18 and scale 10; requested precision {} and scale {}",
-                    precision, hint.scale
-                )));
-            }
             if hint.sql_type == InputSqlType::Numeric {
                 SqlType::Numeric(None)
             } else {
@@ -492,14 +502,6 @@ pub(crate) fn null_sql_type(hint: ParameterHint) -> TdsResult<SqlType> {
         InputSqlType::Udt => return Err(unsupported_udt_parameter()),
         InputSqlType::Date => SqlType::Date(None),
         InputSqlType::Time | InputSqlType::DateTime | InputSqlType::DateTimeOffset => {
-            // TODO(mssql-tds): Carry NULL temporal scale independently of the
-            // optional value so py-core can preserve non-default metadata.
-            if hint.scale != 7 {
-                return Err(Error::UsageError(format!(
-                    "NULL temporal parameters currently require scale 7; requested scale {}",
-                    hint.scale
-                )));
-            }
             match hint.sql_type {
                 InputSqlType::Time => SqlType::Time(None),
                 InputSqlType::DateTime => SqlType::DateTime2(None),
@@ -2060,21 +2062,32 @@ mod tests {
     }
 
     #[test]
-    fn null_numeric_accepts_only_core_default_metadata() {
+    fn null_numeric_preserves_rpc_type_metadata() {
         for sql_type in [2, 3] {
-            assert!(null_sql_type(ParameterHint::new(sql_type, 18, 10).unwrap()).is_ok());
-            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 10).unwrap()).is_ok());
-            assert!(null_sql_type(ParameterHint::new(sql_type, 9, 2).unwrap()).is_err());
-            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 0).unwrap()).is_err());
+            let hint = ParameterHint::new(sql_type, 9, 2).unwrap();
+            assert!(null_sql_type(hint).is_ok());
+            assert_eq!(
+                hint.rpc_type_metadata(),
+                Some(RpcTypeMetadata {
+                    precision: Some(9),
+                    scale: Some(2),
+                })
+            );
         }
     }
 
     #[test]
-    fn null_temporal_accepts_only_core_default_scale() {
+    fn null_temporal_preserves_rpc_type_metadata() {
         for sql_type in [92, 93, -155] {
-            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 7).unwrap()).is_ok());
-            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 3).unwrap()).is_err());
-            assert!(null_sql_type(ParameterHint::new(sql_type, 0, 0).unwrap()).is_err());
+            let hint = ParameterHint::new(sql_type, 0, 3).unwrap();
+            assert!(null_sql_type(hint).is_ok());
+            assert_eq!(
+                hint.rpc_type_metadata(),
+                Some(RpcTypeMetadata {
+                    precision: None,
+                    scale: Some(3),
+                })
+            );
         }
     }
 

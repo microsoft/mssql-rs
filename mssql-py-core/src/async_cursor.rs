@@ -23,7 +23,7 @@
 //! preserved.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::error::Error;
@@ -171,6 +171,7 @@ pub struct PyAsyncCursor {
     cleanup_started: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
+    rowcount: Arc<AtomicI64>,
 }
 
 impl PyAsyncCursor {
@@ -199,6 +200,7 @@ impl PyAsyncCursor {
             cleanup_started: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             fetch_state: Arc::new(FetchState::new()),
+            rowcount: Arc::new(AtomicI64::new(-1)),
         }
     }
 
@@ -242,6 +244,7 @@ impl PyAsyncCursor {
             self.input_sizes_generation,
             self.cleanup_required.clone(),
             self.fetch_state.clone(),
+            self.rowcount.clone(),
         ))
     }
 
@@ -348,6 +351,12 @@ impl PyAsyncCursor {
         self.default_query_timeout
     }
 
+    /// Rows affected by the most recent successful operation, or `-1` when unavailable.
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rowcount.load(Ordering::Acquire)
+    }
+
     /// Set SQL type, size, and scale hints for the next successful `execute()`.
     ///
     /// Each item is a SQL type integer or `(sql_type, size, decimal_digits)`.
@@ -371,6 +380,20 @@ impl PyAsyncCursor {
         reset_cursor: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         crate::async_execute::execute(slf, py, operation, parameters, use_prepare, reset_cursor)
+    }
+
+    /// Execute one T-SQL operation for every supplied parameter row.
+    ///
+    /// Returns an awaitable resolving to `None`. Rows are sent sequentially
+    /// through one connection operation and reuse prepared handles when their
+    /// declarations are compatible.
+    fn executemany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        operation: String,
+        seq_of_parameters: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_execute::executemany(slf, py, operation, seq_of_parameters)
     }
 
     /// Fetch the next row and return an awaitable resolving to a tuple or `None`.

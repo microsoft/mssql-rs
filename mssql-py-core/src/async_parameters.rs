@@ -4,7 +4,7 @@
 use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
-use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, RpcTypeMetadata, StatusFlags};
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -59,7 +59,7 @@ pub(crate) enum ParameterMetadata {
 }
 
 /// Extracts the declaration identity used for prepared-statement reuse.
-fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
+fn sql_type_metadata(value: &SqlType, type_metadata: Option<RpcTypeMetadata>) -> ParameterMetadata {
     match value {
         SqlType::Bit(_) => ParameterMetadata::Scalar("bit"),
         SqlType::TinyInt(_) => ParameterMetadata::Scalar("tinyint"),
@@ -70,27 +70,76 @@ fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
         SqlType::Float(_) => ParameterMetadata::Scalar("float"),
         SqlType::Decimal(value) => ParameterMetadata::Decimal {
             numeric: false,
-            precision: value.as_ref().map_or(18, |value| value.precision),
-            scale: value.as_ref().map_or(10, |value| value.scale),
+            precision: value.as_ref().map_or_else(
+                || {
+                    type_metadata
+                        .and_then(|metadata| metadata.precision)
+                        .unwrap_or(18)
+                },
+                |value| value.precision,
+            ),
+            scale: value.as_ref().map_or_else(
+                || {
+                    type_metadata
+                        .and_then(|metadata| metadata.scale)
+                        .unwrap_or(10)
+                },
+                |value| value.scale,
+            ),
         },
         SqlType::Numeric(value) => ParameterMetadata::Decimal {
             numeric: true,
-            precision: value.as_ref().map_or(18, |value| value.precision),
-            scale: value.as_ref().map_or(10, |value| value.scale),
+            precision: value.as_ref().map_or_else(
+                || {
+                    type_metadata
+                        .and_then(|metadata| metadata.precision)
+                        .unwrap_or(18)
+                },
+                |value| value.precision,
+            ),
+            scale: value.as_ref().map_or_else(
+                || {
+                    type_metadata
+                        .and_then(|metadata| metadata.scale)
+                        .unwrap_or(10)
+                },
+                |value| value.scale,
+            ),
         },
         SqlType::Money(_) => ParameterMetadata::Scalar("money"),
         SqlType::SmallMoney(_) => ParameterMetadata::Scalar("smallmoney"),
         SqlType::Time(value) => ParameterMetadata::Temporal {
             kind: "time",
-            scale: value.as_ref().map_or(7, |value| value.scale),
+            scale: value.as_ref().map_or_else(
+                || {
+                    type_metadata
+                        .and_then(|metadata| metadata.scale)
+                        .unwrap_or(7)
+                },
+                |value| value.scale,
+            ),
         },
         SqlType::DateTime2(value) => ParameterMetadata::Temporal {
             kind: "datetime2",
-            scale: value.as_ref().map_or(7, |value| value.time.scale),
+            scale: value.as_ref().map_or_else(
+                || {
+                    type_metadata
+                        .and_then(|metadata| metadata.scale)
+                        .unwrap_or(7)
+                },
+                |value| value.time.scale,
+            ),
         },
         SqlType::DateTimeOffset(value) => ParameterMetadata::Temporal {
             kind: "datetimeoffset",
-            scale: value.as_ref().map_or(7, |value| value.datetime2.time.scale),
+            scale: value.as_ref().map_or_else(
+                || {
+                    type_metadata
+                        .and_then(|metadata| metadata.scale)
+                        .unwrap_or(7)
+                },
+                |value| value.datetime2.time.scale,
+            ),
         },
         SqlType::SmallDateTime(_) => ParameterMetadata::Scalar("smalldatetime"),
         SqlType::DateTime(_) => ParameterMetadata::Scalar("datetime"),
@@ -131,7 +180,9 @@ fn sql_type_metadata(value: &SqlType) -> ParameterMetadata {
             dimensions: *dimensions,
             base_type: *base_type,
         },
-        SqlType::Variant(inner) => ParameterMetadata::Variant(Box::new(sql_type_metadata(inner))),
+        SqlType::Variant(inner) => {
+            ParameterMetadata::Variant(Box::new(sql_type_metadata(inner, None)))
+        }
         SqlType::Table(type_name, _) => ParameterMetadata::Table {
             schema: type_name
                 .schema_name
@@ -330,6 +381,66 @@ struct Placeholder {
     source_name: Option<String>,
 }
 
+/// SQL text and placeholder metadata compiled once for repeated row binding.
+pub(crate) struct ParameterBindingPlan {
+    operation: String,
+    placeholders: Vec<Placeholder>,
+    named: bool,
+}
+
+impl ParameterBindingPlan {
+    pub(crate) fn new(operation: String, named: bool) -> PyResult<Self> {
+        let (operation, placeholders) = rewrite_placeholders(&operation, named)?;
+        Ok(Self {
+            operation,
+            placeholders,
+            named,
+        })
+    }
+
+    pub(crate) fn into_operation(self) -> String {
+        self.operation
+    }
+
+    pub(crate) fn named(&self) -> bool {
+        self.named
+    }
+
+    pub(crate) fn bind_row(
+        &self,
+        row: &Bound<'_, PyAny>,
+        hints: Option<&[ParameterHint]>,
+    ) -> PyResult<(Vec<RpcParameter>, Vec<ParameterMetadata>)> {
+        validate_hint_count(hints, self.placeholders.len())?;
+        if self.named {
+            let values = row.cast::<PyDict>().map_err(|_| {
+                PyTypeError::new_err("ExecuteMany mapping rows must all use named parameters")
+            })?;
+            if self.placeholders.is_empty() && !values.is_empty() {
+                return Err(PyTypeError::new_err(format!(
+                    "The SQL contains no parameter markers, but {} parameters were supplied. \
+                     Named parameters use the %(name)s style.",
+                    values.len()
+                )));
+            }
+            return bind_named_placeholders(&self.placeholders, values, hints);
+        }
+
+        let values = if let Ok(values) = row.cast::<PyTuple>() {
+            values.iter().collect::<Vec<_>>()
+        } else if let Ok(values) = row.cast::<PyList>() {
+            values.iter().collect::<Vec<_>>()
+        } else if row.get_type().name()? == "Row" {
+            row.try_iter()?.collect::<PyResult<Vec<_>>>()?
+        } else {
+            return Err(PyTypeError::new_err(
+                "ExecuteMany positional rows must be tuples, lists, or Row objects",
+            ));
+        };
+        bind_positional_placeholders(&self.placeholders, values, hints)
+    }
+}
+
 fn parse_pyformat_marker(sql: &str, start: usize, close: Option<usize>) -> Option<(&str, usize)> {
     let body_start = start.checked_add("%(".len())?;
     let close = close.filter(|close| *close >= body_start)?;
@@ -358,8 +469,11 @@ pub(crate) fn bind_parameters(
 ) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     if parameters.len() == 1 {
         let parameter = parameters.get_item(0)?;
-        if let Ok(values) = parameter.cast::<PyDict>() {
-            return bind_named(operation, values, hints);
+        if parameter.cast::<PyDict>().is_ok() {
+            let plan = ParameterBindingPlan::new(operation, true)?;
+            return plan
+                .bind_row(parameter.as_any(), hints)
+                .map(|(parameters, signature)| (plan.operation, parameters, signature));
         }
         if let Ok(values) = parameter.cast::<PyTuple>() {
             return bind_positional(operation, values.iter(), hints);
@@ -424,6 +538,15 @@ fn bind_positional<'py>(
 ) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     let values = values.collect::<Vec<_>>();
     let (operation, names) = rewrite_placeholders(&operation, false)?;
+    let (parameters, parameter_signature) = bind_positional_placeholders(&names, values, hints)?;
+    Ok((operation, parameters, parameter_signature))
+}
+
+fn bind_positional_placeholders(
+    names: &[Placeholder],
+    values: Vec<Bound<'_, PyAny>>,
+    hints: Option<&[ParameterHint]>,
+) -> PyResult<(Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     if names.len() != values.len() {
         return Err(PyTypeError::new_err(format!(
             "The SQL contains {} parameter markers, but {} parameters were supplied",
@@ -433,28 +556,26 @@ fn bind_positional<'py>(
     }
     validate_hint_count(hints, names.len())?;
     let bound_parameters = names
-        .into_iter()
+        .iter()
         .zip(values)
         .enumerate()
         .map(|(index, (placeholder, value))| {
             rpc_parameter(
-                placeholder.rpc_name,
+                placeholder.rpc_name.clone(),
                 &value,
                 hints.and_then(|hints| hints.get(index)),
             )
         })
         .collect::<PyResult<Vec<_>>>()?;
     let (parameters, parameter_signature) = bound_parameters.into_iter().unzip();
-    Ok((operation, parameters, parameter_signature))
+    Ok((parameters, parameter_signature))
 }
 
-/// Rewrites `%(name)s` markers and looks up each value by dictionary key.
-fn bind_named(
-    operation: String,
+fn bind_named_placeholders(
+    names: &[Placeholder],
     values: &Bound<'_, PyDict>,
     hints: Option<&[ParameterHint]>,
-) -> PyResult<(String, Vec<RpcParameter>, Vec<ParameterMetadata>)> {
-    let (operation, names) = rewrite_placeholders(&operation, true)?;
+) -> PyResult<(Vec<RpcParameter>, Vec<ParameterMetadata>)> {
     if names.is_empty() && !values.is_empty() {
         return Err(PyTypeError::new_err(format!(
             "The SQL contains no parameter markers, but {} parameters were supplied. \
@@ -464,24 +585,25 @@ fn bind_named(
     }
     validate_hint_count(hints, names.len())?;
     let bound_parameters = names
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(index, placeholder)| {
             let source_name = placeholder
                 .source_name
+                .as_ref()
                 .expect("named placeholders include source names");
             let value = values
-                .get_item(&source_name)?
+                .get_item(source_name)?
                 .ok_or_else(|| PyKeyError::new_err(source_name.clone()))?;
             rpc_parameter(
-                placeholder.rpc_name,
+                placeholder.rpc_name.clone(),
                 &value,
                 hints.and_then(|hints| hints.get(index)),
             )
         })
         .collect::<PyResult<Vec<_>>>()?;
     let (parameters, parameter_signature) = bound_parameters.into_iter().unzip();
-    Ok((operation, parameters, parameter_signature))
+    Ok((parameters, parameter_signature))
 }
 
 fn validate_hint_count(hints: Option<&[ParameterHint]>, parameter_count: usize) -> PyResult<()> {
@@ -509,6 +631,7 @@ fn rpc_parameter(
     // sp_describe_undeclared_parameters. The existing private path is specific
     // to Always Encrypted, so an unhinted Python None falls back to NVARCHAR(1).
     // TODO(performance): Benchmark representative scalar binding conversions.
+    let is_null = value.is_none();
     let (value, status) = if let Ok(tvp) = value.extract::<PyRef<'_, PyTableValuedParameter>>() {
         if hint.is_some() {
             return Err(PyTypeError::new_err(
@@ -531,8 +654,16 @@ fn rpc_parameter(
             StatusFlags::NONE,
         )
     };
-    let signature = sql_type_metadata(&value);
-    Ok((RpcParameter::new(Some(name), status, value), signature))
+    let type_metadata = is_null
+        .then(|| hint.and_then(|hint| hint.rpc_type_metadata()))
+        .flatten();
+    let signature = sql_type_metadata(&value, type_metadata);
+    let parameter = RpcParameter::new(Some(name), status, value);
+    let parameter = match type_metadata {
+        Some(metadata) => parameter.with_type_metadata(metadata),
+        None => parameter,
+    };
+    Ok((parameter, signature))
 }
 
 /// Rewrites DB-API parameter markers to collision-free SQL Server RPC names.

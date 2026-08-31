@@ -665,31 +665,6 @@ def test_setinputsizes_uses_default_numeric_precision(client_context, use_prepar
     asyncio.run(run())
 
 
-@pytest.mark.parametrize(
-    ("hint", "message"),
-    [
-        ((3, 9, 2), "require precision 18 and scale 10"),
-        ((92, 0, 3), "require scale 7"),
-        ((93, 0, 3), "require scale 7"),
-        ((-155, 0, 3), "require scale 7"),
-    ],
-)
-def test_setinputsizes_rejects_unrepresentable_typed_null_metadata(
-    mock_client_context, hint, message
-):
-    async def run():
-        conn = await connect(mock_client_context)
-        try:
-            cursor = conn.cursor()
-            cursor.setinputsizes([hint])
-            with pytest.raises(TypeError, match=message):
-                cursor.execute("SELECT ?", None)
-        finally:
-            await conn.close()
-
-    asyncio.run(run())
-
-
 @pytest.mark.parametrize("value", [None, b"serialized-udt"])
 def test_setinputsizes_rejects_udt_without_type_name(mock_client_context, value):
     async def run():
@@ -711,9 +686,13 @@ def test_setinputsizes_rejects_udt_without_type_name(mock_client_context, value)
     "hint",
     [
         (3, 18, 10),
+        (3, 9, 2),
         (92, 0, 7),
+        (92, 0, 3),
         (93, 0, 7),
+        (93, 0, 3),
         (-155, 0, 7),
+        (-155, 0, 3),
     ],
 )
 def test_setinputsizes_accepts_representable_typed_null_metadata(

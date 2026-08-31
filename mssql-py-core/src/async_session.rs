@@ -89,6 +89,35 @@ pub(crate) struct SessionOperationGuard {
     completed: bool,
 }
 
+/// Releases a claimed operation abandoned before any protocol work starts.
+pub(crate) struct SessionPreflightGuard {
+    session_state: Arc<AsyncConnectionState>,
+    operation_id: OperationId,
+    completed: bool,
+}
+
+impl SessionPreflightGuard {
+    pub(crate) fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
+        Self {
+            session_state,
+            operation_id,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SessionPreflightGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.session_state.release_operation(self.operation_id);
+        }
+    }
+}
+
 impl SessionOperationGuard {
     pub(crate) fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
         Self {
@@ -370,7 +399,10 @@ impl AsyncConnectionState {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AsyncConnectionState, ClaimError, ConnectionLifecycle, OperationPhase};
+    use super::{
+        AsyncConnectionState, ClaimError, ConnectionLifecycle, OperationPhase,
+        SessionPreflightGuard,
+    };
 
     #[test]
     fn allocates_unique_cursor_ids() {
@@ -386,6 +418,20 @@ mod tests {
 
         assert_eq!(state.allocate_operation_id(), 1);
         assert_eq!(state.allocate_operation_id(), 2);
+    }
+
+    #[test]
+    fn abandoned_preflight_releases_without_breaking_session() {
+        let state = Arc::new(AsyncConnectionState::new());
+        let claim = state.claim_execute(1).unwrap();
+
+        drop(SessionPreflightGuard::new(
+            Arc::clone(&state),
+            claim.operation_id,
+        ));
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert!(state.claim_execute(2).is_ok());
     }
 
     #[test]
