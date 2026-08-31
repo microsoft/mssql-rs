@@ -167,6 +167,10 @@ impl RowOutcome {
     }
 }
 
+/// Writes one decoded TDS row into the application buffers bound by column.
+///
+/// `next_binding` and `last_column_read` survive a packet-boundary continuation,
+/// so the same instance must be passed back when the TDS decoder pauses mid-row.
 struct BoundRowWriter<'a> {
     bindings: &'a [ColumnBinding],
     next_binding: usize,
@@ -182,6 +186,7 @@ struct BoundRowWriter<'a> {
 unsafe impl Send for BoundRowWriter<'_> {}
 
 impl<'a> BoundRowWriter<'a> {
+    /// Starts writing one row at its rowset slot and bind-offset displacement.
     fn new(
         bindings: &'a [ColumnBinding],
         row_index: usize,
@@ -197,6 +202,8 @@ impl<'a> BoundRowWriter<'a> {
         }
     }
 
+    /// Advances the ordered binding cursor to `col`, returning its binding when
+    /// present and skipping unbound columns without losing the wire ordinal.
     fn take_binding(&mut self, col: usize) -> Option<ColumnBinding> {
         let ordinal = col + 1;
         while self
@@ -215,6 +222,7 @@ impl<'a> BoundRowWriter<'a> {
         Some(binding)
     }
 
+    /// Sends a materialized value through the established conversion path.
     fn write_value(&mut self, col: usize, value: ColumnValues) {
         let Some(binding) = self.take_binding(col) else {
             return;
@@ -224,6 +232,8 @@ impl<'a> BoundRowWriter<'a> {
         self.outcome = self.outcome.merge(delivered);
     }
 
+    /// Writes `value` directly when the bound C type is exact, otherwise lazily
+    /// materializes the equivalent `ColumnValues` for normal conversion.
     fn write_exact<T, F>(&mut self, col: usize, target_type: SqlSmallInt, value: T, fallback: F)
     where
         T: Copy,
@@ -240,6 +250,8 @@ impl<'a> BoundRowWriter<'a> {
         self.outcome = self.outcome.merge(delivered);
     }
 
+    /// Converts temporal parts directly into the matching ODBC struct, retaining
+    /// the normal conversion path for other C targets and range failures.
     fn write_temporal<T, P, C, V>(
         &mut self,
         col: usize,
