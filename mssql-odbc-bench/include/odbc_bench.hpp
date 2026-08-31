@@ -201,6 +201,9 @@ struct RetrievalMetrics {
     std::uint64_t get_data_calls = 0;
     double total_seconds = 0.0;
     double execute_seconds = 0.0;
+    /// Time between execute and the start of fetching. Negative when the workload
+    /// has no one-time metadata phase (`bind_cycle_*` re-describes and re-binds
+    /// inside the fetch loop), in which case no counter is emitted.
     double metadata_bind_seconds = 0.0;
     double fetch_seconds = 0.0;
 };

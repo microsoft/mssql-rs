@@ -217,14 +217,15 @@ part of the cost the consumer actually pays.
 
 Connection, buffer allocation, statement attributes set before execution, setup,
 the untimed full-data preflight, cursor close, and the final unbind are all
-outside the boundary. The `metadata_bind_ms` phase counter is therefore zero for
-`bind_cycle_*`, where describe and bind are inside the fetch loop rather than
-ahead of it; `fetch_ms` carries that work.
+outside the boundary. The `metadata_bind_ms` phase counter is omitted entirely
+for `bind_cycle_*`, where describe and bind are inside the fetch loop rather
+than ahead of it; `fetch_ms` carries that work.
 
 JSON results include rows, cells, logical bytes, `SQLGetData` call count, and
-execute, metadata-plus-bind, and fetch phase counters, plus rows/s, cells/s, and
-logical bytes/s. Logical bytes are the generator's own byte total, so all three
-drivers are credited with identical payload regardless of representation.
+execute, metadata-plus-bind (absent for `bind_cycle_*`), and fetch phase
+counters, plus rows/s, cells/s, and logical bytes/s. Logical bytes are the
+generator's own byte total, so all three drivers are credited with identical
+payload regardless of representation.
 
 Preflight checks all indicators, row identity/coverage, an order-independent
 checksum, representative values for every generated type, the exact generated
