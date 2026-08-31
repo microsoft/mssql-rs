@@ -1319,7 +1319,9 @@ impl TdsClient {
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout, cancel);
-        batch.serialize(&mut packet_writer).await?;
+        let serialize_result = batch.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        self.finish_send(serialize_result, message).await?;
         Ok(())
     }
 
@@ -2502,7 +2504,9 @@ impl TdsClient {
         let batch = SqlBatch::new(sql_command, &self.execution_context);
         let mut packet_writer =
             batch.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel_handle);
-        batch.serialize(&mut packet_writer).await?;
+        let serialize_result = batch.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        self.finish_send(serialize_result, message).await?;
 
         // Consume the response
         self.consume_done_token().await

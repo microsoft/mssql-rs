@@ -311,6 +311,11 @@ impl<'a> PacketWriter<'a> {
     /// answers an ignored message with a DONE token, which the caller must
     /// consume before reusing the connection.
     pub(crate) async fn cancel_current_message(&mut self) -> TdsResult<()> {
+        // The server discards an ignored message whole, so the caller re-arms the
+        // reset instead. Cleared explicitly because a message that failed before
+        // its first packet was accounted for still reports `is_first_packet`, and
+        // the header builder would then hand the bit to the ignore packet.
+        self.reset_mode = ResetConnectionMode::None;
         self.populate_header_and_send(true, true).await
     }
 
@@ -981,6 +986,11 @@ pub(crate) mod tests {
         block_on(writer.write_byte_async(0xAB)).unwrap();
         block_on(writer.cancel_current_message()).unwrap();
 
+        assert_eq!(
+            mock.data[1] & (PacketStatusFlags::ResetConnection as u8),
+            0,
+            "the ignore packet must not carry the reset it asks the server to discard"
+        );
         assert!(!mock.take_reset_dispatched());
     }
 
