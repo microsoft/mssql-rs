@@ -115,18 +115,43 @@ protected:
         return collation.find("Latin1_General") != std::string::npos;
     }
 
-    // A round trip on the same connection after a failed execute. A dead
-    // connection fails here (08S01) instead of returning the value. Any cursor
-    // the caller left open is closed first, since reusing the statement with one
-    // live is 24000 and would mask that.
-    void ExpectConnectionStillUsable() {
+    // The server-side session id, so a test can tell a surviving connection from
+    // a transparently rebuilt one.
+    std::string CurrentSpid() {
+        EXPECT_SQL_OK(Prepare("SELECT CAST(@@SPID AS VARCHAR(16))"), SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        const std::string spid = GetColumnChar(1);
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        return spid;
+    }
+
+    // A round trip on the same connection after a failed execute. Any cursor the
+    // caller left open is closed first, since reusing the statement with one live
+    // is 24000 and would mask what this checks.
+    //
+    // The SPID is the assertion that matters: session recovery is negotiated by
+    // default, so a driver that killed the connection would reconnect here and
+    // still answer 'alive'. Only an unchanged SPID says the request was retracted
+    // rather than the session rebuilt.
+    void ExpectSameSessionStillUsable(const std::string& expected_spid) {
         SQLCloseCursor(stmt_);
         ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+        SQLUINTEGER dead = SQL_CD_TRUE;
+        ASSERT_SQL_OK(
+            SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, SQL_IS_UINTEGER, nullptr),
+            SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(SQL_CD_FALSE, dead) << "a retracted request must not cost the connection";
+
         ASSERT_SQL_OK(Prepare("SELECT 'alive'"), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ("alive", GetColumnChar(1));
         EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        EXPECT_EQ(expected_spid, CurrentSpid())
+            << "the session was rebuilt, so the request cost the connection";
     }
 };
 
@@ -892,6 +917,7 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSilentlyCorrupted) {
 // on the wire. This driver rejects it before serializing, so it takes the
 // local-discard branch. Both must end with a usable connection.
 TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUsable) {
+    const std::string spid = CurrentSpid();
     ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
 
     // ColumnSize 0 is the `max` spelling, so no length bound applies to this one.
@@ -908,7 +934,7 @@ TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUs
 
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
 
-    ExpectConnectionStillUsable();
+    ExpectSameSessionStillUsable(spid);
 }
 
 // Strands this driver: the value passes our UTF-16 unit count at one unit, then
@@ -922,6 +948,7 @@ TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectio
         GTEST_SKIP() << "needs a Latin1 collation to make the value unmappable";
     }
 
+    const std::string spid = CurrentSpid();
     ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
 
     std::vector<SQLCHAR> big(20000, 'a');
@@ -939,5 +966,5 @@ TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectio
     ASSERT_EQ(SQL_ERROR, SQLExecute(stmt_))
         << "the over-long value must be rejected during serialization";
 
-    ExpectConnectionStillUsable();
+    ExpectSameSessionStillUsable(spid);
 }

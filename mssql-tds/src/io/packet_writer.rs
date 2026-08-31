@@ -97,6 +97,11 @@ pub struct PacketWriter<'a> {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool, // Note: Cannot just use packet_id because its value can rollover.
+    /// Set the instant a packet reaches the network. Distinct from
+    /// `is_first_packet`, which is cleared only after the write budget check and
+    /// the first-packet callback, so it still reads `true` on error paths where
+    /// the bytes are already gone.
+    any_packet_flushed: bool,
     start_time: Instant,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
@@ -127,6 +132,7 @@ pub(crate) struct SuspendedMessage {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool,
+    any_packet_flushed: bool,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
     reset_mode: ResetConnectionMode,
@@ -137,8 +143,12 @@ impl SuspendedMessage {
     /// `true` while no packet of this message has reached the network yet, so
     /// the request can be abandoned locally without the server ever learning it
     /// existed.
+    ///
+    /// Deliberately not `is_first_packet`: that is cleared only after the write
+    /// budget check and the first-packet callback, so a packet that landed and
+    /// then tripped either would still read as unsent.
     pub(crate) fn nothing_sent(&self) -> bool {
-        self.is_first_packet
+        !self.any_packet_flushed
     }
 
     /// Replaces the write timeout this message inherited from the request that
@@ -222,6 +232,7 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: buffer_cursor,
             packet_size,
             is_first_packet: true,
+            any_packet_flushed: false,
             start_time: Instant::now(),
             max_timeout_sec: effective_timeout,
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
@@ -255,6 +266,7 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: self.payload_cursor,
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
+            any_packet_flushed: self.any_packet_flushed,
             max_timeout_sec: self.max_timeout_sec,
             cancel_handle: self.cancel_handle,
             reset_mode: self.reset_mode,
@@ -282,6 +294,7 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: state.payload_cursor,
             packet_size: state.packet_size,
             is_first_packet: state.is_first_packet,
+            any_packet_flushed: state.any_packet_flushed,
             start_time: Instant::now(),
             max_timeout_sec: state.max_timeout_sec,
             cancel_handle: state.cancel_handle,
@@ -391,6 +404,10 @@ impl<'a> PacketWriter<'a> {
         );
 
         send_data_fut.await?;
+
+        // Set before anything that can fail below: once these bytes are on the
+        // wire the server is mid-message, whatever this call returns.
+        self.any_packet_flushed = true;
 
         // The header just written reached the wire, so any reset bit it carried
         // is now the server's to acknowledge. An ignore packet asks the server
@@ -1607,5 +1624,33 @@ pub(crate) mod tests {
         // Two packets were needed; payload reassembles to the full 16 bytes.
         assert!(mock.data.len() > packet_size as usize);
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
+    }
+
+    /// The write budget is checked *after* the packet lands, so this error path
+    /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
+    /// the flushed flag can tell the caller the server is mid-message, and
+    /// getting it wrong means the request is dropped instead of withdrawn.
+    #[test]
+    fn a_packet_that_lands_then_times_out_is_not_nothing_sent() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+
+        let result = block_on(writer.write_async(&[0xABu8; 64]));
+        let message = writer.suspend();
+
+        assert!(result.is_err(), "the overrun budget must surface an error");
+        assert!(
+            !mock.data.is_empty(),
+            "the packet reached the wire before the budget was checked"
+        );
+        assert!(
+            message.is_first_packet,
+            "the first-packet flag is still set on this path"
+        );
+        assert!(
+            !message.nothing_sent(),
+            "a request the server has part of must be withdrawn, not discarded"
+        );
     }
 }

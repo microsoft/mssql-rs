@@ -73,6 +73,15 @@ const CANCEL_TIMEOUT_SECS: u32 = 120;
 /// Derived rather than converted, so the budget cannot degrade to unbounded.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(CANCEL_TIMEOUT_SECS as u64);
 
+/// Budget for the ignore packet itself, strictly below [`CANCEL_TIMEOUT`].
+///
+/// `PacketWriter` checks this only after a write returns, so it can fire only
+/// while the stream is still intact — which yields the graceful arm, closing the
+/// transport normally. The outer deadline instead drops the write future and
+/// forces retirement without a shutdown, so a merely slow peer should reach this
+/// one first. Only the ordering matters; the exact value does not.
+const CANCEL_WRITE_TIMEOUT_SECS: u32 = CANCEL_TIMEOUT_SECS / 2;
+
 #[derive(Debug)]
 enum Withdrawal {
     /// Ignore packet sent and the server's DONE consumed.
@@ -1872,7 +1881,10 @@ impl TdsClient {
     }
 
     /// Closes an already-sent message with `EOM | IGNORE` and consumes the DONE
-    /// the server answers it with, both under [`CANCEL_TIMEOUT`].
+    /// the server answers it with, each under its own [`CANCEL_TIMEOUT`] — they
+    /// run in sequence, so a withdrawal can hold the caller for twice that.
+    /// msodbcsql is the same shape: `SendPacket(.., DEFAULT_CANCEL_TIMEOUT)`
+    /// followed by `FlushInputStream`.
     async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> Withdrawal {
         // Cached read, not `is_connection_dead`: that one `try_read`s a byte,
         // which here could swallow the server's answer to the half-written
@@ -1890,14 +1902,14 @@ impl TdsClient {
 
         let mut packet_writer = PacketWriter::resume(
             message
-                .with_write_timeout(Some(CANCEL_TIMEOUT_SECS))
+                .with_write_timeout(Some(CANCEL_WRITE_TIMEOUT_SECS))
                 .without_cancellation(),
             self.transport.as_writer(),
         );
         // `PacketWriter` only checks its budget once a write returns, so the
-        // ignore packet needs a deadline of its own. Timing out drops the write
-        // future, which leaves the TLS stream mid-record, so that branch retires
-        // the transport without writing to it again.
+        // ignore packet needs an outer deadline too. Reaching that one means the
+        // write never came back, so the future is dropped mid-record and the
+        // transport is retired without being written to again.
         let ignored =
             tokio::time::timeout(CANCEL_TIMEOUT, packet_writer.cancel_current_message()).await;
         drop(packet_writer);
