@@ -77,12 +77,6 @@ stages:
       displayName: Check duplicate PR head commit
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-    - bash: |
-        set -euo pipefail
-        python3 -m unittest discover -s .pipeline/scripts \
-          -p 'test_compare_odbc_benchmarks.py' -v
-      displayName: Test ODBC benchmark comparison policy
-
 - stage: Build
   displayName: Build Stage
   dependsOn:
@@ -110,6 +104,18 @@ stages:
       expectedSentinels: build_arm,build_win_arm
       sqlImageTag: ${{ parameters.sqlImageTag }}
       jobCondition: and(not(canceled()), eq(variables['Build.Reason'], 'PullRequest'))
+  - job: Test_Benchmark_Policy
+    displayName: Test ODBC benchmark comparison policy
+    pool:
+      name: ${{ parameters.utilPoolName }}
+      demands:
+        - imageOverride -equals RUST-UBUSLIM
+    steps:
+      - bash: |
+          set -euo pipefail
+          python3 -m unittest discover -s .pipeline/scripts \
+            -p 'test_compare_odbc_benchmarks.py' -v
+        displayName: Run comparator policy tests
   - job: Build_Windows
     displayName: Build Windows
     pool:

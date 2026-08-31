@@ -26,6 +26,8 @@ BASELINE_TARGET_DIR="$REPO_ROOT/target/odbc-baseline"
 CANDIDATE_DRIVER_NAME="MSSQL Rust ODBC Perf Candidate"
 BASELINE_DRIVER_NAME="MSSQL Rust ODBC Perf Baseline"
 MICROSOFT_DRIVER_NAME="ODBC Driver 18 for SQL Server"
+NUMPY_VERSION="2.4.6"
+SCIPY_VERSION="1.18.0"
 
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
@@ -237,7 +239,8 @@ ensure_python_stats() {
         return 1
     fi
     "$venv/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-    "$venv/bin/python" -m pip install --quiet numpy scipy || return 1
+    "$venv/bin/python" -m pip install --quiet \
+        "numpy==$NUMPY_VERSION" "scipy==$SCIPY_VERSION" || return 1
     BENCH_PYTHON="$venv/bin/python"
 }
 
@@ -414,7 +417,9 @@ fi
     echo "regression_ratio=$REGRESSION_RATIO"
     echo "confirm_runs=$CONFIRM_RUNS"
     echo "confirm_quorum=$CONFIRM_QUORUM"
-    echo "gbench_compare=${GBENCH_ARGS[1]:-disabled}"
+    echo "gbench_compare=${GBENCH_ARGS[1]}"
+    echo "numpy_version=$NUMPY_VERSION"
+    echo "scipy_version=$SCIPY_VERSION"
     echo "bench_python=$BENCH_PYTHON"
     echo "malloc_mmap_threshold=$MALLOC_MMAP_THRESHOLD_"
     echo "malloc_trim_threshold=$MALLOC_TRIM_THRESHOLD_"
@@ -635,7 +640,7 @@ final_args=(
     --confirm-quorum "$CONFIRM_QUORUM"
     "${CONFIRMATION_ARGS[@]}"
 )
-if [ "$FAIL_ON_REGRESSION" != "1" ]; then
+if [ "$FAIL_ON_REGRESSION" = "0" ]; then
     final_args+=(--no-fail-on-regression)
 fi
 # Exit 2 means the comparison completed and the gate tripped. Delay that exit

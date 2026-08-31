@@ -325,7 +325,8 @@ function Initialize-BenchmarkPython {
         }
         # Send pip's output to the host so only the interpreter path is returned.
         & $venvPython -m pip install --quiet --upgrade pip *> $null
-        & $venvPython -m pip install --quiet numpy scipy | Out-Host
+        & $venvPython -m pip install --quiet `
+            "numpy==$script:NumpyVersion" "scipy==$script:ScipyVersion" | Out-Host
         if ($LASTEXITCODE -ne 0) {
             return $null
         }
@@ -461,6 +462,8 @@ $BaselineTargetDir = Join-Path $RepoRoot 'target\odbc-baseline'
 $CandidateDriverName = 'MSSQL Rust ODBC Perf Candidate'
 $BaselineDriverName = 'MSSQL Rust ODBC Perf Baseline'
 $script:MicrosoftDriverName = 'ODBC Driver 18 for SQL Server'
+$script:NumpyVersion = '2.4.6'
+$script:ScipyVersion = '1.18.0'
 
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
@@ -702,6 +705,8 @@ try {
         "confirm_quorum=$ConfirmQuorum",
         "gbench_compare=$(if ($GbenchArguments.Count) { $GbenchCompare } else { 'disabled' })",
         "bench_python=$script:BenchPython",
+        "numpy_version=$script:NumpyVersion",
+        "scipy_version=$script:ScipyVersion",
         "timestamp_utc=$([DateTime]::UtcNow.ToString('o'))",
         $RustcVersion,
         $CargoVersion,

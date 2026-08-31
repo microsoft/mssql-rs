@@ -23,3 +23,21 @@ extends:
     testScriptArgs: none
     testResultsSubDir: results
     testTimeoutMinutes: 180
+    steps:
+      - bash: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("$(Build.ArtifactStagingDirectory)/results/comparison.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          regressions = [
+              benchmark["name"]
+              for benchmark in data["benchmarks"]
+              if benchmark["regression"]
+          ]
+          if regressions:
+              raise SystemExit(f"confirmed ODBC regressions: {regressions}")
+          PY
+        displayName: Enforce ODBC regression gate
