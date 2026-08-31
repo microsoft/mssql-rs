@@ -160,6 +160,7 @@ impl ExecuteOutcome {
 struct ExecuteFailure {
     error: Error,
     break_connection: bool,
+    row_index: Option<usize>,
 }
 
 impl ExecuteFailure {
@@ -167,7 +168,13 @@ impl ExecuteFailure {
         Self {
             error,
             break_connection: true,
+            row_index: None,
         }
+    }
+
+    fn at_row(mut self, row_index: usize) -> Self {
+        self.row_index = Some(row_index);
+        self
     }
 }
 
@@ -176,6 +183,7 @@ impl From<Error> for ExecuteFailure {
         Self {
             error,
             break_connection: false,
+            row_index: None,
         }
     }
 }
@@ -268,8 +276,28 @@ async fn execute_on_client(
 }
 
 fn map_execute_error(error: impl std::fmt::Display) -> PyErr {
-    tracing::debug!("PyAsyncCursor::execute: failed: {error}");
     PyRuntimeError::new_err(format!("Query execution failed: {error}"))
+}
+
+fn trace_execute_failure(operation: &str, error: &ExecuteFailure, has_open_batch: bool) {
+    let break_connection = error.break_connection || has_open_batch;
+    match (break_connection, error.row_index) {
+        (true, Some(row_index)) => tracing::warn!(
+            "PyAsyncCursor::{operation}: failed; row_index={row_index}; connection marked broken; error={}",
+            error.error
+        ),
+        (true, None) => tracing::warn!(
+            "PyAsyncCursor::{operation}: failed; connection marked broken; error={}",
+            error.error
+        ),
+        (false, Some(row_index)) => tracing::debug!(
+            "PyAsyncCursor::{operation}: failed; row_index={row_index}; error={}",
+            error.error
+        ),
+        (false, None) => {
+            tracing::debug!("PyAsyncCursor::{operation}: failed; error={}", error.error);
+        }
+    }
 }
 
 fn clear_input_sizes_if_current(cursor: &Py<PyAsyncCursor>, generation: u64) {
@@ -304,8 +332,21 @@ struct ExecuteManyRow {
     parameter_signature: Vec<ParameterMetadata>,
 }
 
+struct ExecuteManyOutcome {
+    affected: i64,
+    output_rows: Vec<PyRowWriter>,
+    has_result_set: bool,
+    dispatched: bool,
+}
+
 struct PreflightWorkGuard {
     cancelled: Arc<AtomicBool>,
+    dispatch: Option<tracing::Dispatch>,
+    completed: bool,
+}
+
+struct WireExecutionTraceGuard {
+    dispatch: Option<tracing::Dispatch>,
     completed: bool,
 }
 
@@ -317,9 +358,10 @@ fn has_stable_signature(rows: &[ExecuteManyRow]) -> bool {
 }
 
 impl PreflightWorkGuard {
-    fn new(cancelled: Arc<AtomicBool>) -> Self {
+    fn new(cancelled: Arc<AtomicBool>, dispatch: Option<tracing::Dispatch>) -> Self {
         Self {
             cancelled,
+            dispatch,
             completed: false,
         }
     }
@@ -332,7 +374,33 @@ impl PreflightWorkGuard {
 impl Drop for PreflightWorkGuard {
     fn drop(&mut self) {
         if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::debug!("PyAsyncCursor::executemany: preflight interrupted");
             self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl WireExecutionTraceGuard {
+    fn new(dispatch: Option<tracing::Dispatch>) -> Self {
+        Self {
+            dispatch,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for WireExecutionTraceGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::warn!(
+                "PyAsyncCursor::executemany: wire execution interrupted; connection marked broken"
+            );
         }
     }
 }
@@ -385,6 +453,11 @@ fn bind_parameter_rows(
             None => break,
         }
     }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(PyRuntimeError::new_err(
+            "ExecuteMany preflight was cancelled",
+        ));
+    }
     Ok((
         plan.map_or(operation, ParameterBindingPlan::into_operation),
         rows,
@@ -409,7 +482,7 @@ async fn executemany_on_client(
     prepared_state: &Mutex<PreparedState>,
     claim: &ExecuteClaim,
     request: ExecuteManyRequest,
-) -> Result<(i64, Vec<PyRowWriter>), ExecuteFailure> {
+) -> Result<ExecuteManyOutcome, ExecuteFailure> {
     let ExecuteManyRequest {
         operation,
         rows,
@@ -418,43 +491,70 @@ async fn executemany_on_client(
         autocommit,
     } = request;
     let started = Instant::now();
+    let deadline = (timeout != 0)
+        .then(|| tokio::time::Instant::now() + Duration::from_secs(u64::from(timeout)));
     let mut total = 0_i64;
     let mut output_rows = Vec::new();
+    let mut has_result_set = false;
+    let dispatched = !rows.is_empty();
 
     if claim.drain_previous && client.has_open_batch() {
         client.close_query().await?;
     }
 
     for (row_index, row) in rows.into_iter().enumerate() {
-        let row_timeout = remaining_timeout(timeout, started)?;
-        let outcome = execute_on_client(
-            client,
-            prepared_state,
-            claim,
-            false,
-            ExecuteRequest {
-                operation: operation.clone(),
-                rpc_parameters: row.rpc_parameters,
-                parameter_signature: row.parameter_signature,
-                use_prepare,
-                reset_cursor: row_index == 0,
-                timeout: row_timeout,
-                autocommit,
-            },
-        )
-        .await?;
-        if outcome.has_open_batch() {
-            while client.on_rows() {
-                let mut writer = PyRowWriter::new(client.get_metadata().len());
-                if !client.next_row_into(&mut writer).await? {
-                    break;
+        let row_timeout = remaining_timeout(timeout, started)
+            .map_err(ExecuteFailure::from)
+            .map_err(|error| error.at_row(row_index))?;
+        let execute_row = async {
+            let outcome = execute_on_client(
+                client,
+                prepared_state,
+                claim,
+                false,
+                ExecuteRequest {
+                    operation: operation.clone(),
+                    rpc_parameters: row.rpc_parameters,
+                    parameter_signature: row.parameter_signature,
+                    use_prepare,
+                    reset_cursor: row_index == 0,
+                    timeout: row_timeout,
+                    autocommit,
+                },
+            )
+            .await?;
+            if outcome.has_open_batch() {
+                loop {
+                    if client.on_rows() {
+                        has_result_set = true;
+                        loop {
+                            let mut writer = PyRowWriter::new(client.get_metadata().len());
+                            if !client.next_row_into(&mut writer).await? {
+                                break;
+                            }
+                            output_rows.push(writer);
+                        }
+                    }
+                    if !client.has_open_batch() || !client.advance_to_rows().await? {
+                        break;
+                    }
                 }
-                output_rows.push(writer);
             }
-            if client.has_open_batch() {
-                client.close_query().await?;
+            Ok::<_, ExecuteFailure>(())
+        };
+        let row_result = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, execute_row).await {
+                Ok(result) => result,
+                Err(_) => Err(ExecuteFailure::broken(Error::TimeoutError(
+                    TimeoutErrorType::String(
+                        "ExecuteMany exceeded the configured query timeout".to_string(),
+                    ),
+                ))),
             }
-        }
+        } else {
+            execute_row.await
+        };
+        row_result.map_err(|error| error.at_row(row_index))?;
         let affected = client.last_rows_affected();
         if affected < 0 {
             total = -1;
@@ -464,7 +564,12 @@ async fn executemany_on_client(
             })?;
         }
     }
-    Ok((total, output_rows))
+    Ok(ExecuteManyOutcome {
+        affected: total,
+        output_rows,
+        has_result_set,
+        dispatched,
+    })
 }
 
 pub(crate) fn set_input_sizes(
@@ -563,6 +668,7 @@ pub(crate) fn execute<'py>(
                 Ok(cursor)
             }
             Err(error) => {
+                trace_execute_failure("execute", &error, has_open_batch);
                 operation_guard.settle(error.break_connection || has_open_batch);
                 Err(map_execute_error(error.error))
             }
@@ -612,11 +718,15 @@ pub(crate) fn executemany<'py>(
     let future_fetch_state = fetch_state.clone();
     let previous_rowcount = rowcount.swap(-1, Ordering::AcqRel);
     let future_rowcount = rowcount.clone();
+    let guard_dispatch = dispatch.clone();
 
     let future = async move {
+        let started = Instant::now();
+        tracing::debug!("PyAsyncCursor::executemany: preflight started");
         let mut preflight_guard = SessionPreflightGuard::new(future_state.clone(), operation_id);
         let preflight_cancelled = Arc::new(AtomicBool::new(false));
-        let mut preflight_work_guard = PreflightWorkGuard::new(preflight_cancelled.clone());
+        let mut preflight_work_guard =
+            PreflightWorkGuard::new(preflight_cancelled.clone(), guard_dispatch.clone());
         let request = tokio::task::spawn_blocking(move || {
             let (operation, rows) = bind_parameter_rows(
                 operation,
@@ -643,6 +753,10 @@ pub(crate) fn executemany<'py>(
         let request = match request {
             Ok(request) => request,
             Err(error) => {
+                tracing::debug!(
+                    "PyAsyncCursor::executemany: preflight failed; elapsed_ms={}; error={error}",
+                    started.elapsed().as_millis()
+                );
                 future_state.release_operation(operation_id);
                 preflight_guard.complete();
                 future_fetch_state.set(previous_fetch_status);
@@ -650,14 +764,23 @@ pub(crate) fn executemany<'py>(
                 return Err(error);
             }
         };
+        tracing::debug!(
+            "PyAsyncCursor::executemany: preflight completed; elapsed_ms={}; row_count={}; use_prepare={}",
+            started.elapsed().as_millis(),
+            request.rows.len(),
+            request.use_prepare
+        );
         preflight_work_guard.complete();
         preflight_guard.complete();
+        let mut wire_trace_guard = WireExecutionTraceGuard::new(guard_dispatch);
         let mut operation_guard = SessionOperationGuard::new(future_state, operation_id);
         cleanup_required.store(true, Ordering::Release);
         future_fetch_state.clear_buffered_rows();
         tracing::info!(
-            "PyAsyncCursor::executemany: executing parameter rows; row_count={}",
-            request.rows.len()
+            "PyAsyncCursor::executemany: wire execution started; row_count={}; use_prepare={}; timeout_seconds={}",
+            request.rows.len(),
+            request.use_prepare,
+            request.timeout
         );
 
         let (result, has_open_batch) = {
@@ -668,23 +791,32 @@ pub(crate) fn executemany<'py>(
         };
 
         match result {
-            Ok((affected, output_rows)) => {
-                let has_output_rows = !output_rows.is_empty();
-                future_fetch_state.replace_buffered_rows(output_rows);
-                operation_guard.finish_execute(has_output_rows);
-                future_fetch_state.set(if has_output_rows {
+            Ok(outcome) => {
+                wire_trace_guard.complete();
+                let output_row_count = outcome.output_rows.len();
+                future_fetch_state.replace_buffered_rows(outcome.output_rows);
+                operation_guard.finish_execute(outcome.has_result_set);
+                future_fetch_state.set(if outcome.has_result_set {
                     FetchStatus::Ready
                 } else {
                     FetchStatus::NoResultSet
                 });
-                future_rowcount.store(affected, Ordering::Release);
-                clear_input_sizes_if_current(&cursor, input_sizes_generation);
+                future_rowcount.store(outcome.affected, Ordering::Release);
+                if outcome.dispatched {
+                    clear_input_sizes_if_current(&cursor, input_sizes_generation);
+                }
                 tracing::info!(
-                    "PyAsyncCursor::executemany: completed successfully; rowcount={affected}"
+                    "PyAsyncCursor::executemany: completed successfully; elapsed_ms={}; rowcount={}; output_row_count={}; has_result_set={}",
+                    started.elapsed().as_millis(),
+                    outcome.affected,
+                    output_row_count,
+                    outcome.has_result_set
                 );
                 Python::attach(|py| Ok(py.None()))
             }
             Err(error) => {
+                wire_trace_guard.complete();
+                trace_execute_failure("executemany", &error, has_open_batch);
                 operation_guard.settle(error.break_connection || has_open_batch);
                 Err(map_execute_error(error.error))
             }

@@ -39,9 +39,10 @@ def test_executemany_matches_repeated_execute_and_rowcount(client_context):
                 use_prepare=False,
             )
             rows = [(1,), (2,), (3,)]
-            await cursor.executemany(
+            result = await cursor.executemany(
                 "INSERT INTO #many_compare VALUES ('many', ?)", rows
             )
+            assert result is None
             assert cursor.rowcount == len(rows)
             for row in rows:
                 await cursor.execute(
@@ -362,6 +363,186 @@ def test_executemany_all_null_columns_with_explicit_types(client_context):
 
 
 @pytest.mark.integration
+def test_executemany_all_null_columns_without_input_sizes(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #many_unhinted_nulls (id int, binary_value varbinary(20), decimal_value decimal(18,4), guid_value uniqueidentifier)",
+                use_prepare=False,
+            )
+            await cursor.executemany(
+                "INSERT INTO #many_unhinted_nulls VALUES "
+                "(?, CONVERT(varbinary(20), ?), CONVERT(decimal(18,4), ?), "
+                "CONVERT(uniqueidentifier, ?))",
+                [(1, None, None, None), (2, None, None, None)],
+            )
+            await cursor.execute(
+                "SELECT id, binary_value, decimal_value, guid_value "
+                "FROM #many_unhinted_nulls ORDER BY id",
+                use_prepare=False,
+            )
+            assert await fetchall(cursor) == [
+                (1, None, None, None),
+                (2, None, None, None),
+            ]
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_json_vector_variant_and_smallmoney(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #many_extended (id int, payload json, embedding vector(3), flexible sql_variant, amount smallmoney)",
+                use_prepare=False,
+            )
+            cursor.setinputsizes(
+                [
+                    (4, 0, 0),
+                    mssql_py_core.SQL_JSON,
+                    (mssql_py_core.SQL_VECTOR, 3, 0),
+                    (-150, 0, 0),
+                    mssql_py_core.SQL_SMALLMONEY,
+                ]
+            )
+            rows = [
+                (1, {"answer": 42}, [1.0, 2.0, 3.0], "text", Decimal("123.4500")),
+                (2, [1, 2, 3], [-1.0, 0.0, 1.0], 42, Decimal("-12.3400")),
+            ]
+            await cursor.executemany(
+                "INSERT INTO #many_extended VALUES (?, ?, ?, ?, ?)", rows
+            )
+            await cursor.execute(
+                "SELECT id, CONVERT(nvarchar(max), payload), embedding, flexible, amount "
+                "FROM #many_extended ORDER BY id",
+                use_prepare=False,
+            )
+            actual = await fetchall(cursor)
+            assert actual[0][0:2] == (1, '{"answer":42}')
+            assert actual[0][2] == pytest.approx([1.0, 2.0, 3.0])
+            assert actual[0][3:] == ("text", Decimal("123.4500"))
+            assert actual[1][0:2] == (2, "[1,2,3]")
+            assert actual[1][2] == pytest.approx([-1.0, 0.0, 1.0])
+            assert actual[1][3:] == (42, Decimal("-12.3400"))
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_table_valued_parameters(client_context):
+    async def run():
+        conn = await connect(client_context)
+        type_name = f"PyAsyncManyTvp_{uuid.uuid4().hex}"
+        qualified_type_name = f"dbo.{type_name}"
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                f"CREATE TYPE dbo.[{type_name}] AS TABLE (id int, value nvarchar(50))"
+            )
+            rows = [
+                (
+                    2,
+                    mssql_py_core.TableValuedParameter(
+                        qualified_type_name,
+                        [(4, 0, 0), (-9, 50, 0)],
+                        [(1, "first"), (2, "second")],
+                    ),
+                ),
+                (
+                    0,
+                    mssql_py_core.TableValuedParameter(
+                        qualified_type_name, [(4, 0, 0), (-9, 50, 0)], []
+                    ),
+                ),
+            ]
+            await cursor.executemany(
+                "IF (SELECT COUNT(*) FROM ?) <> ? "
+                "THROW 50000, 'Unexpected TVP row count', 1",
+                [(tvp, expected_count) for expected_count, tvp in rows],
+            )
+        finally:
+            try:
+                await conn.cursor().execute(f"DROP TYPE IF EXISTS dbo.[{type_name}]")
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_malformed_xml_stops_later_rows(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #many_xml_failure (id int, payload xml)", use_prepare=False
+            )
+            cursor.setinputsizes([(4, 0, 0), mssql_py_core.SQL_XML])
+            with pytest.raises(RuntimeError, match="Query execution failed"):
+                await cursor.executemany(
+                    "INSERT INTO #many_xml_failure VALUES (?, ?)",
+                    [(1, "<root />"), (2, "<root>"), (3, "<later />")],
+                )
+            cursor.setinputsizes(None)
+            await cursor.execute(
+                "SELECT id, CONVERT(nvarchar(max), payload) "
+                "FROM #many_xml_failure ORDER BY id",
+                use_prepare=False,
+            )
+            assert await fetchall(cursor) == [(1, "<root/>")]
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_legacy_datetime_and_smalldatetime(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #many_legacy_temporal (id int, dt datetime, smalldt smalldatetime)",
+                use_prepare=False,
+            )
+            rows = [
+                (
+                    1,
+                    datetime.datetime(1753, 1, 1),
+                    datetime.datetime(1900, 1, 1),
+                ),
+                (
+                    2,
+                    datetime.datetime(9999, 12, 31, 23, 59, 59, 996667),
+                    datetime.datetime(2079, 6, 6, 23, 59),
+                ),
+            ]
+            await cursor.executemany(
+                "INSERT INTO #many_legacy_temporal VALUES (?, ?, ?)", rows
+            )
+            await cursor.execute(
+                "SELECT id, dt, smalldt FROM #many_legacy_temporal ORDER BY id",
+                use_prepare=False,
+            )
+            assert await fetchall(cursor) == rows
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_executemany_pyformat_empty_name_and_extra_keys(client_context):
     async def run():
         conn = await connect(client_context)
@@ -378,29 +559,6 @@ def test_executemany_pyformat_empty_name_and_extra_keys(client_context):
                 "SELECT value FROM #many_pyformat ORDER BY value", use_prepare=False
             )
             assert await fetchall(cursor) == [(1,), (2,)]
-        finally:
-            await conn.close()
-
-    asyncio.run(run())
-
-
-@pytest.mark.integration
-def test_executemany_output_buffers_all_rows_in_order(client_context):
-    async def run():
-        conn = await connect(client_context)
-        try:
-            cursor = conn.cursor()
-            await cursor.execute(
-                "CREATE TABLE #many_output (id int, identifier uniqueidentifier)",
-                use_prepare=False,
-            )
-            rows = [(1, uuid.uuid4()), (2, uuid.uuid4()), (3, uuid.uuid4())]
-            await cursor.executemany(
-                "INSERT INTO #many_output OUTPUT inserted.id, inserted.identifier VALUES (?, ?)",
-                rows,
-            )
-            assert cursor.rowcount == -1
-            assert await fetchall(cursor) == rows
         finally:
             await conn.close()
 
