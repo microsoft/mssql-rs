@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use mssql_tds::connection::tds_client::{
-    ExecuteOptions, PreparedStatement, StatementId, StatementResult, TdsClient,
+    ExecuteOptions, PreparedStatement, ResultSet, StatementId, StatementResult, TdsClient,
 };
 use mssql_tds::error::{Error, TimeoutErrorType};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -28,6 +28,7 @@ use crate::async_parameters::{
 use crate::async_session::{
     AsyncConnectionState, CursorId, ExecuteClaim, SessionOperationGuard, SessionPreflightGuard,
 };
+use crate::row_writer::PyRowWriter;
 use crate::types::ParameterHint;
 
 /// Cursor-local state for prepared execution and deferred handle cleanup.
@@ -196,7 +197,7 @@ async fn execute_on_client(
         autocommit,
     } = request;
 
-    if drain_previous {
+    if drain_previous && client.has_open_batch() {
         client.close_query().await?;
     }
     let options = ExecuteOptions {
@@ -408,7 +409,7 @@ async fn executemany_on_client(
     prepared_state: &Mutex<PreparedState>,
     claim: &ExecuteClaim,
     request: ExecuteManyRequest,
-) -> Result<i64, ExecuteFailure> {
+) -> Result<(i64, Vec<PyRowWriter>), ExecuteFailure> {
     let ExecuteManyRequest {
         operation,
         rows,
@@ -418,8 +419,9 @@ async fn executemany_on_client(
     } = request;
     let started = Instant::now();
     let mut total = 0_i64;
+    let mut output_rows = Vec::new();
 
-    if claim.drain_previous {
+    if claim.drain_previous && client.has_open_batch() {
         client.close_query().await?;
     }
 
@@ -442,11 +444,16 @@ async fn executemany_on_client(
         )
         .await?;
         if outcome.has_open_batch() {
-            client.close_query().await?;
-            return Err(Error::UsageError(
-                "ExecuteMany does not yet support operations that return rows".to_string(),
-            )
-            .into());
+            while client.on_rows() {
+                let mut writer = PyRowWriter::new(client.get_metadata().len());
+                if !client.next_row_into(&mut writer).await? {
+                    break;
+                }
+                output_rows.push(writer);
+            }
+            if client.has_open_batch() {
+                client.close_query().await?;
+            }
         }
         let affected = client.last_rows_affected();
         if affected < 0 {
@@ -457,7 +464,7 @@ async fn executemany_on_client(
             })?;
         }
     }
-    Ok(total)
+    Ok((total, output_rows))
 }
 
 pub(crate) fn set_input_sizes(
@@ -518,6 +525,7 @@ pub(crate) fn execute<'py>(
     let future = async move {
         let mut operation_guard = SessionOperationGuard::new(future_state, operation_id);
         cleanup_required.store(true, Ordering::Release);
+        future_fetch_state.clear_buffered_rows();
         tracing::info!(
             "PyAsyncCursor::execute: executing query; parameter_count={}, use_prepare={}, reset_cursor={}",
             request.rpc_parameters.len(),
@@ -646,6 +654,7 @@ pub(crate) fn executemany<'py>(
         preflight_guard.complete();
         let mut operation_guard = SessionOperationGuard::new(future_state, operation_id);
         cleanup_required.store(true, Ordering::Release);
+        future_fetch_state.clear_buffered_rows();
         tracing::info!(
             "PyAsyncCursor::executemany: executing parameter rows; row_count={}",
             request.rows.len()
@@ -659,9 +668,15 @@ pub(crate) fn executemany<'py>(
         };
 
         match result {
-            Ok(affected) => {
-                operation_guard.finish_execute(false);
-                future_fetch_state.set(FetchStatus::NoResultSet);
+            Ok((affected, output_rows)) => {
+                let has_output_rows = !output_rows.is_empty();
+                future_fetch_state.replace_buffered_rows(output_rows);
+                operation_guard.finish_execute(has_output_rows);
+                future_fetch_state.set(if has_output_rows {
+                    FetchStatus::Ready
+                } else {
+                    FetchStatus::NoResultSet
+                });
                 future_rowcount.store(affected, Ordering::Release);
                 clear_input_sizes_if_current(&cursor, input_sizes_generation);
                 tracing::info!(

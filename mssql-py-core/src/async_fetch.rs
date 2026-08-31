@@ -3,8 +3,9 @@
 
 //! Asynchronous row fetching for [`crate::async_cursor::PyAsyncCursor`].
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::error::Error;
@@ -24,15 +25,21 @@ pub(crate) enum FetchStatus {
     Exhausted,
 }
 
-pub(crate) struct FetchState(AtomicU8);
+pub(crate) struct FetchState {
+    status: AtomicU8,
+    buffered_rows: StdMutex<VecDeque<PyRowWriter>>,
+}
 
 impl FetchState {
     pub(crate) fn new() -> Self {
-        Self(AtomicU8::new(FetchStatus::NoResultSet as u8))
+        Self {
+            status: AtomicU8::new(FetchStatus::NoResultSet as u8),
+            buffered_rows: StdMutex::new(VecDeque::new()),
+        }
     }
 
     pub(crate) fn status(&self) -> FetchStatus {
-        match self.0.load(Ordering::Acquire) {
+        match self.status.load(Ordering::Acquire) {
             value if value == FetchStatus::Ready as u8 => FetchStatus::Ready,
             value if value == FetchStatus::Exhausted as u8 => FetchStatus::Exhausted,
             _ => FetchStatus::NoResultSet,
@@ -40,7 +47,7 @@ impl FetchState {
     }
 
     pub(crate) fn replace(&self, status: FetchStatus) -> FetchStatus {
-        let previous = self.0.swap(status as u8, Ordering::AcqRel);
+        let previous = self.status.swap(status as u8, Ordering::AcqRel);
         match previous {
             value if value == FetchStatus::Ready as u8 => FetchStatus::Ready,
             value if value == FetchStatus::Exhausted as u8 => FetchStatus::Exhausted,
@@ -49,7 +56,28 @@ impl FetchState {
     }
 
     pub(crate) fn set(&self, status: FetchStatus) {
-        self.0.store(status as u8, Ordering::Release);
+        self.status.store(status as u8, Ordering::Release);
+    }
+
+    pub(crate) fn replace_buffered_rows(&self, rows: Vec<PyRowWriter>) {
+        *self
+            .buffered_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rows.into();
+    }
+
+    pub(crate) fn clear_buffered_rows(&self) {
+        self.buffered_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn pop_buffered_row(&self) -> Option<PyRowWriter> {
+        self.buffered_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
     }
 }
 
@@ -171,7 +199,10 @@ pub(crate) fn fetchone<'py>(
 
         let (result, has_open_batch) = {
             let mut client = client.lock().await;
-            let result = fetch_one_on_client(&mut client).await;
+            let result = match fetch_state.pop_buffered_row() {
+                Some(row) => Ok(Some(row)),
+                None => fetch_one_on_client(&mut client).await,
+            };
             let has_open_batch = client.has_open_batch();
             (result, has_open_batch)
         };

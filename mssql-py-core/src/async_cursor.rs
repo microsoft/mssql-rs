@@ -72,7 +72,7 @@ impl CursorCleanup {
         let (result, has_open_batch) = {
             let mut client = self.client.lock().await;
             let result = async {
-                if claim.drain_previous {
+                if claim.drain_previous && client.has_open_batch() {
                     client.close_query().await?;
                 }
                 release_prepared_statements(&mut client, &self.prepared_state, self.timeout)

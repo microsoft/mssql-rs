@@ -747,9 +747,6 @@ fn rewrite_placeholders(sql: &str, named: bool) -> PyResult<(String, Vec<Placeho
                                 "Parameter style mismatch: query uses named placeholders (%(name)s) but positional parameters were provided",
                             ));
                         }
-                        if source_name.is_empty() {
-                            return Err(PyTypeError::new_err("Named parameter cannot be empty"));
-                        }
                         let rpc_name = format!("{rpc_prefix}{}", names.len() + 1);
                         output.push_str(&rpc_name);
                         names.push(Placeholder {
@@ -1053,7 +1050,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "sync compatibility gap: empty pyformat parameter names are rejected"]
     fn accepts_empty_named_parameter() {
         let (sql, names) = rewrite_placeholders("SELECT %()s", true).unwrap();
 

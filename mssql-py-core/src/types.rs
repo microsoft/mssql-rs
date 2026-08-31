@@ -736,11 +736,30 @@ fn py_datetime_to_sql_type(
             Error::UsageError(format!("Failed to get timezone offset seconds: {error}"))
         })?;
     let offset_minutes = datetimeoffset_minutes(offset_seconds)?;
+    let local_time = py_time(py_obj, hinted_scale.unwrap_or(7))?;
+    let ticks_per_minute = 600_000_000_i64;
+    let ticks_per_day = 864_000_000_000_i64;
+    let utc_ticks = i64::try_from(local_time.time_nanoseconds)
+        .expect("one day of 100-nanosecond ticks fits i64")
+        - i64::from(offset_minutes) * ticks_per_minute;
+    let day_delta = utc_ticks.div_euclid(ticks_per_day);
+    let utc_days = i64::from(days)
+        .checked_add(day_delta)
+        .and_then(|days| u32::try_from(days).ok())
+        .ok_or_else(|| {
+            Error::UsageError(
+                "DATETIMEOFFSET UTC instant is outside SQL Server's supported date range"
+                    .to_string(),
+            )
+        })?;
 
     Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
         datetime2: SqlDateTime2 {
-            days,
-            time: py_time(py_obj, hinted_scale.unwrap_or(7))?,
+            days: utc_days,
+            time: SqlTime {
+                time_nanoseconds: utc_ticks.rem_euclid(ticks_per_day) as u64,
+                scale: local_time.scale,
+            },
         },
         offset: offset_minutes,
     })))

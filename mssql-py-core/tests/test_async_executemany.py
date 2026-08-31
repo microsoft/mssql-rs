@@ -77,6 +77,67 @@ def test_executemany_rejects_mixed_parameter_row_styles(mock_client_context):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    ("operation", "rows"),
+    [
+        ("SELECT %(value)s", [{"value": 1}, (2,)]),
+        ("SELECT ?", [[1], {"value": 2}]),
+    ],
+)
+def test_executemany_rejects_mixed_parameter_row_styles_in_either_order(
+    mock_client_context, operation, rows
+):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            cursor = conn.cursor()
+            with pytest.raises(TypeError, match="row 1 uses a different parameter style"):
+                await cursor.executemany(operation, rows)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_executemany_reports_missing_mapping_key_and_restores_state(mock_client_context):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            cursor = conn.cursor()
+            with pytest.raises(KeyError, match="value"):
+                await cursor.executemany(
+                    "SELECT %(value)s", [{"value": 1}, {"other": 2}]
+                )
+            assert cursor.rowcount == -1
+            assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_executemany_propagates_generator_failure_and_restores_state(
+    mock_client_context,
+):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            cursor = conn.cursor()
+
+            def rows():
+                yield (1,)
+                raise ValueError("row source failed")
+
+            with pytest.raises(ValueError, match="row source failed"):
+                await cursor.executemany("SELECT ?", rows())
+            assert cursor.rowcount == -1
+            assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
 def test_executemany_defers_parameter_iteration_until_await(mock_client_context):
     async def run():
         conn = await connect(mock_client_context)
@@ -194,7 +255,7 @@ def test_executemany_preserves_typed_null_metadata(client_context):
 
 
 @pytest.mark.integration
-def test_executemany_rejects_row_producing_operations_and_recovers(client_context):
+def test_executemany_buffers_rows_from_result_producing_operations(client_context):
     async def run():
         conn = await connect(client_context)
         try:
@@ -203,13 +264,45 @@ def test_executemany_rejects_row_producing_operations_and_recovers(client_contex
                 "CREATE TABLE #executemany_output (id int NOT NULL)",
                 use_prepare=False,
             )
-            with pytest.raises(RuntimeError, match="does not yet support operations that return rows"):
-                await cursor.executemany(
-                    "INSERT INTO #executemany_output OUTPUT inserted.id VALUES (?)",
-                    [(1,), (2,)],
-                )
+            await cursor.executemany(
+                "INSERT INTO #executemany_output OUTPUT inserted.id VALUES (?)",
+                [(1,), (2,)],
+            )
             assert cursor.rowcount == -1
+            assert await cursor.fetchone() == (1,)
+            assert await cursor.fetchone() == (2,)
+            assert await cursor.fetchone() is None
             assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_unread_buffered_rows_can_be_replaced_or_closed(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #executemany_unread_output (id int NOT NULL)",
+                use_prepare=False,
+            )
+            await cursor.executemany(
+                "INSERT INTO #executemany_unread_output OUTPUT inserted.id VALUES (?)",
+                [(1,), (2,)],
+            )
+            assert await cursor.fetchone() == (1,)
+            assert await cursor.execute("SELECT 3", use_prepare=False) is cursor
+            assert await cursor.fetchone() == (3,)
+            assert await cursor.fetchone() is None
+
+            await cursor.executemany(
+                "INSERT INTO #executemany_unread_output OUTPUT inserted.id VALUES (?)",
+                [(4,), (5,)],
+            )
+            await cursor.close()
         finally:
             await conn.close()
 
