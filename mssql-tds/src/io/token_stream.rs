@@ -206,6 +206,7 @@ pub(crate) trait TdsTokenStreamReader {
     /// Attempts to decode `target` from bytes already buffered by the transport.
     /// Returns `None` without consuming bytes when async I/O or an unsupported
     /// synchronous decoder is required.
+    #[cfg_attr(not(any(test, feature = "test-util", fuzzing)), allow(dead_code))]
     fn try_read_buffered_column(
         &mut self,
         _pause_state: &RowPauseState,

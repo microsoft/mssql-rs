@@ -159,17 +159,24 @@ impl AnyTransport {
         }
     }
 
-    pub(crate) fn try_read_buffered_column(
+    pub(crate) fn try_read_buffered_column_with_base(
         &mut self,
         pause_state: &RowPauseState,
         target: usize,
-    ) -> TdsResult<Option<ColumnValues>> {
+    ) -> TdsResult<
+        Option<(
+            ColumnValues,
+            Option<crate::datatypes::sqldatatypes::TdsDataType>,
+        )>,
+    > {
         match self {
             Self::Network(transport) => {
-                TdsTokenStreamReader::try_read_buffered_column(transport, pause_state, target)
+                transport.try_read_buffered_column_with_base(pause_state, target)
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
-            Self::Dynamic(transport) => transport.try_read_buffered_column(pause_state, target),
+            Self::Dynamic(transport) => transport
+                .try_read_buffered_column(pause_state, target)
+                .map(|value| value.map(|value| (value, None))),
         }
     }
 

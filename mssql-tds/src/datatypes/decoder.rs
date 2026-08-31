@@ -696,6 +696,107 @@ impl PlpColumnStream {
 }
 
 impl GenericDecoder {
+    /// Decodes a complete buffered `sql_variant`, retaining its wire base type.
+    ///
+    /// Only fixed-width and character bases are handled synchronously. Other
+    /// valid shapes return `None` without consuming bytes and use the async path.
+    pub(crate) fn try_decode_buffered_variant(
+        &self,
+        bytes: &[u8],
+    ) -> TdsResult<Option<(Option<TdsDataType>, ColumnValues, usize)>> {
+        let mut outer = BufferedSlice::new(bytes);
+        let Some(length) = outer.u32() else {
+            return Ok(None);
+        };
+        if length == 0 {
+            return Ok(Some((None, ColumnValues::Null, outer.position)));
+        }
+        let Some(payload) = outer.take_slice(length as usize) else {
+            return Ok(None);
+        };
+        let mut reader = BufferedSlice::new(payload);
+        let Some(base_byte) = reader.byte() else {
+            return Ok(None);
+        };
+        let base = TdsDataType::try_from(base_byte)?;
+        let Some(property_bytes) = reader.byte() else {
+            return Ok(None);
+        };
+        let data_length = usize::try_from(length)
+            .ok()
+            .and_then(|length| length.checked_sub(2 + usize::from(property_bytes)))
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(format!(
+                    "SQL_VARIANT data length calculation underflow: length={length}, prop_bytes={property_bytes}"
+                ))
+            })?;
+
+        let value = match property_bytes {
+            0 => {
+                let Ok(fixed_type) = FixedLengthTypes::try_from(base) else {
+                    return Ok(None);
+                };
+                let metadata = ColumnMetadata {
+                    user_type: 0,
+                    flags: 0,
+                    type_info: TypeInfo {
+                        tds_type: base,
+                        length: data_length,
+                        type_info_variant: TypeInfoVariant::FixedLen(fixed_type),
+                    },
+                    data_type: base,
+                    column_name: String::new(),
+                    multi_part_name: None,
+                    crypto_metadata: None,
+                };
+                let Some((value, used)) =
+                    self.try_decode_buffered(&payload[reader.position..], &metadata)?
+                else {
+                    return Ok(None);
+                };
+                if used != data_length {
+                    return Ok(None);
+                }
+                reader.position += used;
+                value
+            }
+            7 if matches!(
+                base,
+                TdsDataType::BigVarChar
+                    | TdsDataType::BigChar
+                    | TdsDataType::NVarChar
+                    | TdsDataType::NChar
+            ) =>
+            {
+                let Some(collation_bytes) = reader.take::<5>() else {
+                    return Ok(None);
+                };
+                let Some(_max_length) = reader.u16() else {
+                    return Ok(None);
+                };
+                let Some(value_bytes) = reader.take_slice(data_length) else {
+                    return Ok(None);
+                };
+                let encoding = if matches!(base, TdsDataType::NVarChar | TdsDataType::NChar) {
+                    EncodingType::Utf16
+                } else {
+                    let collation: SqlCollation = collation_bytes.as_slice().try_into()?;
+                    if collation.utf8() {
+                        EncodingType::Utf8
+                    } else {
+                        EncodingType::LcidBased(collation)
+                    }
+                };
+                ColumnValues::String(SqlString::new(value_bytes.to_vec(), encoding))
+            }
+            _ => return Ok(None),
+        };
+        if reader.position != payload.len() {
+            return Ok(None);
+        }
+        Ok(Some((Some(base), value, outer.position)))
+    }
+
     /// Decodes one complete non-PLP column from `bytes` without awaiting.
     ///
     /// `None` means the buffered bytes are incomplete or this type still
@@ -4918,6 +5019,10 @@ mod test {
                 0xAB,
                 "the NULL variant consumed the following column's bytes"
             );
+            assert_eq!(
+                decoder.try_decode_buffered_variant(&[0, 0, 0, 0]).unwrap(),
+                Some((None, ColumnValues::Null, 4))
+            );
         }
 
         /// A non-NULL variant reports its base type alongside the value, which
@@ -4930,7 +5035,10 @@ mod test {
             let md = fixed_metadata(TdsDataType::SsVariant, 0);
             // 6-byte payload: base type INT4 (0x38), zero property bytes, then
             // the four value bytes. 0xAB trails to prove nothing overreads.
-            let mut reader = ByteReader::new(vec![6, 0, 0, 0, 0x38, 0x00, 42, 0, 0, 0, 0xAB]);
+            let wire = vec![6, 0, 0, 0, 0x38, 0x00, 42, 0, 0, 0];
+            let mut with_sentinel = wire.clone();
+            with_sentinel.push(0xAB);
+            let mut reader = ByteReader::new(with_sentinel);
             let decoder = GenericDecoder::default();
             let mut writer = DefaultRowWriter::new(1);
             decoder
@@ -4941,6 +5049,48 @@ mod test {
             assert_eq!(writer.variant_base(0), Some(TdsDataType::Int4));
             assert_eq!(writer.take_row()[0], ColumnValues::Int(42));
             assert_eq!(reader.read_byte().await.unwrap(), 0xAB);
+            assert_eq!(
+                decoder.try_decode_buffered_variant(&wire).unwrap(),
+                Some((Some(TdsDataType::Int4), ColumnValues::Int(42), wire.len()))
+            );
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_variant(&wire[..wire.len() - 1])
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn buffered_sql_variant_decodes_nvarchar_and_bigint() {
+            let text = "ODBCVARIANT"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let length = 2 + 7 + text.len();
+            let mut wire = (length as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&[TdsDataType::NVarChar as u8, 7, 0x09, 0x04, 0, 0, 0, 64, 0]);
+            wire.extend_from_slice(&text);
+            let decoder = GenericDecoder::default();
+            let (base, value, used) = decoder.try_decode_buffered_variant(&wire).unwrap().unwrap();
+            assert_eq!(base, Some(TdsDataType::NVarChar));
+            assert_eq!(used, wire.len());
+            let ColumnValues::String(value) = value else {
+                panic!("expected string variant");
+            };
+            assert_eq!(value.to_utf8_string(), "ODBCVARIANT");
+
+            let mut bigint = 10_u32.to_le_bytes().to_vec();
+            bigint.extend_from_slice(&[TdsDataType::Int8 as u8, 0]);
+            bigint.extend_from_slice(&i64::MIN.to_le_bytes());
+            assert_eq!(
+                decoder.try_decode_buffered_variant(&bigint).unwrap(),
+                Some((
+                    Some(TdsDataType::Int8),
+                    ColumnValues::BigInt(i64::MIN),
+                    bigint.len(),
+                ))
+            );
         }
 
         #[tokio::test]

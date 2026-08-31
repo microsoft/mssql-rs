@@ -15,6 +15,7 @@ use crate::core::{
 use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::decoder::GenericDecoder;
 use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
@@ -1801,6 +1802,42 @@ impl NetworkTransport {
         };
         self.tds_read_buffer.consume_bytes(used)?;
         Ok(Some(value))
+    }
+
+    pub(crate) fn try_read_buffered_column_with_base(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<(ColumnValues, Option<TdsDataType>)>> {
+        if target != pause_state.next_column_index {
+            return Ok(None);
+        }
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        if pause_state
+            .nbc_null_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        {
+            return Ok(Some((ColumnValues::Null, None)));
+        }
+        if metadata.data_type != TdsDataType::SsVariant {
+            return self
+                .try_read_buffered_column(pause_state, target)
+                .map(|value| value.map(|value| (value, None)));
+        }
+        if pause_state.decryptor.is_some() {
+            return Ok(None);
+        }
+        let decoder = GenericDecoder::default();
+        let Some((base, value, used)) =
+            decoder.try_decode_buffered_variant(self.tds_read_buffer.get_buffered_slice())?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some((value, base)))
     }
 
     pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
@@ -3633,6 +3670,37 @@ pub(crate) mod tests {
                 .unwrap()
         );
         assert_eq!(writer.take_row(), vec![ColumnValues::Null]);
+    }
+
+    #[tokio::test]
+    async fn buffered_variant_column_honors_nbcrow_null_bitmap() {
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::var_len(TdsDataType::SsVariant, 8009).unwrap(),
+                data_type: TdsDataType::SsVariant,
+                column_name: "variant".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: Vec::new(),
+        });
+        let pause_state = RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: Some(Arc::from([1_u8])),
+            decryptor: None,
+        };
+        let mut reader = create_network_transport_with_data(&[]);
+
+        assert_eq!(
+            reader
+                .try_read_buffered_column_with_base(&pause_state, 0)
+                .unwrap(),
+            Some((ColumnValues::Null, None))
+        );
     }
 
     #[tokio::test]
