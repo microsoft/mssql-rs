@@ -326,21 +326,32 @@ const DAYS_0001_TO_1900: i64 = 693_595;
 /// each target C struct can be filled from a single representation.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DateTimeParts {
+    /// Proleptic Gregorian year.
     pub year: i16,
+    /// Calendar month in `1..=12`.
     pub month: u16,
+    /// Calendar day in `1..=31`.
     pub day: u16,
+    /// Hour in `0..=23`.
     pub hour: u16,
+    /// Minute in `0..=59`.
     pub minute: u16,
+    /// Second in `0..=59`.
     pub second: u16,
     /// Fractional seconds in nanoseconds.
     pub fraction_ns: u32,
     /// Declared fractional-seconds scale (0-7) of the source column. Character
     /// rendering pads to exactly this many digits, matching msodbcsql.
     pub scale: u8,
+    /// Signed timezone hour component.
     pub tz_hour: i16,
+    /// Signed timezone minute component.
     pub tz_minute: i16,
+    /// Whether the source carries a date component.
     pub has_date: bool,
+    /// Whether the source carries a time component.
     pub has_time: bool,
+    /// Whether the source carries a timezone offset.
     pub has_tz: bool,
 }
 

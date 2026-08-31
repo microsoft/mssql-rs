@@ -146,6 +146,7 @@ impl AnyTransport {
         }
     }
 
+    /// Attempts to position a row using only bytes already buffered by the active transport.
     pub(crate) fn try_receive_row_header(
         &mut self,
         context: &ParserContext,
@@ -159,6 +160,7 @@ impl AnyTransport {
         }
     }
 
+    /// Attempts to decode one buffered column while retaining a `sql_variant` base type.
     pub(crate) fn try_read_buffered_column_with_base(
         &mut self,
         pause_state: &RowPauseState,
@@ -180,6 +182,7 @@ impl AnyTransport {
         }
     }
 
+    /// Writes as much of the current buffered row as the active transport can complete.
     pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
         &mut self,
         pause_state: &mut RowPauseState,

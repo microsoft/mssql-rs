@@ -199,6 +199,7 @@ pub(crate) const fn decimal_metadata_is_valid(precision: u8, scale: u8) -> bool 
 }
 
 #[inline]
+/// Expands a time value at TDS scale `0..=7` into 100-nanosecond ticks.
 const fn scale_time_value(value: u64, scale: u8) -> u64 {
     match scale {
         0 => value * 10_000_000,
@@ -296,7 +297,9 @@ pub(crate) struct GenericDecoder {
 
 /// Non-consuming-on-failure reader for values already buffered by the transport.
 struct BufferedSlice<'a> {
+    /// Received bytes available to the synchronous decoder.
     bytes: &'a [u8],
+    /// Number of bytes tentatively consumed by this decode attempt.
     position: usize,
 }
 

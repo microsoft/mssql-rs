@@ -172,11 +172,17 @@ impl RowOutcome {
 /// `next_binding` and `last_column_read` survive a packet-boundary continuation,
 /// so the same instance must be passed back when the TDS decoder pauses mid-row.
 struct BoundRowWriter<'a> {
+    /// Ordered snapshot of the statement's bound columns.
     bindings: &'a [ColumnBinding],
+    /// Next binding that may match an incoming wire column.
     next_binding: usize,
+    /// Zero-based destination row within each bound column array.
     row_index: usize,
+    /// Byte displacement from `SQL_ATTR_ROW_BIND_OFFSET_PTR`.
     bind_offset: usize,
+    /// Worst conversion outcome observed for this row.
     outcome: RowOutcome,
+    /// Highest bound column ordinal consumed from the row.
     last_column_read: usize,
 }
 
@@ -283,38 +289,47 @@ impl<'a> BoundRowWriter<'a> {
 }
 
 impl RowWriter for BoundRowWriter<'_> {
+    /// Reports NULL through the bound indicator without disturbing fixed-width data.
     fn write_null(&mut self, col: usize) {
         self.write_value(col, ColumnValues::Null);
     }
 
+    /// Writes a `bit` directly when the target is `SQL_C_BIT`.
     fn write_bool(&mut self, col: usize, val: bool) {
         self.write_exact(col, SQL_C_BIT, u8::from(val), || ColumnValues::Bit(val));
     }
 
+    /// Writes a `tinyint` directly when the target is `SQL_C_UTINYINT`.
     fn write_u8(&mut self, col: usize, val: u8) {
         self.write_exact(col, SQL_C_UTINYINT, val, || ColumnValues::TinyInt(val));
     }
 
+    /// Writes a `smallint` directly when the target is `SQL_C_SSHORT`.
     fn write_i16(&mut self, col: usize, val: i16) {
         self.write_exact(col, SQL_C_SSHORT, val, || ColumnValues::SmallInt(val));
     }
 
+    /// Writes an `int` directly when the target is `SQL_C_SLONG`.
     fn write_i32(&mut self, col: usize, val: i32) {
         self.write_exact(col, SQL_C_SLONG, val, || ColumnValues::Int(val));
     }
 
+    /// Writes a `bigint` directly when the target is `SQL_C_SBIGINT`.
     fn write_i64(&mut self, col: usize, val: i64) {
         self.write_exact(col, SQL_C_SBIGINT, val, || ColumnValues::BigInt(val));
     }
 
+    /// Writes a `real` directly when the target is `SQL_C_FLOAT`.
     fn write_f32(&mut self, col: usize, val: f32) {
         self.write_exact(col, SQL_C_FLOAT, val, || ColumnValues::Real(val));
     }
 
+    /// Writes a `float` directly when the target is `SQL_C_DOUBLE`.
     fn write_f64(&mut self, col: usize, val: f64) {
         self.write_exact(col, SQL_C_DOUBLE, val, || ColumnValues::Float(val));
     }
 
+    /// Delivers borrowed wire text directly when its encoding matches the target.
     fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding: EncodingType) {
         let Some(binding) = self.take_binding(col) else {
             return;
@@ -325,18 +340,22 @@ impl RowWriter for BoundRowWriter<'_> {
         self.outcome = self.outcome.merge(delivered);
     }
 
+    /// Materializes binary data for the established conversion path.
     fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>) {
         self.write_value(col, ColumnValues::Bytes(bytes.into_owned()));
     }
 
+    /// Delivers a decoded `decimal` through the established conversion path.
     fn write_decimal(&mut self, col: usize, val: DecimalParts) {
         self.write_value(col, ColumnValues::Decimal(val));
     }
 
+    /// Delivers a decoded `numeric` through the established conversion path.
     fn write_numeric(&mut self, col: usize, val: DecimalParts) {
         self.write_value(col, ColumnValues::Numeric(val));
     }
 
+    /// Writes a `date` directly into `SQL_DATE_STRUCT` when requested.
     fn write_date(&mut self, col: usize, val: SqlDate) {
         self.write_temporal(
             col,
@@ -351,6 +370,7 @@ impl RowWriter for BoundRowWriter<'_> {
         );
     }
 
+    /// Writes a `time` directly into `SQL_SS_TIME2_STRUCT` when requested.
     fn write_time(&mut self, col: usize, val: SqlTime) {
         self.write_temporal(
             col,
@@ -366,14 +386,17 @@ impl RowWriter for BoundRowWriter<'_> {
         );
     }
 
+    /// Delivers legacy `datetime` through the established temporal converter.
     fn write_datetime(&mut self, col: usize, val: SqlDateTime) {
         self.write_value(col, ColumnValues::DateTime(val));
     }
 
+    /// Delivers `smalldatetime` through the established temporal converter.
     fn write_smalldatetime(&mut self, col: usize, val: SqlSmallDateTime) {
         self.write_value(col, ColumnValues::SmallDateTime(val));
     }
 
+    /// Writes `datetime2` directly into `SQL_TIMESTAMP_STRUCT` when requested.
     fn write_datetime2(&mut self, col: usize, val: SqlDateTime2) {
         self.write_temporal(
             col,
@@ -392,6 +415,7 @@ impl RowWriter for BoundRowWriter<'_> {
         );
     }
 
+    /// Writes directly into `SQL_SS_TIMESTAMPOFFSET_STRUCT` when requested.
     fn write_datetimeoffset(&mut self, col: usize, val: SqlDateTimeOffset) {
         self.write_temporal(
             col,
@@ -412,14 +436,17 @@ impl RowWriter for BoundRowWriter<'_> {
         );
     }
 
+    /// Delivers `money` through the established numeric conversion path.
     fn write_money(&mut self, col: usize, val: SqlMoney) {
         self.write_value(col, ColumnValues::Money(val));
     }
 
+    /// Delivers `smallmoney` through the established numeric conversion path.
     fn write_smallmoney(&mut self, col: usize, val: SqlSmallMoney) {
         self.write_value(col, ColumnValues::SmallMoney(val));
     }
 
+    /// Writes a GUID directly in the ODBC `SQLGUID` field layout when requested.
     fn write_uuid(&mut self, col: usize, val: Uuid) {
         let (data1, data2, data3, data4) = val.as_fields();
         self.write_exact(
@@ -435,20 +462,25 @@ impl RowWriter for BoundRowWriter<'_> {
         );
     }
 
+    /// Delivers XML through the established character conversion path.
     fn write_xml(&mut self, col: usize, val: SqlXml) {
         self.write_value(col, ColumnValues::Xml(val));
     }
 
+    /// Delivers JSON through the established character conversion path.
     fn write_json(&mut self, col: usize, val: SqlJson) {
         self.write_value(col, ColumnValues::Json(val));
     }
 
+    /// Delivers vector data through the established character conversion path.
     fn write_vector(&mut self, col: usize, val: SqlVector) {
         self.write_value(col, ColumnValues::Vector(val));
     }
 
+    /// Bound fetches do not separately expose a `sql_variant` base type.
     fn write_variant_base_type(&mut self, _col: usize, _base: TdsDataType) {}
 
+    /// Row completion is accounted for by the surrounding rowset loop.
     fn end_row(&mut self) {}
 }
 

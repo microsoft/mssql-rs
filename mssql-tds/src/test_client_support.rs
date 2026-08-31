@@ -73,6 +73,7 @@ impl TokenReplayTransport {
         }
     }
 
+    /// Creates a token replay transport with optional partial-row buffering.
     fn with_int_rows(
         metadata: Tokens,
         rows: Vec<Vec<i32>>,
@@ -89,6 +90,7 @@ impl TokenReplayTransport {
         transport
     }
 
+    /// Positions the next scripted integer row under the supplied metadata.
     fn position_int_row(&mut self, context: &ParserContext) -> TdsResult<Option<RowPauseState>> {
         let Some(row) = self.pending_rows.pop_front() else {
             return Ok(None);

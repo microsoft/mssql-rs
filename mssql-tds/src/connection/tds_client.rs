@@ -342,9 +342,12 @@ struct StreamedWriteContext {
     timeout_sec: Option<u32>,
 }
 
+/// Cached whole-row eligibility paired with the exact metadata allocation it describes.
 #[derive(Debug)]
 struct BufferedRowSupport {
+    /// Metadata allocation whose eligibility was evaluated.
     metadata: Arc<ColMetadataToken>,
+    /// Whether all columns support buffered whole-row decoding.
     supported: bool,
 }
 
@@ -1090,6 +1093,7 @@ impl TdsClient {
     }
 
     #[inline]
+    /// Starts timeout accounting only when the request has a finite budget.
     fn request_timeout_start(&self) -> Option<Instant> {
         self.remaining_request_timeout.map(|_| Instant::now())
     }
@@ -5663,6 +5667,7 @@ impl TdsClient {
         Self::metadata_supports_buffered_rows(metadata)
     }
 
+    /// Returns and caches whole-row eligibility for the current metadata allocation.
     fn buffered_row_support(&mut self) -> bool {
         let Some(metadata) = self.current_metadata.as_ref() else {
             return false;
@@ -5681,6 +5686,7 @@ impl TdsClient {
         supported
     }
 
+    /// Checks whether every column can use the non-streaming, non-encrypted row path.
     fn metadata_supports_buffered_rows(metadata: &ColMetadataToken) -> bool {
         metadata.cek_table.is_empty()
             && metadata

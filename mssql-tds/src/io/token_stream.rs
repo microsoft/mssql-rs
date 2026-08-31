@@ -216,6 +216,7 @@ pub(crate) trait TdsTokenStreamReader {
     }
 
     #[cfg(any(test, feature = "test-util"))]
+    /// Test hook that returns a buffered integer-row prefix and whether it is complete.
     fn try_read_buffered_test_row(
         &mut self,
         _pause_state: &mut RowPauseState,
@@ -299,6 +300,7 @@ pub trait TdsTokenStreamReader {
         Ok(None)
     }
 
+    /// Attempts to decode a buffered row prefix for dynamic test transports.
     fn try_read_buffered_test_row(
         &mut self,
         _pause_state: &mut RowPauseState,

@@ -1719,6 +1719,7 @@ impl TdsPacketReader for NetworkTransport {
 }
 
 impl NetworkTransport {
+    /// Parses a buffered ROW/NBCROW header without refilling the network buffer.
     pub(crate) fn try_receive_row_header(
         &mut self,
         context: &ParserContext,
@@ -1772,6 +1773,7 @@ impl NetworkTransport {
         }))
     }
 
+    /// Decodes the next ordinary buffered column without consuming on a miss.
     pub(crate) fn try_read_buffered_column(
         &mut self,
         pause_state: &RowPauseState,
@@ -1804,6 +1806,7 @@ impl NetworkTransport {
         Ok(Some(value))
     }
 
+    /// Decodes the next buffered column and preserves its `sql_variant` base type.
     pub(crate) fn try_read_buffered_column_with_base(
         &mut self,
         pause_state: &RowPauseState,
@@ -1840,6 +1843,10 @@ impl NetworkTransport {
         Ok(Some((value, base)))
     }
 
+    /// Decodes consecutive buffered columns directly into `writer`.
+    ///
+    /// Returns `false` after preserving the partially advanced row state when
+    /// the next value needs async continuation.
     pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
         &mut self,
         pause_state: &mut RowPauseState,
