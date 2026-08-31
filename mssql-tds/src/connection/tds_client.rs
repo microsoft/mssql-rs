@@ -4085,6 +4085,11 @@ impl TdsClient {
     /// look-ahead never consumes a result the caller has yet to navigate to.
     /// The response-tail control tokens that precede `DONEPROC` are absorbed
     /// exactly as the main loop absorbs them.
+    ///
+    /// Unlike msodbcsql's short, non-failing single-byte peek, this consumes the
+    /// trailer under the request's remaining timeout. An expiry therefore fails
+    /// the request after the attention acknowledgement restores synchronization;
+    /// the connection remains reusable.
     async fn settle_rpc_terminator(&mut self, parser_context: &ParserContext) -> TdsResult<()> {
         let mut processing_error = None;
         let mut loop_count = 0u32;
