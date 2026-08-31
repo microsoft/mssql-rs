@@ -29,19 +29,51 @@ the largest `BENCH_IMPROVEMENT_VERIFY_MAX` of them (default 3) are actually
 re-measured; any beyond that cap keep unverified first-pass numbers, and the
 summary reports how many it skipped. Treat only a *reproduced* win as real: one
 that was re-measured and did not reproduce is an artifact, and one that fell
-outside the cap is simply unverified. Take the verdict line at face value; do not
-re-litigate a cleared benchmark from the first-pass numbers.
+outside the cap is simply unverified. Within a single run, take the verdict line
+at face value: do not re-litigate a benchmark it cleared from the first-pass
+numbers.
 
 The Windows step log mangles the summary's UTF-8 (emoji, `±`, `µ`). The raw
 critcmp block is still readable, and the emoji bars are a pure function of Δ%, so
 the table can be reconstructed from it when quoting Windows results elsewhere.
 
+## What the quorum does not cover
+
+The 4 re-runs are interleaved inside a *single* VM session, so they establish
+that a benchmark is consistently slower **on that machine, on that run**. A
+run-level condition — host hardware, CPU frequency and thermal state, a noisy
+neighbor, SQL Server state — biases all 4 equally, and the benchmark it lands on
+trips 4/4 and is published as a confirmed regression.
+
+This is not hypothetical. On 2026-08-31, builds
+[171113](https://sqlclientdrivers.visualstudio.com/mssql-rs/_build/results?buildId=171113)
+and
+[171243](https://sqlclientdrivers.visualstudio.com/mssql-rs/_build/results?buildId=171243)
+confirmed disjoint sets of regressions with no `mssql-tds` source change between
+them: `select_n_rows/10000` (3/4, +12%) and `temporal/decode` (4/4, +10%) in the
+first, `primitives/decode` (4/4, +11%) in the second, each clearing in the other
+run. Both runs measure the same baseline commit, and their `base` columns — a
+repeated measurement of identical code — differ by up to 5.2%, which is the gate
+threshold itself.
+
+So the quorum rules out per-sample noise, not per-run noise, and a single
+confirmed regression is a *candidate* finding rather than a settled one. Until
+[#434](https://github.com/microsoft/mssql-rs/issues/434) narrows the variance,
+compare the two runs' baseline columns before trusting a verdict: when unchanged
+baseline code moves by an amount comparable to the reported regression, the run
+is not decisive.
+
 ## Triage
 
 - **Confirmed regression** (the completed summary verdict reports confirmed
-  regressions) — report the confirmed benchmarks with their trip counts and worst
-  ratios, plus the commit range since the last green run on that platform. Do not
-  retry: the quorum has already ruled out noise.
+  regressions) — re-queue the same definition once at the same commit and compare
+  the two verdicts before reporting a regression or naming suspect commits. A
+  benchmark that confirms in both runs is real; one that clears in the second was
+  run-level noise the quorum could not see, and the pair of runs should be
+  reported as inconclusive instead. This costs one run and is far cheaper than
+  the bisect a false confirmation invites. Once a regression survives the second
+  run, report the confirmed benchmarks with their trip counts and worst ratios,
+  plus the commit range since the last green run on that platform.
 - **Infra or harness failure** (no completed summary verdict, or the failing
   phase is VM deploy, SQL setup, toolchain/critcmp install, baseline SHA
   validation, missing bench binaries, or invalid `BENCH_*` settings) — re-queue
@@ -69,7 +101,10 @@ Bump only when **all** of the following hold:
    to bake that drift into the floor, so it is investigated rather than absorbed.
 
 When (1)–(3) hold but (4) does not, report the win and the drift together; the
-drift is the finding, and the bump waits for it to be explained or fixed.
+drift is the finding, and the bump waits for it to be explained or fixed. Note
+that run-to-run variance is itself a common explanation for a criterion-4
+slowdown — check the baseline columns across runs before treating one as a real
+change.
 
 The bump is a pull request editing `baseline-commit.txt` — reviewed, recorded in
 git history, and attributable. See
