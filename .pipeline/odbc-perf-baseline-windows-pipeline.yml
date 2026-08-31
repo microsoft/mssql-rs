@@ -28,6 +28,9 @@ extends:
           $ErrorActionPreference = 'Stop'
           $path = '$(Build.ArtifactStagingDirectory)\results\comparison.json'
           $data = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+          if ($null -eq $data.benchmarks) {
+              throw "comparison.json has no 'benchmarks' array: $path"
+          }
           $regressions = @($data.benchmarks | Where-Object { $_.regression } |
               ForEach-Object { $_.name })
           if ($regressions.Count -gt 0) {
