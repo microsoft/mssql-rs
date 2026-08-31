@@ -320,9 +320,14 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
     // registered in `dbc_state.descriptors`, by design) fall through to the
     // "live handle missing from parent DBC" branch further down, which is
     // meant to catch a genuine invariant break, not this legitimate case.
+    // `free_errors` runs in the same guarded block as `post_diag`, not after
+    // it: every ODBC entry point must clear stale diagnostics at API entry
+    // before posting a new one, and this branch returns before ever reaching
+    // the `free_errors` call further below.
     if !desc.is_explicit() {
         error!("SQLFreeHandle(DESC): cannot free an implicitly allocated descriptor");
         if let Ok(mut state) = desc.inner.lock() {
+            free_errors(&mut state);
             post_diag(&mut state, ERR_INVALID_USE_OF_AUTO_DESC);
         }
         return SQL_ERROR;
@@ -1005,6 +1010,14 @@ mod tests {
     /// the descriptor handle `SQLFreeHandle` tried (and failed) to free, per
     /// its own spec ("If SQLFreeHandle returns SQL_ERROR, the handle is still
     /// valid"), not on the parent STMT or DBC.
+    ///
+    /// Calls the rejection twice and asserts exactly one diag record after
+    /// each call, not just that the *last* one is HY017: this entry point
+    /// must clear stale diagnostics at API entry like every other one (a
+    /// prior version of this fix regressed exactly this by hoisting the
+    /// rejection above the `free_errors` call — caught in review, not by
+    /// this test, since asserting only `.last()` passes at any record
+    /// count).
     #[test]
     fn free_implicit_desc_is_rejected() {
         use crate::api::sqlstate::SQLSTATE_HY017;
@@ -1017,13 +1030,20 @@ mod tests {
         );
         let ard = unsafe { &*(stmt as *const StmtHandle) }.ard;
 
-        let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, ard) };
-        assert_eq!(ret, SQL_ERROR);
+        for _ in 0..2 {
+            assert_eq!(unsafe { sql_free_handle(SQL_HANDLE_DESC, ard) }, SQL_ERROR);
 
-        let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
-        let diag = desc.inner.lock().unwrap();
-        assert_eq!(diag.diag_records.last().unwrap().sql_state, SQLSTATE_HY017);
-        drop(diag);
+            let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+            let diag = desc.inner.lock().unwrap();
+            assert_eq!(
+                diag.diag_records.len(),
+                1,
+                "a fresh rejection must clear any diagnostic left by the previous call, \
+                 not accumulate one record per call"
+            );
+            assert_eq!(diag.diag_records[0].sql_state, SQLSTATE_HY017);
+            drop(diag);
+        }
 
         // The ARD is untouched: the statement (and its implicit descriptors)
         // still free normally.
