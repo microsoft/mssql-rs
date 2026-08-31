@@ -31,8 +31,16 @@ extends:
           if ($null -eq $data.benchmarks) {
               throw "comparison.json has no 'benchmarks' array: $path"
           }
-          $regressions = @($data.benchmarks | Where-Object { $_.regression } |
-              ForEach-Object { $_.name })
+          $regressions = @(foreach ($benchmark in $data.benchmarks) {
+              foreach ($key in 'name', 'regression') {
+                  if ($null -eq $benchmark.PSObject.Properties[$key]) {
+                      throw "comparison.json benchmark entry has no '$key': $path"
+                  }
+              }
+              if ($benchmark.regression) {
+                  $benchmark.name
+              }
+          })
           if ($regressions.Count -gt 0) {
               throw "Confirmed ODBC regressions: $($regressions -join ', ')"
           }
