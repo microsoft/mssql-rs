@@ -33,7 +33,7 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind;
-use std::net::ToSocketAddrs;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -189,6 +189,30 @@ async fn create_base_stream(
     }
 }
 
+/// Stably sorts resolved addresses per `ipaddress_preference`, keeping the
+/// resolver's original relative order within each address family.
+fn sort_by_ip_preference(
+    socket_addresses: &mut [SocketAddr],
+    ipaddress_preference: IPAddressPreference,
+) {
+    match ipaddress_preference {
+        IPAddressPreference::UsePlatformDefault => {
+            // Do nothing. Use whatever the OS returns.
+            trace!("Using platform default IP address preference");
+        }
+        IPAddressPreference::IPv4First => {
+            // Sort IPv4 addresses first
+            socket_addresses.sort_by_key(|a| a.is_ipv6());
+            trace!("IPv4 addresses first");
+        }
+        IPAddressPreference::IPv6First => {
+            // Sort IPv6 addresses first
+            socket_addresses.sort_by_key(|b| std::cmp::Reverse(b.is_ipv6()));
+            trace!("IPv6 addresses first");
+        }
+    }
+}
+
 /// Creates a TCP stream using sequential connection mode.
 /// Tries each resolved IP address one at a time until one succeeds.
 async fn create_base_stream_sequential(
@@ -204,33 +228,18 @@ async fn create_base_stream_sequential(
         host, port
     );
 
-    // This will cause the DNS resolution of the addresses.
-    let mut socket_addresses = (host, port).to_socket_addrs()?;
+    // This will cause the DNS resolution of the addresses. `lookup_host` (unlike
+    // `std::net::ToSocketAddrs::to_socket_addrs`) awaits the resolution instead of
+    // blocking the calling thread, so a slow or stuck resolver stays subject to the
+    // `timeout()`/deadline machinery in the retry loop above this call instead of
+    // silently escaping it.
+    let mut socket_addresses: Vec<SocketAddr> =
+        tokio::net::lookup_host((host, port)).await?.collect();
 
     let mut last_error = None;
     let mut tcp_stream = None;
 
-    // Sort the address list based on the IP address preference
-    match ipaddress_preference {
-        IPAddressPreference::UsePlatformDefault => {
-            // Do nothing. Use whatever the OS returns.
-            trace!("Using platform default IP address preference");
-        }
-        IPAddressPreference::IPv4First => {
-            let mut addresses: Vec<_> = socket_addresses.collect();
-            // Sort IPv4 addresses first
-            addresses.sort_by_key(|a| a.is_ipv6());
-            socket_addresses = addresses.into_iter();
-            trace!("IPv4 addresses first");
-        }
-        IPAddressPreference::IPv6First => {
-            let mut addresses: Vec<_> = socket_addresses.collect();
-            // Sort IPv6 addresses first
-            addresses.sort_by_key(|b| std::cmp::Reverse(b.is_ipv6()));
-            socket_addresses = addresses.into_iter();
-            trace!("IPv6 addresses first");
-        }
-    }
+    sort_by_ip_preference(&mut socket_addresses, ipaddress_preference);
 
     info!("Socket addresses: {:?}", socket_addresses);
 
@@ -3562,6 +3571,121 @@ pub(crate) mod tests {
             matches!(result, Err(crate::error::Error::ProtocolError(_))),
             "expected a protocol error, got {result:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Regression coverage for AB#47704: `create_base_stream_sequential` used
+    // to resolve DNS via the blocking `std::net::ToSocketAddrs`, which never
+    // yields to the executor. That silently defeated the `timeout()`/deadline
+    // wrapped around the whole connect attempt in `tds_connection_provider`,
+    // so a slow or stuck resolver could hang the caller (and, since ODBC's
+    // `SQLDriverConnectW` runs this via `block_on` on the caller's own
+    // thread, the whole synchronous process) with no internal bound. The fix
+    // switched to `tokio::net::lookup_host`, which awaits resolution instead.
+    // These tests pin the address-sorting logic that moved as part of that
+    // change (`sort_by_ip_preference`), since it has no prior direct coverage.
+    // ---------------------------------------------------------------------
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), port)
+    }
+
+    #[test]
+    fn sort_by_ip_preference_platform_default_leaves_order_untouched() {
+        let mut addrs = vec![
+            addr("2001:db8::1", 1433),
+            addr("192.0.2.1", 1433),
+            addr("2001:db8::2", 1433),
+        ];
+        let original = addrs.clone();
+
+        sort_by_ip_preference(&mut addrs, IPAddressPreference::UsePlatformDefault);
+
+        assert_eq!(addrs, original);
+    }
+
+    #[test]
+    fn sort_by_ip_preference_ipv4_first_orders_v4_before_v6() {
+        let mut addrs = vec![
+            addr("2001:db8::1", 1433),
+            addr("192.0.2.1", 1433),
+            addr("2001:db8::2", 1433),
+            addr("192.0.2.2", 1433),
+        ];
+
+        sort_by_ip_preference(&mut addrs, IPAddressPreference::IPv4First);
+
+        assert_eq!(
+            addrs,
+            vec![
+                addr("192.0.2.1", 1433),
+                addr("192.0.2.2", 1433),
+                addr("2001:db8::1", 1433),
+                addr("2001:db8::2", 1433),
+            ],
+            "IPv4 addresses must sort before IPv6, preserving relative order within each family"
+        );
+    }
+
+    #[test]
+    fn sort_by_ip_preference_ipv6_first_orders_v6_before_v4() {
+        let mut addrs = vec![
+            addr("192.0.2.1", 1433),
+            addr("2001:db8::1", 1433),
+            addr("192.0.2.2", 1433),
+            addr("2001:db8::2", 1433),
+        ];
+
+        sort_by_ip_preference(&mut addrs, IPAddressPreference::IPv6First);
+
+        assert_eq!(
+            addrs,
+            vec![
+                addr("2001:db8::1", 1433),
+                addr("2001:db8::2", 1433),
+                addr("192.0.2.1", 1433),
+                addr("192.0.2.2", 1433),
+            ],
+            "IPv6 addresses must sort before IPv4, preserving relative order within each family"
+        );
+    }
+
+    #[test]
+    fn sort_by_ip_preference_handles_single_family_lists() {
+        let mut v4_only = vec![addr("192.0.2.1", 1433), addr("192.0.2.2", 1433)];
+        let expected = v4_only.clone();
+        sort_by_ip_preference(&mut v4_only, IPAddressPreference::IPv6First);
+        assert_eq!(v4_only, expected, "no IPv6 entries to reorder against");
+    }
+
+    /// Resolving a real hostname (not a literal IP, so the OS resolver is
+    /// actually exercised) must go through `tokio::net::lookup_host` and
+    /// therefore stay bounded by an enclosing `tokio::time::timeout` — the
+    /// exact property the blocking `to_socket_addrs()` call used to violate.
+    #[tokio::test]
+    async fn create_base_stream_sequential_resolution_is_bounded_by_timeout() {
+        // Port 0 is never listening, so the (fast, loopback) TCP connect
+        // fails quickly and the call returns well within the outer bound
+        // instead of the test hanging if resolution ever regresses to a
+        // blocking call.
+        let result = timeout(
+            Duration::from_secs(5),
+            create_base_stream_sequential(
+                IPAddressPreference::UsePlatformDefault,
+                "localhost",
+                0,
+                30_000,
+                1_000,
+                200,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "resolving 'localhost' must not escape the outer timeout"
+        );
+        assert!(result.unwrap().is_err(), "port 0 must not be connectable");
     }
 
     /// `skip_bytes` spins the same way, and it runs on the discard path that

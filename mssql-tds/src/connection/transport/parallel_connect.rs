@@ -27,7 +27,7 @@
 //! and returns as soon as one succeeds. Failed connections are logged but don't
 //! prevent other connections from succeeding.
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::{self, TcpStream};
@@ -125,9 +125,12 @@ pub async fn parallel_connect(
         host, port, config.timeout_ms
     );
 
-    // Resolve DNS to get all IP addresses
-    let addresses: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()?
+    // Resolve DNS to get all IP addresses. `lookup_host` awaits the resolution
+    // instead of blocking the calling thread (unlike `std::net::ToSocketAddrs`),
+    // so a slow or stuck resolver stays subject to the caller's timeout instead
+    // of silently escaping it.
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await?
         .take(MAX_PARALLEL_IPS)
         .collect();
 

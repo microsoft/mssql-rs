@@ -150,3 +150,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   rejected as a protocol error. Such a packet is malformed — it neither carries
   payload nor terminates a message — but was previously consumed as a
   zero-length packet. Empty end-of-message packets remain legal.
+
+- `mssql-tds`: TCP connect no longer resolves the server hostname with the
+  blocking `std::net::ToSocketAddrs`. That call never yields to the async
+  runtime, so a slow or unresponsive resolver silently escaped the
+  `ConnectTimeout`/`LoginTimeout` deadline that wraps the rest of the connect
+  sequence — on `mssql-odbc`, whose `SQLDriverConnectW` drives this via
+  `block_on` on the calling thread, this could hang the caller (and, since
+  ODBC is a blocking API, the whole calling process) indefinitely instead of
+  failing within the configured timeout. Resolution now goes through
+  `tokio::net::lookup_host`, the same async primitive already used for SSRP
+  instance lookups, so it is properly bounded like the rest of the connect
+  attempt.
+
