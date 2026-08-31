@@ -363,7 +363,8 @@ pub unsafe extern "C" fn SQLDriverConnectW(
 /// Disconnects from the data source associated with a connection handle.
 ///
 /// # Safety
-/// - `connection_handle` must be a valid DBC handle that is currently connected.
+/// - `connection_handle` must be a valid DBC handle allocated by
+///   `SQLAllocHandle(SQL_HANDLE_DBC, ...)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLDisconnect(connection_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();

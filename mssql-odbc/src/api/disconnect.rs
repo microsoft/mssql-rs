@@ -20,7 +20,8 @@ use crate::handles::{HandleType, free_handle, handle_from_raw};
 /// Implementation of `SQLDisconnect`.
 ///
 /// # Safety
-/// - `connection_handle` must be a valid `DbcHandle` previously connected via `SQLDriverConnectW`.
+/// - `connection_handle` must be a valid `DbcHandle` allocated by
+///   `SQLAllocHandle(SQL_HANDLE_DBC, ...)`.
 pub(crate) unsafe fn sql_disconnect(connection_handle: SqlHandle) -> SqlReturn {
     debug!(?connection_handle, "SQLDisconnect called");
     crate::ffi_entry!("SQLDisconnect", unsafe {
@@ -52,8 +53,21 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
         };
         free_errors(&mut state);
 
+        // Disconnecting a never-connected DBC is a no-op, matching msodbcsql
+        // (verified: SQL_SUCCESS when called directly). MS Learn marks 08003
+        // here `(DM)`, so under a Driver Manager this is unreachable — the DM
+        // answers 08003 itself. Only a DM-less caller that dlopen's the driver
+        // reaches it, cleaning up after a failed SQLDriverConnectW.
+        if state.connection_state == ConnectionState::Disconnected {
+            debug!("SQLDisconnect: not connected, nothing to do");
+            return SQL_SUCCESS;
+        }
+
+        // Defensive guard only: SQLDriverConnectW holds this mutex from setting
+        // Connecting until it publishes Connected or Disconnected, so a
+        // concurrent disconnect blocks and always observes a final state.
         if state.connection_state != ConnectionState::Connected {
-            error!("SQLDisconnect: not connected");
+            error!("SQLDisconnect: connect still in progress");
             post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
             return SQL_ERROR;
         }
@@ -162,15 +176,37 @@ mod tests {
         let ret = unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) };
         assert_eq!(ret, SQL_SUCCESS);
 
-        // Disconnect without connecting — should error
+        // Disconnect without connecting — a no-op, not an error. A DM-less
+        // caller cleaning up after a failed SQLDriverConnectW lands here.
         let ret = unsafe { sql_disconnect(dbc) };
-        assert_eq!(ret, SQL_ERROR);
-        // TODO: verify SQLSTATE 08003 via SQLGetDiagRec
+        assert_eq!(ret, SQL_SUCCESS);
+
+        // Repeating it stays a no-op rather than becoming an error.
+        let ret = unsafe { sql_disconnect(dbc) };
+        assert_eq!(ret, SQL_SUCCESS);
 
         unsafe {
             sql_free_handle(SQL_HANDLE_DBC, dbc);
             sql_free_handle(SQL_HANDLE_ENV, env);
         }
+    }
+
+    /// `SQLDriverConnectW` holds the DBC mutex until it publishes a final
+    /// state, so `Connecting` is not reachable through the public API. Drive it
+    /// directly to pin the guard's 08003 rather than leave it untested.
+    #[test]
+    fn disconnect_while_connecting_returns_connection_does_not_exist() {
+        let h = crate::test_support::TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc.inner.lock().unwrap().connection_state = ConnectionState::Connecting;
+
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_ERROR);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
+        assert_eq!(state.connection_state, ConnectionState::Connecting);
     }
 
     #[test]

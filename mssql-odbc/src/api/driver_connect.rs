@@ -394,7 +394,8 @@ fn do_connect(
 
     apply_connection_params(&mut context, &params);
 
-    // Connect via mssql-tds (lock is NOT held - the 'Connecting' state prevents races)
+    // Connect via mssql-tds. The caller's DBC lock is still held across this
+    // I/O, so other entry points block here rather than observing 'Connecting'.
     let provider = TdsConnectionProvider::new();
     let client = dbc
         .runtime
@@ -468,6 +469,9 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
 
     if let Some(server_spn) = &params.server_spn {
         context.server_spn = Some(server_spn.clone());
+    }
+    if let Some(application_name) = &params.application_name {
+        context.application_name = application_name.clone();
     }
     if let Some(intent) = &params.application_intent {
         context.application_intent = if intent.eq_ignore_ascii_case("readonly") {
@@ -1008,13 +1012,28 @@ mod tests {
     }
 
     #[test]
+    fn apply_params_maps_app_to_application_name() {
+        let mut ctx = ClientContext::default();
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                application_name: Some("MSSQL-Python".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.application_name, "MSSQL-Python");
+    }
+
+    #[test]
     fn apply_params_leaves_unset_fields_at_defaults() {
         let mut ctx = ClientContext::default();
         let before_packet = ctx.packet_size;
         let before_retry = ctx.connect_retry_count;
+        let before_app_name = ctx.application_name.clone();
         apply_connection_params(&mut ctx, &ConnectionParams::default());
         assert_eq!(ctx.packet_size, before_packet);
         assert_eq!(ctx.connect_retry_count, before_retry);
+        assert_eq!(ctx.application_name, before_app_name);
         assert_eq!(ctx.encryption_options.host_name_in_cert, None);
         assert_eq!(ctx.encryption_options.server_certificate, None);
     }

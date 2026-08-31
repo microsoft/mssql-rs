@@ -87,6 +87,72 @@ protected:
         }
         return std::string(reinterpret_cast<const char*>(buf));
     }
+
+    // serialize_string picks the code page from the collation's LCID alone, so
+    // only the LCID has to be Latin1 for U+65E5 to be unmappable. The parameter
+    // carries the *database* collation, which need not match the instance's.
+    bool DatabaseIsLatin1() {
+        // Each step returns early: EXPECT_* is non-fatal, and falling through to
+        // GetColumnChar on an unfetched row reports a collation mismatch instead
+        // of the prepare or fetch that actually failed.
+        EXPECT_SQL_OK(
+            Prepare("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation')"
+                    " AS VARCHAR(128))"),
+            SQL_HANDLE_STMT, stmt_);
+        if (::testing::Test::HasFailure()) {
+            return false;
+        }
+        EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        if (::testing::Test::HasFailure()) {
+            return false;
+        }
+        EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        if (::testing::Test::HasFailure()) {
+            return false;
+        }
+        const std::string collation = GetColumnChar(1);
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        return collation.find("Latin1_General") != std::string::npos;
+    }
+
+    // The server-side session id, so a test can tell a surviving connection from
+    // a transparently rebuilt one.
+    std::string CurrentSpid() {
+        EXPECT_SQL_OK(Prepare("SELECT CAST(@@SPID AS VARCHAR(16))"), SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        const std::string spid = GetColumnChar(1);
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        return spid;
+    }
+
+    // A round trip on the same connection after a failed execute. Any cursor the
+    // caller left open is closed first, since reusing the statement with one live
+    // is 24000 and would mask what this checks.
+    //
+    // The SPID is the assertion that matters: session recovery is negotiated by
+    // default, so a driver that killed the connection would reconnect here and
+    // still answer 'alive'. Only an unchanged SPID says the request was retracted
+    // rather than the session rebuilt.
+    void ExpectSameSessionStillUsable(const std::string& expected_spid) {
+        SQLCloseCursor(stmt_);
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+        SQLUINTEGER dead = SQL_CD_TRUE;
+        ASSERT_SQL_OK(
+            SQLGetConnectAttr(dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, SQL_IS_UINTEGER, nullptr),
+            SQL_HANDLE_DBC, dbc_);
+        EXPECT_EQ(SQL_CD_FALSE, dead) << "a retracted request must not cost the connection";
+
+        ASSERT_SQL_OK(Prepare("SELECT 'alive'"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("alive", GetColumnChar(1));
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        EXPECT_EQ(expected_spid, CurrentSpid())
+            << "the session was rebuilt, so the request cost the connection";
+    }
 };
 
 // The declared wire type follows ParameterType, not the C type that was bound,
@@ -498,6 +564,36 @@ TEST_F(CharConversionLiveTest, UnboundedColumnSizeCarriesOversizedValues) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// ColumnSize 0 is `max` even for a value that would fit a bounded length, so the
+// parameter cannot be cast to sql_variant - sql_variant has no `max` member. The
+// application has to pass a real ColumnSize, which
+// CharParamDeclaresTheParameterType covers.
+//
+// Asserted rather than fixed because msodbcsql 18.6 declares `max` here too and
+// fails identically, so deriving the length from the data instead would be the
+// divergence (AB#47533).
+//
+// Benefits-from-mock-tds: a mock TDS server could assert the RPC parameter was
+// declared varchar(max)/nvarchar(max) directly.
+TEST_F(CharConversionLiveTest, UnboundedColumnSizeIsMaxEvenForASmallValue) {
+    const std::pair<SQLSMALLINT, SQLSMALLINT> cases[] = {
+        {SQL_C_CHAR, SQL_VARCHAR},
+        {SQL_C_WCHAR, SQL_WVARCHAR},
+    };
+    for (const auto& c : cases) {
+        ASSERT_SQL_OK(Prepare("SELECT CAST(? AS SQL_VARIANT)"), SQL_HANDLE_STMT,
+                      stmt_);
+
+        AsciiParam value(c.first, "abc");
+        ASSERT_SQL_OK(BindAscii(1, value, c.second, 0), SQL_HANDLE_STMT, stmt_);
+
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << "sql type " << c.second;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+        EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT,
+                      stmt_);
+    }
+}
+
 // A zero-length value is an empty string, not a NULL - only SQL_NULL_DATA in the
 // indicator means NULL. The fixed-length targets still pad out to ColumnSize,
 // which is the one case where an empty value has a non-zero DATALENGTH.
@@ -801,4 +897,73 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSilentlyCorrupted) {
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("&#26085;", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// ---------------------------------------------------------------------------
+// A value rejected after a packet has flushed leaves the server holding an
+// incomplete message. Unless it is withdrawn (EOM | IGNORE, then its DONE
+// consumed) the next command is read as a continuation and answered 4002 - on a
+// *later* statement than the one that failed. AB#47687.
+//
+// The drivers are stranded by different events: msodbcsql converts each
+// parameter as the RPC is written, this driver converts all of them first. So a
+// conversion error strands msodbcsql, and only a serialization-time rejection
+// strands us. One test each below; for the mechanism exercised on both at once,
+// see SQLCancelAfterAFlushRetractsTheRequest in execute_test.cpp.
+// ---------------------------------------------------------------------------
+
+// Strands msodbcsql: parameter 2 fails `ParamToSQLType` with parameter 1 already
+// on the wire. This driver rejects it before serializing, so it takes the
+// local-discard branch. Both must end with a usable connection.
+TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUsable) {
+    const std::string spid = CurrentSpid();
+    ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
+
+    // ColumnSize 0 is the `max` spelling, so no length bound applies to this one.
+    std::vector<SQLCHAR> big(20000, 'a');
+    SQLLEN big_ind = static_cast<SQLLEN>(big.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 0, 0,
+                                   big.data(), big_ind, &big_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // Ten characters into varchar(4), with a non-blank overflow, so neither
+    // driver may trim it silently.
+    AsciiParam overlong(SQL_C_CHAR, "abcdefghij");
+    ASSERT_SQL_OK(BindAscii(2, overlong, SQL_VARCHAR, 4), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+
+    ExpectSameSessionStillUsable(spid);
+}
+
+// Strands this driver: the value passes our UTF-16 unit count at one unit, then
+// expands to the eight bytes of "&#26085;" inside serialize_string and is
+// rejected against varchar(1) - after parameter 1 has flushed. msodbcsql
+// measures the converted bytes first and sends it without error, so it never
+// reaches the partial-send state here and the case is skipped on that leg.
+TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectionUsable) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    if (!DatabaseIsLatin1()) {
+        GTEST_SKIP() << "needs a Latin1 collation to make the value unmappable";
+    }
+
+    const std::string spid = CurrentSpid();
+    ASSERT_SQL_OK(Prepare("SELECT ?, ?"), SQL_HANDLE_STMT, stmt_);
+
+    std::vector<SQLCHAR> big(20000, 'a');
+    SQLLEN big_ind = static_cast<SQLLEN>(big.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 0, 0,
+                                   big.data(), big_ind, &big_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR wide[] = {0x65E5};
+    SQLLEN ind = static_cast<SQLLEN>(sizeof(wide));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 1, 0, wide,
+                                   ind, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_ERROR, SQLExecute(stmt_))
+        << "the over-long value must be rejected during serialization";
+
+    ExpectSameSessionStillUsable(spid);
 }
