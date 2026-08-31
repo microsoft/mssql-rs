@@ -703,7 +703,7 @@ try {
         "regression_ratio=$(Format-Invariant $RegressionRatio 'F4')",
         "confirm_runs=$ConfirmRuns",
         "confirm_quorum=$ConfirmQuorum",
-        "gbench_compare=$(if ($GbenchArguments.Count) { $GbenchCompare } else { 'disabled' })",
+        "gbench_compare=$GbenchCompare",
         "bench_python=$script:BenchPython",
         "numpy_version=$script:NumpyVersion",
         "scipy_version=$script:ScipyVersion",

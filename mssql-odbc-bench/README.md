@@ -306,8 +306,9 @@ documents nine repetitions as the minimum for a meaningful U test and the lab
 runs five, so its p-values would be published without being trustworthy;
 reproduction is established by the confirmation rounds instead. The official
 Python code imports NumPy and SciPy at module scope even with `--no-utest`, so
-both runners provision them into a private virtualenv under `target/` when the
-host interpreter lacks them.
+both runners provision pinned NumPy 2.4.6 and SciPy 1.18.0 into a private
+virtualenv under `target/` when the host interpreter lacks them, and record those
+versions in `results/odbc-context.txt`.
 
 ### Noise controls
 
