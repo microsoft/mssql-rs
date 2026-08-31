@@ -175,8 +175,9 @@ four measure that path.
   separates the call shape from the cadence.
 - `getdata/rowwise_1k_c3_lob_max/chunked_8192` — `NVARCHAR(MAX)` of 9,000-9,999
   characters and `VARCHAR(MAX)` of 20,000-20,999 bytes. Both are past one
-  8192-byte chunk, so each value needs three continuation calls; preflight fails
-  the run if a value arrives in fewer, because then the loop under test never ran.
+  8192-byte chunk, so each non-NULL value needs three calls total (the initial
+  call plus two continuations); preflight fails the run if a value arrives in
+  fewer, because then the loop under test never ran.
 - `getdata/rowwise_20k_c16_mixed_lob/whole_result_rowwise` — the 15-column fixed
   pattern plus one *small* `NVARCHAR(MAX)`. The payload is tiny on purpose: what
   this measures is one PLP column moving all sixteen onto the row-at-a-time path.
@@ -259,6 +260,11 @@ comparison drivers; only
 the candidate-versus-mssql-odbc-baseline result participates in the regression
 gate. Raw Google Benchmark JSON and every comparison artifact are written to
 the repository-level `results` directory.
+
+The initial baseline pin is the production `main` commit where this benchmark
+harness is introduced. This PR changes no production driver files, so its first
+candidate and baseline have identical `mssql-odbc` and `mssql-tds` sources.
+Future baseline advances are reviewed changes to `baseline-commit.txt`.
 
 ### Gate and confirmation
 

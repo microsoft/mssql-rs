@@ -255,7 +255,7 @@ binaries keep the per-binary interleaving effective (see §2).
 - Bulk insert (default 10,000 rows, override via `BENCH_BULK_ROWS`) via the `BulkCopy` builder, over batch sizes 500 / 5,000.
 
 ### mssql-tds-specific
-- Packet-size sensitivity (4096 / 8192 / 16192) on large reads — measures reassembly overhead.
+- Packet-size sensitivity (4096 / 8192 / 32768) on large reads — measures reassembly overhead.
 - Zero-copy `next_row` row-iteration throughput at large row counts.
 
 ---
@@ -380,6 +380,12 @@ workload constant. That answers whether the shipped driver artifact regressed.
 The source-isolated Criterion harness above remains the tool for attributing a
 change specifically to `mssql-tds`.
 
+The initial ODBC baseline is the production `main` commit on which this harness
+was introduced. Because the benchmark PR changes no production driver files,
+candidate and baseline begin with identical `mssql-odbc`/`mssql-tds` trees; only
+the candidate supplies the new harness and pipeline. Future baseline advances
+are explicit, reviewed edits to `baseline-commit.txt`.
+
 Dedicated Linux and Windows PerfTest pipelines run five repetitions of each
 workload against the pinned `mssql-odbc` commit, Microsoft ODBC Driver 18.6.2.1,
 and the candidate. Their uploaded `summary.md` leads with the gate verdict and
@@ -403,8 +409,8 @@ driver, not by what is convenient to write:
   workload on the same table and cadence, it isolates that per-call cost.
 - **Row-at-a-time `SQLGetData`.** One LOB or `sql_variant` column moves the
   *whole* result off the bound path, so there are four such workloads: ordinary
-  inline values, `MAX` text past one 8192-byte chunk (three continuation calls
-  per value), a small `MAX` column dragging fifteen fixed columns with it, and
+  inline values, `MAX` text past one 8192-byte chunk (three calls total, including
+  two continuation calls, per non-NULL value), a small `MAX` column dragging fifteen fixed columns with it, and
   the `sql_variant` probe → `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` → typed
   read sequence.
 - **Nullable inline variable width, separate from MAX/PLP.** They are different

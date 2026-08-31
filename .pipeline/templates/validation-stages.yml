@@ -77,6 +77,11 @@ stages:
       displayName: Check duplicate PR head commit
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    - bash: |
+        set -euo pipefail
+        python3 -m unittest discover -s .pipeline/scripts \
+          -p 'test_compare_odbc_benchmarks.py' -v
+      displayName: Test ODBC benchmark comparison policy
 
 - stage: Build
   displayName: Build Stage

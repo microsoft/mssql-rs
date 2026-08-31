@@ -938,6 +938,7 @@ try {
         Write-Host '>>> Removing ODBC benchmark tables...'
         $env:ODBC_BENCH_DRIVER = $CandidateDriverName
         $env:ODBC_BENCH_SCENARIO = ''
+        $env:ODBC_BENCH_PACKET_SIZE_KEYWORD = 'PacketSize'
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
