@@ -533,20 +533,37 @@ impl TdsClient {
             // Inject recovery data into the client context clone
             let mut reconnect_ctx = client_context.clone();
 
-            // Cap the per-attempt connect timeout to the remaining reconnect budget
-            let remaining_secs =
-                deadline.saturating_duration_since(Instant::now()).as_secs() as u32;
-            reconnect_ctx.connect_timeout = reconnect_ctx.connect_timeout.min(remaining_secs);
+            // Cap the per-attempt connect timeout to the remaining reconnect budget.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            reconnect_ctx.connect_timeout = reconnect_ctx
+                .connect_timeout
+                .min(remaining.as_secs() as u32);
 
             info!(attempt, "Attempting reconnection");
-            let connect_result = CancelHandle::run_until_cancelled(
-                cancel_handle,
-                TdsConnectionProvider::connect_with_transport_context(
-                    &reconnect_ctx,
-                    &transport_context,
-                    Some(Box::new((*snapshot).clone())),
-                ),
-            )
+            // `connect_timeout` above only bounds the TCP-connect step inside
+            // `connect_with_transport_context`; DNS resolution ahead of it is
+            // otherwise unbounded here. Wrap the whole attempt (DNS through
+            // login) in `remaining` too, so a slow resolver can't make a
+            // single reconnect attempt outlive the overall reconnect deadline.
+            let connect_result = CancelHandle::run_until_cancelled(cancel_handle, async {
+                match tokio::time::timeout(
+                    remaining,
+                    TdsConnectionProvider::connect_with_transport_context(
+                        &reconnect_ctx,
+                        &transport_context,
+                        Some(Box::new((*snapshot).clone())),
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        Err(Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                            "Reconnection attempt timed out".to_string(),
+                        )))
+                    }
+                }
+            })
             .await;
             match connect_result {
                 Ok((

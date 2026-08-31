@@ -3662,30 +3662,53 @@ pub(crate) mod tests {
     /// actually exercised) must go through `tokio::net::lookup_host` and
     /// therefore stay bounded by an enclosing `tokio::time::timeout` — the
     /// exact property the blocking `to_socket_addrs()` call used to violate.
+    ///
+    /// Timing alone can't prove this: resolving `localhost` completes in
+    /// low-single-digit milliseconds whether or not the underlying call
+    /// blocks, so a `timeout()`-based assertion would pass either way. This
+    /// test instead proves the structural property directly — a concurrently
+    /// spawned task must get *some* chance to run while resolution is in
+    /// flight. `tokio::net::lookup_host` bridges to `spawn_blocking` via a
+    /// channel, so the awaiting task is guaranteed to return `Pending` and
+    /// yield at least once, no matter how fast the lookup itself finishes.
+    /// A synchronous `to_socket_addrs()` call never yields at all: the whole
+    /// resolution runs inside a single poll of this task, so a concurrent
+    /// task gets zero opportunities to run until it is done. Confirmed by
+    /// mutation testing: reverting to `to_socket_addrs()` makes this test
+    /// fail (the heartbeat counter stays at 0) while the timing-based
+    /// version above kept passing regardless.
     #[tokio::test]
-    async fn create_base_stream_sequential_resolution_is_bounded_by_timeout() {
+    async fn create_base_stream_sequential_resolution_yields_to_the_executor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let heartbeats_task = heartbeats.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                heartbeats_task.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
         // Port 0 is never listening, so the (fast, loopback) TCP connect
-        // fails quickly and the call returns well within the outer bound
-        // instead of the test hanging if resolution ever regresses to a
-        // blocking call.
-        let result = timeout(
-            Duration::from_secs(5),
-            create_base_stream_sequential(
-                IPAddressPreference::UsePlatformDefault,
-                "localhost",
-                0,
-                30_000,
-                1_000,
-                200,
-            ),
+        // fails quickly once resolution completes; the call overall still
+        // returns promptly either way.
+        let _ = create_base_stream_sequential(
+            IPAddressPreference::UsePlatformDefault,
+            "localhost",
+            0,
+            30_000,
+            1_000,
+            200,
         )
         .await;
 
+        heartbeat.abort();
         assert!(
-            result.is_ok(),
-            "resolving 'localhost' must not escape the outer timeout"
+            heartbeats.load(Ordering::SeqCst) > 0,
+            "the heartbeat task never ran while resolving 'localhost' — \
+             resolution is blocking the executor instead of awaiting it"
         );
-        assert!(result.unwrap().is_err(), "port 0 must not be connectable");
     }
 
     /// `skip_bytes` spins the same way, and it runs on the discard path that

@@ -160,6 +160,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   ODBC is a blocking API, the whole calling process) indefinitely instead of
   failing within the configured timeout. Resolution now goes through
   `tokio::net::lookup_host`, the same async primitive already used for SSRP
-  instance lookups, so it is properly bounded like the rest of the connect
-  attempt.
+  instance lookups, so it is a genuine, cancellable `.await` point instead of
+  a blocking one. `parallel_connect` (`MultiSubnetFailover`) now also folds
+  DNS resolution into the single overall deadline its `timeout_ms` already
+  documents, instead of only timing the connection race that follows it, and
+  idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
+  full connect (DNS through login) in the attempt's remaining budget instead
+  of only capping the post-resolution TCP connect step.
 
