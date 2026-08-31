@@ -240,14 +240,15 @@ TEST_F(FetchErrorSemanticsLiveTest, DatetimeWithZeroTimeIntoDateTargetIsClean) {
 }
 
 TEST_F(FetchErrorSemanticsLiveTest, DatetimeoffsetIntoSsTime2Succeeds) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_NO_FATAL_FAILURE(FetchOne(
         "SELECT CAST('2023-01-01 12:34:56.1234567 +05:30' AS DATETIMEOFFSET(7)) AS c1"));
 
     SQL_SS_TIME2_STRUCT t{};
     SQLLEN ind = 0;
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_SS_TIME2, &t, sizeof(t), &ind));
-    EXPECT_LE(t.hour, 23);
-    EXPECT_LE(t.minute, 59);
+    EXPECT_EQ(12, t.hour);
+    EXPECT_EQ(34, t.minute);
     EXPECT_EQ(56, t.second);
     EXPECT_EQ(123456700u, t.fraction);
     EXPECT_EQ(static_cast<SQLLEN>(sizeof(t)), ind);
