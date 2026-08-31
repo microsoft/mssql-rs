@@ -26,6 +26,14 @@ pub(crate) enum NumericSource {
     /// and whether anything non-zero was dropped, which survives any length.
     /// `negative` is kept separately because `int_part` cannot hold the sign of
     /// `-0.something` and `approx` can underflow to `-0.0`.
+    ///
+    /// [`NumericSource::Float`] still has that hazard: `"-1e-400"` underflows to
+    /// `-0.0`, which is not `< 0.0`, so [`NumericSource::is_negative`] answers
+    /// `false` and the `SQL_C_BIT` fetch arm writes `0` rather than reporting
+    /// `22003`. Pre-existing and not fixed here - `f64::is_sign_negative` is not
+    /// the fix, since it would call `"-0e0"` negative too; the sign has to come
+    /// from the literal the way `parse_wide_decimal` carries it. Tracked in
+    /// AB#47369.
     WideDecimal {
         approx: f64,
         negative: bool,
@@ -142,10 +150,11 @@ pub(crate) fn narrow_i128<T: TryFrom<i128>>(v: i128) -> Result<T, ConvError> {
 /// a `01S07` warning outbound and a `22001` error inbound, so callers take
 /// [`NumericSource::to_i128_truncating`]'s flag and decide.
 ///
-/// Only exponent forms go through `f64`, so a literal carrying more significant
-/// digits than a double holds still reports its fraction - `CharToBigint` walks
-/// the digits one at a time and flags any non-zero one past the scale
-/// (`sqlccnvt.cpp:7823`) however long the literal is.
+/// Only exponent forms and integers too wide for an exact mantissa go through
+/// `f64`, so a *decimal* carrying more significant digits than a double holds
+/// still reports its fraction - `CharToBigint` walks the digits one at a time
+/// and flags any non-zero one past the scale (`sqlccnvt.cpp:7823`) however long
+/// the literal is.
 pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError> {
     // An embedded NUL ends the number. `CharToBigint` loops
     // `while (len < srclen && charstr[len] != '\0')` (`sqlccnvt.cpp:7800`), so an
@@ -157,15 +166,13 @@ pub(crate) fn parse_numeric_text(text: &str) -> Result<NumericSource, ConvError>
     // msodbcsql itself reports `22018` for the same buffer under `SQL_NTS`.
     let text = text.split('\0').next().unwrap_or("");
 
-    // Only blanks are padding. `CharToBigint` trims `' '` alone
-    // (`sqlccnvt.cpp:7777`) and treats every other non-digit as invalid, so a
-    // tab, an interior blank or a non-breaking space is an error. Checked
-    // explicitly because `parse_decimal_literal` applies `str::trim`, which
-    // would strip the whole Unicode whitespace set first.
+    // Only blanks are padding: `CharToBigint` trims `' '` alone
+    // (`sqlccnvt.cpp:7777`). Everything else fails downstream on its own - the
+    // digit-only checks in `parse_decimal_literal` and `parse_wide_decimal`
+    // reject it, and `f64::from_str` admits no whitespace at all - so a tab, an
+    // interior blank or a non-breaking space lands on `22018` without a guard
+    // here. `a_non_numeric_literal_is_22018` is what holds that.
     let trimmed = text.trim_matches(' ');
-    if trimmed.chars().any(char::is_whitespace) {
-        return Err(ConvError::InvalidCharacterValue);
-    }
 
     if let Some(source) = parse_decimal_literal(trimmed) {
         return Ok(source);

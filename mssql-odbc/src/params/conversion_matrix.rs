@@ -35,6 +35,9 @@ const CHARACTER_SQL_TARGETS: &[SqlSmallInt] = &[
 
 const BINARY_SQL_TARGETS: &[SqlSmallInt] = &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY];
 
+/// Width is not part of legality: a value that does not fit the target is a
+/// runtime `22003`, not a rejected binding, so `SQL_TINYINT` stays reachable
+/// from every integer and character C type.
 const INTEGER_SQL_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT];
 
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
