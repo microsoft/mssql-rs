@@ -1089,6 +1089,54 @@ impl GenericDecoder {
                     ColumnValues::Uuid(uuid::Uuid::from_bytes_le(bytes))
                 }
             }
+            TdsDataType::DecimalN | TdsDataType::NumericN => {
+                let Some(length) = reader.byte() else {
+                    return Ok(None);
+                };
+                let TypeInfoVariant::VarLenPrecisionScale(_, _, precision, scale) =
+                    metadata.type_info.type_info_variant
+                else {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid type info variant for Decimal/Numeric: expected VarLenPrecisionScale, got: {:?}",
+                        metadata.type_info.type_info_variant
+                    )));
+                };
+                if !decimal_metadata_is_valid(precision, scale) {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Invalid decimal precision {precision} / scale {scale}"
+                    )));
+                }
+                if length == 0 {
+                    ColumnValues::Null
+                } else {
+                    let Some(sign) = reader.byte() else {
+                        return Ok(None);
+                    };
+                    let magnitude_len = usize::from(length - 1);
+                    let number_of_int_parts = magnitude_len.div_ceil(4);
+                    if number_of_int_parts > MAX_DECIMAL_INT_PARTS {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Decimal int parts {number_of_int_parts} exceeds maximum allowed {MAX_DECIMAL_INT_PARTS} (length was {length})"
+                        )));
+                    }
+                    let Some(source) = reader.take_slice(magnitude_len) else {
+                        return Ok(None);
+                    };
+                    let mut magnitude = [0u8; DECIMAL_MAGNITUDE_BYTES];
+                    magnitude[..magnitude_len].copy_from_slice(source);
+                    let value = DecimalParts::new(
+                        sign == 1,
+                        precision,
+                        scale,
+                        u128::from_le_bytes(magnitude),
+                    );
+                    if metadata.data_type == TdsDataType::DecimalN {
+                        ColumnValues::Decimal(value)
+                    } else {
+                        ColumnValues::Numeric(value)
+                    }
+                }
+            }
             TdsDataType::NChar
             | TdsDataType::NVarChar
             | TdsDataType::BigChar
@@ -4915,6 +4963,13 @@ mod test {
             let numeric = precision_scale_metadata(TdsDataType::NumericN, 9, 18, 4);
             let mut numeric_wire = vec![9, 1];
             numeric_wire.extend_from_slice(&1_234_500_u64.to_le_bytes());
+            let buffered_numeric = GenericDecoder::default()
+                .try_decode_buffered(&numeric_wire, &numeric)
+                .unwrap();
+            assert!(matches!(
+                buffered_numeric,
+                Some((ColumnValues::Numeric(_), 10))
+            ));
             assert!(matches!(
                 assert_decode_equivalence(numeric_wire, &numeric).await,
                 ColumnValues::Numeric(_)
@@ -6124,6 +6179,13 @@ mod test {
             let mut part = [0u8; 4];
             LittleEndian::write_i32(&mut part, 12345);
             buf.extend_from_slice(&part);
+            let buffered_decimal = GenericDecoder::default()
+                .try_decode_buffered(&buf, &md)
+                .unwrap();
+            assert!(matches!(
+                buffered_decimal,
+                Some((ColumnValues::Decimal(_), 6))
+            ));
             let val = assert_decode_equivalence(buf, &md).await;
             assert!(matches!(val, ColumnValues::Decimal(_)));
         }
