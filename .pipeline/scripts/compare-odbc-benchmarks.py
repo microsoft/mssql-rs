@@ -919,6 +919,10 @@ def parse_confirmations(raw):
 
 def validate_args(args):
     """Reject settings that would silently publish an unusable verdict."""
+    if args.fail_on_regression and args.no_fail_on_regression:
+        raise ValueError(
+            "--fail-on-regression and --no-fail-on-regression are mutually exclusive"
+        )
     if not math.isfinite(args.regression_ratio) or args.regression_ratio <= 1.0:
         raise ValueError("--regression-ratio must be a finite value greater than 1")
     if args.improvement_ratio is not None and (

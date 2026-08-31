@@ -29,7 +29,9 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
     state.counters["logical_bytes_per_second"] =
         static_cast<double>(metrics.logical_bytes) / metrics.total_seconds;
     state.counters["execute_ms"] = metrics.execute_seconds * 1000.0;
-    state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
+    if (metrics.metadata_bind_seconds >= 0.0) {
+        state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
+    }
     state.counters["fetch_ms"] = metrics.fetch_seconds * 1000.0;
     // Zero for the bound modes. On the row-at-a-time workloads it is the number of
     // driver round trips the consumer's access pattern forced, which is the thing

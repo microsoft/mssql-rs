@@ -2060,6 +2060,11 @@ private:
             metrics.total_seconds = seconds_between(start, end);
             metrics.execute_seconds = seconds_between(start, after_execute);
             metrics.metadata_bind_seconds = seconds_between(after_execute, after_bind);
+            if (spec_.access == AccessMode::bound_bind_cycle) {
+                // Describe/bind repeats inside the fetch loop for this workload,
+                // so there is no honest one-time metadata phase to report.
+                metrics.metadata_bind_seconds = -1.0;
+            }
             metrics.fetch_seconds = seconds_between(after_bind, end);
 
             cleanup_statement();

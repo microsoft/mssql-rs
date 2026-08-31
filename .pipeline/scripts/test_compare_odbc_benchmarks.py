@@ -449,6 +449,14 @@ class MismatchTests(ComparatorTestCase):
         self.assertEqual(code, 1)
         self.assertIn("exceed --confirm-runs", output)
 
+    def test_conflicting_gate_flags_are_rejected(self):
+        arguments = self.three_way(100.0, 100.0, 40.0)
+        code, output, _ = self.compare(
+            arguments + ["--fail-on-regression", "--no-fail-on-regression"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("mutually exclusive", output)
+
 
 class LegacyTwoWayTests(ComparatorTestCase):
     """The per-round confirmation comparison still runs without a reference leg,
