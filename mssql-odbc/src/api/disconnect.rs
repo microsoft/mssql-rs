@@ -97,19 +97,29 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     // the DBC lock). However, a call that already took the client and is mid-execute() holds
     // no locks during I/O, so it can race here and access a STMT handle we are about to free.
     // TODO: fix with refcounted handle lifetimes so STMT handles cannot be freed while in use.
-    for &stmt_ptr in &state.statements {
+    //
+    // Locking each STMT's own mutex here is pure synchronization, not a read
+    // of its data: a poisoning panic still fully releases the lock on
+    // unwind, so a poisoned outcome doesn't change whether it's safe to free
+    // the box, only whether the STMT's *contents* were left consistent —
+    // irrelevant here, since the box is dropped whole. Treating it as fatal
+    // instead (returning `SQL_ERROR` without freeing) would orphan the
+    // handle: no longer in `state.statements` for a retry to find, yet never
+    // freed either. Tolerating it and freeing anyway, matching `free_stmt`'s
+    // identical tolerance for its own handle's lock, closes that gap instead
+    // of deferring it.
+    while let Some(stmt_ptr) = state.statements.pop() {
         // SAFETY: `stmt_ptr` came from `handle_to_raw::<StmtHandle>` and is still
-        // live (the DBC owns it). Acquire the STMT lock to serialize with any
-        // op still holding it, then drop the box.
+        // live (the DBC owns it).
         let stmt = unsafe { handle_from_raw::<StmtHandle>(stmt_ptr) };
-        let Ok(guard) = stmt.inner.lock() else {
-            error!(?stmt_ptr, "SQLDisconnect: stmt mutex poisoned");
-            return SQL_ERROR;
-        };
-        drop(guard);
+        if stmt.inner.lock().is_err() {
+            error!(
+                ?stmt_ptr,
+                "SQLDisconnect: stmt mutex poisoned; freeing anyway"
+            );
+        }
         unsafe { free_handle::<StmtHandle>(stmt_ptr) };
     }
-    state.statements.clear();
 
     // Drop all explicitly-allocated DESC handles, after the statements: an
     // explicit descriptor carries no back-pointer to whichever statements had
@@ -119,20 +129,19 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     // descriptor-allocation-node list the same way, after its own statement
     // loop (`sqlcconn.cpp:1313-1448`).
     //
-    // Pops (rather than iterating then clearing) so a poisoned DESC mutex
-    // leaves only the not-yet-freed remainder in `state.descriptors`: a
-    // retried `SQLDisconnect` picks up where this one stopped instead of
-    // re-freeing entries this pass already dropped.
+    // Same poison-tolerant shape as the statement loop above, for the same
+    // reason: synchronization only, and treating poison as fatal here would
+    // equally orphan the descriptor rather than actually resolve anything.
     while let Some(desc_ptr) = state.descriptors.pop() {
         // SAFETY: `desc_ptr` came from `handle_to_raw::<DescHandle>` and is
-        // still live (the DBC owns it). Acquire the DESC lock to serialize
-        // with any op still holding it, then drop the box.
+        // still live (the DBC owns it).
         let desc = unsafe { handle_from_raw::<DescHandle>(desc_ptr) };
-        let Ok(guard) = desc.inner.lock() else {
-            error!(?desc_ptr, "SQLDisconnect: desc mutex poisoned");
-            return SQL_ERROR;
-        };
-        drop(guard);
+        if desc.inner.lock().is_err() {
+            error!(
+                ?desc_ptr,
+                "SQLDisconnect: desc mutex poisoned; freeing anyway"
+            );
+        }
         unsafe { free_handle::<DescHandle>(desc_ptr) };
     }
 
@@ -272,6 +281,79 @@ mod tests {
         // before the read) but not on macOS, whose allocator reused it
         // sooner. The connection no longer tracking the descriptor (checked
         // above) is the real, safely-observable contract.
+
+        unsafe {
+            sql_free_handle(SQL_HANDLE_DBC, dbc);
+            sql_free_handle(SQL_HANDLE_ENV, env);
+        }
+    }
+
+    /// `SQLDisconnect` must tolerate a poisoned STMT mutex instead of
+    /// treating it as fatal: the lock exists purely to synchronize with any
+    /// thread still operating on the statement, not to read its (possibly
+    /// inconsistent) contents, so poison doesn't make it unsafe to free the
+    /// box. Matches `free_stmt`'s identical tolerance for its own handle's
+    /// lock — treating it as fatal here instead would orphan the statement:
+    /// no longer tracked in `state.statements` for a retry to find, yet
+    /// never freed either.
+    #[test]
+    fn disconnect_frees_a_statement_even_if_its_mutex_is_poisoned() {
+        use crate::api::odbc_types::SQL_HANDLE_STMT;
+        use crate::handles::dbc::ConnectionState;
+        use crate::handles::is_live;
+
+        let mut env: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_env_attr(
+                    env,
+                    SQL_ATTR_ODBC_VERSION,
+                    SQL_OV_ODBC3_80 as usize as *mut std::ffi::c_void,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut dbc: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
+            SQL_SUCCESS
+        );
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+        dbc_ref.inner.lock().unwrap().connection_state = ConnectionState::Connected;
+
+        let mut stmt1: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt1) },
+            SQL_SUCCESS
+        );
+        let mut stmt2: SqlHandle = SQL_NULL_HANDLE;
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt2) },
+            SQL_SUCCESS
+        );
+
+        // Poison stmt2's mutex; stmt1's is left untouched.
+        let stmt2_ref = unsafe { handle_from_raw::<StmtHandle>(stmt2) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stmt2_ref.inner.lock().unwrap();
+            panic!("poison the stmt lock");
+        }));
+
+        // Before the fix, this returned SQL_ERROR and left stmt2 neither
+        // tracked nor freed (permanently unreachable). Now it succeeds and
+        // frees both.
+        assert_eq!(unsafe { sql_disconnect(dbc) }, SQL_SUCCESS);
+        assert!(dbc_ref.inner.lock().unwrap().statements.is_empty());
+        assert!(!is_live(stmt1), "stmt1 (unpoisoned) must be actually freed");
+        assert!(
+            !is_live(stmt2),
+            "stmt2 (poisoned) must be actually freed too, not orphaned"
+        );
 
         unsafe {
             sql_free_handle(SQL_HANDLE_DBC, dbc);

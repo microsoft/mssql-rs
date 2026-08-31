@@ -48,7 +48,6 @@ const KNOWN_IGNORED_KEYS: &[&str] = &[
     "description",
     "desc",
     "driver",
-    "app",
     "wsid",
     "language",
     "network",
@@ -135,6 +134,7 @@ enum ConnAttrKey {
     Authentication,
     TrustedConnection,
     ServerSpn,
+    App,
     ApplicationIntent,
     MultiSubnetFailover,
     ConnectRetryCount,
@@ -203,6 +203,7 @@ pub(crate) struct ConnectionParams {
     pub(crate) authentication: Option<String>,
     pub(crate) trusted_connection: Option<bool>,
     pub(crate) server_spn: Option<String>,
+    pub(crate) application_name: Option<String>,
     pub(crate) application_intent: Option<String>,
     pub(crate) multi_subnet_failover: Option<bool>,
     pub(crate) connect_retry_count: Option<u32>,
@@ -248,6 +249,9 @@ impl ConnectionParams {
         }
         if let Some(server_spn) = &self.server_spn {
             parts.push(format!("ServerSPN={}", quote_odbc_value(server_spn)));
+        }
+        if let Some(application_name) = &self.application_name {
+            parts.push(format!("APP={}", quote_odbc_value(application_name)));
         }
         if let Some(application_intent) = &self.application_intent {
             parts.push(format!("ApplicationIntent={application_intent}"));
@@ -318,6 +322,7 @@ impl fmt::Debug for ConnectionParams {
             .field("authentication", &self.authentication)
             .field("trusted_connection", &self.trusted_connection)
             .field("server_spn", &self.server_spn)
+            .field("application_name", &self.application_name)
             .field("application_intent", &self.application_intent)
             .field("multi_subnet_failover", &self.multi_subnet_failover)
             .field("connect_retry_count", &self.connect_retry_count)
@@ -373,6 +378,7 @@ const MAPPED_KEYS: &[(&str, ConnAttrKey)] = &[
     ("authentication", ConnAttrKey::Authentication),
     ("trusted_connection", ConnAttrKey::TrustedConnection),
     ("serverspn", ConnAttrKey::ServerSpn),
+    ("app", ConnAttrKey::App),
     ("applicationintent", ConnAttrKey::ApplicationIntent),
     ("multisubnetfailover", ConnAttrKey::MultiSubnetFailover),
     ("connectretrycount", ConnAttrKey::ConnectRetryCount),
@@ -439,6 +445,7 @@ fn assign_value(
             params.trusted_connection = Some(is_yes(value));
         }
         ConnAttrKey::ServerSpn => params.server_spn = Some(value.to_string()),
+        ConnAttrKey::App => params.application_name = Some(value.to_string()),
         ConnAttrKey::ApplicationIntent => {
             validate_attr(lower, value, APPLICATION_INTENT_VALUES)?;
             params.application_intent = Some(value.to_string());
@@ -1290,7 +1297,6 @@ mod tests {
         for key in [
             "Driver",
             "DSN",
-            "APP",
             "WSID",
             "Language",
             "Network",
@@ -1307,6 +1313,23 @@ mod tests {
             assert_eq!(p.server, "h", "key {key}");
             assert_eq!(p.uid, "u", "key {key}");
         }
+    }
+
+    #[test]
+    fn app_maps_to_application_name() {
+        for key in ["APP", "app", "App"] {
+            let s = format!("Server=h;{key}=My App;UID=u;<PW>=p");
+            let (p, warn) = parse_connection_string(&cs(&s)).unwrap();
+            assert!(!warn, "{key} should map cleanly to APP");
+            assert_eq!(p.application_name.as_deref(), Some("My App"), "key {key}");
+        }
+    }
+
+    #[test]
+    fn app_is_absent_when_not_supplied() {
+        let (p, warn) = parse_connection_string(&cs("Server=h;UID=u;<PW>=p")).unwrap();
+        assert!(!warn);
+        assert_eq!(p.application_name, None);
     }
 
     #[test]
@@ -1485,7 +1508,7 @@ mod tests {
     #[test]
     fn fmt_as_odbc_conn_str_includes_new_keys() {
         let (p, _) = parse_connection_string(
-            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
+            "Server=h;ApplicationIntent=ReadOnly;MultiSubnetFailover=yes;ConnectRetryCount=2;ConnectRetryInterval=10;KeepAlive=30;KeepAliveInterval=1;PacketSize=4096;IpAddressPreference=IPv4First;ServerSPN=svc;APP=MyApp;HostnameInCertificate=cn;ServerCertificate=/tmp/c.pem;UID=u",
         )
         .unwrap();
         let out = p.fmt_as_odbc_conn_str();
@@ -1499,6 +1522,7 @@ mod tests {
             "PacketSize=4096",
             "IpAddressPreference=IPv4First",
             "ServerSPN=svc",
+            "APP=MyApp",
             "HostnameInCertificate=cn",
             "ServerCertificate=/tmp/c.pem",
         ] {

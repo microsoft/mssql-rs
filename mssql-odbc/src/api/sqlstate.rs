@@ -31,6 +31,9 @@ pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_22026: [u8; 5] = *b"22026";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
 pub(crate) const SQLSTATE_25000: [u8; 5] = *b"25000";
+/// Syntax error or access violation — the state a server error carries when it
+/// is the application's statement that is at fault.
+pub(crate) const SQLSTATE_42000: [u8; 5] = *b"42000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
 pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
@@ -517,15 +520,47 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
         .map(|i| SERVER_ERROR_TO_SQL_STATE_MAP[i].1)
 }
 
+/// Highest TDS severity class that is purely informational — msodbcsql's
+/// `EX_MAXISEVERITY` (`tds.h:603`).
+const SEVERITY_MAX_INFO: i32 = 10;
+/// Upper boundary of msodbcsql's `42000` compatibility tier —
+/// `MAXUSEVERITY` (`tds.h:612`).
+const SEVERITY_MAX_USER: i32 = 18;
+
+/// SQLSTATE for a server message whose error number has no entry in
+/// [`SERVER_ERROR_TO_SQL_STATE_MAP`], derived from its TDS severity class.
+///
+/// msodbcsql tiers this fallback rather than using one fixed state
+/// (`PostSQLServerMessageEx`, `sqlcerr.cpp:1385-1401`): severity > 18 →
+/// `IDS_S1_000_01` (`HY000`), > 10 → `IDS_37_000` (`42000`), otherwise
+/// `IDS_01_000_00` (`01000`). The map's own header states the rule
+/// (`sqlcstr.cpp:120`: "Any SQLServer error not here will receive a 37000
+/// SQLState").
+///
+/// The middle tier is what makes an unmapped syntax error or a severity-16
+/// `RAISERROR` a *programming* error rather than a generic one — the
+/// distinction wrappers such as mssql-python use to pick an exception class.
+/// Growing the map instead would fix one error number at a time and violate
+/// its "entries are permanent" contract; the tier fixes every unmapped error.
+fn sqlstate_for_severity(class: i32) -> [u8; 5] {
+    if class > SEVERITY_MAX_USER {
+        SQLSTATE_HY000
+    } else if class > SEVERITY_MAX_INFO {
+        SQLSTATE_42000
+    } else {
+        SQLSTATE_01000
+    }
+}
+
 /// Post one ODBC diagnostic record per server error in `err`.
 ///
 /// For [`TdsError::SqlServerError`], iterates the server-reported errors in
 /// the order TDS delivered them and pushes one
 /// [`DiagRecord`](crate::error::DiagRecord) each. Each record's SQLSTATE
 /// comes from [`sqlstate_for_sql_error`]; any error number not in the map
-/// falls back to `default`. Native error and message are taken straight
-/// from the server-reported error. Any informational/warning messages the
-/// server sent alongside the errors are posted after the error records so a
+/// falls back to [`sqlstate_for_severity`]. Native error and message are taken
+/// straight from the server-reported error. Any informational/warning messages
+/// the server sent alongside the errors are posted after the error records so a
 /// failing call still surfaces the full server diagnostic set (matching
 /// msodbcsql).
 ///
@@ -533,9 +568,10 @@ pub(crate) fn sqlstate_for_sql_error(error_number: u32) -> Option<[u8; 5]> {
 /// timeout, …), pushes a single record with `default`, native error 0, and
 /// the error's `Display` text.
 ///
-/// `default` is the SQLSTATE that best describes the caller's context —
-/// typically `08001` for connect-time failures and `HY000` for general
-/// execution / fetch failures.
+/// `default` therefore describes the caller's context for failures the engine
+/// did *not* raise — typically `08001` for connect-time failures and `HY000`
+/// for general execution / fetch failures. A server error carries its own
+/// severity, so it never uses `default`.
 pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, default: [u8; 5]) {
     if let TdsError::SqlServerError { diagnostics } = err {
         if diagnostics.errors.is_empty() {
@@ -546,7 +582,8 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
             post_sql_error(state, default, 0, err.to_string());
         } else {
             for e in &diagnostics.errors {
-                let sqlstate = sqlstate_for_sql_error(e.number).unwrap_or(default);
+                let sqlstate = sqlstate_for_sql_error(e.number)
+                    .unwrap_or_else(|| sqlstate_for_severity(e.class));
                 let native = i32::try_from(e.number).unwrap_or(i32::MAX);
                 post_sql_error(
                     state,
@@ -581,7 +618,8 @@ pub(crate) fn post_tds_info_messages(
     messages: &[SqlInfoMessage],
 ) -> bool {
     for message in messages {
-        let sqlstate = sqlstate_for_sql_error(message.number).unwrap_or(SQLSTATE_01000);
+        let sqlstate = sqlstate_for_sql_error(message.number)
+            .unwrap_or_else(|| sqlstate_for_severity(message.class));
         let native = i32::try_from(message.number).unwrap_or(i32::MAX);
         post_sql_error(
             state,
@@ -690,7 +728,9 @@ mod tests {
 
     #[test]
     fn post_tds_error_posts_one_record_per_server_error_in_order() {
-        // 18456 → 28000 (mapped); 4060 → fallback (not in our map).
+        // 18456 → 28000 (mapped); 4060 → severity fallback (not in our map).
+        // `sql_error` builds class 14, so the fallback is the middle tier —
+        // `default` (08001 here) applies only to non-server failures.
         let mut s = FakeState::default();
         let err = TdsError::from_sql_errors(vec![
             sql_error(18456, "Login failed."),
@@ -700,8 +740,52 @@ mod tests {
         assert_eq!(s.records.len(), 2);
         assert_eq!(s.records[0].sql_state, *b"28000");
         assert_eq!(s.records[0].native_error, 18456);
-        assert_eq!(s.records[1].sql_state, SQLSTATE_08001); // fallback
+        assert_eq!(s.records[1].sql_state, SQLSTATE_42000);
         assert_eq!(s.records[1].native_error, 4060);
+    }
+
+    #[test]
+    fn severity_tiers_match_msodbcsql_boundaries() {
+        // sqlcerr.cpp:1385-1401 — > MAXUSEVERITY (18), > EX_MAXISEVERITY (10),
+        // else. Exercise both boundaries from either side.
+        assert_eq!(sqlstate_for_severity(0), SQLSTATE_01000);
+        assert_eq!(sqlstate_for_severity(10), SQLSTATE_01000);
+        assert_eq!(sqlstate_for_severity(11), SQLSTATE_42000);
+        assert_eq!(sqlstate_for_severity(16), SQLSTATE_42000);
+        assert_eq!(sqlstate_for_severity(18), SQLSTATE_42000);
+        assert_eq!(sqlstate_for_severity(19), SQLSTATE_HY000);
+        assert_eq!(sqlstate_for_severity(25), SQLSTATE_HY000);
+    }
+
+    #[test]
+    fn unmapped_server_error_takes_sqlstate_from_its_severity() {
+        // The three cases that drove AB#47532: an unmapped syntax error (102,
+        // severity 15), an unmapped conversion error (257, severity 16) and
+        // RAISERROR's generic 50000. None is in the map — nor in msodbcsql's —
+        // yet all must reach 42000 so wrappers classify them as programming
+        // errors rather than operational ones.
+        for (number, class) in [(102u32, 15), (257, 16), (50000, 16)] {
+            assert_eq!(sqlstate_for_sql_error(number), None, "error {number}");
+            let mut s = FakeState::default();
+            let mut e = sql_error(number, "boom");
+            e.class = class;
+            post_tds_error(&mut s, &TdsError::from_sql_errors(vec![e]), SQLSTATE_HY000);
+            assert_eq!(s.records.len(), 1);
+            assert_eq!(s.records[0].sql_state, SQLSTATE_42000, "error {number}");
+        }
+    }
+
+    #[test]
+    fn unmapped_fatal_server_error_stays_hy000() {
+        // Severity above MAXUSEVERITY is not something the application can fix
+        // by rewriting its statement, so it keeps the general error state.
+        let mut s = FakeState::default();
+        let mut e = sql_error(823, "I/O error");
+        e.class = 24;
+        post_tds_error(&mut s, &TdsError::from_sql_errors(vec![e]), SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(s.records[0].native_error, 823);
     }
 
     #[test]

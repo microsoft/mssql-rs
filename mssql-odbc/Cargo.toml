@@ -32,6 +32,7 @@ url = "2"
 # connection silently reuse a stale cached credential built from a different
 # secret.
 sha2 = "0.11.0"
+uuid = "1"
 
 # `ActiveDirectoryInteractive` delegates the sign-in UI to `mssql-auth.dll`
 # (OneAuth), the same library msodbcsql loads. The `windows` crate supplies the
@@ -52,8 +53,4 @@ windows = { version = "0.58", features = [
 # `TdsClient` driven by scripted TDS tokens (see `mssql_tds::test_client_support`)
 # to cover client-driven ODBC paths without a live server.
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
-# Matches the version mssql-tds resolves (workspace lock: 1.x) so the `Uuid`
-# type in tests is the same crate instance as `ColumnValues::Uuid`.
-uuid = "1"
-
 [build-dependencies]
