@@ -4087,14 +4087,21 @@ impl TdsClient {
     /// exactly as the main loop absorbs them.
     async fn settle_rpc_terminator(&mut self, parser_context: &ParserContext) -> TdsResult<()> {
         let mut processing_error = None;
+        let mut loop_count = 0u32;
         loop {
+            loop_count += 1;
+            if loop_count > 10000 {
+                let error = crate::error::Error::ProtocolError(
+                    "Too many RPC trailer tokens without terminal DONEPROC".to_string(),
+                );
+                self.fail_rpc_terminator_look_ahead(&error);
+                return Err(error);
+            }
+
             let token = match self.next_response_token(parser_context).await {
                 Ok(token) => token,
                 Err(error) => {
-                    self.execution_context.set_has_open_batch(false);
-                    self.remaining_request_timeout = None;
-                    self.cancel_handle = None;
-                    self.retire_after_failed_drain(&error);
+                    self.fail_rpc_terminator_look_ahead(&error);
                     return Err(error);
                 }
             };
@@ -4138,6 +4145,18 @@ impl TdsClient {
                     return processing_error.map_or(Ok(()), Err);
                 }
             }
+        }
+    }
+
+    fn fail_rpc_terminator_look_ahead(&mut self, error: &crate::error::Error) {
+        self.execution_context.set_has_open_batch(false);
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        if !matches!(
+            error,
+            crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
+        ) {
+            self.retire_after_failed_drain(error);
         }
     }
 
@@ -9268,10 +9287,10 @@ mod tests {
         assert!(client.recovery_context.session_recovery_negotiated);
     }
 
-    /// Timeout and cancellation during look-ahead leave the response position
-    /// unknown, so the connection is retired and all request state is cleared.
+    /// Timeout and cancellation drain through the attention acknowledgement, so
+    /// request state is cleared without retiring the synchronized connection.
     #[tokio::test]
-    async fn sp_executesql_terminator_failure_retires_and_clears_request_state() {
+    async fn sp_executesql_terminator_timeout_clears_request_state() {
         let errors = [
             crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
                 "test timeout".to_string(),
@@ -9302,9 +9321,32 @@ mod tests {
             assert!(!client.has_open_batch());
             assert!(client.remaining_request_timeout.is_none());
             assert!(client.cancel_handle.is_none());
-            assert!(client.transport.connection_known_dead());
-            assert!(!client.recovery_context.session_recovery_negotiated);
+            assert!(!client.transport.connection_known_dead());
+            assert!(client.recovery_context.session_recovery_negotiated);
         }
+    }
+
+    /// A malicious or corrupt server cannot keep the trailer scanner alive
+    /// indefinitely by streaming control tokens without a terminal `DONEPROC`.
+    #[tokio::test]
+    async fn sp_executesql_terminator_iteration_limit_retires_connection() {
+        let mut tokens = vec![done_in_proc_count(CurrentCommand::Insert, 1)];
+        tokens.extend((0..10000).map(|_| return_status(0)));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let result = client
+            .execute_sp_executesql("INSERT INTO t VALUES (@P1)".to_string(), Vec::new(), ())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::ProtocolError(message))
+                if message == "Too many RPC trailer tokens without terminal DONEPROC"
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
+        assert!(!client.recovery_context.session_recovery_negotiated);
     }
 
     /// The same look-ahead must not swallow a real second statement: a
