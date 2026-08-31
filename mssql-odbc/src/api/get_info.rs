@@ -373,10 +373,12 @@ mod tests {
     fn driver_name_writes_wide_string() {
         #[cfg(target_os = "windows")]
         let expected = "mssqlodbc.dll";
-        #[cfg(target_os = "linux")]
-        let expected = "mssqlodbc.so";
         #[cfg(target_os = "macos")]
         let expected = "mssqlodbc.dylib";
+        // Mirrors the `_` fallback in build.rs, which emits the `.so` name for
+        // every non-Windows, non-macOS target.
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let expected = "mssqlodbc.so";
 
         assert_eq!(driver_name(), expected);
 

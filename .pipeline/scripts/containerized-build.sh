@@ -27,17 +27,12 @@ if [ "$BUILD_TYPE" = "Debug" ] || [ "$BUILD_TYPE" = "Both" ]; then
   echo '==> Building debug...'
   cargo build --frozen
   bash mssql-odbc/scripts/finalize-artifact.sh debug
-  # The CopyFiles exclusion in build-template-container.yml hardcodes Cargo's
-  # private library name; fail loudly if a [lib] rename desyncs it, rather than
-  # silently publishing the private artifact next to the shipped one.
-  test -f target/debug/libmssqlodbc.so || { echo 'ERROR: target/debug/libmssqlodbc.so missing; update the CopyFiles exclusion in .pipeline/templates/build-template-container.yml' >&2; exit 1; }
 fi
 
 if [ "$BUILD_TYPE" = "Release" ] || [ "$BUILD_TYPE" = "Both" ]; then
   echo '==> Building release...'
   cargo build --frozen --release
   bash mssql-odbc/scripts/finalize-artifact.sh release
-  test -f target/release/libmssqlodbc.so || { echo 'ERROR: target/release/libmssqlodbc.so missing; update the CopyFiles exclusion in .pipeline/templates/build-template-container.yml' >&2; exit 1; }
 fi
 
 # Archive nextest (used by later test stages)

@@ -11,7 +11,11 @@ $OdbcCrateDir = Split-Path -Parent $PSScriptRoot
 
 Push-Location $OdbcCrateDir
 try {
-    $Metadata = cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json
+    try {
+        $Metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+    } catch {
+        throw "could not resolve Cargo target directory (is cargo on PATH?): $_"
+    }
     if (-not $Metadata.target_directory) {
         throw "cargo metadata did not return a target directory"
     }

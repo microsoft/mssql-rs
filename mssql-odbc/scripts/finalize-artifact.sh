@@ -42,6 +42,7 @@ SOURCE_PATH="$TARGET_DIR/$PROFILE/$CARGO_ARTIFACT"
 PRODUCT_PATH="$TARGET_DIR/$PROFILE/$PRODUCT_ARTIFACT"
 if [ ! -f "$SOURCE_PATH" ]; then
     echo "Error: Cargo artifact not found at $SOURCE_PATH" >&2
+    echo "Hint: if the [lib] name changed, update the CopyFiles exclusion in .pipeline/templates/build-template-container.yml" >&2
     exit 1
 fi
 
