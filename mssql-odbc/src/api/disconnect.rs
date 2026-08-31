@@ -85,18 +85,15 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     // TODO: fix with refcounted handle lifetimes so STMT handles cannot be freed while in use.
     //
     // Locking each STMT's own mutex here is pure synchronization, not a read
-    // of its data: by the time `.lock()` returns at all (`Ok` or `Err`), no
-    // other thread can be mid-operation holding it, since a poisoning panic
-    // still fully releases the lock on unwind. A poisoned outcome therefore
-    // doesn't change whether it's safe to free the box, only whether the
-    // STMT's *contents* were left consistent — irrelevant here, since the box
-    // is being dropped whole. Treating it as fatal (returning `SQL_ERROR`
-    // without freeing) would orphan the handle: it would no longer be in
-    // `state.statements` for a retry to find, yet never actually freed either
-    // — reachable by no future call at all (mssql-rs#401 follow-up review).
-    // Tolerating it and freeing anyway, matching `free_stmt`'s own identical
-    // tolerance for its handle's lock, closes that gap outright instead of
-    // just deferring it.
+    // of its data: a poisoning panic still fully releases the lock on
+    // unwind, so a poisoned outcome doesn't change whether it's safe to free
+    // the box, only whether the STMT's *contents* were left consistent —
+    // irrelevant here, since the box is dropped whole. Treating it as fatal
+    // instead (returning `SQL_ERROR` without freeing) would orphan the
+    // handle: no longer in `state.statements` for a retry to find, yet never
+    // freed either. Tolerating it and freeing anyway, matching `free_stmt`'s
+    // identical tolerance for its own handle's lock, closes that gap instead
+    // of deferring it.
     while let Some(stmt_ptr) = state.statements.pop() {
         // SAFETY: `stmt_ptr` came from `handle_to_raw::<StmtHandle>` and is still
         // live (the DBC owns it).
@@ -255,18 +252,14 @@ mod tests {
         }
     }
 
-    /// Regression test for a bug in an earlier version of this fix (caught
-    /// by review before merge, mssql-rs#415): treating a poisoned STMT mutex
-    /// as fatal (returning `SQL_ERROR` without freeing) while having already
-    /// popped it off `state.statements` orphaned the statement entirely — no
-    /// longer tracked for a retry to find, yet never actually freed either,
-    /// so no future call could ever reach it again. `SQLDisconnect` must
-    /// instead tolerate a poisoned STMT mutex the same way `free_stmt`
-    /// already tolerates one for its own handle: the lock here exists purely
-    /// to synchronize with any thread still operating on the statement, not
-    /// to read its (possibly inconsistent) contents, so poison doesn't make
-    /// it unsafe to free the box — it succeeds and frees every statement,
-    /// poisoned or not.
+    /// `SQLDisconnect` must tolerate a poisoned STMT mutex instead of
+    /// treating it as fatal: the lock exists purely to synchronize with any
+    /// thread still operating on the statement, not to read its (possibly
+    /// inconsistent) contents, so poison doesn't make it unsafe to free the
+    /// box. Matches `free_stmt`'s identical tolerance for its own handle's
+    /// lock — treating it as fatal here instead would orphan the statement:
+    /// no longer tracked in `state.statements` for a retry to find, yet
+    /// never freed either.
     #[test]
     fn disconnect_frees_a_statement_even_if_its_mutex_is_poisoned() {
         use crate::api::odbc_types::SQL_HANDLE_STMT;

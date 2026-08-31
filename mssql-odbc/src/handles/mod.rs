@@ -12,9 +12,9 @@ pub(crate) use env::EnvHandle;
 pub(crate) use env::OdbcVersion;
 pub(crate) use stmt::StmtHandle;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use tracing::{debug, trace};
 
@@ -31,90 +31,90 @@ pub(crate) enum HandleType {
     Invalid = 0xDEADBEEF,
 }
 
-/// Tracks every currently-allocated handle by raw address, independent of the
-/// handle's own memory. This is what lets a free path confirm a handle is
-/// still live *before* dereferencing it, instead of dereferencing first and
-/// only checking a parent's child list afterward.
+/// Tracks every currently-allocated handle's `HandleType` by raw address,
+/// independent of the handle's own memory. Lets a free path confirm a
+/// handle is still live, and of the expected type, *before* dereferencing
+/// it — instead of dereferencing first and checking a parent's child list,
+/// or the handle's own type tag, afterward.
 ///
-/// Closes a real gap: `SQLDisconnect` cascades-frees every STMT and explicit
-/// DESC on a connection (`sql_disconnect_safe`), which the ODBC Driver
-/// Manager does not observe — an application legitimately holding one of
-/// those now-stale handles can still call `SQLFreeHandle` on it afterward
-/// (confirmed reachable during PR #370's review, not merely hypothetical).
-/// Reading through such a handle before confirming it is still live is a
-/// genuine use-after-free once the memory has actually been reused —
-/// observed allocator-dependently on macOS in CI. See mssql-rs#400.
+/// Closes two real gaps:
+/// - Address liveness: `SQLDisconnect` cascade-frees every STMT and
+///   explicit DESC on a connection (`sql_disconnect_safe`) behind the
+///   Driver Manager's back, so an application legitimately holding one of
+///   those now-stale handles can still call `SQLFreeHandle` on it
+///   afterward. Dereferencing before confirming it's still live is a
+///   genuine use-after-free once the memory is reused. See #400.
+/// - Type confusion: `SQLFreeHandle` dispatches on the caller-supplied
+///   `handle_type` with no cross-check, so a live handle of the wrong type
+///   (e.g. a DESC passed where a STMT was expected) used to reach
+///   `handle_from_raw::<StmtHandle>` and get reinterpreted — no address
+///   reuse required. Recording the type here answers that without the
+///   same dereference-to-check-the-type problem this registry exists to
+///   avoid in the first place.
 ///
 /// # Known limitation: address reuse (ABA)
 ///
-/// This registry answers "is *some* handle currently allocated at this
-/// address," not "is this *specific* allocation still the one at this
-/// address" — it cannot, since it only ever sees a bare `usize`, with
-/// nothing to distinguish one allocation from a different, later one that
-/// happens to land at the same freed address. So: free handle A, then
-/// allocate a brand-new handle B that the allocator happens to place at
-/// A's old address, and `is_live(A)` reports `true` again — not because A
-/// is somehow still valid, but because the registry cannot tell A and B
-/// apart. A caller still holding stale handle A would then have it
-/// dereferenced as if it were still A, corrupting or freeing B instead
-/// (flagged in review of #415; see
+/// Tracking `HandleType` doesn't extend to telling one allocation apart
+/// from a *later, same-typed* one that the allocator places at the same
+/// freed address: free handle A, allocate a new same-typed handle B at A's
+/// old address, and this registry reports A's address as live with the
+/// expected type again — not because A is valid, but because it cannot
+/// distinguish A from B. See
 /// `tests::is_live_cannot_distinguish_a_reused_address_from_the_original_allocation`
-/// for a direct demonstration). This does not make anything *worse* than
-/// before this registry existed — every stale-handle free unconditionally
-/// dereferenced with no check at all — it just means the improvement here
-/// is narrower than "safe against every stale handle": specifically, safe
-/// against the common case where nothing has reallocated at that address
-/// yet, which is what #400's reproduction and the CI failure that
-/// motivated it actually hit.
+/// for a direct demonstration (real OS-level reuse can't be forced
+/// portably/deterministically from a test). Closing this needs handle
+/// identity that survives address reuse — a generation-tracked indirection
+/// layer, the same class of redesign as the pre-existing refcounted-
+/// handle-lifetime TODO in `disconnect.rs` — tracked separately as #422.
 ///
-/// Actually closing this needs handle identity that survives address
-/// reuse — a generation-tracked indirection layer (handles as small stable
-/// indices into a slot table, not raw pointers) rather than a raw-address
-/// registry. That is squarely the same class of redesign as the existing
-/// refcounted-handle-lifetime TODO (`disconnect.rs`), tracked separately as
-/// mssql-rs#422 rather than attempted here.
-///
-/// Deliberately narrower than that redesign in a second way too: this only
-/// distinguishes "already freed" from "still live," not "live but
+/// Also narrower in a second way: this only distinguishes "already freed
+/// or wrong type" from "still live as expected," not "live but
 /// concurrently being freed on another thread right now" — that TOCTOU
-/// window is the pre-existing, wider concurrent-use race this crate already
-/// documents and does not attempt to close here either.
-static LIVE_HANDLES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+/// window is the pre-existing, wider concurrent-use race this crate
+/// already documents and does not attempt to close here.
+static LIVE_HANDLES: LazyLock<Mutex<HashMap<usize, HandleType>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Returns whether `raw` currently refers to a handle that has been
-/// allocated (via `handle_to_raw`) and not yet freed (via `free_handle`).
-///
-/// Safe to call on any pointer value, including a stale one whose memory may
-/// already be deallocated or reused: this never dereferences `raw`, so
-/// callers can use it to decide whether dereferencing is safe in the first
-/// place. If the registry lock is itself poisoned, conservatively reports
-/// "not live" — treating an ambiguous handle as already-freed risks a leak,
-/// treating it as live risks a genuine use-after-free.
-///
-/// That leak-over-UAF trade-off is permanent once triggered, not scoped to
-/// one call: a poisoned `std::sync::Mutex` never un-poisons, and
-/// `handle_to_raw` makes the matching choice on the insert side (silently
-/// skips registering new handles rather than panicking), so every handle —
-/// past and future — would report "not live" for the rest of the process,
-/// making `free_stmt`/`free_desc` skip freeing them all. In practice this
-/// needs a panic while holding `LIVE_HANDLES`'s lock, whose critical
-/// sections are a single `HashSet` op each with no user code or I/O that
-/// could panic, so it's realistically very unlikely — documented here so it
-/// isn't rediscovered as a mystery leak later.
-pub(crate) fn is_live(raw: *mut c_void) -> bool {
+/// Locks `LIVE_HANDLES`, recovering the guard even if the mutex is
+/// poisoned. Its critical sections are a single `HashMap` operation each,
+/// with no user code, I/O, or user-supplied `Hash` impl to panic mid-update
+/// and leave the map inconsistent, so there is no invariant recovering
+/// could violate here — only a handle-freeing path that would otherwise
+/// break for the rest of the process over a poisoning that can't happen.
+fn live_handles() -> MutexGuard<'static, HashMap<usize, HandleType>> {
     LIVE_HANDLES
         .lock()
-        .map(|live| live.contains(&(raw as usize)))
-        .unwrap_or(false)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Returns the `HandleType` recorded for `raw` if it currently refers to a
+/// live handle (allocated via `handle_to_raw`, not yet freed via
+/// `free_handle`), or `None` otherwise.
+///
+/// Safe to call on any pointer value, including one never allocated or
+/// already freed, whose memory may be deallocated or reused: this never
+/// dereferences `raw`, so callers can use it to decide whether
+/// dereferencing is safe — and as what type — in the first place.
+pub(crate) fn live_type(raw: *mut c_void) -> Option<HandleType> {
+    live_handles().get(&(raw as usize)).copied()
+}
+
+/// Returns whether `raw` currently refers to a live handle of any type.
+/// Only used by tests today — production call sites need the type check
+/// `live_type` itself provides, so they match on it directly.
+#[cfg(test)]
+pub(crate) fn is_live(raw: *mut c_void) -> bool {
+    live_type(raw).is_some()
 }
 
 /// Converts a heap-allocated handle into an opaque `*mut c_void` for return through FFI.
-/// Ownership transfers to the caller (ODBC Driver Manager).
-pub(crate) fn handle_to_raw<T>(handle: Box<T>) -> *mut c_void {
+/// Ownership transfers to the caller (ODBC Driver Manager). Records the
+/// handle's `HandleType` in `LIVE_HANDLES` before it does, so `live_type`
+/// can answer for it later without a dereference.
+pub(crate) fn handle_to_raw<T: HasObjectType>(mut handle: Box<T>) -> *mut c_void {
+    let object_type = *handle.object_type_mut();
     let raw = Box::into_raw(handle) as *mut c_void;
-    if let Ok(mut live) = LIVE_HANDLES.lock() {
-        live.insert(raw as usize);
-    }
+    live_handles().insert(raw as usize, object_type);
     raw
 }
 
@@ -158,9 +158,7 @@ pub(crate) unsafe fn handle_from_raw_mut<'a, T>(raw: *mut c_void) -> &'a mut T {
 /// Must only be called once per handle. The pointer is invalid after this call.
 pub(crate) unsafe fn free_handle<T: HasObjectType>(raw: *mut c_void) {
     if !raw.is_null() {
-        if let Ok(mut live) = LIVE_HANDLES.lock() {
-            live.remove(&(raw as usize));
-        }
+        live_handles().remove(&(raw as usize));
         let handle = unsafe { &mut *(raw as *mut T) };
         let object_type = *handle.object_type_mut();
         debug!(?raw, ?object_type, "Freeing handle");
@@ -196,6 +194,35 @@ mod tests {
         );
     }
 
+    /// A poisoned `LIVE_HANDLES` mutex must not permanently blind the
+    /// registry: `live_handles()` recovers the guard instead of treating
+    /// poison as fatal, since its critical sections are a single `HashMap`
+    /// op each with no invariant a panic mid-update could leave broken.
+    /// Poisons the lock directly (panicking while holding it, without
+    /// mutating the map), then confirms handle tracking still works
+    /// normally afterward rather than silently going blind for the rest of
+    /// the process.
+    #[test]
+    fn live_handles_registry_recovers_from_a_poisoned_lock() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = LIVE_HANDLES.lock().unwrap();
+            panic!("poison the live-handles registry lock");
+        });
+
+        let env = EnvHandle::new().expect("failed to create EnvHandle for test");
+        let raw = handle_to_raw(Box::new(env));
+        assert!(
+            is_live(raw),
+            "a poisoned registry must recover and keep tracking new handles"
+        );
+
+        unsafe { free_handle::<EnvHandle>(raw) };
+        assert!(
+            !is_live(raw),
+            "a poisoned registry must recover and still untrack freed handles"
+        );
+    }
+
     /// `is_live` must never dereference its argument: a pointer value that
     /// was never handed out by `handle_to_raw` at all (as opposed to one that
     /// was handed out and later freed) is exactly the kind of garbage input
@@ -207,18 +234,19 @@ mod tests {
     }
 
     /// Documents the registry's known ABA gap (see the doc comment on
-    /// `LIVE_HANDLES`): it tracks addresses, not allocation identity, so it
-    /// cannot tell an original allocation apart from an unrelated later one
-    /// that the allocator happens to place at the same now-freed address.
+    /// `LIVE_HANDLES`): tracking `HandleType` closes type confusion, but not
+    /// address reuse — it still cannot tell an original allocation apart
+    /// from an unrelated, *same-typed* later one that the allocator places
+    /// at the same now-freed address.
     ///
     /// Real OS-level address reuse can't be forced portably or
     /// deterministically from a test, so this demonstrates the exact
-    /// consequence directly against the registry: free a handle, insert a
-    /// *different* handle's address into the registry at the same value
-    /// (standing in for the allocator reusing that address), and show
-    /// `is_live` reports the stale original as live again purely because the
-    /// address matches — not because the original allocation is in any way
-    /// still valid.
+    /// consequence directly against the registry: free a handle, then
+    /// insert its address back under the same type (standing in for the
+    /// allocator reusing that address for a new, unrelated allocation of
+    /// the same type), and show `live_type` reports the stale original as
+    /// live and correctly-typed again — not because the original
+    /// allocation is in any way still valid.
     #[test]
     fn is_live_cannot_distinguish_a_reused_address_from_the_original_allocation() {
         let original = EnvHandle::new().expect("failed to create EnvHandle for test");
@@ -228,18 +256,23 @@ mod tests {
         assert!(!is_live(raw), "freed handle must not be reported live");
 
         // Stand in for the allocator handing the same address back out for
-        // an unrelated new allocation, without going through
-        // `handle_to_raw` (there is no portable way to force the real
-        // allocator to reuse this exact address deterministically).
-        LIVE_HANDLES
-            .lock()
-            .expect("registry mutex should not be poisoned in this test")
-            .insert(raw as usize);
+        // an unrelated new allocation of the same type, without going
+        // through `handle_to_raw` (there is no portable way to force the
+        // real allocator to reuse this exact address deterministically).
+        live_handles().insert(raw as usize, HandleType::Env);
 
-        assert!(
-            is_live(raw),
-            "registry cannot distinguish a reused address from the stale original: \
+        assert_eq!(
+            live_type(raw),
+            Some(HandleType::Env),
+            "registry cannot distinguish a reused address from the stale original, \
+             even with type tracking, once the new allocation shares the same type: \
              this is the documented ABA limitation, not a passing safety check"
         );
+
+        // Clean up: this test shares `LIVE_HANDLES` with every other test in
+        // the process under plain `cargo test` (not `cargo nextest`, which
+        // gives each test its own process), so leaving `raw` behind would
+        // seed a phantom-live address into state other tests read.
+        live_handles().remove(&(raw as usize));
     }
 }

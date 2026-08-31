@@ -14,7 +14,8 @@ use crate::api::sqlstate::{ERR_INVALID_USE_OF_AUTO_DESC, SQLSTATE_HY000, post_di
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{
-    DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw, is_live,
+    DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw,
+    live_type,
 };
 use mssql_tds::connection::tds_client::StatementId;
 
@@ -157,17 +158,30 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
 /// cleanup (`sql_disconnect_safe`), returns `SQL_SUCCESS` immediately without
 /// dereferencing it — that cleanup happens behind the Driver Manager's back,
 /// so an application legitimately holding this now-stale handle can still
-/// reach here (mssql-rs#400). If the STMT is somehow not found in the parent
-/// DBC's statement list despite still being live, it was already dropped by
-/// some other path — also returns `SQL_SUCCESS` without calling `free_handle`
-/// a second time.
+/// reach here (mssql-rs#400). Returns `SQL_INVALID_HANDLE`, per spec, if the
+/// handle is live but of some other type. If the STMT is live and correctly
+/// typed but somehow missing from its parent DBC's statement list — an
+/// invariant break rather than an expected path, since "already freed" is
+/// caught above — logs it and still returns `SQL_SUCCESS` rather than
+/// double-freeing or panicking.
 ///
 /// # Safety
 /// `handle` must be a live `StmtHandle` created by `alloc_stmt`.
 unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
-    if !is_live(handle) {
-        debug!(?handle, "SQLFreeHandle(STMT): handle already freed, no-op");
-        return SQL_SUCCESS;
+    match live_type(handle) {
+        None => {
+            debug!(?handle, "SQLFreeHandle(STMT): handle already freed, no-op");
+            return SQL_SUCCESS;
+        }
+        Some(HandleType::Stmt) => {}
+        Some(actual) => {
+            error!(
+                ?handle,
+                ?actual,
+                "SQLFreeHandle(STMT): handle is live but not a STMT"
+            );
+            return SQL_INVALID_HANDLE;
+        }
     }
 
     let stmt = unsafe { handle_from_raw::<StmtHandle>(handle) };
@@ -203,7 +217,14 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
             return SQL_ERROR;
         };
         let Some(i) = dbc_state.statements.iter().position(|&p| p == handle) else {
-            // Already dropped by SQLDisconnect - early return.
+            // Live but untracked: not the post-SQLDisconnect case (caught by
+            // `live_type` above), so something removed it from the parent
+            // without freeing it — an invariant break, not an expected path.
+            error!(
+                ?handle,
+                "SQLFreeHandle(STMT): live handle missing from parent DBC"
+            );
+            debug_assert!(false, "live STMT not tracked by its parent DBC");
             return SQL_SUCCESS;
         };
         dbc_state.statements.swap_remove(i);
@@ -226,17 +247,30 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
 /// If the handle was already freed by an earlier `SQLDisconnect` cascading
 /// cleanup (`sql_disconnect_safe`), returns `SQL_SUCCESS` immediately without
 /// dereferencing it — mirrors `free_stmt`'s identical guard and the same
-/// reasoning (mssql-rs#400). If the descriptor is somehow not found in the
-/// parent DBC's descriptor list despite still being live, it was already
-/// dropped by some other path — also returns `SQL_SUCCESS` without calling
-/// `free_handle` a second time.
+/// reasoning (mssql-rs#400). Returns `SQL_INVALID_HANDLE`, per spec, if the
+/// handle is live but of some other type. If the descriptor is live and
+/// correctly typed but somehow missing from its parent DBC's descriptor
+/// list — an invariant break rather than an expected path, since "already
+/// freed" is caught above — logs it and still returns `SQL_SUCCESS` rather
+/// than double-freeing or panicking.
 ///
 /// # Safety
 /// `handle` must be a live `DescHandle` created by `alloc_desc`.
 unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
-    if !is_live(handle) {
-        debug!(?handle, "SQLFreeHandle(DESC): handle already freed, no-op");
-        return SQL_SUCCESS;
+    match live_type(handle) {
+        None => {
+            debug!(?handle, "SQLFreeHandle(DESC): handle already freed, no-op");
+            return SQL_SUCCESS;
+        }
+        Some(HandleType::Desc) => {}
+        Some(actual) => {
+            error!(
+                ?handle,
+                ?actual,
+                "SQLFreeHandle(DESC): handle is live but not a DESC"
+            );
+            return SQL_INVALID_HANDLE;
+        }
     }
 
     let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
@@ -271,7 +305,14 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
     };
 
     let Some(i) = dbc_state.descriptors.iter().position(|&p| p == handle) else {
-        // Already dropped by SQLDisconnect - early return.
+        // Live but untracked: not the post-SQLDisconnect case (caught by
+        // `live_type` above), so something removed it from the parent
+        // without freeing it — an invariant break, not an expected path.
+        error!(
+            ?handle,
+            "SQLFreeHandle(DESC): live handle missing from parent DBC"
+        );
+        debug_assert!(false, "live DESC not tracked by its parent DBC");
         return SQL_SUCCESS;
     };
 
@@ -559,6 +600,43 @@ mod tests {
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
+    /// `SQLFreeHandle` dispatches on the caller-supplied `handle_type` with
+    /// no cross-check against the handle it's actually given. Before
+    /// tracking `HandleType` in the live-handle registry, `is_live` only
+    /// confirmed *some* handle was live at this address — so passing a live
+    /// DESC where a STMT was expected still reached
+    /// `handle_from_raw::<StmtHandle>` and reinterpreted a `DescHandle` as a
+    /// `StmtHandle`, no address reuse required. Checking the type recorded
+    /// at allocation time catches this before any dereference, matching the
+    /// ODBC spec's own answer: `SQL_INVALID_HANDLE` for "the handle
+    /// indicated by *Handle* was not a valid handle of the type indicated
+    /// by *HandleType*."
+    #[test]
+    fn free_stmt_on_a_live_desc_handle_returns_invalid_handle() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let mut desc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DESC, dbc, &mut desc) },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_STMT, desc) },
+            SQL_INVALID_HANDLE,
+            "a live DESC handle passed as a STMT must be rejected, not reinterpreted"
+        );
+
+        // The DESC itself is untouched by the rejected call and still frees
+        // normally as what it actually is.
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) },
+            SQL_SUCCESS
+        );
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
     /// Freeing a statement mid data-at-execution must drain the parked
     /// sequence rather than drop the handle with it intact. A dropped
     /// `DaeState` takes the connection's client with it, leaving the DBC with
@@ -687,6 +765,33 @@ mod tests {
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
+    /// Mirror of `free_stmt_on_a_live_desc_handle_returns_invalid_handle`
+    /// through `free_desc`'s own type check: a live STMT passed where a DESC
+    /// was expected must be rejected, not reinterpreted as a `DescHandle`.
+    #[test]
+    fn free_desc_on_a_live_stmt_handle_returns_invalid_handle() {
+        let (env, dbc) = alloc_env_dbc_connected();
+
+        let mut stmt: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_DESC, stmt) },
+            SQL_INVALID_HANDLE,
+            "a live STMT handle passed as a DESC must be rejected, not reinterpreted"
+        );
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) },
+            SQL_SUCCESS
+        );
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
     #[test]
     fn free_desc_unregisters_from_parent_dbc() {
         let (env, dbc) = alloc_env_dbc_connected();
@@ -706,23 +811,17 @@ mod tests {
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
-    /// Reproduces the double-free the AB#47436 review identified: after
-    /// `SQLDisconnect` has already freed every outstanding explicit
-    /// descriptor (`sql_disconnect_safe`), an application retrying
-    /// `SQLFreeHandle` on the same, now-stale handle must get `SQL_SUCCESS`
-    /// without freeing anything a second time — mirrors `free_stmt`'s
-    /// identical "already dropped by SQLDisconnect" guard.
-    ///
-    /// Simulates "already removed" by taking the descriptor out of
-    /// `dbc_state.descriptors` directly, without freeing its box, so the
-    /// test itself never dereferences already-freed memory. (That residual
-    /// risk — reading `desc.object_type`/`is_explicit()` before this guard is
-    /// reached, if the box itself were already dropped — is the same one
-    /// `free_stmt` already accepts and is unaffected by this fix; it's
-    /// tracked by the crate's existing refcounted-handle-lifetimes TODO in
-    /// `disconnect.rs`, not something this test exercises.)
+    /// `free_desc`'s "live but untracked by parent" branch documents a
+    /// genuine invariant, not an expected path: once the `live_type` guard
+    /// above already catches the ordinary "freed by `SQLDisconnect`'s
+    /// cascade" case (mssql-rs#400), reaching here while still live and
+    /// correctly typed means something else removed the descriptor from
+    /// `dbc_state.descriptors` without freeing it. No public API can reach
+    /// that state (it would need a panic between `swap_remove` and
+    /// `free_handle`, which `ffi_entry!` swallows), so this test forces it
+    /// directly to exercise the `debug_assert!` that documents it.
     #[test]
-    fn free_desc_already_removed_from_parent_is_a_no_op() {
+    fn free_desc_live_but_untracked_by_parent_fails_in_debug() {
         let (env, dbc) = alloc_env_dbc_connected();
 
         let mut desc: SqlHandle = ptr::null_mut();
@@ -731,17 +830,23 @@ mod tests {
             SQL_SUCCESS
         );
 
-        // Simulate SQLDisconnect having already unregistered (but not yet
-        // dropped) the descriptor.
         let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
         dbc_ref.inner.lock().unwrap().descriptors.clear();
 
         let ret = unsafe { sql_free_handle(SQL_HANDLE_DESC, desc) };
-        assert_eq!(ret, SQL_SUCCESS);
-
-        // The guard above stopped `free_desc` from dropping the box, so this
-        // test must clean it up itself to avoid leaking.
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                ret, SQL_ERROR,
+                "debug_assert! must fire for a live-but-untracked descriptor"
+            );
+        } else {
+            assert_eq!(ret, SQL_SUCCESS);
+        }
+        // Neither branch drops the box: the debug build panics before
+        // reaching any drop code, and the release build's early return
+        // skips it too — same cleanup either way.
         unsafe { free_handle::<DescHandle>(desc) };
+
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
