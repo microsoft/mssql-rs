@@ -1619,9 +1619,6 @@ impl TdsClient {
             // The prefix runs every materialized parameter through the same
             // checks as the non-streamed sites, so this is retractable rather
             // than a reason to discard the connection.
-            // Not redundant: this function has no entry guard against an already
-            // active stream, and the retraction does not touch the field.
-            self.streamed_write_state = StreamedWriteState::Idle;
             self.retract_partial_request(message).await;
             return Err(error);
         }
@@ -1890,9 +1887,15 @@ impl TdsClient {
             // acknowledgement is already being tracked. Re-arming would send it
             // twice.
             drop(message);
-            let _ = self
+            // `send_attention_and_wait` logs its own timeouts, but the write
+            // failure path returns without logging - and that is the one that
+            // costs a connection.
+            if let Err(error) = self
                 .send_attention_with_timeout(Duration::from_secs(ATTENTION_TIMEOUT_SECONDS))
-                .await;
+                .await
+            {
+                warn!(%error, "Failed to cancel a fully sent request");
+            }
             self.execution_context.set_has_open_batch(false);
             return;
         }
