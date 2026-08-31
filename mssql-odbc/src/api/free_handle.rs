@@ -56,11 +56,27 @@ pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle
 ///
 /// No mutex is acquired - per the ODBC spec, the DM guarantees the
 /// connection count on this ENV is 0 before calling `SQLFreeEnv`. DM also
-/// ensures no concurrent SQLFreeHandle calls on the same handle.
+/// ensures no concurrent SQLFreeHandle calls on the same handle. Returns
+/// `SQL_INVALID_HANDLE`, per spec, if the handle is live but of some other
+/// type — matches `free_stmt`/`free_desc`'s identical check; unlike those
+/// two, an ENV is never cascade-freed behind the DM's back, so there is no
+/// legitimate stale-handle case here to distinguish from "wrong type."
 ///
 /// # Safety
 /// `handle` must be a live `EnvHandle` created by `alloc_env`.
 unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
+    match live_type(handle) {
+        Some(HandleType::Env) => {}
+        other => {
+            error!(
+                ?handle,
+                ?other,
+                "SQLFreeHandle(ENV): handle is not a live ENV"
+            );
+            return SQL_INVALID_HANDLE;
+        }
+    }
+
     let env = unsafe { handle_from_raw::<EnvHandle>(handle) };
     debug_assert_eq!(
         env.object_type,
@@ -90,11 +106,27 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
 /// before calling `SQLFreeConnect`, and `SQLDisconnect` drops all child
 /// handles (statements, and their implicit descriptors, plus any explicit
 /// descriptors — `sql_disconnect_safe`). msodbcsql's `SQLFreeConnect` doesn't
-/// lock the connection mutex either.
+/// lock the connection mutex either. Returns `SQL_INVALID_HANDLE`, per spec,
+/// if the handle is live but of some other type — matches `free_stmt`/
+/// `free_desc`'s identical check; unlike those two, a DBC is never
+/// cascade-freed behind the DM's back, so there is no legitimate
+/// stale-handle case here to distinguish from "wrong type."
 ///
 /// # Safety
 /// `handle` must be a live `DbcHandle` created by `alloc_dbc`.
 unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
+    match live_type(handle) {
+        Some(HandleType::Dbc) => {}
+        other => {
+            error!(
+                ?handle,
+                ?other,
+                "SQLFreeHandle(DBC): handle is not a live DBC"
+            );
+            return SQL_INVALID_HANDLE;
+        }
+    }
+
     let dbc = unsafe { handle_from_raw::<DbcHandle>(handle) };
     debug_assert_eq!(
         dbc.object_type,
@@ -280,14 +312,24 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         "SQLFreeHandle(DESC): handle is not a DESC"
     );
 
+    // Checked unconditionally, before taking any lock: `is_explicit` reads
+    // only `alloc_type`, set once at construction and never mutated, so this
+    // rejection cannot depend on whether `desc.inner`'s lock is healthy.
+    // Nesting it inside the lock below used to mean a poisoned mutex skipped
+    // this check entirely — silently letting an implicit descriptor (never
+    // registered in `dbc_state.descriptors`, by design) fall through to the
+    // "live handle missing from parent DBC" branch further down, which is
+    // meant to catch a genuine invariant break, not this legitimate case.
+    if !desc.is_explicit() {
+        error!("SQLFreeHandle(DESC): cannot free an implicitly allocated descriptor");
+        if let Ok(mut state) = desc.inner.lock() {
+            post_diag(&mut state, ERR_INVALID_USE_OF_AUTO_DESC);
+        }
+        return SQL_ERROR;
+    }
+
     if let Ok(mut state) = desc.inner.lock() {
         free_errors(&mut state);
-
-        if !desc.is_explicit() {
-            error!("SQLFreeHandle(DESC): cannot free an implicitly allocated descriptor");
-            post_diag(&mut state, ERR_INVALID_USE_OF_AUTO_DESC);
-            return SQL_ERROR;
-        }
     }
 
     let dbc = unsafe { handle_from_raw::<DbcHandle>(desc.parent_dbc) };
@@ -478,6 +520,55 @@ mod tests {
 
         let ret = unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
         assert_eq!(ret, SQL_SUCCESS);
+    }
+
+    /// The type-confusion fix for `free_stmt`/`free_desc` (`live_type`
+    /// checked before any dereference) has an ENV/DBC counterpart: without
+    /// it, `SQLFreeHandle(SQL_HANDLE_ENV, <live DBC>)` would reach
+    /// `handle_from_raw::<EnvHandle>` and reinterpret a `DbcHandle` as an
+    /// `EnvHandle` — `debug_assert_eq!` on `object_type` can't catch this
+    /// either, since it reads through the already-wrongly-typed reference,
+    /// and `EnvHandle`/`DbcHandle` are neither `#[repr(C)]` nor the same
+    /// size. `free_env` now checks `live_type` first, matching `free_stmt`/
+    /// `free_desc`.
+    #[test]
+    fn free_env_on_a_live_dbc_handle_returns_invalid_handle() {
+        let env = alloc_env();
+
+        let mut dbc: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_DBC, env, &mut dbc) },
+            SQL_SUCCESS
+        );
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_ENV, dbc) },
+            SQL_INVALID_HANDLE,
+            "a live DBC handle passed as an ENV must be rejected, not reinterpreted"
+        );
+
+        // The DBC itself is untouched by the rejected call and still frees
+        // normally as what it actually is.
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    /// Mirror of `free_env_on_a_live_dbc_handle_returns_invalid_handle`
+    /// through `free_dbc`'s own type check: a live ENV passed where a DBC
+    /// was expected must be rejected, not reinterpreted as a `DbcHandle`.
+    #[test]
+    fn free_dbc_on_a_live_env_handle_returns_invalid_handle() {
+        let env = alloc_env();
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_DBC, env) },
+            SQL_INVALID_HANDLE,
+            "a live ENV handle passed as a DBC must be rejected, not reinterpreted"
+        );
+
+        // The ENV itself is untouched by the rejected call and still frees
+        // normally as what it actually is.
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
     #[test]
@@ -936,6 +1027,60 @@ mod tests {
 
         // The ARD is untouched: the statement (and its implicit descriptors)
         // still free normally.
+        unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
+        unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    /// Regression test: `free_implicit_desc_is_rejected` above only exercises
+    /// the healthy-lock path. `is_explicit()` used to be checked *inside*
+    /// `if let Ok(mut state) = desc.inner.lock()`, so a poisoned descriptor
+    /// mutex skipped the whole block — including the HY017 rejection — and
+    /// let an implicit descriptor (never registered in
+    /// `dbc_state.descriptors`, by design) fall through all the way to the
+    /// "live handle missing from parent DBC" branch, incorrectly firing that
+    /// branch's `debug_assert!` in debug builds and silently returning
+    /// `SQL_SUCCESS` for an unfreed, unfreeable handle in release builds.
+    /// `is_explicit()` reads only `alloc_type`, set once at construction and
+    /// never mutated, so the rejection must not depend on lock health at all.
+    ///
+    /// Calls `free_desc` directly rather than through `sql_free_handle`:
+    /// the latter's `ffi_entry!` catches any panic and converts it to the
+    /// same `SQL_ERROR` a correct HY017 rejection also returns, so a return
+    /// code alone can't tell "rejected properly" apart from "panicked on the
+    /// wrongly-firing `debug_assert!`, then caught." Catching the panic here
+    /// instead keeps that distinction visible.
+    #[test]
+    fn free_implicit_desc_is_rejected_even_with_a_poisoned_mutex() {
+        let (env, dbc) = alloc_env_dbc();
+        let mut stmt: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
+            SQL_SUCCESS
+        );
+        let ard = unsafe { &*(stmt as *const StmtHandle) }.ard;
+
+        let ard_ref = unsafe { handle_from_raw::<DescHandle>(ard) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ard_ref.inner.lock().unwrap();
+            panic!("poison the ard lock");
+        }));
+
+        match std::panic::catch_unwind(|| unsafe { free_desc(ard) }) {
+            Ok(ret) => assert_eq!(
+                ret, SQL_ERROR,
+                "an implicit descriptor must be rejected regardless of its own lock's health"
+            ),
+            Err(_) => panic!(
+                "free_desc must reject an implicit descriptor via HY017, not panic on a \
+                 debug_assert! that only fires because its own lock happens to be poisoned"
+            ),
+        }
+
+        // The ARD is untouched: the statement (and its implicit descriptors)
+        // still free normally, poisoned lock and all — matches
+        // `free_stmt`/`free_desc`'s existing tolerance for their own
+        // handle's lock elsewhere in this module.
         unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) };
         unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) };
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
