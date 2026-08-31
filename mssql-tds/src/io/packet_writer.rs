@@ -1653,6 +1653,31 @@ pub(crate) mod tests {
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
     }
 
+    /// The budget is checked after the write, so `finalize`'s terminating packet
+    /// is on the wire before it can fail. Such a message needs cancelling, not
+    /// withdrawing: a second `EOM | IGNORE` would leave the server owing two
+    /// responses and the extra DONE for the next command.
+    #[test]
+    fn a_finalized_message_that_times_out_is_still_complete() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        block_on(writer.write_async(&[0xABu8; 4])).unwrap();
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+
+        let result = block_on(writer.finalize());
+        let message = writer.suspend();
+
+        assert!(result.is_err(), "the overrun budget must surface an error");
+        assert!(
+            mock.data[1] & (PacketStatusFlags::Eom as u8) != 0,
+            "the terminating packet reached the wire"
+        );
+        assert!(
+            message.message_complete(),
+            "a terminated message must not be withdrawn as if it were partial"
+        );
+    }
+
     /// The write budget is checked *after* the packet lands, so this error path
     /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
     /// the flushed flag can tell the caller the server is mid-message, and

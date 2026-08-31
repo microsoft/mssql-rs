@@ -899,7 +899,6 @@ TEST_F(CharConversionLiveTest, UnmappableCharacterIsSilentlyCorrupted) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-
 // ---------------------------------------------------------------------------
 // A value rejected after a packet has flushed leaves the server holding an
 // incomplete message. Unless it is withdrawn (EOM | IGNORE, then its DONE
