@@ -365,25 +365,111 @@ held constant), store results across builds, and watch for drift — catching sl
 from dependency/toolchain changes that the isolated mode hides. Three modes in total:
 (1) existing PR-vs-target, (2) new isolated pinned-commit baseline, (3) trend of main.
 
-### Future: perf testing mssql-odbc (Rust ODBC driver)
+### mssql-odbc end-to-end benchmarks
 
-Criterion benchmarks Rust functions compiled into the same test binary (in-process,
-Rust-native). The future `mssql-odbc` will be a `cdylib` exposing the C ABI
-(`SQLConnect`, `SQLExecDirect`, `SQLFetch`, …), normally consumed through an ODBC Driver
-Manager (unixODBC / Windows DM). The representative path is *through the driver manager*,
-the way a real ODBC app uses it.
+[`mssql-odbc-bench`](../mssql-odbc-bench) is a fixed C++ harness that calls the
+ODBC C API through the platform Driver Manager, matching the path a real
+application uses. Google Benchmark supplies cross-platform wall-clock sampling
+and JSON output; the workload itself uses raw ODBC calls, so the same executable
+can run unchanged against the candidate driver, a pinned Rust baseline, or
+`msodbcsql`.
 
-A Rust bench *could* load the driver via FFI (e.g., `odbc-api`) with Criterion as the
-timing engine, but that loses cross-driver comparability and doesn't measure the real
-consumer path. The cross-driver spec already prescribes a **C/C++ ODBC harness**
-(`QueryPerformanceCounter` / `clock_gettime`) for ODBC. Sharing that harness with
-`msodbcsql` enables an apples-to-apples **Rust mssql-odbc vs native msodbcsql** comparison.
+The ODBC comparison swaps the complete `mssql-odbc` shared library, including
+its statically linked `mssql-tds`, while holding the harness and database
+workload constant. That answers whether the shipped driver artifact regressed.
+The source-isolated Criterion harness above remains the tool for attributing a
+change specifically to `mssql-tds`.
 
-This points to a layered strategy:
+The initial ODBC baseline is the production `main` commit on which this harness
+was introduced. Because the benchmark PR changes no production driver files,
+candidate and baseline begin with identical `mssql-odbc`/`mssql-tds` trees; only
+the candidate supplies the new harness and pipeline. Future baseline advances
+are explicit, reviewed edits to `baseline-commit.txt`.
+
+Dedicated Linux and Windows PerfTest pipelines run five repetitions of each
+workload against the pinned `mssql-odbc` commit, Microsoft ODBC Driver 18.6.2.1,
+and the candidate. Their uploaded `summary.md` leads with the gate verdict and
+three median complete-result wall times, followed by separate colored
+diverging-bar tables for candidate vs Rust baseline and candidate vs Microsoft
+ODBC. The bars use about five percentage points per square (capped at 20), while
+each row retains the exact lower/higher wall-time percentage and speedup factor.
+Only candidate vs the pinned Rust baseline can fail the gate; Microsoft is an
+informational reference. The scripts also echo the report to the step log and
+retain raw JSON, context, and comparison artifacts.
+
+The workload catalog is shaped by what `mssql-python` actually does to the
+driver, not by what is convenient to write:
+
+- **Bound rowsets at 1, 64, and 1000.** `Cursor.arraysize` defaults to 1, so an
+  unconfigured `fetchmany()` binds a one-row rowset; `fetchall()` caps its
+  computed batch at 1000. A round 1024 is a size no consumer asks for.
+- **A bind/fetch/unbind lifecycle workload.** `fetchmany()` does not bind once
+  and drain — every call re-describes, rebinds, sets the row-array size, fetches
+  one rowset, resets the size, and unbinds. Paired against the plain bound
+  workload on the same table and cadence, it isolates that per-call cost.
+- **Row-at-a-time `SQLGetData`.** One LOB or `sql_variant` column moves the
+  *whole* result off the bound path, so there are four such workloads: ordinary
+  inline values, `MAX` text past one 8192-byte chunk (three calls total, including
+  two continuation calls, per non-NULL value), a small `MAX` column dragging fifteen fixed columns with it, and
+  the `sql_variant` probe → `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` → typed
+  read sequence.
+- **Nullable inline variable width, separate from MAX/PLP.** They are different
+  driver paths — one fills a bound buffer, the other streams — so they are
+  measured separately. `VARBINARY` is deliberately absent: binary delivery is
+  still unimplemented in `mssql-odbc` (AB#47239), so including it would fail two
+  legs and pass the third.
+
+Every workload is a C++ call into the driver through the ODBC Driver Manager.
+`mssql-python` is a workload-shape reference only — the source of the rowset
+sizes, the bind/unbind cadence, and the `SQLGetData` sequences. Its own
+performance, including Arrow conversion, is out of scope, and no Python package
+is loaded inside a measurement. That keeps a change attributable to the driver
+without an interpreter, a pybind11 layer, and an Arrow builder in the path.
+
+The gate uses the same 5% threshold and the same auto-confirm contract as the
+fixed-baseline `mssql-tds` runner. The initial five-sample median only screens:
+it selects the candidate-vs-baseline regressions and up to three of the largest
+apparent improvements, which are then re-measured with the candidate and the
+pinned baseline back-to-back for four confirmation rounds, alternating which
+driver runs first. A result counts only when it reproduces in at least three of
+those four rounds, and the headline change is the median of the four confirmation
+ratios — the initial pass that triggered the re-measurement is excluded so the
+outlier under test does not vote on its own verdict. Regression-direction hits
+are counted independently, so an apparent improvement that reverses into a
+3-of-4 regression still fails the run by default. Confirmation re-measures whole
+scenarios rather than single benchmarks, so a flagged id costs one paired re-run
+of its own leg per round.
+
+The pairwise math is Google Benchmark's own `tools/compare.py` and
+`gbench.report` from the pinned v1.9.1 checkout in the CMake build tree, run once
+per comparison pair with its text and JSON output retained.
+`compare-odbc-benchmarks.py` stays a thin wrapper for the repo-specific policy:
+exact benchmark-set validation, the combined three-way report, custom counters
+and pins, the gate, the confirmation overrides, and the Azure DevOps Markdown.
+The Mann-Whitney U test is disabled explicitly because five repetitions are well
+below the nine that Google Benchmark documents as meaningful for it; the
+confirmation rounds establish reproduction instead. Its policy is covered offline
+by `.pipeline/scripts/test_compare_odbc_benchmarks.py`, which drives the whole
+workload catalog through synthetic legs: three-way and legacy two-way reports,
+mismatched benchmark sets, confirmed and unconfirmed regressions, an apparent
+improvement that reverses, and the plan/ratio outputs the runners consume.
+
+Both runners apply the same noise controls as the `mssql-tds` lab: a SQL Server
+configuration snapshot from the shared `sql-config-dump.sql`, CPU
+frequency/utilization telemetry bracketing the initial pass and every
+confirmation round, optional client CPU pinning, and platform-specific
+large-buffer tuning (glibc mmap/trim thresholds on Linux; debug-heap opt-out,
+priority class, and power scheme on Windows, all restored afterwards).
+Connection-churn network tuning is deliberately not applied: this harness opens
+one connection and reuses it for every measured retrieval, so there is no
+ephemeral-port or TIME_WAIT pressure to relieve.
+
+The resulting layered strategy is:
 
 - **Layer 1 — mssql-tds (Rust lib):** Criterion component/micro benchmarks → attributes
   protocol/codec/parsing regressions to source. *(This plan.)*
-- **Layer 2 — mssql-odbc (cdylib via ODBC DM):** end-to-end benchmarks via the C/C++ ODBC
-  harness shared with msodbcsql → Rust-vs-native ODBC comparison. *(Future.)*
+- **Layer 2 — mssql-odbc (cdylib via ODBC DM):** end-to-end result-fetch
+  benchmarks via the fixed C++ harness → candidate/baseline driver comparison
+  and informational Rust-vs-native ODBC comparison.
 - **Cross-cutting — longitudinal trend of main:** catches dependency/toolchain drift that
   Layer 1's isolation hides.
