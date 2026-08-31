@@ -432,7 +432,7 @@ function Write-ParityReport([string]$RustXml, [string]$MsXml) {
 # distinct gtest processes and ctest retries never clobber each other's .profraw).
 # PowerShell has no `eval`, so parse each KEY=VALUE line (stripping surrounding
 # quotes) into the process env. The subsequent `cargo build` then produces an
-# instrumented mssql-odbc.dll, and every ctest child process inherits
+# instrumented mssqlodbc.dll, and every ctest child process inherits
 # LLVM_PROFILE_FILE from this environment. The llvm-cov target dir is also
 # exported so the later `cargo metadata` resolves the INSTRUMENTED DLL.
 function Enable-CoverageInstrumentation {
@@ -488,7 +488,7 @@ function New-CoverageReport([string]$OutputPath) {
     }
     Push-Location $WorkspaceDir
     try {
-        cargo llvm-cov report --package mssql-tds --package mssql-odbc `
+        cargo llvm-cov report --package mssql-tds --package mssqlodbc `
             --cobertura --output-path $OutputPath
         if ($LASTEXITCODE -eq 0) {
             Write-Host "Coverage report written to $OutputPath"
@@ -604,7 +604,7 @@ try {
         Pop-Location
     }
 
-    $DriverPath = & (Join-Path $OdbcCrateDir "scripts\finalize-artifact.ps1") -Profile $BuildType
+    $DriverPath = & (Join-Path $OdbcCrateDir "scripts\finalize-artifact.ps1") -BuildProfile $BuildType
     Write-Host "Rust driver: $DriverPath"
 
     if ($Coverage) {

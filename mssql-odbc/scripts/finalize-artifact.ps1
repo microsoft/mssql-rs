@@ -3,7 +3,7 @@
 
 param(
     [ValidateSet("debug", "release")]
-    [string]$Profile = "debug"
+    [string]$BuildProfile = "debug"
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,11 +19,11 @@ try {
     Pop-Location
 }
 
-$SourcePath = Join-Path $Metadata.target_directory "$Profile\mssqlodbc.dll"
-$ProductPath = Join-Path $Metadata.target_directory "$Profile\mssql-odbc.dll"
-if (-not (Test-Path $SourcePath -PathType Leaf)) {
-    throw "Cargo artifact not found at $SourcePath"
+# On Windows the Cargo cdylib output has no `lib` prefix, so it already carries
+# the shipped basename `mssqlodbc.dll`. No copy is needed; just resolve it.
+$ArtifactPath = Join-Path $Metadata.target_directory "$BuildProfile\mssqlodbc.dll"
+if (-not (Test-Path $ArtifactPath -PathType Leaf)) {
+    throw "Cargo artifact not found at $ArtifactPath"
 }
 
-Copy-Item -Force $SourcePath $ProductPath
-(Resolve-Path $ProductPath).Path
+(Resolve-Path $ArtifactPath).Path

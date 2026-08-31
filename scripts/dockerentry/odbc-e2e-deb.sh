@@ -6,7 +6,7 @@
 # (apt) containers. Installs only the RUNTIME dependencies needed to rerun the
 # prebuilt driver + ctest binaries (no compiler, no cargo): ctest (from cmake),
 # the unixODBC driver manager runtime, libssl, and the Kerberos runtime the
-# driver may link. The prebuilt build/ tree (with mssql-odbc.so staged
+# driver may link. The prebuilt build/ tree (with mssqlodbc.so staged
 # inside) is restored to mssql-odbc/tests/e2e/build by the calling template.
 #
 # Connection details arrive via ODBC_TEST_* env vars; ODBC_E2E_RETRIES controls

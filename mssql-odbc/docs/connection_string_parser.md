@@ -223,4 +223,4 @@ Exhaustive unit tests live in the `#[cfg(test)] mod tests` block of
 table above plus
 value validation, first-wins duplicates, whitespace fidelity, `}}` escaping,
 separator/empty-input edge cases, and the `S_OK` / `S_FALSE` / `E_FAIL` mapping.
-Run them with `cargo btest` (or `cargo nextest run -p mssql-odbc`).
+Run them with `cargo btest` (or `cargo nextest run -p mssqlodbc`).

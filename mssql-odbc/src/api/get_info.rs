@@ -268,19 +268,9 @@ fn write_wide_str(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn driver_name() -> &'static str {
-    "mssql-odbc.dll"
-}
-
-#[cfg(target_os = "linux")]
-fn driver_name() -> &'static str {
-    "mssql-odbc.so"
-}
-
-#[cfg(target_os = "macos")]
-fn driver_name() -> &'static str {
-    "mssql-odbc.dylib"
+    env!("MSSQL_ODBC_ARTIFACT")
 }
 
 #[cfg(test)]
@@ -383,11 +373,11 @@ mod tests {
     #[test]
     fn driver_name_writes_wide_string() {
         #[cfg(target_os = "windows")]
-        let expected = "mssql-odbc.dll";
+        let expected = "mssqlodbc.dll";
         #[cfg(target_os = "linux")]
-        let expected = "mssql-odbc.so";
+        let expected = "mssqlodbc.so";
         #[cfg(target_os = "macos")]
-        let expected = "mssql-odbc.dylib";
+        let expected = "mssqlodbc.dylib";
 
         assert_eq!(driver_name(), expected);
 

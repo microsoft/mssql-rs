@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Build just the mssql-odbc cdylib (mssql-odbc.so) inside the Linux build
+# Build just the mssql-odbc cdylib (mssqlodbc.so) inside the Linux build
 # container and stage it into a drop directory, for the job that swaps it in for
 # the driver mssql-python bundles (see swap-mssql-python-odbc-driver.sh).
 #
@@ -24,8 +24,8 @@ DROP_DIR="${ODBC_DROP_DIR:-/workspace/odbc-swap-drop}"
 rm -rf "$DROP_DIR"
 mkdir -p "$DROP_DIR"
 
-cargo build --release -p mssql-odbc
+cargo build --release -p mssqlodbc
 
-DRIVER_PATH="$(bash /workspace/mssql-odbc/scripts/finalize-artifact.sh release)"
+DRIVER_PATH="$(bash mssql-odbc/scripts/finalize-artifact.sh release)"
 cp "$DRIVER_PATH" "$DROP_DIR/"
 ls -la "$DROP_DIR"
