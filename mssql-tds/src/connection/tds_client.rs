@@ -1619,6 +1619,8 @@ impl TdsClient {
             // The prefix runs every materialized parameter through the same
             // checks as the non-streamed sites, so this is retractable rather
             // than a reason to discard the connection.
+            // Not redundant: this function has no entry guard against an already
+            // active stream, and the retraction does not touch the field.
             self.streamed_write_state = StreamedWriteState::Idle;
             self.retract_partial_request(message).await;
             return Err(error);
@@ -1851,13 +1853,13 @@ impl TdsClient {
         }
     }
 
-    /// Retracts a request whose serialization failed part-way, so the failure
-    /// costs the request rather than the connection.
+    /// Gives up a request whose serialization failed, so the failure costs the
+    /// request rather than the connection.
     ///
-    /// Without it the server holds a truncated message and answers 4002 on the
-    /// *next* command. Same handling as
-    /// [`cancel_streamed_write`](Self::cancel_streamed_write), for the ordinary
-    /// (non-data-at-execution) path.
+    /// How depends on how much of the message reached the server: nothing is
+    /// discarded locally, part is withdrawn with `EOM | IGNORE`, and all of it is
+    /// cancelled with an attention. Without this the server holds a truncated
+    /// message and answers 4002 on the *next* command.
     async fn retract_partial_request(&mut self, message: SuspendedMessage) {
         // Before anything that drains: a RETURNVALUE read with the capture still
         // armed would record a handle for a request that never ran.
@@ -1877,6 +1879,11 @@ impl TdsClient {
             // and leave its DONE for the next command. Cancel with an attention
             // instead, which is msodbcsql's `STATE_BATCH_CMDSENT` arm. The
             // transport marks itself dead if the attention goes unacknowledged.
+            //
+            // Bounded by `ATTENTION_TIMEOUT_SECONDS`, not `CANCEL_TIMEOUT`:
+            // msodbcsql passes its 120s cancel budget here too, but an ACK that
+            // has not arrived in 5s is not coming, and the bulk-load abort takes
+            // the same bound for the same reason.
             //
             // Dropped rather than abandoned: this message carried its reset bit
             // all the way out and `note_reset_dispatched` recorded it, so the
@@ -2203,7 +2210,6 @@ impl TdsClient {
             // connection for a failure that cost only the request.
             Err(e) => {
                 let message = packet_writer.suspend();
-                self.streamed_write_state = StreamedWriteState::Idle;
                 self.retract_partial_request(message).await;
                 Err(e)
             }
@@ -6705,7 +6711,11 @@ mod tests {
         async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
             self.attentions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(false)
+            // Acknowledged. `Ok(false)` would mean the ACK never came, and
+            // `send_attention_and_wait` retires the transport on every such
+            // outcome - a mock that returned it without doing so would let a test
+            // read a dead connection as a surviving one.
+            Ok(true)
         }
         fn is_connection_dead(&self) -> bool {
             self.closed
@@ -11685,6 +11695,10 @@ mod tests {
             sent.lock().unwrap().len(),
             sent_before,
             "no second message may be opened to withdraw the first"
+        );
+        assert!(
+            !client.transport.connection_known_dead(),
+            "an acknowledged attention leaves the connection reusable"
         );
     }
 
