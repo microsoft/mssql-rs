@@ -97,6 +97,16 @@ pub struct PacketWriter<'a> {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool, // Note: Cannot just use packet_id because its value can rollover.
+    /// Set the instant a packet reaches the network. Distinct from
+    /// `is_first_packet`, which is cleared only after the write budget check and
+    /// the first-packet callback, so it still reads `true` on error paths where
+    /// the bytes are already gone.
+    any_packet_flushed: bool,
+    /// Whether the final packet of this message reached the network. Like
+    /// `any_packet_flushed`, set with the flush rather than after the checks that
+    /// follow it, so a budget expiry on the last packet cannot make a message the
+    /// server holds in full look incomplete.
+    message_complete: bool,
     start_time: Instant,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
@@ -127,6 +137,8 @@ pub(crate) struct SuspendedMessage {
     payload_cursor: Cursor<Vec<u8>>,
     packet_size: usize,
     is_first_packet: bool,
+    any_packet_flushed: bool,
+    message_complete: bool,
     max_timeout_sec: Option<u32>,
     cancel_handle: Option<CancelHandle>,
     reset_mode: ResetConnectionMode,
@@ -137,8 +149,45 @@ impl SuspendedMessage {
     /// `true` while no packet of this message has reached the network yet, so
     /// the request can be abandoned locally without the server ever learning it
     /// existed.
+    ///
+    /// Deliberately not `is_first_packet`: that is cleared only after the write
+    /// budget check and the first-packet callback, so a packet that landed and
+    /// then tripped either would still read as unsent.
     pub(crate) fn nothing_sent(&self) -> bool {
-        self.is_first_packet
+        !self.any_packet_flushed
+    }
+
+    /// `true` when the final packet reached the network, so the server holds the
+    /// whole request and will answer it. Such a message cannot be withdrawn: an
+    /// `EOM | IGNORE` would open a second one rather than retract this one.
+    pub(crate) fn message_complete(&self) -> bool {
+        self.message_complete
+    }
+
+    /// Replaces the write timeout this message inherited from the request that
+    /// opened it.
+    ///
+    /// Withdrawing a request must be bounded even when the request itself was
+    /// not, so the retraction paths swap in their own budget rather than
+    /// resuming under `None`.
+    pub(crate) fn with_write_timeout(mut self, max_timeout_sec: Option<u32>) -> Self {
+        self.max_timeout_sec = max_timeout_sec;
+        self
+    }
+
+    /// Detaches the request's cancellation from this message.
+    ///
+    /// A retraction runs *because* the request is already over. Letting the
+    /// caller's cancel abort it too would strand the half-sent message the
+    /// retraction exists to withdraw.
+    pub(crate) fn without_cancellation(mut self) -> Self {
+        self.cancel_handle = None;
+        self
+    }
+
+    /// The RESETCONNECTION mode this message took from the connection.
+    pub(crate) fn reset_mode(&self) -> ResetConnectionMode {
+        self.reset_mode
     }
 
     /// Discards an unsent message, returning any RESETCONNECTION request it was
@@ -196,6 +245,8 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: buffer_cursor,
             packet_size,
             is_first_packet: true,
+            any_packet_flushed: false,
+            message_complete: false,
             start_time: Instant::now(),
             max_timeout_sec: effective_timeout,
             cancel_handle: cancel_handle.map(|handle| handle.child_handle()),
@@ -229,6 +280,8 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: self.payload_cursor,
             packet_size: self.packet_size,
             is_first_packet: self.is_first_packet,
+            any_packet_flushed: self.any_packet_flushed,
+            message_complete: self.message_complete,
             max_timeout_sec: self.max_timeout_sec,
             cancel_handle: self.cancel_handle,
             reset_mode: self.reset_mode,
@@ -256,6 +309,8 @@ impl<'a> PacketWriter<'a> {
             payload_cursor: state.payload_cursor,
             packet_size: state.packet_size,
             is_first_packet: state.is_first_packet,
+            any_packet_flushed: state.any_packet_flushed,
+            message_complete: state.message_complete,
             start_time: Instant::now(),
             max_timeout_sec: state.max_timeout_sec,
             cancel_handle: state.cancel_handle,
@@ -272,6 +327,11 @@ impl<'a> PacketWriter<'a> {
     /// answers an ignored message with a DONE token, which the caller must
     /// consume before reusing the connection.
     pub(crate) async fn cancel_current_message(&mut self) -> TdsResult<()> {
+        // The server discards an ignored message whole, so the caller re-arms the
+        // reset instead. Cleared explicitly because a message that failed before
+        // its first packet was accounted for still reports `is_first_packet`, and
+        // the header builder would then hand the bit to the ignore packet.
+        self.reset_mode = ResetConnectionMode::None;
         self.populate_header_and_send(true, true).await
     }
 
@@ -366,20 +426,21 @@ impl<'a> PacketWriter<'a> {
 
         send_data_fut.await?;
 
+        // Set before anything that can fail below: once these bytes are on the
+        // wire the server is mid-message, whatever this call returns.
+        self.any_packet_flushed = true;
+        self.message_complete = is_last_packet && !is_ignore_packet;
+
         // The header just written reached the wire, so any reset bit it carried
         // is now the server's to acknowledge. An ignore packet asks the server
         // to discard the message, so it is deliberately not recorded — treating
         // it as carrying the reset could condemn a healthy session.
         //
-        // This exemption assumes the ignored message is a single packet. For a
-        // multi-packet message, packet #1 already recorded the dispatch and a
-        // later ignore packet does not undo it: the server discards the whole
-        // message (reset included) while the client still believes the bit
-        // landed, so the next request settles it as "reset done" and an unreset
-        // session can go back to the pool. Latent today — `cancel_current_message`
-        // is the only ignore-packet emitter and is `#[cfg(test)]`-only. If that
-        // changes, the cancel path must clear the dispatch record *and* re-arm
-        // the mode so the bit rides the next request.
+        // Not recording is not enough on its own for a multi-packet message:
+        // packet #1 already recorded the dispatch, a later ignore packet does not
+        // undo it, and the server discards the whole message with the reset in
+        // it. Callers of `cancel_current_message` must hand the bit back —
+        // `TdsClient::rearm_withdrawn_reset` does so for both withdrawal paths.
         if reset_mode != ResetConnectionMode::None && !is_ignore_packet {
             self.network_writer.note_reset_dispatched();
         }
@@ -851,6 +912,23 @@ pub(crate) mod tests {
         );
     }
 
+    /// A retraction must not inherit the write timeout of the request it is
+    /// withdrawing: that request may have had none, and blocking forever while
+    /// giving up a connection is the failure this bound exists to prevent.
+    #[test]
+    fn with_write_timeout_replaces_the_inherited_budget() {
+        let mut mock = MockNetworkWriter::new(16);
+        let writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        let message = writer.suspend();
+        assert_eq!(
+            message.max_timeout_sec, None,
+            "a request without a timeout suspends with none"
+        );
+
+        let message = message.with_write_timeout(Some(120));
+        assert_eq!(message.max_timeout_sec, Some(120));
+    }
+
     #[test]
     fn test_cancel_current_message_sends_ignore_packet() {
         let mut mock = MockNetworkWriter::new(16);
@@ -925,6 +1003,11 @@ pub(crate) mod tests {
         block_on(writer.write_byte_async(0xAB)).unwrap();
         block_on(writer.cancel_current_message()).unwrap();
 
+        assert_eq!(
+            mock.data[1] & (PacketStatusFlags::ResetConnection as u8),
+            0,
+            "the ignore packet must not carry the reset it asks the server to discard"
+        );
         assert!(!mock.take_reset_dispatched());
     }
 
@@ -1568,5 +1651,58 @@ pub(crate) mod tests {
         // Two packets were needed; payload reassembles to the full 16 bytes.
         assert!(mock.data.len() > packet_size as usize);
         assert_eq!(reassemble_payload(&mock.data), (0..16).collect::<Vec<u8>>());
+    }
+
+    /// The budget is checked after the write, so `finalize`'s terminating packet
+    /// is on the wire before it can fail. Such a message needs cancelling, not
+    /// withdrawing: a second `EOM | IGNORE` would leave the server owing two
+    /// responses and the extra DONE for the next command.
+    #[test]
+    fn a_finalized_message_that_times_out_is_still_complete() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        block_on(writer.write_async(&[0xABu8; 4])).unwrap();
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+
+        let result = block_on(writer.finalize());
+        let message = writer.suspend();
+
+        assert!(result.is_err(), "the overrun budget must surface an error");
+        assert!(
+            mock.data[1] & (PacketStatusFlags::Eom as u8) != 0,
+            "the terminating packet reached the wire"
+        );
+        assert!(
+            message.message_complete(),
+            "a terminated message must not be withdrawn as if it were partial"
+        );
+    }
+
+    /// The write budget is checked *after* the packet lands, so this error path
+    /// leaves bytes on the wire. `is_first_packet` is still `true` here - only
+    /// the flushed flag can tell the caller the server is mid-message, and
+    /// getting it wrong means the request is dropped instead of withdrawn.
+    #[test]
+    fn a_packet_that_lands_then_times_out_is_not_nothing_sent() {
+        let mut mock = MockNetworkWriter::new(16);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, Some(1), None);
+        writer.start_time = Instant::now() - std::time::Duration::from_secs(30);
+
+        let result = block_on(writer.write_async(&[0xABu8; 64]));
+        let message = writer.suspend();
+
+        assert!(result.is_err(), "the overrun budget must surface an error");
+        assert!(
+            !mock.data.is_empty(),
+            "the packet reached the wire before the budget was checked"
+        );
+        assert!(
+            message.is_first_packet,
+            "the first-packet flag is still set on this path"
+        );
+        assert!(
+            !message.nothing_sent(),
+            "a request the server has part of must be withdrawn, not discarded"
+        );
     }
 }
