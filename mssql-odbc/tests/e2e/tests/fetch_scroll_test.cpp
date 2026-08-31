@@ -615,6 +615,16 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatedToWcharReportsFullLength) 
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
     EXPECT_EQ(10000, ind) << "5000 characters, two bytes each";
+
+    // The indicator alone would pass while the buffer held nothing, so check
+    // what actually landed.
+    int units = 0;
+    while (units < 16 && buf[units] != 0) {
+        ++units;
+    }
+    EXPECT_EQ(15, units) << "filled to capacity, less the terminator";
+    EXPECT_EQ(u'x', buf[0]);
+    EXPECT_EQ(u'x', buf[14]);
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }
@@ -634,9 +644,15 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedReportsFullLength) {
 }
 
 // Non-ASCII, to prove the transcode is not a byte copy: each e-acute is two
-// UTF-16 bytes on the wire and two UTF-8 bytes delivered, and the surrogate
-// handling is shared with the SQLGetData path.
+// UTF-16 bytes on the wire and two UTF-8 bytes delivered.
+//
+// Skipped on the msodbcsql leg because it asserts UTF-8 specifically. This
+// driver always delivers SQL_C_CHAR as UTF-8; msodbcsql converts to the client
+// code page, so on a Windows client the same value arrives as one 0xE9 byte per
+// character. That is the documented divergence AB#47564, and it is invisible on
+// Linux only because the client code page there is already UTF-8.
 TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("SELECT CAST(REPLICATE(NCHAR(233), 4) AS NVARCHAR(MAX)) AS c1");
 
     unsigned char buf[64] = {};
@@ -653,22 +669,96 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
     SQLCloseCursor(stmt_);
 }
 
+// Truncation has to stop on a character boundary. Each e-acute is two UTF-8
+// bytes, so a 32-byte buffer holds 15 of them in 30 bytes and the 16th does not
+// fit -- delivering its lead byte alone would leave the caller with text that
+// does not decode. msodbcsql trims the same way (TrimPartialCodePt).
+TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
+    SKIP_IF_COMPARING_MSODBCSQL();  // asserts UTF-8; see AB#47564 above
+    ExecDirect("SELECT REPLICATE(CAST(NCHAR(233) AS NVARCHAR(MAX)), 5000) AS c1");
+
+    unsigned char buf[32] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    const size_t len = std::strlen(reinterpret_cast<const char*>(buf));
+    EXPECT_EQ(30u, len) << "15 whole characters, not 31 bytes ending mid-sequence";
+    ASSERT_EQ(0u, len % 2u);
+    for (size_t i = 0; i < len; i += 2) {
+        EXPECT_EQ(0xC3u, buf[i]) << "lead byte at " << i;
+        EXPECT_EQ(0xA9u, buf[i + 1]) << "continuation byte at " << (i + 1);
+    }
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// The wide-target equivalent: a surrogate pair must not be split across the
+// capacity boundary. U+1F600 is two code units, so an odd-sized buffer would
+// otherwise end on a lone high surrogate. msodbcsql trims it too
+// (GetColDataSurrogateSafe).
+TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxDoesNotSplitASurrogatePair) {
+    ExecDirect(
+        "SELECT REPLICATE(CAST(NCHAR(0xD83D) + NCHAR(0xDE00) AS NVARCHAR(MAX)), 500) AS c1");
+
+    // 9 usable units: four whole pairs, and no room for the ninth's low half.
+    SQLWCHAR buf[10] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    int units = 0;
+    while (units < 10 && buf[units] != 0) {
+        ++units;
+    }
+    EXPECT_EQ(8, units) << "four whole pairs; the fifth high surrogate is dropped";
+    ASSERT_EQ(0, units % 2);
+    for (int i = 0; i < units; i += 2) {
+        EXPECT_GE(buf[i], 0xD800) << "high surrogate at " << i;
+        EXPECT_LT(buf[i], 0xDC00) << "high surrogate at " << i;
+        EXPECT_GE(buf[i + 1], 0xDC00) << "low surrogate at " << (i + 1);
+        EXPECT_LT(buf[i + 1], 0xE000) << "low surrogate at " << (i + 1);
+    }
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
 // Bound binary delivery is unimplemented for every type, not just the max ones
 // (AB#47239), so this asserts our own answer rather than parity -- msodbcsql
 // delivers it.
 TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
     SKIP_IF_COMPARING_MSODBCSQL();
-    ExecDirect("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS c1");
+    // Two rows and a trailing scalar: the refused target takes the drain path
+    // rather than the fill loop, so proving the row ended is not enough --
+    // the value after it, and the row after that, have to decode correctly.
+    ExecDirect(
+        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS lob, n * 11 AS tail "
+        "FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
 
+    SQLINTEGER n = -1;
     unsigned char buf[32] = {};
-    SQLLEN ind = 0;
-    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+    SQLINTEGER tail = -1;
+    SQLLEN nInd = 0, ind = 0, tailInd = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &n, sizeof(n), &nInd), SQL_HANDLE_STMT,
                   stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 3, SQL_C_SLONG, &tail, sizeof(tail), &tailInd),
+                  SQL_HANDLE_STMT, stmt_);
+
     EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    EXPECT_EQ(11, tail) << "the column after a refused LOB must still decode";
 
-    // The stream still has to be drained even when the target is refused, or
-    // the next row would decode from inside this value.
+    // And the next row too: a drain that stopped short would misread it.
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_EQ(2, n);
+    EXPECT_EQ(22, tail);
+
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);

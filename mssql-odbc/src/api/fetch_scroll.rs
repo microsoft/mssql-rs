@@ -380,6 +380,27 @@ fn fill_rowset(
     let mut fetch_error: Option<TdsError> = None;
     let mut last_column_read = 0usize;
 
+    // Snapshot the per-column PLP encodings once. Taking the statement lock
+    // inside the fill loop would make a poisoned mutex indistinguishable from a
+    // column that simply is not PLP, which would silently downgrade a supported
+    // column to "unsupported" and drain it.
+    let plp_encodings: Vec<Option<PlpEncoding>> = {
+        let Ok(ss) = stmt.inner.lock() else {
+            error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
+            if let Ok(mut ds) = dbc.inner.lock() {
+                ds.client = Some(client);
+            }
+            return SQL_ERROR;
+        };
+        ss.column_metadata
+            .iter()
+            .map(|m| m.plp_encoding())
+            .collect()
+    };
+    // One scratch buffer for the whole fill: a bound LOB in a wide rowset would
+    // otherwise allocate one per cell.
+    let mut plp_scratch = vec![0u8; PLP_BOUND_CHUNK];
+
     // Read once per fetch, not once per bind, so an application can move the
     // whole rowset between calls by updating the pointed-to value.
     let bind_offset = unsafe { read_bind_offset(row_bind_offset_ptr) };
@@ -415,16 +436,29 @@ fn fill_rowset(
                 // The stream has to be consumed either way to keep the row in
                 // sync, so the only choice is whether the bytes land in the
                 // caller's buffer or in a discard buffer.
-                Ok(CursorColumn::PlpStreaming { .. }) => unsafe {
-                    deliver_bound_plp(
-                        &mut client,
-                        &dbc.runtime,
-                        binding,
-                        rows_filled as usize,
-                        bind_offset,
-                        plp_encoding_for(stmt, column),
-                    )
-                },
+                Ok(CursorColumn::PlpStreaming { .. }) => {
+                    let delivered = unsafe {
+                        deliver_bound_plp(
+                            &mut client,
+                            &dbc.runtime,
+                            binding,
+                            rows_filled as usize,
+                            bind_offset,
+                            plp_encodings.get(column - 1).copied().flatten(),
+                            &mut plp_scratch,
+                        )
+                    };
+                    match delivered {
+                        Ok(outcome) => outcome,
+                        // A wire failure mid-LOB leaves the cursor inside the
+                        // value, so it fails the fetch rather than the row --
+                        // the same treatment read_row_column's error arm gets.
+                        Err(e) => {
+                            fetch_error = Some(e);
+                            RowOutcome::Error(RowIssue::Restricted)
+                        }
+                    }
+                }
                 // Reading ascending and once per column, neither of these is
                 // reachable; treat them as a row error rather than assuming.
                 Ok(CursorColumn::RowEnded) | Ok(CursorColumn::AlreadyConsumed) => {
@@ -638,11 +672,28 @@ unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
 /// value itself is never materialized, only one chunk at a time.
 const PLP_BOUND_CHUNK: usize = 8 * 1024;
 
-/// Reads the PLP encoding declared for `column` (1-based) in the current
-/// result set.
-fn plp_encoding_for(stmt: &StmtHandle, column: usize) -> Option<PlpEncoding> {
-    let ss = stmt.inner.lock().ok()?;
-    ss.column_metadata.get(column - 1)?.plp_encoding()
+/// The length a bound PLP delivery reports in the indicator.
+///
+/// Extracted so the rule can be tested without a live server: it was derived by
+/// probing msodbcsql, and all four of its cases are pinned in unit tests below.
+fn plp_indicator(
+    produced_bytes: usize,
+    truncated: bool,
+    transcoded: bool,
+    wire_total: Option<u64>,
+) -> SqlLen {
+    if !truncated {
+        // Everything arrived, so the produced length is exact whatever the
+        // encoding did.
+        produced_bytes as SqlLen
+    } else if transcoded {
+        // Transcoding makes the wire byte count the wrong unit, and the
+        // delivered count is not the total. msodbcsql reports SQL_NO_TOTAL here
+        // for the same reason.
+        SQL_NO_TOTAL
+    } else {
+        wire_total.map_or(SQL_NO_TOTAL, |t| t as SqlLen)
+    }
 }
 
 /// Drains an active PLP (max/LOB) stream into a bound column's fixed buffer.
@@ -650,8 +701,14 @@ fn plp_encoding_for(stmt: &StmtHandle, column: usize) -> Option<PlpEncoding> {
 /// Unlike `SQLGetData`, which hands back one chunk per call and lets the caller
 /// come back for more, a bound column is filled once: everything past the
 /// buffer is discarded, but still read off the wire so the row stays in sync.
-/// Nothing larger than one chunk is ever held in memory, so a multi-gigabyte
-/// LOB delivered into a small buffer costs the buffer, not the value.
+/// Only one chunk is held at a time, and once the buffer is full the remaining
+/// chunks are read but not decoded, so an oversized LOB costs the wire read
+/// rather than the value.
+///
+/// Truncation stops on a character boundary, never mid-sequence: a partial
+/// UTF-8 sequence or a lone surrogate would leave the caller holding text that
+/// does not decode. msodbcsql trims the same way (`TrimPartialCodePt`, and
+/// `GetColDataSurrogateSafe` for the wide target).
 ///
 /// # Safety
 /// Same contract as `deliver_bound`.
@@ -662,7 +719,8 @@ unsafe fn deliver_bound_plp(
     row_index: usize,
     bind_offset: usize,
     encoding: Option<PlpEncoding>,
-) -> RowOutcome {
+    scratch: &mut [u8],
+) -> Result<RowOutcome, TdsError> {
     let stride = element_stride(binding.target_type, binding.buffer_length);
     let indicator = if binding.strlen_or_ind_ptr.is_null() {
         std::ptr::null_mut()
@@ -677,8 +735,12 @@ unsafe fn deliver_bound_plp(
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
-    // Same pairings SQLGetData supports. Binary delivery is still unimplemented
-    // (AB#47239), and varchar -> SQL_C_WCHAR widening with it.
+    // Same pairings SQLGetData supports. Three refusals are deliberate and
+    // tracked, not oversights: bound binary delivery (AB#47239), widening
+    // varchar(max)/json to SQL_C_WCHAR, and a max column bound to a typed C
+    // target -- the last two are AB#47767, and both are cases msodbcsql
+    // delivers. The typed one means varchar(50) and varchar(max) differ for the
+    // same bind, since only the non-max path reaches convert_typed_c.
     let target = binding.target_type;
     let compatible = matches!(
         (target, encoding),
@@ -689,9 +751,10 @@ unsafe fn deliver_bound_plp(
     );
     if !compatible {
         // The stream still has to be consumed, or the next column decodes from
-        // the middle of this value.
-        let _ = runtime.block_on(drain_plp_to_end(client));
-        return RowOutcome::Error(RowIssue::Unsupported);
+        // the middle of this value. A failure here is the caller's problem, not
+        // this column's: it leaves the cursor mid-LOB.
+        drain_plp_to_end(client, runtime, scratch)?;
+        return Ok(RowOutcome::Error(RowIssue::Unsupported));
     }
 
     let transcode = target == SQL_C_CHAR && matches!(encoding, Some(PlpEncoding::Utf16Text));
@@ -705,14 +768,19 @@ unsafe fn deliver_bound_plp(
     let mut pending_high_surrogate: Option<u16> = None;
     let mut truncated = false;
     let mut wire_total: Option<u64>;
-    let mut scratch = vec![0u8; PLP_BOUND_CHUNK];
 
     loop {
-        let chunk = match runtime.block_on(client.read_active_plp_chunk(&mut scratch)) {
-            Ok(c) => c,
-            Err(_) => return RowOutcome::Error(RowIssue::Restricted),
-        };
+        let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
         wire_total = chunk.known_total;
+
+        // Once the buffer is full the rest of the value still has to come off
+        // the wire, but decoding it would be pure waste.
+        if truncated {
+            if chunk.reached_end {
+                break;
+            }
+            continue;
+        }
 
         if target == SQL_C_WCHAR {
             // Whole code units only; an odd tail is carried to the next chunk.
@@ -726,10 +794,16 @@ unsafe fn deliver_bound_plp(
                 pending_byte = Some(bytes[even]);
             }
             for pair in bytes[..even].chunks_exact(2) {
-                if out_units.len() < capacity_elements {
-                    out_units.push(u16::from_le_bytes([pair[0], pair[1]]));
+                let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                let is_high_surrogate = (0xD800..0xDC00).contains(&unit);
+                // A high surrogate is only worth keeping if its low half fits
+                // too; alone it is not a character.
+                let need = if is_high_surrogate { 2 } else { 1 };
+                if out_units.len() + need <= capacity_elements {
+                    out_units.push(unit);
                 } else {
                     truncated = true;
+                    break;
                 }
             }
         } else if transcode {
@@ -739,15 +813,21 @@ unsafe fn deliver_bound_plp(
                 &mut pending_byte,
                 &mut pending_high_surrogate,
             );
-            for b in utf8.as_bytes() {
-                if out_bytes.len() < capacity_elements {
-                    out_bytes.push(*b);
+            // Whole characters only: a partial UTF-8 sequence in the caller's
+            // buffer would not decode.
+            for ch in utf8.chars() {
+                let need = ch.len_utf8();
+                if out_bytes.len() + need <= capacity_elements {
+                    let mut enc = [0u8; 4];
+                    out_bytes.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
                 } else {
                     truncated = true;
                     break;
                 }
             }
         } else {
+            // Single-byte and UTF-8 wire bytes are copied verbatim, so there is
+            // no character boundary to respect here beyond what the server sent.
             for b in &scratch[..chunk.read] {
                 if out_bytes.len() < capacity_elements {
                     out_bytes.push(*b);
@@ -768,19 +848,12 @@ unsafe fn deliver_bound_plp(
     } else {
         out_bytes.len()
     };
-
-    // Matches msodbcsql, verified against it for each case: a value that fit
-    // reports exactly what was produced; a truncated one reports the full
-    // length when the target's units match the wire's, and SQL_NO_TOTAL when
-    // transcoding makes the wire byte count the wrong unit.
-    let reported = if !truncated {
-        produced_bytes as SqlLen
-    } else if transcode {
-        SQL_NO_TOTAL
-    } else {
-        wire_total.map_or(SQL_NO_TOTAL, |t| t as SqlLen)
+    unsafe {
+        write_if_some(
+            indicator,
+            plp_indicator(produced_bytes, truncated, transcode, wire_total),
+        )
     };
-    unsafe { write_if_some(indicator, reported) };
 
     if target == SQL_C_WCHAR {
         unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &out_units) };
@@ -788,20 +861,24 @@ unsafe fn deliver_bound_plp(
         unsafe { copy_with_nul(slot, buf_elements, &out_bytes) };
     }
 
-    if truncated {
+    Ok(if truncated {
         RowOutcome::Info(RowIssue::StringTruncated)
     } else {
         RowOutcome::Success
-    }
+    })
 }
 
 /// Consumes whatever is left of the active PLP stream and discards it.
-async fn drain_plp_to_end(
+fn drain_plp_to_end(
     client: &mut mssql_tds::connection::tds_client::TdsClient,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    scratch: &mut [u8],
 ) -> Result<(), TdsError> {
-    let mut sink = vec![0u8; PLP_BOUND_CHUNK];
     loop {
-        if client.read_active_plp_chunk(&mut sink).await?.reached_end {
+        if runtime
+            .block_on(client.read_active_plp_chunk(scratch))?
+            .reached_end
+        {
             return Ok(());
         }
     }
@@ -1443,6 +1520,29 @@ mod tests {
         assert_eq!(ind[0], 10);
         assert_eq!(&buf[..7], b"1234567");
         assert_eq!(buf[7], 0, "the buffer stays NUL-terminated");
+    }
+
+    /// The bound-PLP indicator rule, pinned in process. Every case here was
+    /// first observed on msodbcsql; the e2e suite proves the wiring, this
+    /// proves the decision without needing a live server.
+    #[test]
+    fn plp_indicator_matches_msodbcsql() {
+        // Everything arrived: the produced length is exact, whether or not the
+        // bytes were transcoded on the way.
+        assert_eq!(plp_indicator(10, false, true, Some(20)), 10);
+        assert_eq!(plp_indicator(10, false, false, Some(10)), 10);
+
+        // Truncated, and the delivered unit matches the wire's: the full length
+        // is knowable, so it is reported.
+        assert_eq!(plp_indicator(30, true, false, Some(5000)), 5000);
+        assert_eq!(plp_indicator(30, true, false, Some(10000)), 10000);
+
+        // Truncated while transcoding: wire bytes are the wrong unit and the
+        // produced count is not the total, so neither can be reported.
+        assert_eq!(plp_indicator(31, true, true, Some(10000)), SQL_NO_TOTAL);
+
+        // A streamed value of unknown length has no total to report either.
+        assert_eq!(plp_indicator(31, true, false, None), SQL_NO_TOTAL);
     }
 
     /// A zero-length character binding is a length probe, as it is for
