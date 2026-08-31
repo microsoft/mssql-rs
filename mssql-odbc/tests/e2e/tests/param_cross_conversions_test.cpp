@@ -483,7 +483,14 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
 // read when the parameter list is built. Streaming would have to write the C
 // buffer's bytes to the wire untranscoded, which cannot serve an integer wire
 // type, so the pairing stays materialize-only (AB#47590).
+//
+// msodbcsql streams it: SQLExecute returns SQL_NEED_DATA (99) here rather than
+// refusing, same as the narrow-to-wide pairing in
+// execute_test.cpp/CrossFamilyDataAtExecutionIsRejected. Skipped for that
+// reason, not because the state differs.
 TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 

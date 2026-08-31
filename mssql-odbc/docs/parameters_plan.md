@@ -98,7 +98,9 @@ transparent reconnects.
   pairings bindable, the refusal moved from `SQLBindParameter` to execute - the
   DAE indicator is only read while building the parameter list - so an
   application gets `HYC00` from `SQLExecute` after setting up its
-  `SQLParamData` loop rather than at bind. Pinned by
+  `SQLParamData` loop rather than at bind. msodbcsql streams the pairing
+  instead, returning `SQL_NEED_DATA`, so this is the same gap as the
+  narrow-to-wide case and closes with it (AB#47590). Pinned by
   `CrossFamilyDataAtExecutionIsRejectedAtExecute`.
 
 ## `mssql-tds` prepared API
