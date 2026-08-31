@@ -237,8 +237,9 @@ fn fetch_scroll_safe(
         }
 
         // The ARD lock is taken after this one is released (below), never
-        // while it is held — see the crate's locking-order docs on why a
-        // STMT lock must never nest inside a DESC lock's acquisition.
+        // while it is held — see ".github/instructions/mssql-odbc.instructions.md",
+        // "Locking rules": a STMT lock must never be held while acquiring a
+        // DESC lock.
         let ard = stmt_state.effective_ard(stmt);
         // Claiming the statement here is what stops a concurrent SQLBindCol
         // from freeing an application buffer the fill loop is still reading

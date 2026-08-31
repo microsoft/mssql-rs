@@ -187,9 +187,10 @@ impl BoundParam {
     /// Every parameter position in `apd_state`, in ordinal order, paired with
     /// its IPD twin at the same position — `build_named_params`'s input,
     /// snapshotted fresh from the active APD/IPD immediately before an
-    /// execute and never while the STMT lock is held (see the crate's
-    /// locking-order docs). `None` slots are gaps: an ordinal never bound, or
-    /// unbound since.
+    /// execute and never while the STMT lock is held (see
+    /// ".github/instructions/mssql-odbc.instructions.md", "Locking rules": a
+    /// STMT lock must never be held while acquiring a DESC lock). `None`
+    /// slots are gaps: an ordinal never bound, or unbound since.
     pub(crate) fn all_from_descriptor_states(
         apd_state: &DescState,
         ipd_state: &DescState,

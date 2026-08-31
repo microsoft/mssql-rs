@@ -127,6 +127,13 @@ fn sql_get_desc_rec_w_safe(
     scale_ptr: *mut SqlSmallInt,
     nullable_ptr: *mut SqlSmallInt,
 ) -> SqlReturn {
+    // BufferLength is validated by the DM (SQLSTATE HY090), same as
+    // SQLDescribeColW's identical argument (describe_col.rs).
+    debug_assert!(
+        buffer_length >= 0,
+        "SQLGetDescRecW: DM should reject negative buffer_length (HY090)"
+    );
+
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLGetDescRecW: desc mutex poisoned");
         return SQL_ERROR;

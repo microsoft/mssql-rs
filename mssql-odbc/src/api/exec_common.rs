@@ -404,8 +404,10 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
 /// APD/IPD, in ordinal order.
 ///
 /// Read once, immediately before an execute's main STMT-locked critical
-/// section — never while that lock is held (see the crate's locking-order
-/// docs) — since ODBC requires bindings to stay stable across one execute.
+/// section — never while that lock is held (see
+/// ".github/instructions/mssql-odbc.instructions.md", "Locking rules": a
+/// STMT lock must never be held while acquiring a DESC lock) — since ODBC
+/// requires bindings to stay stable across one execute.
 /// `SQLBindParameter` and `SQLSetDescFieldW` write into these same descriptor
 /// records (AB#47437), so this is the one place `build_named_params` and the
 /// data-at-execution lookups need to look, regardless of which API produced
@@ -586,6 +588,18 @@ pub(super) fn finish_execute(
     let metadata = client.get_metadata().clone();
     let has_result_set = !metadata.is_empty();
 
+    // Populated before `metadata` is moved into `stmt_state.begin_batch`
+    // below (each arm), while it's still owned locally — avoids a clone per
+    // arm purely to keep a copy alive across the STMT lock drop.
+    // `populate_ird` only ever touches the IRD's own DescHandle, with no
+    // dependency on `stmt_state`/`client`/`dbc`, so running it before the
+    // STMT-locked bookkeeping instead of after doesn't change what state ends
+    // up where — only whether an IRD failure is checked before or after that
+    // bookkeeping runs, and every arm already runs the bookkeeping
+    // unconditionally and reports the IRD failure (if any) in its return
+    // value regardless.
+    let ird_ok = populate_ird(stmt, &metadata).is_ok();
+
     if !has_result_set && client.has_open_batch() {
         // Statement-wise navigation: positioned on a no-row statement result
         // (PRINT / low-severity RAISERROR / DDL / DML) with more statements still
@@ -599,7 +613,7 @@ pub(super) fn finish_execute(
             return_client_busy(dbc, client);
             return SQL_ERROR;
         };
-        stmt_state.begin_batch(metadata.clone()); // empty (0 columns)
+        stmt_state.begin_batch(metadata); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
@@ -610,7 +624,7 @@ pub(super) fn finish_execute(
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
         return_client_busy(dbc, client);
-        if populate_ird(stmt, &metadata).is_err() {
+        if !ird_ok {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_sql_error(
                     &mut stmt_state,
@@ -647,7 +661,7 @@ pub(super) fn finish_execute(
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
-        stmt_state.begin_batch(metadata.clone()); // empty
+        stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.clear_exhaustion_state();
@@ -656,7 +670,7 @@ pub(super) fn finish_execute(
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
         return_client_idle(dbc, statement_handle, client);
-        if populate_ird(stmt, &metadata).is_err() {
+        if !ird_ok {
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_sql_error(
                     &mut stmt_state,
@@ -681,7 +695,7 @@ pub(super) fn finish_execute(
         return_client_busy(dbc, client);
         return SQL_ERROR;
     };
-    stmt_state.begin_batch(metadata.clone());
+    stmt_state.begin_batch(metadata);
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
     stmt_state.clear_exhaustion_state();
@@ -690,7 +704,7 @@ pub(super) fn finish_execute(
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
     drop(stmt_state);
     return_client_busy(dbc, client);
-    if populate_ird(stmt, &metadata).is_err() {
+    if !ird_ok {
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
                 &mut stmt_state,

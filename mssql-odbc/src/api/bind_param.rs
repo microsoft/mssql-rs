@@ -313,9 +313,11 @@ fn sql_bind_parameter_safe(
 /// but this still reports it as an error rather than panicking or silently
 /// truncating to the wrong record.
 ///
-/// Always locks `apd` before `ipd`: the only place in this crate that holds
-/// two DESC locks at once, so this order must stay the only order, matching
-/// how [`BoundParam::all_from_descriptor_states`] reads them back.
+/// Always locks `apd` before `ipd` (see
+/// ".github/instructions/mssql-odbc.instructions.md", "Locking rules" —
+/// "APD before IPD"): the only place in this crate that holds two DESC locks
+/// at once, so this order must stay the only order, matching how
+/// [`BoundParam::all_from_descriptor_states`] reads them back.
 fn bind_param_records(
     apd: SqlHandle,
     ipd: SqlHandle,
@@ -381,8 +383,9 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
     // `SQL_DESC_COUNT` on the APD to 0 — a real truncation, matching
     // `SQL_UNBIND`'s identical rule for the ARD (bind_col.rs). IPD is left
     // alone: the spec names only the APD, and `BoundParam::from_records`
-    // gates entirely on the APD's `SQL_DESC_DATA_PTR`, so a stale IPD record
-    // beyond the truncated APD range is simply never visited.
+    // gates on the APD record's `SQL_DESC_CONCISE_TYPE`, and
+    // `all_from_descriptor_states` iterates the APD's records, so a stale IPD
+    // record beyond the truncated APD range is simply never visited.
     let apd = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFreeStmt(SQL_RESET_PARAMS): stmt mutex poisoned");

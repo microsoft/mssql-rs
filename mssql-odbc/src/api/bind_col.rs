@@ -92,7 +92,8 @@ fn sql_bind_col_safe(
     // the single source of truth `SQLBindCol` and `SQLSetDescFieldW` share,
     // not a separate table) — which needs its own lock. The STMT lock is
     // dropped before that one is taken: this crate never holds a STMT lock
-    // while acquiring a DESC lock (see the crate's locking-order docs), since
+    // while acquiring a DESC lock (see ".github/instructions/mssql-odbc.instructions.md",
+    // "Locking rules" — DESC is a DBC sibling of STMT, not its child), since
     // `free_desc` already walks DBC→STMT in the other direction to reset a
     // freed descriptor's associations, and holding both here in the opposite
     // order would be a classic ABBA deadlock.

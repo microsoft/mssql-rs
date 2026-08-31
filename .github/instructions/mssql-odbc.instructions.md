@@ -297,6 +297,29 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 - **Free path**: Lock the parent's mutex to unregister from its child list.
 - **Lock ordering**: Always lock parent before child (ENV before DBC, DBC before
   STMT) to prevent deadlocks. Always acquire the parent lock before the child lock.
+- **DESC is a sibling of STMT, not a child**: a descriptor's parent is the DBC
+  (`DescHandle::parent_dbc`), not the statement it happens to be associated
+  with — an explicit descriptor can be reassociated across statements, or
+  shared by several at once. The free path (`free_desc`, `free_handle.rs`)
+  walks DBC → STMT to clear a freed descriptor's association from every
+  statement that had it active, so the STMT lock and a DESC lock must never
+  nest the other way: **never hold a STMT lock while acquiring a DESC lock**.
+  Every entry point that both validates STMT state and writes to a
+  descriptor (`SQLBindCol`, `SQLBindParameter`, `SQLFetchScroll`,
+  `SQLFreeStmt(SQL_UNBIND | SQL_RESET_PARAMS)`, execute's parameter
+  snapshot) follows the same two-phase shape: lock STMT, validate and
+  resolve the target descriptor handle (`effective_ard`/`effective_apd`),
+  drop the STMT lock, *then* lock the descriptor. A descriptor pointer
+  resolved this way can be freed by a concurrent `SQLFreeHandle` before it
+  is dereferenced; re-check `handles::live_type` immediately before the
+  dereference to fail cleanly instead of touching freed memory.
+- **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
+  place in this crate that holds two DESC locks at once (writing a
+  parameter's APD and IPD records together). It locks APD before IPD, and
+  that must stay the only order used anywhere both are locked together —
+  `BoundParam::all_from_descriptor_states` (used by
+  `snapshot_bound_params`) only ever reads them, never locks both
+  simultaneously, so it does not need to follow this rule itself.
 - **`debug_assert!` for DM invariants**: The free path uses `debug_assert!` to
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and

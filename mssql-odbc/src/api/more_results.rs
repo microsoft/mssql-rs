@@ -173,6 +173,16 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Positioned on a new row-returning result set. Refresh metadata,
             // clear row state, keep CURSOR_OPEN and active_stmt set.
             let metadata = client.get_metadata().clone();
+            // Populated before `metadata` is moved into `begin_result_set`
+            // below, while it's still owned locally — avoids a clone purely
+            // to keep a copy alive across the STMT lock drop.
+            // `populate_ird` only ever touches the IRD's own DescHandle,
+            // independent of the STMT lock's poison state, so this can run
+            // before the poisoned-mutex check just below without changing
+            // what gets reported: a poisoned STMT mutex already returns
+            // SQL_ERROR unconditionally, and every other path still checks
+            // `ird_ok` before returning success.
+            let ird_ok = populate_ird(stmt, &metadata).is_ok();
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLMoreResults: stmt mutex poisoned advancing result set");
                 if let Ok(mut ds) = dbc.inner.lock() {
@@ -183,7 +193,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
                 return SQL_ERROR;
             };
-            stmt_state.begin_result_set(metadata.clone());
+            stmt_state.begin_result_set(metadata);
             stmt_state.reset_row_stream();
             stmt_state.result_set_exhausted = false;
             stmt_state.batch_exhausted = false;
@@ -193,7 +203,6 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
-            let ird_ok = populate_ird(stmt, &metadata).is_ok();
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 // Explicitly (re-)claim: AB#47508's early release can have left
