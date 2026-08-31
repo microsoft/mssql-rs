@@ -19,9 +19,10 @@ use super::odbc_types::*;
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use super::util::write_if_some;
+use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
-use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 
 const DESCRIBE_PARAMETERS_PROC: &str = "sp_describe_undeclared_parameters";
 
@@ -145,6 +146,13 @@ fn sql_describe_param_safe(
                 post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
                 return SQL_ERROR;
             };
+            // Re-assert IPD every cache-served call, not just the first: a
+            // rebind between two `SQLDescribeParam` calls could otherwise
+            // leave a stale, unrefined IPD in place while this answer keeps
+            // reporting the server's original description.
+            let cached = stmt_state.parameter_metadata.clone();
+            drop(stmt_state);
+            refine_ipd(stmt, &cached);
             write_description(
                 description,
                 data_type_ptr,
@@ -242,7 +250,7 @@ fn sql_describe_param_safe(
         error!("SQLDescribeParam: stmt mutex poisoned storing metadata");
         return SQL_ERROR;
     };
-    stmt_state.parameter_metadata = descriptions;
+    stmt_state.parameter_metadata = descriptions.clone();
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_info = post_tds_info_messages(&mut stmt_state, &info_messages);
 
@@ -254,6 +262,10 @@ fn sql_describe_param_safe(
         post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     };
+    // Dropped before refine_ipd locks the IPD: this crate never holds a
+    // STMT lock while acquiring a DESC lock (see bind_col.rs's rationale).
+    drop(stmt_state);
+    refine_ipd(stmt, &descriptions);
     write_description(
         description,
         data_type_ptr,
@@ -266,6 +278,50 @@ fn sql_describe_param_safe(
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
+    }
+}
+
+/// Refines `stmt`'s IPD records from server-described `descriptions` — one
+/// per marker ordinal, in order — overriding whatever `SQLBindParameter`
+/// guessed at bind time: `sp_describe_undeclared_parameters` is the
+/// authoritative source once available. Grows the IPD to cover every
+/// described marker but never shrinks it, so an application that grew the
+/// IPD further itself (`SQLSetDescField(IPD, 0, SQL_DESC_COUNT, ...)`) keeps
+/// that choice.
+///
+/// `ParameterDescription` carries no parameter direction or name — the
+/// server doesn't determine either from `sp_describe_undeclared_parameters`
+/// — so `SQL_DESC_PARAMETER_TYPE` and `SQL_DESC_NAME` are left exactly as
+/// `SQLBindParameter` (or the record's un-bound default) set them.
+///
+/// Call only after the STMT lock has been dropped (see `bind_col.rs`'s
+/// locking-order rationale). A poisoned IPD mutex is logged and otherwise
+/// ignored: `SQLDescribeParam`'s own answer, already written from the
+/// in-memory `descriptions`, does not depend on this refinement succeeding.
+fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
+    let Ok(mut desc_state) = desc.inner.lock() else {
+        error!("SQLDescribeParam: ipd mutex poisoned; parameter metadata left unrefined");
+        return;
+    };
+    let target_count = desc_state.records.len().max(descriptions.len());
+    desc_state.set_record_count(target_count, desc.kind);
+    for (i, description) in descriptions.iter().enumerate() {
+        let record_number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
+        let Some(record) = desc_state.record_mut(record_number) else {
+            continue;
+        };
+        record.concise_type = description.data_type;
+        record.scale = description.decimal_digits;
+        record.nullable = description.nullable;
+        if parameter_size_is_precision(description.data_type) {
+            record.precision =
+                SqlSmallInt::try_from(description.parameter_size).unwrap_or(SqlSmallInt::MAX);
+            record.length = 0;
+        } else {
+            record.length = description.parameter_size;
+            record.precision = 0;
+        }
     }
 }
 
@@ -943,5 +999,105 @@ mod tests {
         collector.accept(1, description).unwrap();
         collector.accept(0, description).unwrap();
         assert_eq!(collector.finish().unwrap().len(), 2);
+    }
+
+    fn ipd_records(h: &TestHandles) -> Vec<crate::handles::desc::DescRecord> {
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        desc.inner.lock().unwrap().records.clone()
+    }
+
+    fn param_description(
+        data_type: SqlSmallInt,
+        parameter_size: SqlULen,
+        decimal_digits: SqlSmallInt,
+        nullable: SqlSmallInt,
+    ) -> ParameterDescription {
+        ParameterDescription {
+            data_type,
+            parameter_size,
+            decimal_digits,
+            nullable,
+        }
+    }
+
+    #[test]
+    fn refine_ipd_writes_type_scale_and_nullable() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let descriptions = vec![param_description(SQL_VARCHAR, 50, 0, SQL_NULLABLE)];
+        refine_ipd(stmt, &descriptions);
+
+        let records = ipd_records(&h);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].concise_type, SQL_VARCHAR);
+        assert_eq!(records[0].length, 50);
+        assert_eq!(records[0].precision, 0);
+        assert_eq!(records[0].scale, 0);
+        assert_eq!(records[0].nullable, SQL_NULLABLE);
+    }
+
+    /// `SQL_DESC_PRECISION` and `SQL_DESC_LENGTH` are independent fields in
+    /// this driver's model (`get_desc_field.rs` reads each directly), so
+    /// exactly one must carry the server's `ColumnSize` per type: precision
+    /// for the exact numerics, length for everything else.
+    #[test]
+    fn refine_ipd_splits_precision_and_length_by_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let descriptions = vec![
+            param_description(SQL_DECIMAL, 12, 3, SQL_NULLABLE),
+            param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS),
+        ];
+        refine_ipd(stmt, &descriptions);
+
+        let records = ipd_records(&h);
+        assert_eq!(records[0].precision, 12);
+        assert_eq!(
+            records[0].length, 0,
+            "decimal reports precision, not length"
+        );
+        assert_eq!(records[0].scale, 3);
+
+        assert_eq!(records[1].length, 80);
+        assert_eq!(
+            records[1].precision, 0,
+            "varchar reports length, not precision"
+        );
+    }
+
+    /// An application that grew the IPD itself (`SQLSetDescField(IPD, 0,
+    /// SQL_DESC_COUNT, ...)`) before ever calling `SQLDescribeParam` keeps
+    /// that sizing; describing fewer markers than that must not shrink it.
+    #[test]
+    fn refine_ipd_never_shrinks_an_already_larger_ipd() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            state.set_record_count(3, desc.kind);
+        }
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        assert_eq!(
+            ipd_records(&h).len(),
+            3,
+            "refining fewer markers must not shrink the IPD"
+        );
+    }
+
+    /// `ParameterDescription` carries no parameter direction; `SQLBindParameter`
+    /// is the only API that knows it, so refining must leave it alone.
+    #[test]
+    fn refine_ipd_leaves_parameter_type_untouched() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            state.set_record_count(1, desc.kind);
+            state.record_mut(1).unwrap().parameter_type = SQL_PARAM_INPUT;
+        }
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        assert_eq!(ipd_records(&h)[0].parameter_type, SQL_PARAM_INPUT);
     }
 }

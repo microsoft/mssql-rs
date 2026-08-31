@@ -41,7 +41,7 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{
     ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
 };
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 /// Implements SQLFetchScroll for the current forward-only result set.
 ///
@@ -157,18 +157,11 @@ fn fetch_scroll_safe(
     fetch_orientation: SqlSmallInt,
     _fetch_offset: SqlLen,
 ) -> SqlReturn {
-    // Snapshot the rowset controls and the binding table, then release the
+    // Snapshot the rowset controls and the effective ARD, then release the
     // statement lock: the fill loop below blocks on the network and must not
     // hold it. The application is not allowed to rebind concurrently with a
     // fetch on the same statement, so the snapshot cannot go stale under us.
-    let (
-        row_array_size,
-        bindings,
-        rows_fetched_ptr,
-        row_status_ptr,
-        column_count,
-        row_bind_offset_ptr,
-    ) = {
+    let (ard, row_array_size, rows_fetched_ptr, row_status_ptr, column_count, row_bind_offset_ptr) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
             return SQL_ERROR;
@@ -243,20 +236,42 @@ fn fetch_scroll_safe(
             return rc;
         }
 
-        let bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
-        // The buffers in that snapshot belong to the application, and the fill
-        // loop writes through them after this lock is released. Claiming the
-        // statement here is what stops a concurrent SQLBindCol from freeing one
-        // mid-write; the mutating entry points refuse while this is set.
+        // The ARD lock is taken after this one is released (below), never
+        // while it is held — see the crate's locking-order docs on why a
+        // STMT lock must never nest inside a DESC lock's acquisition.
+        let ard = stmt_state.effective_ard(stmt);
+        // Claiming the statement here is what stops a concurrent SQLBindCol
+        // from freeing an application buffer the fill loop is still reading
+        // through after this lock is released; the mutating entry points
+        // refuse while this is set.
         stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
         (
+            ard,
             stmt_state.row_array_size,
-            bindings,
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
         )
+    };
+
+    // AB#47437: the ARD is the fill loop's single source of truth, derived
+    // fresh from its records every fetch rather than cached, so a
+    // descriptor-field bind (`SQLSetDescFieldW`) and a `SQLBindCol` bind are
+    // indistinguishable here. A poisoned ARD mutex is treated as "nothing
+    // bound" rather than failing the fetch outright: every bound buffer
+    // belongs to the application, so the safe, honest answer to "I can't
+    // read the binding table" is to deliver an unbound rowset (still
+    // reporting an accurate row count), not to refuse to advance the cursor.
+    let bindings: Vec<ColumnBinding> = {
+        let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+        match desc.inner.lock() {
+            Ok(desc_state) => ColumnBinding::all_from_ard_state(&desc_state),
+            Err(_) => {
+                error!("SQLFetchScroll: ard mutex poisoned; fetching with no bound columns");
+                Vec::new()
+            }
+        }
     };
 
     let rc = fill_rowset(

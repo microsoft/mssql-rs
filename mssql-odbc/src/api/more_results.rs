@@ -13,6 +13,7 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
 use super::close_cursor::reset_cursor_state;
+use super::ird::populate_ird;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
     SqlReturn,
@@ -107,6 +108,8 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             stmt_state.begin_result_set(Vec::new());
             stmt_state.row_count = next;
             debug!("SQLMoreResults: advanced to next DML result set");
+            drop(stmt_state);
+            populate_ird(stmt, &[]);
             return SQL_SUCCESS;
         }
         stmt_state.has_state(STMT_STATE_CURSOR_OPEN)
@@ -169,7 +172,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
                 return SQL_ERROR;
             };
-            stmt_state.begin_result_set(metadata);
+            stmt_state.begin_result_set(metadata.clone());
             stmt_state.reset_row_stream();
             stmt_state.result_set_exhausted = false;
             stmt_state.batch_exhausted = false;
@@ -179,6 +182,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
+            populate_ird(stmt, &metadata);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 // Explicitly (re-)claim: AB#47508's early release can have left
@@ -225,6 +229,7 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             let info_messages = client.take_info_messages();
             let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
             drop(stmt_state);
+            populate_ird(stmt, &[]);
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 // Explicitly (re-)claim — see the `Rows` arm above.

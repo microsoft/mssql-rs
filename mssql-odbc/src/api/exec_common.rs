@@ -15,6 +15,7 @@ use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
+use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
@@ -28,7 +29,8 @@ use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED, StmtState,
 };
-use crate::handles::{DbcHandle, StmtHandle};
+use crate::handles::{DbcHandle, DescHandle, StmtHandle, handle_from_raw};
+use crate::params::BoundParam;
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -397,6 +399,44 @@ fn dae_expected_length(indicator: SqlLen) -> Option<usize> {
     }
 }
 
+/// Snapshots every parameter position currently bound on `stmt`'s effective
+/// APD/IPD, in ordinal order.
+///
+/// Read once, immediately before an execute's main STMT-locked critical
+/// section — never while that lock is held (see the crate's locking-order
+/// docs) — since ODBC requires bindings to stay stable across one execute.
+/// `SQLBindParameter` and `SQLSetDescFieldW` write into these same descriptor
+/// records (AB#47437), so this is the one place `build_named_params` and the
+/// data-at-execution lookups need to look, regardless of which API produced
+/// the binding; the snapshot itself is what lets the rest of the execute path
+/// (`build_named_params`, `StmtState::dae_current_c_type`) stay unchanged,
+/// reading `StmtState::bound_params` exactly as it did before AB#47437.
+///
+/// A poisoned APD or IPD mutex snapshots as "every parameter unbound" rather
+/// than failing the call outright: `build_named_params` already turns that
+/// into an accurate `07002` for any statement with markers.
+pub(super) fn snapshot_bound_params(stmt: &StmtHandle) -> Vec<Option<BoundParam>> {
+    let (apd, ipd) = {
+        let Ok(stmt_state) = stmt.inner.lock() else {
+            error!("snapshotting parameters: stmt mutex poisoned; treating as unbound");
+            return Vec::new();
+        };
+        (stmt_state.effective_apd(stmt), stmt.ipd)
+    };
+
+    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let Ok(apd_state) = apd_desc.inner.lock() else {
+        error!("snapshotting parameters: apd mutex poisoned; treating as unbound");
+        return Vec::new();
+    };
+    let ipd_desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
+    let Ok(ipd_state) = ipd_desc.inner.lock() else {
+        error!("snapshotting parameters: ipd mutex poisoned; treating as unbound");
+        return Vec::new();
+    };
+    BoundParam::all_from_descriptor_states(&apd_state, &ipd_state)
+}
+
 /// Builds the ordered `@P1..@Pn` RPC parameter list from the statement's bound
 /// parameters, reading application value buffers by reference. Shared by
 /// `SQLExecute` and `SQLExecDirect`; `op` names the entry point for traceable
@@ -524,7 +564,7 @@ pub(super) fn finish_execute(
             return_client_busy(dbc, client);
             return SQL_ERROR;
         };
-        stmt_state.begin_batch(metadata); // empty (0 columns)
+        stmt_state.begin_batch(metadata.clone()); // empty (0 columns)
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
@@ -534,6 +574,7 @@ pub(super) fn finish_execute(
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
+        populate_ird(stmt, &metadata);
         return_client_busy(dbc, client);
         return if has_server_info {
             SQL_SUCCESS_WITH_INFO
@@ -561,7 +602,7 @@ pub(super) fn finish_execute(
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
-        stmt_state.begin_batch(metadata); // empty
+        stmt_state.begin_batch(metadata.clone()); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
         stmt_state.clear_exhaustion_state();
@@ -569,6 +610,7 @@ pub(super) fn finish_execute(
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
         drop(stmt_state);
+        populate_ird(stmt, &metadata);
         return_client_idle(dbc, statement_handle, client);
         return if has_server_info {
             SQL_SUCCESS_WITH_INFO
@@ -584,7 +626,7 @@ pub(super) fn finish_execute(
         return_client_busy(dbc, client);
         return SQL_ERROR;
     };
-    stmt_state.begin_batch(metadata);
+    stmt_state.begin_batch(metadata.clone());
     stmt_state.row_count = client.last_rows_affected();
     stmt_state.pending_row_counts.clear();
     stmt_state.clear_exhaustion_state();
@@ -592,6 +634,7 @@ pub(super) fn finish_execute(
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
     drop(stmt_state);
+    populate_ird(stmt, &metadata);
     return_client_busy(dbc, client);
     if has_server_info {
         SQL_SUCCESS_WITH_INFO

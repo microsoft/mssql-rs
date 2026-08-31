@@ -327,7 +327,7 @@ fn set_record_field(
 /// Writes a validated value into an existing record via a closure, so
 /// validation (which needs `&mut DescState` to post diagnostics) and the
 /// mutation (which needs `&mut DescRecord`) never borrow `state` at once.
-fn write_record_field(
+pub(super) fn write_record_field(
     state: &mut DescState,
     record_number: SqlSmallInt,
     f: impl FnOnce(&mut DescRecord),
@@ -366,7 +366,7 @@ fn write_record_field(
 /// `SQL_DESC_CONCISE_TYPE`, or through `SQL_DESC_TYPE` itself — is validated
 /// the same way `SQLBindParameter` validates `ParameterType`
 /// (`classify_parameter_sql_type`).
-fn set_type(
+pub(super) fn set_type(
     state: &mut DescState,
     kind: DescKind,
     record_number: SqlSmallInt,
@@ -447,7 +447,7 @@ fn concise_type_for_datetime_code(code: SqlSmallInt) -> Option<SqlSmallInt> {
 /// (`SQL_INTERVAL_YEAR..SQL_INTERVAL_MINUTE_TO_SECOND`) is not modeled here:
 /// SQL Server has no interval SQL type, so no concise interval value can
 /// reach a descriptor record through this driver's execution path.
-fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
+pub(super) fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
     let code = match concise_type {
         SQL_TYPE_DATE => SQL_CODE_DATE,
         SQL_TYPE_TIME => SQL_CODE_TIME,
@@ -463,7 +463,7 @@ fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
 /// than deferring to an execute-time consistency pass this driver does not
 /// have yet — task AB#47297 calls out "numeric value representation"
 /// validation as this PR's job.
-fn set_precision(
+pub(super) fn set_precision(
     state: &mut DescState,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,
@@ -489,7 +489,7 @@ fn set_precision(
 /// `SQL_DESC_SCALE` write. Same `SQL_C_NUMERIC` consistency bound as
 /// [`set_precision`]: scale must be non-negative and `<= precision`
 /// (`sqlcdesc.cpp:11391-11394`).
-fn set_scale(
+pub(super) fn set_scale(
     state: &mut DescState,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,
@@ -539,7 +539,7 @@ fn set_scale(
 /// (`CheckADDescConsistency`, over each record's live `rgbValue`), a
 /// different call site skipping records nothing is currently bound to —
 /// not from a single `SQLSetDescField(SQL_DESC_DATA_PTR, ...)` call.
-fn set_data_ptr(
+pub(super) fn set_data_ptr(
     state: &mut DescState,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,

@@ -16,7 +16,7 @@ use crate::api::type_rules::{
     parameter_column_size_is_valid, resolve_default_c_type,
 };
 use crate::error::{free_errors, post_sql_error};
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 use crate::params::BoundParam;
 use crate::params::conversion_matrix::is_supported_conversion;
 
@@ -137,107 +137,122 @@ fn sql_bind_parameter_safe(
         env_state.odbc_version
     };
 
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLBindParameter: stmt mutex poisoned");
-        return SQL_ERROR;
-    };
-    free_errors(&mut stmt_state);
-
-    // Fold the deprecated 2.x date/time C spellings onto the SQL_C_TYPE_* forms
-    // so only one form per type reaches validation, conversion, and storage.
-    let value_type = canonical_c_type(value_type);
-
-    // ValueType (C type) and ParameterType (SQL type) must be known type
-    // identifiers (HY003 / HY004).
-    if !is_valid_c_type(value_type) {
-        error!(
-            value_type,
-            "SQLBindParameter: invalid application buffer type"
-        );
-        post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
-        return SQL_ERROR;
-    }
-    match classify_parameter_sql_type(parameter_type) {
-        SqlTypeSupport::Supported => {}
-        SqlTypeSupport::NotImplemented => {
-            error!(
-                parameter_type,
-                "SQLBindParameter: unsupported SQL data type"
-            );
-            post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
-            return SQL_ERROR;
-        }
-        SqlTypeSupport::Invalid => {
-            error!(parameter_type, "SQLBindParameter: invalid SQL data type");
-            post_diag(&mut stmt_state, ERR_INVALID_SQL_DATA_TYPE);
-            return SQL_ERROR;
-        }
-    }
-
-    // Resolve SQL_C_DEFAULT here so the execute path never sees the placeholder,
-    // matching msodbcsql, which stores the resolved type in the APD.
-    let c_type = if value_type == SQL_C_DEFAULT {
-        let Some(resolved) = resolve_default_c_type(parameter_type, odbc_version) else {
-            // Unreachable: every Supported type has a default C type, pinned by
-            // every_supported_sql_type_has_a_default_c_type.
-            debug_assert!(
-                false,
-                "no default C type for supported SQL type {parameter_type}"
-            );
-            error!(
-                parameter_type,
-                "SQLBindParameter: no default C type for this SQL type"
-            );
-            post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+    // Validated under the STMT lock, exactly as before, but the write lands
+    // on the effective APD's and the IPD's own DescState records (AB#47437:
+    // the descriptors are the storage `SQLBindParameter` and
+    // `SQLSetDescFieldW` share, not a separate table), which need their own
+    // locks. The STMT lock is dropped before those are taken — this crate
+    // never holds a STMT lock while acquiring a DESC lock (see
+    // bind_col.rs's identical rationale for SQLBindCol).
+    let (apd, c_type) = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLBindParameter: stmt mutex poisoned");
             return SQL_ERROR;
         };
-        resolved
-    } else {
-        value_type
+        free_errors(&mut stmt_state);
+
+        // Fold the deprecated 2.x date/time C spellings onto the SQL_C_TYPE_*
+        // forms so only one form per type reaches validation, conversion, and
+        // storage.
+        let value_type = canonical_c_type(value_type);
+
+        // ValueType (C type) and ParameterType (SQL type) must be known type
+        // identifiers (HY003 / HY004).
+        if !is_valid_c_type(value_type) {
+            error!(
+                value_type,
+                "SQLBindParameter: invalid application buffer type"
+            );
+            post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
+            return SQL_ERROR;
+        }
+        match classify_parameter_sql_type(parameter_type) {
+            SqlTypeSupport::Supported => {}
+            SqlTypeSupport::NotImplemented => {
+                error!(
+                    parameter_type,
+                    "SQLBindParameter: unsupported SQL data type"
+                );
+                post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+                return SQL_ERROR;
+            }
+            SqlTypeSupport::Invalid => {
+                error!(parameter_type, "SQLBindParameter: invalid SQL data type");
+                post_diag(&mut stmt_state, ERR_INVALID_SQL_DATA_TYPE);
+                return SQL_ERROR;
+            }
+        }
+
+        // Resolve SQL_C_DEFAULT here so the execute path never sees the placeholder,
+        // matching msodbcsql, which stores the resolved type in the APD.
+        let c_type = if value_type == SQL_C_DEFAULT {
+            let Some(resolved) = resolve_default_c_type(parameter_type, odbc_version) else {
+                // Unreachable: every Supported type has a default C type, pinned by
+                // every_supported_sql_type_has_a_default_c_type.
+                debug_assert!(
+                    false,
+                    "no default C type for supported SQL type {parameter_type}"
+                );
+                error!(
+                    parameter_type,
+                    "SQLBindParameter: no default C type for this SQL type"
+                );
+                post_diag(&mut stmt_state, ERR_RESTRICTED_DATA_TYPE);
+                return SQL_ERROR;
+            };
+            resolved
+        } else {
+            value_type
+        };
+
+        // The C type -> SQL type conversion must be one this driver implements.
+        if !is_supported_conversion(c_type, parameter_type) {
+            error!(
+                c_type,
+                parameter_type, "SQLBindParameter: unsupported C/SQL type conversion"
+            );
+            post_diag(&mut stmt_state, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED);
+            return SQL_ERROR;
+        }
+
+        // ColumnSize is validated last, after the type and conversion checks, the
+        // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
+        if !parameter_column_size_is_valid(parameter_type, column_size) {
+            error!(
+                parameter_type,
+                column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
+            );
+            post_diag(&mut stmt_state, ERR_INVALID_PARAM_PRECISION_OR_SCALE);
+            return SQL_ERROR;
+        }
+
+        // Phase 1: input parameters only. Output / input-output binding is a
+        // deferred feature.
+        if input_output_type != SQL_PARAM_INPUT {
+            error!(
+                input_output_type,
+                "SQLBindParameter: only input parameters are supported"
+            );
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Output parameters not yet implemented",
+            );
+            return SQL_ERROR;
+        }
+
+        // A rebind invalidates any cached server-side prepared plan: the next
+        // SQLExecute must re-prepare so the plan matches the new bindings. This
+        // mirrors msodbcsql clearing DESC_CONSISTENT → FIsReprepareRequired. The
+        // prepared SQL text is kept; the server handle is orphaned for release
+        // (via sp_unprepare) at the next execute, forcing the sp_prepexec path.
+        stmt_state.orphan_prepared_handle();
+
+        (stmt_state.effective_apd(stmt), c_type)
     };
 
-    // The C type -> SQL type conversion must be one this driver implements.
-    if !is_supported_conversion(c_type, parameter_type) {
-        error!(
-            c_type,
-            parameter_type, "SQLBindParameter: unsupported C/SQL type conversion"
-        );
-        post_diag(&mut stmt_state, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED);
-        return SQL_ERROR;
-    }
-
-    // ColumnSize is validated last, after the type and conversion checks, the
-    // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
-    if !parameter_column_size_is_valid(parameter_type, column_size) {
-        error!(
-            parameter_type,
-            column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
-        );
-        post_diag(&mut stmt_state, ERR_INVALID_PARAM_PRECISION_OR_SCALE);
-        return SQL_ERROR;
-    }
-
-    // Phase 1: input parameters only. Output / input-output binding is a
-    // deferred feature.
-    if input_output_type != SQL_PARAM_INPUT {
-        error!(
-            input_output_type,
-            "SQLBindParameter: only input parameters are supported"
-        );
-        post_sql_error(
-            &mut stmt_state,
-            SQLSTATE_HYC00,
-            0,
-            "Output parameters not yet implemented",
-        );
-        return SQL_ERROR;
-    }
-
-    let idx = (parameter_number - 1) as usize;
-    if stmt_state.bound_params.len() <= idx {
-        stmt_state.bound_params.resize(idx + 1, None);
-    }
-    stmt_state.bound_params[idx] = Some(BoundParam {
+    let bound = BoundParam {
         input_output_type,
         c_type,
         sql_type: parameter_type,
@@ -246,17 +261,62 @@ fn sql_bind_parameter_safe(
         parameter_value_ptr,
         buffer_length,
         strlen_or_ind_ptr,
-    });
-
-    // A rebind invalidates any cached server-side prepared plan: the next
-    // SQLExecute must re-prepare so the plan matches the new bindings. This
-    // mirrors msodbcsql clearing DESC_CONSISTENT → FIsReprepareRequired. The
-    // prepared SQL text is kept; the server handle is orphaned for release
-    // (via sp_unprepare) at the next execute, forcing the sp_prepexec path.
-    stmt_state.orphan_prepared_handle();
+    };
+    let Ok(()) = bind_param_records(apd, stmt.ipd, parameter_number, bound) else {
+        error!("SQLBindParameter: apd/ipd mutex poisoned");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error binding parameter",
+            );
+        }
+        return SQL_ERROR;
+    };
 
     debug!(parameter_number, "SQLBindParameter: parameter bound");
     SQL_SUCCESS
+}
+
+/// Writes `bound` into `apd`'s and `ipd`'s records at `parameter_number`,
+/// growing either record list first if that ordinal doesn't exist yet on it.
+/// `Err(())` only on a poisoned mutex (either descriptor) — the caller
+/// decides how to report that against the statement, since bind errors are
+/// always posted to the STMT handle, never a descriptor.
+///
+/// Always locks `apd` before `ipd`: the only place in this crate that holds
+/// two DESC locks at once, so this order must stay the only order, matching
+/// how [`BoundParam::all_from_descriptor_states`] reads them back.
+fn bind_param_records(
+    apd: SqlHandle,
+    ipd: SqlHandle,
+    parameter_number: SqlUSmallInt,
+    bound: BoundParam,
+) -> Result<(), ()> {
+    let apd_desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    let Ok(mut apd_state) = apd_desc.inner.lock() else {
+        return Err(());
+    };
+    let ipd_desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
+    let Ok(mut ipd_state) = ipd_desc.inner.lock() else {
+        return Err(());
+    };
+
+    let target_count = apd_state.records.len().max(usize::from(parameter_number));
+    apd_state.set_record_count(target_count, apd_desc.kind);
+    let target_count = ipd_state.records.len().max(usize::from(parameter_number));
+    ipd_state.set_record_count(target_count, ipd_desc.kind);
+
+    let record_number = SqlSmallInt::try_from(parameter_number).unwrap_or(SqlSmallInt::MAX);
+    let apd_record = apd_state
+        .record_mut(record_number)
+        .expect("just grew the record list to include this parameter_number");
+    let ipd_record = ipd_state
+        .record_mut(record_number)
+        .expect("just grew the record list to include this parameter_number");
+    bound.write_to_records(apd_record, ipd_record);
+    Ok(())
 }
 
 /// Implements the `SQL_RESET_PARAMS` option of `SQLFreeStmt` — releases all
@@ -283,12 +343,27 @@ unsafe fn sql_free_stmt_reset_params_impl(statement_handle: SqlHandle) -> SqlRet
 }
 
 fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLFreeStmt(SQL_RESET_PARAMS): stmt mutex poisoned");
-        return SQL_ERROR;
+    // Per spec (`SQLFreeStmt`'s `SQL_RESET_PARAMS` option) this sets
+    // `SQL_DESC_COUNT` on the APD to 0 — a real truncation, matching
+    // `SQL_UNBIND`'s identical rule for the ARD (bind_col.rs). IPD is left
+    // alone: the spec names only the APD, and `BoundParam::from_records`
+    // gates entirely on the APD's `SQL_DESC_DATA_PTR`, so a stale IPD record
+    // beyond the truncated APD range is simply never visited.
+    let apd = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLFreeStmt(SQL_RESET_PARAMS): stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut stmt_state);
+        stmt_state.effective_apd(stmt)
     };
-    free_errors(&mut stmt_state);
-    stmt_state.bound_params.clear();
+
+    let desc = unsafe { handle_from_raw::<DescHandle>(apd) };
+    if let Ok(mut desc_state) = desc.inner.lock() {
+        desc_state.set_record_count(0, desc.kind);
+    } else {
+        error!("SQLFreeStmt(SQL_RESET_PARAMS): apd mutex poisoned; reset dropped");
+    }
     debug!("SQLFreeStmt(SQL_RESET_PARAMS): parameter bindings released");
     SQL_SUCCESS
 }
@@ -302,6 +377,22 @@ mod tests {
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
+
+    /// Every parameter position on `h`'s implicit APD/IPD, in ordinal order —
+    /// the same view `snapshot_bound_params` derives fresh before an execute.
+    fn bound_params(h: &TestHandles) -> Vec<Option<BoundParam>> {
+        let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        let apd_state = apd.inner.lock().unwrap();
+        let ipd_state = ipd.inner.lock().unwrap();
+        BoundParam::all_from_descriptor_states(&apd_state, &ipd_state)
+    }
+
+    /// `SQL_DESC_COUNT` on `h`'s implicit APD.
+    fn apd_record_count(h: &TestHandles) -> usize {
+        let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        apd.inner.lock().unwrap().records.len()
+    }
 
     #[test]
     fn null_handle_returns_invalid_handle() {
@@ -369,12 +460,11 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.bound_params.len(), 3);
-        assert!(state.bound_params[0].is_none());
-        assert!(state.bound_params[1].is_none());
-        assert!(state.bound_params[2].is_some());
+        let params = bound_params(&h);
+        assert_eq!(params.len(), 3);
+        assert!(params[0].is_none());
+        assert!(params[1].is_none());
+        assert!(params[2].is_some());
     }
 
     #[test]
@@ -396,11 +486,20 @@ mod tests {
                 &mut ind,
             )
         };
+        assert_eq!(
+            apd_record_count(&h),
+            1,
+            "parameter 1 should have grown the APD"
+        );
+
         let ret = unsafe { sql_free_stmt_reset_params(h.stmt) };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert!(state.bound_params.is_empty());
+        assert_eq!(
+            apd_record_count(&h),
+            0,
+            "SQL_RESET_PARAMS must reset SQL_DESC_COUNT to 0"
+        );
+        assert!(bound_params(&h).is_empty());
     }
 
     #[test]
@@ -526,9 +625,7 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        let bound = state.bound_params[0].expect("parameter 1 should be bound");
+        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
         assert_eq!(bound.c_type, SQL_C_CHAR);
     }
 
@@ -747,5 +844,98 @@ mod tests {
             orphaned,
             mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42)
         );
+    }
+
+    /// After `SQLSetStmtAttrW` reassociates the APD, `SQLBindParameter` must
+    /// write through to the *new* explicit descriptor, not the implicit one
+    /// it replaced — the actual bind-through-reassociation path, matching
+    /// `bind_col.rs`'s identical ARD test.
+    #[test]
+    fn bind_parameter_writes_through_a_reassociated_apd() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_apd = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    h.stmt,
+                    crate::api::odbc_types::SQL_ATTR_APP_PARAM_DESC,
+                    explicit_apd as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let mut buf: Vec<u8> = b"abc\0".to_vec();
+        let mut ind: SqlLen = crate::api::odbc_types::SQL_NTS as SqlLen;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let explicit = unsafe { handle_from_raw::<DescHandle>(explicit_apd) };
+        assert_eq!(
+            explicit.inner.lock().unwrap().records.len(),
+            1,
+            "the bind must land on the reassociated descriptor"
+        );
+        assert_eq!(
+            apd_record_count(&h),
+            0,
+            "the implicit APD it replaced must be untouched"
+        );
+    }
+
+    /// Freeing the explicit descriptor currently associated as the APD
+    /// resets the statement back to its implicit APD (`free_desc`'s existing
+    /// association-reset logic) — and a *subsequent* `SQLBindParameter` must
+    /// write through to that implicit descriptor rather than erroring or
+    /// touching the now-freed one.
+    #[test]
+    fn bind_parameter_falls_back_to_the_implicit_apd_after_the_explicit_one_is_freed() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_apd = h.alloc_explicit_desc();
+        unsafe {
+            crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                h.stmt,
+                crate::api::odbc_types::SQL_ATTR_APP_PARAM_DESC,
+                explicit_apd as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(h.free_explicit_desc(explicit_apd), SQL_SUCCESS);
+
+        let mut buf: Vec<u8> = b"abc\0".to_vec();
+        let mut ind: SqlLen = crate::api::odbc_types::SQL_NTS as SqlLen;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(
+            ret, SQL_SUCCESS,
+            "must fall back to the implicit APD, not error or touch freed memory"
+        );
+        assert_eq!(apd_record_count(&h), 1);
     }
 }

@@ -12,21 +12,27 @@
 //! the get/set entry points share a single source of truth for which fields
 //! apply to which kind.
 //!
-//! Scope note: IRD/IPD records here are the driver's own descriptor storage,
-//! independent of `StmtState::column_metadata` / `parameter_metadata`.
-//! Reconciling the two (populating IRD from a result set, IPD from
-//! `SQLDescribeParam`) is AB#47437, not this module — until then, IRD/IPD
-//! records exist and behave correctly per the ODBC field-access contract, but
-//! start out empty (`SQL_DESC_COUNT == 0`) rather than reflecting a live
-//! query. Catalog-style descriptive fields (`SQL_DESC_LABEL`,
-//! `TABLE_NAME`/`CATALOG_NAME`/`SCHEMA_NAME`, `LITERAL_PREFIX`/`SUFFIX`,
-//! `LOCAL_TYPE_NAME`, `TYPE_NAME`, `SEARCHABLE`, `UPDATABLE`,
-//! `CASE_SENSITIVE`, `AUTO_UNIQUE_VALUE`, `FIXED_PREC_SCALE`, `UNSIGNED`,
-//! `NUM_PREC_RADIX`, `DISPLAY_SIZE`) are likewise out of scope here: they
-//! remain answerable via the already-implemented `SQLColAttributeW`
-//! (`api::col_attribute`), and duplicating that mapping into descriptor
-//! storage ahead of the AB#47437 IRD-population design would risk the two
-//! diverging.
+//! Scope note: IRD/IPD records are populated from the driver's own live
+//! metadata sources, not read independently of them:
+//! `api::ird::populate_ird` rewrites the IRD from `column_metadata` after
+//! every execute and `SQLMoreResults` advance (AB#47437), using the exact
+//! field-mapping functions `SQLDescribeColW`/`SQLColAttributeW` already use,
+//! so the three cannot disagree for the same column; `describe_param.rs`'s
+//! `refine_ipd` does the equivalent for IPD from `SQLDescribeParam`'s
+//! server-described `parameter_metadata`, overriding whatever
+//! `SQLBindParameter` guessed at bind time. One deliberate, narrow gap
+//! remains: the IRD is not reset to empty when a cursor closes
+//! (`SQLCloseCursor`/`SQLFreeStmt(SQL_CLOSE)`/`SQLMoreResults`'s
+//! batch-end/error arms) — see `api::ird::populate_ird`'s doc comment for
+//! why this is safe in practice. Catalog-style descriptive fields
+//! (`SQL_DESC_LABEL`, `TABLE_NAME`/`CATALOG_NAME`/`SCHEMA_NAME`,
+//! `LITERAL_PREFIX`/`SUFFIX`, `LOCAL_TYPE_NAME`, `TYPE_NAME`, `SEARCHABLE`,
+//! `UPDATABLE`, `CASE_SENSITIVE`, `AUTO_UNIQUE_VALUE`, `FIXED_PREC_SCALE`,
+//! `UNSIGNED`, `NUM_PREC_RADIX`, `DISPLAY_SIZE`) remain out of scope here:
+//! they stay answerable via the already-implemented `SQLColAttributeW`
+//! (`api::col_attribute`) alone, deliberately not duplicated into descriptor
+//! storage, since nothing above needs them to close the ARD/APD/IRD/IPD
+//! binding-and-metadata gap this module used to describe.
 //!
 //! Same scope note applies to four `DescHeader` fields the ODBC spec defines
 //! as *aliases* of statement attributes rather than as independent storage:
@@ -36,25 +42,21 @@
 //! (`SQL_ATTR_ROWS_FETCHED_PTR`). `DescHeader` stores these independently of
 //! `StmtState`'s equivalent fields (`set_stmt_attr.rs`), so a
 //! `SQLSetStmtAttrW`/`SQLGetDescFieldW` pair (or the reverse) on the same
-//! logical value currently sees two unaliased copies.
+//! logical value currently sees two unaliased copies. This is the one
+//! header-field gap AB#47437 did not close: it scoped record-level binding
+//! and metadata, not header-level attribute aliasing.
 //!
-//! Same gap on the ARD *record* side, and — since AB#46580 landed
-//! `SQLBindCol`/`SQLFetchScroll` (`bind_col.rs`/`fetch_scroll.rs`) — no longer
-//! hypothetical: `SQLBindCol` stores each binding in `StmtState::bindings`
-//! (`ColumnBinding`: `target_type`, `target_value_ptr`, `buffer_length`,
-//! `strlen_or_ind_ptr`) with no reference to the ARD at all, and
-//! `SQLFetchScroll` reads only `StmtState::bindings` and the four header
-//! fields above to fill a rowset. So today, on this same statement:
-//! `SQLBindCol` leaves the ARD's own `SQL_DESC_COUNT`/`TYPE`/`DATA_PTR`/
-//! `OCTET_LENGTH`/`INDICATOR_PTR` at their unbound defaults, and conversely a
-//! column bound purely through `SQLSetDescFieldW` on the ARD — the
-//! ODBC-documented alternative to `SQLBindCol` — is invisible to
-//! `SQLFetchScroll`, which never consults the ARD. Not this module's or
-//! AB#46580's job to close (reconciling both directions needs a single owner
-//! for bind state, decided once), but the header-field note above no longer
-//! describes a someday-consumer: the divergence is real and observable
-//! today. Tracked under the same AB#47437 aliasing work as the IRD/IPD
-//! record population above.
+//! The equivalent *record*-side gap — `SQLBindCol` storing bindings
+//! somewhere other than the ARD, invisible to a column bound purely through
+//! `SQLSetDescFieldW` — is resolved: the ARD's own records (`ColumnBinding`'s
+//! `write_to_record`/`from_record`, `bind_col.rs`) are now the single
+//! storage `SQLBindCol` and `SQLFetchScroll` share, and the equivalent
+//! APD/IPD pairing for `SQLBindParameter`/execute (`BoundParam`'s
+//! `write_to_records`/`from_records`, `bind_param.rs`/`exec_common.rs`) closes
+//! the same gap for parameters. `SQLGetDescRecW`/`SQLSetDescRecW`
+//! (`api::get_desc_rec.rs`/`api::set_desc_rec.rs`) round out the descriptor
+//! API surface over this same storage, reusing `set_desc_field.rs`'s own
+//! field setters so the bulk and single-field APIs cannot diverge.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -223,7 +225,7 @@ impl DescRecord {
     /// msodbcsql since it is always populated from result metadata rather
     /// than grown by an application `SQL_DESC_COUNT` write; a freshly grown
     /// IRD record here is simply zeroed, matching an unpopulated column.
-    fn default_for(kind: DescKind) -> Self {
+    pub(crate) fn default_for(kind: DescKind) -> Self {
         let (concise_type, parameter_type, nullable) = match kind {
             DescKind::AppRow | DescKind::AppParam | DescKind::Ad => (SQL_C_DEFAULT, 0, 0),
             DescKind::ImpParam => (0, SQL_PARAM_INPUT, SQL_NULLABLE),
@@ -245,28 +247,38 @@ impl DescRecord {
         }
     }
 
-    /// `SQL_DESC_TYPE`, the verbose form of `concise_type`: the datetime
-    /// family (`SQL_TYPE_DATE..=SQL_TYPE_TIMESTAMP`) collapses to
-    /// `SQL_DATETIME`, with the member identified by
-    /// `datetime_interval_code`; every other type reports its concise value
-    /// unchanged.
+    /// `SQL_DESC_TYPE`, the verbose form of `concise_type`: `SQL_TYPE_TIME`/
+    /// `SQL_TYPE_TIMESTAMP` collapse to `SQL_DATETIME`, with the member
+    /// identified by `datetime_interval_code`; every other type — including
+    /// `SQL_TYPE_DATE` — reports its concise value unchanged.
     ///
-    /// Deliberately simpler than msodbcsql's equivalent
-    /// (`sqlcdesc.cpp:2226-2243`): msodbcsql stores descriptor types in a
-    /// 2.x-era internal representation and remaps on both read and write.
-    /// This driver targets ODBC 3.x only
+    /// `SQL_TYPE_DATE` is deliberately excluded from the fold, not an
+    /// oversight: verified against msodbcsql's own `GetDescField`
+    /// (`sqlcdesc.cpp:2226-2236`), which special-cases its stored `SQL_DATE`
+    /// tag to answer `SQL_DESC_TYPE = SQL_TYPE_DATE` — *not* the verbose
+    /// `SQL_DATETIME` its `SQL_TIME`/`SQL_TIMESTAMP` siblings fold to — and
+    /// matches this crate's own `SQLColAttributeW` (`col_attribute.rs`'s
+    /// `verbose_type`, `is_odbc_timestamp` excludes `TdsDataType::DateN` for
+    /// the identical reason), which an IRD populated from live column
+    /// metadata must agree with (AB#47437's consistency requirement) —
+    /// folding `SQL_TYPE_DATE` here would silently disagree with that
+    /// already-verified answer for every `date` column.
+    ///
+    /// Otherwise deliberately simpler than msodbcsql's equivalent:
+    /// msodbcsql stores descriptor types in a 2.x-era internal
+    /// representation and remaps on both read and write. This driver
+    /// targets ODBC 3.x only
     /// (`.github/instructions/mssql-odbc.instructions.md`) and stores the
-    /// 3.x concise value directly, so verbose synthesis is a direct range
+    /// 3.x concise value directly, so verbose synthesis is a direct type
     /// check rather than a remap. The ODBC `SQL_INTERVAL_*` family is
     /// likewise not folded to a verbose `SQL_INTERVAL`: SQL Server has no
     /// interval SQL type, so no concise interval value can ever reach a
     /// descriptor record through this driver's execution path.
     pub(crate) fn verbose_type(&self) -> SqlSmallInt {
-        use crate::api::odbc_types::{SQL_DATETIME, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP};
-        if (SQL_TYPE_DATE..=SQL_TYPE_TIMESTAMP).contains(&self.concise_type) {
-            SQL_DATETIME
-        } else {
-            self.concise_type
+        use crate::api::odbc_types::{SQL_DATETIME, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP};
+        match self.concise_type {
+            SQL_TYPE_TIME | SQL_TYPE_TIMESTAMP => SQL_DATETIME,
+            _ => self.concise_type,
         }
     }
 }
@@ -709,10 +721,20 @@ mod tests {
         assert!(state.record_mut(0).is_none());
     }
 
+    /// `SQL_TYPE_DATE` is the one member of the "datetime family" that does
+    /// *not* fold to the verbose `SQL_DATETIME` — verified against
+    /// msodbcsql's `GetDescField` (`sqlcdesc.cpp:2226-2236`), which
+    /// special-cases it to answer its own concise value, unlike
+    /// `SQL_TYPE_TIME`/`SQL_TYPE_TIMESTAMP` which do fold. Getting this wrong
+    /// would disagree with `SQLColAttributeW`'s already-verified answer for
+    /// a `date` column once an IRD is populated from live metadata
+    /// (AB#47437) — see [`super::verbose_type`]'s doc comment.
     #[test]
-    fn verbose_type_collapses_datetime_family_and_passes_through_others() {
+    fn verbose_type_passes_through_date_but_collapses_time_and_timestamp() {
         let mut record = DescRecord::default_for(DescKind::ImpRow);
         record.concise_type = SQL_TYPE_DATE;
+        assert_eq!(record.verbose_type(), SQL_TYPE_DATE);
+        record.concise_type = crate::api::odbc_types::SQL_TYPE_TIME;
         assert_eq!(record.verbose_type(), SQL_DATETIME);
         record.concise_type = SQL_TYPE_TIMESTAMP;
         assert_eq!(record.verbose_type(), SQL_DATETIME);

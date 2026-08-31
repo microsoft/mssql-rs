@@ -13,7 +13,7 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
-    park_dae_client,
+    park_dae_client, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -247,6 +247,14 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
 /// setting `EXEC_STARTED` on success. Application value buffers are read here by
 /// reference (no network I/O).
 fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
+    // Snapshotted before the STMT lock below is taken — this crate never
+    // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
+    // rationale). Not applied to `stmt_state.bound_params` until every
+    // early-return check below has passed: a statement already mid-DAE-
+    // sequence must keep that sequence's own frozen snapshot if this call
+    // turns out to be a rejected re-entry rather than a real new execute.
+    let bound_params = snapshot_bound_params(stmt);
+
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecute: stmt mutex poisoned");
         return Err(SQL_ERROR);
@@ -291,6 +299,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         .expect("prepared checked non-None above")
         .marker_count;
 
+    // All state-sequencing checks passed: this is a real new execute, so the
+    // fresh snapshot now becomes the one `build_named_params` and any DAE
+    // sequence it opens will read for the rest of this execute.
+    stmt_state.bound_params = bound_params;
+
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
     let ParamsWithDae { params, dae_params } =
@@ -329,11 +342,12 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::bind_param::sql_bind_parameter;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+        SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SQL_VARCHAR,
+        SqlLen,
     };
     use crate::api::util::rewrite_param_markers;
-    use crate::params::BoundParam;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
@@ -432,20 +446,21 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
-        stmt.inner
-            .lock()
-            .unwrap()
-            .bound_params
-            .push(Some(BoundParam {
-                input_output_type: SQL_PARAM_INPUT,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR,
-                column_size: 0,
-                decimal_digits: 0,
-                parameter_value_ptr: std::ptr::null_mut(),
-                buffer_length: 0,
-                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
-            }));
+        let bind_ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(bind_ret, SQL_SUCCESS);
 
         let ret = unsafe { sql_execute(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
@@ -547,20 +562,21 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
-        stmt.inner
-            .lock()
-            .unwrap()
-            .bound_params
-            .push(Some(BoundParam {
-                input_output_type: SQL_PARAM_INPUT,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR,
-                column_size: 0,
-                decimal_digits: 0,
-                parameter_value_ptr: std::ptr::null_mut(),
-                buffer_length: 0,
-                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
-            }));
+        let bind_ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(bind_ret, SQL_SUCCESS);
 
         let staging = stage_execution(stmt).expect("staging should succeed");
         match staging {

@@ -9,7 +9,7 @@ use mssql_tds::connection::tds_client::StreamedParamStatus;
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
-    flush_pending_unprepare, park_dae_client,
+    flush_pending_unprepare, park_dae_client, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -85,6 +85,13 @@ fn sql_exec_direct_w_safe(
 
     let dbc = stmt.parent_dbc();
 
+    // Snapshotted before the STMT lock below is taken — this crate never
+    // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
+    // rationale). Not applied to `stmt_state.bound_params` until the
+    // early-return checks below have passed, so a rejected re-entry during
+    // an active DAE sequence can't clobber that sequence's own snapshot.
+    let bound_params = snapshot_bound_params(stmt);
+
     // Check STMT state, gather parameter values, and reset prior context.
     let (named_params, rewritten_sql, marker_count) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -106,6 +113,7 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        stmt_state.bound_params = bound_params;
         // Rewrite markers and read the bound parameter buffers before mutating
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
