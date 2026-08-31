@@ -54,6 +54,7 @@ struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
     pending_rows: VecDeque<VecDeque<i32>>,
     active_row: Option<VecDeque<i32>>,
+    buffered_prefix_columns: Option<usize>,
     reset_mode: ResetConnectionMode,
     reset_dispatched: bool,
     known_dead: bool,
@@ -65,13 +66,18 @@ impl TokenReplayTransport {
             pending_tokens: VecDeque::from(tokens),
             pending_rows: VecDeque::new(),
             active_row: None,
+            buffered_prefix_columns: None,
             reset_mode: ResetConnectionMode::None,
             reset_dispatched: false,
             known_dead: false,
         }
     }
 
-    fn with_int_rows(metadata: Tokens, rows: Vec<Vec<i32>>) -> Self {
+    fn with_int_rows(
+        metadata: Tokens,
+        rows: Vec<Vec<i32>>,
+        buffered_prefix_columns: Option<usize>,
+    ) -> Self {
         let done = Tokens::Done(DoneToken {
             status: DoneStatus::FINAL,
             cur_cmd: CurrentCommand::Select,
@@ -79,6 +85,7 @@ impl TokenReplayTransport {
         });
         let mut transport = Self::new(vec![metadata, done]);
         transport.pending_rows = rows.into_iter().map(VecDeque::from).collect();
+        transport.buffered_prefix_columns = buffered_prefix_columns;
         transport
     }
 
@@ -125,8 +132,20 @@ impl TdsTokenStreamReader for TokenReplayTransport {
     fn try_read_buffered_test_row(
         &mut self,
         _pause_state: &mut RowPauseState,
-    ) -> TdsResult<Option<Vec<i32>>> {
-        Ok(self.active_row.take().map(VecDeque::into))
+    ) -> TdsResult<Option<(Vec<i32>, bool)>> {
+        let Some(row) = self.active_row.as_mut() else {
+            return Ok(None);
+        };
+        let take = self
+            .buffered_prefix_columns
+            .unwrap_or(row.len())
+            .min(row.len());
+        let prefix = row.drain(..take).collect();
+        let complete = row.is_empty();
+        if complete {
+            self.active_row = None;
+        }
+        Ok(Some((prefix, complete)))
     }
 
     async fn receive_token(
@@ -178,12 +197,19 @@ impl TdsTokenStreamReader for TokenReplayTransport {
     // these resume paths are therefore unreachable for it.
     async fn resume_row_into(
         &mut self,
-        _pause_state: RowPauseState,
+        mut pause_state: RowPauseState,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
         _plan: ColumnPolicy,
-        _writer: &mut (dyn RowWriter + Send),
+        writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
+        if let Some(mut row) = self.active_row.take() {
+            while let Some(value) = row.pop_front() {
+                writer.write_i32(pause_state.next_column_index, value);
+                pause_state.next_column_index += 1;
+            }
+            return Ok(RowReadResult::RowWritten);
+        }
         Err(crate::error::Error::ConnectionClosed("test".to_string()))
     }
 
@@ -301,7 +327,37 @@ pub fn tds_client_from_int_rows(rows: Vec<Vec<i32>>) -> TdsClient {
         columns: int_columns(width),
         cek_table: Vec::new(),
     });
-    let transport = AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows));
+    let transport =
+        AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows, None));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let execution_context = ExecutionContext::new();
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+        Vec::new(),
+    )
+}
+
+/// Builds an integer-row client whose buffered whole-row attempt writes only
+/// `buffered_prefix_columns` before forcing async continuation.
+pub fn tds_client_from_partial_int_rows(
+    rows: Vec<Vec<i32>>,
+    buffered_prefix_columns: usize,
+) -> TdsClient {
+    let width = rows.first().map_or(0, Vec::len);
+    let metadata = Tokens::ColMetadata(ColMetadataToken {
+        column_count: u16::try_from(width).unwrap_or(u16::MAX),
+        columns: int_columns(width),
+        cek_table: Vec::new(),
+    });
+    let transport = AnyTransport::dynamic(TokenReplayTransport::with_int_rows(
+        metadata,
+        rows,
+        Some(buffered_prefix_columns),
+    ));
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");
@@ -469,7 +525,7 @@ mod tests {
     #[test]
     fn buffered_rows_require_column_metadata_context() {
         let metadata = Tokens::ColMetadata(ColMetadataToken::default());
-        let mut transport = TokenReplayTransport::with_int_rows(metadata, vec![vec![1]]);
+        let mut transport = TokenReplayTransport::with_int_rows(metadata, vec![vec![1]], None);
 
         assert!(
             transport

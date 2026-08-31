@@ -674,7 +674,7 @@ fn fill_rowset(
         .is_some_and(|binding| binding.column_number as usize == column_count)
         && client.current_result_supports_row_into();
 
-    dispatch_rows(row_budget, |_| {
+    dispatch_rows(row_budget, || {
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
         if can_write_complete_rows {
@@ -906,9 +906,9 @@ fn row_budget(max_rows: SqlULen, rows_returned: SqlULen, row_array_size: SqlULen
 
 /// Calls `dispatch` for consecutive row slots until the budget is spent or the
 /// callback reports that no later row should be attempted.
-fn dispatch_rows(row_budget: SqlULen, mut dispatch: impl FnMut(SqlULen) -> bool) {
-    for row in 0..row_budget {
-        if !dispatch(row) {
+fn dispatch_rows(row_budget: SqlULen, mut dispatch: impl FnMut() -> bool) {
+    for _ in 0..row_budget {
+        if !dispatch() {
             break;
         }
     }
@@ -1218,7 +1218,7 @@ mod tests {
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::test_client_support::{
         col_metadata_empty, done_no_more, int_columns, tds_client_from_int_rows,
-        tds_client_from_tokens,
+        tds_client_from_partial_int_rows, tds_client_from_tokens,
     };
 
     fn binding(
@@ -1473,6 +1473,83 @@ mod tests {
         );
         assert_eq!(value, 10);
         assert_eq!(indicator, 4);
+
+        let mut second = 0_i32;
+        let mut second_indicator = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::get_data::sql_get_data(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    (&mut second as *mut i32).cast(),
+                    0,
+                    &mut second_indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(second, 20);
+        assert_eq!(second_indicator, 4);
+    }
+
+    fn assert_partial_buffered_row_delivery(buffered_prefix_columns: usize) {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut first = [0_i32; 2];
+        let mut second = [0_i32; 2];
+        let mut first_indicators = [0 as SqlLen; 2];
+        let mut second_indicators = [0 as SqlLen; 2];
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(2));
+            state.set_binding(binding(
+                1,
+                SQL_C_SLONG,
+                first.as_mut_ptr().cast(),
+                0,
+                first_indicators.as_mut_ptr(),
+            ));
+            state.set_binding(binding(
+                2,
+                SQL_C_SLONG,
+                second.as_mut_ptr().cast(),
+                0,
+                second_indicators.as_mut_ptr(),
+            ));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client =
+            tds_client_from_partial_int_rows(vec![vec![10, 20]], buffered_prefix_columns);
+        dbc.runtime
+            .block_on(client.execute("SELECT partial buffered row".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(first[0], 10);
+        assert_eq!(second[0], 20);
+        assert_eq!(first_indicators[0], 4);
+        assert_eq!(second_indicators[0], 4);
+    }
+
+    #[test]
+    fn bound_row_writer_survives_continuation_after_row_header() {
+        assert_partial_buffered_row_delivery(0);
+    }
+
+    #[test]
+    fn bound_row_writer_survives_continuation_after_first_column() {
+        assert_partial_buffered_row_delivery(1);
     }
 
     /// The cap is per result set, so advancing onto a new one must restart the

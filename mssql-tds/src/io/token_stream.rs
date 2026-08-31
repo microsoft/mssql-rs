@@ -219,7 +219,7 @@ pub(crate) trait TdsTokenStreamReader {
     fn try_read_buffered_test_row(
         &mut self,
         _pause_state: &mut RowPauseState,
-    ) -> TdsResult<Option<Vec<i32>>> {
+    ) -> TdsResult<Option<(Vec<i32>, bool)>> {
         Ok(None)
     }
 
@@ -302,7 +302,7 @@ pub trait TdsTokenStreamReader {
     fn try_read_buffered_test_row(
         &mut self,
         _pause_state: &mut RowPauseState,
-    ) -> TdsResult<Option<Vec<i32>>> {
+    ) -> TdsResult<Option<(Vec<i32>, bool)>> {
         Ok(None)
     }
 
