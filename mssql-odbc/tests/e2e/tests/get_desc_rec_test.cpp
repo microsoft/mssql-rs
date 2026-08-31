@@ -100,13 +100,17 @@ TEST_F(GetDescRecLiveTest, ReadsBackValueSetBySetDescField) {
 
 TEST_F(GetDescRecLiveTest, NameTruncationReturnsInfo) {
     SQLHDESC hdesc = ImpParamDesc();
-    ASSERT_SQL_OK(SQLSetDescFieldW(hdesc, 1, SQL_DESC_NAME,
-                                   const_cast<SQLTCHAR*>(
-                                       ODBCTestUtils::ToSqlTStr("a_long_parameter_name").c_str()),
-                                   SQL_NTS),
+    // SQLSetDescFieldW/SQLGetDescRecW are explicit wide entry points: their
+    // string arguments are always SQLWCHAR (UTF-16), regardless of whether
+    // this test binary itself was built with UNICODE/_UNICODE (SQLTCHAR is
+    // narrow on the non-Windows leg of this suite - see CMakeLists.txt).
+    std::string narrow_name = "a_long_parameter_name";
+    std::vector<SQLWCHAR> wide_name(narrow_name.begin(), narrow_name.end());
+    wide_name.push_back(0);
+    ASSERT_SQL_OK(SQLSetDescFieldW(hdesc, 1, SQL_DESC_NAME, wide_name.data(), SQL_NTS),
                   SQL_HANDLE_DESC, hdesc);
 
-    SQLTCHAR name[5] = {};
+    SQLWCHAR name[5] = {};
     SQLSMALLINT name_len = -1;
     SQLRETURN rc = SQLGetDescRecW(hdesc, 1, name, 5, &name_len, nullptr, nullptr, nullptr,
                                   nullptr, nullptr, nullptr);

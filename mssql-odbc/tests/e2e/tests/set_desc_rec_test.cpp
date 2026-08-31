@@ -1,5 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
-// set_desc_rec_test.cpp - Tests for SQLSetDescRecW.
+// set_desc_rec_test.cpp - Tests for SQLSetDescRec.
+//
+// Unlike SQLGetDescRecW, this function has no W/A split — none of its
+// arguments are character data, so the ODBC spec declares only one entry
+// point (sql.h has SQLSetDescRec, not SQLSetDescRecW/SQLSetDescRecA).
 //
 // Verifies:
 //   1. NullHandle                    - null descriptor handle -> SQL_INVALID_HANDLE
@@ -8,10 +12,10 @@
 //   4. GrowsRecordCount              - RecNumber > SQL_DESC_COUNT grows the record plex
 //   5. DatetimeSubTypeResolvesConciseType - Type=SQL_DATETIME + SubType=
 //      SQL_CODE_TIMESTAMP resolves SQL_DESC_CONCISE_TYPE to SQL_TYPE_TIMESTAMP
-//   6. EquivalentToSetDescFieldSequence - one SQLSetDescRecW call and the
+//   6. EquivalentToSetDescFieldSequence - one SQLSetDescRec call and the
 //      equivalent sequence of SQLSetDescFieldW calls produce the same record
 //   7. BindsAParameterUsableForExecute - a parameter bound purely through
-//      SQLSetDescRecW (never SQLBindParameter) executes correctly — the
+//      SQLSetDescRec (never SQLBindParameter) executes correctly — the
 //      strongest form of AB#47437's "descriptor-field and convenience bind
 //      APIs must be equivalent" requirement
 
@@ -21,7 +25,7 @@
 
 TEST(SetDescRecTest, NullHandle) {
     EXPECT_EQ(SQL_INVALID_HANDLE,
-              SQLSetDescRecW(SQL_NULL_HANDLE, 1, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr,
+              SQLSetDescRec(SQL_NULL_HANDLE, 1, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr,
                              nullptr));
 }
 
@@ -68,14 +72,14 @@ protected:
 TEST_F(SetDescRecLiveTest, CannotModifyIrd) {
     SQLHDESC hdesc = ImpRowDesc();
     ASSERT_SQL_ERROR(
-        SQLSetDescRecW(hdesc, 1, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr, nullptr));
+        SQLSetDescRec(hdesc, 1, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr, nullptr));
     EXPECT_SQLSTATE(SQL_HANDLE_DESC, hdesc, "HY016");
 }
 
 TEST_F(SetDescRecLiveTest, RecordNumberZeroReturnsError) {
     SQLHDESC hdesc = AppParamDesc();
     ASSERT_SQL_ERROR(
-        SQLSetDescRecW(hdesc, 0, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr, nullptr));
+        SQLSetDescRec(hdesc, 0, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr, nullptr));
     EXPECT_SQLSTATE(SQL_HANDLE_DESC, hdesc, "07009");
 }
 
@@ -83,14 +87,14 @@ TEST_F(SetDescRecLiveTest, GrowsRecordCount) {
     SQLHDESC hdesc = AppParamDesc();
     EXPECT_EQ(0, GetSmallInt(hdesc, 0, SQL_DESC_COUNT));
     ASSERT_SQL_OK(
-        SQLSetDescRecW(hdesc, 3, SQL_C_LONG, 0, 0, 0, 0, nullptr, nullptr, nullptr),
+        SQLSetDescRec(hdesc, 3, SQL_C_LONG, 0, 0, 0, 0, nullptr, nullptr, nullptr),
         SQL_HANDLE_DESC, hdesc);
     EXPECT_EQ(3, GetSmallInt(hdesc, 0, SQL_DESC_COUNT));
 }
 
 TEST_F(SetDescRecLiveTest, DatetimeSubTypeResolvesConciseType) {
     SQLHDESC hdesc = AppParamDesc();
-    ASSERT_SQL_OK(SQLSetDescRecW(hdesc, 1, SQL_DATETIME, SQL_CODE_TIMESTAMP, 0, 0, 0, nullptr,
+    ASSERT_SQL_OK(SQLSetDescRec(hdesc, 1, SQL_DATETIME, SQL_CODE_TIMESTAMP, 0, 0, 0, nullptr,
                                  nullptr, nullptr),
                   SQL_HANDLE_DESC, hdesc);
     EXPECT_EQ(SQL_TYPE_TIMESTAMP, GetSmallInt(hdesc, 1, SQL_DESC_CONCISE_TYPE));
@@ -111,7 +115,7 @@ TEST_F(SetDescRecLiveTest, EquivalentToSetDescFieldSequence) {
     SQLINTEGER buf_a = 0;
     SQLLEN ind_a = 0;
     ASSERT_SQL_OK(
-        SQLSetDescRecW(via_rec, 1, SQL_C_LONG, 0, 0, 0, 0, &buf_a, nullptr, &ind_a),
+        SQLSetDescRec(via_rec, 1, SQL_C_LONG, 0, 0, 0, 0, &buf_a, nullptr, &ind_a),
         SQL_HANDLE_DESC, via_rec);
 
     SQLINTEGER buf_b = 0;
@@ -148,7 +152,7 @@ TEST_F(SetDescRecLiveTest, EquivalentToSetDescFieldSequence) {
 }
 
 // The strongest form of AB#47437's equivalence requirement: a parameter bound
-// purely through SQLSetDescRecW (SQLBindParameter is never called) must be
+// purely through SQLSetDescRec (SQLBindParameter is never called) must be
 // just as usable for a real execute as one bound the conventional way. The
 // APD carries the C type/buffer, the IPD carries the SQL type — exactly the
 // two descriptors SQLBindParameter itself writes in one call
@@ -158,12 +162,12 @@ TEST_F(SetDescRecLiveTest, BindsAParameterUsableForExecute) {
     SQLHDESC apd = AppParamDesc();
     SQLINTEGER value = 42;
     SQLLEN ind = 0;
-    ASSERT_SQL_OK(SQLSetDescRecW(apd, 1, SQL_C_LONG, 0, 0, 0, 0, &value, nullptr, &ind),
+    ASSERT_SQL_OK(SQLSetDescRec(apd, 1, SQL_C_LONG, 0, 0, 0, 0, &value, nullptr, &ind),
                   SQL_HANDLE_DESC, apd);
 
     SQLHDESC ipd = ImpParamDesc();
     ASSERT_SQL_OK(
-        SQLSetDescRecW(ipd, 1, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr, nullptr),
+        SQLSetDescRec(ipd, 1, SQL_INTEGER, 0, 0, 0, 0, nullptr, nullptr, nullptr),
         SQL_HANDLE_DESC, ipd);
 
     SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT CAST(? AS INT)");

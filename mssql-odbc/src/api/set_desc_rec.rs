@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implementation of `SQLSetDescRecW`.
+//! Implementation of `SQLSetDescRec`.
 //!
 //! Sets the same eight fields `SQLSetDescFieldW` can set individually —
 //! `SQL_DESC_TYPE`, `SQL_DESC_DATETIME_INTERVAL_CODE`, `SQL_DESC_OCTET_LENGTH`,
@@ -11,6 +11,11 @@
 //! (`set_type`/`set_precision`/`set_scale`/`set_data_ptr`/`write_record_field`),
 //! so the two APIs cannot diverge in what they accept or how they resolve a
 //! type: this is the same descriptor-record storage either way (AB#47437).
+//!
+//! No `W`/`A` split: none of `SQLSetDescRec`'s arguments are character data
+//! (unlike `SQLGetDescRecW`'s `Name`), so the ODBC spec defines only the one
+//! entry point — `sql.h` declares `SQLSetDescRec` directly, with no
+//! `SQLSetDescRecW`/`SQLSetDescRecA` pair.
 
 use tracing::{debug, error};
 
@@ -26,12 +31,12 @@ use crate::error::free_errors;
 use crate::handles::desc::DescKind;
 use crate::handles::{DescHandle, HandleType, handle_from_raw};
 
-/// Implementation of [`SQLSetDescRecW`](super::exports::SQLSetDescRecW).
+/// Implementation of [`SQLSetDescRec`](super::exports::SQLSetDescRec).
 ///
 /// # Safety
 /// See the exported function's doc for caller requirements.
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn sql_set_desc_rec_w(
+pub(crate) unsafe fn sql_set_desc_rec(
     descriptor_handle: SqlHandle,
     record_number: SqlSmallInt,
     field_type: SqlSmallInt,
@@ -54,10 +59,10 @@ pub(crate) unsafe fn sql_set_desc_rec_w(
         ?data_ptr,
         ?string_length_ptr,
         ?indicator_ptr,
-        "SQLSetDescRecW called",
+        "SQLSetDescRec called",
     );
-    crate::ffi_entry!("SQLSetDescRecW", unsafe {
-        sql_set_desc_rec_w_impl(
+    crate::ffi_entry!("SQLSetDescRec", unsafe {
+        sql_set_desc_rec_impl(
             descriptor_handle,
             record_number,
             field_type,
@@ -73,7 +78,7 @@ pub(crate) unsafe fn sql_set_desc_rec_w(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn sql_set_desc_rec_w_impl(
+unsafe fn sql_set_desc_rec_impl(
     descriptor_handle: SqlHandle,
     record_number: SqlSmallInt,
     field_type: SqlSmallInt,
@@ -86,7 +91,7 @@ unsafe fn sql_set_desc_rec_w_impl(
     indicator_ptr: *mut SqlLen,
 ) -> SqlReturn {
     if descriptor_handle.is_null() {
-        error!("SQLSetDescRecW: descriptor_handle is null");
+        error!("SQLSetDescRec: descriptor_handle is null");
         return SQL_INVALID_HANDLE;
     }
 
@@ -94,10 +99,10 @@ unsafe fn sql_set_desc_rec_w_impl(
     debug_assert_eq!(
         desc.object_type,
         HandleType::Desc,
-        "SQLSetDescRecW: handle is not a DESC"
+        "SQLSetDescRec: handle is not a DESC"
     );
 
-    sql_set_desc_rec_w_safe(
+    sql_set_desc_rec_safe(
         desc,
         record_number,
         field_type,
@@ -112,7 +117,7 @@ unsafe fn sql_set_desc_rec_w_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sql_set_desc_rec_w_safe(
+fn sql_set_desc_rec_safe(
     desc: &DescHandle,
     record_number: SqlSmallInt,
     field_type: SqlSmallInt,
@@ -125,7 +130,7 @@ fn sql_set_desc_rec_w_safe(
     indicator_ptr: *mut SqlLen,
 ) -> SqlReturn {
     let Ok(mut state) = desc.inner.lock() else {
-        error!("SQLSetDescRecW: desc mutex poisoned");
+        error!("SQLSetDescRec: desc mutex poisoned");
         return SQL_ERROR;
     };
     free_errors(&mut state);
@@ -133,7 +138,7 @@ fn sql_set_desc_rec_w_safe(
     // "must not be an IRD handle" (spec) — mirrors SQLSetDescFieldW's own
     // blanket IRD gate (set_desc_field.rs).
     if desc.kind == DescKind::ImpRow {
-        error!("SQLSetDescRecW: cannot modify an implementation row descriptor");
+        error!("SQLSetDescRec: cannot modify an implementation row descriptor");
         post_diag(&mut state, ERR_CANNOT_MODIFY_IRD);
         return SQL_ERROR;
     }
@@ -142,7 +147,7 @@ fn sql_set_desc_rec_w_safe(
     // bind_col.rs's identical rejection of the bookmark column, and
     // SQLGetDescRecW's matching gate — so record 0 is out of range here too.
     if record_number < 1 {
-        error!(record_number, "SQLSetDescRecW: invalid record number");
+        error!(record_number, "SQLSetDescRec: invalid record number");
         post_diag(&mut state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     }
@@ -211,7 +216,7 @@ fn sql_set_desc_rec_w_safe(
         return data_ptr_write;
     }
 
-    debug!(record_number, "SQLSetDescRecW: record updated");
+    debug!(record_number, "SQLSetDescRec: record updated");
     SQL_SUCCESS
 }
 
@@ -273,7 +278,7 @@ mod tests {
     #[test]
     fn null_handle_returns_invalid_handle() {
         let ret = unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 SQL_NULL_HANDLE,
                 1,
                 SQL_INTEGER,
@@ -293,7 +298,7 @@ mod tests {
     fn cannot_modify_ird_returns_hy016() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret = unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 h.ird(),
                 1,
                 SQL_INTEGER,
@@ -314,7 +319,7 @@ mod tests {
     fn record_number_zero_returns_invalid_descriptor_index() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret = unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 h.ard(),
                 0,
                 SQL_INTEGER,
@@ -339,7 +344,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         assert_eq!(record_count(h.ard()), 0);
         let ret = unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 h.ard(),
                 3,
                 canonical_c_type_i32(),
@@ -370,7 +375,7 @@ mod tests {
         let mut ind: SqlLen = 0;
         let mut str_len: SqlLen = 0;
         let ret = unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 h.ard(),
                 1,
                 canonical_c_type_i32(),
@@ -438,7 +443,7 @@ mod tests {
     fn datetime_subtype_resolves_the_concise_type() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret = unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 h.ipd(),
                 1,
                 SQL_DATETIME,
@@ -471,7 +476,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let mut buf = 0u8;
         let ret = unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 h.apd(),
                 1,
                 SQL_C_NUMERIC,
@@ -487,7 +492,7 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
     }
 
-    /// `SQLSetDescRecW` and an equivalent sequence of `SQLSetDescFieldW`
+    /// `SQLSetDescRec` and an equivalent sequence of `SQLSetDescFieldW`
     /// calls must produce byte-identical records: they are two entry points
     /// into the exact same field setters (AB#47437's "cannot produce
     /// contradictory binding state" requirement, extended from bind APIs to
@@ -500,7 +505,7 @@ mod tests {
 
         let via_rec = TestHandles::with_env_dbc_stmt();
         unsafe {
-            sql_set_desc_rec_w(
+            sql_set_desc_rec(
                 via_rec.ard(),
                 1,
                 canonical_c_type_i32(),

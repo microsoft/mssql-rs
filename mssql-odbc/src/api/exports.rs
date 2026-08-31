@@ -1209,6 +1209,11 @@ pub unsafe extern "C" fn SQLGetDescRecW(
 /// octet-length-indicator pointer, and indicator pointer. Not valid on an
 /// IRD handle.
 ///
+/// Unlike `SQLGetDescRecW`, this function has no `W`/`A` variants: none of
+/// its arguments are character data, so the ODBC spec defines only one
+/// entry point, `SQLSetDescRec` (see `sql.h`'s declaration — no `SQLSetDescRecA`
+/// exists either).
+///
 /// # Safety
 /// - `descriptor_handle` must be a valid descriptor handle, not an IRD.
 /// - `data_ptr`, if non-null, is stored verbatim and not dereferenced by this
@@ -1216,7 +1221,7 @@ pub unsafe extern "C" fn SQLGetDescRecW(
 /// - `string_length_ptr`/`indicator_ptr`, if non-null, are stored verbatim
 ///   and not dereferenced by this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn SQLSetDescRecW(
+pub unsafe extern "C" fn SQLSetDescRec(
     descriptor_handle: SqlHandle,
     record_number: SqlSmallInt,
     field_type: SqlSmallInt,
@@ -1230,7 +1235,7 @@ pub unsafe extern "C" fn SQLSetDescRecW(
 ) -> SqlReturn {
     crate::init_tracing();
     unsafe {
-        super::set_desc_rec::sql_set_desc_rec_w(
+        super::set_desc_rec::sql_set_desc_rec(
             descriptor_handle,
             record_number,
             field_type,

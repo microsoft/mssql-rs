@@ -53,10 +53,12 @@
 //! storage `SQLBindCol` and `SQLFetchScroll` share, and the equivalent
 //! APD/IPD pairing for `SQLBindParameter`/execute (`BoundParam`'s
 //! `write_to_records`/`from_records`, `bind_param.rs`/`exec_common.rs`) closes
-//! the same gap for parameters. `SQLGetDescRecW`/`SQLSetDescRecW`
+//! the same gap for parameters. `SQLGetDescRecW`/`SQLSetDescRec`
 //! (`api::get_desc_rec.rs`/`api::set_desc_rec.rs`) round out the descriptor
 //! API surface over this same storage, reusing `set_desc_field.rs`'s own
 //! field setters so the bulk and single-field APIs cannot diverge.
+//! `SQLSetDescRec` has no `W`/`A` split (its arguments carry no character
+//! data), unlike `SQLGetDescRecW`'s `Name` output.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
