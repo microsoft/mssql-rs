@@ -2226,6 +2226,45 @@ mod tests {
     }
 
     #[test]
+    fn fetch_clears_recycled_value_when_lob_remains_deferred() {
+        let h = TestHandles::with_env_dbc_stmt();
+        mixed_lob_stmt(&h, vec![vec![10, 20, 30, 40, 50, 60, 70]]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.spare_get_data_row = Some(BufferedGetDataRow {
+                values: vec![
+                    Some(ColumnValues::Int(-1)),
+                    Some(ColumnValues::Int(-2)),
+                    Some(ColumnValues::Int(-3)),
+                    Some(ColumnValues::Int(-4)),
+                    Some(ColumnValues::Int(-5)),
+                    Some(ColumnValues::Int(-6)),
+                    Some(ColumnValues::Int(-7)),
+                    Some(ColumnValues::String(SqlString::new(
+                        b"previous result".to_vec(),
+                        EncodingType::Utf16,
+                    ))),
+                ],
+                variant_bases: vec![None; 8],
+                consumed: 0,
+                wire_deferred: false,
+            });
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        let row = state.buffered_get_data_row.as_ref().unwrap();
+        assert_eq!(row.values[0], Some(ColumnValues::Int(10)));
+        assert_eq!(row.values[6], Some(ColumnValues::Int(70)));
+        assert_eq!(row.values[7], None);
+    }
+
+    #[test]
     fn leading_lob_bypasses_prefix_buffering() {
         let h = TestHandles::with_env_dbc_stmt();
         mixed_lob_stmt(&h, vec![vec![]]);
