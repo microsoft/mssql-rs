@@ -79,6 +79,40 @@ pub(crate) unsafe fn copy_with_nul<T: Copy + Default>(
     copy_len < src.len()
 }
 
+/// Encodes `src` directly into a caller-owned UTF-16 buffer and appends a NUL
+/// when the buffer has room. Returns the full encoded length and whether the
+/// destination truncated it.
+///
+/// A null `dst` is a length-only query and never reports truncation.
+///
+/// # Safety
+/// `dst`, if non-null, must be writable for `buf_len` [`SqlWChar`] values.
+pub(crate) unsafe fn copy_str_utf16_with_nul(
+    dst: *mut SqlWChar,
+    buf_len: usize,
+    src: &str,
+) -> (usize, bool) {
+    if dst.is_null() {
+        return (src.encode_utf16().count(), false);
+    }
+
+    let copy_capacity = buf_len.saturating_sub(1);
+    let mut encoded_len = 0;
+    let mut copied_len = 0;
+    for value in src.encode_utf16() {
+        if copied_len < copy_capacity {
+            unsafe { dst.add(copied_len).write_unaligned(value) };
+            copied_len += 1;
+        }
+        encoded_len += 1;
+    }
+    if buf_len > 0 {
+        unsafe { dst.add(copied_len).write_unaligned(0) };
+    }
+
+    (encoded_len, copied_len < encoded_len)
+}
+
 /// Read a UTF-16 string from a raw pointer and an explicit or NUL-terminated length.
 ///
 /// # Safety
@@ -341,8 +375,8 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long, rewrite_param_markers,
-        write_if_some,
+        copy_str_utf16_with_nul, copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long,
+        rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
 
@@ -684,6 +718,36 @@ mod tests {
         assert!(truncated);
         assert_eq!(buf[0], 0xD83D);
         assert_eq!(buf[1], 0);
+    }
+
+    #[test]
+    fn copy_str_utf16_with_nul_copies_unicode() {
+        let mut buf = [0xFFFF; 6];
+        let (len, truncated) =
+            unsafe { copy_str_utf16_with_nul(buf.as_mut_ptr(), buf.len(), "a😀b") };
+        assert_eq!(len, 4);
+        assert!(!truncated);
+        assert_eq!(
+            &buf[..5],
+            &[u16::from(b'a'), 0xD83D, 0xDE00, u16::from(b'b'), 0]
+        );
+    }
+
+    #[test]
+    fn copy_str_utf16_with_nul_reports_code_unit_truncation() {
+        let mut buf = [0xFFFF; 3];
+        let (len, truncated) =
+            unsafe { copy_str_utf16_with_nul(buf.as_mut_ptr(), buf.len(), "a😀b") };
+        assert_eq!(len, 4);
+        assert!(truncated);
+        assert_eq!(buf, [u16::from(b'a'), 0xD83D, 0]);
+    }
+
+    #[test]
+    fn copy_str_utf16_with_nul_supports_length_queries() {
+        let (len, truncated) = unsafe { copy_str_utf16_with_nul(std::ptr::null_mut(), 0, "😀") };
+        assert_eq!(len, 2);
+        assert!(!truncated);
     }
 
     // Lock in that the generic helper works for narrow (`SQL_C_CHAR`) buffers,
