@@ -426,6 +426,12 @@ pub struct TdsClient {
     pub(in crate::connection) last_return_status: ReturnStatus,
     pub(in crate::connection) current_result_set_has_been_read_till_end: bool,
 
+    /// Result boundary read ahead after the current row set was exhausted.
+    /// RPC completion tokens may trail that row set before either the terminal
+    /// DONE or a genuine next result. The former can be consumed immediately;
+    /// the latter must remain observable by the next [`advance`](Self::advance).
+    pending_result_boundary: Option<ResultBoundaryKind>,
+
     /// Column Encryption setting for the command currently executing. Set by
     /// each execute entry point; consulted by the parameter-encryption and
     /// result-decryption paths to honor per-command overrides.
@@ -551,6 +557,7 @@ impl TdsClient {
             output_param_ceks: HashMap::new(),
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
+            pending_result_boundary: None,
             current_command_ce_setting:
                 crate::connection::client_context::ExecutionColumnEncryptionSetting::default(),
             pending_capture: None,
@@ -761,6 +768,7 @@ impl TdsClient {
         // metadata.
         self.clear_session_bound_caches();
         self.current_result_set_has_been_read_till_end = false;
+        self.pending_result_boundary = None;
         self.active_row_read_state = ActiveRowReadState::Idle;
         self.row_already_positioned = false;
         self.parked_token = None;
@@ -1206,16 +1214,29 @@ impl TdsClient {
             return Ok(elapsed);
         }
 
-        // Only attempt recovery when session recovery was negotiated and
-        // the server supports retry (connect_retry_count > 0).
-        if !self.recovery_context.session_recovery_negotiated {
-            return Ok(Duration::ZERO);
-        }
         let connect_retry_count = self
             .recovery_context
             .client_context
             .as_ref()
             .map_or(0, |ctx| ctx.connect_retry_count);
+
+        // A cached dead verdict is authoritative. Without this gate, callers
+        // with recovery disabled (including intentionally closed clients and
+        // clients retired after protocol desynchronization) would fall through
+        // and write another request to the unusable transport.
+        if self.transport.connection_known_dead()
+            && (!self.recovery_context.session_recovery_negotiated || connect_retry_count == 0)
+        {
+            return Err(crate::error::Error::ConnectionClosed(
+                "Connection is dead and session recovery is unavailable".to_string(),
+            ));
+        }
+
+        // Only attempt recovery when session recovery was negotiated and
+        // the server supports retry (connect_retry_count > 0).
+        if !self.recovery_context.session_recovery_negotiated {
+            return Ok(Duration::ZERO);
+        }
         if connect_retry_count == 0 {
             return Ok(Duration::ZERO);
         }
@@ -4381,7 +4402,7 @@ impl TdsClient {
     /// Used by the ODBC layer to decide whether the connection stays busy after
     /// positioning on a no-row statement result.
     pub fn has_open_batch(&self) -> bool {
-        self.execution_context.has_open_batch()
+        self.execution_context.has_open_batch() || self.pending_result_boundary.is_some()
     }
 
     /// Reads the next response token, replaying one parked by the RPC-terminator
@@ -4503,8 +4524,7 @@ impl TdsClient {
 
     /// Returns `true` when an open result batch or streamed write blocks a new command.
     pub(in crate::connection) fn command_is_busy(&self) -> bool {
-        self.execution_context.has_open_batch()
-            || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
+        self.has_open_batch() || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
     }
 
     /// Returns `true` when the client is currently positioned on a row-returning
@@ -4532,7 +4552,10 @@ impl TdsClient {
     /// skip straight to the next row-returning result set.
     #[instrument(skip(self), level = "info")]
     pub async fn advance(&mut self) -> TdsResult<StatementResult> {
-        if !self.execution_context.has_open_batch() {
+        if let Some(boundary) = self.pending_result_boundary.take() {
+            return Ok(self.apply_result_boundary(boundary));
+        }
+        if !self.has_open_batch() {
             return Ok(StatementResult::End);
         }
         if self.maybe_has_unread_rows()
@@ -4545,7 +4568,7 @@ impl TdsClient {
         // DONE token (has_more=false), which closes the batch. If so there is
         // nothing left on the wire to advance to; reading again would block
         // forever waiting for a token that never arrives.
-        if !self.execution_context.has_open_batch() {
+        if !self.has_open_batch() {
             return Ok(StatementResult::End);
         }
         match self.position_on_first_result().await {
@@ -4569,6 +4592,74 @@ impl TdsClient {
                 StatementResult::Rows => return Ok(true),
                 StatementResult::NoRows { .. } => continue,
                 StatementResult::End => return Ok(false),
+            }
+        }
+    }
+
+    /// Finishes an exhausted row set far enough to determine whether the wire
+    /// contains only protocol-level completion tokens or another result that a
+    /// consumer must observe.
+    ///
+    /// SQL Server RPC responses can end a row set with `DONE_MORE`, then emit
+    /// RETURNVALUE/RETURNSTATUS tokens and a terminal DONE. Those control tokens
+    /// do not constitute another ODBC result and must not keep the connection
+    /// busy. If a real next row set, update count, or message result is found,
+    /// its boundary is parked and returned by the next [`advance`](Self::advance)
+    /// call without reading past it.
+    ///
+    /// Returns `true` only when the batch is fully exhausted.
+    pub async fn complete_current_result(&mut self) -> TdsResult<bool> {
+        if !self.current_result_set_has_been_read_till_end {
+            return Ok(false);
+        }
+        if self.pending_result_boundary.is_some() {
+            return Ok(false);
+        }
+        if !self.execution_context.has_open_batch() {
+            return Ok(true);
+        }
+
+        let boundary = match self.advance_to_result_boundary().await {
+            Ok(boundary) => boundary,
+            Err(error) => {
+                // Timeout and cancellation already send ATTENTION and drain
+                // through its acknowledgement. Other failures leave this
+                // response unsafe to resume unless token handling already
+                // completed the batch, as server ERROR handling does.
+                let attention_error = matches!(
+                    &error,
+                    crate::error::Error::TimeoutError(_)
+                        | crate::error::Error::OperationCancelledError(_)
+                );
+                if attention_error && self.transport.connection_known_dead() {
+                    // ATTENTION did not restore a message boundary. Reconnecting
+                    // would hide a failed cancellation cleanup, so this session
+                    // is not eligible for transparent recovery.
+                    self.recovery_context.session_recovery_negotiated = false;
+                } else if self.execution_context.has_open_batch() && !attention_error {
+                    self.retire_after_failed_drain(&error);
+                }
+                self.execution_context.set_has_open_batch(false);
+                self.pending_result_boundary = None;
+                self.current_metadata = None;
+                self.current_result_set_has_been_read_till_end = true;
+                self.abort_pending_prepare_capture();
+                return Err(error);
+            }
+        };
+
+        match boundary {
+            ResultBoundaryKind::End => {
+                self.apply_result_boundary(ResultBoundaryKind::End);
+                Ok(true)
+            }
+            boundary => {
+                // Token parsing updates this state while reading ahead. Keep
+                // the current row set exhausted until `advance` applies the
+                // parked boundary.
+                self.current_result_set_has_been_read_till_end = true;
+                self.pending_result_boundary = Some(boundary);
+                Ok(false)
             }
         }
     }
@@ -6706,7 +6797,7 @@ impl TdsClient {
     /// cover.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
-        if !self.execution_context.has_open_batch() {
+        if !self.has_open_batch() {
             return Ok(());
         }
         // call next row to consume any remaining tokens
@@ -6729,6 +6820,7 @@ impl TdsClient {
         // The sp_prepexec @handle, if any, was captured during the drain above
         // (see push_return_value) and survives this clear.
         self.current_metadata = None;
+        self.pending_result_boundary = None;
         self.return_values.clear();
         self.abort_pending_prepare_capture();
         self.remaining_request_timeout = None;
@@ -6768,6 +6860,7 @@ impl TdsClient {
         // An intentional close is not a recoverable disconnect: disable recovery
         // so a later call on a lingering handle cannot silently resurrect it.
         self.recovery_context.session_recovery_negotiated = false;
+        self.transport.mark_known_dead();
         self.transport.close_transport().await?;
         Ok(())
     }
@@ -7374,7 +7467,8 @@ mod tests {
         create_network_transport_with_live_peer,
     };
     use crate::token::tokens::{
-        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, TokenType, Tokens,
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, ReturnStatusToken,
+        TokenType, Tokens,
     };
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -9864,6 +9958,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_current_result_drains_rpc_tail_and_captures_prepared_handle() {
+        let transport = TestTransport::with_tokens(vec![
+            done_more(),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            Tokens::ReturnStatus(ReturnStatusToken { value: 0 }),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+        client.pending_capture = Some(sid(1));
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(client.has_open_batch(), "DONE_MORE keeps the RPC open");
+        assert!(client.complete_current_result().await.unwrap());
+
+        assert!(!client.has_open_batch());
+        assert_eq!(client.prepared_handles.get(&sid(1)).copied(), Some(9));
+        assert!(matches!(
+            client.last_return_status,
+            ReturnStatus::Received(0)
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_retires_a_truncated_rpc_tail() {
+        let transport = TestTransport::with_tokens(vec![done_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.current_result_set_has_been_read_till_end);
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_parks_a_following_rowset() {
+        let transport = TestTransport::with_tokens(vec![done_more(), empty_col_metadata()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(client.has_open_batch());
+
+        assert!(matches!(client.advance().await, Ok(StatementResult::Rows)));
+        assert!(!client.current_result_set_has_been_read_till_end);
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_parks_a_terminal_update_count() {
+        let transport = TestTransport::with_tokens(vec![
+            done_more(),
+            done_count(CurrentCommand::Update, 7, false),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(
+            client.has_open_batch(),
+            "the parked count is still a result"
+        );
+
+        assert!(matches!(
+            client.advance().await,
+            Ok(StatementResult::NoRows {
+                rows_affected: Some(7)
+            })
+        ));
+        assert!(!client.has_open_batch());
+        assert!(matches!(client.advance().await, Ok(StatementResult::End)));
+    }
+
+    #[tokio::test]
     async fn peek_past_current_row_already_exhausted_touches_nothing() {
         // Calling the peek when `next_row_cursor` would already short-circuit
         // (end of set previously observed) must stay free: the ODBC layer
@@ -10469,16 +10652,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_and_reconnect_is_noop_after_close_connection() {
+    async fn check_and_reconnect_rejects_after_close_connection() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
 
         client.close_connection().await.unwrap();
         assert!(!client.recovery_context.session_recovery_negotiated);
 
-        // A dead transport must not be resurrected once the caller closed it.
-        let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
-        assert_eq!(elapsed, Duration::ZERO);
+        // A dead transport must neither be resurrected nor reused once the
+        // caller closed it.
+        assert!(matches!(
+            client.check_and_reconnect(Some(5), None).await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
     }
 
     #[tokio::test]
