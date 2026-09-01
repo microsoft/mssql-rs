@@ -125,17 +125,43 @@ impl Drop for EnvHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use super::*;
 
-    /// Guards against reintroducing a blocking join in `Drop`: this must
-    /// return promptly rather than waiting out the runtime's worker thread,
-    /// which is what `shutdown_background` (vs. the default `Runtime` drop)
-    /// buys us. Can't reproduce the OS-forcibly-killed-the-thread case that
-    /// actually panicked (AB#47509) from a unit test — that needs a real
-    /// process/DLL teardown — so this exercises the ordinary path instead.
+    /// Guards against reintroducing a blocking join in `Drop`. The default
+    /// `Runtime` drop waits out in-flight blocking work; `shutdown_background`
+    /// detaches from it. An idle runtime joins its idle worker promptly under
+    /// either one, so this parks a blocking task to tell them apart. The
+    /// OS-already-killed-the-thread case that actually panicked (AB#47509)
+    /// needs real process/DLL teardown and isn't reproducible from a unit test.
     #[test]
-    fn dropping_env_handle_does_not_hang_or_panic() {
+    fn dropping_env_handle_does_not_wait_for_blocking_work() {
+        const PARK: Duration = Duration::from_secs(5);
+
         let env = EnvHandle::new().expect("failed to create EnvHandle for test");
+        let (started_tx, started_rx) = mpsc::channel();
+        env.runtime
+            .as_ref()
+            .expect("a live ENV owns its runtime")
+            .spawn_blocking(move || {
+                let _ = started_tx.send(());
+                thread::sleep(PARK);
+            });
+        started_rx
+            .recv_timeout(PARK)
+            .expect("blocking task should have started");
+
+        let start = Instant::now();
         drop(env);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < PARK / 2,
+            "dropping EnvHandle blocked for {elapsed:?} waiting on the runtime's \
+             blocking work; Drop must detach via shutdown_background, not join"
+        );
     }
 }
