@@ -704,7 +704,7 @@ TEST_F(FetchScrollLiveTest, ABoundJsonWidensToWchar) {
     if (!ServerSupportsNativeJson()) {
         GTEST_SKIP() << "server has no native json type";
     }
-    ExecDirect("SELECT CAST(N'[\"\u00e9\"]' AS JSON) AS c1");
+    ExecDirect("SELECT CAST(N'[\"' + NCHAR(233) + N'\"]' AS JSON) AS c1");
 
     SQLWCHAR buf[16] = {};
     SQLLEN ind = 0;
