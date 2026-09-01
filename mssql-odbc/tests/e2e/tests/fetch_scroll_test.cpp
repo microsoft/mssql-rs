@@ -239,8 +239,13 @@ TEST_F(FetchScrollLiveTest, DefaultTargetResolvesAtFetchTime) {
 // column resolves to SQL_C_WCHAR and a uniqueidentifier to SQL_C_GUID, where
 // msodbcsql resolves both to its ANSI SQL_C_CHAR. The GUID case also pins the
 // resulting rowset layout, because a fixed-width target strides by its C type
-// rather than by BufferLength. See mssql-odbc/docs/typed-columnar-fetch-plan.md.
+// rather than by BufferLength. See mssql-odbc/docs/typed-columnar-fetch-plan.md,
+// which records the measured msodbcsql values these assertions diverge from.
+//
+// Skipped on the reference leg by construction: asserting a deviation is the
+// point, so comparing it would always report a divergence.
 TEST_F(FetchScrollLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     SQLWCHAR wide[2][8] = {};
     // Four slots for a rowset of two, with BufferLength deliberately set to two
     // SQLGUIDs. A BufferLength-driven stride would land row 1 in guids[2]; the
