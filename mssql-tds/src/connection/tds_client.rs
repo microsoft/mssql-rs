@@ -1975,11 +1975,10 @@ impl TdsClient {
         }
     }
 
-    /// Closes an already-sent message with `EOM | IGNORE` and consumes the DONE
-    /// the server answers it with, each under its own [`CANCEL_TIMEOUT`] — they
-    /// run in sequence, so a withdrawal can hold the caller for twice that.
-    /// msodbcsql is the same shape: `SendPacket(.., DEFAULT_CANCEL_TIMEOUT)`
-    /// followed by `FlushInputStream`.
+    /// Closes an already-sent message with `EOM | IGNORE`, allowing 60 seconds
+    /// for the write and then 120 seconds to consume its DONE. A stalled write
+    /// hits the 120-second outer deadline and skips the drain. msodbcsql instead
+    /// allows 120 seconds for each sequential leg.
     async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> Withdrawal {
         // Cached read, not `is_connection_dead`: that one `try_read`s a byte,
         // which here could swallow the server's answer to the half-written
@@ -2057,9 +2056,13 @@ impl TdsClient {
     /// Completes a send, retracting the half-sent message when serialization
     /// failed so the failure costs the request rather than the connection.
     ///
+    /// SQL batch and RPC sends that can fail after bytes reach an otherwise
+    /// usable transport must pass their result and suspended message here.
+    /// TODO(AB#47772): move these sends behind one API.
+    ///
     /// The `drop(rpc)` stays at each call site: `SqlRpc` borrows
     /// `&self.execution_context`, so that borrow has to end before `&mut self`.
-    async fn finish_send(
+    pub(super) async fn finish_send(
         &mut self,
         serialize_result: TdsResult<()>,
         message: SuspendedMessage,
@@ -6836,6 +6839,7 @@ pub trait ResultSet {
 mod tests {
     use super::*;
     use crate::connection::client_context::ClientContext;
+    use crate::connection::cursor_ops::CursorClient;
     use crate::connection::transport::network_transport::TransportSslHandler;
     use crate::connection::transport::tds_transport::TdsTransport;
     use crate::core::{CancelHandle, TdsResult};
@@ -6880,6 +6884,9 @@ mod tests {
         /// When set, `send` never returns, so a test can drive a write deadline
         /// without a real stalled peer.
         send_should_hang: Arc<std::sync::atomic::AtomicBool>,
+        /// Fires after the first successful send, allowing a multi-packet
+        /// request to be cancelled while the server holds its first packet.
+        cancel_after_send: Option<tokio_util::sync::CancellationToken>,
         /// Attentions requested, so a test can tell the cancel-a-sent-request
         /// path from the withdraw-a-partial-one path.
         attentions: Arc<std::sync::atomic::AtomicUsize>,
@@ -6908,6 +6915,7 @@ mod tests {
                 resume_results: VecDeque::new(),
                 send_should_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 send_should_hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                cancel_after_send: None,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
                 sync_header_available: false,
@@ -7094,6 +7102,9 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             self.sent.lock().unwrap().extend_from_slice(data);
+            if let Some(cancel) = self.cancel_after_send.take() {
+                cancel.cancel();
+            }
             Ok(())
         }
         fn packet_size(&self) -> u32 {
@@ -12747,6 +12758,221 @@ mod tests {
             !client.is_connection_dead(),
             "a withdrawn request leaves the connection reusable"
         );
+    }
+
+    fn partially_serializable_cursor_params() -> Vec<RpcParameter> {
+        vec![
+            RpcParameter::new(
+                Some("@big".to_string()),
+                StatusFlags::NONE,
+                SqlType::VarcharMax(Some(SqlString::from_utf8_string("a".repeat(20_000)))),
+            ),
+            RpcParameter::new(
+                Some("@bad".to_string()),
+                StatusFlags::NONE,
+                SqlType::Varchar(
+                    Some(SqlString::from_utf8_string("abcdefghij".to_string())),
+                    1,
+                ),
+            ),
+        ]
+    }
+
+    fn assert_cursor_send_was_retracted(client: &TdsClient, sent: &Arc<std::sync::Mutex<Vec<u8>>>) {
+        use crate::message::messages::PacketStatusFlags;
+
+        let wire = sent.lock().unwrap().clone();
+        assert!(
+            wire.len() >= PacketWriter::PACKET_HEADER_SIZE,
+            "expected at least one complete TDS packet, got {} bytes",
+            wire.len()
+        );
+        let last = &wire[wire.len() - PacketWriter::PACKET_HEADER_SIZE..];
+        assert_eq!(
+            u16::from_be_bytes([last[2], last[3]]) as usize,
+            PacketWriter::PACKET_HEADER_SIZE,
+            "the withdrawal must end with a header-only TDS packet"
+        );
+        assert_eq!(
+            last[1],
+            PacketStatusFlags::Eom as u8 | PacketStatusFlags::Ignore as u8,
+            "the half-sent cursor RPC must be withdrawn"
+        );
+        assert!(
+            !client.is_connection_dead(),
+            "a withdrawn cursor RPC must leave the connection reusable"
+        );
+    }
+
+    fn assert_overlong_parameter_error(error: crate::error::Error) {
+        assert!(
+            error.to_string().contains("exceeds schema size"),
+            "the caller must receive the original serialization error, got {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_open_with_params_retracts_a_partial_send() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .cursor_open_with_params(
+                "SELECT @big, @bad",
+                partially_serializable_cursor_params(),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_open_retracts_when_cancelled_after_a_flush() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let sent = Arc::clone(&transport.sent);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let mut client = create_test_client_with_transport(transport);
+
+        let error = client
+            .cursor_open(
+                &"a".repeat(20_000),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                Some(&cancel),
+            )
+            .await
+            .expect_err("cancellation after packet one must stop serialization");
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_prepare_retracts_when_cancelled_after_a_flush() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let sent = Arc::clone(&transport.sent);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let mut client = create_test_client_with_transport(transport);
+
+        let error = client
+            .cursor_prepare(
+                &"a".repeat(20_000),
+                "",
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                None,
+                Some(&cancel),
+            )
+            .await
+            .expect_err("cancellation after packet one must stop serialization");
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn set_cursor_option_retracts_when_cancelled_after_a_flush() {
+        let cancel = CancelHandle::new();
+        let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+        let sent = Arc::clone(&transport.sent);
+        transport.cancel_after_send = Some(cancel.cancel_token.clone());
+        let mut client = create_test_client_with_transport(transport);
+
+        let error = client
+            .set_cursor_option(
+                1,
+                crate::cursor::CursorOptionCode::CursorName,
+                crate::cursor::CursorOptionValue::String("a".repeat(20_000)),
+                None,
+                Some(&cancel),
+            )
+            .await
+            .expect_err("cancellation after packet one must stop serialization");
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn perform_cursor_operation_retracts_a_partial_send() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .perform_cursor_operation(
+                1,
+                crate::cursor::CursorOperation::UPDATE,
+                1,
+                "",
+                partially_serializable_cursor_params(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_prepexec_retracts_a_partial_send() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .cursor_prepexec(
+                "SELECT @big, @bad",
+                partially_serializable_cursor_params(),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_send_was_retracted(&client, &sent);
+    }
+
+    #[tokio::test]
+    async fn cursor_execute_retracts_a_partial_send() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+
+        let error = client
+            .cursor_execute(
+                1,
+                partially_serializable_cursor_params(),
+                crate::cursor::CursorScrollOption::FORWARD_ONLY,
+                crate::cursor::CursorConcurrency::READONLY,
+                0,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the over-long cursor parameter must fail");
+
+        assert_overlong_parameter_error(error);
+        assert_cursor_send_was_retracted(&client, &sent);
     }
 
     /// The retraction runs on its own budget, so a request that had a timeout
