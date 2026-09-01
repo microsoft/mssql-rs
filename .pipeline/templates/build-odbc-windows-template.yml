@@ -25,7 +25,7 @@ parameters:
 steps:
   - pwsh: |
       $ErrorActionPreference = 'Stop'
-      cargo build --release --package mssql-odbc
+      cargo build --release --package mssqlodbc
     displayName: 'Build mssql-odbc driver (${{ parameters.architecture }})'
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 

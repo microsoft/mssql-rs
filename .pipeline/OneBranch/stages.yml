@@ -224,8 +224,6 @@ stages:
           sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
           targetFolder: '$(ob_outputDirectory)/odbc_glibc_x64'
           contents: '**'
-      - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
-        displayName: 'Clear odbc-drop before next ODBC variant'
       - template: /.pipeline/templates/build-odbc-alpine-template.yml
         parameters:
           architecture: x64
@@ -237,8 +235,6 @@ stages:
           sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
           targetFolder: '$(ob_outputDirectory)/odbc_musl_x64'
           contents: '**'
-      - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
-        displayName: 'Clear odbc-drop before next ODBC variant'
       - template: /.pipeline/templates/build-odbc-glibc228-template.yml
         parameters:
           architecture: x64
@@ -309,8 +305,6 @@ stages:
             sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
             targetFolder: '$(ob_outputDirectory)/odbc_glibc_arm64'
             contents: '**'
-        - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
-          displayName: 'Clear odbc-drop before next ODBC variant'
         - template: /.pipeline/templates/build-odbc-alpine-template.yml
           parameters:
             architecture: ARM64
@@ -322,8 +316,6 @@ stages:
             sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
             targetFolder: '$(ob_outputDirectory)/odbc_musl_arm64'
             contents: '**'
-        - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
-          displayName: 'Clear odbc-drop before next ODBC variant'
         - template: /.pipeline/templates/build-odbc-glibc228-template.yml
           parameters:
             architecture: ARM64
@@ -516,6 +508,10 @@ stages:
         - pwsh: |
             $ErrorActionPreference = 'Stop'
 
+            # Template expansion produces bare True/False which aren't valid
+            # PowerShell; string comparison converts to a proper boolean.
+            $buildAllTargets = "${{ parameters.buildAllTargets }}" -eq "True"
+
             # source artifact/subfolder -> (platform tag, driver filename).
             # Subfolder names match the CopyFiles targetFolder used in each
             # Build job (see Windows_x64/Windows_ARM64/Linux_x64/Linux_ARM64
@@ -526,11 +522,17 @@ stages:
               'drop_Build_Linux_x64_linux_x64/odbc_glibc_x64'             = @{ tag = 'linux_x64';      file = 'mssqlodbc.so' }
               'drop_Build_Linux_x64_linux_x64/odbc_musl_x64'              = @{ tag = 'musl_x64';       file = 'mssqlodbc.so' }
               'drop_Build_Linux_x64_linux_x64/odbc_glibc228_x64'          = @{ tag = 'glibc228_x64';   file = 'mssqlodbc.so' }
-              'drop_Build_Linux_ARM64_linux_arm64/odbc_glibc_arm64'       = @{ tag = 'linux_arm64';    file = 'mssqlodbc.so' }
-              'drop_Build_Linux_ARM64_linux_arm64/odbc_musl_arm64'        = @{ tag = 'musl_arm64';     file = 'mssqlodbc.so' }
-              'drop_Build_Linux_ARM64_linux_arm64/odbc_glibc228_arm64'    = @{ tag = 'glibc228_arm64'; file = 'mssqlodbc.so' }
               'drop_Build_Windows_x64_windows_x64/odbc_windows_x64'       = @{ tag = 'windows_x64';    file = 'mssqlodbc.dll' }
-              'drop_Build_Windows_ARM64_windows_arm64/odbc_windows_arm64' = @{ tag = 'windows_arm64';  file = 'mssqlodbc.dll' }
+            }
+
+            # Windows_ARM64/Linux_ARM64 jobs only run when buildAllTargets is
+            # true (see the job-level ${{ if }} guards above); skip these
+            # entries otherwise, or the Test-Path check below always fails.
+            if ($buildAllTargets) {
+              $platforms['drop_Build_Linux_ARM64_linux_arm64/odbc_glibc_arm64']       = @{ tag = 'linux_arm64';    file = 'mssqlodbc.so' }
+              $platforms['drop_Build_Linux_ARM64_linux_arm64/odbc_musl_arm64']        = @{ tag = 'musl_arm64';     file = 'mssqlodbc.so' }
+              $platforms['drop_Build_Linux_ARM64_linux_arm64/odbc_glibc228_arm64']    = @{ tag = 'glibc228_arm64'; file = 'mssqlodbc.so' }
+              $platforms['drop_Build_Windows_ARM64_windows_arm64/odbc_windows_arm64'] = @{ tag = 'windows_arm64';  file = 'mssqlodbc.dll' }
             }
 
             foreach ($key in $platforms.Keys) {
@@ -550,14 +552,46 @@ stages:
         - pwsh: |
             $ErrorActionPreference = 'Stop'
 
-            # Reuses $(nugetVersion)/$(shortSha) computed above for the wheels
-            # package - both packages are built from the same commit/run.
+            # mssql-odbc is versioned independently from mssql-py-core, so
+            # compute its own package version rather than reusing $(nugetVersion).
+            $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-odbc/Cargo.toml" -Raw
+            if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+              $version = $Matches[1]
+            } else {
+              Write-Error "Could not extract version from mssql-odbc/Cargo.toml"
+              exit 1
+            }
+
+            $buildReason = "$(Build.Reason)"
+            $isOfficial = "${{ parameters.isOfficial }}" -eq "True"
+            $dateStamp = Get-Date -Format "yyyyMMdd"
+            $buildId = "$(Build.BuildId)"
+
+            switch ($buildReason) {
+              'Schedule' { $odbcPackageVersion = "$version-nightly.$dateStamp" }
+              'Manual' {
+                if ($isOfficial) {
+                  $odbcPackageVersion = $version
+                } else {
+                  $odbcPackageVersion = "$version-dev.$dateStamp.$buildId"
+                }
+              }
+              default { $odbcPackageVersion = "$version-dev.$dateStamp.$buildId" }
+            }
+
+            Write-Host "ODBC native package version: $odbcPackageVersion"
+            Write-Host "##vso[task.setvariable variable=odbcNugetVersion]$odbcPackageVersion"
+          displayName: 'Compute ODBC native package version'
+
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+
             $nuspecContent = @"
             <?xml version="1.0"?>
             <package>
               <metadata>
                 <id>mssql-odbc-native</id>
-                <version>$(nugetVersion)</version>
+                <version>$(odbcNugetVersion)</version>
                 <description>mssql-odbc native driver binaries across platforms. Commit: $(Build.SourceVersion). Build: $(Build.BuildNumber)</description>
                 <authors>SqlClientDrivers</authors>
               </metadata>
