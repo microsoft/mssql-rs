@@ -1996,9 +1996,9 @@ impl TdsClient {
     /// Completes a send, retracting the half-sent message when serialization
     /// failed so the failure costs the request rather than the connection.
     ///
-    /// Every request serialized through a `PacketWriter` must pass its result
-    /// and suspended message here instead of propagating the error directly.
-    /// TODO(AB#47772): enforce this by moving serialization behind one API.
+    /// SQL batch and RPC sends that can fail after bytes reach an otherwise
+    /// usable transport must pass their result and suspended message here.
+    /// TODO(AB#47772): move these sends behind one API.
     ///
     /// The `drop(rpc)` stays at each call site: `SqlRpc` borrows
     /// `&self.execution_context`, so that borrow has to end before `&mut self`.
