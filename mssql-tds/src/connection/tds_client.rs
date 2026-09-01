@@ -474,9 +474,11 @@ impl TdsClient {
 
     /// Attempt to reconnect a dead connection by replaying session state.
     ///
-    /// The overall reconnection is bounded by `timeout`. Each individual
-    /// TCP/TDS handshake attempt uses the original `connect_timeout`. Before
-    /// each retry sleep, we verify enough time remains for the interval.
+    /// The overall reconnection is bounded by `timeout`. Each attempt (DNS
+    /// resolution through login) is wrapped in whatever remains of that
+    /// budget, and `connect_timeout` is capped to the same remaining budget
+    /// so it can't ask for more than is left. Before each retry sleep, we
+    /// verify enough time remains for the interval.
     #[instrument(skip(self), level = "info")]
     pub(crate) async fn reconnect(
         &mut self,

@@ -470,10 +470,14 @@ mod tests {
     async fn parallel_connect_resolution_yields_to_the_executor() {
         let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
         let heartbeats_task = heartbeats.clone();
+        // A short sleep (rather than `yield_now()`) still catches the same
+        // scheduling gap — the first increment can't happen until the main
+        // task yields either way — without busy-spinning a core for however
+        // long this host takes to NXDOMAIN.
         let heartbeat = tokio::spawn(async move {
             loop {
                 heartbeats_task.fetch_add(1, Ordering::SeqCst);
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
 
