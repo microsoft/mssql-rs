@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::error;
 
@@ -168,6 +168,7 @@ pub(crate) struct StmtState {
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// UTF-16 column names built once when result metadata changes.
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
+    pub(crate) plp_encodings: Option<Arc<[Option<PlpEncoding>]>>,
     /// Set once a fetch has confirmed — possibly by peeking one token past
     /// the row it just delivered — that no further rows exist for the
     /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
@@ -865,18 +866,28 @@ impl StmtState {
     /// command ordinal restarts rather than climbing across executions.
     pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
         self.column_metadata = metadata;
-        self.refresh_column_name_cache();
+        self.refresh_metadata_caches();
         self.rows_returned = 0;
         self.current_command += 1;
     }
 
-    pub(crate) fn refresh_column_name_cache(&mut self) {
+    pub(crate) fn refresh_metadata_caches(&mut self) {
         self.column_names_utf16.clear();
         self.column_names_utf16.extend(
             self.column_metadata
                 .iter()
                 .map(|column| column.column_name.encode_utf16().collect()),
         );
+        self.plp_encodings = self
+            .column_metadata
+            .iter()
+            .any(ColumnMetadata::is_plp)
+            .then(|| {
+                self.column_metadata
+                    .iter()
+                    .map(ColumnMetadata::plp_encoding)
+                    .collect::<Arc<[_]>>()
+            });
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -1042,6 +1053,7 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
+                plp_encodings: None,
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,

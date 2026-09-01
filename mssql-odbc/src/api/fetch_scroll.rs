@@ -18,6 +18,7 @@
 //! shot at a fixed-size buffer and reports `01004` if the value does not fit.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use tracing::{debug, error};
 
@@ -667,6 +668,7 @@ fn fetch_scroll_safe(
         row_bind_offset_ptr,
         reusable_get_data_row,
         buffer_trailing_utf16_plp,
+        plp_encodings,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
@@ -742,18 +744,23 @@ fn fetch_scroll_safe(
             return rc;
         }
 
+        let get_data_fetch = stmt_state.row_array_size == 1 && stmt_state.bindings.is_empty();
         let bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
         // The buffers in that snapshot belong to the application, and the fill
         // loop writes through them after this lock is released. Claiming the
         // statement here is what stops a concurrent SQLBindCol from freeing one
         // mid-write; the mutating entry points refuse while this is set.
         stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
-        let reusable_get_data_row = stmt_state.spare_get_data_row.take();
-        let buffer_trailing_utf16_plp = stmt_state
-            .column_metadata
-            .last()
-            .and_then(|metadata| metadata.plp_encoding())
-            == Some(PlpEncoding::Utf16Text);
+        let reusable_get_data_row = get_data_fetch
+            .then(|| stmt_state.spare_get_data_row.take())
+            .flatten();
+        let buffer_trailing_utf16_plp = get_data_fetch
+            && stmt_state
+                .column_metadata
+                .last()
+                .and_then(|metadata| metadata.plp_encoding())
+                == Some(PlpEncoding::Utf16Text);
+        let plp_encodings = stmt_state.plp_encodings.clone();
         (
             stmt_state.row_array_size,
             bindings,
@@ -763,6 +770,7 @@ fn fetch_scroll_safe(
             stmt_state.row_bind_offset_ptr,
             reusable_get_data_row,
             buffer_trailing_utf16_plp,
+            plp_encodings,
         )
     };
 
@@ -777,6 +785,7 @@ fn fetch_scroll_safe(
         row_bind_offset_ptr,
         reusable_get_data_row,
         buffer_trailing_utf16_plp,
+        plp_encodings,
     );
 
     // Single clearing point for the guard, so every early return inside the
@@ -800,6 +809,7 @@ fn fill_rowset(
     row_bind_offset_ptr: *mut SqlULen,
     mut reusable_get_data_row: Option<BufferedGetDataRow>,
     buffer_trailing_utf16_plp: bool,
+    plp_encodings: Option<Arc<[Option<PlpEncoding>]>>,
 ) -> SqlReturn {
     // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
     // result set. Once that many have been returned the cursor stops without
@@ -895,28 +905,6 @@ fn fill_rowset(
     let mut last_column_read = 0usize;
     let mut buffered_get_data_row = None;
 
-    // Snapshot the per-column PLP encodings once. Taking the statement lock
-    // inside the fill loop would make a poisoned mutex indistinguishable from a
-    // column that simply is not PLP, which would silently downgrade a supported
-    // column to "unsupported" and drain it.
-    let plp_encodings: Option<Vec<Option<PlpEncoding>>> = {
-        let Ok(ss) = stmt.inner.lock() else {
-            error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
-            if let Ok(mut ds) = dbc.inner.lock() {
-                ds.client = Some(client);
-            }
-            return SQL_ERROR;
-        };
-        ss.column_metadata
-            .iter()
-            .any(|metadata| metadata.is_plp())
-            .then(|| {
-                ss.column_metadata
-                    .iter()
-                    .map(|metadata| metadata.plp_encoding())
-                    .collect()
-            })
-    };
     // Allocate only if a bound PLP value is actually reached. Fixed rowsets,
     // especially row-array size 1, otherwise paid this 8 KiB zero-fill per fetch.
     let mut plp_scratch = None;
@@ -928,19 +916,55 @@ fn fill_rowset(
         .last()
         .is_some_and(|binding| binding.column_number as usize == column_count)
         && client.current_result_supports_row_into();
-    let can_buffer_get_data_row =
-        row_array_size == 1 && bindings.is_empty() && client.current_result_supports_row_into();
-    let buffered_prefix_len =
-        if row_array_size == 1 && bindings.is_empty() && !can_buffer_get_data_row {
-            client.current_result_bufferable_prefix_len()
+    let (can_buffer_get_data_row, buffered_prefix_len) =
+        if can_write_complete_rows || row_array_size != 1 || !bindings.is_empty() {
+            (false, None)
         } else {
-            None
+            let can_buffer = client.current_result_supports_row_into();
+            let prefix = (!can_buffer)
+                .then(|| client.current_result_bufferable_prefix_len())
+                .flatten();
+            (can_buffer, prefix)
         };
 
     dispatch_rows(row_budget, || {
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
-        if can_buffer_get_data_row {
+        if can_write_complete_rows {
+            let mut writer = BoundRowWriter::new(bindings, rows_filled as usize, bind_offset);
+            let result = match client.try_next_buffered_row_into(&mut writer) {
+                Ok(BufferedRowPoll::Complete) => Ok(()),
+                Ok(BufferedRowPoll::Partial) => {
+                    dbc.runtime.block_on(client.finish_row_into(&mut writer))
+                }
+                Ok(BufferedRowPoll::Exhausted) => return false,
+                Ok(BufferedRowPoll::Pending) => {
+                    let cursor_poll = client.try_next_row_cursor();
+                    match cursor_poll.and_then(|poll| {
+                        poll.resolve(|| dbc.runtime.block_on(client.next_row_cursor()))
+                    }) {
+                        Ok(true) => match client.try_finish_row_into(&mut writer) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => dbc.runtime.block_on(client.finish_row_into(&mut writer)),
+                            Err(error) => Err(error),
+                        },
+                        Ok(false) => return false,
+                        Err(error) => {
+                            fetch_error = Some(error);
+                            return false;
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                fetch_error = Some(error);
+                outcome = outcome.merge(RowOutcome::Error(RowIssue::Restricted));
+            } else {
+                columns_read = writer.last_column_read;
+                outcome = outcome.merge(writer.outcome);
+            }
+        } else if can_buffer_get_data_row {
             let mut writer = BufferedGetDataRow::empty(&mut reusable_get_data_row, column_count);
             let result = match client.try_next_buffered_row_into(&mut writer) {
                 Ok(BufferedRowPoll::Complete) => Ok(()),
@@ -1039,40 +1063,6 @@ fn fill_rowset(
                 // (`sqlccurs.cpp`; consumed later by `sqlcdata.cpp::SQLGetData`).
                 buffered_get_data_row = Some(writer);
                 columns_read = buffered_columns;
-            }
-        } else if can_write_complete_rows {
-            let mut writer = BoundRowWriter::new(bindings, rows_filled as usize, bind_offset);
-            let result = match client.try_next_buffered_row_into(&mut writer) {
-                Ok(BufferedRowPoll::Complete) => Ok(()),
-                Ok(BufferedRowPoll::Partial) => {
-                    dbc.runtime.block_on(client.finish_row_into(&mut writer))
-                }
-                Ok(BufferedRowPoll::Exhausted) => return false,
-                Ok(BufferedRowPoll::Pending) => {
-                    let cursor_poll = client.try_next_row_cursor();
-                    match cursor_poll.and_then(|poll| {
-                        poll.resolve(|| dbc.runtime.block_on(client.next_row_cursor()))
-                    }) {
-                        Ok(true) => match client.try_finish_row_into(&mut writer) {
-                            Ok(true) => Ok(()),
-                            Ok(false) => dbc.runtime.block_on(client.finish_row_into(&mut writer)),
-                            Err(error) => Err(error),
-                        },
-                        Ok(false) => return false,
-                        Err(error) => {
-                            fetch_error = Some(error);
-                            return false;
-                        }
-                    }
-                }
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                fetch_error = Some(error);
-                outcome = outcome.merge(RowOutcome::Error(RowIssue::Restricted));
-            } else {
-                columns_read = writer.last_column_read;
-                outcome = outcome.merge(writer.outcome);
             }
         } else {
             let cursor_poll = client.try_next_row_cursor();
@@ -1246,12 +1236,11 @@ fn fill_rowset(
         // already consumed, so a following SQLGetData continues from there
         // rather than re-reading a column the fill loop took.
         stmt_state.begin_row();
-        stmt_state.current_row_last_col = if buffered_get_data_row.is_some() {
-            0
+        if let Some(row) = buffered_get_data_row {
+            stmt_state.buffered_get_data_row = Some(row);
         } else {
-            last_column_read
-        };
-        stmt_state.buffered_get_data_row = buffered_get_data_row;
+            stmt_state.current_row_last_col = last_column_read;
+        }
     } else {
         stmt_state.reset_row_stream();
     }
