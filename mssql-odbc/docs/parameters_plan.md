@@ -84,10 +84,9 @@ transparent reconnects.
   `ParameterType`. `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
   time, since they need a server type name no describe call reports.
 - **Value conversion** - the wire type follows `ParameterType`, not the C type:
-  an integer or character buffer is declared as the SQL type the application
-  named and converted to it, cross-family pairings included. `SQL_C_BINARY` is
-  the exception, still pinned to `varbinary(max)` because the binary quadrants
-  are unbuilt. Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
+  an integer, character or binary buffer is declared as the SQL type the
+  application named and converted to it, cross-family pairings included.
+  Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
   explicit byte length; binary values use explicit byte length or
   `BufferLength` when no indicator pointer is supplied.
 - **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
@@ -473,8 +472,8 @@ Verified against msodbcsql source:
 - Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
   its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
   which is not in this source tree. `22018` is tracked with AB#47565.
-- Still `HYC00`: `SQL_SS_XML` and the binary types. The latter keeps
-  `DISABLED_DescribesMaxLengthParameters` parked.
+- Still `HYC00`: `SQL_SS_XML`. `DescribesMaxLengthParameters` is re-enabled with
+  the binary types; the decimal case parked beside it still waits on AB#47500.
 
 Deferred:
 
@@ -642,9 +641,11 @@ role `Convert()`'s dispatch switch plays - not a legality table.
   correctness issue.
 - **Type matrix and TDS type selection:** tracked by the conversion milestone
   above. P3-P5 drive the wire type from `ParameterType` for the integer and
-  character types, in both directions across the two families. Beyond this
-  milestone the same work is needed for binary, `uniqueidentifier`, money,
-  decimal, and date/time values, which still emit their P0-era shapes.
+  character types, in both directions across the two families, and AB#47688 does
+  the same for the binary types. Beyond this milestone the same work is needed
+  for `uniqueidentifier`, money, decimal, and date/time values, which still emit
+  their P0-era shapes. `ColumnSize` still does not bound a data-at-execution
+  value in either family (AB#47775).
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
