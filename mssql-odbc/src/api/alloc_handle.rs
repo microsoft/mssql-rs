@@ -121,7 +121,11 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
     );
 
-    let dbc = Box::new(DbcHandle::new(input_handle, env.runtime.clone()));
+    let runtime = env
+        .runtime
+        .clone()
+        .expect("SQLAllocHandle(DBC): ENV runtime already shut down");
+    let dbc = Box::new(DbcHandle::new(input_handle, runtime));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
 

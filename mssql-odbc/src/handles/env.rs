@@ -49,8 +49,10 @@ pub(crate) struct EnvHandle {
     pub(crate) object_type: HandleType,
     pub(crate) inner: Mutex<EnvState>,
     /// Shared Tokio runtime for all connections on this ENV.
-    /// Wrapped in `Arc` so DBCs can hold a reference without lifetime issues.
-    pub(crate) runtime: Arc<Runtime>,
+    /// Wrapped in `Arc` so DBCs can hold a reference without lifetime issues,
+    /// and in `Option` so `Drop` can take ownership to shut it down (see the
+    /// `Drop` impl below). Only `None` after this handle starts dropping.
+    pub(crate) runtime: Option<Arc<Runtime>>,
 }
 
 /// Mutable state within an environment handle, protected by `inner`.
@@ -90,7 +92,7 @@ impl EnvHandle {
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),
             }),
-            runtime: Arc::new(runtime),
+            runtime: Some(Arc::new(runtime)),
         })
     }
 }
@@ -98,5 +100,42 @@ impl EnvHandle {
 impl HasObjectType for EnvHandle {
     fn object_type_mut(&mut self) -> &mut HandleType {
         &mut self.object_type
+    }
+}
+
+impl Drop for EnvHandle {
+    /// Shuts down the per-ENV Tokio runtime without joining its worker thread.
+    ///
+    /// `SQLFreeHandle(SQL_HANDLE_ENV)` can run long after the OS has already
+    /// force-terminated background threads — e.g. a caller that loads this
+    /// driver directly instead of through the ODBC Driver Manager may defer
+    /// the free to a C++ static destructor that only runs at
+    /// `DLL_PROCESS_DETACH`, by which point Windows has already killed every
+    /// thread but the one tearing the process down (AB#47509). The default
+    /// `Runtime` drop unconditionally joins its worker thread, which panics
+    /// ("threads should not terminate unexpectedly") if that thread no
+    /// longer exists. `shutdown_background` detaches instead of joining, so
+    /// it's safe no matter when this runs.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take().and_then(|rt| Arc::try_unwrap(rt).ok()) {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards against reintroducing a blocking join in `Drop`: this must
+    /// return promptly rather than waiting out the runtime's worker thread,
+    /// which is what `shutdown_background` (vs. the default `Runtime` drop)
+    /// buys us. Can't reproduce the OS-forcibly-killed-the-thread case that
+    /// actually panicked (AB#47509) from a unit test — that needs a real
+    /// process/DLL teardown — so this exercises the ordinary path instead.
+    #[test]
+    fn dropping_env_handle_does_not_hang_or_panic() {
+        let env = EnvHandle::new().expect("failed to create EnvHandle for test");
+        drop(env);
     }
 }
