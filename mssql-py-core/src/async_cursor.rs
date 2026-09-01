@@ -228,6 +228,7 @@ impl PyAsyncCursor {
             self.session_state.clone(),
             self.cursor_id,
             self.fetch_state.clone(),
+            self.description_state.clone(),
         ))
     }
 
@@ -416,6 +417,11 @@ impl PyAsyncCursor {
     /// Fetch all remaining rows in the current result set.
     fn fetchall<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         crate::async_fetch::fetchall(slf, py)
+    }
+
+    /// Advance to the next statement result, returning `True` or `False` at batch end.
+    fn nextset<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_fetch::nextset(slf, py)
     }
 
     /// Drain pending results, release prepared handles, and close this cursor.

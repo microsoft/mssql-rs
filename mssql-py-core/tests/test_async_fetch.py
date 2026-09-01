@@ -5,6 +5,7 @@
 
 import asyncio
 import datetime
+import sys
 import uuid
 import warnings
 from decimal import Decimal
@@ -33,6 +34,7 @@ def test_module_exposes_fetchone():
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchone")
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchmany")
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchall")
+    assert hasattr(mssql_py_core.PyAsyncCursor, "nextset")
 
 
 def test_fetchone_without_result_set_raises(mock_client_context):
@@ -50,6 +52,10 @@ def test_fetchone_without_result_set_raises(mock_client_context):
                 cursor.fetchall(1)
             with pytest.raises(TypeError):
                 cursor.fetchall(size=1)
+            with pytest.raises(RuntimeError, match="No active result set"):
+                await cursor.nextset()
+            with pytest.raises(TypeError):
+                cursor.nextset(1)
         finally:
             await conn.close()
 
@@ -68,6 +74,8 @@ def test_fetchone_after_cursor_close_raises(mock_client_context):
                 await cursor.fetchmany(0)
             with pytest.raises(RuntimeError, match="Cursor is closed"):
                 await cursor.fetchall()
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                await cursor.nextset()
         finally:
             await conn.close()
 
@@ -211,6 +219,7 @@ def test_fetchone_logs_exhaustion(client_context):
                 in message
                 for level, message, _module in logger.events
             )
+
         finally:
             await conn.close()
 
@@ -380,6 +389,210 @@ def test_fetchall_keeps_event_loop_responsive(client_context):
             stop_heartbeat = True
             if "heartbeat_task" in locals():
                 await heartbeat_task
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_drains_rows_and_updates_description(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT 1 AS first_value UNION ALL SELECT 2; "
+                "SELECT N'x' AS second_value; SELECT 3 AS third_value",
+                use_prepare=False,
+            )
+            assert cursor.description[0][:2] == ("first_value", int)
+            assert await cursor.fetchone() == (1,)
+
+            assert await cursor.nextset() is True
+            assert cursor.description[0][:2] == ("second_value", str)
+            assert await cursor.fetchall() == [("x",)]
+
+            assert await cursor.nextset() is True
+            assert cursor.description[0][:2] == ("third_value", int)
+            assert await cursor.fetchone() == (3,)
+
+            assert await cursor.nextset() is False
+            assert cursor.description is None
+            assert await cursor.nextset() is False
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_surfaces_statement_without_rows(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "DECLARE @rows TABLE (value int); "
+                "SELECT 1 AS first_value; "
+                "INSERT INTO @rows VALUES (1); "
+                "SELECT 2 AS second_value",
+                use_prepare=False,
+            )
+            assert await cursor.nextset() is True
+            assert cursor.description is None
+            with pytest.raises(RuntimeError, match="No active result set"):
+                await cursor.fetchone()
+
+            assert await cursor.nextset() is True
+            assert cursor.description[0][:2] == ("second_value", int)
+            assert await cursor.fetchall() == [(2,)]
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_logs_result_transitions(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT 1; SELECT N'x' AS value", use_prepare=False)
+            logger.events.clear()
+
+            assert await cursor.nextset() is True
+            assert (
+                10,
+                "PyAsyncCursor::nextset: started",
+                "async_fetch.rs",
+            ) in logger.events
+            assert any(
+                level == 10
+                and "PyAsyncCursor::nextset: completed; has_result=true; has_rows=true; column_count=1; elapsed_ms="
+                in message
+                for level, message, _module in logger.events
+            )
+
+            assert await cursor.nextset() is False
+            assert (
+                20,
+                "PyAsyncCursor::nextset: batch exhausted",
+                "async_fetch.rs",
+            ) in logger.events
+
+            await cursor.execute(
+                "SELECT 1; SELECT CAST(1 AS decimal(10, 2)) AS value",
+                use_prepare=False,
+            )
+            decimal_module = sys.modules["decimal"]
+            sys.modules["decimal"] = None
+            logger.events.clear()
+            try:
+                with pytest.raises(
+                    RuntimeError,
+                    match="Advanced result set but cursor description materialization failed",
+                ):
+                    await cursor.nextset()
+            finally:
+                sys.modules["decimal"] = decimal_module
+            assert cursor.description is None
+            assert await cursor.fetchone() == (Decimal("1.00"),)
+            assert any(
+                level == 40
+                and "PyAsyncCursor::nextset: description materialization failed; "
+                "column_count=1; elapsed_ms=" in message
+                and "; read_ms=" in message
+                and "; materialization_ms=" in message
+                for level, message, _module in logger.events
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_keeps_event_loop_responsive_while_draining(client_context):
+    async def run():
+        conn = await connect(client_context)
+        heartbeat_ticks = 0
+        stop_heartbeat = False
+
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while not stop_heartbeat:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0)
+
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                WITH numbers AS (
+                    SELECT 0 AS value
+                    UNION ALL
+                    SELECT value + 1 FROM numbers WHERE value < 32767
+                )
+                SELECT value FROM numbers OPTION (MAXRECURSION 32767);
+                SELECT 42 AS final_value
+                """,
+                use_prepare=False,
+            )
+            heartbeat_task = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0)
+            ticks_before_nextset = heartbeat_ticks
+
+            assert await cursor.nextset() is True
+            ticks_during_nextset = heartbeat_ticks - ticks_before_nextset
+
+            assert ticks_during_nextset > 0
+            assert await cursor.fetchone() == (42,)
+        finally:
+            stop_heartbeat = True
+            if "heartbeat_task" in locals():
+                await heartbeat_task
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_rejects_concurrent_operation_and_cancellation_breaks_session(
+    client_context,
+):
+    async def run():
+        conn = await connect(client_context)
+        cursor = conn.cursor()
+        try:
+            await cursor.execute(
+                "SELECT REPLICATE(CAST('x' AS varchar(max)), 32000000); SELECT 2",
+                use_prepare=False,
+            )
+            task = asyncio.ensure_future(cursor.nextset())
+            with pytest.raises(RuntimeError, match="busy with another cursor operation"):
+                cursor.nextset()
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            probe = conn.cursor()
+            for _ in range(100):
+                try:
+                    await probe.execute("SELECT 1", use_prepare=False)
+                except RuntimeError as error:
+                    if "busy" in str(error).lower():
+                        await asyncio.sleep(0.01)
+                        continue
+                    assert "broken" in str(error).lower()
+                    break
+                else:
+                    pytest.fail("Cancelled nextset left the connection reusable")
+            else:
+                pytest.fail("Cancelled nextset left the connection permanently busy")
+        finally:
             await conn.close()
 
     asyncio.run(run())

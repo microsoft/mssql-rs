@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
+use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::error::Error;
 use pyo3::prelude::*;
@@ -15,7 +16,8 @@ use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
-use crate::async_session::{AsyncConnectionState, CursorId, OperationId};
+use crate::async_description::{DescriptionState, materialize};
+use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
 use crate::row_writer::PyRowWriter;
 
 const FETCH_YIELD_INTERVAL: usize = 256;
@@ -65,6 +67,7 @@ pub(crate) struct FetchResources {
     session_state: Arc<AsyncConnectionState>,
     cursor_id: CursorId,
     fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
 }
 
 impl FetchResources {
@@ -74,6 +77,7 @@ impl FetchResources {
         session_state: Arc<AsyncConnectionState>,
         cursor_id: CursorId,
         fetch_state: Arc<FetchState>,
+        description_state: Arc<DescriptionState>,
     ) -> Self {
         Self {
             client,
@@ -81,6 +85,7 @@ impl FetchResources {
             session_state,
             cursor_id,
             fetch_state,
+            description_state,
         }
     }
 }
@@ -301,6 +306,13 @@ fn map_fetch_error(operation: &str, error: Error, elapsed_ms: u128) -> PyErr {
     ))
 }
 
+fn map_nextset_error(error: Error, elapsed_ms: u128) -> PyErr {
+    tracing::error!("PyAsyncCursor::nextset: failed; elapsed_ms={elapsed_ms}; error={error}");
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "PyAsyncCursor.nextset failed while advancing results: {error}"
+    ))
+}
+
 fn fetch<'py>(
     cursor: Py<PyAsyncCursor>,
     py: Python<'py>,
@@ -315,7 +327,12 @@ fn fetch<'py>(
         session_state,
         cursor_id,
         fetch_state,
+        description_state: _,
     } = resources;
+    if fetch_state.status() == FetchStatus::NoResultSet {
+        session_state.ensure_open().map_err(map_claim_error)?;
+        return Err(map_claim_error(ClaimError::NoResultSet));
+    }
     if fetch_state.status() == FetchStatus::Exhausted {
         session_state.ensure_open().map_err(map_claim_error)?;
         return pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -475,13 +492,128 @@ pub(crate) fn fetchall<'py>(
     )
 }
 
+/// Return an awaitable that advances to the next statement result.
+pub(crate) fn nextset<'py>(
+    cursor: Py<PyAsyncCursor>,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let resources = cursor.borrow(py).fetch_resources()?;
+    let FetchResources {
+        client,
+        dispatch,
+        session_state,
+        cursor_id,
+        fetch_state,
+        description_state,
+    } = resources;
+    let claim = match session_state.claim_fetch(cursor_id) {
+        Ok(claim) => claim,
+        Err(ClaimError::NoResultSet) if fetch_state.status() == FetchStatus::Exhausted => {
+            return pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(false) });
+        }
+        Err(error) => return Err(map_claim_error(error)),
+    };
+    let operation_id = claim.operation_id;
+    let future_state = session_state.clone();
+    let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
+    let previous_description = description_state.replace(None);
+    let future_fetch_state = fetch_state.clone();
+    let future_description_state = description_state.clone();
+    let guard_dispatch = dispatch.clone();
+    let materialization_dispatch = dispatch.clone();
+
+    let future = async move {
+        let started = Instant::now();
+        tracing::debug!("PyAsyncCursor::nextset: started");
+        let _cursor = cursor;
+        let mut fetch_guard =
+            FetchGuard::new(future_state, operation_id, "nextset", guard_dispatch);
+
+        let (result, has_open_batch) = {
+            let mut client = client.lock().await;
+            let result = client.advance().await.map(|result| {
+                let metadata =
+                    matches!(result, StatementResult::Rows).then(|| client.get_metadata().clone());
+                (result, metadata)
+            });
+            (result, client.has_open_batch())
+        };
+        let read_ms = started.elapsed().as_millis();
+
+        match result {
+            Ok((result, metadata)) => {
+                let has_result = !matches!(result, StatementResult::End);
+                let has_rows = matches!(result, StatementResult::Rows);
+                let column_count = metadata.as_ref().map_or(0, Vec::len);
+                future_fetch_state.set(match result {
+                    StatementResult::Rows => FetchStatus::Ready,
+                    StatementResult::NoRows { .. } => FetchStatus::NoResultSet,
+                    StatementResult::End => FetchStatus::Exhausted,
+                });
+                fetch_guard.complete(!has_rows, has_open_batch);
+
+                let materialization_started = Instant::now();
+                let mut materialization_guard =
+                    MaterializationGuard::new("nextset", materialization_dispatch);
+                match materialize(metadata).await {
+                    Ok(description) => {
+                        materialization_guard.complete();
+                        future_description_state.replace(description);
+                        tracing::debug!(
+                            "PyAsyncCursor::nextset: completed; has_result={has_result}; has_rows={has_rows}; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}",
+                            started.elapsed().as_millis(),
+                            materialization_started.elapsed().as_millis(),
+                        );
+                        if !has_result {
+                            tracing::info!("PyAsyncCursor::nextset: batch exhausted");
+                        }
+                        Ok(has_result)
+                    }
+                    Err(error) => {
+                        materialization_guard.complete();
+                        tracing::error!(
+                            "PyAsyncCursor::nextset: description materialization failed; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}; error={error}",
+                            started.elapsed().as_millis(),
+                            materialization_started.elapsed().as_millis(),
+                        );
+                        Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Advanced result set but cursor description materialization failed: {error}"
+                        )))
+                    }
+                }
+            }
+            Err(error) => {
+                fetch_guard.fail(has_open_batch);
+                future_fetch_state.set(FetchStatus::NoResultSet);
+                Err(map_nextset_error(error, read_ms))
+            }
+        }
+    };
+    let future = async move {
+        match dispatch {
+            Some(dispatch) => future.with_subscriber(dispatch).await,
+            None => future.await,
+        }
+    };
+
+    match pyo3_async_runtimes::tokio::future_into_py(py, future) {
+        Ok(awaitable) => Ok(awaitable),
+        Err(error) => {
+            session_state.restore_fetch(operation_id);
+            fetch_state.set(previous_fetch_status);
+            description_state.replace(previous_description);
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use mssql_tds::error::Error;
 
-    use super::{FetchGuard, map_fetch_error};
+    use super::{FetchGuard, map_fetch_error, map_nextset_error};
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
 
     fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64) {
@@ -524,6 +656,15 @@ mod tests {
 
         assert!(error.to_string().contains(
             "PyAsyncCursor.fetchone failed while reading rows: Protocol Error: invalid row token"
+        ));
+    }
+
+    #[test]
+    fn maps_nextset_error_to_python_runtime_error() {
+        let error = map_nextset_error(Error::ProtocolError("invalid result token".to_string()), 7);
+
+        assert!(error.to_string().contains(
+            "PyAsyncCursor.nextset failed while advancing results: Protocol Error: invalid result token"
         ));
     }
 }
