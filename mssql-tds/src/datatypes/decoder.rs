@@ -443,6 +443,94 @@ impl PlpChunkStreamReader {
         Ok(Some(Self::new(length)))
     }
 
+    fn try_begin_buffered(bytes: &[u8]) -> TdsResult<Option<(Option<Self>, usize)>> {
+        let Some(header) = bytes.get(..8) else {
+            return Ok(None);
+        };
+        let raw_len_i64 = i64::from_le_bytes(header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP header".to_string())
+        })?);
+        let raw_len = raw_len_i64 as u64;
+        let raw_len_usize = raw_len as usize;
+        if raw_len_usize == GenericDecoder::SQL_PLP_NULL {
+            return Ok(Some((None, 8)));
+        }
+        let length = if raw_len_usize == GenericDecoder::SQL_PLP_UNKNOWNLEN
+            || raw_len_usize == GenericDecoder::SQL_PLP_MAXLEN
+        {
+            PlpChunkReadLength::Unknown
+        } else {
+            let declared_len = raw_len as usize;
+            if raw_len_i64 < 0 || declared_len > MAX_PLP_SIZE {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP length {declared_len} (raw i64: {raw_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
+                )));
+            }
+            PlpChunkReadLength::Known(raw_len)
+        };
+        Ok(Some((Some(Self::new(length)), 8)))
+    }
+
+    fn try_read_complete_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let PlpChunkReadLength::Known(known_len) = self.length else {
+            return Ok(None);
+        };
+        if self.reached_end || self.chunk_remaining != 0 || self.total_read != 0 {
+            return Ok(None);
+        }
+        let length = usize::try_from(known_len).map_err(|_| {
+            crate::error::Error::ProtocolError("PLP length does not fit usize".to_string())
+        })?;
+        if length > out.len() {
+            return Ok(None);
+        }
+        let Some(chunk_header) = bytes.get(..4) else {
+            return Ok(None);
+        };
+        let chunk_len = u32::from_le_bytes(chunk_header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP chunk header".to_string())
+        })?) as usize;
+        if length == 0 && chunk_len == 0 {
+            self.reached_end = true;
+            return Ok(Some((4, 0)));
+        }
+        if chunk_len != length {
+            return Ok(None);
+        }
+        let payload_end = 4usize.checked_add(length).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP length overflowed".to_string())
+        })?;
+        let terminator_end = payload_end.checked_add(4).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP terminator overflowed".to_string())
+        })?;
+        let Some(payload) = bytes.get(4..payload_end) else {
+            return Ok(None);
+        };
+        let Some(terminator) = bytes.get(payload_end..terminator_end) else {
+            return Ok(None);
+        };
+        if u32::from_le_bytes(terminator.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP terminator".to_string())
+        })?) != 0
+        {
+            return Ok(None);
+        }
+        out.get_mut(..length)
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(
+                    "Buffered PLP output range was unavailable".to_string(),
+                )
+            })?
+            .copy_from_slice(payload);
+        self.total_read = length;
+        self.reached_end = true;
+        Ok(Some((terminator_end, length)))
+    }
+
     pub(crate) fn total_read(&self) -> usize {
         self.total_read
     }
@@ -638,6 +726,32 @@ impl PlpColumnStream {
             collation,
             inner,
         }))
+    }
+
+    pub(crate) fn try_begin_buffered(
+        metadata: &ColumnMetadata,
+        bytes: &[u8],
+    ) -> TdsResult<Option<(Option<Self>, usize)>> {
+        let (plp_type, collation) = Self::type_from_metadata(metadata)?;
+        let Some((inner, used)) = PlpChunkStreamReader::try_begin_buffered(bytes)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            inner.map(|inner| Self {
+                plp_type,
+                collation,
+                inner,
+            }),
+            used,
+        )))
+    }
+
+    pub(crate) fn try_read_complete_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        self.inner.try_read_complete_buffered(bytes, out)
     }
 
     /// The PLP-capable SQL Server type for this column.
@@ -3446,7 +3560,8 @@ mod test {
     use crate::datatypes::{
         column_values::ColumnValues,
         decoder::{
-            DecimalParts, GenericDecoder, MAX_ALLOC_SIZE, StringDecoder, validate_alloc_size,
+            DecimalParts, GenericDecoder, MAX_ALLOC_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
+            StringDecoder, validate_alloc_size,
         },
         sqldatatypes::TdsDataType,
     };
@@ -3481,6 +3596,20 @@ mod test {
         let parts = DecimalParts::new(true, 1, 0, magnitude);
 
         assert_eq!(expected, parts.to_f64());
+    }
+
+    #[test]
+    fn empty_buffered_plp_consumes_only_its_single_terminator() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(0));
+        let mut out = [];
+
+        assert_eq!(
+            stream
+                .try_read_complete_buffered(&[0; 8], &mut out)
+                .unwrap(),
+            Some((4, 0))
+        );
+        assert!(stream.reached_end());
     }
 
     #[test]

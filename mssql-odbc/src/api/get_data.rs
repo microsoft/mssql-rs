@@ -3,7 +3,7 @@
 
 //! SQLGetData implementation with incremental row materialization.
 
-use tracing::{debug, error};
+use tracing::error;
 
 use std::sync::MutexGuard;
 
@@ -49,16 +49,6 @@ pub(crate) unsafe fn sql_get_data(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        column_number,
-        target_type,
-        ?target_value_ptr,
-        buffer_length,
-        ?strlen_or_ind_ptr,
-        "SQLGetData called",
-    );
-
     crate::ffi_entry!("SQLGetData", unsafe {
         sql_get_data_impl(
             statement_handle,
@@ -206,34 +196,96 @@ fn sql_get_data_safe(
         return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
     }
 
-    if stmt_state.buffered_get_data_row.is_some() {
-        let captured = {
-            let row = stmt_state.buffered_get_data_row.as_mut();
-            row.and_then(|row| {
-                let value = row.values.get_mut(col_index - 1)?.take()?;
+    let mut try_complete_buffered_plp = false;
+    if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
+        for skipped in row.values.iter_mut().take(col_index - 1) {
+            *skipped = None;
+        }
+        let typed_buffered = is_typed_c_target(target_type)
+            && row
+                .values
+                .get(col_index - 1)
+                .and_then(Option::as_ref)
+                .is_some_and(|value| !matches!(value, ColumnValues::Null));
+        if typed_buffered {
+            let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
+            let converted =
+                row.values
+                    .get(col_index - 1)
+                    .and_then(Option::as_ref)
+                    .map(|value| unsafe {
+                        convert_typed_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
+                    });
+            let Some(converted) = converted else {
+                post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+                return SQL_ERROR;
+            };
+            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            let rc = finish_typed_conv(&mut stmt_state, converted);
+            if rc != SQL_ERROR {
+                if let Some(row) = stmt_state.buffered_get_data_row.as_mut()
+                    && let Some(value) = row.values.get_mut(col_index - 1)
+                {
+                    *value = None;
+                }
+                stmt_state.current_row_last_col = col_index;
+                stmt_state.partial_text_offset = None;
+            }
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
+        }
+
+        let captured = row
+            .values
+            .get_mut(col_index - 1)
+            .and_then(Option::take)
+            .map(|value| {
                 let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
-                Some((value, variant_base))
-            })
-        };
-        let Some((value, variant_base)) = captured else {
-            post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
-            return SQL_ERROR;
-        };
-        stmt_state.last_captured = Some((col_index, value));
-        stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
-        let rc = write_captured_column(
-            &mut stmt_state,
-            col_index,
-            target_type,
-            target_value_ptr,
-            buffer_length,
-            strlen_or_ind_ptr,
-        );
-        return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
+                (value, variant_base)
+            });
+        if let Some((value, variant_base)) = captured {
+            stmt_state.last_captured = Some((col_index, value));
+            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            let rc = write_captured_column(
+                &mut stmt_state,
+                col_index,
+                target_type,
+                target_value_ptr,
+                buffer_length,
+                strlen_or_ind_ptr,
+            );
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
+        }
+
+        // A deferred slot marks the first PLP or a later column. The TDS cursor
+        // is already paused at that boundary, so discard the now-inaccessible
+        // prefix and continue through the ordinary streaming/resume path.
+        if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
+            row.wire_deferred = true;
+        }
+        try_complete_buffered_plp = target_type == SQL_C_WCHAR
+            && !strlen_or_ind_ptr.is_null()
+            && buffer_length >= SqlLen::try_from(std::mem::size_of::<SqlWChar>()).unwrap_or(2)
+            && stmt_state
+                .column_metadata
+                .get(col_index - 1)
+                .and_then(|metadata| metadata.plp_encoding())
+                == Some(PlpEncoding::Utf16Text);
     }
 
     // Resume the decoder to the requested column then write output.
     drop(stmt_state);
+    if try_complete_buffered_plp
+        && let Some(rc) = try_deliver_complete_buffered_unicode_plp(
+            stmt,
+            statement_handle,
+            col_index,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        )
+    {
+        return rc;
+    }
     let rc = resume_row_to_column(stmt, statement_handle, col_index);
     if rc != SQL_SUCCESS {
         return rc;
@@ -267,6 +319,79 @@ fn sql_get_data_safe(
     finish_get_data(stmt, statement_handle, reopened_stmt_state, col_index, rc)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn try_deliver_complete_buffered_unicode_plp(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    col_index: usize,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> Option<SqlReturn> {
+    let payload_capacity = (buffer_length as usize).saturating_sub(std::mem::size_of::<SqlWChar>());
+    let mut payload = [0_u8; 256];
+    let out_len = payload_capacity.min(payload.len()) & !1;
+    let dbc = stmt.parent_dbc();
+    let mut dbc_state = dbc.inner.lock().ok()?;
+    if dbc_state
+        .active_stmt
+        .is_some_and(|busy_stmt| busy_stmt != statement_handle)
+    {
+        return None;
+    }
+    let poll = dbc_state
+        .client
+        .as_mut()?
+        .try_read_row_plp_complete(col_index - 1, &mut payload[..out_len])
+        .ok()?;
+    let value = match poll {
+        CursorPoll::Pending => return None,
+        CursorPoll::Ready(value) => value,
+    };
+    dbc_state.active_stmt = Some(statement_handle);
+    drop(dbc_state);
+
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        return Some(SQL_ERROR);
+    };
+    let rc = if let Some(chunk) = value {
+        if !target_value_ptr.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    target_value_ptr.cast::<u8>(),
+                    chunk.read,
+                );
+                target_value_ptr
+                    .cast::<u8>()
+                    .add(chunk.read)
+                    .cast::<SqlWChar>()
+                    .write_unaligned(0);
+            }
+        }
+        unsafe { write_if_some(strlen_or_ind_ptr, chunk.read as SqlLen) };
+        SQL_SUCCESS
+    } else {
+        unsafe {
+            write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA);
+            if !target_value_ptr.is_null() {
+                target_value_ptr.cast::<SqlWChar>().write_unaligned(0);
+            }
+        }
+        SQL_SUCCESS
+    };
+    stmt_state.current_row_last_col = col_index;
+    stmt_state.last_captured = None;
+    stmt_state.active_plp = None;
+    Some(finish_get_data(
+        stmt,
+        statement_handle,
+        stmt_state,
+        col_index,
+        rc,
+    ))
+}
+
 /// After `SQLGetData` finishes delivering `col_index`, peeks one token past
 /// the current row if that was the result set's last column — mirroring
 /// `fetch_scroll.rs`'s bound-column fetch path. Safe here because every
@@ -294,14 +419,20 @@ fn sql_get_data_safe(
 fn finish_get_data(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
-    stmt_state: MutexGuard<'_, StmtState>,
+    mut stmt_state: MutexGuard<'_, StmtState>,
     col_index: usize,
     rc: SqlReturn,
 ) -> SqlReturn {
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
-    let row_was_buffered = stmt_state.buffered_get_data_row.is_some();
+    let row_was_buffered = stmt_state
+        .buffered_get_data_row
+        .as_ref()
+        .is_some_and(|row| !row.wire_deferred);
+    if ready {
+        stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
+    }
     drop(stmt_state);
     if !ready || row_was_buffered {
         return rc;
@@ -702,7 +833,7 @@ fn stream_active_plp_chunk(
         return SQL_ERROR;
     }
 
-    {
+    let (plp_encoding, widen_carry_len) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLGetData: stmt mutex poisoned while preparing PLP stream read");
             return SQL_ERROR;
@@ -796,13 +927,6 @@ fn stream_active_plp_chunk(
             );
             return SQL_ERROR;
         }
-    }
-
-    let (plp_encoding, widen_carry_len) = {
-        let Ok(ss) = stmt.inner.lock() else {
-            return SQL_ERROR;
-        };
-        let stream = ss.active_plp.as_ref();
         (
             stream.map(|s| s.encoding),
             stream.map_or(0, |s| s.pending_units.len()),
@@ -914,46 +1038,70 @@ fn stream_active_plp_chunk(
         return SQL_ERROR;
     }
 
-    let mut payload = vec![0u8; max_read];
+    let mut inline_payload = [0_u8; 256];
+    let mut heap_payload = Vec::new();
+    let payload = if max_read <= inline_payload.len() {
+        &mut inline_payload[..max_read]
+    } else {
+        heap_payload.resize(max_read, 0);
+        heap_payload.as_mut_slice()
+    };
     let dbc = stmt.parent_dbc();
-    let mut client = {
-        let Ok(mut dbc_state) = dbc.inner.lock() else {
+    let mut dbc_state = match dbc.inner.lock() {
+        Ok(state) => state,
+        Err(_) => {
             error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
             return SQL_ERROR;
-        };
-
-        if let Some(busy_stmt) = dbc_state.active_stmt
-            && busy_stmt != statement_handle
-        {
-            drop(dbc_state);
-            if let Ok(mut s) = stmt.inner.lock() {
-                post_diag(&mut s, ERR_CONNECTION_BUSY);
-            }
-            return SQL_ERROR;
         }
-
-        let Some(client) = dbc_state.client.take() else {
+    };
+    if let Some(busy_stmt) = dbc_state.active_stmt
+        && busy_stmt != statement_handle
+    {
+        drop(dbc_state);
+        if let Ok(mut s) = stmt.inner.lock() {
+            post_diag(&mut s, ERR_CONNECTION_BUSY);
+        }
+        return SQL_ERROR;
+    }
+    let buffered_read = {
+        let Some(client) = dbc_state.client.as_mut() else {
             drop(dbc_state);
             if let Ok(mut s) = stmt.inner.lock() {
                 post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
             }
             return SQL_ERROR;
         };
-
-        client
+        client.try_read_active_plp_chunk(payload)
     };
-
-    let read_result = dbc
-        .runtime
-        .block_on(client.read_active_plp_chunk(&mut payload));
-
-    let Ok(mut dbc_state) = dbc.inner.lock() else {
-        error!("SQLGetData: dbc mutex poisoned after PLP read");
-        return SQL_ERROR;
-    };
-    dbc_state.client = Some(client);
     dbc_state.active_stmt = Some(statement_handle);
-    drop(dbc_state);
+    let read_result = match buffered_read {
+        Ok(CursorPoll::Ready(chunk)) => {
+            drop(dbc_state);
+            Ok(chunk)
+        }
+        Err(error) => {
+            drop(dbc_state);
+            Err(error)
+        }
+        Ok(CursorPoll::Pending) => {
+            let Some(mut client) = dbc_state.client.take() else {
+                drop(dbc_state);
+                if let Ok(mut s) = stmt.inner.lock() {
+                    post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
+                }
+                return SQL_ERROR;
+            };
+            drop(dbc_state);
+            let result = dbc.runtime.block_on(client.read_active_plp_chunk(payload));
+            let Ok(mut dbc_state) = dbc.inner.lock() else {
+                error!("SQLGetData: dbc mutex poisoned after PLP read");
+                return SQL_ERROR;
+            };
+            dbc_state.client = Some(client);
+            dbc_state.active_stmt = Some(statement_handle);
+            result
+        }
+    };
 
     let PlpChunk {
         read,
@@ -1026,15 +1174,23 @@ fn stream_active_plp_chunk(
         );
     } else if target_type == SQL_C_WCHAR {
         let usable = read & !1;
-        let units: Vec<u16> = payload[..usable]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
         let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
-        unsafe {
-            copy_with_nul(target_value_ptr as *mut SqlWChar, buf_elements, &units);
-            write_if_some(strlen_or_ind_ptr, usable as SqlLen);
+        if buf_elements > 0 && !target_value_ptr.is_null() {
+            let copy_bytes = usable.min((buf_elements - 1) * std::mem::size_of::<SqlWChar>());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    target_value_ptr.cast::<u8>(),
+                    copy_bytes,
+                );
+                target_value_ptr
+                    .cast::<u8>()
+                    .add(copy_bytes)
+                    .cast::<SqlWChar>()
+                    .write_unaligned(0);
+            }
         }
+        unsafe { write_if_some(strlen_or_ind_ptr, usable as SqlLen) };
     } else if transcode_utf16_to_utf8 {
         // NVARCHAR PLP wire bytes are UTF-16LE; transcode to UTF-8 for
         // SQL_C_CHAR, carrying a split code unit or surrogate pair across the
@@ -1119,7 +1275,7 @@ fn stream_active_plp_chunk(
 
     if reached_end && !widen_units_still_held {
         stmt_state.active_plp = None;
-        return SQL_SUCCESS;
+        return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
     }
 
     // active_plp already holds this column's stream state; leave it in place so
@@ -1987,7 +2143,40 @@ mod tests {
                 .into_iter()
                 .map(|value| Some(ColumnValues::Int(value)))
                 .collect(),
+            wire_deferred: false,
         });
+    }
+
+    fn stmt_with_buffered_prefix_and_deferred_client(h: &TestHandles) {
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.column_metadata = int_columns(2);
+            state.row_positioned = true;
+            state.buffered_get_data_row = Some(BufferedGetDataRow {
+                values: vec![Some(ColumnValues::Int(10)), None],
+                variant_bases: vec![None, None],
+                wire_deferred: false,
+            });
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10, 20]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT deferred column".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        assert!(matches!(
+            client.try_read_row_column(0).unwrap(),
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Int(10),
+                ..
+            })
+        ));
+        let mut state = dbc.inner.lock().unwrap();
+        state.client = Some(client);
+        state.active_stmt = Some(h.stmt);
     }
 
     #[test]
@@ -2087,6 +2276,130 @@ mod tests {
         assert_eq!(
             stmt.inner.lock().unwrap().last_variant_base,
             Some((1, TdsDataType::Int4))
+        );
+    }
+
+    #[test]
+    fn buffered_typed_get_data_preserves_variant_base() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_get_data_row(&h, vec![42]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .buffered_get_data_row
+            .as_mut()
+            .unwrap()
+            .variant_bases[0] = Some(TdsDataType::Int4);
+        let mut value = 0_i32;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 42);
+        assert_eq!(
+            stmt.inner.lock().unwrap().last_variant_base,
+            Some((1, TdsDataType::Int4))
+        );
+    }
+
+    #[test]
+    fn get_data_serves_prefix_then_resumes_deferred_column() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_prefix_and_deferred_client(&h);
+        let mut value = 0_i32;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 10);
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 20);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.buffered_get_data_row.is_none());
+        let row = state.spare_get_data_row.as_ref().unwrap();
+        assert!(row.wire_deferred);
+        assert!(row.values.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn direct_deferred_access_discards_buffered_prefix() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_prefix_and_deferred_client(&h);
+        let mut value = 0_i32;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 20);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert!(state.buffered_get_data_row.is_none());
+        let row = state.spare_get_data_row.as_ref().unwrap();
+        assert!(row.wire_deferred);
+        assert!(row.values.iter().all(Option::is_none));
+        assert_eq!(state.current_row_last_col, 2);
+        drop(state);
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
         );
     }
 
