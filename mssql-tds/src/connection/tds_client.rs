@@ -401,6 +401,26 @@ pub struct TdsClient {
     streamed_write_state: StreamedWriteState,
 }
 
+/// Runs `fut` bounded by `remaining`, converting an elapsed timeout into
+/// `Error::TimeoutError`. Extracted out of `TdsClient::reconnect` so the
+/// elapsed branch can be driven directly in a test (`tokio::time::pause` plus
+/// a future that never resolves) instead of needing a live, slow connect
+/// attempt to provoke it.
+async fn attempt_within<T>(
+    remaining: Duration,
+    fut: impl Future<Output = TdsResult<T>>,
+) -> TdsResult<T> {
+    tokio::time::timeout(remaining, fut)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(crate::error::Error::TimeoutError(
+                crate::error::TimeoutErrorType::String(
+                    "Reconnection attempt timed out".to_string(),
+                ),
+            ))
+        })
+}
+
 impl TdsClient {
     pub(crate) fn new(
         transport: AnyTransport,
@@ -534,10 +554,16 @@ impl TdsClient {
             let mut reconnect_ctx = client_context.clone();
 
             // Cap the per-attempt connect timeout to the remaining reconnect budget.
+            // `.max(1)`: `remaining` can be under a second this close to the deadline,
+            // and `as_secs()` truncates that to 0 — which `create_base_stream_sequential`
+            // has no "0 means default" fallback for, so it would time out the attempt
+            // on its first poll instead of giving it a real chance. The outer
+            // `attempt_within(remaining, ...)` below is the actual deadline backstop,
+            // so rounding up here can't make an attempt outlive the reconnect budget.
             let remaining = deadline.saturating_duration_since(Instant::now());
             reconnect_ctx.connect_timeout = reconnect_ctx
                 .connect_timeout
-                .min(remaining.as_secs() as u32);
+                .min(remaining.as_secs().max(1) as u32);
 
             info!(attempt, "Attempting reconnection");
             // `connect_timeout` above only bounds the TCP-connect step inside
@@ -545,25 +571,17 @@ impl TdsClient {
             // otherwise unbounded here. Wrap the whole attempt (DNS through
             // login) in `remaining` too, so a slow resolver can't make a
             // single reconnect attempt outlive the overall reconnect deadline.
-            let connect_result = CancelHandle::run_until_cancelled(cancel_handle, async {
-                match tokio::time::timeout(
+            let connect_result = CancelHandle::run_until_cancelled(
+                cancel_handle,
+                attempt_within(
                     remaining,
                     TdsConnectionProvider::connect_with_transport_context(
                         &reconnect_ctx,
                         &transport_context,
                         Some(Box::new((*snapshot).clone())),
                     ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_elapsed) => {
-                        Err(Error::TimeoutError(crate::error::TimeoutErrorType::String(
-                            "Reconnection attempt timed out".to_string(),
-                        )))
-                    }
-                }
-            })
+                ),
+            )
             .await;
             match connect_result {
                 Ok((
@@ -8040,6 +8058,28 @@ mod tests {
             err.to_string().contains("Session recovery failed"),
             "Expected SessionRecoveryFailed, got: {err}"
         );
+    }
+
+    /// Covers the elapsed branch of `attempt_within` directly, since nothing
+    /// in `reconnect`'s own tests can provoke it: every failure a test can
+    /// reach today (no server, bad recovery state, ...) returns well before
+    /// any deadline. `start_paused` lets the timeout fire on a fake clock
+    /// instead of a real, slow connect attempt.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_within_times_out_when_the_future_never_completes() {
+        let remaining = Duration::from_secs(5);
+        let handle = tokio::spawn(attempt_within(
+            remaining,
+            std::future::pending::<TdsResult<()>>(),
+        ));
+
+        tokio::time::advance(remaining + Duration::from_millis(1)).await;
+
+        let result = handle.await.expect("attempt_within task panicked");
+        match result {
+            Err(crate::error::Error::TimeoutError(_)) => {}
+            other => panic!("expected a TimeoutError once the deadline elapses, got {other:?}"),
+        }
     }
 
     #[tokio::test]
