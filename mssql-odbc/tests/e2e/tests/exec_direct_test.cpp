@@ -543,3 +543,76 @@ TEST_F(ExecDirectLiveTest, SelectIntoCountStillReported) {
     EXPECT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
+
+// -------------------------------------------------------------------
+// Re-execution without an intervening close
+// -------------------------------------------------------------------
+
+// A parameterized DML runs as sp_executesql, whose DONEINPROC always claims
+// DONE_MORE because the RPC's own DONEPROC follows it. Taking that at face
+// value left a 0-column cursor open and failed every subsequent execute on the
+// statement with 24000 — the loop shape every ORM and mssql-python's own
+// batch-insert tests use (AB#47531).
+TEST_F(ExecDirectLiveTest, ParameterizedDmlIsImmediatelyReExecutable) {
+    SqlTString setup = ODBCTestUtils::ToSqlTStr("CREATE TABLE #reexec(i int)");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SqlTString insert = ODBCTestUtils::ToSqlTStr("INSERT INTO #reexec VALUES (?)");
+    for (SQLINTEGER value = 1; value <= 3; ++value) {
+        SCOPED_TRACE("execute #" + std::to_string(value) +
+                     " must not need an intervening SQLCloseCursor");
+        SQLINTEGER bound = value;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                       &bound, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(insert.c_str()), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN row_count = 0;
+        ASSERT_SQL_OK(SQLRowCount(stmt_, &row_count), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(1, row_count);
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+
+    SqlTString count = ODBCTestUtils::ToSqlTStr("SELECT COUNT(*) FROM #reexec");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(count.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER rows = -1;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &rows, sizeof(rows), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3, rows);
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The look-ahead that makes the case above work must not swallow a real second
+// result: a parameterized statement with anything still pending keeps its
+// cursor open and rejects re-execution with 24000, exactly as msodbcsql does.
+TEST_F(ExecDirectLiveTest, ParameterizedBatchWithPendingResultsRejectsReExecute) {
+    SqlTString setup = ODBCTestUtils::ToSqlTStr("CREATE TABLE #pending(i int)");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(setup.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER first = 1;
+    SQLINTEGER second = 2;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &first, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &second, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SqlTString batch = ODBCTestUtils::ToSqlTStr(
+        "INSERT INTO #pending VALUES (?); INSERT INTO #pending VALUES (?)");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(batch.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SqlTString again = ODBCTestUtils::ToSqlTStr("SELECT 1");
+    EXPECT_SQL_ERROR(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(again.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "24000");
+
+    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}

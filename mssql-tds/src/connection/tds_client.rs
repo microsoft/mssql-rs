@@ -475,6 +475,14 @@ pub struct TdsClient {
     /// (see `drain_active_row_if_needed`).
     row_already_positioned: bool,
 
+    /// A token read by the RPC-terminator look-ahead
+    /// (see [`settle_rpc_terminator`](Self::settle_rpc_terminator)) that turned
+    /// out to start another result instead of ending the response. Replayed by
+    /// [`next_response_token`](Self::next_response_token) before the wire is
+    /// touched again. Boxed to keep the client — and every future that owns it
+    /// by value — small.
+    parked_token: Option<Box<Tokens>>,
+
     /// Test-only: when `Some`, [`check_and_reconnect`](Self::check_and_reconnect)
     /// reports this as the elapsed recovery time and skips the transport, so
     /// budget-exhaustion paths are exercised without live reconnect timing.
@@ -532,6 +540,7 @@ impl TdsClient {
             empty_metadata: Vec::new(),
             active_row_read_state: ActiveRowReadState::Idle,
             row_already_positioned: false,
+            parked_token: None,
             #[cfg(test)]
             reconnect_elapsed_for_test: None,
             streamed_write_state: StreamedWriteState::Idle,
@@ -715,6 +724,7 @@ impl TdsClient {
         self.current_result_set_has_been_read_till_end = false;
         self.active_row_read_state = ActiveRowReadState::Idle;
         self.row_already_positioned = false;
+        self.parked_token = None;
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
 
@@ -2513,17 +2523,7 @@ impl TdsClient {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
 
         loop {
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &parser_context,
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
-            self.observe_response_token(&token)?;
+            let token = self.next_response_token(&parser_context).await?;
 
             match token {
                 Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
@@ -3905,17 +3905,7 @@ impl TdsClient {
             self.negotiated_settings.is_column_encryption_supported(),
         );
         loop {
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &parser_context,
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
-            self.observe_response_token(&token)?;
+            let token = self.next_response_token(&parser_context).await?;
 
             match token {
                 Tokens::Done(done) | Tokens::DoneProc(done) | Tokens::DoneInProc(done) => {
@@ -4098,17 +4088,11 @@ impl TdsClient {
                 );
             }
 
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &parser_context,
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
-            self.observe_response_token(&token)?;
+            let token = self.next_response_token(&parser_context).await?;
+            // `Tokens` moves into the match below; capture the one distinction
+            // the shared DONE arm erases — only an RPC emits DONEINPROC, and
+            // only there is the MORE flag ambiguous.
+            let is_done_in_proc = matches!(token, Tokens::DoneInProc(_));
             match token {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
@@ -4192,6 +4176,12 @@ impl TdsClient {
                             self.last_rows_affected = -1;
                         }
                         self.execution_context.set_has_open_batch(!is_last);
+                        if !is_last && is_done_in_proc {
+                            // The MORE flag may only be reporting the RPC's own
+                            // trailing DONEPROC; find out before the caller
+                            // treats it as another result.
+                            self.settle_rpc_terminator(&parser_context).await?;
+                        }
                         return Ok(ResultBoundaryKind::NoRows {
                             rows_affected: if has_update_count {
                                 Some(done.row_count)
@@ -4306,7 +4296,16 @@ impl TdsClient {
         loop {
             match self.advance_to_result_boundary().await? {
                 ResultBoundaryKind::RowSet(md) => return Ok(Some(md)),
-                ResultBoundaryKind::NoRows { .. } => continue,
+                // A no-row statement can also be the *last* thing in the
+                // response — a terminal DONE with a count, or an RPC whose
+                // terminator the look-ahead already consumed. Reading on would
+                // block on a token that is never coming, so honour the same
+                // guard `advance` applies.
+                ResultBoundaryKind::NoRows { .. } => {
+                    if !self.execution_context.has_open_batch() {
+                        return Ok(None);
+                    }
+                }
                 ResultBoundaryKind::End => return Ok(None),
             }
         }
@@ -4344,6 +4343,123 @@ impl TdsClient {
     /// positioning on a no-row statement result.
     pub fn has_open_batch(&self) -> bool {
         self.execution_context.has_open_batch()
+    }
+
+    /// Reads the next response token, replaying one parked by the RPC-terminator
+    /// look-ahead before touching the wire.
+    ///
+    /// A parked token was already timed and observed when it was first read, so
+    /// it is replayed as-is; re-observing it would charge one token's evidence
+    /// to the reset acknowledgement twice.
+    async fn next_response_token(&mut self, parser_context: &ParserContext) -> TdsResult<Tokens> {
+        if let Some(token) = self.parked_token.take() {
+            return Ok(*token);
+        }
+        let start = Instant::now();
+        let token = self
+            .transport
+            .receive_token(
+                parser_context,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+            )
+            .await?;
+        self.update_remaining_timeout(start);
+        self.observe_response_token(&token)?;
+        Ok(token)
+    }
+
+    /// Resolves whether an RPC response has anything left after the no-row
+    /// result just positioned on, closing the batch when it does not.
+    ///
+    /// Every `DONEINPROC` carries the MORE flag, because the RPC's own
+    /// `DONEPROC` still follows it, so the flag alone cannot tell "another
+    /// statement result is coming" from "that was the last one". Resolving that
+    /// ambiguity here lets every caller distinguish an exhausted RPC from one
+    /// with another result still available.
+    ///
+    /// Anything that is not the terminator is parked for the next read, so the
+    /// look-ahead never consumes a result the caller has yet to navigate to.
+    /// The response-tail control tokens that precede `DONEPROC` are absorbed
+    /// exactly as the main loop absorbs them.
+    ///
+    /// Unlike msodbcsql's short, non-failing single-byte peek, this consumes the
+    /// trailer under the request's remaining timeout. An expiry therefore fails
+    /// the request after the attention acknowledgement restores synchronization;
+    /// the connection remains reusable.
+    async fn settle_rpc_terminator(&mut self, parser_context: &ParserContext) -> TdsResult<()> {
+        let mut processing_error = None;
+        let mut loop_count = 0u32;
+        loop {
+            loop_count += 1;
+            if loop_count > 10000 {
+                let error = crate::error::Error::ProtocolError(
+                    "Too many RPC trailer tokens without terminal DONEPROC".to_string(),
+                );
+                self.fail_rpc_terminator_look_ahead(&error);
+                return Err(error);
+            }
+
+            let token = match self.next_response_token(parser_context).await {
+                Ok(token) => token,
+                Err(error) => {
+                    self.fail_rpc_terminator_look_ahead(&error);
+                    return Err(error);
+                }
+            };
+            match token {
+                Tokens::ReturnStatus(return_status) => {
+                    self.last_return_status = ReturnStatus::Received(return_status.value);
+                }
+                Tokens::ReturnValue(return_value_token) => {
+                    match self.finalize_return_value(return_value_token) {
+                        Ok(return_value) => self.push_return_value(return_value),
+                        Err(error) => {
+                            processing_error.get_or_insert(error);
+                        }
+                    };
+                }
+                Tokens::EnvChange(env_change) => {
+                    if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                        self.on_reset_connection_ack();
+                    }
+                    if let Err(error) = self
+                        .execution_context
+                        .capture_change_property(&env_change, &mut self.negotiated_settings)
+                    {
+                        processing_error.get_or_insert(error);
+                    }
+                }
+                Tokens::SessionState(session_state) => {
+                    if let Err(error) = self.recovery_context.process_session_state(&session_state)
+                    {
+                        processing_error.get_or_insert(error);
+                    }
+                }
+                Tokens::DoneProc(done) if !done.has_more() && !done.has_error() => {
+                    self.remaining_request_timeout = None;
+                    self.cancel_handle = None;
+                    self.execution_context.set_has_open_batch(false);
+                    return processing_error.map_or(Ok(()), Err);
+                }
+                other => {
+                    self.parked_token = Some(Box::new(other));
+                    return processing_error.map_or(Ok(()), Err);
+                }
+            }
+        }
+    }
+
+    fn fail_rpc_terminator_look_ahead(&mut self, error: &crate::error::Error) {
+        self.execution_context.set_has_open_batch(false);
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        if !matches!(
+            error,
+            crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
+        ) {
+            self.retire_after_failed_drain(error);
+        }
     }
 
     /// Returns `true` when an open result batch or streamed write blocks a new command.
@@ -6152,6 +6268,9 @@ impl TdsClient {
     fn begin_command(&mut self) {
         self.settle_abandoned_reset_verification();
         self.info_messages.clear();
+        // A token parked by the look-ahead belongs to the previous response;
+        // replaying it here would desynchronize this command's reader.
+        self.parked_token = None;
         // Clear output parameters / return values from the previous command so a
         // fully-navigated prior RPC does not leave `get_return_values()` /
         // `retrieve_output_params()` reporting stale values for this new command.
@@ -6491,17 +6610,7 @@ impl TdsClient {
     pub(crate) async fn consume_transaction_response(&mut self) -> TdsResult<()> {
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
         loop {
-            let start = Instant::now();
-            let token = self
-                .transport
-                .receive_token(
-                    &ParserContext::None(()),
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
-                )
-                .await?;
-            self.update_remaining_timeout(start);
-            self.observe_response_token(&token)?;
+            let token = self.next_response_token(&ParserContext::None(())).await?;
 
             match token {
                 Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
@@ -6893,6 +7002,7 @@ mod tests {
         /// Cached liveness flag toggled by `mark_known_dead`, surfaced through
         /// `connection_known_dead` so tests can assert the fatal-error path.
         known_dead: bool,
+        receive_error: Option<crate::error::Error>,
         sync_header_available: bool,
         sync_columns: VecDeque<ColumnValues>,
         encryption_setting: NegotiatedEncryptionSetting,
@@ -6918,6 +7028,7 @@ mod tests {
                 cancel_after_send: None,
                 attentions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 known_dead: false,
+                receive_error: None,
                 sync_header_available: false,
                 sync_columns: VecDeque::new(),
                 encryption_setting: NegotiatedEncryptionSetting::NoEncryption,
@@ -6929,6 +7040,13 @@ mod tests {
             Self {
                 pending_tokens: VecDeque::from(tokens),
                 ..Self::new()
+            }
+        }
+
+        fn with_tokens_then_error(tokens: Vec<Tokens>, error: crate::error::Error) -> Self {
+            Self {
+                receive_error: Some(error),
+                ..Self::with_tokens(tokens)
             }
         }
 
@@ -7003,6 +7121,9 @@ mod tests {
             }
             if let Some(tok) = self.pending_tokens.pop_front() {
                 return Ok(tok);
+            }
+            if let Some(error) = self.receive_error.take() {
+                return Err(error);
             }
             Err(crate::error::Error::ConnectionClosed("test".to_string()))
         }
@@ -10240,6 +10361,347 @@ mod tests {
         client.advance().await.unwrap();
         assert_eq!(client.last_rows_affected(), 1);
         assert_eq!(client.take_dml_result_counts(), vec![3, 2, 1]);
+    }
+
+    /// A `DONEINPROC` carrying a DML count. Every one of these sets `DONE_MORE`
+    /// on the wire — the RPC's own `DONEPROC` still follows — which is exactly
+    /// the ambiguity the terminator look-ahead resolves.
+    fn done_in_proc_count(cmd: CurrentCommand, rows: u64) -> Tokens {
+        Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::COUNT | DoneStatus::MORE,
+            cur_cmd: cmd,
+            row_count: rows,
+        })
+    }
+
+    /// The terminal `DONEPROC` that closes an RPC response.
+    fn done_proc_final() -> Tokens {
+        Tokens::DoneProc(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn return_status(value: i32) -> Tokens {
+        Tokens::ReturnStatus(crate::token::tokens::ReturnStatusToken { value })
+    }
+
+    /// A single-statement `sp_executesql` DML: its `DONEINPROC` claims MORE, but
+    /// the only thing behind it is the RPC's `RETURNSTATUS`/`DONEPROC` trailer.
+    /// The batch must be reported closed so the ODBC layer leaves the statement
+    /// re-executable instead of parking a 0-column cursor on it (which surfaced
+    /// as 24000 on the second parameterized INSERT — AB#47531).
+    #[tokio::test]
+    async fn sp_executesql_single_dml_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            done_proc_final(),
+        ]);
+        let cancel_handle = CancelHandle::new();
+        let result = client
+            .execute_sp_executesql(
+                "INSERT INTO t VALUES (@P1)".to_string(),
+                Vec::new(),
+                ExecuteOptions::new()
+                    .timeout_secs(30)
+                    .cancel(&cancel_handle),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, StatementResult::NoRows { .. }));
+        assert!(
+            !client.has_open_batch(),
+            "only the RPC trailer followed, so nothing is left to navigate to"
+        );
+        assert_eq!(client.last_rows_affected(), 1);
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+    }
+
+    /// Output parameters belong to the RPC trailer and must be finalized before
+    /// the terminal `DONEPROC` closes the batch.
+    #[tokio::test]
+    async fn sp_executesql_output_parameters_close_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::ReturnValue(ae_return_value_token("@out1", ColumnValues::Int(7), None)),
+            Tokens::ReturnValue(ae_return_value_token("@out2", ColumnValues::Int(9), None)),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("SET @out1 = 7; SET @out2 = 9".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        let values = client.retrieve_output_params().unwrap().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].value, ColumnValues::Int(7));
+        assert_eq!(values[1].value, ColumnValues::Int(9));
+    }
+
+    /// Session-state control tokens can appear in the RPC response tail and
+    /// must be applied without keeping the batch open.
+    #[tokio::test]
+    async fn sp_executesql_session_state_trailer_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::SessionState(SessionStateToken {
+                sequence_number: u32::MAX,
+                status: 0,
+                states: Vec::new(),
+            }),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("SET NOCOUNT ON".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        assert!(
+            client
+                .recovery_context
+                .session_state_table
+                .master_recovery_disabled
+        );
+    }
+
+    /// Environment changes in the RPC response tail must update connection
+    /// state without keeping the batch open.
+    #[tokio::test]
+    async fn sp_executesql_env_change_trailer_closes_the_batch() {
+        use crate::token::tokens::{EnvChangeToken, EnvChangeTokenSubType};
+
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::BeginTransaction,
+                change_type: (0u64, 42u64).into(),
+            }),
+            done_proc_final(),
+        ]);
+
+        client
+            .execute_sp_executesql("BEGIN TRANSACTION".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+
+        assert!(!client.has_open_batch());
+        assert_eq!(client.execution_context.get_transaction_descriptor(), 42);
+    }
+
+    /// A fully parsed output parameter that cannot be decrypted is a command
+    /// error, not a transport or synchronization failure.
+    #[tokio::test]
+    async fn sp_executesql_output_decryption_error_does_not_retire_connection() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            return_status(0),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            done_proc_final(),
+        ]);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let result = client
+            .execute_sp_executesql(
+                "SET @out = 7".to_string(),
+                Vec::new(),
+                ExecuteOptions::new().column_encryption(ExecutionColumnEncryptionSetting::Enabled),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+    }
+
+    /// Timeout and cancellation drain through the attention acknowledgement, so
+    /// request state is cleared without retiring the synchronized connection.
+    #[tokio::test]
+    async fn sp_executesql_terminator_timeout_clears_request_state() {
+        let errors = [
+            crate::error::Error::TimeoutError(crate::error::TimeoutErrorType::String(
+                "test timeout".to_string(),
+            )),
+            crate::error::Error::OperationCancelledError("test cancellation".to_string()),
+        ];
+
+        for error in errors {
+            let transport = TestTransport::with_tokens_then_error(
+                vec![done_in_proc_count(CurrentCommand::Insert, 1)],
+                error,
+            );
+            let mut client = create_test_client_with_transport(transport);
+            client.recovery_context.session_recovery_negotiated = true;
+            let cancel_handle = CancelHandle::new();
+
+            let result = client
+                .execute_sp_executesql(
+                    "INSERT INTO t VALUES (@P1)".to_string(),
+                    Vec::new(),
+                    ExecuteOptions::new()
+                        .timeout_secs(30)
+                        .cancel(&cancel_handle),
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert!(!client.has_open_batch());
+            assert!(client.remaining_request_timeout.is_none());
+            assert!(client.cancel_handle.is_none());
+            assert!(!client.transport.connection_known_dead());
+            assert!(client.recovery_context.session_recovery_negotiated);
+        }
+    }
+
+    /// A malicious or corrupt server cannot keep the trailer scanner alive
+    /// indefinitely by streaming control tokens without a terminal `DONEPROC`.
+    #[tokio::test]
+    async fn sp_executesql_terminator_iteration_limit_retires_connection() {
+        let mut tokens = vec![done_in_proc_count(CurrentCommand::Insert, 1)];
+        tokens.extend((0..10000).map(|_| return_status(0)));
+        let mut client = create_test_client_with_tokens(tokens);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let result = client
+            .execute_sp_executesql("INSERT INTO t VALUES (@P1)".to_string(), Vec::new(), ())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::ProtocolError(message))
+                if message == "Too many RPC trailer tokens without terminal DONEPROC"
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
+        assert!(!client.recovery_context.session_recovery_negotiated);
+    }
+
+    /// The same look-ahead must not swallow a real second statement: a
+    /// two-statement parameterized DML batch keeps the batch open, and the
+    /// parked token is replayed as the next result rather than re-read from the
+    /// wire.
+    #[tokio::test]
+    async fn sp_executesql_second_dml_keeps_the_batch_open() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            done_in_proc_count(CurrentCommand::Insert, 5),
+            return_status(0),
+            done_proc_final(),
+        ]);
+        client
+            .execute_sp_executesql(
+                "INSERT INTO t VALUES (@P1); INSERT INTO t VALUES (@P2)".to_string(),
+                Vec::new(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(client.has_open_batch());
+        assert_eq!(client.last_rows_affected(), 1);
+
+        let next = client.advance().await.unwrap();
+        assert!(matches!(next, StatementResult::NoRows { .. }));
+        assert_eq!(client.last_rows_affected(), 5);
+        assert!(!client.has_open_batch());
+    }
+
+    /// A row-returning statement behind the first result is likewise preserved:
+    /// the parked COLMETADATA becomes the next navigable result set.
+    #[tokio::test]
+    async fn sp_executesql_dml_then_select_keeps_the_select_navigable() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_in_proc_count(CurrentCommand::Insert, 1),
+            int_col_metadata(1),
+            done_proc_final(),
+        ]);
+        client
+            .execute_sp_executesql(
+                "INSERT INTO t VALUES (@P1); SELECT 42".to_string(),
+                Vec::new(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(client.has_open_batch());
+        assert!(matches!(
+            client.advance().await.unwrap(),
+            StatementResult::Rows
+        ));
+    }
+
+    /// A message-only statement (PRINT) is surfaced the same way a counted one
+    /// is, so it needs the same resolution — otherwise a parameterized PRINT
+    /// also stranded a cursor.
+    #[tokio::test]
+    async fn sp_executesql_message_only_statement_closes_the_batch() {
+        let mut client = create_test_client_with_tokens(vec![
+            info_token(0, 0, "printed"),
+            Tokens::DoneInProc(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            return_status(0),
+            done_proc_final(),
+        ]);
+        client
+            .execute_sp_executesql("PRINT CAST(@P1 AS VARCHAR(10))".to_string(), Vec::new(), ())
+            .await
+            .unwrap();
+        assert!(!client.has_open_batch());
+    }
+
+    /// A plain SQL batch has no `DONEPROC` trailer, so its `DONE_MORE` is
+    /// unambiguous and must be left alone: the second statement's count is still
+    /// a separate result.
+    #[tokio::test]
+    async fn plain_batch_more_flag_is_not_second_guessed() {
+        let mut client = create_test_client_with_tokens(vec![
+            done_count(CurrentCommand::Insert, 1, true),
+            done_count(CurrentCommand::Insert, 1, false),
+        ]);
+        client
+            .execute(
+                "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)".to_string(),
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            client.has_open_batch(),
+            "a plain batch's DONE_MORE always means another statement result"
+        );
+        assert!(
+            client.parked_token.is_none(),
+            "a plain batch's DONE_MORE needs no look-ahead"
+        );
+    }
+
+    /// `next_rowset` collapses no-row results, but a no-row result can also be
+    /// the last thing in the response. Without a batch-open guard it reads on
+    /// and blocks (here: the mock runs dry) on a token that never arrives.
+    #[tokio::test]
+    async fn next_rowset_stops_at_a_terminal_no_row_result() {
+        let mut client =
+            create_test_client_with_tokens(vec![done_count(CurrentCommand::Update, 3, false)]);
+        assert!(client.next_rowset().await.unwrap().is_none());
     }
 
     #[tokio::test]
