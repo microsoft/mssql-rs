@@ -30,7 +30,7 @@ use crate::api::odbc_types::{
 use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
 use crate::conversion::error::{ConvError, ConvOk};
-use crate::conversion::numeric::{NumericSource, narrow_i128, parse_decimal_literal};
+use crate::conversion::numeric::{NumericSource, narrow_i128, parse_numeric_text};
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
 };
@@ -136,19 +136,7 @@ fn numeric_source(value: &ColumnValues) -> Result<NumericSource, ConvError> {
 fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvError> {
     if let ColumnValues::String(s) = value {
         let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
-        if let Some(n) = parse_decimal_literal(&text) {
-            return Ok(n);
-        }
-        let t = text.trim();
-        return match t.parse::<f64>() {
-            Ok(f) if f.is_finite() => Ok(NumericSource::Float(f)),
-            // Rust folds overflow into `Ok(inf)`, but msodbcsql's `VarR8FromStr`
-            // reports DISP_E_OVERFLOW -> 22003 and keeps the cast error for text
-            // that is not a number at all. Digits present means it was numeric.
-            Ok(_) if t.bytes().any(|b| b.is_ascii_digit()) => Err(ConvError::OutOfRange),
-            // "inf" / "infinity" / "nan" parse in Rust but are not SQL literals.
-            _ => Err(ConvError::InvalidCharacterValue),
-        };
+        return parse_numeric_text(&text);
     }
     numeric_source(value)
 }
@@ -1161,6 +1149,111 @@ mod tests {
         .unwrap();
         assert_eq!(ok, ConvOk::Exact);
         assert_eq!(out, 123);
+    }
+
+    /// Only blanks are padding, in this direction too. `Convert` routes a
+    /// character source to `ConvertToFixed`'s `case SQL_C_CHAR` arm whichever
+    /// way the data moves - `SQL_C_CHAR` and `SQL_CHAR` are both `1` - so
+    /// `CharToBigint`'s blanks-only trim (`sqlccnvt.cpp:7777`) governs a column
+    /// exactly as it governs a bound parameter. Shared with the parameter path
+    /// through `parse_numeric_text`.
+    #[test]
+    fn only_blanks_pad_a_numeric_column() {
+        for text in ["  123  ", "+123", "-123"] {
+            let mut out: i32 = 0;
+            let mut ind: SqlLen = 0;
+            assert!(
+                conv(
+                    &utf8_col(text),
+                    SQL_C_SLONG,
+                    (&mut out as *mut i32).cast(),
+                    &mut ind,
+                )
+                .is_ok(),
+                "{text:?} should parse"
+            );
+        }
+
+        // A tab, an interior blank, and a non-breaking space are not padding.
+        for bad in ["\t123", "123\n", "1 23", "\u{a0}123", "1,234"] {
+            let mut out: i32 = 0;
+            let mut ind: SqlLen = 0;
+            let err = conv(
+                &utf8_col(bad),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                ConvError::InvalidCharacterValue,
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// A literal too wide for an exact `i128` mantissa reaches a float target at
+    /// full precision. `parse_numeric_text` reduces it for integer targets, and
+    /// routing that reduction to `as_f64` would hand `SQL_C_DOUBLE` about 1.1.
+    #[test]
+    fn wide_decimal_column_reaches_a_double_target() {
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        conv_f(
+            &utf8_col("1.234567890123456789012345678901234567890"),
+            SQL_C_DOUBLE,
+            (&mut out as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert!((out - 1.234_567_890_123_456_7).abs() < 1e-15, "got {out}");
+        assert_eq!(ind, 8);
+    }
+
+    /// The same literal to an integer target keeps the dropped-fraction report
+    /// the reduction exists for.
+    #[test]
+    fn wide_decimal_column_truncating_to_an_integer_reports_truncation() {
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ok = conv(
+            &utf8_col("7.000000000000000000000000000000000000000001"),
+            SQL_C_SLONG,
+            (&mut out as *mut i32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 7);
+    }
+
+    /// `SQL_C_FLOAT` narrows to 32 bits through its own arm, so it needs the
+    /// approximation too - and a wide literal past the `f32` range is `22003`
+    /// there rather than infinity.
+    #[test]
+    fn wide_decimal_column_reaches_a_single_precision_target() {
+        let mut out: f32 = 0.0;
+        let mut ind: SqlLen = 0;
+        conv_f(
+            &utf8_col("1.234567890123456789012345678901234567890"),
+            SQL_C_FLOAT,
+            (&mut out as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert!((out - 1.234_567_9_f32).abs() < 1e-6, "got {out}");
+        assert_eq!(ind, 4);
+
+        let mut big: f32 = 0.0;
+        let err = conv_f(
+            &utf8_col("400000000000000000000000000000000000000000.5"),
+            SQL_C_FLOAT,
+            (&mut big as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
     }
 
     #[test]

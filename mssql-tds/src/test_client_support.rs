@@ -3,7 +3,7 @@
 
 //! Test-only helpers for driving a [`TdsClient`] against a scripted sequence of
 //! TDS tokens, without a live server. Gated behind the `test-util` feature so
-//! downstream crates (e.g. `mssql-odbc`) can unit-test the code paths that
+//! downstream crates (e.g. `mssqlodbc`) can unit-test the code paths that
 //! require a positioned client — statement-wise navigation, no-row results,
 //! end-of-batch — which otherwise are only reachable through end-to-end tests.
 //!

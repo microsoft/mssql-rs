@@ -350,8 +350,34 @@ build_driver() {
     echo ">>> Building $label mssql-odbc driver..."
     (
         cd "$source_root"
-        CARGO_TARGET_DIR="$target_dir" cargo build -p mssql-odbc --release
+        CARGO_TARGET_DIR="$target_dir" cargo build \
+            --manifest-path mssql-odbc/Cargo.toml --release
     )
+}
+
+driver_artifact() {
+    # The pinned baseline can predate a cdylib rename, so resolve each checkout.
+    local source_root="$1"
+    local target_dir="$2"
+    local target_name
+    target_name="$(
+        awk '
+            /^\[lib\][[:space:]]*$/ { in_lib = 1; next }
+            /^\[/ { in_lib = 0 }
+            in_lib && /^[[:space:]]*name[[:space:]]*=/ {
+                name = $0
+                sub(/^[^"]*"/, "", name)
+                sub(/".*$/, "", name)
+                print name
+                exit
+            }
+        ' "$source_root/mssql-odbc/Cargo.toml"
+    )"
+    if [ -z "$target_name" ]; then
+        echo "ERROR: cdylib target name not found in $source_root/mssql-odbc/Cargo.toml" >&2
+        return 1
+    fi
+    printf '%s/release/lib%s.so\n' "$target_dir" "$target_name"
 }
 
 build_driver "$REPO_ROOT" "$CANDIDATE_TARGET_DIR" "candidate"
@@ -362,8 +388,8 @@ echo ">>> Adding baseline worktree for $BASELINE_COMMIT..."
 git worktree add --detach "$BASELINE_TREE" "$BASELINE_COMMIT"
 build_driver "$BASELINE_TREE" "$BASELINE_TARGET_DIR" "baseline"
 
-CANDIDATE_DRIVER="$CANDIDATE_TARGET_DIR/release/libmsodbcsql18.so"
-BASELINE_DRIVER="$BASELINE_TARGET_DIR/release/libmsodbcsql18.so"
+CANDIDATE_DRIVER="$(driver_artifact "$REPO_ROOT" "$CANDIDATE_TARGET_DIR")"
+BASELINE_DRIVER="$(driver_artifact "$BASELINE_TREE" "$BASELINE_TARGET_DIR")"
 BENCH_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench"
 ADMIN_EXE="$HARNESS_BUILD_DIR/mssql_odbc_bench_admin"
 for required_file in \

@@ -268,19 +268,8 @@ fn write_wide_str(
     }
 }
 
-#[cfg(target_os = "windows")]
 fn driver_name() -> &'static str {
-    "msodbcsql18.dll"
-}
-
-#[cfg(target_os = "linux")]
-fn driver_name() -> &'static str {
-    "libmsodbcsql18.so"
-}
-
-#[cfg(target_os = "macos")]
-fn driver_name() -> &'static str {
-    "libmsodbcsql18.dylib"
+    env!("MSSQL_ODBC_ARTIFACT")
 }
 
 #[cfg(test)]
@@ -382,6 +371,17 @@ mod tests {
 
     #[test]
     fn driver_name_writes_wide_string() {
+        #[cfg(target_os = "windows")]
+        let expected = "mssqlodbc.dll";
+        #[cfg(target_os = "macos")]
+        let expected = "mssqlodbc.dylib";
+        // Mirrors the `_` fallback in build.rs, which emits the `.so` name for
+        // every non-Windows, non-macOS target.
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let expected = "mssqlodbc.so";
+
+        assert_eq!(driver_name(), expected);
+
         let h = TestHandles::with_env_dbc();
         let mut buf = [0u16; 64];
         let mut len: SqlSmallInt = -1;
@@ -395,7 +395,6 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_SUCCESS);
-        let expected = driver_name();
         assert_eq!(len, (expected.encode_utf16().count() * 2) as SqlSmallInt);
         let n = (len as usize) / 2;
         assert_eq!(String::from_utf16_lossy(&buf[..n]), expected);
