@@ -1879,6 +1879,76 @@ mod tests {
         assert_eq!(second_indicator, 4);
     }
 
+    /// After `SQLSetStmtAttrW` reassociates the ARD, `SQLFetchScroll` must
+    /// deliver into the buffer bound on the *new* explicit descriptor, not
+    /// the implicit one it replaced — the fetch-side counterpart of
+    /// `bind_col.rs`'s `bind_col_writes_through_a_reassociated_ard`, which
+    /// only checks that the bind lands on the right descriptor, not that a
+    /// later fetch actually reads from it.
+    #[test]
+    fn fetch_scroll_reads_through_a_reassociated_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let explicit_ard = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    h.stmt,
+                    crate::api::odbc_types::SQL_ATTR_APP_ROW_DESC,
+                    explicit_ard as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+        }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![42]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT reassociated ard".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 42, "the fetch must read the reassociated ARD");
+        assert_eq!(indicator, 4);
+
+        let implicit = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        assert_eq!(
+            implicit.inner.lock().unwrap().records.len(),
+            0,
+            "the implicit ARD it replaced must never have been bound"
+        );
+    }
+
     fn assert_partial_buffered_row_delivery(buffered_prefix_columns: usize) {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();

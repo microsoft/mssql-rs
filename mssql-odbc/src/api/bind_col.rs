@@ -756,6 +756,51 @@ mod tests {
         );
     }
 
+    /// After `SQLSetStmtAttrW` reassociates the ARD, `SQLFreeStmt(SQL_UNBIND)`
+    /// must clear bindings on the *new* explicit descriptor, not the
+    /// implicit one it replaced — the unbind-side counterpart of
+    /// `bind_col_writes_through_a_reassociated_ard` above.
+    #[test]
+    fn free_stmt_unbind_clears_a_reassociated_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit_ard = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    h.stmt,
+                    crate::api::odbc_types::SQL_ATTR_APP_ROW_DESC,
+                    explicit_ard as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let mut buf = [0i32; 1];
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    buf.as_mut_ptr() as SqlPointer,
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let explicit = unsafe { handle_from_raw::<DescHandle>(explicit_ard) };
+        assert_eq!(explicit.inner.lock().unwrap().records.len(), 1);
+
+        assert_eq!(unsafe { sql_free_stmt_unbind(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(
+            explicit.inner.lock().unwrap().records.len(),
+            0,
+            "unbind must clear the reassociated descriptor, not the implicit one"
+        );
+    }
+
     /// Freeing the explicit descriptor currently associated as the ARD
     /// resets the statement back to its implicit ARD (`free_desc`'s existing
     /// association-reset logic, `free_handle.rs`) — and a *subsequent*
