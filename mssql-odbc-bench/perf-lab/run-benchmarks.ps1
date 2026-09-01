@@ -274,7 +274,9 @@ function Build-Driver {
     $env:CARGO_TARGET_DIR = $TargetDir
     Push-Location $SourceRoot
     try {
-        Invoke-Native { cargo build -p mssql-odbc --release }
+        Invoke-Native {
+            cargo build --manifest-path 'mssql-odbc\Cargo.toml' --release
+        }
     } finally {
         Pop-Location
         if ($null -eq $previousTarget) {
@@ -283,6 +285,29 @@ function Build-Driver {
             $env:CARGO_TARGET_DIR = $previousTarget
         }
     }
+}
+
+function Get-DriverArtifact {
+    # The pinned baseline can predate a cdylib rename, so resolve each checkout.
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$TargetDir
+    )
+
+    $manifest = Join-Path $SourceRoot 'mssql-odbc\Cargo.toml'
+    $inLibSection = $false
+    foreach ($line in Get-Content -LiteralPath $manifest) {
+        if ($line -match '^\s*\[lib\]\s*$') {
+            $inLibSection = $true
+            continue
+        }
+        if ($line -match '^\s*\[') {
+            $inLibSection = $false
+        } elseif ($inLibSection -and $line -match '^\s*name\s*=\s*"([^"]+)"') {
+            return Join-Path $TargetDir "release\$($Matches[1]).dll"
+        }
+    }
+    throw "cdylib target name not found in $manifest"
 }
 
 function Find-Sqlcmd {
@@ -663,8 +688,8 @@ try {
     Invoke-Native { git worktree add --detach $BaselineTree $BaselineCommit }
     Build-Driver -SourceRoot $BaselineTree -TargetDir $BaselineTargetDir -Label 'baseline'
 
-    $CandidateDriver = Join-Path $CandidateTargetDir 'release\msodbcsql18.dll'
-    $BaselineDriver = Join-Path $BaselineTargetDir 'release\msodbcsql18.dll'
+    $CandidateDriver = Get-DriverArtifact -SourceRoot $RepoRoot -TargetDir $CandidateTargetDir
+    $BaselineDriver = Get-DriverArtifact -SourceRoot $BaselineTree -TargetDir $BaselineTargetDir
     $script:BenchExe = Join-Path $HarnessRuntimeDir 'mssql_odbc_bench.exe'
     $AdminExe = Join-Path $HarnessRuntimeDir 'mssql_odbc_bench_admin.exe'
     foreach ($requiredFile in @(

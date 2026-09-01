@@ -17,7 +17,7 @@
 # the result does not depend on which one wins on sys.path.
 #
 # Env:
-#   MSSQL_ODBC_DRIVER   Path to the built libmsodbcsql18.so (required).
+#   MSSQL_ODBC_DRIVER   Path to the shipped mssqlodbc.so (required).
 #   MSSQL_PYTHON_DIR    mssql-python checkout (default: /workspace).
 
 set -euo pipefail
@@ -26,7 +26,7 @@ MSSQL_PYTHON_DIR="${MSSQL_PYTHON_DIR:-/workspace}"
 DRIVER_SO="${MSSQL_ODBC_DRIVER:-}"
 
 if [ -z "$DRIVER_SO" ] || [ ! -f "$DRIVER_SO" ]; then
-    echo "##[error]MSSQL_ODBC_DRIVER must point at the built libmsodbcsql18.so (got: '${DRIVER_SO:-unset}')"
+    echo "##[error]MSSQL_ODBC_DRIVER must point at the shipped mssqlodbc.so (got: '${DRIVER_SO:-unset}')"
     exit 1
 fi
 
