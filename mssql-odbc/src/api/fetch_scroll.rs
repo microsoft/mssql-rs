@@ -905,7 +905,7 @@ fn fill_rowset(
     // inside the fill loop would make a poisoned mutex indistinguishable from a
     // column that simply is not PLP, which would silently downgrade a supported
     // column to "unsupported" and drain it.
-    let plp_encodings: Vec<Option<PlpEncoding>> = {
+    let plp_encodings: Option<Vec<Option<PlpEncoding>>> = {
         let Ok(ss) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
             if let Ok(mut ds) = dbc.inner.lock() {
@@ -915,12 +915,17 @@ fn fill_rowset(
         };
         ss.column_metadata
             .iter()
-            .map(|m| m.plp_encoding())
-            .collect()
+            .any(|metadata| metadata.is_plp())
+            .then(|| {
+                ss.column_metadata
+                    .iter()
+                    .map(|metadata| metadata.plp_encoding())
+                    .collect()
+            })
     };
-    // One scratch buffer for the whole fill: a bound LOB in a wide rowset would
-    // otherwise allocate one per cell.
-    let mut plp_scratch = vec![0u8; PLP_BOUND_CHUNK];
+    // Allocate only if a bound PLP value is actually reached. Fixed rowsets,
+    // especially row-array size 1, otherwise paid this 8 KiB zero-fill per fetch.
+    let mut plp_scratch = None;
 
     // Read once per fetch, not once per bind, so an application can move the
     // whole rowset between calls by updating the pointed-to value.
@@ -1108,6 +1113,7 @@ fn fill_rowset(
                         deliver_bound(binding, rows_filled as usize, bind_offset, &value)
                     },
                     Ok(CursorColumn::PlpStreaming { .. }) => {
+                        let scratch = plp_scratch.get_or_insert_with(|| vec![0u8; PLP_BOUND_CHUNK]);
                         let delivered = unsafe {
                             deliver_bound_plp(
                                 &mut client,
@@ -1115,8 +1121,12 @@ fn fill_rowset(
                                 binding,
                                 rows_filled as usize,
                                 bind_offset,
-                                plp_encodings.get(column - 1).copied().flatten(),
-                                &mut plp_scratch,
+                                plp_encodings
+                                    .as_ref()
+                                    .and_then(|encodings| encodings.get(column - 1))
+                                    .copied()
+                                    .flatten(),
+                                scratch,
                             )
                         };
                         match delivered {

@@ -204,8 +204,24 @@ fn sql_get_data_safe(
     let mut try_complete_buffered_plp = false;
     if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
         row.discard_before(col_index - 1);
-        let wide_buffered_row = row.values.len() >= 8;
-        let direct_string = wide_buffered_row
+        let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
+        if binary_probe
+            && let Some(value) = row.values.get(col_index - 1).and_then(Option::as_ref)
+            && !matches!(value, ColumnValues::Null)
+        {
+            let length = binary_length(value);
+            let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
+            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            unsafe { write_if_some(strlen_or_ind_ptr, length) };
+            return SQL_SUCCESS;
+        }
+
+        let direct_buffered = row.values.len() >= 8
+            || row
+                .variant_bases
+                .get(col_index - 1)
+                .is_some_and(Option::is_some);
+        let direct_string = direct_buffered
             && matches!(target_type, SQL_C_CHAR | SQL_C_WCHAR)
             && row
                 .values
@@ -228,7 +244,7 @@ fn sql_get_data_safe(
             stmt_state.partial_text_offset = None;
             return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
         }
-        let direct_decimal = wide_buffered_row
+        let direct_decimal = direct_buffered
             && target_type == SQL_C_CHAR
             && row
                 .values
@@ -250,19 +266,18 @@ fn sql_get_data_safe(
             stmt_state.partial_text_offset = None;
             return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
         }
-        let direct_scalar = wide_buffered_row
-            && row
-                .values
-                .get(col_index - 1)
-                .and_then(Option::as_ref)
-                .is_some_and(|value| unsafe {
-                    try_write_exact_buffered_scalar(
-                        value,
-                        target_type,
-                        target_value_ptr,
-                        strlen_or_ind_ptr,
-                    )
-                });
+        let direct_scalar = row
+            .values
+            .get(col_index - 1)
+            .and_then(Option::as_ref)
+            .is_some_and(|value| unsafe {
+                try_write_exact_buffered_scalar(
+                    value,
+                    target_type,
+                    target_value_ptr,
+                    strlen_or_ind_ptr,
+                )
+            });
         if direct_scalar {
             let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
             row.consumed = row.consumed.max(col_index);
@@ -1294,9 +1309,28 @@ fn stream_active_plp_chunk(
         return SQL_ERROR;
     }
 
+    let direct_wire_output = max_read > 0
+        && !target_value_ptr.is_null()
+        && matches!(
+            (target_type, plp_encoding),
+            (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
+                | (
+                    SQL_C_CHAR,
+                    Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
+                )
+        );
     let mut inline_payload = [0_u8; 256];
     let mut heap_payload = Vec::new();
-    let payload = if max_read <= inline_payload.len() {
+    let payload = if direct_wire_output {
+        // The application owns this writable buffer for the duration of the ODBC
+        // call. Initialize it before forming a byte slice because ODBC output
+        // buffers may contain uninitialized storage; `max_read` reserves the
+        // required terminator bytes.
+        unsafe {
+            std::ptr::write_bytes(target_value_ptr.cast::<u8>(), 0, max_read);
+            std::slice::from_raw_parts_mut(target_value_ptr.cast::<u8>(), max_read)
+        }
+    } else if max_read <= inline_payload.len() {
         &mut inline_payload[..max_read]
     } else {
         heap_payload.resize(max_read, 0);
@@ -1434,11 +1468,13 @@ fn stream_active_plp_chunk(
         if buf_elements > 0 && !target_value_ptr.is_null() {
             let copy_bytes = usable.min((buf_elements - 1) * std::mem::size_of::<SqlWChar>());
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    payload.as_ptr(),
-                    target_value_ptr.cast::<u8>(),
-                    copy_bytes,
-                );
+                if !direct_wire_output {
+                    std::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        target_value_ptr.cast::<u8>(),
+                        copy_bytes,
+                    );
+                }
                 target_value_ptr
                     .cast::<u8>()
                     .add(copy_bytes)
@@ -1487,11 +1523,15 @@ fn stream_active_plp_chunk(
         // conversion later lands for `varchar(max)` (`SingleByteText`), or
         // non-ASCII json silently corrupts.
         let copy_verbatim = || unsafe {
-            copy_with_nul(
-                target_value_ptr as *mut u8,
-                buffer_length as usize,
-                &payload[..read],
-            );
+            if direct_wire_output {
+                target_value_ptr.cast::<u8>().add(read).write_unaligned(0);
+            } else {
+                copy_with_nul(
+                    target_value_ptr as *mut u8,
+                    buffer_length as usize,
+                    &payload[..read],
+                );
+            }
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         };
         match plp_encoding {
@@ -2534,6 +2574,24 @@ mod tests {
         assert_eq!(
             stmt.inner.lock().unwrap().last_variant_base,
             Some((1, TdsDataType::Int4))
+        );
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(state.last_captured.is_none());
+            assert!(state.buffered_get_data_row.as_ref().unwrap().values[0].is_some());
+        }
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_BINARY,
+                    (&mut probe as *mut u8).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
         );
 
         let mut value = 0_i32;
