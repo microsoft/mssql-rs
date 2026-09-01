@@ -16,6 +16,7 @@ mod async_fetch;
 mod async_parameters;
 mod async_runtime;
 mod async_session;
+mod async_tracing;
 mod bulkcopy;
 mod connection;
 mod cursor;

@@ -25,6 +25,7 @@ use crate::async_description::{DescriptionState, materialize};
 use crate::async_fetch::{FetchState, FetchStatus};
 use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
 use crate::async_session::{AsyncConnectionState, CursorId, ExecuteClaim, SessionOperationGuard};
+use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::types::ParameterHint;
 
 /// Cursor-local state for prepared execution and deferred handle cleanup.
@@ -345,6 +346,13 @@ pub(crate) fn execute<'py>(
             Ok(outcome) => {
                 let has_open_batch = outcome.has_open_batch();
                 let has_result_set = outcome.has_rows();
+                record_result_set_status(if has_result_set {
+                    "rows"
+                } else if has_open_batch {
+                    "no_rows"
+                } else {
+                    "exhausted"
+                });
                 operation_guard.finish_execute(has_open_batch);
                 let metadata = match outcome {
                     ExecuteOutcome::Rows(metadata) => Some(metadata),
@@ -380,11 +388,13 @@ pub(crate) fn execute<'py>(
                 Ok(cursor)
             }
             Err(error) => {
+                record_result_set_status("error");
                 operation_guard.settle(error.break_connection || has_open_batch);
                 Err(map_execute_error(error.error))
             }
         }
     };
+    let future = in_cursor_operation_span(future, cursor_id, operation_id, "execute", "pending");
     let future = async move {
         match dispatch {
             Some(dispatch) => future.with_subscriber(dispatch).await,

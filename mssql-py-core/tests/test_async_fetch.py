@@ -266,6 +266,52 @@ def test_fetchmany_uses_arraysize_and_interleaves_without_skipping(client_contex
 
 
 @pytest.mark.integration
+def test_large_fetchmany_keeps_event_loop_responsive(client_context):
+    async def run():
+        conn = await connect(client_context)
+        heartbeat_ticks = 0
+        stop_heartbeat = False
+
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while not stop_heartbeat:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0)
+
+        try:
+            cursor = conn.cursor()
+            cursor.arraysize = 4096
+            await cursor.execute(
+                """
+                WITH numbers AS (
+                    SELECT 0 AS value
+                    UNION ALL
+                    SELECT value + 1 FROM numbers WHERE value < 4095
+                )
+                SELECT value FROM numbers ORDER BY value
+                OPTION (MAXRECURSION 4095)
+                """,
+                use_prepare=False,
+            )
+            heartbeat_task = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0)
+            ticks_before_fetch = heartbeat_ticks
+
+            rows = await cursor.fetchmany()
+            ticks_during_fetch = heartbeat_ticks - ticks_before_fetch
+
+            assert rows == [(value,) for value in range(4096)]
+            assert ticks_during_fetch > 0
+        finally:
+            stop_heartbeat = True
+            if "heartbeat_task" in locals():
+                await heartbeat_task
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_fetchmany_nonpositive_size_does_not_advance_and_partial_batch_releases_session(
     client_context,
 ):

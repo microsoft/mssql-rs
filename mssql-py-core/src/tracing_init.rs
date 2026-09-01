@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 use tracing::Subscriber;
 use tracing_appender::non_blocking;
-use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
 
@@ -69,6 +69,17 @@ where
             "{}, {}, {}, {}, ",
             timestamp, thread_id_str, level, target
         )?;
+
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope.from_root() {
+                let extensions = span.extensions();
+                if let Some(fields) = extensions.get::<FormattedFields<N>>()
+                    && !fields.is_empty()
+                {
+                    write!(writer, "{}{{{fields}}}: ", span.name())?;
+                }
+            }
+        }
 
         // Message (fields)
         ctx.field_format().format_fields(writer.by_ref(), event)?;
@@ -327,6 +338,15 @@ mod tests {
             tracing::error!("Error message");
             tracing::warn!("Warn message");
             tracing::info!("Info message");
+            let span = tracing::info_span!(
+                "async_cursor_operation",
+                cursor_id = 41_u64,
+                operation_id = 73_u64,
+                operation = "fetchmany",
+                result_set_status = "reading",
+            );
+            let _entered = span.enter();
+            tracing::info!("Correlated message");
             tracing::debug!("Debug message - should not appear");
             tracing::trace!("Trace message - should not appear");
 
@@ -365,6 +385,12 @@ mod tests {
             assert!(log_content.contains("Error message"));
             assert!(log_content.contains("Warn message"));
             assert!(log_content.contains("Info message"));
+            assert!(log_content.contains("Correlated message"));
+            assert!(log_content.contains("async_cursor_operation{"));
+            assert!(log_content.contains("cursor_id=41"));
+            assert!(log_content.contains("operation_id=73"));
+            assert!(log_content.contains("operation=\"fetchmany\""));
+            assert!(log_content.contains("result_set_status=\"reading\""));
 
             // Should NOT contain DEBUG or TRACE (filtered out by the default 'info' level)
             assert!(!log_content.contains("Debug message"));

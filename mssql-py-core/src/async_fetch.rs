@@ -19,10 +19,11 @@ use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::map_tds_error;
 use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
+use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::row_writer::PyRowWriter;
 
 const FETCH_YIELD_INTERVAL: usize = 256;
-const FETCHALL_MATERIALIZE_CHUNK_SIZE: usize = 256;
+const LIST_MATERIALIZE_CHUNK_SIZE: usize = 256;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
@@ -196,43 +197,32 @@ impl FetchOutput {
             Self::Many | Self::All => Ok(PyList::empty(py).into_any().unbind()),
         }
     }
-
-    fn materialize(self, py: Python<'_>, rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
-        match self {
-            Self::One => match rows.into_iter().next() {
-                Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
-                None => Ok(py.None()),
-            },
-            Self::Many | Self::All => {
-                let rows = rows
-                    .into_iter()
-                    .map(|writer| writer.to_py_tuple(py).map(Bound::unbind))
-                    .collect::<PyResult<Vec<_>>>()?;
-                Ok(PyList::new(py, rows)?.into_any().unbind())
-            }
-        }
-    }
 }
 
 async fn materialize_rows(output: FetchOutput, rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
-    if matches!(output, FetchOutput::All) {
-        return materialize_all_rows(rows).await;
-    }
-    tokio::task::spawn_blocking(move || Python::attach(|py| output.materialize(py, rows)))
+    match output {
+        FetchOutput::One => tokio::task::spawn_blocking(move || {
+            Python::attach(|py| match rows.into_iter().next() {
+                Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
+                None => Ok(py.None()),
+            })
+        })
         .await
-        .map_err(map_materialization_join_error)?
+        .map_err(map_materialization_join_error)?,
+        FetchOutput::Many | FetchOutput::All => materialize_list_rows(rows).await,
+    }
 }
 
-async fn materialize_all_rows(rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
+async fn materialize_list_rows(rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
     let mut rows = rows.into_iter();
     let mut list: Option<Py<PyList>> = None;
 
     loop {
         let chunk = rows
             .by_ref()
-            .take(FETCHALL_MATERIALIZE_CHUNK_SIZE)
+            .take(LIST_MATERIALIZE_CHUNK_SIZE)
             .collect::<Vec<_>>();
-        let finished = chunk.len() < FETCHALL_MATERIALIZE_CHUNK_SIZE;
+        let finished = chunk.len() < LIST_MATERIALIZE_CHUNK_SIZE;
         list = Some(
             tokio::task::spawn_blocking(move || {
                 Python::attach(|py| {
@@ -377,6 +367,7 @@ fn fetch<'py>(
             Ok(batch) => {
                 let returned = batch.rows.len();
                 let exhausted = batch.exhausted;
+                record_result_set_status(if exhausted { "exhausted" } else { "ready" });
                 fetch_state.set(if batch.exhausted {
                     FetchStatus::Exhausted
                 } else {
@@ -418,6 +409,7 @@ fn fetch<'py>(
                 }
             }
             Err(error) => {
+                record_result_set_status("error");
                 fetch_guard.fail(has_open_batch);
                 fetch_state.set(FetchStatus::NoResultSet);
                 Err(map_fetch_error(
@@ -428,6 +420,7 @@ fn fetch<'py>(
             }
         }
     };
+    let future = in_cursor_operation_span(future, cursor_id, operation_id, operation, "reading");
     let future = async move {
         match dispatch {
             Some(dispatch) => future.with_subscriber(dispatch).await,
@@ -547,6 +540,11 @@ pub(crate) fn nextset<'py>(
             Ok((result, metadata)) => {
                 let has_result = !matches!(result, StatementResult::End);
                 let has_rows = matches!(result, StatementResult::Rows);
+                record_result_set_status(match result {
+                    StatementResult::Rows => "rows",
+                    StatementResult::NoRows { .. } => "no_rows",
+                    StatementResult::End => "exhausted",
+                });
                 let column_count = metadata.as_ref().map_or(0, Vec::len);
                 future_fetch_state.set(match result {
                     StatementResult::Rows => FetchStatus::Ready,
@@ -586,12 +584,14 @@ pub(crate) fn nextset<'py>(
                 }
             }
             Err(error) => {
+                record_result_set_status("error");
                 fetch_guard.fail(has_open_batch);
                 future_fetch_state.set(FetchStatus::NoResultSet);
                 Err(map_nextset_error(error, read_ms))
             }
         }
     };
+    let future = in_cursor_operation_span(future, cursor_id, operation_id, "nextset", "advancing");
     let future = async move {
         match dispatch {
             Some(dispatch) => future.with_subscriber(dispatch).await,

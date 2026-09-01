@@ -39,6 +39,7 @@ use crate::async_fetch::FetchState;
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, SessionOperationGuard,
 };
+use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 
 /// Converts a failed session claim into a Python error with operation-specific busy text.
 fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static str) -> PyErr {
@@ -109,7 +110,10 @@ impl FinalizerCleanup {
     async fn run(mut self, claim: CursorCloseClaim) {
         let cleanup = self.cleanup.take().expect("finalizer cleanup is available");
         if let Err(error) = cleanup.run(claim).await {
+            record_result_set_status("error");
             tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
+        } else {
+            record_result_set_status("closed");
         }
         self.completion_guard.complete();
     }
@@ -295,21 +299,34 @@ impl Drop for PyAsyncCursor {
             }
             Err(ClaimError::Busy) => {
                 tracing::warn!(
+                    cursor_id = self.cursor_id,
+                    operation = "finalize",
                     "PyAsyncCursor finalizer skipped: session busy; prepared handle deferred to connection close"
                 );
                 return;
             }
             Err(error) => {
-                tracing::warn!("PyAsyncCursor finalizer could not claim cleanup: {error:?}");
+                tracing::warn!(
+                    cursor_id = self.cursor_id,
+                    operation = "finalize",
+                    "PyAsyncCursor finalizer could not claim cleanup: {error:?}"
+                );
                 session_state.abandon_cursor(self.cursor_id);
                 return;
             }
         };
+        let operation_id = claim.operation_id;
         let finalizer = FinalizerCleanup {
             cleanup: Some(cleanup),
             completion_guard: FinalizerCompletionGuard::new(session_state, self.cursor_id),
         };
-        pyo3_async_runtimes::tokio::get_runtime().spawn(finalizer.run(claim));
+        pyo3_async_runtimes::tokio::get_runtime().spawn(in_cursor_operation_span(
+            finalizer.run(claim),
+            self.cursor_id,
+            operation_id,
+            "finalize",
+            "closing",
+        ));
     }
 }
 
@@ -462,13 +479,17 @@ impl PyAsyncCursor {
             }
         };
         let operation_id = claim.operation_id;
+        let cursor_id = cleanup.cursor_id;
         let future = async move {
             cleanup.run(claim).await.map_err(|error| {
+                record_result_set_status("error");
                 tracing::error!("PyAsyncCursor::close: failed: {error}");
                 PyRuntimeError::new_err(format!("Cursor close failed: {error}"))
             })?;
+            record_result_set_status("closed");
             Python::attach(|py| Ok(py.None()))
         };
+        let future = in_cursor_operation_span(future, cursor_id, operation_id, "close", "closing");
         let future = async move {
             match dispatch {
                 Some(dispatch) => future.with_subscriber(dispatch).await,
