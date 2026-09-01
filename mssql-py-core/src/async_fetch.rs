@@ -5,10 +5,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::error::Error;
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
@@ -84,21 +86,30 @@ impl FetchResources {
 struct FetchGuard {
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
+    operation: &'static str,
+    dispatch: Option<tracing::Dispatch>,
     completed: bool,
 }
 
 impl FetchGuard {
-    fn new(session_state: Arc<AsyncConnectionState>, operation_id: OperationId) -> Self {
+    fn new(
+        session_state: Arc<AsyncConnectionState>,
+        operation_id: OperationId,
+        operation: &'static str,
+        dispatch: Option<tracing::Dispatch>,
+    ) -> Self {
         Self {
             session_state,
             operation_id,
+            operation,
+            dispatch,
             completed: false,
         }
     }
 
-    fn complete(&mut self, has_row: bool, has_open_batch: bool) {
+    fn complete(&mut self, result_set_exhausted: bool, has_open_batch: bool) {
         self.session_state
-            .finish_fetch(self.operation_id, has_row, has_open_batch);
+            .finish_fetch(self.operation_id, result_set_exhausted, has_open_batch);
         self.completed = true;
     }
 
@@ -114,36 +125,108 @@ impl FetchGuard {
 impl Drop for FetchGuard {
     fn drop(&mut self) {
         if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::warn!(
+                "PyAsyncCursor::{}: interrupted; connection marked broken",
+                self.operation
+            );
             self.session_state.mark_broken();
             self.session_state.release_operation(self.operation_id);
         }
     }
 }
 
-async fn fetch_one_on_client(client: &mut TdsClient) -> Result<Option<PyRowWriter>, Error> {
+struct FetchBatch {
+    rows: Vec<PyRowWriter>,
+    exhausted: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FetchOutput {
+    One,
+    Many,
+}
+
+impl FetchOutput {
+    fn logs_batch_summary(self) -> bool {
+        matches!(self, Self::Many)
+    }
+
+    fn empty(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self {
+            Self::One => Ok(py.None()),
+            Self::Many => Ok(PyList::empty(py).into_any().unbind()),
+        }
+    }
+
+    fn materialize(self, py: Python<'_>, rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
+        match self {
+            Self::One => match rows.into_iter().next() {
+                Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
+                None => Ok(py.None()),
+            },
+            Self::Many => {
+                let rows = rows
+                    .into_iter()
+                    .map(|writer| writer.to_py_tuple(py).map(Bound::unbind))
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok(PyList::new(py, rows)?.into_any().unbind())
+            }
+        }
+    }
+}
+
+async fn materialize_rows(output: FetchOutput, rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
+    tokio::task::spawn_blocking(move || Python::attach(|py| output.materialize(py, rows)))
+        .await
+        .map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to materialize fetched rows: {error}"
+            ))
+        })?
+}
+
+async fn fetch_rows_on_client(client: &mut TdsClient, limit: usize) -> Result<FetchBatch, Error> {
     if !client.on_rows() {
-        return Ok(None);
+        return Ok(FetchBatch {
+            rows: Vec::new(),
+            exhausted: true,
+        });
     }
 
-    let mut writer = PyRowWriter::new(client.get_metadata().len());
-    if client.next_row_into(&mut writer).await? {
-        Ok(Some(writer))
-    } else {
-        Ok(None)
+    let column_count = client.get_metadata().len();
+    let mut rows = Vec::with_capacity(limit.min(1024));
+    while rows.len() < limit {
+        let mut writer = PyRowWriter::new(column_count);
+        if !client.next_row_into(&mut writer).await? {
+            return Ok(FetchBatch {
+                rows,
+                exhausted: true,
+            });
+        }
+        rows.push(writer);
     }
+    Ok(FetchBatch {
+        rows,
+        exhausted: false,
+    })
 }
 
-fn map_fetch_error(error: Error) -> PyErr {
-    tracing::error!("PyAsyncCursor::fetchone: failed: {error}");
-    pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to fetch row: {error}"))
+fn map_fetch_error(operation: &str, error: Error, elapsed_ms: u128) -> PyErr {
+    tracing::error!("PyAsyncCursor::{operation}: failed; elapsed_ms={elapsed_ms}; error={error}");
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "PyAsyncCursor.{operation} failed while reading rows: {error}"
+    ))
 }
 
-/// Return an awaitable resolving to the next row tuple or `None`.
-pub(crate) fn fetchone<'py>(
+fn fetch<'py>(
     cursor: Py<PyAsyncCursor>,
     py: Python<'py>,
+    resources: FetchResources,
+    limit: usize,
+    output: FetchOutput,
+    operation: &'static str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let resources = cursor.borrow(py).fetch_resources()?;
     let FetchResources {
         client,
         dispatch,
@@ -154,7 +237,7 @@ pub(crate) fn fetchone<'py>(
     if fetch_state.status() == FetchStatus::Exhausted {
         session_state.ensure_open().map_err(map_claim_error)?;
         return pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Python::attach(|py| Ok(py.None()))
+            Python::attach(|py| output.empty(py))
         });
     }
     let claim = session_state
@@ -162,41 +245,66 @@ pub(crate) fn fetchone<'py>(
         .map_err(map_claim_error)?;
     let operation_id = claim.operation_id;
     let future_state = session_state.clone();
+    let guard_dispatch = dispatch.clone();
 
     let future = async move {
+        let started = Instant::now();
+        if output.logs_batch_summary() {
+            tracing::debug!("PyAsyncCursor::{operation}: started; requested={limit}");
+        }
         // Retain the Python cursor until the row operation settles so its finalizer
         // cannot race the in-flight TDS read.
         let _cursor = cursor;
-        let mut fetch_guard = FetchGuard::new(future_state, operation_id);
+        let mut fetch_guard =
+            FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
 
         let (result, has_open_batch) = {
             let mut client = client.lock().await;
-            let result = fetch_one_on_client(&mut client).await;
+            let result = fetch_rows_on_client(&mut client, limit).await;
             let has_open_batch = client.has_open_batch();
             (result, has_open_batch)
         };
 
         match result {
-            Ok(writer) => {
-                let has_row = writer.is_some();
-                fetch_state.set(if has_row {
-                    FetchStatus::Ready
-                } else {
+            Ok(batch) => {
+                let returned = batch.rows.len();
+                let exhausted = batch.exhausted;
+                fetch_state.set(if batch.exhausted {
                     FetchStatus::Exhausted
+                } else {
+                    FetchStatus::Ready
                 });
-                fetch_guard.complete(has_row, has_open_batch);
-                if !has_row {
-                    tracing::info!("PyAsyncCursor::fetchone: result set exhausted");
+                fetch_guard.complete(batch.exhausted, has_open_batch);
+                match materialize_rows(output, batch.rows).await {
+                    Ok(rows) => {
+                        if output.logs_batch_summary() {
+                            tracing::debug!(
+                                "PyAsyncCursor::{operation}: completed; requested={limit}; returned={returned}; exhausted={exhausted}; elapsed_ms={}",
+                                started.elapsed().as_millis()
+                            );
+                        }
+                        if exhausted {
+                            tracing::info!("PyAsyncCursor::{operation}: result set exhausted");
+                        }
+                        Ok(rows)
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "PyAsyncCursor::{operation}: row materialization failed; returned={returned}; elapsed_ms={}; error={error}",
+                            started.elapsed().as_millis()
+                        );
+                        Err(error)
+                    }
                 }
-                Python::attach(|py| match writer {
-                    Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
-                    None => Ok(py.None()),
-                })
             }
             Err(error) => {
                 fetch_guard.fail(has_open_batch);
                 fetch_state.set(FetchStatus::NoResultSet);
-                Err(map_fetch_error(error))
+                Err(map_fetch_error(
+                    operation,
+                    error,
+                    started.elapsed().as_millis(),
+                ))
             }
         }
     };
@@ -214,6 +322,41 @@ pub(crate) fn fetchone<'py>(
             Err(error)
         }
     }
+}
+
+/// Return an awaitable resolving to the next row tuple or `None`.
+pub(crate) fn fetchone<'py>(
+    cursor: Py<PyAsyncCursor>,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let resources = cursor.borrow(py).fetch_resources()?;
+    fetch(cursor, py, resources, 1, FetchOutput::One, "fetchone")
+}
+
+/// Return an awaitable resolving to at most `size` row tuples.
+pub(crate) fn fetchmany<'py>(
+    cursor: Py<PyAsyncCursor>,
+    py: Python<'py>,
+    size: isize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let resources = cursor.borrow(py).fetch_resources()?;
+    if size <= 0 {
+        resources
+            .session_state
+            .ensure_open()
+            .map_err(map_claim_error)?;
+        return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Python::attach(|py| FetchOutput::Many.empty(py))
+        });
+    }
+    fetch(
+        cursor,
+        py,
+        resources,
+        size as usize,
+        FetchOutput::Many,
+        "fetchmany",
+    )
 }
 
 #[cfg(test)]
@@ -236,7 +379,7 @@ mod tests {
     #[test]
     fn failed_fetch_releases_reusable_session_without_open_batch() {
         let (state, operation_id) = claimed_fetch();
-        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id);
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
 
         guard.fail(false);
 
@@ -247,7 +390,7 @@ mod tests {
     #[test]
     fn failed_fetch_breaks_session_with_open_batch() {
         let (state, operation_id) = claimed_fetch();
-        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id);
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
 
         guard.fail(true);
 
@@ -257,12 +400,14 @@ mod tests {
 
     #[test]
     fn maps_fetch_error_to_python_runtime_error() {
-        let error = map_fetch_error(Error::ProtocolError("invalid row token".to_string()));
-
-        assert!(
-            error
-                .to_string()
-                .contains("Failed to fetch row: Protocol Error: invalid row token")
+        let error = map_fetch_error(
+            "fetchone",
+            Error::ProtocolError("invalid row token".to_string()),
+            7,
         );
+
+        assert!(error.to_string().contains(
+            "PyAsyncCursor.fetchone failed while reading rows: Protocol Error: invalid row token"
+        ));
     }
 }

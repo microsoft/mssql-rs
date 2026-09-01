@@ -166,6 +166,7 @@ pub struct PyAsyncCursor {
     /// `cursor()` time (`0` = no timeout). Applied by the future `execute`
     /// path unless overridden per-call.
     default_query_timeout: u32,
+    arraysize: isize,
     input_sizes: Option<Vec<crate::types::ParameterHint>>,
     input_sizes_generation: u64,
     cleanup_required: Arc<AtomicBool>,
@@ -195,6 +196,7 @@ impl PyAsyncCursor {
             session_state,
             cursor_id,
             default_query_timeout,
+            arraysize: 1,
             input_sizes: None,
             input_sizes_generation: 0,
             cleanup_required: Arc::new(AtomicBool::new(false)),
@@ -354,11 +356,20 @@ impl PyAsyncCursor {
 
     /// A seven-item DB-API descriptor for each column in the current result set.
     #[getter]
-    fn description<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, pyo3::types::PyList>>> {
-        self.description_state.to_python(py)
+    fn description<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyList>> {
+        self.description_state.get(py)
+    }
+
+    /// Number of rows requested by `fetchmany()` when no size is supplied.
+    #[getter]
+    fn arraysize(&self) -> isize {
+        self.arraysize
+    }
+
+    /// Set the default number of rows requested by `fetchmany()`.
+    #[setter]
+    fn set_arraysize(&mut self, arraysize: isize) {
+        self.arraysize = arraysize;
     }
 
     /// Set SQL type, size, and scale hints for the next successful `execute()`.
@@ -389,6 +400,17 @@ impl PyAsyncCursor {
     /// Fetch the next row and return an awaitable resolving to a tuple or `None`.
     fn fetchone<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         crate::async_fetch::fetchone(slf, py)
+    }
+
+    /// Fetch at most `size` rows, defaulting to `arraysize`.
+    #[pyo3(signature = (size=None))]
+    fn fetchmany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        size: Option<isize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let size = size.unwrap_or_else(|| slf.borrow(py).arraysize);
+        crate::async_fetch::fetchmany(slf, py, size)
     }
 
     /// Drain pending results, release prepared handles, and close this cursor.

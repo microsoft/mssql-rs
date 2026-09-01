@@ -9,6 +9,7 @@ import subprocess
 import sys
 import textwrap
 import warnings
+from decimal import Decimal
 
 import pytest
 import mssql_py_core
@@ -146,9 +147,32 @@ def test_connection_operations_reuse_connect_logger(client_context):
         await cursor.execute("SELECT 1 AS value", use_prepare=False)
         assert any(
             "PyAsyncCursor::execute: query executed successfully; "
-            "has_result_set=true; column_count=1" in message
+            "has_result_set=true; column_count=1; description_materialization_ms="
+            in message
             for message in logger.messages
         )
+        assert await cursor.fetchone() == (1,)
+
+        decimal_module = sys.modules["decimal"]
+        sys.modules["decimal"] = None
+        logger.messages.clear()
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="Query executed but cursor description materialization failed",
+            ):
+                await cursor.execute(
+                    "SELECT CAST(1 AS decimal(10, 2)) AS value", use_prepare=False
+                )
+        finally:
+            sys.modules["decimal"] = decimal_module
+        assert cursor.description is None
+        assert any(
+            "PyAsyncCursor::execute: cursor description materialization failed; "
+            "column_count=1; elapsed_ms=" in message
+            for message in logger.messages
+        )
+        assert await cursor.fetchone() == (Decimal("1.00"),)
         await cursor.close()
 
         logger.messages.clear()

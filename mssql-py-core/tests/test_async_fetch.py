@@ -31,6 +31,7 @@ async def connect(client_context, python_logger=None):
 
 def test_module_exposes_fetchone():
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchone")
+    assert hasattr(mssql_py_core.PyAsyncCursor, "fetchmany")
 
 
 def test_fetchone_without_result_set_raises(mock_client_context):
@@ -40,6 +41,8 @@ def test_fetchone_without_result_set_raises(mock_client_context):
             cursor = conn.cursor()
             with pytest.raises(RuntimeError, match="No active result set"):
                 await cursor.fetchone()
+            with pytest.raises(RuntimeError, match="No active result set"):
+                await cursor.fetchmany(1)
         finally:
             await conn.close()
 
@@ -54,6 +57,39 @@ def test_fetchone_after_cursor_close_raises(mock_client_context):
             await cursor.close()
             with pytest.raises(RuntimeError, match="Cursor is closed"):
                 await cursor.fetchone()
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                await cursor.fetchmany(0)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_fetchmany_argument_and_arraysize_contract(mock_client_context):
+    async def run():
+        conn = await connect(mock_client_context)
+        try:
+            cursor = conn.cursor()
+            assert cursor.arraysize == 1
+            cursor.arraysize = 3
+            assert cursor.arraysize == 3
+
+            assert await cursor.fetchmany(0) == []
+            assert await cursor.fetchmany(-1) == []
+            assert await cursor.fetchmany(False) == []
+            cursor.arraysize = -2
+            assert await cursor.fetchmany() == []
+
+            with pytest.raises(RuntimeError, match="No active result set"):
+                await cursor.fetchmany(True)
+            with pytest.raises(TypeError):
+                cursor.fetchmany(1.5)
+            with pytest.raises(TypeError):
+                cursor.fetchmany(1, 2)
+            with pytest.raises(TypeError):
+                cursor.fetchmany(unknown=1)
+            with pytest.raises(TypeError):
+                cursor.arraysize = 1.5
         finally:
             await conn.close()
 
@@ -126,6 +162,100 @@ def test_fetchone_logs_exhaustion(client_context):
                 "PyAsyncCursor::fetchone: result set exhausted",
                 "async_fetch.rs",
             ) in logger.events
+
+            await cursor.execute("SELECT 1", use_prepare=False)
+            logger.events.clear()
+            assert await cursor.fetchmany(2) == [(1,)]
+            assert (
+                10,
+                "PyAsyncCursor::fetchmany: started; requested=2",
+                "async_fetch.rs",
+            ) in logger.events
+            assert (
+                20,
+                "PyAsyncCursor::fetchmany: result set exhausted",
+                "async_fetch.rs",
+            ) in logger.events
+            assert any(
+                level == 10
+                and "PyAsyncCursor::fetchmany: completed; requested=2; returned=1; exhausted=true; elapsed_ms="
+                in message
+                for level, message, _module in logger.events
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchmany_uses_arraysize_and_interleaves_without_skipping(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.arraysize = 2
+            await cursor.execute(
+                "SELECT value FROM (VALUES (1), (2), (3), (4), (5)) rows(value) ORDER BY value",
+                use_prepare=False,
+            )
+            description = cursor.description
+
+            assert await cursor.fetchone() == (1,)
+            assert await cursor.fetchmany() == [(2,), (3,)]
+            assert await cursor.fetchmany(None) == [(4,), (5,)]
+            assert cursor.description == description
+            assert await cursor.fetchmany(size=2) == []
+            assert await cursor.fetchmany() == []
+            assert await cursor.fetchone() is None
+            assert cursor.description == description
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchmany_nonpositive_size_does_not_advance_and_partial_batch_releases_session(
+    client_context,
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            owner = conn.cursor()
+            other = conn.cursor()
+            await owner.execute(
+                "SELECT value FROM (VALUES (1), (2), (3)) rows(value) ORDER BY value",
+                use_prepare=False,
+            )
+
+            assert await owner.fetchmany(0) == []
+            assert await owner.fetchmany(-10) == []
+            assert await owner.fetchmany(2) == [(1,), (2,)]
+            assert await owner.fetchmany(2) == [(3,)]
+            await other.execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchmany_stops_at_current_result_set(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            owner = conn.cursor()
+            other = conn.cursor()
+            await owner.execute("SELECT 1; SELECT 2", use_prepare=False)
+
+            assert await owner.fetchmany(10) == [(1,)]
+            assert await owner.fetchmany(10) == []
+            with pytest.raises(RuntimeError, match="busy with another cursor"):
+                await other.execute("SELECT 3", use_prepare=False)
+
+            await owner.close()
+            await other.execute("SET NOCOUNT ON", use_prepare=False)
         finally:
             await conn.close()
 
@@ -630,7 +760,8 @@ def test_exhausted_fetchone_after_connection_close_raises(client_context):
 
 
 @pytest.mark.integration
-def test_fetchone_rejects_concurrent_read_on_same_cursor(client_context):
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany"])
+def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation):
     async def run():
         conn = await connect(client_context)
         try:
@@ -640,10 +771,15 @@ def test_fetchone_rejects_concurrent_read_on_same_cursor(client_context):
                 use_prepare=False,
             )
 
-            first = cursor.fetchone()
+            first = cursor.fetchone() if operation == "fetchone" else cursor.fetchmany(1)
             with pytest.raises(RuntimeError, match="busy with another cursor operation"):
-                cursor.fetchone()
-            assert len((await first)[0]) == 8000000
+                if operation == "fetchone":
+                    cursor.fetchone()
+                else:
+                    cursor.fetchmany(1)
+            result = await first
+            value = result[0] if operation == "fetchone" else result[0][0]
+            assert len(value) == 8000000
             assert await cursor.fetchone() is None
         finally:
             await conn.close()
@@ -652,7 +788,8 @@ def test_fetchone_rejects_concurrent_read_on_same_cursor(client_context):
 
 
 @pytest.mark.integration
-def test_cancelling_blocked_fetchone_breaks_session(client_context):
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany"])
+def test_cancelling_blocked_fetch_breaks_session(client_context, operation):
     async def run():
         conn = await connect(client_context)
         cursor = conn.cursor()
@@ -661,7 +798,10 @@ def test_cancelling_blocked_fetchone_breaks_session(client_context):
                 "SELECT REPLICATE(CAST('x' AS varchar(max)), 32000000)",
                 use_prepare=False,
             )
-            task = asyncio.ensure_future(cursor.fetchone())
+            awaitable = (
+                cursor.fetchone() if operation == "fetchone" else cursor.fetchmany(1)
+            )
+            task = asyncio.ensure_future(awaitable)
             await asyncio.sleep(0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -678,9 +818,9 @@ def test_cancelling_blocked_fetchone_breaks_session(client_context):
                     assert "broken" in str(error).lower()
                     break
                 else:
-                    pytest.fail("Cancelled FetchOne left the connection reusable")
+                    pytest.fail(f"Cancelled {operation} left the connection reusable")
             else:
-                pytest.fail("Cancelled FetchOne left the connection permanently busy")
+                pytest.fail(f"Cancelled {operation} left the connection permanently busy")
         finally:
             await conn.close()
 

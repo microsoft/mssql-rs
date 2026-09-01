@@ -49,6 +49,7 @@ def test_description_matches_sync_cursor_contract(client_context):
                 ("database_id", int, None, 10, 10, 0, False),
                 ("name", str, None, 128, 128, 0, False),
             ]
+            assert cursor.description is cursor.description
         finally:
             await conn.close()
 

@@ -13,37 +13,48 @@ use pyo3::types::{
     PyTuple, PyType,
 };
 
-/// Cursor-local snapshot of the current result-set metadata.
-pub(crate) struct DescriptionState(StdMutex<Option<Vec<ColumnMetadata>>>);
+/// Cursor-local Python snapshot of the current result-set metadata.
+pub(crate) struct DescriptionState(StdMutex<Option<Py<PyList>>>);
 
 impl DescriptionState {
     pub(crate) fn new() -> Self {
         Self(StdMutex::new(None))
     }
 
-    pub(crate) fn replace(
-        &self,
-        metadata: Option<Vec<ColumnMetadata>>,
-    ) -> Option<Vec<ColumnMetadata>> {
+    pub(crate) fn replace(&self, description: Option<Py<PyList>>) -> Option<Py<PyList>> {
         std::mem::replace(
             &mut self
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            metadata,
+            description,
         )
     }
 
-    pub(crate) fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
-        let metadata = self
-            .0
+    pub(crate) fn get<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyList>> {
+        self.0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        metadata
-            .as_deref()
-            .map(|columns| description_to_python(py, columns))
-            .transpose()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|description| description.clone_ref(py).into_bound(py))
     }
+}
+
+pub(crate) async fn materialize(
+    metadata: Option<Vec<ColumnMetadata>>,
+) -> PyResult<Option<Py<PyList>>> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || {
+        Python::attach(|py| Ok(Some(description_to_python(py, &metadata)?.unbind())))
+    })
+    .await
+    .map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Failed to materialize cursor description: {error}"
+        ))
+    })?
 }
 
 fn python_type<'py>(py: Python<'py>, metadata: &ColumnMetadata) -> PyResult<Bound<'py, PyType>> {

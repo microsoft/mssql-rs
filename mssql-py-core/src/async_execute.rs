@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
     ExecuteOptions, PreparedStatement, ResultSet, StatementId, StatementResult, TdsClient,
@@ -20,7 +21,7 @@ use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
-use crate::async_description::DescriptionState;
+use crate::async_description::{DescriptionState, materialize};
 use crate::async_fetch::{FetchState, FetchStatus};
 use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
 use crate::async_session::{AsyncConnectionState, CursorId, ExecuteClaim, SessionOperationGuard};
@@ -352,15 +353,26 @@ pub(crate) fn execute<'py>(
                 } else {
                     FetchStatus::NoResultSet
                 });
-                future_description_state.replace(metadata);
                 Python::attach(|py| {
                     let mut cursor_ref = cursor.borrow_mut(py);
                     if cursor_ref.input_sizes_generation() == input_sizes_generation {
                         cursor_ref.clear_input_sizes();
                     }
                 });
+                let description_started = Instant::now();
+                let description = materialize(metadata).await.map_err(|error| {
+                    tracing::error!(
+                        "PyAsyncCursor::execute: cursor description materialization failed; column_count={column_count}; elapsed_ms={}; error={error}",
+                        description_started.elapsed().as_millis()
+                    );
+                    PyRuntimeError::new_err(format!(
+                        "Query executed but cursor description materialization failed: {error}"
+                    ))
+                })?;
+                let description_materialization_ms = description_started.elapsed().as_millis();
+                future_description_state.replace(description);
                 tracing::info!(
-                    "PyAsyncCursor::execute: query executed successfully; has_result_set={has_open_batch}; column_count={column_count}"
+                    "PyAsyncCursor::execute: query executed successfully; has_result_set={has_open_batch}; column_count={column_count}; description_materialization_ms={description_materialization_ms}"
                 );
                 Ok(cursor)
             }
