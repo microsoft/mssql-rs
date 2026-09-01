@@ -79,6 +79,29 @@ pub(crate) unsafe fn copy_with_nul<T: Copy + Default>(
     copy_len < src.len()
 }
 
+/// UTF-16 variant of [`copy_with_nul`] that encodes directly into the caller's
+/// buffer instead of allocating an intermediate `Vec`.
+///
+/// # Safety
+/// - `dst`, if non-null, must be writable for `buf_len` `SqlWChar`s.
+pub(crate) unsafe fn copy_utf16_with_nul(dst: *mut SqlWChar, buf_len: usize, src: &str) -> bool {
+    if dst.is_null() {
+        return false;
+    }
+
+    let src_len = src.encode_utf16().count();
+    if buf_len == 0 {
+        return src_len != 0;
+    }
+
+    let copy_len = src_len.min(buf_len - 1);
+    for (index, unit) in src.encode_utf16().take(copy_len).enumerate() {
+        unsafe { dst.add(index).write_unaligned(unit) };
+    }
+    unsafe { dst.add(copy_len).write_unaligned(0) };
+    copy_len < src_len
+}
+
 /// Read a UTF-16 string from a raw pointer and an explicit or NUL-terminated length.
 ///
 /// # Safety
@@ -341,8 +364,8 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long, rewrite_param_markers,
-        write_if_some,
+        copy_utf16_with_nul, copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long,
+        rewrite_param_markers, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
 
@@ -599,6 +622,27 @@ mod tests {
             let truncated = unsafe { copy_with_nul(std::ptr::null_mut(), buf_len, &src) };
             assert!(!truncated, "null dst must not report truncation");
         }
+    }
+
+    #[test]
+    fn copy_utf16_encodes_without_splitting_semantics() {
+        let mut buf = [0xDEAD; 5];
+        let truncated = unsafe { copy_utf16_with_nul(buf.as_mut_ptr(), buf.len(), "a😀b") };
+        assert!(!truncated);
+        assert_eq!(&buf, &[b'a' as u16, 0xD83D, 0xDE00, b'b' as u16, 0]);
+    }
+
+    #[test]
+    fn copy_utf16_matches_null_zero_and_truncation_rules() {
+        assert!(!unsafe { copy_utf16_with_nul(std::ptr::null_mut(), 0, "abc") });
+
+        let mut untouched = [0xDEAD];
+        assert!(unsafe { copy_utf16_with_nul(untouched.as_mut_ptr(), 0, "abc") });
+        assert_eq!(untouched, [0xDEAD]);
+
+        let mut truncated = [0xDEAD; 3];
+        assert!(unsafe { copy_utf16_with_nul(truncated.as_mut_ptr(), truncated.len(), "abc") });
+        assert_eq!(truncated, [b'a' as u16, b'b' as u16, 0]);
     }
 
     #[test]
