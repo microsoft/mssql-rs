@@ -421,9 +421,8 @@ unsafe fn try_write_complete_buffered_string(
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
         )
         .all(|unit| unit.is_ok());
-    if !direct_wchar
-        || (buffer_length as usize).saturating_sub(std::mem::size_of::<SqlWChar>()) < bytes.len()
-    {
+    let required = bytes.len().saturating_add(std::mem::size_of::<SqlWChar>());
+    if !direct_wchar || usize::try_from(buffer_length).map_or(true, |len| len < required) {
         return false;
     }
 
@@ -2828,6 +2827,32 @@ mod tests {
         });
         assert_eq!(wide_out, [b'h' as u16, b'i' as u16, 0]);
         assert_eq!(indicator, 4);
+
+        let empty = ColumnValues::String(SqlString::new(Vec::new(), EncodingType::Utf16));
+        let mut empty_out = [0xAA_u8; 2];
+        for buffer_length in [0, 1] {
+            assert!(!unsafe {
+                try_write_complete_buffered_string(
+                    &empty,
+                    SQL_C_WCHAR,
+                    empty_out.as_mut_ptr().cast(),
+                    buffer_length,
+                    &mut indicator,
+                )
+            });
+            assert_eq!(empty_out, [0xAA, 0xAA]);
+        }
+        assert!(unsafe {
+            try_write_complete_buffered_string(
+                &empty,
+                SQL_C_WCHAR,
+                empty_out.as_mut_ptr().cast(),
+                std::mem::size_of_val(&empty_out) as SqlLen,
+                &mut indicator,
+            )
+        });
+        assert_eq!(empty_out, [0, 0]);
+        assert_eq!(indicator, 0);
     }
 
     #[test]

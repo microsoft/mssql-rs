@@ -107,11 +107,11 @@ impl BufferedGetDataRow {
         }
     }
 
-    fn defer_value(&mut self, col: usize) {
-        if let Some(slot) = self.values.get_mut(col) {
+    fn defer_from(&mut self, col: usize) {
+        for slot in self.values.iter_mut().skip(col) {
             *slot = None;
         }
-        if let Some(slot) = self.variant_bases.get_mut(col) {
+        for slot in self.variant_bases.iter_mut().skip(col) {
             *slot = None;
         }
     }
@@ -1026,10 +1026,11 @@ fn fill_rowset(
                         writer.write_null(prefix_len);
                         buffered_columns = column_count;
                     }
-                    Ok(CursorPoll::Pending) => writer.defer_value(prefix_len),
+                    Ok(CursorPoll::Pending) => {}
                     Err(error) => result = Err(error),
                 }
             }
+            writer.defer_from(buffered_columns);
             if let Err(error) = result {
                 fetch_error = Some(error);
                 outcome = RowOutcome::Error(RowIssue::Restricted);
@@ -1907,20 +1908,27 @@ mod tests {
     }
 
     #[test]
-    fn deferred_trailing_value_drops_recycled_row_data() {
+    fn deferred_columns_drop_recycled_row_data() {
         let mut reusable = None;
         let mut row = BufferedGetDataRow::empty(&mut reusable, 8);
-        row.values[7] = Some(ColumnValues::String(SqlString::new(
-            b"previous row".to_vec(),
-            EncodingType::Utf16,
-        )));
+        for col in 6..8 {
+            row.values[col] = Some(ColumnValues::String(SqlString::new(
+                b"previous result".to_vec(),
+                EncodingType::Utf8,
+            )));
+        }
+        row.variant_bases[6] = Some(TdsDataType::VarBinary);
         row.variant_bases[7] = Some(TdsDataType::NVarChar);
         reusable = Some(row);
 
         let mut next = BufferedGetDataRow::empty(&mut reusable, 8);
-        next.defer_value(7);
+        next.values[5] = Some(ColumnValues::Int(42));
+        next.defer_from(6);
 
+        assert_eq!(next.values[5], Some(ColumnValues::Int(42)));
+        assert_eq!(next.values[6], None);
         assert_eq!(next.values[7], None);
+        assert_eq!(next.variant_bases[6], None);
         assert_eq!(next.variant_bases[7], None);
     }
 
