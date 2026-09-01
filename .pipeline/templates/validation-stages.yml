@@ -77,7 +77,6 @@ stages:
       displayName: Check duplicate PR head commit
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-
 - stage: Build
   displayName: Build Stage
   dependsOn:
@@ -251,6 +250,11 @@ stages:
       - template: cargo-authenticate-template.yml
         parameters:
           osType: Linux
+      - bash: |
+          set -euo pipefail
+          python3 -m unittest discover -s .pipeline/scripts \
+            -p 'test_compare_odbc_benchmarks.py' -v
+        displayName: Test ODBC benchmark comparison policy
       - template: build-template-container.yml
         parameters:
           architecture: x64

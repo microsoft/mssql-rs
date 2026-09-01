@@ -120,8 +120,8 @@ steps:
 
   - script: |
         export CERT_HOST_NAME="sql1"
-        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssql-odbc --no-fail-fast --profile ci --success-output immediate
-    displayName: Run tests (mssql-tds and mssql-odbc packages)
+        cargo llvm-cov nextest ${{ parameters.testFilter }} --frozen --no-report --all-targets --package mssql-tds --package mssqlodbc --no-fail-fast --profile ci --success-output immediate
+    displayName: Run tests (mssql-tds and mssqlodbc packages)
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
     env:
       SQL_PASSWORD: $(SQL_PASSWORD)
@@ -139,10 +139,10 @@ steps:
   # `test_client_support.rs` is test-only scaffolding (gated behind the
   # `test-util` feature) used to drive a `TdsClient` from scripted tokens in
   # unit tests; it is not product code, so it is excluded from coverage.
-  - script: cargo llvm-cov report --package mssql-tds --package mssql-odbc --ignore-filename-regex 'test_client_support\.rs' --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
+  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --ignore-filename-regex 'test_client_support\.rs' --lcov --output-path "$(Build.SourcesDirectory)/target/lcov.info"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in lcov format (mssql-tds and mssql-odbc)
+    displayName: Save code coverage in lcov format (mssql-tds and mssqlodbc)
 
   - ${{ if eq(parameters.osType, 'Linux') }}:
     - bash: |
@@ -159,10 +159,10 @@ steps:
   # with the mssql-py-core Python report and publishes the single combined
   # report to the ADO coverage tab, because ADO does not merge coverage across
   # stages/jobs. The merged report is what the GitHub diff-cover workflow uses.
-  - script: cargo llvm-cov report --package mssql-tds --package mssql-odbc --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
+  - script: cargo llvm-cov report --package mssql-tds --package mssqlodbc --ignore-filename-regex 'test_client_support\.rs' --cobertura --output-path "$(Build.SourcesDirectory)/target/cobertura.xml"
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
     workingDirectory: "$(Build.SourcesDirectory)"
-    displayName: Save code coverage in Cobertura format (mssql-tds and mssql-odbc)
+    displayName: Save code coverage in Cobertura format (mssql-tds and mssqlodbc)
 
   - task: PublishPipelineArtifact@1
     condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))

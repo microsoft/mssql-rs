@@ -10,10 +10,12 @@ use futures::future::Either;
 use crate::connection::transport::network_transport::NetworkTransport;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, TdsResult};
+use crate::datatypes::column_values::ColumnValues;
 use crate::datatypes::row_writer::RowWriter;
 use crate::io::reader_writer::NetworkWriter;
 use crate::io::token_stream::{
     ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
+    TdsTokenStreamReader,
 };
 use crate::token::tokens::Tokens;
 
@@ -140,6 +142,65 @@ impl AnyTransport {
                 transport
                     .receive_row_header(context, remaining_request_timeout, cancel_handle)
                     .await
+            }
+        }
+    }
+
+    /// Attempts to position a row using only bytes already buffered by the active transport.
+    pub(crate) fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        match self {
+            Self::Network(transport) => {
+                TdsTokenStreamReader::try_receive_row_header(transport, context)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport.try_receive_row_header(context),
+        }
+    }
+
+    /// Attempts to decode one buffered column while retaining a `sql_variant` base type.
+    pub(crate) fn try_read_buffered_column_with_base(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<
+        Option<(
+            ColumnValues,
+            Option<crate::datatypes::sqldatatypes::TdsDataType>,
+        )>,
+    > {
+        match self {
+            Self::Network(transport) => {
+                transport.try_read_buffered_column_with_base(pause_state, target)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => transport
+                .try_read_buffered_column(pause_state, target)
+                .map(|value| value.map(|value| (value, None))),
+        }
+    }
+
+    /// Writes as much of the current buffered row as the active transport can complete.
+    pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        match self {
+            Self::Network(transport) => transport.try_read_buffered_row_into(pause_state, writer),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(transport) => {
+                let Some((row, complete)) = transport.try_read_buffered_test_row(pause_state)?
+                else {
+                    return Ok(false);
+                };
+                for value in row {
+                    writer.write_i32(pause_state.next_column_index, value);
+                    pause_state.next_column_index += 1;
+                }
+                Ok(complete)
             }
         }
     }

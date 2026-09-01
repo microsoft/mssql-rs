@@ -9,7 +9,7 @@ This project delivers a **production-ready ODBC Driver 18 for SQL Server written
 The driver wraps the `mssql-tds` library (TDS protocol implementation, workspace-local path dependency) with a full ODBC 3.x API layer — ~78 exported functions (including W wide-char variants) covering connectivity, query execution, data types, authentication, encryption, bulk operations, and more.
 
 **Target platforms**: Windows, Linux, macOS (x64 and ARM64) - Same as the platforms currently supported by msodbcsql
-**Binary output**: `msodbcsql18.dll` (Windows), `libmsodbcsql-18.so.1.1` (Linux), `libmsodbcsql.18.dylib` (macOS)
+**Binary output**: `mssqlodbc.dll` (Windows), `mssqlodbc.so` (Linux), `mssqlodbc.dylib` (macOS)
 
 ---
 
