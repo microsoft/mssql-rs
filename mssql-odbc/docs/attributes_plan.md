@@ -284,14 +284,17 @@ by unit + e2e tests.
 - `SQLGetConnectAttrW` deliberately has **no** arm, so it falls through to
   `HY092` exactly as msodbcsql does (`sqlcmisc.cpp:4378`).
 
-**Explicitly out of scope:** enforcing the timeout (cancel/abort on expiry) —
-AB#46385. This is a **known, deliberate divergence**: msodbcsql returns `HYT00`
-after N seconds on a long query, this driver runs the query to completion. No
-e2e test asserts enforcement, so the parity suite stays green either way.
+**Enforcement (AB#46385 — delivered):** `SQLExecute` / `SQLExecDirectW` thread
+`StmtState::query_timeout` into `ExecuteOptions::timeout_secs`, so a non-zero
+value bounds the wait for a response: on expiry the client sends `ATTENTION`
+and reports the failure as `HYT00`, matching msodbcsql. `0` (the default)
+stays unlimited — no behavior change for the common case. See mssql-rs#439,
+where the timeout being silently dropped left a blocked statement with no
+client-side escape hatch.
 
 **Acceptance:** `cursor.timeout = N` in mssql-python stops logging
 "Failed to set query timeout"; value round-trips through get; clamp + `01S02`
-matches msodbcsql.
+matches msodbcsql; a query still running after `N` seconds fails with `HYT00`.
 
 **Size:** S–M. **Depends on:** S1 (table, SQLSTATE policy).
 
