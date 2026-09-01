@@ -54,4 +54,9 @@ windows = { version = "0.58", features = [
 # `TdsClient` driven by scripted TDS tokens (see `mssql_tds::test_client_support`)
 # to cover client-driven ODBC paths without a live server.
 mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
+# Drives a real TdsClient over a real socket against a mock TDS server, so
+# SQL_ATTR_QUERY_TIMEOUT regression tests can prove the timeout actually
+# bounds the wire wait (see mssql-rs#439) rather than only checking that the
+# configured value reaches an `ExecuteOptions` struct.
+mssql-mock-tds = { path = "../mssql-mock-tds" }
 [build-dependencies]
