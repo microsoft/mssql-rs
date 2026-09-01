@@ -224,6 +224,31 @@ pub(crate) struct DaeStream {
 /// declaring one encoding and sending another -- so it is still rejected here
 /// rather than risking silent corruption (AB#47590). `ColumnSize` is likewise
 /// unenforceable: every streamed type is a `max`.
+///
+/// Deliberate deviation from msodbcsql: `needs_transcode` buffers the whole
+/// value and transcodes it once (`transcode_dae_bytes`), rather than
+/// transcoding each `SQLPutData` chunk with a carried code-point residual the
+/// way msodbcsql's `ProcessDAEColumnData` does (`sqlccmd.cpp:3864`,
+/// `:3899-3901`; `ConvertLongData`, `sqlccnvt.cpp:938-990`; residual flushed
+/// at `sqlccmd.cpp:5999-6001`). Whole-value buffering costs memory
+/// proportional to the value on a path whose purpose is to avoid exactly
+/// that, and is not a regression -- this pairing previously failed outright
+/// -- but it is real cost, taken because a per-chunk carry is meaningfully
+/// more machinery (correctly splitting a UTF-16 surrogate pair or a
+/// multi-byte narrow sequence across calls) than this driver has today.
+/// Tracked under AB#47590 alongside this file's other DAE-transcoding gaps.
+///
+/// Known residual, also AB#47590: a same-family pairing whose wideness
+/// *matches* the C type (`needs_transcode: false`, e.g. `SQL_C_CHAR` bound to
+/// `SQL_VARCHAR`) still streams its chunks to the wire untranscoded. That is
+/// correct for the wide case -- `SQL_C_WCHAR` is already UTF-16LE, the wire
+/// encoding -- but not for the narrow one: this driver's `SQL_C_CHAR` is
+/// UTF-8 by convention, not a wire encoding, so a non-ASCII value streamed
+/// under a non-UTF8 collation round-trips as mojibake, the same defect
+/// `transcode_dae_bytes` fixes for the wideness-mismatched case. Extending
+/// `needs_transcode` to cover it needs the connection's collation at this
+/// function's call site (`build_named_params`, execute time), which it does
+/// not have today.
 pub(crate) fn dae_placeholder_type(
     c_type: SqlSmallInt,
     sql_type: SqlSmallInt,

@@ -171,18 +171,25 @@ fn sql_param_data_safe(
             return SQL_ERROR;
         };
 
-        let transcode = stmt_state.dae.as_ref().and_then(|dae| {
+        let transcode = stmt_state.dae.as_mut().and_then(|dae| {
             if dae.progress.is_null || dae.progress.pending_bytes.is_empty() {
                 return None;
             }
-            let param = dae.current_param()?;
-            if !param.needs_transcode {
-                return None;
-            }
+            let (c_type, sql_type) = {
+                let param = dae.current_param()?;
+                if !param.needs_transcode {
+                    return None;
+                }
+                (param.c_type, param.sql_type)
+            };
+            // Free to take rather than clone: `advance()` resets `progress`
+            // wholesale before the next parameter, and every failure arm
+            // below tears the whole sequence down, so nothing reads
+            // `pending_bytes` again after this.
             Some((
-                param.c_type,
-                param.sql_type,
-                dae.progress.pending_bytes.clone(),
+                c_type,
+                sql_type,
+                std::mem::take(&mut dae.progress.pending_bytes),
             ))
         });
 

@@ -178,3 +178,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
   full connect (DNS through login) in the attempt's remaining budget instead
   of only capping the post-resolution TCP connect step.
+

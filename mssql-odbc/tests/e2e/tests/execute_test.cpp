@@ -734,10 +734,51 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTrans
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// A genuine cross-*family* pairing -- character streamed against a binary SQL
-// type, or the reverse -- has no transcode to fall back on: there is nothing
-// it could mean other than one side declaring one encoding and sending
-// another, so it is still refused at execute rather than risking corruption.
+// The pairing this fix actually targets: mssql-python always declares
+// SQL_C_WCHAR for a streamed character parameter, including ASCII values it
+// also declares as the *narrow* SQL_VARCHAR (a documented convention in its
+// own source -- "a long-standing alias in the Python layer"). A non-ASCII
+// value here exercises both the wideness-mismatch transcode and the
+// collation-correct narrow encoding in one test: the narrow-to-wide
+// direction above produces wide UTF-16LE output, which never touches
+// collation encoding at all, so it cannot cover that half of the fix.
+TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLWCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR,
+                                   SQL_VARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    // "caf" + LATIN SMALL LETTER E WITH ACUTE (U+00E9), as UTF-16LE code units.
+    const SQLWCHAR chunk[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLWCHAR*>(chunk), sizeof(chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // "café" as UTF-8, matching GetColumnChar's SQL_C_CHAR convention.
+    EXPECT_EQ("caf\xC3\xA9", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A genuine cross-*family* pairing -- character streamed against an integer
+// SQL type -- has no transcode to fall back on: there is nothing it could
+// mean other than one side declaring one encoding and sending another, so it
+// is still refused at execute rather than risking corruption.
+//
+// SQL_C_CHAR -> SQL_INTEGER is reachable here (rather than failing at bind,
+// like SQL_C_CHAR -> a binary type still does) specifically because the
+// integer/character cross-conversions feature made it a valid *materialized*
+// binding; DAE has no equivalent, so the refusal for this one pairing moves
+// from bind time to here.
 //
 // msodbcsql's behavior for this pairing has not been characterized, so the
 // parity run stays skipped, as it was before this pairing was split out from
@@ -749,8 +790,8 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
     SQLCHAR token = 0;
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY,
-                                   SQL_VARCHAR, 0, 0, &token, 0, &ind),
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_INTEGER, 0, 0, &token, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
