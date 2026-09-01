@@ -1,0 +1,48 @@
+# filepath: .pipeline/templates/build-odbc-windows-template.yml
+#
+# Build the mssql-odbc driver (mssqlodbc.dll) natively on Windows and publish
+# it as a pipeline artifact for the native NuGet package Publish stage.
+#
+# Driver only - no C++ gtest e2e binaries. Windows e2e coverage stays in the
+# PR-only leg in build-template.yml; this is the CI-only leg that stages a
+# releasable driver drop, mirroring build-odbc-template.yml on Linux.
+#
+# CI (non-PR) only.
+
+parameters:
+  # 'x64' or 'ARM64' - selects the build pool the surrounding job runs on.
+  - name: architecture
+    type: string
+  # Pipeline artifact name, e.g. 'Odbc_Windows_x64' / 'Odbc_Windows_arm64'.
+  - name: artifactName
+    type: string
+  # Publish this template's own artifact (disable when the caller does one
+  # combined publish for the whole job, e.g. OneBranch's stages.yml).
+  - name: publishArtifacts
+    type: boolean
+    default: true
+
+steps:
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+      cargo build --release --package mssql-odbc
+    displayName: 'Build mssql-odbc driver (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+      # Nest under build/ so the Publish stage's extraction step can use the
+      # same relative layout (build/<driver file>) across every platform.
+      $dropDir = "$(Build.SourcesDirectory)\odbc-drop\build"
+      New-Item -ItemType Directory -Force -Path $dropDir | Out-Null
+      Copy-Item "$(CARGO_TARGET_DIR)\release\mssqlodbc.dll" $dropDir
+    displayName: 'Stage driver into drop (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ if eq(parameters.publishArtifacts, true) }}:
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish ${{ parameters.artifactName }}'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+        artifact: ${{ parameters.artifactName }}

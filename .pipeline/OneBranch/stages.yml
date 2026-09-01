@@ -6,6 +6,10 @@
 # Then packages all wheels into a NuGet archive and publishes to Azure         #
 # Artifacts via OneBranch native nugetPublishing mechanism.                    #
 #                                                                               #
+# When buildOdbcNative is true, the Windows/Linux x64+ARM64 jobs also build   #
+# the mssql-odbc native driver (glibc/musl/glibc-2.28 on Linux) and publish   #
+# it as a separate mssql-odbc-native NuGet package. No macOS lane yet.         #
+#                                                                               #
 # Build jobs use custom 1ES pools (Rust, Docker, Python pre-installed).        #
 # Publish job uses managed OneBranch pool with ob_nugetPublishing_enabled.     #
 # Artifact publishing on custom pools requires explicit                        #
@@ -23,6 +27,11 @@ parameters:
   type: boolean
   default: true
   displayName: 'Build Python wheels'
+
+- name: buildOdbcNative
+  type: boolean
+  default: false
+  displayName: 'Build mssql-odbc native driver binaries alongside the wheels'
 
 - name: isOfficial
   type: boolean
@@ -77,6 +86,18 @@ stages:
           architecture: x64
           publishArtifacts: false
           signWindowsWheels: ${{ parameters.isOfficial }}
+    - ${{ if eq(parameters.buildOdbcNative, true) }}:
+      - template: /.pipeline/templates/build-odbc-windows-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Windows_x64'
+          publishArtifacts: false
+      - task: CopyFiles@2
+        displayName: 'Collect ODBC native driver (Windows x64)'
+        inputs:
+          sourceFolder: '$(Build.SourcesDirectory)\odbc-drop'
+          targetFolder: '$(ob_outputDirectory)\odbc_windows_x64'
+          contents: '**'
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Windows x64 Artifacts'
       inputs:
@@ -133,6 +154,18 @@ stages:
             - '3.12'
             - '3.13'
             - '3.14'
+      - ${{ if eq(parameters.buildOdbcNative, true) }}:
+        - template: /.pipeline/templates/build-odbc-windows-template.yml
+          parameters:
+            architecture: ARM64
+            artifactName: 'Odbc_Windows_ARM64'
+            publishArtifacts: false
+        - task: CopyFiles@2
+          displayName: 'Collect ODBC native driver (Windows ARM64)'
+          inputs:
+            sourceFolder: '$(Build.SourcesDirectory)\odbc-drop'
+            targetFolder: '$(ob_outputDirectory)\odbc_windows_arm64'
+            contents: '**'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Windows ARM64 Artifacts'
         inputs:
@@ -179,6 +212,44 @@ stages:
           osType: Alpine
           architecture: x64
           publishArtifacts: false
+    - ${{ if eq(parameters.buildOdbcNative, true) }}:
+      - template: /.pipeline/templates/build-odbc-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Linux_x64_glibc'
+          publishArtifacts: false
+      - task: CopyFiles@2
+        displayName: 'Collect ODBC glibc driver (Linux x64)'
+        inputs:
+          sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+          targetFolder: '$(ob_outputDirectory)/odbc_glibc_x64'
+          contents: '**'
+      - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
+        displayName: 'Clear odbc-drop before next ODBC variant'
+      - template: /.pipeline/templates/build-odbc-alpine-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Linux_x64_musl'
+          publishArtifacts: false
+      - task: CopyFiles@2
+        displayName: 'Collect ODBC musl driver (Linux x64)'
+        inputs:
+          sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+          targetFolder: '$(ob_outputDirectory)/odbc_musl_x64'
+          contents: '**'
+      - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
+        displayName: 'Clear odbc-drop before next ODBC variant'
+      - template: /.pipeline/templates/build-odbc-glibc228-template.yml
+        parameters:
+          architecture: x64
+          artifactName: 'Odbc_Linux_x64_glibc228'
+          publishArtifacts: false
+      - task: CopyFiles@2
+        displayName: 'Collect ODBC glibc-2.28 driver (Linux x64)'
+        inputs:
+          sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+          targetFolder: '$(ob_outputDirectory)/odbc_glibc228_x64'
+          contents: '**'
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Linux x64 Artifacts'
       inputs:
@@ -226,6 +297,45 @@ stages:
             osType: Alpine
             architecture: arm64
             publishArtifacts: false
+      - ${{ if eq(parameters.buildOdbcNative, true) }}:
+        - template: /.pipeline/templates/build-odbc-template.yml
+          parameters:
+            architecture: ARM64
+            artifactName: 'Odbc_Linux_ARM64_glibc'
+            publishArtifacts: false
+        - task: CopyFiles@2
+          displayName: 'Collect ODBC glibc driver (Linux ARM64)'
+          inputs:
+            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+            targetFolder: '$(ob_outputDirectory)/odbc_glibc_arm64'
+            contents: '**'
+        - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
+          displayName: 'Clear odbc-drop before next ODBC variant'
+        - template: /.pipeline/templates/build-odbc-alpine-template.yml
+          parameters:
+            architecture: ARM64
+            artifactName: 'Odbc_Linux_ARM64_musl'
+            publishArtifacts: false
+        - task: CopyFiles@2
+          displayName: 'Collect ODBC musl driver (Linux ARM64)'
+          inputs:
+            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+            targetFolder: '$(ob_outputDirectory)/odbc_musl_arm64'
+            contents: '**'
+        - script: rm -rf $(Build.SourcesDirectory)/odbc-drop
+          displayName: 'Clear odbc-drop before next ODBC variant'
+        - template: /.pipeline/templates/build-odbc-glibc228-template.yml
+          parameters:
+            architecture: ARM64
+            buildImage: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
+            artifactName: 'Odbc_Linux_ARM64_glibc228'
+            publishArtifacts: false
+        - task: CopyFiles@2
+          displayName: 'Collect ODBC glibc-2.28 driver (Linux ARM64)'
+          inputs:
+            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+            targetFolder: '$(ob_outputDirectory)/odbc_glibc228_arm64'
+            contents: '**'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Linux ARM64 Artifacts'
         inputs:
@@ -398,3 +508,81 @@ stages:
           }
           Write-Host "OneBranch will auto-publish from $(ob_outputDirectory)/packages"
         displayName: 'Verify NuGet package'
+
+      # mssql-odbc native driver binaries - packaged as a separate NuGet
+      # (unrelated product/consumers from the Python wheels above), built
+      # from the same artifacts this job already downloaded.
+      - ${{ if eq(parameters.buildOdbcNative, true) }}:
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+
+            # source artifact/subfolder -> (platform tag, driver filename).
+            # Subfolder names match the CopyFiles targetFolder used in each
+            # Build job (see Windows_x64/Windows_ARM64/Linux_x64/Linux_ARM64
+            # above); every source path shares the build/<file> layout that
+            # build-odbc-*-template.yml and build-odbc-windows-template.yml
+            # stage the driver into.
+            $platforms = [ordered]@{
+              'drop_Build_Linux_x64_linux_x64/odbc_glibc_x64'             = @{ tag = 'linux_x64';      file = 'mssqlodbc.so' }
+              'drop_Build_Linux_x64_linux_x64/odbc_musl_x64'              = @{ tag = 'musl_x64';       file = 'mssqlodbc.so' }
+              'drop_Build_Linux_x64_linux_x64/odbc_glibc228_x64'          = @{ tag = 'glibc228_x64';   file = 'mssqlodbc.so' }
+              'drop_Build_Linux_ARM64_linux_arm64/odbc_glibc_arm64'       = @{ tag = 'linux_arm64';    file = 'mssqlodbc.so' }
+              'drop_Build_Linux_ARM64_linux_arm64/odbc_musl_arm64'        = @{ tag = 'musl_arm64';     file = 'mssqlodbc.so' }
+              'drop_Build_Linux_ARM64_linux_arm64/odbc_glibc228_arm64'    = @{ tag = 'glibc228_arm64'; file = 'mssqlodbc.so' }
+              'drop_Build_Windows_x64_windows_x64/odbc_windows_x64'       = @{ tag = 'windows_x64';    file = 'mssqlodbc.dll' }
+              'drop_Build_Windows_ARM64_windows_arm64/odbc_windows_arm64' = @{ tag = 'windows_arm64';  file = 'mssqlodbc.dll' }
+            }
+
+            foreach ($key in $platforms.Keys) {
+              $info = $platforms[$key]
+              $sourcePath = "$(Pipeline.Workspace)/$key/build/$($info.file)"
+              if (-not (Test-Path $sourcePath)) {
+                Write-Error "Missing ODBC driver binary: $sourcePath"
+                exit 1
+              }
+              $destDir = "$(Build.StagingDirectory)/odbc-native/$($info.tag)"
+              New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+              Copy-Item $sourcePath "$destDir/$($info.file)"
+              Write-Host "Staged $($info.tag): $sourcePath -> $destDir/$($info.file)"
+            }
+          displayName: 'Collect ODBC native driver binaries'
+
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+
+            # Reuses $(nugetVersion)/$(shortSha) computed above for the wheels
+            # package - both packages are built from the same commit/run.
+            $nuspecContent = @"
+            <?xml version="1.0"?>
+            <package>
+              <metadata>
+                <id>mssql-odbc-native</id>
+                <version>$(nugetVersion)</version>
+                <description>mssql-odbc native driver binaries across platforms. Commit: $(Build.SourceVersion). Build: $(Build.BuildNumber)</description>
+                <authors>SqlClientDrivers</authors>
+              </metadata>
+              <files>
+                <file src="odbc-native\**\*" target="native" />
+              </files>
+            </package>
+            "@
+
+            $nuspecPath = "$(Build.StagingDirectory)/mssql-odbc-native.nuspec"
+            $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
+            Write-Host "Created nuspec at $nuspecPath"
+          displayName: 'Generate ODBC native NuGet package metadata'
+
+        - task: NuGetCommand@2
+          displayName: 'Create ODBC native NuGet package'
+          inputs:
+            command: pack
+            packagesToPack: '$(Build.StagingDirectory)/mssql-odbc-native.nuspec'
+            packDestination: '$(ob_outputDirectory)/packages'
+            basePath: '$(Build.StagingDirectory)'
+
+        - pwsh: |
+            Write-Host "=== ODBC native NuGet package created ==="
+            Get-ChildItem "$(ob_outputDirectory)/packages" -Filter mssql-odbc-native*.nupkg | ForEach-Object {
+              Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
+            }
+          displayName: 'Verify ODBC native NuGet package'

@@ -31,6 +31,11 @@ parameters:
   type: boolean
   default: true
 
+- name: buildOdbcNative
+  displayName: 'Build mssql-odbc native driver binaries alongside the wheels'
+  type: boolean
+  default: false
+
 variables:
   CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]  # For onebranch.pipeline.version task
   LinuxContainerImage: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
@@ -70,5 +75,6 @@ extends:
       parameters:
         buildAllTargets: true
         buildPythonWheels: true
+        buildOdbcNative: ${{ parameters.buildOdbcNative }}
         isOfficial: false
         publishToFeed: ${{ parameters.publishToFeed }}
