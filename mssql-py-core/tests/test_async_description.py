@@ -184,11 +184,29 @@ def test_description_is_replaced_or_cleared_by_execute(client_context):
         conn = await connect(client_context)
         try:
             cursor = conn.cursor()
-            await cursor.execute("SELECT 1 AS first_value", use_prepare=False)
-            assert cursor.description[0][0] == "first_value"
+            await cursor.execute(
+                "SELECT value AS first_value, CAST(value AS decimal(10, 2)) AS amount "
+                "FROM (VALUES (1), (2)) rows(value) ORDER BY value",
+                use_prepare=False,
+            )
+            assert [column[:2] for column in cursor.description] == [
+                ("first_value", int),
+                ("amount", Decimal),
+            ]
+            assert await cursor.fetchone() == (1, Decimal("1.00"))
 
-            await cursor.execute("SELECT N'x' AS second_value", use_prepare=False)
-            assert cursor.description[0][:2] == ("second_value", str)
+            # Re-execute with unread rows and a different column order, width, and types.
+            await cursor.execute(
+                "SELECT N'x' AS text_value, CAST(3.5 AS float) AS ratio, "
+                "CAST(7 AS bigint) AS first_value",
+                use_prepare=False,
+            )
+            assert [column[:2] for column in cursor.description] == [
+                ("text_value", str),
+                ("ratio", float),
+                ("first_value", int),
+            ]
+            assert await cursor.fetchone() == ("x", 3.5, 7)
 
             await cursor.execute("SET NOCOUNT ON", use_prepare=False)
             assert cursor.description is None

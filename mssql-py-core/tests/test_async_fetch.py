@@ -247,6 +247,63 @@ def test_fetchmany_uses_arraysize_and_interleaves_without_skipping(client_contex
             assert await cursor.fetchmany() == []
             assert await cursor.fetchone() is None
             assert cursor.description == description
+
+            # Regression parity with mssql-python issue #427: fetchmany then fetchone.
+            await cursor.execute(
+                "SELECT value FROM (VALUES (1), (2)) rows(value) ORDER BY value",
+                use_prepare=False,
+            )
+            assert await cursor.fetchmany(1) == [(1,)]
+            assert await cursor.fetchone() == (2,)
+
+            # Repeated alternation must preserve the exact row position.
+            await cursor.execute(
+                "SELECT value FROM (VALUES (1), (2), (3), (4)) rows(value) "
+                "ORDER BY value",
+                use_prepare=False,
+            )
+            assert await cursor.fetchmany(1) == [(1,)]
+            assert await cursor.fetchone() == (2,)
+            assert await cursor.fetchmany(1) == [(3,)]
+            assert await cursor.fetchone() == (4,)
+            assert await cursor.fetchone() is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchmany_and_fetchall_preserve_mixed_large_lob_batches(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            query = """
+                SELECT id, lob_value
+                FROM (VALUES
+                    (1, CAST(N'' AS nvarchar(max))),
+                    (2, CAST(NULL AS nvarchar(max))),
+                    (3, CAST(N'Small' AS nvarchar(max))),
+                    (4, REPLICATE(CAST(N'x' AS nvarchar(max)), 1000)),
+                    (5, REPLICATE(CAST(N'y' AS nvarchar(max)), 10000))
+                ) rows(id, lob_value)
+                ORDER BY id
+            """
+            await cursor.execute(query, use_prepare=False)
+
+            assert await cursor.fetchmany(2) == [(1, ""), (2, None)]
+            assert await cursor.fetchone() == (3, "Small")
+            remaining = await cursor.fetchall()
+            assert remaining == [(4, "x" * 1000), (5, "y" * 10000)]
+            assert await cursor.fetchmany(2) == []
+            assert await cursor.fetchall() == []
+
+            await cursor.execute(query, use_prepare=False)
+            rows = await cursor.fetchall()
+            assert rows[:3] == [(1, ""), (2, None), (3, "Small")]
+            assert rows[3][1] == "x" * 1000
+            assert rows[4][1] == "y" * 10000
         finally:
             await conn.close()
 
@@ -402,15 +459,20 @@ def test_nextset_drains_rows_and_updates_description(client_context):
             cursor = conn.cursor()
             await cursor.execute(
                 "SELECT 1 AS first_value UNION ALL SELECT 2; "
-                "SELECT N'x' AS second_value; SELECT 3 AS third_value",
+                "SELECT value AS second_value, LEN(value) AS value_length "
+                "FROM (VALUES (N'x'), (N'yy'), (N'zzz')) rows(value); "
+                "SELECT 3 AS third_value",
                 use_prepare=False,
             )
             assert cursor.description[0][:2] == ("first_value", int)
             assert await cursor.fetchone() == (1,)
 
             assert await cursor.nextset() is True
-            assert cursor.description[0][:2] == ("second_value", str)
-            assert await cursor.fetchall() == [("x",)]
+            assert [column[:2] for column in cursor.description] == [
+                ("second_value", str),
+                ("value_length", int),
+            ]
+            assert await cursor.fetchall() == [("x", 1), ("yy", 2), ("zzz", 3)]
 
             assert await cursor.nextset() is True
             assert cursor.description[0][:2] == ("third_value", int)
@@ -419,6 +481,104 @@ def test_nextset_drains_rows_and_updates_description(client_context):
             assert await cursor.nextset() is False
             assert cursor.description is None
             assert await cursor.nextset() is False
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetch_interleaving_across_result_transitions_and_ownership(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            owner = conn.cursor()
+            other = conn.cursor()
+            await owner.execute(
+                """
+                DECLARE @sink TABLE (value int);
+                SELECT value FROM (VALUES (1), (2), (3), (4), (5), (6)) rows(value)
+                    ORDER BY value;
+                INSERT INTO @sink VALUES (1);
+                SELECT value FROM (VALUES (10), (11), (12), (13)) rows(value)
+                    ORDER BY value;
+                SELECT CAST(1 AS int) AS empty_value WHERE 1 = 0;
+                SELECT value FROM (VALUES (20), (21)) rows(value) ORDER BY value;
+                """,
+                use_prepare=False,
+            )
+
+            assert await owner.fetchone() == (1,)
+            assert await owner.fetchmany(2) == [(2,), (3,)]
+            assert await owner.fetchall() == [(4,), (5,), (6,)]
+            assert await owner.fetchall() == []
+            with pytest.raises(RuntimeError, match="busy with another cursor"):
+                await other.execute("SELECT 99", use_prepare=False)
+
+            assert await owner.nextset() is True
+            assert owner.description is None
+            with pytest.raises(RuntimeError, match="No active result set"):
+                await owner.fetchall()
+
+            assert await owner.nextset() is True
+            assert await owner.fetchone() == (10,)
+            assert await owner.fetchmany(2) == [(11,), (12,)]
+            assert await owner.fetchall() == [(13,)]
+
+            assert await owner.nextset() is True
+            assert owner.description[0][0] == "empty_value"
+            assert await owner.fetchone() is None
+            assert await owner.fetchmany(2) == []
+            assert await owner.fetchall() == []
+
+            assert await owner.nextset() is True
+            assert await owner.fetchmany(1) == [(20,)]
+            assert await owner.fetchall() == [(21,)]
+            assert await owner.nextset() is False
+            assert await owner.nextset() is False
+            await other.execute("SET NOCOUNT ON", use_prepare=False)
+
+            await owner.execute("SELECT 1; SELECT 2", use_prepare=False)
+            await owner.close()
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                await owner.nextset()
+            await other.execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_asyncio_timeout_breaks_connection_ownership(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT TOP (10000000) REPLICATE(CAST('x' AS varchar(100)), 100) "
+                "FROM sys.all_objects AS first_rows "
+                "CROSS JOIN sys.all_objects AS second_rows; SELECT 2",
+                use_prepare=False,
+            )
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(cursor.nextset(), timeout=0.01)
+
+            probe = conn.cursor()
+            for _ in range(100):
+                try:
+                    await probe.execute("SELECT 3", use_prepare=False)
+                except RuntimeError as error:
+                    if "busy" in str(error).lower():
+                        await asyncio.sleep(0.01)
+                        continue
+                    assert "broken" in str(error).lower()
+                    break
+                else:
+                    pytest.fail("Timed-out nextset left the connection reusable")
+            else:
+                pytest.fail("Timed-out nextset left the connection permanently busy")
         finally:
             await conn.close()
 
