@@ -1,10 +1,9 @@
 # Performance baseline commit for mssql-odbc.
 #
-# This pin is the current main commit used as the production base for the
-# optimization diff. It builds the benchmark-era driver plus later main changes
-# without this PR's optimizations. Future advances require a pull request, so
-# every baseline move is reviewed and recorded.
+# This pin records the accepted optimized production state after PR #418.
+# Future baseline moves require a pull request, so every change is
+# reviewed and recorded in git history.
 #
 # Exactly one full 40-character commit SHA on its own line. Lines starting with
 # '#' and blank lines are ignored.
-db7d266506c4fbc92b681221d50e686c2926201a
+c453af2c95ddc5bb5525634ac0112474e9610378
