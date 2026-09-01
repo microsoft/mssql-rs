@@ -53,14 +53,14 @@ tests/e2e/
 In `--verbose` mode, `run_e2e.sh` defaults to:
 
 - `MSSQL_TDS_TRACE=true`
-- `MSSQL_TDS_TRACE_LEVEL=warn,msodbcsql18=debug`
+- `MSSQL_TDS_TRACE_LEVEL=warn,mssqlodbc=debug`
 
 unless those variables are already set in your environment.
 
 To override the verbose default filter:
 
 ```bash
-MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=trace" ./run_e2e.sh --verbose
+MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=trace" ./run_e2e.sh --verbose
 ```
 
 ### Comparing against msodbcsql 18
@@ -274,8 +274,8 @@ running the tests.
   substituting your chosen driver name for `<driver name>`:
   ```
   HKLM\Software\ODBC\ODBCINST.INI\<driver name>
-      Driver = <path to msodbcsql18.dll>
-      Setup  = <path to msodbcsql18.dll>
+      Driver = <path to mssqlodbc.dll>
+      Setup  = <path to mssqlodbc.dll>
 
   HKLM\Software\ODBC\ODBCINST.INI\ODBC Drivers
       <driver name> = Installed
@@ -383,11 +383,11 @@ splits the flow into a build half and a run half so a single set of binaries can
 be exercised on many Linux versions:
 
 - **`build_e2e.sh [--release] [--out=DIR]`** — builds the Rust driver and the
-  C++ gtest binaries, then stages `build/` (with `libmsodbcsql18.so` copied
+  C++ gtest binaries, then stages `build/` (with `mssqlodbc.so` copied
   inside) into `DIR`. That directory is published as a pipeline artifact.
 - **`run_e2e.sh --skip-build [--driver=PATH]`** — skips all compilation. It
   restores the prebuilt `build/` tree, auto-resolves the driver from
-  `build/libmsodbcsql18.so` (or `--driver`), registers it, and reruns the
+  `build/mssqlodbc.so` (or `--driver`), registers it, and reruns the
   prebuilt binaries via CTest.
 
 `CTestTestfile.cmake` bakes **absolute** paths to the test executables, so the

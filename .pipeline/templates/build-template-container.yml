@@ -437,6 +437,7 @@ steps:
     Contents: |
       *
       !.cargo-lock
+      !libmssqlodbc.so
     TargetFolder: '$(Build.ArtifactStagingDirectory)/debug'
 
 - task: CopyFiles@2
@@ -447,6 +448,7 @@ steps:
     Contents: |
       *
       !.cargo-lock
+      !libmssqlodbc.so
     TargetFolder: '$(Build.ArtifactStagingDirectory)/release'
 
 - script: |

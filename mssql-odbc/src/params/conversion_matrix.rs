@@ -24,12 +24,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::is_integer_c_type;
 
-/// SQL types a character C buffer can be converted to.
-///
-/// msodbcsql's matching arm (`sqlcfunc.cpp:2861`) also accepts `SQL_SS_XML` and
-/// the binary types, the latter by reading the buffer as a hex string. Neither
-/// is built here yet, so both are rejected at bind with `HYC00`.
-const CHARACTER_C_TARGETS: &[SqlSmallInt] = &[
+const CHARACTER_SQL_TARGETS: &[SqlSmallInt] = &[
     SQL_CHAR,
     SQL_VARCHAR,
     SQL_LONGVARCHAR,
@@ -38,12 +33,12 @@ const CHARACTER_C_TARGETS: &[SqlSmallInt] = &[
     SQL_WLONGVARCHAR,
 ];
 
-/// SQL types a `SQL_C_BINARY` buffer can be converted to.
-const BINARY_C_TARGETS: &[SqlSmallInt] = &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY];
-/// SQL types any integer C buffer can be converted to. Width is not part of
-/// legality: a value that does not fit the target is a runtime `22003`, not a
-/// rejected binding.
-const INTEGER_C_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT];
+const BINARY_SQL_TARGETS: &[SqlSmallInt] = &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY];
+
+/// Width is not part of legality: a value that does not fit the target is a
+/// runtime `22003`, not a rejected binding, so `SQL_TINYINT` stays reachable
+/// from every integer and character C type.
+const INTEGER_SQL_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT];
 
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
 /// for an input parameter.
@@ -57,13 +52,13 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
         c_type, SQL_C_DEFAULT,
         "SQL_C_DEFAULT must be resolved before consulting the conversion matrix"
     );
-    let targets: &[SqlSmallInt] = match c_type {
-        SQL_C_CHAR | SQL_C_WCHAR => CHARACTER_C_TARGETS,
-        SQL_C_BINARY => BINARY_C_TARGETS,
-        _ if is_integer_c_type(c_type) => INTEGER_C_TARGETS,
+    let targets: &[&[SqlSmallInt]] = match c_type {
+        SQL_C_CHAR | SQL_C_WCHAR => &[CHARACTER_SQL_TARGETS, INTEGER_SQL_TARGETS],
+        SQL_C_BINARY => &[BINARY_SQL_TARGETS],
+        _ if is_integer_c_type(c_type) => &[INTEGER_SQL_TARGETS, CHARACTER_SQL_TARGETS],
         _ => return false,
     };
-    targets.contains(&sql_type)
+    targets.iter().any(|group| group.contains(&sql_type))
 }
 
 #[cfg(test)]
@@ -103,9 +98,48 @@ mod tests {
         assert!(!is_supported_conversion(SQL_C_BINARY, SQL_VARCHAR));
     }
 
+    /// A character buffer parses a numeric literal, so it reaches the integer
+    /// SQL types as well as the character ones.
     #[test]
-    fn numeric_conversions_are_unsupported() {
-        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_INTEGER));
+    fn every_character_c_type_reaches_every_integer_sql_type() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for sql_type in [SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT] {
+                assert!(
+                    is_supported_conversion(c_type, sql_type),
+                    "{c_type} -> {sql_type} should be supported"
+                );
+            }
+        }
+    }
+
+    /// An integer buffer formats itself base 10, so it reaches the character SQL
+    /// types as well as the integer ones.
+    #[test]
+    fn every_integer_c_type_reaches_every_character_sql_type() {
+        for c_type in [SQL_C_STINYINT, SQL_C_USHORT, SQL_C_SLONG, SQL_C_UBIGINT] {
+            for sql_type in [
+                SQL_CHAR,
+                SQL_VARCHAR,
+                SQL_LONGVARCHAR,
+                SQL_WCHAR,
+                SQL_WVARCHAR,
+                SQL_WLONGVARCHAR,
+            ] {
+                assert!(
+                    is_supported_conversion(c_type, sql_type),
+                    "{c_type} -> {sql_type} should be supported"
+                );
+            }
+        }
+    }
+
+    /// The binary row is not part of the character/integer composition, so it
+    /// gains nothing from the cross-family rows.
+    #[test]
+    fn binary_stays_outside_the_cross_family_rows() {
+        assert!(!is_supported_conversion(SQL_C_BINARY, SQL_INTEGER));
+        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_VARBINARY));
+        assert!(!is_supported_conversion(SQL_C_SLONG, SQL_VARBINARY));
     }
 
     #[test]
@@ -132,16 +166,9 @@ mod tests {
         }
     }
 
-    /// Quadrants C and D (integer <-> character) are P5, so they stay rejected.
-    #[test]
-    fn integer_to_character_conversions_are_unsupported() {
-        assert!(!is_supported_conversion(SQL_C_SLONG, SQL_VARCHAR));
-        assert!(!is_supported_conversion(SQL_C_SLONG, SQL_WVARCHAR));
-        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_BIGINT));
-    }
-
     #[test]
     fn c_types_without_a_row_are_unsupported() {
         assert!(!is_supported_conversion(SQL_C_SLONG, SQL_GUID));
+        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_GUID));
     }
 }

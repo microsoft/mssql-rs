@@ -8,7 +8,6 @@ use crate::api::odbc_types::{
 };
 use crate::api::sqlstate::{WARN_STRING_TRUNCATION, post_diag};
 use crate::error::HasDiagnostics;
-
 /// Bit 0 of the COLMETADATA flags word marks a column nullable (`fNullable`).
 /// Shared by any RPC-backed result set (`SQLGetTypeInfo`, catalog functions)
 /// that clears it on the ODBC-mandated NOT NULL columns after execution.
