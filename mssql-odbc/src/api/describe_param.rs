@@ -180,9 +180,11 @@ fn sql_describe_param_safe(
         Ok(client) => client,
         Err(rc) => return rc,
     };
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLDescribeParam");
+    // Not SQLExecute/SQLExecDirectW, so out of scope for the
+    // SQL_ATTR_QUERY_TIMEOUT wiring; `0` keeps existing unbounded behavior.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLDescribeParam", 0);
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLDescribeParam") {
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLDescribeParam", 0) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

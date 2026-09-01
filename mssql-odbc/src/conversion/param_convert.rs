@@ -162,7 +162,9 @@ pub(crate) unsafe fn bound_param_to_value(
         (AppValue::WideText(bytes), SqlFamily::Character) => {
             convert_character_sql(param.sql_type, param.column_size, AppText::Utf16(bytes))?
         }
-        (AppValue::Binary(bytes), SqlFamily::Binary) => SqlType::VarBinaryMax(Some(bytes)),
+        (AppValue::Binary(bytes), SqlFamily::Binary) => {
+            convert_binary_sql(param.sql_type, param.column_size, bytes)?
+        }
         (AppValue::Integer(v), SqlFamily::Character) => {
             convert_character_sql(param.sql_type, param.column_size, integer_as_text(v))?
         }
@@ -370,9 +372,9 @@ fn convert_character_sql(
     };
 
     // Fit before transcoding: the limit counts source units, not the encoded
-    // result - see [`fit_to_declared_length`].
+    // result - see [`trim_blank_overflow`].
     let text = match limit {
-        Some(limit) => fit_to_declared_length(text, limit)?,
+        Some(limit) => trim_blank_overflow(text, limit)?,
         None => text,
     };
     let value = Some(text.transcode(wide).into_sql_string());
@@ -420,7 +422,7 @@ fn convert_character_sql(
 /// tests `cchDest > cchMax` before incrementing and `break`s past the trim
 /// (`sqlcfunc.cpp:2926`), so one character of overflow escapes and overflowing
 /// blanks survive. Deliberately not replicated.
-fn fit_to_declared_length(text: AppText, limit: usize) -> Result<AppText, ParamBuildError> {
+fn trim_blank_overflow(text: AppText, limit: usize) -> Result<AppText, ParamBuildError> {
     const BLANK_UTF16: [u8; 2] = [b' ', 0];
 
     // A UTF-8 buffer never yields more UTF-16 units than it has bytes, so fitting
@@ -463,6 +465,71 @@ fn fit_to_declared_length(text: AppText, limit: usize) -> Result<AppText, ParamB
             AppText::Utf16(bytes)
         }
     })
+}
+
+/// Emits the binary `SqlType` named by `ParameterType` and `ColumnSize`.
+///
+/// `ColumnSize` is a byte count here, where the character path counts characters.
+fn convert_binary_sql(
+    sql_type: SqlSmallInt,
+    column_size: usize,
+    bytes: Vec<u8>,
+) -> Result<SqlType, ParamBuildError> {
+    // `image` carries no declared length but is still bounded by `ColumnSize`,
+    // exactly as `text`/`ntext` are; only `varbinary(max)` is unbounded.
+    let (declared, limit) = match sql_type {
+        SQL_BINARY => {
+            let length = fixed_length(column_size, SQL_PREC_BIGCHARBINARY)?;
+            (Some(length), Some(usize::from(length)))
+        }
+        SQL_VARBINARY => {
+            let declared = variable_length(column_size, SQL_PREC_BIGCHARBINARY);
+            (declared, declared.map(usize::from))
+        }
+        SQL_LONGVARBINARY => (None, Some(column_size.min(SQL_PREC_TEXTIMAGE))),
+        other => return Err(ParamBuildError::UnsupportedSqlType(other)),
+    };
+
+    let bytes = match limit {
+        Some(limit) => trim_zero_overflow(bytes, limit)?,
+        None => bytes,
+    };
+
+    Ok(match (sql_type, declared) {
+        (SQL_BINARY, Some(length)) => SqlType::Binary(Some(bytes), length),
+        (SQL_VARBINARY, Some(length)) => SqlType::VarBinary(Some(bytes), length),
+        (SQL_VARBINARY, None) => SqlType::VarBinaryMax(Some(bytes)),
+        // `image` would be the msodbcsql default; `mssql-tds` serializes it in
+        // bulk-copy ROW format and the server rejects the RPC, so `max` goes out
+        // instead - the same substitution `text`/`ntext` carry (AB#47592). The
+        // `ColumnSize` bound above still applies, so only the declaration differs.
+        (SQL_LONGVARBINARY, _) => SqlType::VarBinaryMax(Some(bytes)),
+        // Unreachable: the match above already rejected everything else.
+        (other, _) => return Err(ParamBuildError::UnsupportedSqlType(other)),
+    })
+}
+
+/// Trims `bytes` to `limit` when the overflow is entirely *zeros*, or reports
+/// `22001`.
+///
+/// The character sibling is [`trim_blank_overflow`]; this is
+/// `CheckTrailingZeros` (`sqlccnvt.cpp:8690`) driving the binary arm at
+/// `sqlcfunc.cpp:2611`, where that one is `CheckTrailingChars` with a blank.
+/// A partially zero overflow is `22001` in both: the scan stops at the first
+/// byte that is not padding, wherever it sits.
+///
+/// Unlike the character sibling this count is **exact** - `ColumnSize` bounds
+/// bytes and bytes are what reach the wire, so there is no collation to
+/// approximate and no registered deviation to carry.
+fn trim_zero_overflow(mut bytes: Vec<u8>, limit: usize) -> Result<Vec<u8>, ParamBuildError> {
+    if bytes.len() <= limit {
+        return Ok(bytes);
+    }
+    if bytes[limit..].iter().any(|b| *b != 0) {
+        return Err(ParamBuildError::StringTruncation);
+    }
+    bytes.truncate(limit);
+    Ok(bytes)
 }
 
 /// Emits the integer `SqlType` named by `ParameterType`, not by the C type, so
@@ -1081,6 +1148,162 @@ mod tests {
             SqlType::NVarcharMax(Some(s)) => assert_eq!(s.to_utf8_string(), "hi"),
             other => panic!("expected NVarcharMax(Some), got {other:?}"),
         }
+    }
+
+    /// Binds `bytes` under `sql_type`/`column_size` and returns the wire value.
+    fn convert_binary(
+        sql_type: SqlSmallInt,
+        column_size: usize,
+        bytes: &[u8],
+    ) -> Result<SqlType, ParamBuildError> {
+        let mut buf = bytes.to_vec();
+        let mut ind: SqlLen = buf.len() as SqlLen;
+        let mut p = param(SQL_C_BINARY, buf.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = sql_type;
+        p.column_size = column_size;
+        unsafe { bound_param_to_value(&p) }.map(|(value, _)| value)
+    }
+
+    /// The wire type follows `ParameterType` and `ColumnSize`, as it does for
+    /// the character families - previously every binary value went out as
+    /// `varbinary(max)` whatever the application declared.
+    #[test]
+    fn parameter_type_names_the_binary_wire_type() {
+        let value = convert_binary(SQL_BINARY, 4, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(value, SqlType::Binary(Some(vec![1, 2, 3, 4]), 4));
+
+        let value = convert_binary(SQL_VARBINARY, 4, &[1, 2]).unwrap();
+        assert_eq!(value, SqlType::VarBinary(Some(vec![1, 2]), 4));
+
+        // 0 is the `max` spelling for the variable-length type, as it is for
+        // `varchar`/`nvarchar`.
+        let value = convert_binary(SQL_VARBINARY, 0, &[1, 2]).unwrap();
+        assert_eq!(value, SqlType::VarBinaryMax(Some(vec![1, 2])));
+
+        // `image` has no declared length; AB#47592 sends it as `max`.
+        let value = convert_binary(SQL_LONGVARBINARY, 16, &[1, 2]).unwrap();
+        assert_eq!(value, SqlType::VarBinaryMax(Some(vec![1, 2])));
+    }
+
+    /// Overflow that is entirely `0x00` is padding and is dropped silently -
+    /// `CheckTrailingZeros` (`sqlccnvt.cpp:8690`) returning FALSE at
+    /// `sqlcfunc.cpp:2611`. The blank-padding character rule, one byte value over.
+    #[test]
+    fn an_all_zero_binary_overflow_is_trimmed_silently() {
+        let value = convert_binary(SQL_VARBINARY, 4, &[1, 2, 3, 4, 0, 0, 0]).unwrap();
+        assert_eq!(value, SqlType::VarBinary(Some(vec![1, 2, 3, 4]), 4));
+
+        let value = convert_binary(SQL_BINARY, 2, &[0xAB, 0xCD, 0, 0]).unwrap();
+        assert_eq!(value, SqlType::Binary(Some(vec![0xAB, 0xCD]), 2));
+
+        // `image` is the only arm where the declared type is unbounded and the
+        // enforced bound is not, so the trim has to be asserted separately from
+        // the declaration.
+        let value = convert_binary(SQL_LONGVARBINARY, 2, &[1, 2, 0, 0]).unwrap();
+        assert_eq!(value, SqlType::VarBinaryMax(Some(vec![1, 2])));
+    }
+
+    /// Any non-zero byte past the declared length is data, so it is `22001`
+    /// rather than a silent loss.
+    #[test]
+    fn a_binary_overflow_carrying_data_is_22001() {
+        assert_eq!(
+            convert_binary(SQL_VARBINARY, 4, &[1, 2, 3, 4, 5]),
+            Err(ParamBuildError::StringTruncation)
+        );
+        assert_eq!(
+            convert_binary(SQL_BINARY, 2, &[1, 2, 3]),
+            Err(ParamBuildError::StringTruncation)
+        );
+        assert_eq!(
+            convert_binary(SQL_LONGVARBINARY, 2, &[1, 2, 3]),
+            Err(ParamBuildError::StringTruncation)
+        );
+    }
+
+    /// The scan stops at the first non-pad byte wherever it sits, so an overflow
+    /// that is *mostly* zero still errors. The character equivalent of this case
+    /// was missed once and only caught by mutation testing.
+    #[test]
+    fn a_partially_zero_binary_overflow_is_22001() {
+        // Non-zero byte first in the overflow, then padding.
+        assert_eq!(
+            convert_binary(SQL_VARBINARY, 3, &[1, 2, 3, 9, 0, 0]),
+            Err(ParamBuildError::StringTruncation)
+        );
+        // Padding first, then a non-zero byte at the very end.
+        assert_eq!(
+            convert_binary(SQL_VARBINARY, 3, &[1, 2, 3, 0, 0, 9]),
+            Err(ParamBuildError::StringTruncation)
+        );
+        // A non-zero byte in the middle of the overflow.
+        assert_eq!(
+            convert_binary(SQL_VARBINARY, 3, &[1, 2, 3, 0, 9, 0]),
+            Err(ParamBuildError::StringTruncation)
+        );
+    }
+
+    /// A value at exactly the declared length is untouched, and a zero *inside*
+    /// it is data rather than padding.
+    #[test]
+    fn a_binary_value_that_fits_keeps_its_interior_zeros() {
+        let value = convert_binary(SQL_VARBINARY, 4, &[1, 0, 0, 2]).unwrap();
+        assert_eq!(value, SqlType::VarBinary(Some(vec![1, 0, 0, 2]), 4));
+
+        // Shorter than the declaration is not padded anywhere in this driver:
+        // `is_fixed_length` is false for every RPC type, so `serialize_bytes`
+        // sends the value's own length and the server pads to `binary(n)`.
+        let value = convert_binary(SQL_BINARY, 4, &[1, 2]).unwrap();
+        assert_eq!(value, SqlType::Binary(Some(vec![1, 2]), 4));
+    }
+
+    /// An empty buffer never overflows. msodbcsql guards the whole check with
+    /// `cbData > 0` (`sqlcfunc.cpp:2603`), which only bites when the bound is
+    /// itself 0; no binding reaches this function that way, since `SQL_VARBINARY`
+    /// 0 means `max` and the other two reject 0 at bind. The second case below
+    /// constructs that unreachable pairing directly, so the zero-bound arm is
+    /// covered even though the API cannot produce it.
+    #[test]
+    fn an_empty_binary_value_is_never_truncated() {
+        let value = convert_binary(SQL_VARBINARY, 4, &[]).unwrap();
+        assert_eq!(value, SqlType::VarBinary(Some(Vec::new()), 4));
+
+        let value = convert_binary(SQL_LONGVARBINARY, 0, &[]).unwrap();
+        assert_eq!(value, SqlType::VarBinaryMax(Some(Vec::new())));
+    }
+
+    /// `ColumnSize` past the non-`max` bound widens to `max` here, matching
+    /// `variable_length` and `RpcParameter::get_sql_name`.
+    ///
+    /// **Not reachable through the API**: `parameter_column_size_is_valid` caps
+    /// `SQL_VARBINARY` at 8000, so `SQLBindParameter` answers `HY104` first - as
+    /// `ColumnSizeAtTheNonMaxBoundary` asserts end to end. This pins the
+    /// converter's own contract, nothing more.
+    #[test]
+    fn an_oversized_varbinary_column_size_widens_to_max() {
+        let value = convert_binary(SQL_VARBINARY, SQL_PREC_BIGCHARBINARY, &[1, 2]).unwrap();
+        assert_eq!(value, SqlType::VarBinary(Some(vec![1, 2]), 8000));
+
+        let value = convert_binary(SQL_VARBINARY, SQL_PREC_BIGCHARBINARY + 1, &[1, 2]).unwrap();
+        assert_eq!(value, SqlType::VarBinaryMax(Some(vec![1, 2])));
+    }
+
+    /// `binary(0)` is not legal T-SQL and has no `max` spelling, so it is
+    /// `HY104` - the same line `char`/`nchar` draw, and the same one msodbcsql
+    /// draws at bind time (`sqlcdesc.cpp:11783` groups `SQL_BINARY` with
+    /// `SQL_CHAR` through `CheckSqlPrec`).
+    #[test]
+    fn a_zero_column_size_on_fixed_binary_is_rejected() {
+        assert_eq!(
+            convert_binary(SQL_BINARY, 0, &[1, 2]),
+            Err(ParamBuildError::InvalidParameterSize(0))
+        );
+        assert_eq!(
+            convert_binary(SQL_BINARY, SQL_PREC_BIGCHARBINARY + 1, &[1, 2]),
+            Err(ParamBuildError::InvalidParameterSize(
+                SQL_PREC_BIGCHARBINARY + 1
+            ))
+        );
     }
 
     /// Binds `text` under `sql_type`/`column_size` and returns the wire value.

@@ -494,6 +494,26 @@ pub struct TdsClient {
     streamed_write_state: StreamedWriteState,
 }
 
+/// Runs `fut` bounded by `remaining`, converting an elapsed timeout into
+/// `Error::TimeoutError`. Extracted out of `TdsClient::reconnect` so the
+/// elapsed branch can be driven directly in a test (`tokio::time::pause` plus
+/// a future that never resolves) instead of needing a live, slow connect
+/// attempt to provoke it.
+async fn attempt_within<T>(
+    remaining: Duration,
+    fut: impl Future<Output = TdsResult<T>>,
+) -> TdsResult<T> {
+    tokio::time::timeout(remaining, fut)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(crate::error::Error::TimeoutError(
+                crate::error::TimeoutErrorType::String(
+                    "Reconnection attempt timed out".to_string(),
+                ),
+            ))
+        })
+}
+
 impl TdsClient {
     pub(crate) fn new(
         transport: AnyTransport,
@@ -549,9 +569,11 @@ impl TdsClient {
 
     /// Attempt to reconnect a dead connection by replaying session state.
     ///
-    /// The overall reconnection is bounded by `timeout`. Each individual
-    /// TCP/TDS handshake attempt uses the original `connect_timeout`. Before
-    /// each retry sleep, we verify enough time remains for the interval.
+    /// The overall reconnection is bounded by `timeout`. Each attempt (DNS
+    /// resolution through login) is wrapped in whatever remains of that
+    /// budget, and `connect_timeout` is capped to the same remaining budget
+    /// so it can't ask for more than is left. Before each retry sleep, we
+    /// verify enough time remains for the interval.
     #[instrument(skip(self), level = "info")]
     pub(crate) async fn reconnect(
         &mut self,
@@ -628,18 +650,33 @@ impl TdsClient {
             // Inject recovery data into the client context clone
             let mut reconnect_ctx = client_context.clone();
 
-            // Cap the per-attempt connect timeout to the remaining reconnect budget
-            let remaining_secs =
-                deadline.saturating_duration_since(Instant::now()).as_secs() as u32;
-            reconnect_ctx.connect_timeout = reconnect_ctx.connect_timeout.min(remaining_secs);
+            // Cap the per-attempt connect timeout to the remaining reconnect budget.
+            // `.max(1)`: `remaining` can be under a second this close to the deadline,
+            // and `as_secs()` truncates that to 0 — which `create_base_stream_sequential`
+            // has no "0 means default" fallback for, so it would time out the attempt
+            // on its first poll instead of giving it a real chance. The outer
+            // `attempt_within(remaining, ...)` below is the actual deadline backstop,
+            // so rounding up here can't make an attempt outlive the reconnect budget.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            reconnect_ctx.connect_timeout = reconnect_ctx
+                .connect_timeout
+                .min(remaining.as_secs().max(1) as u32);
 
             info!(attempt, "Attempting reconnection");
+            // `connect_timeout` above only bounds the TCP-connect step inside
+            // `connect_with_transport_context`; DNS resolution ahead of it is
+            // otherwise unbounded here. Wrap the whole attempt (DNS through
+            // login) in `remaining` too, so a slow resolver can't make a
+            // single reconnect attempt outlive the overall reconnect deadline.
             let connect_result = CancelHandle::run_until_cancelled(
                 cancel_handle,
-                TdsConnectionProvider::connect_with_transport_context(
-                    &reconnect_ctx,
-                    &transport_context,
-                    Some(Box::new((*snapshot).clone())),
+                attempt_within(
+                    remaining,
+                    TdsConnectionProvider::connect_with_transport_context(
+                        &reconnect_ctx,
+                        &transport_context,
+                        Some(Box::new((*snapshot).clone())),
+                    ),
                 ),
             )
             .await;
@@ -6452,22 +6489,48 @@ impl TdsClient {
     /// Begin a new transaction with the given isolation level and optional name.
     ///
     /// Fails if a batch is currently executing. Use [`has_active_transaction`](Self::has_active_transaction)
-    /// to check whether a transaction is already open.
+    /// to check whether a transaction is already open. Runs unbounded — see
+    /// [`begin_transaction_with_options`](Self::begin_transaction_with_options)
+    /// to bound the wait (e.g. with a statement's `SQL_ATTR_QUERY_TIMEOUT`).
     #[instrument(skip(self), level = "info")]
     pub async fn begin_transaction(
         &mut self,
         isolation_level: TransactionIsolationLevel,
         name: Option<String>,
     ) -> TdsResult<()> {
+        self.begin_transaction_with_options(isolation_level, name, ())
+            .await
+    }
+
+    /// Like [`begin_transaction`](Self::begin_transaction), but honors
+    /// `options` — in particular its timeout, so an implicit transaction begin
+    /// (e.g. the autocommit-off prologue a driver runs before every statement)
+    /// cannot wait past a caller-supplied deadline. Mirrors msodbcsql's
+    /// `CheckOptions`, which passes `GetQueryTimeOut(lpstmt)` to
+    /// `ExecTMRImmediate` (`sqlccmd.cpp:10572-10586`).
+    #[instrument(skip(self, options), level = "info")]
+    pub async fn begin_transaction_with_options<'a>(
+        &mut self,
+        isolation_level: TransactionIsolationLevel,
+        name: Option<String>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
         if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
         }
+        let ExecuteOptions {
+            timeout, cancel, ..
+        } = options.into();
 
         self.begin_command();
-        // begin_transaction has no command timeout — use connect_timeout as fallback.
-        let _reconnect_elapsed = self.check_and_reconnect(None, None).await?;
+        let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
+        let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        self.remaining_request_timeout = resolved.duration();
+        self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
         let transaction_params = TransactionManagementType::Begin(CreateTxnParams {
             level: isolation_level,
@@ -6476,7 +6539,7 @@ impl TdsClient {
         let transaction =
             TransactionManagementRequest::new(transaction_params, &self.execution_context);
         let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), None, None);
+            transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
         transaction.serialize(&mut packet_writer).await?;
 
         self.consume_transaction_response().await?;
@@ -9366,6 +9429,28 @@ mod tests {
             err.to_string().contains("Session recovery failed"),
             "Expected SessionRecoveryFailed, got: {err}"
         );
+    }
+
+    /// Covers the elapsed branch of `attempt_within` directly, since nothing
+    /// in `reconnect`'s own tests can provoke it: every failure a test can
+    /// reach today (no server, bad recovery state, ...) returns well before
+    /// any deadline. `start_paused` lets the timeout fire on a fake clock
+    /// instead of a real, slow connect attempt.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_within_times_out_when_the_future_never_completes() {
+        let remaining = Duration::from_secs(5);
+        let handle = tokio::spawn(attempt_within(
+            remaining,
+            std::future::pending::<TdsResult<()>>(),
+        ));
+
+        tokio::time::advance(remaining + Duration::from_millis(1)).await;
+
+        let result = handle.await.expect("attempt_within task panicked");
+        match result {
+            Err(crate::error::Error::TimeoutError(_)) => {}
+            other => panic!("expected a TimeoutError once the deadline elapses, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -252,3 +252,119 @@ impl Drop for OtherConnection {
         }
     }
 }
+
+/// A running mock TDS server plus the real, connected `TdsClient` installed on
+/// a DBC by [`connect_mock_server`]. Dropping it shuts the server down.
+///
+/// The server runs on its own dedicated Tokio runtime/thread — never the
+/// DBC's own runtime — matching how a real SQL Server is a separate process
+/// that never competes with the driver for the runtime's worker thread. This
+/// is what lets a query-timeout regression test tell "the timeout bounded the
+/// wait" from "the server just answered quickly": the server can independently
+/// delay a response for seconds while the DBC-side call is timed.
+pub(crate) struct MockServer {
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    server_handle: Option<tokio::task::JoinHandle<()>>,
+    server_runtime: tokio::runtime::Runtime,
+    query_registry: std::sync::Arc<tokio::sync::Mutex<mssql_mock_tds::QueryRegistry>>,
+}
+
+impl MockServer {
+    /// Registers a delay for the server's answer to the TDS Transaction
+    /// Manager `Begin` request — the implicit transaction begin an
+    /// autocommit-off connection issues before its first statement. Lets a
+    /// test prove `SQL_ATTR_QUERY_TIMEOUT` bounds that step specifically,
+    /// the same way [`connect_mock_server`]'s `response` bounds a query.
+    pub(crate) fn set_tm_begin_delay(&self, delay: std::time::Duration) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(
+                mssql_mock_tds::TM_BEGIN_DELAY_KEY,
+                mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+            );
+        });
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.server_handle.take() {
+            let _ = self.server_runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(2), handle).await
+            });
+        }
+    }
+}
+
+/// Starts a mock TDS server registered to answer `query` with `response`,
+/// then connects a real `TdsClient` to it over a real TCP socket (via `dbc`'s
+/// own runtime) and installs it as `dbc`'s active, connected client — so a
+/// unit test can drive the real `SQLExecute` / `SQLExecDirectW` code path
+/// against a genuinely slow (or fast) server response instead of a scripted,
+/// instantaneous one.
+///
+/// Keep the returned [`MockServer`] alive for the duration of the test; it
+/// shuts the server down on drop.
+pub(crate) fn connect_mock_server(
+    dbc: &crate::handles::dbc::DbcHandle,
+    query: &str,
+    response: mssql_mock_tds::QueryResponse,
+) -> MockServer {
+    use crate::handles::dbc::ConnectionState;
+    use mssql_mock_tds::MockTdsServer;
+    use mssql_tds::connection::client_context::ClientContext;
+    use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
+    use mssql_tds::core::{EncryptionOptions, EncryptionSetting};
+    use std::time::Duration;
+
+    let server_runtime =
+        tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+    let (server_addr, shutdown_tx, server_handle, query_registry) =
+        server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let registry = server.query_registry();
+            registry.lock().await.register(query, response);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle, registry)
+        });
+
+    let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+    let mut context = ClientContext::default();
+    context.user_name = "sa".to_string();
+    context.password = "unused-by-the-mock-server".to_string();
+    context.database = "master".to_string();
+    context.encryption_options = EncryptionOptions {
+        mode: EncryptionSetting::PreferOff,
+        trust_server_certificate: true,
+        host_name_in_cert: None,
+        server_certificate: None,
+    };
+
+    let provider = TdsConnectionProvider {};
+    let client = dbc
+        .runtime
+        .block_on(provider.create_client(context, &datasource, None))
+        .expect("mock client failed to connect");
+
+    {
+        let mut state = dbc.inner.lock().unwrap();
+        state.client = Some(client);
+        state.connection_state = ConnectionState::Connected;
+    }
+
+    MockServer {
+        shutdown_tx: Some(shutdown_tx),
+        server_handle: Some(server_handle),
+        server_runtime,
+        query_registry,
+    }
+}
