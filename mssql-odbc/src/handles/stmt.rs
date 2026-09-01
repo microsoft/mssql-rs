@@ -60,6 +60,8 @@ pub(crate) struct ActivePlpStream {
 pub(crate) struct BufferedGetDataRow {
     pub(crate) values: Vec<Option<ColumnValues>>,
     pub(crate) variant_bases: Vec<Option<TdsDataType>>,
+    /// The TDS cursor still owns deferred columns after the captured prefix.
+    pub(crate) wire_deferred: bool,
 }
 
 impl ActivePlpStream {
@@ -250,6 +252,8 @@ pub(crate) struct StmtState {
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
     /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
     pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
+    /// Emptied row storage retained across fetches to avoid per-row allocations.
+    pub(crate) spare_get_data_row: Option<BufferedGetDataRow>,
     /// Base type of `last_captured` when that column is `sql_variant`, with its
     /// 1-based column index. Set per value, since a variant column can hold a
     /// different type in every row.
@@ -1034,6 +1038,7 @@ impl StmtHandle {
                 row_positioned: false,
                 last_captured: None,
                 buffered_get_data_row: None,
+                spare_get_data_row: None,
                 last_variant_base: None,
                 row_exhausted: false,
                 active_plp: None,
@@ -1197,6 +1202,7 @@ mod tests {
             s.buffered_get_data_row = Some(BufferedGetDataRow {
                 values: vec![Some(ColumnValues::Int(1))],
                 variant_bases: vec![Some(TdsDataType::Int4)],
+                wire_deferred: false,
             });
 
             s.begin_row();

@@ -342,13 +342,15 @@ struct StreamedWriteContext {
     timeout_sec: Option<u32>,
 }
 
-/// Cached whole-row eligibility paired with the exact metadata allocation it describes.
+/// Cached row-buffering eligibility paired with the exact metadata allocation it describes.
 #[derive(Debug)]
 struct BufferedRowSupport {
     /// Metadata allocation whose eligibility was evaluated.
     metadata: Arc<ColMetadataToken>,
     /// Whether all columns support buffered whole-row decoding.
-    supported: bool,
+    whole_row: bool,
+    /// Number of inline columns before the first PLP, when a safe prefix exists.
+    prefix_len: Option<usize>,
 }
 
 /// Active TDS connection to a SQL Server instance.
@@ -5334,6 +5336,40 @@ impl TdsClient {
         })
     }
 
+    /// Attempts to consume a complete known-length PLP value from buffered bytes.
+    pub fn try_read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<CursorPoll<PlpChunk>> {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        let start = self.request_timeout_start();
+        let read = match &mut self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => self
+                .transport
+                .try_read_complete_buffered_plp(plp_state, out)?,
+            _ => {
+                return Err(UsageError(
+                    "try_read_active_plp_chunk called with no active PLP stream".to_string(),
+                ));
+            }
+        };
+        let Some(read) = read else {
+            return Ok(CursorPoll::Pending);
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        Ok(CursorPoll::Ready(PlpChunk {
+            read,
+            reached_end: self.active_plp_reached_end(),
+            known_total: self.active_plp_known_len(),
+            total_read: self.active_plp_total_read(),
+        }))
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     ///
@@ -5570,6 +5606,58 @@ impl TdsClient {
         }
     }
 
+    /// Attempts to position a row and capture its inline prefix from buffered bytes.
+    pub fn try_next_buffered_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
+            ));
+        }
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(BufferedRowPoll::Exhausted);
+        }
+        if !matches!(self.active_row_read_state, ActiveRowReadState::Idle)
+            || self
+                .cancel_handle
+                .as_ref()
+                .is_some_and(|handle| handle.cancel_token.is_cancelled())
+            || self.current_result_bufferable_prefix_len() != Some(prefix_len)
+        {
+            return Ok(BufferedRowPoll::Pending);
+        }
+        let metadata = Arc::clone(
+            self.current_metadata
+                .as_ref()
+                .ok_or_else(|| UsageError("Buffered row metadata was cleared".to_string()))?,
+        );
+        let context = ParserContext::ColumnMetadata(metadata, None);
+        let start = self.request_timeout_start();
+        let Some(mut pause_state) = self.transport.try_receive_row_header(&context)? else {
+            return Ok(BufferedRowPoll::Pending);
+        };
+        let complete = self.transport.try_read_buffered_row_prefix_into(
+            &mut pause_state,
+            prefix_len,
+            writer,
+        )?;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+        Ok(if complete {
+            BufferedRowPoll::Complete
+        } else {
+            BufferedRowPoll::Partial
+        })
+    }
+
     /// Positions the cursor on the next row without decoding any column
     /// (ODBC `SQLFetch`). Returns `Ok(true)` when positioned on a row and
     /// `Ok(false)` when the result set is exhausted.
@@ -5702,6 +5790,71 @@ impl TdsClient {
             return Ok(CursorPoll::Pending);
         }
 
+        let buffered_null = matches!(
+            &self.active_row_read_state,
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        );
+        if buffered_null {
+            let ActiveRowReadState::RowPaused(mut pause_state) =
+                std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+            else {
+                return Err(crate::error::Error::ImplementationError(
+                    "buffered NULL decode lost its row pause state".to_string(),
+                ));
+            };
+            pause_state.next_column_index = target + 1;
+            if pause_state.next_column_index < column_count {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+            }
+            return Ok(CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Null,
+                variant_base: None,
+            }));
+        }
+
+        let buffered_plp = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .columns()
+                    .get(target)
+                    .is_some_and(|metadata| metadata.is_plp()) =>
+            {
+                self.transport.try_begin_buffered_plp(pause_state, target)?
+            }
+            _ => None,
+        };
+        if let Some(stream) = buffered_plp {
+            let ActiveRowReadState::RowPaused(mut pause_state) =
+                std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+            else {
+                return Err(crate::error::Error::ImplementationError(
+                    "buffered PLP decode lost its row pause state".to_string(),
+                ));
+            };
+            pause_state.next_column_index = target + 1;
+            return if let Some(plp_stream) = stream {
+                let collation = plp_stream.collation();
+                self.active_row_read_state =
+                    ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+                        row_pause_state: *pause_state,
+                        plp_stream,
+                    }));
+                Ok(CursorPoll::Ready(CursorColumn::PlpStreaming { collation }))
+            } else {
+                if pause_state.next_column_index < column_count {
+                    self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+                }
+                Ok(CursorPoll::Ready(CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None,
+                }))
+            };
+        }
+
         let start = self.request_timeout_start();
         let value = match &self.active_row_read_state {
             ActiveRowReadState::RowPaused(pause_state) => self
@@ -5731,6 +5884,70 @@ impl TdsClient {
             value,
             variant_base,
         }))
+    }
+
+    /// Attempts to consume one complete buffered PLP column without opening a stream.
+    pub fn try_read_row_plp_complete(
+        &mut self,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CursorPoll<Option<PlpChunk>>> {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        let (next_column, column_count) = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => {
+                (pause_state.next_column_index, pause_state.columns().len())
+            }
+            _ => return Ok(CursorPoll::Pending),
+        };
+        if target != next_column || target >= column_count {
+            return Ok(CursorPoll::Pending);
+        }
+        let is_null = matches!(
+            &self.active_row_read_state,
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        );
+        let result = if is_null {
+            Some(None)
+        } else {
+            match &self.active_row_read_state {
+                ActiveRowReadState::RowPaused(pause_state) => self
+                    .transport
+                    .try_read_complete_buffered_plp_column(pause_state, target, out)?,
+                _ => None,
+            }
+        };
+        let Some(result) = result else {
+            return Ok(CursorPoll::Pending);
+        };
+        let ActiveRowReadState::RowPaused(mut pause_state) =
+            std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+        else {
+            return Err(crate::error::Error::ImplementationError(
+                "complete buffered PLP lost its row pause state".to_string(),
+            ));
+        };
+        pause_state.next_column_index = target + 1;
+        if pause_state.next_column_index < column_count {
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+        }
+        Ok(CursorPoll::Ready(result.map(
+            |(read, known_total, total_read)| PlpChunk {
+                read,
+                reached_end: true,
+                known_total,
+                total_read,
+            },
+        )))
     }
 
     /// Attempts to finish the positioned row through `writer` from bytes already
@@ -5772,6 +5989,40 @@ impl TdsClient {
         Ok(complete)
     }
 
+    /// Attempts to finish an inline row prefix from bytes already buffered.
+    pub fn try_finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(false);
+        }
+        let start = self.request_timeout_start();
+        let complete = match &mut self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => self
+                .transport
+                .try_read_buffered_row_prefix_into(pause_state, prefix_len, writer)?,
+            ActiveRowReadState::PlpPaused(_) => return Ok(false),
+            ActiveRowReadState::Idle => {
+                return Err(UsageError(
+                    "try_finish_row_prefix_into called without a positioned row".to_string(),
+                ));
+            }
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        Ok(complete)
+    }
+
     /// Returns whether the current result can be consumed as complete rows
     /// without changing the pull cursor's PLP streaming behavior.
     pub fn current_result_supports_row_into(&self) -> bool {
@@ -5781,9 +6032,17 @@ impl TdsClient {
         if let Some(cached) = self.buffered_row_support.as_ref()
             && Arc::ptr_eq(metadata, &cached.metadata)
         {
-            return cached.supported;
+            return cached.whole_row;
         }
         Self::metadata_supports_buffered_rows(metadata)
+    }
+
+    /// Returns the contiguous non-PLP prefix eligible for fetch-time capture.
+    pub fn current_result_bufferable_prefix_len(&mut self) -> Option<usize> {
+        self.buffered_row_support();
+        self.buffered_row_support
+            .as_ref()
+            .and_then(|support| support.prefix_len)
     }
 
     /// Returns and caches whole-row eligibility for the current metadata allocation.
@@ -5794,15 +6053,30 @@ impl TdsClient {
         if let Some(cached) = self.buffered_row_support.as_ref()
             && Arc::ptr_eq(metadata, &cached.metadata)
         {
-            return cached.supported;
+            return cached.whole_row;
         }
 
-        let supported = Self::metadata_supports_buffered_rows(metadata);
+        let whole_row = Self::metadata_supports_buffered_rows(metadata);
+        let prefix_len = if metadata.cek_table.is_empty()
+            && metadata
+                .columns
+                .iter()
+                .all(|column| column.crypto_metadata.is_none())
+        {
+            metadata
+                .columns
+                .iter()
+                .position(|column| column.is_plp())
+                .filter(|prefix_len| *prefix_len > 0)
+        } else {
+            None
+        };
         self.buffered_row_support = Some(Box::new(BufferedRowSupport {
             metadata: Arc::clone(metadata),
-            supported,
+            whole_row,
+            prefix_len,
         }));
-        supported
+        whole_row
     }
 
     /// Checks whether every column can use the non-streaming, non-encrypted row path.
@@ -5865,6 +6139,71 @@ impl TdsClient {
             }
             Ok(RowReadResult::Token(_)) => Err(crate::error::Error::ProtocolError(
                 "row continuation returned a control token".to_string(),
+            )),
+            Err(error) => {
+                self.abort_pending_prepare_capture();
+                Err(error)
+            }
+        }
+    }
+
+    /// Finishes a partially buffered inline prefix and pauses before its first PLP.
+    pub async fn finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let state = std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle);
+        let pause_state = match state {
+            ActiveRowReadState::RowPaused(pause_state) => pause_state,
+            state => {
+                self.active_row_read_state = state;
+                return Err(UsageError(
+                    "finish_row_prefix_into called without a resumable positioned row".to_string(),
+                ));
+            }
+        };
+        let start = self.request_timeout_start();
+        let result = self
+            .transport
+            .resume_row_into(
+                *pause_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                ColumnPolicy::DecodePrefix(prefix_len),
+                writer,
+            )
+            .await;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        match result {
+            Ok(RowReadResult::RowPaused(pause_state))
+                if pause_state.next_column_index == prefix_len =>
+            {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+                Ok(())
+            }
+            Ok(RowReadResult::RowPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "Inline prefix decode paused at the wrong column".to_string(),
+                ))
+            }
+            Ok(RowReadResult::RowWritten) => Err(crate::error::Error::ProtocolError(
+                "Inline prefix decode consumed the complete row".to_string(),
+            )),
+            Ok(RowReadResult::PlpPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "Inline prefix decode consumed the PLP header".to_string(),
+                ))
+            }
+            Ok(RowReadResult::Token(_)) => Err(crate::error::Error::ProtocolError(
+                "Inline prefix continuation returned a control token".to_string(),
             )),
             Err(error) => {
                 self.abort_pending_prepare_capture();
@@ -7699,6 +8038,29 @@ mod tests {
         })
     }
 
+    fn mixed_lob_metadata(prefix_columns: usize) -> Arc<ColMetadataToken> {
+        let mut columns = int_column_metadata(prefix_columns).columns.clone();
+        columns.push(crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::NVarChar,
+                usize::from(u16::MAX),
+                None,
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::NVarChar,
+            column_name: "lob".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        });
+        Arc::new(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap(),
+            columns,
+            cek_table: vec![],
+        })
+    }
+
     fn done_more() -> Tokens {
         Tokens::Done(DoneToken {
             status: DoneStatus::MORE,
@@ -8317,6 +8679,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_prefix_capture_leaves_and_consumes_complete_plp() {
+        let metadata = mixed_lob_metadata(2);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(&4_i64.to_le_bytes());
+        payload.extend_from_slice(&4_u32.to_le_bytes());
+        payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        assert_eq!(client.current_result_bufferable_prefix_len(), Some(2));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert_eq!(
+            writer.take_row(),
+            vec![ColumnValues::Int(10), ColumnValues::Int(20)]
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+
+        let mut bytes = [0_u8; 4];
+        let CursorPoll::Ready(Some(chunk)) =
+            client.try_read_row_plp_complete(2, &mut bytes).unwrap()
+        else {
+            panic!("complete buffered PLP should not require async continuation");
+        };
+        assert_eq!(bytes, [b'o', 0, b'k', 0]);
+        assert_eq!(chunk.read, 4);
+        assert!(chunk.reached_end);
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_continues_across_packets() {
+        let metadata = mixed_lob_metadata(2);
+        let second_value = 20_i32.to_le_bytes();
+        let mut first_payload = vec![0xff, TokenType::Row as u8];
+        first_payload.extend_from_slice(&10_i32.to_le_bytes());
+        first_payload.extend_from_slice(&second_value[..2]);
+        let mut first = TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut second =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(
+            &second
+                .append_bytes(&second_value[2..])
+                .append_bytes(&(-1_i64).to_le_bytes())
+                .build(),
+        );
+        let mut transport = create_network_transport_with_data(&stream);
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Partial
+        );
+        client.finish_row_prefix_into(2, &mut writer).await.unwrap();
+        assert_eq!(
+            writer.take_row(),
+            vec![ColumnValues::Int(10), ColumnValues::Int(20)]
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+    }
+
+    #[tokio::test]
     async fn next_row_into_uses_buffered_dispatch() {
         let expected = [0x1234_5678_i32, -42_i32];
         let mut payload = vec![0xff, TokenType::Row as u8];
@@ -8498,6 +8948,7 @@ mod tests {
         let mut client = create_test_client();
         assert!(!client.current_result_supports_row_into());
         assert!(!client.buffered_row_support());
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
 
         client.current_metadata = Some(int_column_metadata(1));
         assert!(client.current_result_supports_row_into());
@@ -8525,11 +8976,27 @@ mod tests {
         }));
         assert!(!client.current_result_supports_row_into());
         assert!(!client.buffered_row_support());
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
         let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
         assert_eq!(
             client.try_next_buffered_row_into(&mut writer).unwrap(),
             BufferedRowPoll::Pending
         );
+    }
+
+    #[test]
+    fn prefix_eligibility_requires_inline_columns_and_no_encryption() {
+        let mut client = create_test_client();
+        client.current_metadata = Some(mixed_lob_metadata(2));
+        assert_eq!(client.current_result_bufferable_prefix_len(), Some(2));
+
+        client.current_metadata = Some(mixed_lob_metadata(0));
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
+
+        let mut encrypted = mixed_lob_metadata(2).as_ref().clone();
+        encrypted.columns[0].crypto_metadata = Some(ae_crypto_metadata());
+        client.current_metadata = Some(Arc::new(encrypted));
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
 };
 use crate::datatypes::column_values::ColumnValues;
-use crate::datatypes::decoder::GenericDecoder;
+use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream};
 use crate::datatypes::row_writer::RowWriter;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
@@ -43,6 +43,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{self, TcpStream};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, error, event, info, trace, warn};
+
+type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
 
 #[cfg(windows)]
 use crate::connection::transport::localdb::resolve_localdb_instance;
@@ -1843,13 +1845,92 @@ impl NetworkTransport {
         Ok(Some((value, base)))
     }
 
+    pub(crate) fn try_begin_buffered_plp(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<Option<PlpColumnStream>>> {
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        let Some((stream, used)) = PlpColumnStream::try_begin_buffered(
+            metadata,
+            self.tds_read_buffer.get_buffered_slice(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some(stream))
+    }
+
+    pub(crate) fn try_read_complete_buffered_plp_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CompleteBufferedPlp> {
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        let buffered = self.tds_read_buffer.get_buffered_slice();
+        let Some((stream, header_used)) = PlpColumnStream::try_begin_buffered(metadata, buffered)?
+        else {
+            return Ok(None);
+        };
+        let Some(mut stream) = stream else {
+            self.tds_read_buffer.consume_bytes(header_used)?;
+            return Ok(Some(None));
+        };
+        let Some(remaining) = buffered.get(header_used..) else {
+            return Ok(None);
+        };
+        let Some((payload_used, written)) = stream.try_read_complete_buffered(remaining, out)?
+        else {
+            return Ok(None);
+        };
+        let total_used = header_used.checked_add(payload_used).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP byte count overflowed".to_string())
+        })?;
+        let known_total = stream.known_len();
+        let total_read = stream.total_read();
+        self.tds_read_buffer.consume_bytes(total_used)?;
+        Ok(Some(Some((written, known_total, total_read))))
+    }
+
+    pub(crate) fn try_read_complete_buffered_plp(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        out: &mut [u8],
+    ) -> TdsResult<Option<usize>> {
+        let Some((used, written)) = plp_state
+            .plp_stream
+            .try_read_complete_buffered(self.tds_read_buffer.get_buffered_slice(), out)?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some(written))
+    }
+
     /// Decodes consecutive buffered columns directly into `writer`.
     ///
     /// Returns `false` after preserving the partially advanced row state when
     /// the next value needs async continuation.
+    #[cfg(test)]
     pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
         &mut self,
         pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        self.try_read_buffered_row_prefix_into(pause_state, usize::MAX, writer)
+    }
+
+    /// Decodes consecutive buffered columns before `end_column` into `writer`.
+    pub(crate) fn try_read_buffered_row_prefix_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        end_column: usize,
         writer: &mut W,
     ) -> TdsResult<bool> {
         if pause_state.decryptor.is_some() {
@@ -1861,10 +1942,11 @@ impl NetworkTransport {
         let outcome = {
             let buffered = self.tds_read_buffer.get_buffered_slice();
             let mut outcome = Ok(true);
-            while let Some(metadata) = pause_state
-                .metadata
-                .columns
-                .get(pause_state.next_column_index)
+            while pause_state.next_column_index < end_column
+                && let Some(metadata) = pause_state
+                    .metadata
+                    .columns
+                    .get(pause_state.next_column_index)
             {
                 let col = pause_state.next_column_index;
                 if pause_state
@@ -1907,7 +1989,11 @@ impl NetworkTransport {
             outcome
         };
         self.tds_read_buffer.consume_bytes(consumed)?;
-        outcome
+        outcome.map(|complete| {
+            complete
+                && (pause_state.next_column_index >= end_column
+                    || pause_state.next_column_index >= pause_state.metadata.columns.len())
+        })
     }
 
     pub(crate) async fn receive_token(

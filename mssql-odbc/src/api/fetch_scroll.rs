@@ -27,7 +27,7 @@ use mssql_tds::datatypes::column_values::{
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
-use mssql_tds::datatypes::row_writer::{DefaultRowWriter, RowWriter};
+use mssql_tds::datatypes::row_writer::RowWriter;
 use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
@@ -64,6 +64,143 @@ use crate::handles::stmt::{
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
+impl BufferedGetDataRow {
+    fn empty(reusable: &mut Option<Self>, column_count: usize) -> Self {
+        let mut row = reusable.take().unwrap_or_else(|| Self {
+            values: Vec::new(),
+            variant_bases: Vec::new(),
+            wire_deferred: false,
+        });
+        if row.values.len() != column_count {
+            row.values.clear();
+            row.values.resize_with(column_count, || None);
+        }
+        if row.variant_bases.len() != column_count {
+            row.variant_bases.clear();
+            row.variant_bases.resize(column_count, None);
+        } else {
+            row.variant_bases.fill(None);
+        }
+        row.wire_deferred = false;
+        row
+    }
+
+    fn write_value(&mut self, col: usize, value: ColumnValues) {
+        if let Some(slot) = self.values.get_mut(col) {
+            *slot = Some(value);
+        }
+    }
+}
+
+impl RowWriter for BufferedGetDataRow {
+    fn write_null(&mut self, col: usize) {
+        self.write_value(col, ColumnValues::Null);
+    }
+
+    fn write_variant_base_type(&mut self, col: usize, base: TdsDataType) {
+        if let Some(slot) = self.variant_bases.get_mut(col) {
+            *slot = Some(base);
+        }
+    }
+
+    fn write_bool(&mut self, col: usize, val: bool) {
+        self.write_value(col, ColumnValues::Bit(val));
+    }
+
+    fn write_u8(&mut self, col: usize, val: u8) {
+        self.write_value(col, ColumnValues::TinyInt(val));
+    }
+
+    fn write_i16(&mut self, col: usize, val: i16) {
+        self.write_value(col, ColumnValues::SmallInt(val));
+    }
+
+    fn write_i32(&mut self, col: usize, val: i32) {
+        self.write_value(col, ColumnValues::Int(val));
+    }
+
+    fn write_i64(&mut self, col: usize, val: i64) {
+        self.write_value(col, ColumnValues::BigInt(val));
+    }
+
+    fn write_f32(&mut self, col: usize, val: f32) {
+        self.write_value(col, ColumnValues::Real(val));
+    }
+
+    fn write_f64(&mut self, col: usize, val: f64) {
+        self.write_value(col, ColumnValues::Float(val));
+    }
+
+    fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType) {
+        self.write_value(
+            col,
+            ColumnValues::String(SqlString::new(bytes.into_owned(), encoding_type)),
+        );
+    }
+
+    fn write_bytes(&mut self, col: usize, bytes: Cow<'_, [u8]>) {
+        self.write_value(col, ColumnValues::Bytes(bytes.into_owned()));
+    }
+
+    fn write_decimal(&mut self, col: usize, val: DecimalParts) {
+        self.write_value(col, ColumnValues::Decimal(val));
+    }
+
+    fn write_numeric(&mut self, col: usize, val: DecimalParts) {
+        self.write_value(col, ColumnValues::Numeric(val));
+    }
+
+    fn write_date(&mut self, col: usize, val: SqlDate) {
+        self.write_value(col, ColumnValues::Date(val));
+    }
+
+    fn write_time(&mut self, col: usize, val: SqlTime) {
+        self.write_value(col, ColumnValues::Time(val));
+    }
+
+    fn write_datetime(&mut self, col: usize, val: SqlDateTime) {
+        self.write_value(col, ColumnValues::DateTime(val));
+    }
+
+    fn write_smalldatetime(&mut self, col: usize, val: SqlSmallDateTime) {
+        self.write_value(col, ColumnValues::SmallDateTime(val));
+    }
+
+    fn write_datetime2(&mut self, col: usize, val: SqlDateTime2) {
+        self.write_value(col, ColumnValues::DateTime2(val));
+    }
+
+    fn write_datetimeoffset(&mut self, col: usize, val: SqlDateTimeOffset) {
+        self.write_value(col, ColumnValues::DateTimeOffset(val));
+    }
+
+    fn write_money(&mut self, col: usize, val: SqlMoney) {
+        self.write_value(col, ColumnValues::Money(val));
+    }
+
+    fn write_smallmoney(&mut self, col: usize, val: SqlSmallMoney) {
+        self.write_value(col, ColumnValues::SmallMoney(val));
+    }
+
+    fn write_uuid(&mut self, col: usize, val: Uuid) {
+        self.write_value(col, ColumnValues::Uuid(val));
+    }
+
+    fn write_xml(&mut self, col: usize, val: SqlXml) {
+        self.write_value(col, ColumnValues::Xml(val));
+    }
+
+    fn write_json(&mut self, col: usize, val: SqlJson) {
+        self.write_value(col, ColumnValues::Json(val));
+    }
+
+    fn write_vector(&mut self, col: usize, val: SqlVector) {
+        self.write_value(col, ColumnValues::Vector(val));
+    }
+
+    fn end_row(&mut self) {}
+}
+
 /// Implements SQLFetchScroll for the current forward-only result set.
 ///
 /// # Safety
@@ -73,10 +210,6 @@ pub(crate) unsafe fn sql_fetch_scroll(
     fetch_orientation: SqlSmallInt,
     fetch_offset: SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        fetch_orientation, fetch_offset, "SQLFetchScroll called"
-    );
     crate::ffi_entry!("SQLFetchScroll", unsafe {
         sql_fetch_scroll_impl(statement_handle, fetch_orientation, fetch_offset)
     })
@@ -506,6 +639,7 @@ fn fetch_scroll_safe(
         row_status_ptr,
         column_count,
         row_bind_offset_ptr,
+        reusable_get_data_row,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
@@ -587,6 +721,7 @@ fn fetch_scroll_safe(
         // statement here is what stops a concurrent SQLBindCol from freeing one
         // mid-write; the mutating entry points refuse while this is set.
         stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
+        let reusable_get_data_row = stmt_state.spare_get_data_row.take();
         (
             stmt_state.row_array_size,
             bindings,
@@ -594,6 +729,7 @@ fn fetch_scroll_safe(
             stmt_state.row_status_ptr,
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
+            reusable_get_data_row,
         )
     };
 
@@ -606,6 +742,7 @@ fn fetch_scroll_safe(
         rows_fetched_ptr,
         row_status_ptr,
         row_bind_offset_ptr,
+        reusable_get_data_row,
     );
 
     // Single clearing point for the guard, so every early return inside the
@@ -627,6 +764,7 @@ fn fill_rowset(
     rows_fetched_ptr: *mut SqlULen,
     row_status_ptr: *mut SqlUSmallInt,
     row_bind_offset_ptr: *mut SqlULen,
+    mut reusable_get_data_row: Option<BufferedGetDataRow>,
 ) -> SqlReturn {
     // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
     // result set. Once that many have been returned the cursor stops without
@@ -752,12 +890,18 @@ fn fill_rowset(
         && client.current_result_supports_row_into();
     let can_buffer_get_data_row =
         row_array_size == 1 && bindings.is_empty() && client.current_result_supports_row_into();
+    let buffered_prefix_len =
+        if row_array_size == 1 && bindings.is_empty() && !can_buffer_get_data_row {
+            client.current_result_bufferable_prefix_len()
+        } else {
+            None
+        };
 
     dispatch_rows(row_budget, || {
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
         if can_buffer_get_data_row {
-            let mut writer = DefaultRowWriter::new(column_count);
+            let mut writer = BufferedGetDataRow::empty(&mut reusable_get_data_row, column_count);
             let result = match client.try_next_buffered_row_into(&mut writer) {
                 Ok(BufferedRowPoll::Complete) => Ok(()),
                 Ok(BufferedRowPoll::Partial) => {
@@ -787,14 +931,49 @@ fn fill_rowset(
                 fetch_error = Some(error);
                 outcome = RowOutcome::Error(RowIssue::Restricted);
             } else {
-                let variant_bases = (0..column_count)
-                    .map(|index| writer.variant_base(index))
-                    .collect();
-                buffered_get_data_row = Some(BufferedGetDataRow {
-                    values: writer.take_row().into_iter().map(Some).collect(),
-                    variant_bases,
-                });
+                buffered_get_data_row = Some(writer);
                 columns_read = column_count;
+            }
+        } else if let Some(prefix_len) = buffered_prefix_len {
+            let mut writer = BufferedGetDataRow::empty(&mut reusable_get_data_row, column_count);
+            let result = match client.try_next_buffered_row_prefix_into(prefix_len, &mut writer) {
+                Ok(BufferedRowPoll::Complete) => Ok(()),
+                Ok(BufferedRowPoll::Partial) => dbc
+                    .runtime
+                    .block_on(client.finish_row_prefix_into(prefix_len, &mut writer)),
+                Ok(BufferedRowPoll::Exhausted) => return false,
+                Ok(BufferedRowPoll::Pending) => {
+                    let cursor_poll = client.try_next_row_cursor();
+                    match cursor_poll.and_then(|poll| {
+                        poll.resolve(|| dbc.runtime.block_on(client.next_row_cursor()))
+                    }) {
+                        Ok(true) => {
+                            match client.try_finish_row_prefix_into(prefix_len, &mut writer) {
+                                Ok(true) => Ok(()),
+                                Ok(false) => dbc.runtime.block_on(
+                                    client.finish_row_prefix_into(prefix_len, &mut writer),
+                                ),
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Ok(false) => return false,
+                        Err(error) => {
+                            fetch_error = Some(error);
+                            return false;
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                fetch_error = Some(error);
+                outcome = RowOutcome::Error(RowIssue::Restricted);
+            } else {
+                // msodbcsql materializes fixed columns during fetch while
+                // UpdateTxtPtrOnly leaves unbound long data deferred
+                // (`sqlccurs.cpp`; consumed later by `sqlcdata.cpp::SQLGetData`).
+                buffered_get_data_row = Some(writer);
+                columns_read = prefix_len;
             }
         } else if can_write_complete_rows {
             let mut writer = BoundRowWriter::new(bindings, rows_filled as usize, bind_offset);
@@ -1585,8 +1764,9 @@ mod tests {
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::test_client_support::{
-        col_metadata_empty, done_no_more, int_columns, tds_client_from_int_rows,
-        tds_client_from_partial_int_rows, tds_client_from_tokens,
+        col_metadata_empty, done_no_more, int_columns, mixed_lob_columns, tds_client_from_int_rows,
+        tds_client_from_mixed_lob_prefix_rows, tds_client_from_partial_int_rows,
+        tds_client_from_tokens,
     };
 
     fn binding(
@@ -1859,6 +2039,109 @@ mod tests {
         );
         assert_eq!(second, 20);
         assert_eq!(second_indicator, 4);
+    }
+
+    fn mixed_lob_stmt(h: &TestHandles, rows: Vec<Vec<i32>>) {
+        h.mark_dbc_connected();
+        let prefix_columns = rows.first().map_or(0, Vec::len);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(mixed_lob_columns(prefix_columns));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_mixed_lob_prefix_rows(rows);
+        dbc.runtime
+            .block_on(client.execute("SELECT mixed LOB row".to_string(), ()))
+            .unwrap();
+        let mut state = dbc.inner.lock().unwrap();
+        state.client = Some(client);
+        state.active_stmt = Some(h.stmt);
+    }
+
+    #[test]
+    fn fetch_captures_inline_prefix_and_defers_lob() {
+        let h = TestHandles::with_env_dbc_stmt();
+        mixed_lob_stmt(&h, vec![vec![10, 20]]);
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        let row = state.buffered_get_data_row.as_ref().unwrap();
+        assert_eq!(
+            row.values,
+            vec![
+                Some(ColumnValues::Int(10)),
+                Some(ColumnValues::Int(20)),
+                None
+            ]
+        );
+        assert_eq!(state.current_row_last_col, 0);
+    }
+
+    #[test]
+    fn leading_lob_bypasses_prefix_buffering() {
+        let h = TestHandles::with_env_dbc_stmt();
+        mixed_lob_stmt(&h, vec![vec![]]);
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt.inner.lock().unwrap().buffered_get_data_row.is_none());
+    }
+
+    #[test]
+    fn bound_and_multi_row_fetches_bypass_prefix_buffering() {
+        let bound = TestHandles::with_env_dbc_stmt();
+        mixed_lob_stmt(&bound, vec![vec![10, 20]]);
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let bound_stmt = unsafe { handle_from_raw::<StmtHandle>(bound.stmt) };
+        bound_stmt.inner.lock().unwrap().set_binding(binding(
+            1,
+            SQL_C_SLONG,
+            (&mut value as *mut i32).cast(),
+            0,
+            &mut indicator,
+        ));
+        assert_eq!(
+            unsafe { sql_fetch_scroll(bound.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 10);
+        assert!(
+            bound_stmt
+                .inner
+                .lock()
+                .unwrap()
+                .buffered_get_data_row
+                .is_none()
+        );
+
+        let multi = TestHandles::with_env_dbc_stmt();
+        mixed_lob_stmt(&multi, vec![vec![10, 20], vec![30, 40]]);
+        let multi_stmt = unsafe { handle_from_raw::<StmtHandle>(multi.stmt) };
+        multi_stmt.inner.lock().unwrap().row_array_size = 2;
+        assert_eq!(
+            unsafe { sql_fetch_scroll(multi.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert!(
+            multi_stmt
+                .inner
+                .lock()
+                .unwrap()
+                .buffered_get_data_row
+                .is_none()
+        );
     }
 
     #[test]

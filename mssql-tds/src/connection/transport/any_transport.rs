@@ -19,6 +19,8 @@ use crate::io::token_stream::{
 };
 use crate::token::tokens::Tokens;
 
+type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
+
 /// Concrete transport representation held by [`crate::connection::tds_client::TdsClient`].
 ///
 /// Production clients always use the network arm. The dynamic arm preserves the
@@ -182,25 +184,78 @@ impl AnyTransport {
         }
     }
 
+    pub(crate) fn try_begin_buffered_plp(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<Option<crate::datatypes::decoder::PlpColumnStream>>> {
+        match self {
+            Self::Network(transport) => transport.try_begin_buffered_plp(pause_state, target),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn try_read_complete_buffered_plp_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CompleteBufferedPlp> {
+        match self {
+            Self::Network(transport) => {
+                transport.try_read_complete_buffered_plp_column(pause_state, target, out)
+            }
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn try_read_complete_buffered_plp(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        out: &mut [u8],
+    ) -> TdsResult<Option<usize>> {
+        match self {
+            Self::Network(transport) => transport.try_read_complete_buffered_plp(plp_state, out),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(None),
+        }
+    }
+
     /// Writes as much of the current buffered row as the active transport can complete.
     pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
         &mut self,
         pause_state: &mut RowPauseState,
         writer: &mut W,
     ) -> TdsResult<bool> {
+        self.try_read_buffered_row_prefix_into(pause_state, usize::MAX, writer)
+    }
+
+    pub(crate) fn try_read_buffered_row_prefix_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        end_column: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
         match self {
-            Self::Network(transport) => transport.try_read_buffered_row_into(pause_state, writer),
+            Self::Network(transport) => {
+                transport.try_read_buffered_row_prefix_into(pause_state, end_column, writer)
+            }
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(transport) => {
                 let Some((row, complete)) = transport.try_read_buffered_test_row(pause_state)?
                 else {
                     return Ok(false);
                 };
-                for value in row {
+                for value in row
+                    .into_iter()
+                    .take(end_column.saturating_sub(pause_state.next_column_index))
+                {
                     writer.write_i32(pause_state.next_column_index, value);
                     pause_state.next_column_index += 1;
                 }
-                Ok(complete)
+                Ok(complete || pause_state.next_column_index >= end_column)
             }
         }
     }
