@@ -13,6 +13,8 @@
 //! A `SQL_NULL_DATA` parameter is materialised as a typed TDS NULL from
 //! `sql_type` -- see [`typed_null`].
 
+use std::borrow::Cow;
+
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
@@ -501,9 +503,11 @@ fn integer_as_text(v: i128) -> AppText {
 ///   narrows before that rewrite runs, which is why the order below is narrow,
 ///   then check the fraction.
 fn integer_from_text(sql_type: SqlSmallInt, text: AppText) -> Result<SqlType, ParamBuildError> {
-    let decoded = match text {
-        AppText::Utf8(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        AppText::Utf16(bytes) => decode_utf16le(&bytes),
+    // Borrowed so a valid narrow buffer - the ordinary case - is parsed in
+    // place; `from_utf8_lossy` allocates only to repair malformed input.
+    let decoded: Cow<'_, str> = match &text {
+        AppText::Utf8(bytes) => String::from_utf8_lossy(bytes),
+        AppText::Utf16(bytes) => Cow::Owned(decode_utf16le(bytes)),
     };
     let (v, fraction_dropped) = parse_numeric_text(&decoded)
         .map_err(ParamBuildError::Value)?
