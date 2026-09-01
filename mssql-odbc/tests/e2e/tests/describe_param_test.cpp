@@ -199,13 +199,7 @@ TEST_F(DescribeParamLiveTest, ReprepareInvalidatesMetadata) {
 
 // `*(max)` parameters have no bounded length; both drivers report a size of 0,
 // and a bind from that description must still round-trip.
-//
-// Disabled: every bind is now checked against the conversion matrix, defaulted
-// ones included, and `SQL_VARBINARY` has no row yet - so the second parameter is
-// rejected at bind with HYC00. A deliberate phase 0 scope restriction, not a
-// defect; `typed_null` already handles the type. Re-enable when binary
-// conversions land: AB#47500. See the design rules in docs/parameters_plan.md.
-TEST_F(DescribeParamLiveTest, DISABLED_DescribesMaxLengthParameters) {
+TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
     ASSERT_SQL_OK(Prepare("SELECT CAST(? AS NVARCHAR(MAX)), CAST(? AS VARBINARY(MAX))"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -228,17 +222,19 @@ TEST_F(DescribeParamLiveTest, DISABLED_DescribesMaxLengthParameters) {
     SQLLEN result = 0;
     GetColumn(1, &result);
     EXPECT_EQ(SQL_NULL_DATA, result);
+    GetColumn(2, &result);
+    EXPECT_EQ(SQL_NULL_DATA, result);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // A described decimal must be re-declared with the same precision and scale, or
 // the first non-NULL value bound from that description would be truncated.
 //
-// Disabled for the same reason as DISABLED_DescribesMaxLengthParameters:
-// `SQL_DECIMAL` resolves to `SQL_C_CHAR`, which the matrix pairs only with the
-// character SQL types, so the bind is rejected with HYC00. Re-enable when
-// decimal conversions land (AB#47500) - this test also guards the scale-0
-// wire-metadata regression, so it should come back with them.
+// Disabled because every bind is checked against the conversion matrix,
+// defaulted ones included: `SQL_DECIMAL` resolves to `SQL_C_CHAR`, which the
+// matrix pairs only with the character SQL types, so the bind is rejected with
+// HYC00. Re-enable when decimal conversions land (AB#47500) - this test also
+// guards the scale-0 wire-metadata regression, so it should come back with them.
 TEST_F(DescribeParamLiveTest, DISABLED_DescribedDecimalRoundTripsPrecisionAndScale) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, CAST(1.5 AS DECIMAL(12,3)))"),
                   SQL_HANDLE_STMT, stmt_);

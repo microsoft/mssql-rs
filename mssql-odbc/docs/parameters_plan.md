@@ -1,7 +1,7 @@
 # Parameterized execution - `SQLBindParameter` / `SQLExecute` / `SQLExecDirect`
 
 Status, behavior, and known gaps for parameterized prepared-statement execution
-in the ODBC Driver 18 (Rust). Updated 2026-08-28.
+in the ODBC Driver 18 (Rust). Updated 2026-09-01.
 
 ---
 
@@ -75,19 +75,19 @@ transparent reconnects.
   never sees the placeholder. Version-aware, like msodbcsql's `Sql2CDefault`,
   which reads `rgbTRANSTYPE` for a 3.51-or-earlier application and
   `rgbTRANSTYPE380` otherwise: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET`
-  default to `SQL_C_BINARY` below ODBC 3.8. `BoundParam` also records that the
-  binding was defaulted, because a resolved C type alone loses information the
-  execute path still needs - `SQL_DECIMAL` resolves to `SQL_C_CHAR`, and a NULL
-  built from that would go out as a `varchar`. A defaulted binding therefore
-  skips the conversion matrix (the resolved pairing is the SQL type's own
-  default, so it is supported by construction) and builds NULLs from
-  `ParameterType`. `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
+  default to `SQL_C_BINARY` below ODBC 3.8. The resolved type is then run through
+  the conversion matrix like an explicit one - see the design rule below - so a
+  defaulted binding gets the same answer as naming the C type. `BoundParam`
+  stores only the resolved type: it needs no defaulted flag, because a typed NULL
+  is built from `ParameterType` for every binding, not just defaulted ones.
+  `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
   time, since they need a server type name no describe call reports.
 - **Value conversion** - the wire type follows `ParameterType`, not the C type:
-  an integer or character buffer is declared as the SQL type the application
-  named and converted to it, cross-family pairings included. `SQL_C_BINARY` is
-  the exception, still pinned to `varbinary(max)` because the binary quadrants
-  are unbuilt. Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
+  an integer, character or binary buffer is declared as the SQL type the
+  application named and converted to it. Integer and character buffers reach
+  each other's SQL types (P5); `SQL_C_BINARY` reaches only the binary SQL types,
+  so binary is binary-to-binary only.
+  Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
   explicit byte length; binary values use explicit byte length or
   `BufferLength` when no indicator pointer is supplied.
 - **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
@@ -159,7 +159,9 @@ Four conversion quadrants:
 | **character C** | D: parse (`22018`, `22003`, `22001`) | B: transcode and length (`22001`) |
 
 Out of scope for this milestone: decimal/numeric, money, temporal, GUID, binary,
-output parameters, data-at-exec, parameter arrays, and TVPs.
+output parameters, data-at-exec, parameter arrays, and TVPs. Binary (AB#47688)
+and data-at-execution landed separately, outside this milestone; the rest still
+emit their P0-era shapes.
 
 ### Design rules
 
@@ -252,10 +254,10 @@ SQLSTATE constant or a never-constructed enum variant fails the lint gate:
   `HY003` / `HY004` identifier gates, and version-aware `SQL_C_DEFAULT`
   resolution. Direction-neutral, so it sits in `api` rather than `params`.
 - [`params/conversion_matrix.rs`](../src/params/conversion_matrix.rs) - one row
-  per C type listing the SQL types it converts to. Rows today: `SQL_C_CHAR` ->
-  `CHAR` / `VARCHAR` / `LONGVARCHAR`, `SQL_C_WCHAR` -> `WCHAR` / `WVARCHAR` /
-  `WLONGVARCHAR`, and `SQL_C_BINARY` -> `BINARY` / `VARBINARY` /
-  `LONGVARBINARY`.
+  per C type listing the SQL types it converts to. Rows as P1 landed them:
+  `SQL_C_CHAR` -> `CHAR` / `VARCHAR` / `LONGVARCHAR`, `SQL_C_WCHAR` -> `WCHAR` /
+  `WVARCHAR` / `WLONGVARCHAR`, and `SQL_C_BINARY` -> `BINARY` / `VARBINARY` /
+  `LONGVARBINARY`. P3-P5 added the integer rows and the cross-family targets.
 - [`api/bind_param.rs`](../src/api/bind_param.rs) - runs both checks and stores
   the resolved C type on the binding.
 
@@ -473,8 +475,8 @@ Verified against msodbcsql source:
 - Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
   its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
   which is not in this source tree. `22018` is tracked with AB#47565.
-- Still `HYC00`: `SQL_SS_XML` and the binary types. The latter keeps
-  `DISABLED_DescribesMaxLengthParameters` parked.
+- Still `HYC00`: `SQL_SS_XML`. `DescribesMaxLengthParameters` is re-enabled with
+  the binary types; the decimal case parked beside it still waits on AB#47500.
 
 Deferred:
 
@@ -642,9 +644,11 @@ role `Convert()`'s dispatch switch plays - not a legality table.
   correctness issue.
 - **Type matrix and TDS type selection:** tracked by the conversion milestone
   above. P3-P5 drive the wire type from `ParameterType` for the integer and
-  character types, in both directions across the two families. Beyond this
-  milestone the same work is needed for binary, `uniqueidentifier`, money,
-  decimal, and date/time values, which still emit their P0-era shapes.
+  character types, in both directions across the two families, and AB#47688 does
+  the same for the binary types. Beyond this milestone the same work is needed
+  for `uniqueidentifier`, money, decimal, and date/time values, which still emit
+  their P0-era shapes. `ColumnSize` still does not bound a data-at-execution
+  value in either family (AB#47590).
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
