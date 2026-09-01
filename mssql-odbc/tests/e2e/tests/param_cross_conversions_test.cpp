@@ -34,6 +34,11 @@ protected:
     // buffers are members so they outlive the SQLExecute that reads them.
     SQLRETURN BindText(SQLSMALLINT c_type, const std::string& text,
                        SQLSMALLINT sql_type, SQLULEN column_size = 0) {
+        // Reserve before assigning so data() is non-null even for "": an empty
+        // vector may return nullptr, which SQLBindParameter reads as a null
+        // ParameterValuePtr and answers HY009 instead of the state under test.
+        narrow_.reserve(text.size() + 1);
+        wide_.reserve(text.size() + 1);
         narrow_.assign(text.begin(), text.end());
         wide_.clear();
         void* data;
@@ -425,8 +430,9 @@ TEST_F(CrossConversionLiveTest, CharParamAcceptsScientificNotation) {
 // IDS_22_005 -> L"2200522018"); a 3.x application takes the second half.
 TEST_F(CrossConversionLiveTest, CharParamInvalidLiteralIs22018) {
     // Only blanks are padding, so other whitespace and interior blanks are
-    // invalid rather than trimmed.
-    for (const char* text : {"abc", "", "   ", "1 2", "\t12", "--1", "1.2.3", "0x1F", "12abc"}) {
+    // invalid rather than trimmed. The empty buffer runs first deliberately: it
+    // is the case whose bound pointer would be null if BindText did not reserve.
+    for (const char* text : {"", "abc", "   ", "1 2", "\t12", "--1", "1.2.3", "0x1F", "12abc"}) {
         for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
             // The one pairing msodbcsql answers differently; see
             // BlankOnlyWideLiteralIs22018.
