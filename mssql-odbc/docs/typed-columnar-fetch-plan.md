@@ -158,6 +158,24 @@ Two details worth keeping in mind when extending this:
 - **`BufferLength` is ignored for fixed-width C targets.** The stride comes from the C type; only the character and binary targets are sized by the application. Honouring a caller's `sizeof(array)` would place later rows outside it.
 - **`SQL_ATTR_ROW_BIND_OFFSET_PTR` is read per fetch, not per bind,** and displaces the data *and* indicator bases by the same byte count — so the offset has to keep both naturally aligned.
 
+#### `SQL_C_DEFAULT` bindings
+
+`SQLBindCol` accepts `SQL_C_DEFAULT` and stores it unresolved, the way msodbcsql does (`sqlcfunc.cpp` `BindOffset` → `Sql2CDefault`): the answer depends on the IRD, which does not exist until a statement executes, and one binding can outlive several result sets. Each `SQLFetchScroll` resolves the placeholder on its own snapshot of the binding table, so the stored binding still says `SQL_C_DEFAULT` for the next result set.
+
+The mapping is `type_rules::resolve_default_c_type`, shared with `SQLBindParameter` so the driver gives one answer for what `SQL_C_DEFAULT` means. It carries two deliberate deviations from msodbcsql, and they apply here too:
+
+| SQL type | This driver | msodbcsql | Why the deviation is kept |
+| --- | --- | --- | --- |
+| `SQL_WCHAR`, `SQL_WVARCHAR`, `SQL_WLONGVARCHAR`, `SQL_SS_XML` | `SQL_C_WCHAR` | `SQL_C_CHAR` | The narrow default is an artifact of a driver shipped in both ANSI and Unicode builds. This driver has only the Unicode one and its `SQL_C_CHAR` is UTF-8, so following msodbcsql would transcode every wide column by default |
+| `SQL_GUID` | `SQL_C_GUID` | `SQL_C_CHAR` | Follows the ODBC 3.x default-C-type table. This is the one deviation that also changes the rowset layout: the stride becomes `sizeof(SQLGUID)` rather than `BufferLength`, per the fixed-width rule above. A slot sized for the 36-character text form is wider than 16 bytes, so the narrower stride stays inside the application's array |
+
+The msodbcsql column is measured, not inferred from `Sql2CDefault`. Binding an `nvarchar` and a `uniqueidentifier` column with `SQL_C_DEFAULT` and `BufferLength` 64 against msodbcsql18 produces, for `N'one'` and `01020304-0506-0708-090A-0B0C0D0E0F10`:
+
+- the wide column as the three narrow bytes `6F 6E 65` with indicator `3`, not six bytes of UTF-16 with indicator `6`;
+- the GUID column as the 36-character text form with indicator `36`, the rowset striding by the full `BufferLength` of 64 rather than by `sizeof(SQLGUID)`.
+
+A bound column with no matching result column, or a SQL type with no default, keeps `SQL_C_DEFAULT` and is reported per row as an unsupported target rather than guessed at.
+
 ### P4 — Exports & driver-load compatibility — Task [46581](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46581)
 
 - Export `SQLBindCol`, `SQLFetchScroll`, `SQLColAttributeW` (exact names incl. the `W` variant) so `ddbc_bindings.cpp` `GetFunctionPointer` succeeds.

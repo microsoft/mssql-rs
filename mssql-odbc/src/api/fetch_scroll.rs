@@ -33,7 +33,7 @@ use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::error::Error as TdsError;
-use mssql_tds::query::metadata::PlpEncoding;
+use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 use uuid::Uuid;
 
 use super::sqlstate::*;
@@ -60,6 +60,7 @@ use crate::conversion::fetch_convert::{
     DateTimeParts, date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
 };
 use crate::error::{free_errors, post_sql_error};
+use crate::handles::OdbcVersion;
 use crate::handles::stmt::{
     ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
 };
@@ -490,6 +491,54 @@ impl RowWriter for BoundRowWriter<'_> {
     fn end_row(&mut self) {}
 }
 
+/// Resolves every `SQL_C_DEFAULT` binding against the current result set's
+/// column types.
+///
+/// Applied to the fetch's snapshot rather than to `StmtState`, so a binding
+/// that outlives its result set keeps the placeholder and is resolved again
+/// against the next set's metadata.
+///
+/// The mapping is [`resolve_default_c_type`], shared with `SQLBindParameter` so
+/// the driver gives one answer to "what does `SQL_C_DEFAULT` mean". Its two
+/// documented deviations from msodbcsql's `Sql2CDefault` therefore apply on the
+/// fetch path too. Both were confirmed by probing msodbcsql18, which resolves
+/// each to `SQL_C_CHAR`, and both are kept:
+///
+/// - The wide character types (and `SQL_SS_XML`) resolve to `SQL_C_WCHAR`. The
+///   narrow default is an ANSI-transfer artifact of a driver shipped in both an
+///   ANSI and a Unicode build; this driver has only the Unicode one, and its
+///   `SQL_C_CHAR` is UTF-8, so following msodbcsql would transcode every wide
+///   column by default.
+/// - `SQL_GUID` resolves to `SQL_C_GUID`, following the ODBC 3.x
+///   default-C-type table. This is the one deviation that also changes the
+///   rowset layout, because a fixed-width target takes its stride from the C
+///   type rather than from `BufferLength` ([`element_stride`]): 16 bytes per
+///   row where msodbcsql delivers the 36-character text form and strides by
+///   the caller's slot size. The narrower stride stays inside the
+///   application's array either way.
+///
+/// A column with no metadata, or a SQL type with no default, is left at
+/// `SQL_C_DEFAULT`, which [`deliver_bound`] reports as an unsupported target
+/// per row rather than guessing at a layout.
+fn resolve_default_bindings(
+    bindings: &mut [ColumnBinding],
+    column_metadata: &[ColumnMetadata],
+    odbc_version: OdbcVersion,
+) {
+    for binding in bindings {
+        if binding.target_type != SQL_C_DEFAULT {
+            continue;
+        }
+        let Some(meta) = column_metadata.get(usize::from(binding.column_number).saturating_sub(1))
+        else {
+            continue;
+        };
+        if let Some(target_type) = resolve_default_c_type(odbc_sql_type(meta), odbc_version) {
+            binding.target_type = target_type;
+        }
+    }
+}
+
 fn fetch_scroll_safe(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
@@ -594,20 +643,7 @@ fn fetch_scroll_safe(
         }
 
         let mut bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
-        for binding in &mut bindings {
-            if binding.target_type != SQL_C_DEFAULT {
-                continue;
-            }
-            let Some(meta) = stmt_state
-                .column_metadata
-                .get(usize::from(binding.column_number).saturating_sub(1))
-            else {
-                continue;
-            };
-            if let Some(target_type) = resolve_default_c_type(odbc_sql_type(meta), odbc_version) {
-                binding.target_type = target_type;
-            }
-        }
+        resolve_default_bindings(&mut bindings, &stmt_state.column_metadata, odbc_version);
         // The buffers in that snapshot belong to the application, and the fill
         // loop writes through them after this lock is released. Claiming the
         // statement here is what stops a concurrent SQLBindCol from freeing one
@@ -1875,6 +1911,48 @@ mod tests {
             SQL_C_DEFAULT,
             "the persistent binding must be resolved again for later result sets"
         );
+    }
+
+    /// The resolver is shared with `SQLBindParameter`, so its two deliberate
+    /// deviations from msodbcsql reach the fetch path as well: a wide column
+    /// resolves to `SQL_C_WCHAR` and a GUID column to `SQL_C_GUID`, where
+    /// msodbcsql resolves both to its ANSI `SQL_C_CHAR`.
+    #[test]
+    fn default_bindings_resolve_wide_and_guid_columns_to_typed_targets() {
+        let mut metadata = int_columns(3);
+        metadata[1].data_type = TdsDataType::NVarChar;
+        metadata[1].type_info.tds_type = TdsDataType::NVarChar;
+        metadata[2].data_type = TdsDataType::Guid;
+        metadata[2].type_info.tds_type = TdsDataType::Guid;
+
+        let mut bindings: Vec<ColumnBinding> = (1..=3)
+            .map(|col| binding(col, SQL_C_DEFAULT, ptr::null_mut(), 64, ptr::null_mut()))
+            .collect();
+        resolve_default_bindings(&mut bindings, &metadata, OdbcVersion::Odbc3_80);
+
+        assert_eq!(bindings[0].target_type, SQL_C_SLONG);
+        assert_eq!(bindings[1].target_type, SQL_C_WCHAR);
+        assert_eq!(bindings[2].target_type, SQL_C_GUID);
+        // The GUID deviation also narrows the rowset stride, because a
+        // fixed-width target ignores the caller's 64-byte slot.
+        assert_eq!(element_stride(bindings[2].target_type, 64), 16);
+        assert_eq!(element_stride(bindings[1].target_type, 64), 64);
+    }
+
+    /// A binding whose column is past the end of the result set keeps the
+    /// placeholder instead of borrowing another column's type; `deliver_bound`
+    /// then reports it per row.
+    #[test]
+    fn a_default_binding_without_metadata_stays_unresolved() {
+        let mut bindings = vec![binding(
+            9,
+            SQL_C_DEFAULT,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+        )];
+        resolve_default_bindings(&mut bindings, &int_columns(1), OdbcVersion::Odbc3_80);
+        assert_eq!(bindings[0].target_type, SQL_C_DEFAULT);
     }
 
     fn assert_partial_buffered_row_delivery(buffered_prefix_columns: usize) {

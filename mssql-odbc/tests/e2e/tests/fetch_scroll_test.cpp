@@ -234,6 +234,74 @@ TEST_F(FetchScrollLiveTest, DefaultTargetResolvesAtFetchTime) {
     SQLCloseCursor(stmt_);
 }
 
+// The two deliberate deviations from msodbcsql's Sql2CDefault, which the fetch
+// path inherits from the resolver it shares with SQLBindParameter: an NVARCHAR
+// column resolves to SQL_C_WCHAR and a uniqueidentifier to SQL_C_GUID, where
+// msodbcsql resolves both to its ANSI SQL_C_CHAR. The GUID case also pins the
+// resulting rowset layout, because a fixed-width target strides by its C type
+// rather than by BufferLength. See mssql-odbc/docs/typed-columnar-fetch-plan.md.
+TEST_F(FetchScrollLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
+    SQLWCHAR wide[2][8] = {};
+    // Four slots for a rowset of two, with BufferLength deliberately set to two
+    // SQLGUIDs. A BufferLength-driven stride would land row 1 in guids[2]; the
+    // C-type stride lands it in guids[1]. Both stay inside the array, so the
+    // wrong layout fails an assertion instead of corrupting the stack.
+    SQLGUID guids[4] = {};
+    SQLLEN wideIndicators[2] = {-99, -99};
+    SQLLEN guidIndicators[2] = {-99, -99};
+    SQLULEN rowsFetched = 0;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_DEFAULT, wide, sizeof(wide[0]), wideIndicators),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_DEFAULT, guids,
+                             static_cast<SQLLEN>(2 * sizeof(SQLGUID)), guidIndicators),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ExecDirect(
+        "SELECT w, g FROM (VALUES "
+        "(1, CAST(N'one' AS NVARCHAR(8)), "
+        "CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER)), "
+        "(2, N'two', CAST('11121314-1516-1718-191A-1B1C1D1E1F20' AS UNIQUEIDENTIFIER))"
+        ") AS t(n, w, g) ORDER BY n");
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2u, rowsFetched);
+
+    const SQLWCHAR one[] = {'o', 'n', 'e', 0};
+    const SQLWCHAR two[] = {'t', 'w', 'o', 0};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(one[i], wide[0][i]) << "row 0 unit " << i;
+        EXPECT_EQ(two[i], wide[1][i]) << "row 1 unit " << i;
+    }
+    // Bytes of UTF-16, which is what makes the wide resolution observable: the
+    // narrow default would report 3.
+    EXPECT_EQ(static_cast<SQLLEN>(3 * sizeof(SQLWCHAR)), wideIndicators[0]);
+    EXPECT_EQ(static_cast<SQLLEN>(3 * sizeof(SQLWCHAR)), wideIndicators[1]);
+
+    EXPECT_EQ(0x01020304u, guids[0].Data1);
+    EXPECT_EQ(0x0506u, guids[0].Data2);
+    EXPECT_EQ(0x0708u, guids[0].Data3);
+    const unsigned char firstTail[8] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10};
+    EXPECT_EQ(0, std::memcmp(guids[0].Data4, firstTail, sizeof(firstTail)));
+    EXPECT_EQ(0x11121314u, guids[1].Data1);
+    EXPECT_EQ(0x1516u, guids[1].Data2);
+    EXPECT_EQ(0x1718u, guids[1].Data3);
+    const unsigned char secondTail[8] = {0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20};
+    EXPECT_EQ(0, std::memcmp(guids[1].Data4, secondTail, sizeof(secondTail)));
+    // Nothing beyond the rowset was written, which is what rules out a
+    // BufferLength-driven stride.
+    const SQLGUID untouched{};
+    EXPECT_EQ(0, std::memcmp(&guids[2], &untouched, sizeof(SQLGUID)));
+    // sizeof(SQLGUID), not the 36 characters msodbcsql's SQL_C_CHAR would give.
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLGUID)), guidIndicators[0]);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLGUID)), guidIndicators[1]);
+    SQLCloseCursor(stmt_);
+}
+
 // Two columns of different shapes bound at once, to prove the fill loop walks
 // the binding table rather than assuming a single column.
 TEST_F(FetchScrollLiveTest, BindsSeveralColumnsOfDifferentTypes) {
