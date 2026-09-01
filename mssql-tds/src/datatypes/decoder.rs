@@ -4497,6 +4497,7 @@ mod test {
         };
         use crate::io::packet_reader::TdsPacketReader;
         use crate::query::metadata::ColumnMetadata;
+        use crate::token::tokens::SqlCollation;
 
         /// Byte-buffer backed mock implementing every `TdsPacketReader` method
         /// used by the decoder.
@@ -5149,6 +5150,61 @@ mod test {
                     bigint.len(),
                 ))
             );
+        }
+
+        #[tokio::test]
+        async fn buffered_sql_variant_preserves_narrow_character_collations() {
+            let decoder = GenericDecoder::default();
+            let cases = [
+                (
+                    [0x09, 0x04, 0x00, 0x04, 0x00],
+                    "caf\u{e9}".as_bytes().to_vec(),
+                    "caf\u{e9}",
+                ),
+                (
+                    [0x09, 0x04, 0x00, 0x00, 0x00],
+                    vec![b'c', b'a', b'f', 0xE9],
+                    "caf\u{e9}",
+                ),
+            ];
+
+            for (collation_bytes, text, expected_text) in cases {
+                let collation = SqlCollation::try_from(collation_bytes.as_slice()).unwrap();
+                let expected_encoding = if collation.utf8() {
+                    EncodingType::Utf8
+                } else {
+                    EncodingType::LcidBased(collation)
+                };
+                let length = 2 + 7 + text.len();
+                let mut wire = (length as u32).to_le_bytes().to_vec();
+                wire.extend_from_slice(&[TdsDataType::BigVarChar as u8, 7]);
+                wire.extend_from_slice(&collation_bytes);
+                wire.extend_from_slice(&64_u16.to_le_bytes());
+                wire.extend_from_slice(&text);
+
+                let (buffered_base, buffered_value, used) =
+                    decoder.try_decode_buffered_variant(&wire).unwrap().unwrap();
+                let mut reader = ByteReader::new(wire.clone());
+                let (async_base, async_value) = decoder
+                    .read_sql_variant_with_base(&mut reader)
+                    .await
+                    .unwrap();
+
+                assert_eq!(buffered_base, Some(TdsDataType::BigVarChar));
+                assert_eq!(buffered_base, async_base);
+                assert_eq!(used, wire.len());
+                assert_eq!(reader.pos, wire.len());
+                let ColumnValues::String(buffered_text) = buffered_value else {
+                    panic!("expected buffered string variant");
+                };
+                let ColumnValues::String(async_text) = async_value else {
+                    panic!("expected async string variant");
+                };
+                assert_eq!(buffered_text.encoding_type(), &expected_encoding);
+                assert_eq!(async_text.encoding_type(), &expected_encoding);
+                assert_eq!(buffered_text, async_text);
+                assert_eq!(buffered_text.to_utf8_string(), expected_text);
+            }
         }
 
         #[tokio::test]
