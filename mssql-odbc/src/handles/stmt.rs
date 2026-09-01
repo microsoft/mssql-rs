@@ -56,6 +56,12 @@ pub(crate) struct ActivePlpStream {
     pub(crate) pending_units: Vec<u16>,
 }
 
+#[derive(Debug)]
+pub(crate) struct BufferedGetDataRow {
+    pub(crate) values: Vec<Option<ColumnValues>>,
+    pub(crate) variant_bases: Vec<Option<TdsDataType>>,
+}
+
 impl ActivePlpStream {
     /// Opens a stream for `column`. Every carry field starts empty, so a call
     /// site names only what identifies the stream — and a carry field added
@@ -242,6 +248,8 @@ pub(crate) struct StmtState {
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
+    pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
     /// Base type of `last_captured` when that column is `sql_variant`, with its
     /// 1-based column index. Set per value, since a variant column can hold a
     /// different type in every row.
@@ -877,6 +885,7 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
         self.last_captured = None;
+        self.buffered_get_data_row = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
         self.active_plp = None;
@@ -1024,6 +1033,7 @@ impl StmtHandle {
                 pending_unprepare: None,
                 row_positioned: false,
                 last_captured: None,
+                buffered_get_data_row: None,
                 last_variant_base: None,
                 row_exhausted: false,
                 active_plp: None,
@@ -1178,6 +1188,21 @@ mod tests {
         with_state(|s| {
             assert!(s.bindings.is_empty());
             assert!(s.row_bind_offset_ptr.is_null());
+        });
+    }
+
+    #[test]
+    fn beginning_a_row_discards_the_previous_buffered_get_data_row() {
+        with_state(|s| {
+            s.buffered_get_data_row = Some(BufferedGetDataRow {
+                values: vec![Some(ColumnValues::Int(1))],
+                variant_bases: vec![Some(TdsDataType::Int4)],
+            });
+
+            s.begin_row();
+
+            assert!(s.row_positioned);
+            assert!(s.buffered_get_data_row.is_none());
         });
     }
 }

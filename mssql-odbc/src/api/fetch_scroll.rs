@@ -27,7 +27,7 @@ use mssql_tds::datatypes::column_values::{
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
-use mssql_tds::datatypes::row_writer::RowWriter;
+use mssql_tds::datatypes::row_writer::{DefaultRowWriter, RowWriter};
 use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
@@ -55,7 +55,8 @@ use crate::conversion::fetch_convert::{
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{
-    ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
+    BufferedGetDataRow, ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS,
+    StmtState,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -709,6 +710,7 @@ fn fill_rowset(
     let mut worst = RowOutcome::Success;
     let mut fetch_error: Option<TdsError> = None;
     let mut last_column_read = 0usize;
+    let mut buffered_get_data_row = None;
 
     // Read once per fetch, not once per bind, so an application can move the
     // whole rowset between calls by updating the pointed-to value.
@@ -717,11 +719,53 @@ fn fill_rowset(
         .last()
         .is_some_and(|binding| binding.column_number as usize == column_count)
         && client.current_result_supports_row_into();
+    let can_buffer_get_data_row =
+        row_array_size == 1 && bindings.is_empty() && client.current_result_supports_row_into();
 
     dispatch_rows(row_budget, || {
         let mut outcome = RowOutcome::Success;
         let mut columns_read = 0usize;
-        if can_write_complete_rows {
+        if can_buffer_get_data_row {
+            let mut writer = DefaultRowWriter::new(column_count);
+            let result = match client.try_next_buffered_row_into(&mut writer) {
+                Ok(BufferedRowPoll::Complete) => Ok(()),
+                Ok(BufferedRowPoll::Partial) => {
+                    dbc.runtime.block_on(client.finish_row_into(&mut writer))
+                }
+                Ok(BufferedRowPoll::Exhausted) => return false,
+                Ok(BufferedRowPoll::Pending) => {
+                    let cursor_poll = client.try_next_row_cursor();
+                    match cursor_poll.and_then(|poll| {
+                        poll.resolve(|| dbc.runtime.block_on(client.next_row_cursor()))
+                    }) {
+                        Ok(true) => match client.try_finish_row_into(&mut writer) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => dbc.runtime.block_on(client.finish_row_into(&mut writer)),
+                            Err(error) => Err(error),
+                        },
+                        Ok(false) => return false,
+                        Err(error) => {
+                            fetch_error = Some(error);
+                            return false;
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                fetch_error = Some(error);
+                outcome = RowOutcome::Error(RowIssue::Restricted);
+            } else {
+                let variant_bases = (0..column_count)
+                    .map(|index| writer.variant_base(index))
+                    .collect();
+                buffered_get_data_row = Some(BufferedGetDataRow {
+                    values: writer.take_row().into_iter().map(Some).collect(),
+                    variant_bases,
+                });
+                columns_read = column_count;
+            }
+        } else if can_write_complete_rows {
             let mut writer = BoundRowWriter::new(bindings, rows_filled as usize, bind_offset);
             let result = match client.try_next_buffered_row_into(&mut writer) {
                 Ok(BufferedRowPoll::Complete) => Ok(()),
@@ -910,7 +954,12 @@ fn fill_rowset(
         // already consumed, so a following SQLGetData continues from there
         // rather than re-reading a column the fill loop took.
         stmt_state.begin_row();
-        stmt_state.current_row_last_col = last_column_read;
+        stmt_state.current_row_last_col = if buffered_get_data_row.is_some() {
+            0
+        } else {
+            last_column_read
+        };
+        stmt_state.buffered_get_data_row = buffered_get_data_row;
     } else {
         stmt_state.reset_row_stream();
     }

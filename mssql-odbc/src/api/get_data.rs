@@ -206,6 +206,32 @@ fn sql_get_data_safe(
         return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
     }
 
+    if stmt_state.buffered_get_data_row.is_some() {
+        let captured = {
+            let row = stmt_state.buffered_get_data_row.as_mut();
+            row.and_then(|row| {
+                let value = row.values.get_mut(col_index - 1)?.take()?;
+                let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
+                Some((value, variant_base))
+            })
+        };
+        let Some((value, variant_base)) = captured else {
+            post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
+            return SQL_ERROR;
+        };
+        stmt_state.last_captured = Some((col_index, value));
+        stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+        let rc = write_captured_column(
+            &mut stmt_state,
+            col_index,
+            target_type,
+            target_value_ptr,
+            buffer_length,
+            strlen_or_ind_ptr,
+        );
+        return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
+    }
+
     // Resume the decoder to the requested column then write output.
     drop(stmt_state);
     let rc = resume_row_to_column(stmt, statement_handle, col_index);
@@ -275,8 +301,9 @@ fn finish_get_data(
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
+    let row_was_buffered = stmt_state.buffered_get_data_row.is_some();
     drop(stmt_state);
-    if !ready {
+    if !ready || row_was_buffered {
         return rc;
     }
 
@@ -1492,7 +1519,9 @@ mod tests {
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NULL_HANDLE};
     use crate::error::diag::DiagRecord;
     use crate::handles::DbcHandle;
+    use crate::handles::stmt::BufferedGetDataRow;
     use crate::test_support::TestHandles;
+    use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::test_client_support::{int_columns, tds_client_from_int_rows};
 
     /// Assert the most recent diagnostic matches the expected canonical
@@ -1944,6 +1973,121 @@ mod tests {
         let mut state = dbc.inner.lock().unwrap();
         state.client = Some(client);
         state.active_stmt = Some(h.stmt);
+    }
+
+    fn stmt_with_buffered_get_data_row(h: &TestHandles, values: Vec<i32>) {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        state.set_state(STMT_STATE_CURSOR_OPEN);
+        state.column_metadata = int_columns(values.len());
+        state.row_positioned = true;
+        state.buffered_get_data_row = Some(BufferedGetDataRow {
+            variant_bases: vec![None; values.len()],
+            values: values
+                .into_iter()
+                .map(|value| Some(ColumnValues::Int(value)))
+                .collect(),
+        });
+    }
+
+    #[test]
+    fn get_data_reads_complete_buffered_row_without_a_client() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_get_data_row(&h, vec![10, 20, 30]);
+        let mut value = 0_i32;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 20);
+        assert_eq!(indicator, 4);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.current_row_last_col, 2);
+        assert!(state.last_captured.is_none());
+        assert!(state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn buffered_get_data_soft_failure_keeps_value_for_retry() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_get_data_row(&h, vec![42]);
+        let mut value = 0_i32;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_BINARY,
+                    (&mut value as *mut i32).cast(),
+                    4,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn buffered_get_data_preserves_variant_base_for_probe() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_get_data_row(&h, vec![42]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .buffered_get_data_row
+            .as_mut()
+            .unwrap()
+            .variant_bases[0] = Some(TdsDataType::Int4);
+        let mut probe = 0_u8;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_BINARY,
+                    (&mut probe as *mut u8).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            stmt.inner.lock().unwrap().last_variant_base,
+            Some((1, TdsDataType::Int4))
+        );
     }
 
     #[test]
