@@ -12,6 +12,7 @@
 #include "odbc_test_fixture.h"
 
 #include <chrono>
+#include <functional>
 #include <string>
 
 // SQL_TXN_SS_SNAPSHOT lives in msodbcsql.h, which these tests do not include.
@@ -548,53 +549,92 @@ TEST_F(TransactionLiveTest, IsolationIsAppliedOnTheServer) {
 }
 
 // A server-side lock timeout is a statement error, not a client query timeout.
-// SQLExecDirect must consume the ERROR/DONE response and return it instead of
+// Execution must consume the ERROR/DONE response and return it instead of
 // waiting indefinitely for another token (AB#47771).
-TEST_F(TransactionLiveTest, BlockedSelectReturnsServerLockTimeout) {
-    const std::string table = GlobalTempTable("lock_timeout");
-    Exec("CREATE TABLE " + table + "(id int PRIMARY KEY, value int)");
-    Exec("INSERT INTO " + table + " VALUES (1, 0)");
+//
+// Both execution paths are covered: mssql-python's cursor.execute() defaults to
+// use_prepare=True and so drives SQLPrepare + SQLExecute, not SQLExecDirect
+// (AB#47510). The fix lives in the shared finish_execute, but only a test per
+// path can prove neither branch regresses.
+class BlockedSelectTest : public TransactionLiveTest {
+  protected:
+    // Holds an exclusive row lock on |table| from dbc_, then runs a blocked
+    // SELECT on a second connection via |execute_blocked| and asserts it
+    // reports native error 1222 rather than hanging or succeeding.
+    void RunBlockedSelect(const std::string& suffix,
+                          const std::function<SQLRETURN(SQLHSTMT, const std::string&)>&
+                              execute_blocked) {
+        const std::string table = GlobalTempTable(suffix);
+        Exec("CREATE TABLE " + table + "(id int PRIMARY KEY, value int)");
+        Exec("INSERT INTO " + table + " VALUES (1, 0)");
 
-    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
-    Exec("UPDATE " + table + " SET value = 1 WHERE id = 1");
+        ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+        Exec("UPDATE " + table + " SET value = 1 WHERE id = 1");
 
-    SQLHDBC reader = SQL_NULL_HDBC;
-    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &reader), SQL_HANDLE_ENV, env_);
-    SqlTString connstr = ODBCTestUtils::BuildConnectionString();
-    SQLTCHAR out_str[1024] = {};
-    SQLSMALLINT out_len = 0;
-    ASSERT_SQL_OK(SQLDriverConnect(reader, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
-                                   static_cast<SQLSMALLINT>(connstr.size()), out_str,
-                                   static_cast<SQLSMALLINT>(std::size(out_str)), &out_len,
-                                   SQL_DRIVER_NOPROMPT),
-                  SQL_HANDLE_DBC, reader);
+        SQLHDBC reader = SQL_NULL_HDBC;
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &reader), SQL_HANDLE_ENV, env_);
+        SqlTString connstr = ODBCTestUtils::BuildConnectionString();
+        SQLTCHAR out_str[1024] = {};
+        SQLSMALLINT out_len = 0;
+        ASSERT_SQL_OK(SQLDriverConnect(reader, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
+                                       static_cast<SQLSMALLINT>(connstr.size()), out_str,
+                                       static_cast<SQLSMALLINT>(std::size(out_str)), &out_len,
+                                       SQL_DRIVER_NOPROMPT),
+                      SQL_HANDLE_DBC, reader);
 
-    SQLHSTMT reader_stmt = SQL_NULL_HSTMT;
-    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, reader, &reader_stmt), SQL_HANDLE_DBC, reader);
-    ASSERT_SQL_OK(SQLSetStmtAttr(reader_stmt, SQL_ATTR_QUERY_TIMEOUT,
-                                 reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(10)), 0),
-                  SQL_HANDLE_STMT, reader_stmt);
-    ASSERT_SQL_OK(Run(reader_stmt, "SET LOCK_TIMEOUT 1000"), SQL_HANDLE_STMT, reader_stmt);
+        SQLHSTMT reader_stmt = SQL_NULL_HSTMT;
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, reader, &reader_stmt), SQL_HANDLE_DBC,
+                      reader);
+        // Bounds the wait if execution regresses to waiting for a token the
+        // server will never send. This is a real deadline only once the
+        // query-timeout enforcement of AB#46385 (#442) is in; this PR merges
+        // after it.
+        ASSERT_SQL_OK(SQLSetStmtAttr(reader_stmt, SQL_ATTR_QUERY_TIMEOUT,
+                                     reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(10)), 0),
+                      SQL_HANDLE_STMT, reader_stmt);
+        ASSERT_SQL_OK(Run(reader_stmt, "SET LOCK_TIMEOUT 1000"), SQL_HANDLE_STMT, reader_stmt);
 
-    const auto start = std::chrono::steady_clock::now();
-    const SQLRETURN rc = Run(reader_stmt, "SELECT value FROM " + table + " WHERE id = 1");
-    const auto elapsed = std::chrono::steady_clock::now() - start;
+        const auto start = std::chrono::steady_clock::now();
+        const SQLRETURN rc = execute_blocked(reader_stmt, table);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
 
-    EXPECT_EQ(SQL_ERROR, rc);
-    SQLTCHAR state[6] = {};
-    SQLINTEGER native = 0;
-    SQLTCHAR message[1024] = {};
-    SQLSMALLINT length = 0;
-    ASSERT_SQL_OK(SQLGetDiagRec(SQL_HANDLE_STMT, reader_stmt, 1, state, &native, message,
-                                static_cast<SQLSMALLINT>(std::size(message)), &length),
-                  SQL_HANDLE_STMT, reader_stmt);
-    EXPECT_EQ(1222, native);
-    EXPECT_LT(elapsed, std::chrono::seconds(5));
+        EXPECT_EQ(SQL_ERROR, rc) << "the lock timeout must surface from execution, not a later "
+                                    "SQLFetch";
+        SQLTCHAR state[6] = {};
+        SQLINTEGER native = 0;
+        SQLTCHAR message[1024] = {};
+        SQLSMALLINT length = 0;
+        ASSERT_SQL_OK(SQLGetDiagRec(SQL_HANDLE_STMT, reader_stmt, 1, state, &native, message,
+                                    static_cast<SQLSMALLINT>(std::size(message)), &length),
+                      SQL_HANDLE_STMT, reader_stmt);
+        EXPECT_EQ(1222, native);
+        EXPECT_LT(elapsed, std::chrono::seconds(5));
 
-    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
-    SQLFreeHandle(SQL_HANDLE_STMT, reader_stmt);
-    SQLDisconnect(reader);
-    SQLFreeHandle(SQL_HANDLE_DBC, reader);
+        ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
+        SQLFreeHandle(SQL_HANDLE_STMT, reader_stmt);
+        SQLDisconnect(reader);
+        SQLFreeHandle(SQL_HANDLE_DBC, reader);
+    }
+};
+
+TEST_F(BlockedSelectTest, ExecDirectReturnsServerLockTimeout) {
+    RunBlockedSelect("lock_timeout", [](SQLHSTMT hstmt, const std::string& table) {
+        return Run(hstmt, "SELECT value FROM " + table + " WHERE id = 1");
+    });
+}
+
+// The path mssql-python actually uses. SQLPrepare materializes the statement
+// (its COLMETADATA arrives before the row), so the ERROR token trails metadata
+// on SQLExecute exactly as it does on SQLExecDirect.
+TEST_F(BlockedSelectTest, PreparedExecuteReturnsServerLockTimeout) {
+    RunBlockedSelect("lock_timeout_prep", [](SQLHSTMT hstmt, const std::string& table) {
+        SqlTString sql =
+            ODBCTestUtils::ToSqlTStr("SELECT value FROM " + table + " WHERE id = 1");
+        SQLRETURN prepare_rc =
+            SQLPrepare(hstmt, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS);
+        EXPECT_SQL_OK(prepare_rc, SQL_HANDLE_STMT, hstmt);
+        return SQLExecute(hstmt);
+    });
 }
 
 // The isolation level survives commit and rollback — it is a session setting.
