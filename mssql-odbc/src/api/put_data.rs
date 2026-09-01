@@ -428,7 +428,6 @@ mod tests {
     fn open_dae(expected_len: Option<usize>) -> DaeState {
         DaeState::for_test(
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
                 needs_transcode: false,
@@ -484,29 +483,32 @@ mod tests {
         assert_eq!(unsafe { nts_byte_count(ptr, 0) }, 1);
     }
 
-    /// A binding can disappear under an open sequence via
-    /// `SQLFreeStmt(SQL_RESET_PARAMS)`, leaving no C type to size `SQL_NTS`
-    /// with. The call is rejected instead of guessing.
-    ///
-    /// This asserts the outcome, not the branch: `for_test` parks no client, so
-    /// a sequence that got past the guard would post the same `HY010` when it
-    /// failed to check one out. The truncation the guard prevents is pinned by
+    /// `SQLFreeStmt(SQL_RESET_PARAMS)` can clear `bound_params` while a
+    /// data-at-execution sequence is still open. Sizing an `SQL_NTS` chunk no
+    /// longer needs that live binding: `dae_current_c_type()` reads
+    /// `DaeParam::c_type`, snapshotted at execute time, so the call reaches
+    /// the same "no client parked" state
+    /// `failed_client_checkout_leaves_progress_untouched` covers, rather than
+    /// being rejected earlier for a binding that no longer exists. The
+    /// truncation a lost snapshot would risk is pinned by
     /// `nts_byte_count_narrows_a_wide_buffer_when_the_c_type_defaults`.
     #[test]
-    fn nts_without_a_binding_returns_hy010() {
+    fn nts_uses_the_snapshotted_c_type_with_bound_params_cleared() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            // `open_dae` points at bound index 0, which was never bound.
+            // `open_dae`'s DaeParam snapshots SQL_C_CHAR; bound_params stays
+            // empty, as SQL_RESET_PARAMS would leave it.
             state.dae = Some(open_dae(None));
-            assert!(state.dae_current_c_type().is_none());
+            assert!(state.bound_params.is_empty());
+            assert_eq!(state.dae_current_c_type(), Some(SQL_C_CHAR));
         }
-        let wide: [u16; 3] = [0x0041, 0x0042, 0x0000];
+        let narrow = b"AB\0";
         let ret = unsafe {
             sql_put_data(
                 h.stmt,
-                wide.as_ptr() as *mut std::ffi::c_void,
+                narrow.as_ptr() as *mut std::ffi::c_void,
                 SQL_NTS as SqlLen,
             )
         };
@@ -590,16 +592,6 @@ mod tests {
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.dae = Some(open_dae(Some(declared)));
-                state.bound_params.push(Some(crate::params::BoundParam {
-                    input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
-                    c_type: SQL_C_CHAR,
-                    sql_type: crate::api::odbc_types::SQL_VARCHAR,
-                    column_size: 0,
-                    decimal_digits: 0,
-                    parameter_value_ptr: std::ptr::null_mut(),
-                    buffer_length: 0,
-                    strlen_or_ind_ptr: std::ptr::null_mut(),
-                }));
             }
 
             let mut bytes = b"abc\0".to_vec();
@@ -626,17 +618,16 @@ mod tests {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let mut state = stmt.inner.lock().unwrap();
-                state.dae = Some(open_dae(Some(declared)));
-                state.bound_params.push(Some(crate::params::BoundParam {
-                    input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
-                    c_type: crate::api::odbc_types::SQL_C_WCHAR,
-                    sql_type: crate::api::odbc_types::SQL_WVARCHAR,
-                    column_size: 0,
-                    decimal_digits: 0,
-                    parameter_value_ptr: std::ptr::null_mut(),
-                    buffer_length: 0,
-                    strlen_or_ind_ptr: std::ptr::null_mut(),
-                }));
+                state.dae = Some(DaeState::for_test(
+                    vec![DaeParam {
+                        value_ptr: std::ptr::null_mut(),
+                        expected_len: Some(declared),
+                        needs_transcode: false,
+                        c_type: crate::api::odbc_types::SQL_C_WCHAR,
+                        sql_type: crate::api::odbc_types::SQL_WVARCHAR,
+                    }],
+                    Some(0),
+                ));
             }
 
             let mut units: Vec<u16> = "hi".encode_utf16().chain(std::iter::once(0)).collect();
@@ -692,7 +683,6 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(DaeState::for_test(
                 vec![DaeParam {
-                    bound_index: 0,
                     value_ptr: std::ptr::null_mut(),
                     expected_len: None,
                     needs_transcode: true,

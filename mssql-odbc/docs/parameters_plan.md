@@ -108,8 +108,8 @@ transparent reconnects.
   moved from `SQLBindParameter` to execute - the DAE indicator is only read
   while building the parameter list - so an application gets `HYC00` from
   `SQLExecute` after setting up its `SQLParamData` loop rather than at bind.
-  msodbcsql's behavior for this pairing has not been characterized. Pinned by
-  `CrossFamilyDataAtExecutionIsRejectedAtExecute` and, for the
+  msodbcsql returns `SQL_NEED_DATA` for this pairing instead of refusing it.
+  Pinned by `CrossFamilyDataAtExecutionIsRejectedAtExecute` and, for the
   wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
   / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
   `execute_test.cpp`.

@@ -64,10 +64,16 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
     if collation.utf8() {
         return text.as_bytes().to_vec();
     }
-    lcid_encoding_or_fallback(collation)
-        .encode(text)
-        .0
-        .into_owned()
+    let (encoded, _, had_errors) = lcid_encoding_or_fallback(collation).encode(text);
+    if had_errors {
+        warn!(
+            "Encountered encoding errors while converting string to LCID 0x{:04X} ({}) encoding. \
+             Some characters may have been replaced.",
+            collation.info & 0x000F_FFFF,
+            collation.info & 0x000F_FFFF
+        );
+    }
+    encoded.into_owned()
 }
 
 impl EncodingType {
@@ -554,5 +560,19 @@ mod tests {
             sort_id: 0,
         };
         assert_eq!(encode_narrow("Caf\u{e9}", collation), b"Caf\xe9");
+    }
+
+    /// U+65E5 has no Windows-1252 representation. `encoding_rs` substitutes
+    /// an HTML numeric character reference, not `?`, and `encode_narrow`
+    /// warns on this rather than substituting silently.
+    #[test]
+    fn encode_narrow_substitutes_ncr_for_a_character_the_codepage_cannot_represent() {
+        let collation = SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(encode_narrow("\u{65e5}", collation), b"&#26085;");
     }
 }

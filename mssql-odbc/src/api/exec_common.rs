@@ -463,7 +463,6 @@ pub(super) unsafe fn build_named_params(
             let rpc =
                 RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, dae_stream.sql_type);
             dae_params.push(DaeParam {
-                bound_index: i,
                 value_ptr: bound_param.parameter_value_ptr,
                 expected_len: dae_expected_length(indicator),
                 needs_transcode: dae_stream.needs_transcode,
@@ -1121,7 +1120,6 @@ mod tests {
         assert_eq!(
             dae.dae_params,
             vec![DaeParam {
-                bound_index: 1,
                 value_ptr: std::ptr::null_mut(),
                 expected_len: None,
                 needs_transcode: false,
@@ -1156,7 +1154,6 @@ mod tests {
         assert_eq!(
             dae.dae_params,
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len: Some(7),
                 needs_transcode: false,

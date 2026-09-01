@@ -343,7 +343,6 @@ mod tests {
     fn open_dae(expected_len: Option<usize>) -> DaeState {
         DaeState::for_test(
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
                 needs_transcode: false,
@@ -382,7 +381,6 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(DaeState::for_test(
                 vec![DaeParam {
-                    bound_index: 0,
                     value_ptr: token_ptr,
                     expected_len: None,
                     needs_transcode: false,

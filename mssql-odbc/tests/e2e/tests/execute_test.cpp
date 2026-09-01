@@ -795,9 +795,11 @@ TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTrans
 // binding; DAE has no equivalent, so the refusal for this one pairing moves
 // from bind time to here.
 //
-// msodbcsql's behavior for this pairing has not been characterized, so the
-// parity run stays skipped, as it was before this pairing was split out from
-// the wideness-mismatch case above.
+// msodbcsql returns SQL_NEED_DATA for this pairing rather than refusing (see
+// param_cross_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute).
+// Unlike the character wideness mismatch above, there is no transcode from
+// arbitrary bytes to an integer wire value, so this driver's refusal stands
+// and the parity run stays skipped.
 TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
     SKIP_IF_COMPARING_MSODBCSQL();
 

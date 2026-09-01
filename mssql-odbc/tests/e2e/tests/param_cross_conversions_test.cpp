@@ -496,16 +496,14 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
 
 // The cross-family pairings are bindable now, so a data-at-execution indicator
 // on one is refused at execute rather than at bind: the DAE indicator is only
-// read when the parameter list is built. There is no transcode from arbitrary
-// character bytes to an integer wire value, so the pairing stays
-// materialize-only.
+// read when the parameter list is built.
 //
-// msodbcsql's behavior for this pairing has not been characterized, so the
-// parity run stays skipped, as it does for the analogous
-// execute_test.cpp/CrossFamilyDataAtExecutionIsRejected. Not to be confused
-// with the narrow/wide character mismatch, which now transcodes instead of
-// refusing (execute_test.cpp/NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes
-// and WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes).
+// msodbcsql returns SQL_NEED_DATA for this pairing rather than refusing --
+// unlike the character wideness mismatch (now transcoded, see
+// execute_test.cpp/NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes and
+// WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes), there is no
+// transcode from arbitrary bytes to an integer wire value, so this driver's
+// refusal stands and the parity run stays skipped.
 TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
