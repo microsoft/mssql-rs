@@ -1249,8 +1249,9 @@ mod tests {
         let value = convert_binary(SQL_VARBINARY, 4, &[1, 0, 0, 2]).unwrap();
         assert_eq!(value, SqlType::VarBinary(Some(vec![1, 0, 0, 2]), 4));
 
-        // Shorter than the declaration is not padded here; `binary(n)` padding
-        // is the serializer's job.
+        // Shorter than the declaration is not padded anywhere in this driver:
+        // `is_fixed_length` is false for every RPC type, so `serialize_bytes`
+        // sends the value's own length and the server pads to `binary(n)`.
         let value = convert_binary(SQL_BINARY, 4, &[1, 2]).unwrap();
         assert_eq!(value, SqlType::Binary(Some(vec![1, 2]), 4));
     }

@@ -84,7 +84,9 @@ transparent reconnects.
   time, since they need a server type name no describe call reports.
 - **Value conversion** - the wire type follows `ParameterType`, not the C type:
   an integer, character or binary buffer is declared as the SQL type the
-  application named and converted to it, cross-family pairings included.
+  application named and converted to it. Integer and character buffers reach
+  each other's SQL types (P5); `SQL_C_BINARY` reaches only the binary SQL types,
+  so binary is binary-to-binary only.
   Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
   explicit byte length; binary values use explicit byte length or
   `BufferLength` when no indicator pointer is supplied.
