@@ -60,6 +60,48 @@ async fn read_all_rows(
     rows
 }
 
+async fn current_spid(client: &mut mssql_tds::connection::tds_client::TdsClient) -> i16 {
+    client
+        .execute("SELECT @@SPID".to_string(), ())
+        .await
+        .unwrap();
+    let rows = read_all_rows(client).await;
+    match rows.as_slice() {
+        [row] => match row.as_slice() {
+            [ColumnValues::SmallInt(spid)] => *spid,
+            other => panic!("expected one SMALLINT column for @@SPID, got {other:?}"),
+        },
+        other => panic!("expected one row for @@SPID, got {other:?}"),
+    }
+}
+
+fn partially_serializable_cursor_params() -> Vec<RpcParameter> {
+    use mssql_tds::datatypes::sql_string::SqlString;
+
+    vec![
+        RpcParameter::new(
+            Some("@big".to_string()),
+            StatusFlags::NONE,
+            SqlType::VarcharMax(Some(SqlString::from_utf8_string("a".repeat(20_000)))),
+        ),
+        RpcParameter::new(
+            Some("@bad".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(SqlString::from_utf8_string("abcdefghij".to_string())),
+                1,
+            ),
+        ),
+    ]
+}
+
+fn assert_overlong_parameter_error(error: mssql_tds::error::Error) {
+    assert!(
+        error.to_string().contains("exceeds schema size"),
+        "the caller must receive the original serialization error, got {error}"
+    );
+}
+
 // --- Basic Lifecycle Tests ---
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -659,6 +701,167 @@ async fn cursor_open_with_params_success() {
 
     client
         .cursor_close(resp.cursor_id, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+// Benefits-from-mock-tds: assert that the failed cursor-open RPC ends with
+// EOM | IGNORE and that its DONE is consumed before the SPID query is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_open_with_params_serialization_failure_preserves_session() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    let spid = current_spid(&mut client).await;
+
+    let error = client
+        .cursor_open_with_params(
+            "SELECT @big, @bad",
+            partially_serializable_cursor_params(),
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the over-long cursor parameter must fail");
+
+    assert_overlong_parameter_error(error);
+    assert_eq!(
+        current_spid(&mut client).await,
+        spid,
+        "cursor-open recovery must reuse the physical session"
+    );
+    client.close_connection().await.unwrap();
+}
+
+// Benefits-from-mock-tds: assert that the failed sp_cursor RPC ends with
+// EOM | IGNORE and that its DONE is consumed before the SPID query is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_operation_serialization_failure_preserves_session() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    setup_temp_table(&mut client, 3).await;
+    let cursor = client
+        .cursor_open(
+            "SELECT id, name, value FROM #ct ORDER BY id",
+            CursorScrollOption::KEYSET_DRIVEN,
+            CursorConcurrency::OPTCC,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    client
+        .cursor_fetch(cursor.cursor_id, FetchDirection::NEXT, 0, 1, None, None)
+        .await
+        .unwrap();
+    assert_eq!(read_all_rows(&mut client).await.len(), 1);
+    let spid = current_spid(&mut client).await;
+
+    let error = client
+        .perform_cursor_operation(
+            cursor.cursor_id,
+            CursorOperation::UPDATE,
+            1,
+            "",
+            partially_serializable_cursor_params(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the over-long cursor parameter must fail");
+
+    assert_overlong_parameter_error(error);
+    assert_eq!(
+        current_spid(&mut client).await,
+        spid,
+        "cursor-operation recovery must reuse the physical session"
+    );
+    client
+        .cursor_fetch(cursor.cursor_id, FetchDirection::NEXT, 0, 1, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_all_rows(&mut client).await.len(),
+        1,
+        "the same cursor must remain usable after its RPC is withdrawn"
+    );
+    client
+        .cursor_close(cursor.cursor_id, None, None)
+        .await
+        .unwrap();
+    client.close_connection().await.unwrap();
+}
+
+// Benefits-from-mock-tds: assert that the failed cursor-prepexec RPC ends with
+// EOM | IGNORE and that its DONE is consumed before the SPID query is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_prepexec_serialization_failure_preserves_session() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    let spid = current_spid(&mut client).await;
+
+    let error = client
+        .cursor_prepexec(
+            "SELECT @big, @bad",
+            partially_serializable_cursor_params(),
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the over-long cursor parameter must fail");
+
+    assert_overlong_parameter_error(error);
+    assert_eq!(
+        current_spid(&mut client).await,
+        spid,
+        "cursor-prepexec recovery must reuse the physical session"
+    );
+    client.close_connection().await.unwrap();
+}
+
+// Benefits-from-mock-tds: assert that the failed cursor-execute RPC ends with
+// EOM | IGNORE and that its DONE is consumed before the SPID query is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_execute_serialization_failure_preserves_session() {
+    let mut client = begin_connection(&build_tcp_datasource()).await;
+    let prepared = client
+        .cursor_prepare(
+            "SELECT @big, @bad",
+            "@big VARCHAR(MAX), @bad VARCHAR(1)",
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let spid = current_spid(&mut client).await;
+
+    let error = client
+        .cursor_execute(
+            prepared.prepared_handle,
+            partially_serializable_cursor_params(),
+            CursorScrollOption::FORWARD_ONLY,
+            CursorConcurrency::READONLY,
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the over-long cursor parameter must fail");
+
+    assert_overlong_parameter_error(error);
+    assert_eq!(
+        current_spid(&mut client).await,
+        spid,
+        "cursor-execute recovery must reuse the physical session"
+    );
+    client
+        .cursor_unprepare(prepared.prepared_handle, None, None)
         .await
         .unwrap();
     client.close_connection().await.unwrap();
