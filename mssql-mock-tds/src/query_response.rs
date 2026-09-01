@@ -303,6 +303,14 @@ impl QueryResponse {
     }
 }
 
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to a
+/// TDS Transaction Manager `Begin` request (the implicit transaction begin an
+/// autocommit-off connection issues before its first statement). Not a SQL
+/// query, so it can never collide with a real registration; only its
+/// [`QueryResponse::delay`] is consulted — its result-set/error fields are
+/// ignored, since `Begin` always acknowledges with an `EnvChange` + `DONE`.
+pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
+
 /// Registry of query responses
 pub struct QueryRegistry {
     responses: HashMap<String, QueryResponse>,
@@ -334,6 +342,31 @@ impl QueryRegistry {
     /// Get a response for a query
     pub fn get(&self, query: &str) -> Option<&QueryResponse> {
         self.responses.get(&query.to_uppercase())
+    }
+
+    /// Finds a registered response whose query text appears — encoded as
+    /// UTF-16LE, matching the wire encoding of an RPC string parameter —
+    /// anywhere inside `haystack`.
+    ///
+    /// Used to match `sp_prepexec` / `sp_execute` RPC requests (whose `@stmt`
+    /// / declared SQL text carries the query verbatim) without needing a full
+    /// RPC parameter parser: the mock server only needs to recognize a
+    /// specific, test-registered statement, not decode arbitrary parameters.
+    ///
+    /// The comparison is byte-exact against the *uppercased* registered
+    /// query (matching `register`'s case-insensitive key), so callers using
+    /// this path must register and send the same-case (conventionally
+    /// upper-case) SQL text — unlike [`get`](Self::get), which decodes and
+    /// uppercases the incoming text before comparing.
+    pub fn get_by_contained_utf16_text(&self, haystack: &[u8]) -> Option<&QueryResponse> {
+        self.responses.iter().find_map(|(query, response)| {
+            let needle: Vec<u8> = query
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            (!needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle))
+                .then_some(response)
+        })
     }
 }
 

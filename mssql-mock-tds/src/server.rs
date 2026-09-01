@@ -4,20 +4,22 @@
 //! Mock TDS Server implementation
 
 use crate::protocol::{
-    PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, build_done_token,
-    build_error_response, build_feature_ext_ack_fedauth, build_fedauth_challenge_response,
-    build_login_ack, build_prelogin_response, build_prelogin_response_with_fedauth,
-    build_query_result, build_routing_response, build_transaction_manager_response,
-    parse_fedauth_token, parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
+    PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, TM_BEGIN_XACT,
+    build_attention_ack_packet, build_done_token, build_error_response,
+    build_feature_ext_ack_fedauth, build_fedauth_challenge_response, build_login_ack,
+    build_prelogin_response, build_prelogin_response_with_fedauth, build_query_result,
+    build_routing_response, build_transaction_manager_response, parse_fedauth_token,
+    parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
 };
-use crate::query_response::QueryRegistry;
+use crate::query_response::{QueryRegistry, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
 use native_tls::Identity;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_native_tls::{TlsAcceptor, TlsStream};
@@ -178,8 +180,65 @@ impl ConnectionProcessor {
         }
     }
 
-    /// Process a single packet from the buffer and return the response
-    pub async fn process_packet(&mut self) -> Result<Option<BytesMut>, ProtocolError> {
+    /// Waits out `delay` (if any) before a registered response is sent,
+    /// interruptibly: races the delay against reading more bytes from
+    /// `socket`, so a client-sent `Attention` arriving mid-delay is answered
+    /// immediately instead of sitting unread until the delay elapses.
+    ///
+    /// Returns `Ok(Some(ack))` when an `Attention` interrupted the wait — the
+    /// caller must send that instead of its own response, abandoning it — or
+    /// `Ok(None)` once `delay` elapsed normally (or there was none), meaning
+    /// the caller should build and send its own response as usual.
+    async fn wait_out_delay_or_attention<S>(
+        &mut self,
+        socket: &mut S,
+        delay: Option<Duration>,
+    ) -> Result<Option<BytesMut>, ProtocolError>
+    where
+        S: AsyncRead + Unpin + Send,
+    {
+        let Some(delay) = delay else {
+            return Ok(None);
+        };
+        debug!(?delay, "Delaying response");
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                () = &mut sleep => return Ok(None),
+                read_result = socket.read_buf(&mut self.buffer) => {
+                    let n = read_result?;
+                    if n == 0 {
+                        return Err(ProtocolError::Protocol(
+                            "connection closed while a response was delayed".to_string(),
+                        ));
+                    }
+                    if let Some(ack) = self.try_take_attention()? {
+                        debug!("Attention arrived during delay; abandoning the delayed response");
+                        return Ok(Some(ack));
+                    }
+                    // Not a (complete) Attention — keep waiting out the remaining delay.
+                }
+            }
+        }
+    }
+
+    /// Process a single packet from the buffer and return the response.
+    ///
+    /// `socket` is used only when a registered response carries an artificial
+    /// `delay` (see [`QueryResponse::with_delay`](crate::query_response::QueryResponse::with_delay)):
+    /// the wait is raced against reading more bytes from the same connection,
+    /// so a client-sent `Attention` arriving mid-delay is answered immediately
+    /// instead of queuing unread until the delay elapses — mirroring a real
+    /// SQL Server, which can cancel a blocked request rather than only ever
+    /// finishing it.
+    pub async fn process_packet<S>(
+        &mut self,
+        socket: &mut S,
+    ) -> Result<Option<BytesMut>, ProtocolError>
+    where
+        S: AsyncRead + Unpin + Send,
+    {
         if self.buffer.len() < PACKET_HEADER_SIZE {
             return Ok(None);
         }
@@ -371,9 +430,11 @@ impl ConnectionProcessor {
                             let registered = self.query_registry.lock().await.get(&sql).cloned();
                             if let Some(response_data) = registered {
                                 info!("Found registered response for query");
-                                if let Some(delay) = response_data.delay {
-                                    debug!(?delay, "Delaying response for query");
-                                    tokio::time::sleep(delay).await;
+                                if let Some(ack) = self
+                                    .wait_out_delay_or_attention(socket, response_data.delay)
+                                    .await?
+                                {
+                                    return Ok(Some(ack));
                                 }
                                 // build_query_result already wraps in a packet, so return directly
                                 let packet = build_query_result(&response_data);
@@ -401,18 +462,54 @@ impl ConnectionProcessor {
                 }
             }
 
+            PacketType::RpcRequest => {
+                if !self.is_authenticated {
+                    warn!(
+                        "Received RPC request from {} before authentication",
+                        self.addr
+                    );
+                    Some(build_error_response("Not authenticated"))
+                } else {
+                    debug!("Handling RPC request from {}", self.addr);
+                    let packet_body = &packet_data[PACKET_HEADER_SIZE..];
+
+                    // No general RPC parameter parser: a registered response is
+                    // matched by finding its (upper-cased) SQL text as a UTF-16LE
+                    // substring of the request body, which is sufficient for
+                    // `sp_prepexec` / `sp_execute`'s `@stmt` parameter — see
+                    // `QueryRegistry::get_by_contained_utf16_text`.
+                    let registered = self
+                        .query_registry
+                        .lock()
+                        .await
+                        .get_by_contained_utf16_text(packet_body)
+                        .cloned();
+                    if let Some(response_data) = registered {
+                        info!("Found registered response for RPC request");
+                        if let Some(ack) = self
+                            .wait_out_delay_or_attention(socket, response_data.delay)
+                            .await?
+                        {
+                            return Ok(Some(ack));
+                        }
+                        Some(build_query_result(&response_data))
+                    } else {
+                        info!("No registered response for RPC request, returning empty result");
+                        let response = build_done_token(0);
+                        let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
+                        let mut packet = BytesMut::with_capacity(total_length as usize);
+                        let resp_header =
+                            PacketHeader::new(PacketType::TabularResult, total_length, 1);
+                        resp_header.write(&mut packet);
+                        packet.extend_from_slice(&response);
+                        Some(packet)
+                    }
+                }
+            }
+
             PacketType::Attention => {
                 debug!("Handling Attention from {}", self.addr);
-                // Send DONE with attention flag
-                let response = build_done_token(0x0020); // DONE_ATTN
-
-                let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
-                let mut packet = BytesMut::with_capacity(total_length as usize);
-                let resp_header = PacketHeader::new(PacketType::TabularResult, total_length, 1);
-                resp_header.write(&mut packet);
-                packet.extend_from_slice(&response);
-
-                Some(packet)
+                Some(build_attention_ack_packet())
             }
 
             PacketType::TransactionManager => {
@@ -426,6 +523,23 @@ impl ConnectionProcessor {
                     "Handling TransactionManager request (type {}) from {}",
                     request_type, self.addr
                 );
+
+                // A Begin request can be delayed the same way a registered
+                // SqlBatch/RPC response can, via the reserved
+                // `TM_BEGIN_DELAY_KEY` query — needed to prove
+                // SQL_ATTR_QUERY_TIMEOUT bounds the implicit transaction begin
+                // an autocommit-off connection issues before every statement.
+                if request_type == TM_BEGIN_XACT {
+                    let delay = self
+                        .query_registry
+                        .lock()
+                        .await
+                        .get(TM_BEGIN_DELAY_KEY)
+                        .and_then(|r| r.delay);
+                    if let Some(ack) = self.wait_out_delay_or_attention(socket, delay).await? {
+                        return Ok(Some(ack));
+                    }
+                }
 
                 let tokens = build_transaction_manager_response(request_type);
 
@@ -448,6 +562,34 @@ impl ConnectionProcessor {
         };
 
         Ok(response)
+    }
+
+    /// Checks whether a complete `Attention` (0x06) packet is now sitting at
+    /// the front of the buffer — having arrived while [`process_packet`]
+    /// was racing a delayed response against further reads — and, if so,
+    /// consumes it and returns its acknowledgment packet. Returns `Ok(None)`
+    /// without consuming anything when the buffer holds an incomplete packet
+    /// or a packet of any other type, leaving it for the next ordinary
+    /// [`process_packet`] call.
+    ///
+    /// [`process_packet`]: Self::process_packet
+    fn try_take_attention(&mut self) -> Result<Option<BytesMut>, ProtocolError> {
+        if self.buffer.len() < PACKET_HEADER_SIZE {
+            return Ok(None);
+        }
+        let header = {
+            let mut buf_clone = self.buffer.clone();
+            match PacketHeader::parse(&mut buf_clone) {
+                Ok(h) => h,
+                Err(_) => return Ok(None),
+            }
+        };
+        if header.packet_type != PacketType::Attention || self.buffer.len() < header.length as usize
+        {
+            return Ok(None);
+        }
+        let _ = self.buffer.split_to(header.length as usize);
+        Ok(Some(build_attention_ack_packet()))
     }
 }
 
@@ -989,7 +1131,7 @@ async fn handle_strict_encrypted_connection(
         }
 
         // Process other packets (Login7, SqlBatch, etc.)
-        while let Some(response) = processor.process_packet().await? {
+        while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!(
                 "Sending {} encrypted bytes response (strict mode)",
                 response.len()
@@ -1034,7 +1176,7 @@ async fn handle_encrypted_connection(
         debug!("Received {} encrypted bytes from {}", n, addr);
 
         // Process packets
-        while let Some(response) = processor.process_packet().await? {
+        while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!("Sending {} encrypted bytes response", response.len());
             socket.write_all(&response).await?;
         }
@@ -1085,7 +1227,7 @@ async fn handle_encrypted_tds_wrapped_connection(
         );
 
         // Process packets
-        while let Some(response) = processor.process_packet().await? {
+        while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!("Sending {} encrypted bytes response", response.len());
             socket.write_all(&response).await?;
         }
@@ -1131,7 +1273,7 @@ async fn handle_unencrypted_connection(
         debug!("Received {} bytes from {}", n, addr);
 
         // Process packets
-        while let Some(response) = processor.process_packet().await? {
+        while let Some(response) = processor.process_packet(&mut socket).await? {
             debug!("Sending {} bytes response", response.len());
             socket.write_all(&response).await?;
         }

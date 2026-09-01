@@ -672,15 +672,18 @@ pub fn build_login_ack() -> BytesMut {
     token_data
 }
 
-/// Build a DONE token
-pub fn build_done_token(row_count: u64) -> BytesMut {
+/// Build a DONE token with explicit status flags (MS-TDS `DONE_STATUS`) and
+/// row count. The lower-level primitive behind [`build_done_token`] (which
+/// always passes `DONE_FINAL`) and [`build_attention_ack_packet`] (which needs
+/// `DONE_ATTN` instead).
+fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
     let mut token_data = BytesMut::new();
 
     // DONE token (0xFD)
     token_data.put_u8(TokenType::Done as u8);
 
-    // Status: DONE_FINAL (0x00) - little-endian
-    token_data.put_u16_le(0x0000);
+    // Status - little-endian
+    token_data.put_u16_le(status);
 
     // CurCmd: SELECT (0xC1) - little-endian
     token_data.put_u16_le(0x00C1);
@@ -689,6 +692,19 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data.put_u64_le(row_count);
 
     token_data
+}
+
+/// Build a DONE token
+pub fn build_done_token(row_count: u64) -> BytesMut {
+    build_done_token_with_status(0x0000, row_count) // DONE_FINAL
+}
+
+/// Build the full packet answering an `Attention` (0x06) request: a DONE
+/// token carrying the DONE_ATTN flag (0x0020), matching real SQL Server's
+/// acknowledgment that it stopped processing the cancelled request.
+pub fn build_attention_ack_packet() -> BytesMut {
+    let response = build_done_token_with_status(0x0020, 0); // DONE_ATTN
+    wrap_in_packet(PacketType::TabularResult, response)
 }
 
 /// Transaction Manager request types (MS-TDS SQLTransactionManagerRequest).

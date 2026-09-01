@@ -115,15 +115,27 @@ fn two_connections_share_a_single_worker_thread_runtime_without_hanging() {
         .expect("conn2 failed to connect");
 
     let started = Instant::now();
-    let result = dbc_runtime.block_on(conn2.execute(SELECT_SQL.to_string(), ()));
+    // Wrapped in a bounded `tokio::time::timeout` so a genuine starvation
+    // regression fails the test deterministically after 30s instead of
+    // hanging the whole suite — `block_on` itself has no deadline, so an
+    // un-wrapped await here would never return if the runtime really did
+    // starve the blocked statement.
+    let result = dbc_runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            conn2.execute(SELECT_SQL.to_string(), ()),
+        )
+        .await
+    });
     let elapsed = started.elapsed();
 
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "SQLExecute-equivalent on conn2 took {elapsed:?} to return — the shared \
-         single-worker-thread runtime is starving the blocked statement instead of resuming it \
-         once the (delayed) response arrives (mssql-rs#439)"
-    );
+    let result = result.unwrap_or_else(|_| {
+        panic!(
+            "SQLExecute-equivalent on conn2 did not return within 30s — the shared \
+             single-worker-thread runtime is starving the blocked statement instead of resuming \
+             it once the (delayed) response arrives (mssql-rs#439)"
+        )
+    });
     result.expect_err("a lock-timed-out statement must surface as an error, not succeed");
     assert!(
         elapsed >= RESPONSE_DELAY,

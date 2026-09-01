@@ -5,11 +5,13 @@
 
 use tracing::{debug, error};
 
+use std::time::Instant;
+
 use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
-    flush_pending_unprepare, park_dae_client,
+    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
+    finish_execute, flush_pending_unprepare, park_dae_client, query_timeout_expired_error,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -143,13 +145,48 @@ fn sql_exec_direct_w_safe(
         Ok(client) => client,
         Err(rc) => return rc,
     };
+    let started = Instant::now();
 
     // Release any handle orphaned by the reset above before running the batch.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW");
+    // Bounded by the full budget: nothing has run yet to charge against it.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW", query_timeout);
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW") {
+    // `query_timeout` (SQL_ATTR_QUERY_TIMEOUT) bounds every wire operation this
+    // call makes, not just the final execute — matching msodbcsql's
+    // `DropPrepHandle` / `CheckOptions`, which charge the same deducted budget
+    // to the deferred `sp_unprepare` and the implicit transaction begin. Each
+    // step's wall-clock cost (measured cumulatively from `started`) is
+    // deducted before the next step runs; an already-exhausted budget fails
+    // immediately with HYT00 rather than sending the next step unbounded.
+    let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW", query_timeout) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
+
+    let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
 
     // Data-at-execution parameters park the half-written RPC on the statement
     // and hand control to SQLParamData / SQLPutData. There is no prepared plan
@@ -182,7 +219,7 @@ fn sql_exec_direct_w_safe(
 
     // Parameterized text runs via sp_executesql (direct execution, no cached
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
-    // STMT lock is held during I/O. `query_timeout` (SQL_ATTR_QUERY_TIMEOUT)
+    // STMT lock is held during I/O. `query_timeout` (already deducted above)
     // bounds either call; `0` means unlimited, matching the ODBC default.
     let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
         dbc.runtime
@@ -406,27 +443,122 @@ mod tests {
         assert!(ds.client.is_some());
     }
 
-    /// `SQL_ATTR_QUERY_TIMEOUT` (`StmtState::query_timeout`) must reach
-    /// `ExecuteOptions` without disturbing a normal execute that completes
-    /// well inside the budget — see mssql-rs#439, where the timeout was
-    /// silently dropped on the floor instead of bounding a blocked statement.
+    /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,
+    /// not just reach `ExecuteOptions` — see mssql-rs#439, where the timeout
+    /// was silently dropped on the floor instead of bounding a statement
+    /// blocked server-side (e.g. behind another session's row lock).
+    ///
+    /// Drives the real `SQLExecDirectW` code path (`claim_connection`,
+    /// `begin_transaction_if_manual`, the elapsed-time deduction, and the
+    /// final `execute`) against a real `TdsClient` connected to a mock TDS
+    /// server that holds its response for `RESPONSE_DELAY` — far longer than
+    /// the statement's configured timeout. Reverting the timeout wiring back
+    /// to `ExecuteOptions::default()` would make this test take the full
+    /// `RESPONSE_DELAY` and return `SQL_SUCCESS`/`1222` instead of the prompt
+    /// `HYT00` asserted here, so it fails if the plumbing regresses.
     #[test]
-    fn exec_direct_honors_configured_query_timeout_on_the_happy_path() {
-        use crate::api::odbc_types::SQL_SUCCESS;
+    fn exec_direct_query_timeout_bounds_a_longer_server_delay() {
         use crate::handles::dbc::DbcHandle;
-        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+        const SELECT_SQL: &str = "SELECT * FROM ##t WHERE id = 1";
 
         let h = TestHandles::with_env_dbc_stmt();
-        h.mark_dbc_connected();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let client = tds_client_from_tokens(vec![done_no_more()]);
-        dbc.inner.lock().unwrap().client = Some(client);
+        let _mock_server = crate::test_support::connect_mock_server(
+            dbc,
+            SELECT_SQL,
+            QueryResponse::error_only(TerminalError::new(
+                1222,
+                16,
+                "Lock request time out period exceeded.",
+            ))
+            .with_delay(RESPONSE_DELAY),
+        );
 
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.inner.lock().unwrap().query_timeout = 30;
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
 
-        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SET LOCK_TIMEOUT 5000".to_string());
-        assert_eq!(ret, SQL_SUCCESS);
+        let started = Instant::now();
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, SELECT_SQL.to_string());
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLExecDirectW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the wait well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must also bound the implicit transaction begin
+    /// `begin_transaction_if_manual` sends before the statement itself when
+    /// the connection is in manual-commit mode — mirroring msodbcsql's
+    /// `CheckOptions`/`ExecTMRImmediate` (`sqlccmd.cpp:10572-10585`), which
+    /// passes the statement's own query timeout to that TM request. Unlike
+    /// `exec_direct_query_timeout_bounds_a_longer_server_delay` above (which
+    /// delays the query response), this delays only the server's answer to
+    /// the Begin request, via the mock server's reserved
+    /// `TM_BEGIN_DELAY_KEY`, so it fails if the timeout wiring into
+    /// `begin_transaction_if_manual` regresses even though the query step
+    /// itself is untouched.
+    #[test]
+    fn exec_direct_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const BEGIN_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below BEGIN_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+        const SELECT_SQL: &str = "SELECT * FROM ##t WHERE id = 1";
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, SELECT_SQL, QueryResponse::select_one());
+        mock_server.set_tm_begin_delay(BEGIN_DELAY);
+        // Manual-commit mode with no transaction open yet is what makes
+        // `begin_transaction_if_manual` send a real Begin request instead of
+        // returning immediately.
+        dbc.inner.lock().unwrap().autocommit = false;
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, SELECT_SQL.to_string());
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLExecDirectW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the implicit transaction begin well below the server's \
+             {BEGIN_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
     }
 
     /// SQL Server compiles variable assignment as a SQLSELECT command carrying
