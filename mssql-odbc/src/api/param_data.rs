@@ -36,6 +36,7 @@ use super::util::write_if_some;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlPointer, SqlReturn,
 };
+use crate::conversion::param_convert::transcode_dae_bytes;
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_STARTED;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -155,13 +156,33 @@ fn sql_param_data_safe(
     }
 
     // ── Subsequent calls: close current parameter and advance ───────────────
-    // Take the TDS client out of stmt_state while we do I/O.
-    let mut client = {
+    // Snapshot what's needed to transcode the parameter being closed -- when
+    // its C type and SQL type disagreed on wideness, `SQLPutData` buffered its
+    // bytes instead of streaming them (see `dae_placeholder_type`) -- and take
+    // the TDS client out of stmt_state while we do I/O.
+    let (mut client, transcode) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned taking dae_client");
             return SQL_ERROR;
         };
-        match stmt_state
+
+        let transcode = stmt_state.dae.as_ref().and_then(|dae| {
+            if dae.progress.is_null || dae.progress.pending_bytes.is_empty() {
+                return None;
+            }
+            let param = dae.current_param()?;
+            if !param.needs_transcode {
+                return None;
+            }
+            let bound = stmt_state.bound_params.get(param.bound_index)?.as_ref()?;
+            Some((
+                bound.c_type,
+                bound.sql_type,
+                dae.progress.pending_bytes.clone(),
+            ))
+        });
+
+        let client = match stmt_state
             .dae
             .as_mut()
             .and_then(|dae| dae.checkout_client())
@@ -172,8 +193,30 @@ fn sql_param_data_safe(
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                 return SQL_ERROR;
             }
-        }
+        };
+        (client, transcode)
     };
+
+    // The buffered value is written as a single chunk, once, before the
+    // stream is told the parameter is complete. Nothing about this differs
+    // from an application that called `SQLPutData` once with the whole value
+    // -- the wire never sees the untranscoded bytes.
+    if let Some((c_type, sql_type, pending_bytes)) = transcode {
+        let wire_bytes = transcode_dae_bytes(c_type, sql_type, pending_bytes);
+        if let Err(e) = dbc
+            .runtime
+            .block_on(client.write_streamed_chunk(&wire_bytes))
+        {
+            error!(%e, "SQLParamData: writing transcoded DAE value failed");
+            dbc.runtime.block_on(client.cancel_streamed_write());
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                let parked = stmt_state.take_dae();
+                debug_assert!(parked.is_none(), "the client was checked out above");
+                stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+            }
+            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+        }
+    }
 
     let end_result = dbc.runtime.block_on(client.end_streamed_param());
 
@@ -291,6 +334,7 @@ mod tests {
                 bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
+                needs_transcode: false,
             }],
             Some(0),
         )
@@ -327,6 +371,7 @@ mod tests {
                     bound_index: 0,
                     value_ptr: token_ptr,
                     expected_len: None,
+                    needs_transcode: false,
                 }],
                 None,
             ));

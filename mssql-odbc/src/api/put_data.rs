@@ -291,7 +291,26 @@ unsafe fn sql_put_data_safe(
             return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_DAE_LENGTH_MISMATCH);
         }
 
+        let needs_transcode = dae
+            .current_param()
+            .is_some_and(|param| param.needs_transcode);
+
         let client = if byte_count == 0 {
+            None
+        } else if needs_transcode {
+            // The declared C type and SQL type disagree on wideness (see
+            // `dae_placeholder_type`), so a chunk transcoded in isolation
+            // could split a multi-byte character across two calls. Buffer
+            // the raw bytes instead; the whole value is transcoded once,
+            // when the parameter closes (`sql_param_data_safe`).
+            //
+            // Safety: caller guarantees data_ptr is readable for byte_count
+            // bytes, and byte_count > 0 here, so data_ptr is non-null (the
+            // null+nonzero-length combination was already rejected above).
+            let chunk = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) };
+            if let Some(dae) = stmt_state.dae.as_mut() {
+                dae.progress.pending_bytes.extend_from_slice(chunk);
+            }
             None
         } else {
             match stmt_state
@@ -317,7 +336,9 @@ unsafe fn sql_put_data_safe(
 
     let Some(mut client) = checked_out else {
         // Zero-length chunk with a non-null pointer supplies an empty value.
-        // NULL/0 is handled above as SQL NULL to match msodbcsql.
+        // NULL/0 is handled above as SQL NULL to match msodbcsql. A buffered
+        // (`needs_transcode`) chunk was appended above with no network write
+        // of its own.
         return SQL_SUCCESS;
     };
 
@@ -385,6 +406,7 @@ mod tests {
                 bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
+                needs_transcode: false,
             }],
             Some(0),
         )
@@ -622,6 +644,48 @@ mod tests {
         let dae = state.dae.as_ref().expect("sequence still active");
         assert_eq!(dae.progress.bytes_sent, 0);
         assert!(!dae.progress.put_data_called);
+    }
+
+    /// A parameter whose C type and SQL type disagree on wideness cannot be
+    /// transcoded one `SQLPutData` call at a time (see `dae_placeholder_type`),
+    /// so its chunks are buffered here instead of written to the wire. This
+    /// must succeed with no client parked at all -- proving the buffering path
+    /// never touches the network -- unlike a normal (streamed) chunk, which
+    /// `failed_client_checkout_leaves_progress_untouched` shows fails without
+    /// one.
+    #[test]
+    fn transcoded_param_buffers_chunks_without_a_client() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![DaeParam {
+                    bound_index: 0,
+                    value_ptr: std::ptr::null_mut(),
+                    expected_len: None,
+                    needs_transcode: true,
+                }],
+                Some(0),
+            ));
+        }
+
+        let to_utf16le =
+            |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let mut first = to_utf16le("caf\u{e9}");
+        let ret = unsafe { sql_put_data(h.stmt, first.as_mut_ptr().cast(), first.len() as SqlLen) };
+        assert_eq!(ret, SQL_SUCCESS, "a buffered chunk must not need a client");
+
+        let mut second = to_utf16le("!");
+        let ret =
+            unsafe { sql_put_data(h.stmt, second.as_mut_ptr().cast(), second.len() as SqlLen) };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert!(dae.progress.put_data_called);
+        assert_eq!(dae.progress.bytes_sent, first.len() + second.len());
+        assert_eq!(dae.progress.pending_bytes, to_utf16le("caf\u{e9}!"));
     }
 
     #[test]

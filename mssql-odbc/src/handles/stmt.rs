@@ -481,6 +481,11 @@ pub(crate) struct DaeParam {
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
+    /// Set from `dae_placeholder_type`'s report at the same time the streamed
+    /// wire type was decided. `SQLPutData` buffers this parameter's chunks in
+    /// [`DaeProgress::pending_bytes`] instead of writing them to the wire, and
+    /// they are transcoded once, as a whole, when the parameter closes.
+    pub(crate) needs_transcode: bool,
 }
 
 /// How much of the open data-at-execution parameter the application has
@@ -497,6 +502,11 @@ pub(crate) struct DaeProgress {
     /// The parameter was supplied as SQL NULL, so the declared-length check is
     /// skipped, as in msodbcsql.
     pub(crate) is_null: bool,
+    /// Raw `SQLPutData` bytes accumulated so far, in the C type's own
+    /// encoding. Only appended to -- instead of being streamed to the wire
+    /// immediately -- when [`DaeParam::needs_transcode`] is set; empty and
+    /// unused otherwise.
+    pub(crate) pending_bytes: Vec<u8>,
 }
 
 /// A data-at-execution sequence in progress: everything the statement holds

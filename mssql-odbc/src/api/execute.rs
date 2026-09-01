@@ -571,7 +571,8 @@ mod tests {
                     vec![DaeParam {
                         bound_index: 0,
                         value_ptr: std::ptr::null_mut(),
-                        expected_len: None
+                        expected_len: None,
+                        needs_transcode: false
                     }]
                 );
                 assert_eq!(dae.params.len(), 1, "one param in list");
