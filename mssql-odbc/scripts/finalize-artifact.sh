@@ -46,5 +46,9 @@ if [ ! -f "$SOURCE_PATH" ]; then
     exit 1
 fi
 
-cp -f "$SOURCE_PATH" "$PRODUCT_PATH"
+TEMP_PATH="$PRODUCT_PATH.tmp.$$"
+trap 'rm -f "$TEMP_PATH"' EXIT
+cp -f "$SOURCE_PATH" "$TEMP_PATH"
+mv -f "$TEMP_PATH" "$PRODUCT_PATH"
+trap - EXIT
 printf '%s\n' "$PRODUCT_PATH"
