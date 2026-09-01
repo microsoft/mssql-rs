@@ -297,12 +297,12 @@ stages:
           # and build-odbc-windows-template.yml), so every source path below
           # shares that same relative layout.
           $platforms = [ordered]@{
-            'drop_Build_Linux_x64'      = @{ tag = 'linux_x64';      file = 'libmssqlodbc.so' }
-            'drop_Build_Linux_ARM64'    = @{ tag = 'linux_arm64';    file = 'libmssqlodbc.so' }
-            'drop_Build_Musl_x64'       = @{ tag = 'musl_x64';       file = 'libmssqlodbc.so' }
-            'drop_Build_Musl_ARM64'     = @{ tag = 'musl_arm64';     file = 'libmssqlodbc.so' }
-            'drop_Build_Glibc228_x64'   = @{ tag = 'glibc228_x64';   file = 'libmssqlodbc.so' }
-            'drop_Build_Glibc228_ARM64' = @{ tag = 'glibc228_arm64'; file = 'libmssqlodbc.so' }
+            'drop_Build_Linux_x64'      = @{ tag = 'linux_x64';      file = 'mssqlodbc.so' }
+            'drop_Build_Linux_ARM64'    = @{ tag = 'linux_arm64';    file = 'mssqlodbc.so' }
+            'drop_Build_Musl_x64'       = @{ tag = 'musl_x64';       file = 'mssqlodbc.so' }
+            'drop_Build_Musl_ARM64'     = @{ tag = 'musl_arm64';     file = 'mssqlodbc.so' }
+            'drop_Build_Glibc228_x64'   = @{ tag = 'glibc228_x64';   file = 'mssqlodbc.so' }
+            'drop_Build_Glibc228_ARM64' = @{ tag = 'glibc228_arm64'; file = 'mssqlodbc.so' }
             'drop_Build_Windows_x64'    = @{ tag = 'windows_x64';    file = 'mssqlodbc.dll' }
             'drop_Build_Windows_ARM64'  = @{ tag = 'windows_arm64';  file = 'mssqlodbc.dll' }
           }
