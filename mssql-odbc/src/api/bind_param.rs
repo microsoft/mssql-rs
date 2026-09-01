@@ -434,7 +434,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{
         SQL_C_CHAR, SQL_C_FLOAT, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA,
-        SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARCHAR,
+        SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -619,7 +619,8 @@ mod tests {
 
     #[test]
     fn unsupported_conversion_returns_hyc00() {
-        // Both types are supported, but integer -> character is quadrant C (P5).
+        // Both types are supported on their own, but integer -> binary is not a
+        // pairing the execute path can convert yet.
         let h = TestHandles::with_env_dbc_stmt();
         let mut val: i32 = 0;
         let mut ind: SqlLen = 0;
@@ -629,7 +630,7 @@ mod tests {
                 1,
                 SQL_PARAM_INPUT,
                 SQL_C_SLONG,
-                SQL_VARCHAR,
+                SQL_VARBINARY,
                 0,
                 0,
                 &mut val as *mut i32 as SqlPointer,

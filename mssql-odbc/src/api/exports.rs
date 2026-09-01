@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Exported ODBC entry points for the msodbcsql18 shared library.
+//! Exported ODBC entry points for the mssqlodbc shared library.
 //!
 //! Every `#[unsafe(no_mangle)] pub extern "C"` function that appears in the
 //! driver's symbol table is listed here. Implementations live in sibling

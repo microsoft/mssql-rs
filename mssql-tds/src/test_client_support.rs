@@ -3,7 +3,7 @@
 
 //! Test-only helpers for driving a [`TdsClient`] against a scripted sequence of
 //! TDS tokens, without a live server. Gated behind the `test-util` feature so
-//! downstream crates (e.g. `mssql-odbc`) can unit-test the code paths that
+//! downstream crates (e.g. `mssqlodbc`) can unit-test the code paths that
 //! require a positioned client — statement-wise navigation, no-row results,
 //! end-of-batch — which otherwise are only reachable through end-to-end tests.
 //!
@@ -52,6 +52,9 @@ pub struct ScriptedToken(Tokens);
 #[derive(Debug)]
 struct TokenReplayTransport {
     pending_tokens: VecDeque<Tokens>,
+    pending_rows: VecDeque<VecDeque<i32>>,
+    active_row: Option<VecDeque<i32>>,
+    buffered_prefix_columns: Option<usize>,
     reset_mode: ResetConnectionMode,
     reset_dispatched: bool,
     known_dead: bool,
@@ -61,15 +64,92 @@ impl TokenReplayTransport {
     fn new(tokens: Vec<Tokens>) -> Self {
         Self {
             pending_tokens: VecDeque::from(tokens),
+            pending_rows: VecDeque::new(),
+            active_row: None,
+            buffered_prefix_columns: None,
             reset_mode: ResetConnectionMode::None,
             reset_dispatched: false,
             known_dead: false,
         }
     }
+
+    /// Creates a token replay transport with optional partial-row buffering.
+    fn with_int_rows(
+        metadata: Tokens,
+        rows: Vec<Vec<i32>>,
+        buffered_prefix_columns: Option<usize>,
+    ) -> Self {
+        let done = Tokens::Done(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        });
+        let mut transport = Self::new(vec![metadata, done]);
+        transport.pending_rows = rows.into_iter().map(VecDeque::from).collect();
+        transport.buffered_prefix_columns = buffered_prefix_columns;
+        transport
+    }
+
+    /// Positions the next scripted integer row under the supplied metadata.
+    fn position_int_row(&mut self, context: &ParserContext) -> TdsResult<Option<RowPauseState>> {
+        let Some(row) = self.pending_rows.pop_front() else {
+            return Ok(None);
+        };
+        let ParserContext::ColumnMetadata(metadata, decryptor) = context else {
+            return Err(crate::error::Error::ProtocolError(
+                "Expected column metadata while positioning a scripted row".to_string(),
+            ));
+        };
+        self.active_row = Some(row);
+        Ok(Some(RowPauseState {
+            next_column_index: 0,
+            metadata: std::sync::Arc::clone(metadata),
+            nbc_null_bitmap: None,
+            decryptor: decryptor.clone(),
+        }))
+    }
 }
 
 #[async_trait]
 impl TdsTokenStreamReader for TokenReplayTransport {
+    fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        self.position_int_row(context)
+    }
+
+    fn try_read_buffered_column(
+        &mut self,
+        _pause_state: &RowPauseState,
+        _target: usize,
+    ) -> TdsResult<Option<crate::datatypes::column_values::ColumnValues>> {
+        Ok(self
+            .active_row
+            .as_mut()
+            .and_then(VecDeque::pop_front)
+            .map(crate::datatypes::column_values::ColumnValues::Int))
+    }
+
+    fn try_read_buffered_test_row(
+        &mut self,
+        _pause_state: &mut RowPauseState,
+    ) -> TdsResult<Option<(Vec<i32>, bool)>> {
+        let Some(row) = self.active_row.as_mut() else {
+            return Ok(None);
+        };
+        let take = self
+            .buffered_prefix_columns
+            .unwrap_or(row.len())
+            .min(row.len());
+        let prefix = row.drain(..take).collect();
+        let complete = row.is_empty();
+        if complete {
+            self.active_row = None;
+        }
+        Ok(Some((prefix, complete)))
+    }
+
     async fn receive_token(
         &mut self,
         _context: &ParserContext,
@@ -101,10 +181,13 @@ impl TdsTokenStreamReader for TokenReplayTransport {
     // `RowHeader::Token`, never `Positioned`.
     async fn receive_row_header(
         &mut self,
-        _context: &ParserContext,
+        context: &ParserContext,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<RowHeader> {
+        if let Some(row) = self.position_int_row(context)? {
+            return Ok(RowHeader::Positioned(row));
+        }
         if let Some(tok) = self.pending_tokens.pop_front() {
             return Ok(RowHeader::Token(tok));
         }
@@ -116,12 +199,19 @@ impl TdsTokenStreamReader for TokenReplayTransport {
     // these resume paths are therefore unreachable for it.
     async fn resume_row_into(
         &mut self,
-        _pause_state: RowPauseState,
+        mut pause_state: RowPauseState,
         _remaining_request_timeout: Option<Duration>,
         _cancel_handle: Option<&CancelHandle>,
         _plan: ColumnPolicy,
-        _writer: &mut (dyn RowWriter + Send),
+        writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult> {
+        if let Some(mut row) = self.active_row.take() {
+            while let Some(value) = row.pop_front() {
+                writer.write_i32(pause_state.next_column_index, value);
+                pause_state.next_column_index += 1;
+            }
+            return Ok(RowReadResult::RowWritten);
+        }
         Err(crate::error::Error::ConnectionClosed("test".to_string()))
     }
 
@@ -218,6 +308,58 @@ impl TdsTransport for TokenReplayTransport {
 pub fn tds_client_from_tokens(tokens: Vec<ScriptedToken>) -> TdsClient {
     let tokens: Vec<Tokens> = tokens.into_iter().map(|t| t.0).collect();
     let transport = AnyTransport::dynamic(TokenReplayTransport::new(tokens));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let execution_context = ExecutionContext::new();
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+        Vec::new(),
+    )
+}
+
+/// Builds a client that first returns integer-column metadata and then replays
+/// the supplied rows through the buffered cursor APIs.
+pub fn tds_client_from_int_rows(rows: Vec<Vec<i32>>) -> TdsClient {
+    let width = rows.first().map_or(0, Vec::len);
+    let metadata = Tokens::ColMetadata(ColMetadataToken {
+        column_count: u16::try_from(width).unwrap_or(u16::MAX),
+        columns: int_columns(width),
+        cek_table: Vec::new(),
+    });
+    let transport =
+        AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows, None));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let execution_context = ExecutionContext::new();
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+        Vec::new(),
+    )
+}
+
+/// Builds an integer-row client whose buffered whole-row attempt writes only
+/// `buffered_prefix_columns` before forcing async continuation.
+pub fn tds_client_from_partial_int_rows(
+    rows: Vec<Vec<i32>>,
+    buffered_prefix_columns: usize,
+) -> TdsClient {
+    let width = rows.first().map_or(0, Vec::len);
+    let metadata = Tokens::ColMetadata(ColMetadataToken {
+        column_count: u16::try_from(width).unwrap_or(u16::MAX),
+        columns: int_columns(width),
+        cek_table: Vec::new(),
+    });
+    let transport = AnyTransport::dynamic(TokenReplayTransport::with_int_rows(
+        metadata,
+        rows,
+        Some(buffered_prefix_columns),
+    ));
     let negotiated_settings = create_test_negotiated_settings_internal();
     let execution_context = ExecutionContext::new();
     let client_context = ClientContext::with_data_source("tcp:localhost,1433");
@@ -376,6 +518,23 @@ pub fn sql_error(number: u32, severity: u8, message: &str) -> ScriptedToken {
         proc_name: String::new(),
         line_number: 1,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffered_rows_require_column_metadata_context() {
+        let metadata = Tokens::ColMetadata(ColMetadataToken::default());
+        let mut transport = TokenReplayTransport::with_int_rows(metadata, vec![vec![1]], None);
+
+        assert!(
+            transport
+                .position_int_row(&ParserContext::None(()))
+                .is_err()
+        );
+    }
 }
 
 // ── Byte-level replay harness (test-only) ──────────────────────────────────

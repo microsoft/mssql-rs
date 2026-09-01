@@ -5,7 +5,7 @@ built on top of [mssql-tds](../mssql-tds).
 
 ## What it does
 
-Produces a shared library (`libmsodbcsql18.so` / `libmsodbcsql.18.dylib` / `msodbcsql18.dll`) that implements
+Ships a shared library (`mssqlodbc.so` / `mssqlodbc.dylib` / `mssqlodbc.dll`) that implements
 the ODBC C API. The ODBC Driver Manager (`unixODBC` on Linux/macOS, `odbc32` on Windows)
 loads it via `dlopen` — applications use standard ODBC calls without knowing the driver
 is written in Rust.
@@ -13,21 +13,30 @@ is written in Rust.
 ## Build
 
 ```bash
-cargo build              # debug build
-cargo build --release    # release build
+cargo build
+bash scripts/finalize-artifact.sh debug
+
+cargo build --release
+bash scripts/finalize-artifact.sh release
 ```
+
+On Windows, run `scripts/finalize-artifact.ps1` with `-BuildProfile debug` or
+`-BuildProfile release` after the corresponding Cargo build. Cargo uses the internal
+target name `mssqlodbc`; on Linux and macOS the finalization scripts create the
+shipped artifact, while on Windows Cargo already emits it and the script resolves
+its path.
 
 Output location: `target/{debug,release}/` with a platform-specific filename:
 
 | Platform | Output file |
 |---|---|
-| Linux | `libmsodbcsql18.so` |
-| macOS | `libmsodbcsql18.dylib` |
-| Windows | `msodbcsql18.dll` |
+| Linux | `mssqlodbc.so` |
+| macOS | `mssqlodbc.dylib` |
+| Windows | `mssqlodbc.dll` |
 
 The `build.rs` script embeds platform-specific metadata:
-- **Linux:** `soname` → `libmsodbcsql-18.4.so.1.1`
-- **macOS:** `install_name` → `libmsodbcsql.18.dylib`
+- **Linux:** `soname` → `mssqlodbc.so`
+- **macOS:** `install_name` → `mssqlodbc.dylib`
 - **Windows:** no extra linker args needed
 
 ## Testing
@@ -35,7 +44,7 @@ The `build.rs` script embeds platform-specific metadata:
 ### Rust unit tests
 
 ```bash
-cargo btest -p mssql-odbc
+cargo btest -p mssqlodbc
 ```
 
 ### C++ e2e tests (Google Test)
@@ -68,13 +77,13 @@ Examples:
 
 ```bash
 # Enable default warn-level logging
-MSSQL_TDS_TRACE=true cargo btest -p mssql-odbc
+MSSQL_TDS_TRACE=true cargo btest -p mssqlodbc
 
 # ODBC-driver-focused debug logs only
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug" cargo btest -p mssql-odbc
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug" cargo btest -p mssqlodbc
 
 # Full filter syntax is supported
-MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,msodbcsql18=debug,mssql_tds=off" cargo btest -p mssql-odbc
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug,mssql_tds=off" cargo btest -p mssqlodbc
 ```
 
 ## Architecture
@@ -84,7 +93,7 @@ Application
     ↓ ODBC C API (SQLAllocHandle, SQLDriverConnect, ...)
 Driver Manager (unixODBC / odbc32)
     ↓ dlopen / LoadLibrary
-libmsodbcsql18.so (this crate)
+mssqlodbc.so (this crate)
     ↓
 mssql-tds (TDS protocol)
     ↓
