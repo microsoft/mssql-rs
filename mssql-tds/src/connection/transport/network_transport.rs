@@ -3658,26 +3658,22 @@ pub(crate) mod tests {
         assert_eq!(v4_only, expected, "no IPv6 entries to reorder against");
     }
 
-    /// Resolving a real hostname (not a literal IP, so the OS resolver is
-    /// actually exercised) must go through `tokio::net::lookup_host` and
-    /// therefore stay bounded by an enclosing `tokio::time::timeout` — the
-    /// exact property the blocking `to_socket_addrs()` call used to violate.
+    /// `tokio::net::lookup_host` must be used (not blocking `to_socket_addrs()`),
+    /// so a slow/stuck resolver stays bounded by an enclosing `timeout()`
+    /// instead of escaping it. Timing can't prove this — resolving `localhost`
+    /// completes in single-digit ms either way — so this asserts the
+    /// structural property instead: a concurrently spawned heartbeat must get
+    /// scheduled while resolution is in flight. `lookup_host` bridges to
+    /// `spawn_blocking` via a channel, so the awaiting task is guaranteed to
+    /// yield at least once; a blocking `to_socket_addrs()` call never yields,
+    /// so the heartbeat gets zero chances to run. Confirmed by mutation
+    /// testing (reverting to `to_socket_addrs()` makes this fail).
     ///
-    /// Timing alone can't prove this: resolving `localhost` completes in
-    /// low-single-digit milliseconds whether or not the underlying call
-    /// blocks, so a `timeout()`-based assertion would pass either way. This
-    /// test instead proves the structural property directly — a concurrently
-    /// spawned task must get *some* chance to run while resolution is in
-    /// flight. `tokio::net::lookup_host` bridges to `spawn_blocking` via a
-    /// channel, so the awaiting task is guaranteed to return `Pending` and
-    /// yield at least once, no matter how fast the lookup itself finishes.
-    /// A synchronous `to_socket_addrs()` call never yields at all: the whole
-    /// resolution runs inside a single poll of this task, so a concurrent
-    /// task gets zero opportunities to run until it is done. Confirmed by
-    /// mutation testing: reverting to `to_socket_addrs()` makes this test
-    /// fail (the heartbeat counter stays at 0) while the timing-based
-    /// version above kept passing regardless.
-    #[tokio::test]
+    /// Must stay on the default `current_thread` runtime: a `multi_thread`
+    /// flavor would let the heartbeat run on another worker even if
+    /// resolution blocked, so the assertion would pass without proving
+    /// anything.
+    #[tokio::test(flavor = "current_thread")]
     async fn create_base_stream_sequential_resolution_yields_to_the_executor() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 

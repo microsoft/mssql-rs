@@ -450,23 +450,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Regression coverage for AB#47704: `parallel_connect` used to resolve
-    /// DNS via the blocking `std::net::ToSocketAddrs`, which never yields to
-    /// the executor. Timing alone can't prove the fix — resolving even a
-    /// nonexistent host completes in milliseconds whether or not the call
-    /// blocks, so a `timeout()`-based assertion would pass either way. This
-    /// proves the structural property instead: a concurrently spawned task
-    /// must get *some* chance to run while resolution is in flight.
-    /// `tokio::net::lookup_host` bridges to `spawn_blocking` via a channel,
-    /// so the awaiting task is guaranteed to yield at least once no matter
-    /// how fast the lookup itself finishes; a synchronous `to_socket_addrs()`
-    /// call never yields at all. Uses a host that fails to resolve so the
-    /// call returns from DNS resolution alone, without reaching
+    /// DNS via blocking `to_socket_addrs()`, which never yields to the
+    /// executor. Timing can't prove the fix — resolving even a nonexistent
+    /// host completes in ms either way — so this asserts the structural
+    /// property instead: a concurrently spawned heartbeat must get scheduled
+    /// while resolution is in flight. `lookup_host` bridges to
+    /// `spawn_blocking` via a channel, so the awaiting task is guaranteed to
+    /// yield at least once; a blocking call never yields, so the heartbeat
+    /// gets zero chances to run. Uses a host that fails to resolve so the
+    /// call returns from resolution alone, without reaching
     /// `race_connections` — which spawns tasks and awaits a channel
-    /// regardless of DNS behavior, and would otherwise mask the signal this
-    /// test is after. Confirmed by mutation testing: reverting
-    /// `parallel_connect` to `to_socket_addrs()` makes this test fail (the
-    /// heartbeat counter stays at 0).
-    #[tokio::test]
+    /// regardless of DNS behavior, and would mask the signal. Confirmed by
+    /// mutation testing (reverting to `to_socket_addrs()` makes this fail).
+    ///
+    /// Must stay on the default `current_thread` runtime: a `multi_thread`
+    /// flavor would let the heartbeat run on another worker even if
+    /// resolution blocked, so the assertion would pass without proving
+    /// anything.
+    #[tokio::test(flavor = "current_thread")]
     async fn parallel_connect_resolution_yields_to_the_executor() {
         let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
         let heartbeats_task = heartbeats.clone();
