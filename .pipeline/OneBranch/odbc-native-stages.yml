@@ -1,0 +1,305 @@
+#################################################################################
+#                     ODBC Native Artifact - Build Stages                       #
+# Builds the mssql-odbc native driver across Linux (glibc, musl, glibc-2.28;    #
+# x64 + ARM64) and Windows (x64 + ARM64), packages the driver binaries into a   #
+# NuGet archive, and publishes to Azure Artifacts via OneBranch's native        #
+# nugetPublishing mechanism.                                                    #
+#                                                                               #
+# macOS is intentionally out of scope for v1 - mssql-odbc has no build lane     #
+# there yet (see docs/rust-odbc-provider-integration-w-mssqlpython.md).         #
+#                                                                               #
+# Build jobs use custom 1ES pools (Rust, Docker, Python pre-installed), same    #
+# pools/images as validation-stages.yml's Build_Linux*/Build_Windows* jobs.     #
+# Publish job uses managed OneBranch pool with ob_nugetPublishing_enabled.      #
+#################################################################################
+
+parameters:
+- name: publishToFeed
+  type: boolean
+  default: false
+  displayName: 'Publish NuGet package to Azure Artifacts feed'
+
+stages:
+#############################################################################
+# Build Stage - Linux (glibc/musl/glibc-2.28) + Windows, x64 and ARM64
+#############################################################################
+- stage: Build
+  jobs:
+  #########################################################################
+  # Linux x64
+  #########################################################################
+  - job: Linux_x64
+    displayName: 'Linux x64'
+    pool:
+      type: linux
+      isCustom: true
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-1ES-UBUSLIM
+    variables:
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+    - template: /.pipeline/templates/cargo-authenticate-template.yml
+      parameters:
+        osType: Linux
+    - script: .pipeline/scripts/install-rustup.sh
+      displayName: 'Install Rustup'
+    - task: DockerInstaller@0
+      inputs:
+        dockerVersion: '29.0.0'
+      displayName: 'Install Docker'
+    - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+      parameters:
+        installDocker: true
+    - template: /.pipeline/templates/build-odbc-template.yml
+      parameters:
+        architecture: x64
+        artifactName: 'Odbc_Linux_x64'
+    - template: /.pipeline/templates/build-odbc-alpine-template.yml
+      parameters:
+        architecture: x64
+        artifactName: 'Odbc_Musl_x64'
+    - template: /.pipeline/templates/build-odbc-glibc228-template.yml
+      parameters:
+        architecture: x64
+        artifactName: 'Odbc_glibc228_x64'
+
+  #########################################################################
+  # Linux ARM64
+  #########################################################################
+  - job: Linux_ARM64
+    displayName: 'Linux ARM64'
+    pool:
+      type: linux
+      isCustom: true
+      name: RUST-1ES-POOL-ARM-WUS3
+      demands:
+        - imageOverride -equals RUST-UBUNTU-ARM64
+    variables:
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+    steps:
+    - template: /.pipeline/templates/cargo-authenticate-template.yml
+      parameters:
+        osType: Linux
+    - script: .pipeline/scripts/install-rustup.sh
+      displayName: 'Install Rustup'
+    - task: DockerInstaller@0
+      inputs:
+        dockerVersion: '29.0.0'
+      displayName: 'Install Docker'
+    - template: /.pipeline/templates/install-ubuntu-dependency.yaml
+      parameters:
+        installDocker: true
+    - template: /.pipeline/templates/build-odbc-template.yml
+      parameters:
+        architecture: ARM64
+        artifactName: 'Odbc_Linux_arm64'
+    - template: /.pipeline/templates/build-odbc-alpine-template.yml
+      parameters:
+        architecture: ARM64
+        artifactName: 'Odbc_Musl_arm64'
+    - template: /.pipeline/templates/build-odbc-glibc228-template.yml
+      parameters:
+        architecture: ARM64
+        buildImage: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
+        artifactName: 'Odbc_glibc228_arm64'
+
+  #########################################################################
+  # Windows x64
+  #########################################################################
+  - job: Windows_x64
+    displayName: 'Windows x64'
+    pool:
+      type: windows
+      isCustom: true
+      name: RUST-1ES-POOL-WUS3
+      demands:
+        - imageOverride -equals RUST-Win22-Sql25-1P
+    variables:
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+    steps:
+    - template: /.pipeline/templates/cargo-authenticate-template.yml
+      parameters:
+        osType: Windows
+    - template: /.pipeline/templates/install-dependencies.yml
+      parameters:
+        osType: Windows
+        skipPythonSetup: true
+        skipRustupInstall: false
+        enableJsDeps: false
+    - template: /.pipeline/templates/build-odbc-windows-template.yml
+      parameters:
+        architecture: x64
+        artifactName: 'Odbc_Windows_x64'
+
+  #########################################################################
+  # Windows ARM64
+  #########################################################################
+  - job: Windows_ARM64
+    displayName: 'Windows ARM64'
+    pool:
+      type: windows
+      isCustom: true
+      name: RUST-1ES-POOL-ARM-WUS3
+      demands:
+        - imageOverride -equals RUST-WINSRV-ARM
+    variables:
+      ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+      CARGO_TARGET_DIR: C:\cargo_target_dir
+    steps:
+    # Node.js workaround for ARM64 ADO tasks
+    - pwsh: ./scripts/setup-nodejs-path.ps1
+      displayName: 'Add Node.js to PATH for ADO tasks'
+    - pwsh: ./scripts/install-nodejs-to-agent.ps1
+      displayName: 'Install Node.js to agent externals folder'
+    - template: /.pipeline/templates/cargo-authenticate-template.yml
+      parameters:
+        osType: Windows
+    - template: /.pipeline/templates/install-dependencies.yml
+      parameters:
+        osType: Windows
+        skipPythonSetup: true
+        skipRustupInstall: false
+        enableJsDeps: false
+    - template: /.pipeline/templates/build-odbc-windows-template.yml
+      parameters:
+        architecture: ARM64
+        artifactName: 'Odbc_Windows_arm64'
+
+#############################################################################
+# Publish Stage - Collect driver binaries, create NuGet package, publish
+#############################################################################
+- ${{ if eq(parameters.publishToFeed, true) }}:
+  - stage: Publish
+    dependsOn: Build
+    # Skip publish on PR builds - only publish on CI, scheduled, or manual runs
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+    - job: PackageAndPublish
+      displayName: 'Package native drivers into NuGet and publish'
+      pool:
+        type: windows
+      variables:
+        ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+        ob_nugetPublishing_enabled: true
+      steps:
+      - download: current
+        displayName: 'Download all build artifacts'
+
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+
+          # artifact name -> (platform tag, driver filename). Each build job's
+          # drop nests the driver under build/ (see build-odbc-*-template.yml
+          # and build-odbc-windows-template.yml), so every source path below
+          # shares that same relative layout.
+          $platforms = [ordered]@{
+            'Odbc_Linux_x64'      = @{ tag = 'linux_x64';      file = 'libmssqlodbc.so' }
+            'Odbc_Linux_arm64'    = @{ tag = 'linux_arm64';    file = 'libmssqlodbc.so' }
+            'Odbc_Musl_x64'       = @{ tag = 'musl_x64';       file = 'libmssqlodbc.so' }
+            'Odbc_Musl_arm64'     = @{ tag = 'musl_arm64';     file = 'libmssqlodbc.so' }
+            'Odbc_glibc228_x64'   = @{ tag = 'glibc228_x64';   file = 'libmssqlodbc.so' }
+            'Odbc_glibc228_arm64' = @{ tag = 'glibc228_arm64'; file = 'libmssqlodbc.so' }
+            'Odbc_Windows_x64'    = @{ tag = 'windows_x64';    file = 'mssqlodbc.dll' }
+            'Odbc_Windows_arm64'  = @{ tag = 'windows_arm64';  file = 'mssqlodbc.dll' }
+          }
+
+          $nativeRoot = "$(Build.StagingDirectory)/native"
+          New-Item -ItemType Directory -Force -Path $nativeRoot | Out-Null
+
+          $missing = @()
+          foreach ($artifactName in $platforms.Keys) {
+            $info = $platforms[$artifactName]
+            $srcFile = "$(Pipeline.Workspace)/$artifactName/build/$($info.file)"
+            if (-not (Test-Path $srcFile)) {
+              $missing += $artifactName
+              continue
+            }
+            $destDir = Join-Path $nativeRoot $info.tag
+            New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+            Copy-Item $srcFile $destDir
+            Write-Host "Staged $($info.file) -> native/$($info.tag)"
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing driver drop(s) for: $($missing -join ', ')"
+            exit 1
+          }
+
+          Write-Host "=== Staged native/ tree ==="
+          Get-ChildItem $nativeRoot -Recurse -File | ForEach-Object {
+            Write-Host "  $($_.FullName.Substring($nativeRoot.Length + 1))  ($([math]::Round($_.Length/1KB, 1)) KB)"
+          }
+        displayName: 'Collect native driver binaries'
+
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+
+          # Extract version from mssql-odbc/Cargo.toml
+          $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-odbc/Cargo.toml" -Raw
+          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+            $version = $Matches[1]
+          } else {
+            Write-Error "Could not extract version from Cargo.toml"
+            exit 1
+          }
+
+          # Determine prerelease suffix based on Build.Reason. No official/clean
+          # release path yet - see mssql-py-core's Publish stage for that shape
+          # if/when this package needs one.
+          $buildReason = "$(Build.Reason)"
+          $dateStamp = Get-Date -Format "yyyyMMdd"
+          $buildId = "$(Build.BuildId)"
+          $commitSha = "$(Build.SourceVersion)"
+          $shortSha = $commitSha.Substring(0, 8)
+
+          if ($buildReason -eq 'Schedule') {
+            # Nightly build: 0.1.0-nightly.20260217
+            $packageVersion = "$version-nightly.$dateStamp"
+            Write-Host "Nightly build detected"
+          } else {
+            # CI push / manual trigger: 0.1.0-dev.20260217.12345
+            $packageVersion = "$version-dev.$dateStamp.$buildId"
+            Write-Host "Dev build detected (reason: $buildReason)"
+          }
+
+          Write-Host "Package version: $packageVersion"
+          Write-Host "##vso[task.setvariable variable=nugetVersion]$packageVersion"
+
+          # Create .nuspec
+          $nuspecContent = @"
+          <?xml version="1.0"?>
+          <package>
+            <metadata>
+              <id>mssql-odbc-wheels</id>
+              <version>$packageVersion</version>
+              <description>Native mssql-odbc driver binaries across all platforms. Commit: $shortSha. Build: $(Build.BuildNumber)</description>
+              <authors>SqlClientDrivers</authors>
+            </metadata>
+            <files>
+              <file src="native\**\*.*" target="native" />
+            </files>
+          </package>
+          "@
+
+          $nuspecPath = "$(Build.StagingDirectory)/mssql-odbc-wheels.nuspec"
+          $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
+          Write-Host "Created nuspec at $nuspecPath"
+        displayName: 'Generate NuGet package metadata'
+
+      - task: NuGetCommand@2
+        displayName: 'Create NuGet package'
+        inputs:
+          command: pack
+          packagesToPack: '$(Build.StagingDirectory)/mssql-odbc-wheels.nuspec'
+          packDestination: '$(ob_outputDirectory)/packages'
+          basePath: '$(Build.StagingDirectory)'
+
+      - pwsh: |
+          Write-Host "=== NuGet package created ==="
+          Get-ChildItem "$(ob_outputDirectory)/packages" -Filter *.nupkg | ForEach-Object {
+            Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
+          }
+          Write-Host "OneBranch will auto-publish from $(ob_outputDirectory)/packages"
+        displayName: 'Verify NuGet package'

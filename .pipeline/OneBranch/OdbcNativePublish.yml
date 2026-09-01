@@ -1,0 +1,74 @@
+#################################################################################
+#                        OneBranch Pipelines - NonOfficial                      #
+# Builds the mssql-odbc native driver across Linux (glibc/musl/glibc-2.28,      #
+# x64+ARM64) and Windows (x64+ARM64), packages the binaries into a NuGet        #
+# archive, and publishes to Azure Artifacts.                                    #
+# Documentation:  https://aka.ms/obpipelines                                    #
+# Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
+# Retail Tasks:   https://aka.ms/obpipelines/tasks                              #
+# Support:        https://aka.ms/onebranchsup                                   #
+#################################################################################
+
+# Source repo is GitHub microsoft/mssql-rs. CI runs on merge to main.
+# No PR trigger: unlike the Python wheels pipeline, every build-odbc-*
+# template here is hard-gated to CI (non-PR) runs already (see
+# build-odbc-template.yml et al.), so a PR run would spin up every agent and
+# skip every step - pure wasted capacity with zero validation value.
+trigger:
+- main
+
+pr: none
+
+# Nightly builds
+schedules:
+- cron: '0 3 * * *'
+  displayName: Nightly build
+  branches:
+    include:
+    - main
+  always: true
+
+parameters:
+- name: publishToFeed
+  displayName: 'Publish NuGet package to Azure Artifacts feed'
+  type: boolean
+  default: true
+
+variables:
+  CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]  # For onebranch.pipeline.version task
+  LinuxContainerImage: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
+  WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+  DEBIAN_FRONTEND: noninteractive
+  # IMPORTANT: This feed must be an Azure Artifacts NuGet feed in your ADO org with
+  # azure-feed://mscodehub/Rust/Rust@Release as an upstream source.
+  # The pipeline build service account needs Collaborator permissions on this feed.
+  # See https://aka.ms/rustinado for setup details.
+  toolchainFeed: 'https://sqlclientdrivers.pkgs.visualstudio.com/mssql-rs/_packaging/mssql-rs/nuget/v3/index.json'
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+extends:
+  template: v2/OneBranch.NonOfficial.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      EnableCDPxPAT: false
+      WindowsHostVersion: 1ESWindows2022
+    globalSdl:
+      binskim:
+        # Rust build scripts will not be built with spectre-mitigations enabled
+        scanOutputDirectoryOnly: true
+      clippy:
+        enabled: true
+    nugetPublishing:
+      feeds:
+      - name: public/mssql-rs_Public
+        continueOnConflict: true
+    stages:
+    - template: /.pipeline/OneBranch/odbc-native-stages.yml@self
+      parameters:
+        publishToFeed: ${{ parameters.publishToFeed }}
