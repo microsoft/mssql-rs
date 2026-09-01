@@ -2144,14 +2144,14 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
 
-        assert_eq!(resume_row_to_column(stmt, h.stmt, 2), SQL_SUCCESS);
+        assert_eq!(resume_row_to_column(stmt, h.stmt, 1), SQL_SUCCESS);
 
         let dbc_state = dbc.inner.lock().unwrap();
         assert!(dbc_state.client.is_some());
         assert_eq!(dbc_state.active_stmt, Some(h.stmt));
         drop(dbc_state);
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.last_captured, Some((2, ColumnValues::Int(10))));
+        assert_eq!(state.last_captured, Some((1, ColumnValues::Int(10))));
         assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
         assert!(state.diag_records.is_empty());
     }

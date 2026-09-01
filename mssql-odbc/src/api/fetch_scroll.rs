@@ -549,6 +549,7 @@ fn fetch_scroll_safe(
             let rows_fetched_ptr = stmt_state.rows_fetched_ptr;
             let row_status_ptr = stmt_state.row_status_ptr;
             let row_array_size = stmt_state.row_array_size;
+            stmt_state.reset_row_stream();
             // That same peek can have found a trailing SQL Server error
             // instead of a clean end of set (see
             // `release_busy_if_row_exhausted`): the call that found it had
@@ -561,7 +562,6 @@ fn fetch_scroll_safe(
             // too — this closes the cursor, so `SQLCloseCursor`/
             // `SQLFreeStmt(SQL_CLOSE)` can no longer reach it afterward.
             let rc = if let Some(e) = stmt_state.pending_fetch_error.take() {
-                stmt_state.reset_row_stream();
                 stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);
                 let pending_info = std::mem::take(&mut stmt_state.pending_fetch_info);
@@ -677,6 +677,12 @@ fn fill_rowset(
             // it is explicitly closed, so this is SQL_NO_DATA rather than an
             // error. Report a zero-row rowset so the caller sees the count.
             drop(dbc_state);
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
+                error!("SQLFetchScroll: stmt mutex poisoned resetting drained cursor");
+                return SQL_ERROR;
+            };
+            stmt_state.reset_row_stream();
+            drop(stmt_state);
             unsafe { write_if_some(rows_fetched_ptr, 0) };
             mark_no_rows(row_status_ptr, 0, row_array_size);
             debug!("SQLFetchScroll: cursor already drained; returning SQL_NO_DATA");
@@ -1584,6 +1590,77 @@ mod tests {
         );
         assert_eq!(second, 20);
         assert_eq!(second_indicator, 4);
+    }
+
+    #[test]
+    fn terminal_fetch_invalidates_fetch_buffered_get_data_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(2));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10, 17]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT buffered row".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::get_data::sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 10);
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_NO_DATA
+        );
+
+        value = 0;
+        assert_eq!(
+            unsafe {
+                crate::api::get_data::sql_get_data(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_ERROR
+        );
+        assert_eq!(value, 0, "the stale buffered value must not be replayed");
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.last().unwrap().sql_state, SQLSTATE_24000);
+        assert!(!state.row_positioned);
+        assert!(state.buffered_get_data_row.is_none());
+        drop(state);
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
     }
 
     fn assert_partial_buffered_row_delivery(buffered_prefix_columns: usize) {
