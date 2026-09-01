@@ -338,7 +338,7 @@ TEST_F(BinaryConversionLiveTest, TwoBinaryParamsKeepSeparateDeclarations) {
 //
 // Not narrowed to binary: the character DAE path has the same gap, and closing
 // either needs ColumnSize threaded into the placeholder type plus a running
-// total in SQLPutData. Tracked as AB#47775; skipped here rather than left
+// total in SQLPutData. Tracked as AB#47590; skipped here rather than left
 // asserting the wrong direction.
 TEST_F(BinaryConversionLiveTest, DataAtExecutionIgnoresColumnSize) {
     SKIP_IF_COMPARING_MSODBCSQL();

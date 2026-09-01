@@ -648,7 +648,7 @@ role `Convert()`'s dispatch switch plays - not a legality table.
   the same for the binary types. Beyond this milestone the same work is needed
   for `uniqueidentifier`, money, decimal, and date/time values, which still emit
   their P0-era shapes. `ColumnSize` still does not bound a data-at-execution
-  value in either family (AB#47775).
+  value in either family (AB#47590).
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
