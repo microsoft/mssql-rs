@@ -60,6 +60,8 @@ pub(crate) struct ActivePlpStream {
 pub(crate) struct BufferedGetDataRow {
     pub(crate) values: Vec<Option<ColumnValues>>,
     pub(crate) variant_bases: Vec<Option<TdsDataType>>,
+    /// Number of leading value slots already discarded or delivered.
+    pub(crate) consumed: usize,
     /// The TDS cursor still owns deferred columns after the captured prefix.
     pub(crate) wire_deferred: bool,
 }
@@ -164,6 +166,8 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// UTF-16 column names built once when result metadata changes.
+    pub(crate) column_names_utf16: Vec<Vec<u16>>,
     /// Set once a fetch has confirmed — possibly by peeking one token past
     /// the row it just delivered — that no further rows exist for the
     /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
@@ -861,8 +865,18 @@ impl StmtState {
     /// command ordinal restarts rather than climbing across executions.
     pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
         self.column_metadata = metadata;
+        self.refresh_column_name_cache();
         self.rows_returned = 0;
         self.current_command += 1;
+    }
+
+    pub(crate) fn refresh_column_name_cache(&mut self) {
+        self.column_names_utf16.clear();
+        self.column_names_utf16.extend(
+            self.column_metadata
+                .iter()
+                .map(|column| column.column_name.encode_utf16().collect()),
+        );
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -1027,6 +1041,7 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                column_names_utf16: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,
@@ -1105,6 +1120,7 @@ impl Drop for StmtHandle {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
+    use mssql_tds::test_client_support::int_columns;
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {
@@ -1202,6 +1218,7 @@ mod tests {
             s.buffered_get_data_row = Some(BufferedGetDataRow {
                 values: vec![Some(ColumnValues::Int(1))],
                 variant_bases: vec![Some(TdsDataType::Int4)],
+                consumed: 0,
                 wire_deferred: false,
             });
 
@@ -1209,6 +1226,25 @@ mod tests {
 
             assert!(s.row_positioned);
             assert!(s.buffered_get_data_row.is_none());
+        });
+    }
+
+    #[test]
+    fn beginning_result_set_caches_utf16_column_names() {
+        with_state(|s| {
+            let mut metadata = int_columns(2);
+            metadata[0].column_name = "alpha".to_string();
+            metadata[1].column_name = "beta\u{1f642}".to_string();
+
+            s.begin_result_set(metadata);
+
+            assert_eq!(
+                s.column_names_utf16,
+                vec![
+                    "alpha".encode_utf16().collect::<Vec<_>>(),
+                    "beta\u{1f642}".encode_utf16().collect::<Vec<_>>(),
+                ]
+            );
         });
     }
 }

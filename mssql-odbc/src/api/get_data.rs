@@ -8,9 +8,12 @@ use tracing::error;
 use std::sync::MutexGuard;
 
 use super::odbc_types::{
-    SQL_C_BINARY, SQL_C_CHAR, SQL_C_GUID, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA,
-    SQL_NO_TOTAL, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlPointer,
-    SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT,
+    SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TYPE_DATE,
+    SQL_C_TYPE_TIMESTAMP, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA,
+    SQL_NO_TOTAL, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlDateStruct, SqlGuid,
+    SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlSsTime2Struct,
+    SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlUSmallInt,
 };
 use super::sqlstate::*;
 use crate::api::exec_common::release_busy_if_row_exhausted;
@@ -26,11 +29,13 @@ use mssql_tds::encoding_rs::{self, Decoder};
 
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
-    convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, extract_datetime_parts,
-    format_datetime_parts, is_datetime_c_target, is_float_c_target, is_integer_c_target,
-    money_scaled, sql_string_to_text,
+    convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, date_parts,
+    datetime2_parts, datetimeoffset_parts, extract_datetime_parts, format_datetime_parts,
+    is_datetime_c_target, is_float_c_target, is_integer_c_target, money_scaled, sql_string_to_text,
+    time_parts,
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sql_string::EncodingType;
 use mssql_tds::query::metadata::PlpEncoding;
 
@@ -198,8 +203,73 @@ fn sql_get_data_safe(
 
     let mut try_complete_buffered_plp = false;
     if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
-        for skipped in row.values.iter_mut().take(col_index - 1) {
-            *skipped = None;
+        row.discard_before(col_index - 1);
+        let wide_buffered_row = row.values.len() >= 8;
+        let direct_string = wide_buffered_row
+            && matches!(target_type, SQL_C_CHAR | SQL_C_WCHAR)
+            && row
+                .values
+                .get(col_index - 1)
+                .and_then(Option::as_ref)
+                .is_some_and(|value| unsafe {
+                    try_write_complete_buffered_string(
+                        value,
+                        target_type,
+                        target_value_ptr,
+                        buffer_length,
+                        strlen_or_ind_ptr,
+                    )
+                });
+        if direct_string {
+            let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
+            row.consumed = row.consumed.max(col_index);
+            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            stmt_state.current_row_last_col = col_index;
+            stmt_state.partial_text_offset = None;
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
+        }
+        let direct_decimal = wide_buffered_row
+            && target_type == SQL_C_CHAR
+            && row
+                .values
+                .get(col_index - 1)
+                .and_then(Option::as_ref)
+                .is_some_and(|value| unsafe {
+                    try_write_complete_buffered_decimal(
+                        value,
+                        target_value_ptr,
+                        buffer_length,
+                        strlen_or_ind_ptr,
+                    )
+                });
+        if direct_decimal {
+            let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
+            row.consumed = row.consumed.max(col_index);
+            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            stmt_state.current_row_last_col = col_index;
+            stmt_state.partial_text_offset = None;
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
+        }
+        let direct_scalar = wide_buffered_row
+            && row
+                .values
+                .get(col_index - 1)
+                .and_then(Option::as_ref)
+                .is_some_and(|value| unsafe {
+                    try_write_exact_buffered_scalar(
+                        value,
+                        target_type,
+                        target_value_ptr,
+                        strlen_or_ind_ptr,
+                    )
+                });
+        if direct_scalar {
+            let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
+            row.consumed = row.consumed.max(col_index);
+            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            stmt_state.current_row_last_col = col_index;
+            stmt_state.partial_text_offset = None;
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
         }
         let typed_buffered = is_typed_c_target(target_type)
             && row
@@ -227,6 +297,7 @@ fn sql_get_data_safe(
                     && let Some(value) = row.values.get_mut(col_index - 1)
                 {
                     *value = None;
+                    row.consumed = row.consumed.max(col_index);
                 }
                 stmt_state.current_row_last_col = col_index;
                 stmt_state.partial_text_offset = None;
@@ -234,15 +305,10 @@ fn sql_get_data_safe(
             return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
         }
 
-        let captured = row
-            .values
-            .get_mut(col_index - 1)
-            .and_then(Option::take)
-            .map(|value| {
-                let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
-                (value, variant_base)
-            });
-        if let Some((value, variant_base)) = captured {
+        let captured = row.values.get_mut(col_index - 1).and_then(Option::take);
+        if let Some(value) = captured {
+            row.consumed = row.consumed.max(col_index);
+            let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
             stmt_state.last_captured = Some((col_index, value));
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             let rc = write_captured_column(
@@ -317,6 +383,197 @@ fn sql_get_data_safe(
         strlen_or_ind_ptr,
     );
     finish_get_data(stmt, statement_handle, reopened_stmt_state, col_index, rc)
+}
+
+#[inline(never)]
+unsafe fn try_write_complete_buffered_string(
+    value: &ColumnValues,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> bool {
+    let ColumnValues::String(value) = value else {
+        return false;
+    };
+    let bytes = &value.bytes;
+    let direct_char = target_type == SQL_C_CHAR
+        && (matches!(value.encoding_type(), EncodingType::Utf8)
+            && std::str::from_utf8(bytes).is_ok()
+            || matches!(value.encoding_type(), EncodingType::LcidBased(_)) && bytes.is_ascii());
+    if direct_char && (buffer_length as usize) > bytes.len() {
+        unsafe {
+            write_if_some(
+                strlen_or_ind_ptr,
+                SqlLen::try_from(bytes.len()).unwrap_or(SqlLen::MAX),
+            );
+            copy_with_nul(target_value_ptr.cast::<u8>(), buffer_length as usize, bytes);
+        }
+        return true;
+    }
+
+    let direct_wchar = target_type == SQL_C_WCHAR
+        && matches!(value.encoding_type(), EncodingType::Utf16)
+        && bytes.len().is_multiple_of(2)
+        && std::char::decode_utf16(
+            bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
+        )
+        .all(|unit| unit.is_ok());
+    if !direct_wchar
+        || (buffer_length as usize).saturating_sub(std::mem::size_of::<SqlWChar>()) < bytes.len()
+    {
+        return false;
+    }
+
+    unsafe {
+        write_if_some(
+            strlen_or_ind_ptr,
+            SqlLen::try_from(bytes.len()).unwrap_or(SqlLen::MAX),
+        );
+        if !target_value_ptr.is_null() {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                target_value_ptr.cast::<u8>(),
+                bytes.len(),
+            );
+            target_value_ptr
+                .cast::<u8>()
+                .add(bytes.len())
+                .cast::<SqlWChar>()
+                .write_unaligned(0);
+        }
+    }
+    true
+}
+
+#[inline(never)]
+unsafe fn try_write_complete_buffered_decimal(
+    value: &ColumnValues,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> bool {
+    let parts = match value {
+        ColumnValues::Decimal(parts) | ColumnValues::Numeric(parts) => parts,
+        _ => return false,
+    };
+    let mut formatted = [0_u8; DECIMAL_STR_LEN];
+    let rendered = parts.format_into(&mut formatted).as_bytes();
+    let (prefix, rest): (&[u8], &[u8]) = if let Some(rest) = rendered.strip_prefix(b"0.") {
+        (b".", rest)
+    } else if let Some(rest) = rendered.strip_prefix(b"-0.") {
+        (b"-.", rest)
+    } else {
+        (b"", rendered)
+    };
+    let Some(rendered_len) = prefix.len().checked_add(rest.len()) else {
+        return false;
+    };
+    if (buffer_length as usize) <= rendered_len {
+        return false;
+    }
+    unsafe {
+        write_if_some(
+            strlen_or_ind_ptr,
+            SqlLen::try_from(rendered_len).unwrap_or(SqlLen::MAX),
+        );
+        if !target_value_ptr.is_null() {
+            let target = target_value_ptr.cast::<u8>();
+            std::ptr::copy_nonoverlapping(prefix.as_ptr(), target, prefix.len());
+            std::ptr::copy_nonoverlapping(rest.as_ptr(), target.add(prefix.len()), rest.len());
+            target.add(rendered_len).write_unaligned(0);
+        }
+    }
+    true
+}
+
+#[inline(never)]
+unsafe fn try_write_exact_buffered_scalar(
+    value: &ColumnValues,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> bool {
+    macro_rules! write_exact {
+        ($value:expr) => {{
+            let value = $value;
+            unsafe {
+                write_if_some(target_value_ptr.cast(), value);
+                write_if_some(
+                    strlen_or_ind_ptr,
+                    SqlLen::try_from(std::mem::size_of_val(&value)).unwrap_or(SqlLen::MAX),
+                );
+            }
+            return true;
+        }};
+    }
+
+    match (value, target_type) {
+        (ColumnValues::Bit(value), SQL_C_BIT) => write_exact!(u8::from(*value)),
+        (ColumnValues::TinyInt(value), SQL_C_UTINYINT) => write_exact!(*value),
+        (ColumnValues::SmallInt(value), SQL_C_SSHORT) => write_exact!(*value),
+        (ColumnValues::Int(value), SQL_C_SLONG) => write_exact!(*value),
+        (ColumnValues::BigInt(value), SQL_C_SBIGINT) => write_exact!(*value),
+        (ColumnValues::Real(value), SQL_C_FLOAT) => write_exact!(*value),
+        (ColumnValues::Float(value), SQL_C_DOUBLE) => write_exact!(*value),
+        (ColumnValues::Date(value), SQL_C_TYPE_DATE) => {
+            let parts = date_parts(value);
+            write_exact!(SqlDateStruct {
+                year: parts.year,
+                month: parts.month,
+                day: parts.day,
+            })
+        }
+        (ColumnValues::Time(value), SQL_C_SS_TIME2) => {
+            let parts = time_parts(value);
+            write_exact!(SqlSsTime2Struct {
+                hour: parts.hour,
+                minute: parts.minute,
+                second: parts.second,
+                fraction: parts.fraction_ns,
+            })
+        }
+        (ColumnValues::DateTime2(value), SQL_C_TYPE_TIMESTAMP) => {
+            let parts = datetime2_parts(value);
+            write_exact!(SqlTimestampStruct {
+                year: parts.year,
+                month: parts.month,
+                day: parts.day,
+                hour: parts.hour,
+                minute: parts.minute,
+                second: parts.second,
+                fraction: parts.fraction_ns,
+            })
+        }
+        (ColumnValues::DateTimeOffset(value), SQL_C_SS_TIMESTAMPOFFSET) => {
+            let Some(parts) = datetimeoffset_parts(value) else {
+                return false;
+            };
+            write_exact!(SqlSsTimestampoffsetStruct {
+                year: parts.year,
+                month: parts.month,
+                day: parts.day,
+                hour: parts.hour,
+                minute: parts.minute,
+                second: parts.second,
+                fraction: parts.fraction_ns,
+                timezone_hour: parts.tz_hour,
+                timezone_minute: parts.tz_minute,
+            })
+        }
+        (ColumnValues::Uuid(value), SQL_C_GUID) => {
+            let (data1, data2, data3, data4) = value.as_fields();
+            write_exact!(SqlGuid {
+                data1,
+                data2,
+                data3,
+                data4: *data4,
+            })
+        }
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2143,6 +2400,7 @@ mod tests {
                 .into_iter()
                 .map(|value| Some(ColumnValues::Int(value)))
                 .collect(),
+            consumed: 0,
             wire_deferred: false,
         });
     }
@@ -2158,6 +2416,7 @@ mod tests {
             state.buffered_get_data_row = Some(BufferedGetDataRow {
                 values: vec![Some(ColumnValues::Int(10)), None],
                 variant_bases: vec![None, None],
+                consumed: 0,
                 wire_deferred: false,
             });
         }
@@ -2277,6 +2536,22 @@ mod tests {
             stmt.inner.lock().unwrap().last_variant_base,
             Some((1, TdsDataType::Int4))
         );
+
+        let mut value = 0_i32;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 42);
     }
 
     #[test]
@@ -2356,6 +2631,7 @@ mod tests {
         let row = state.spare_get_data_row.as_ref().unwrap();
         assert!(row.wire_deferred);
         assert!(row.values.iter().all(Option::is_none));
+        assert_eq!(row.consumed, 1);
     }
 
     #[test]
@@ -2505,6 +2781,109 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(binary_length(value), *expected, "{value:?}");
         }
+    }
+
+    #[test]
+    fn complete_buffered_strings_copy_only_for_matching_full_buffers() {
+        use mssql_tds::datatypes::sql_string::SqlString;
+
+        let narrow = ColumnValues::String(SqlString::new(b"hello".to_vec(), EncodingType::Utf8));
+        let mut narrow_out = [0_u8; 6];
+        let mut indicator = 0;
+        assert!(unsafe {
+            try_write_complete_buffered_string(
+                &narrow,
+                SQL_C_CHAR,
+                narrow_out.as_mut_ptr().cast(),
+                narrow_out.len() as SqlLen,
+                &mut indicator,
+            )
+        });
+        assert_eq!(&narrow_out, b"hello\0");
+        assert_eq!(indicator, 5);
+        assert!(!unsafe {
+            try_write_complete_buffered_string(
+                &narrow,
+                SQL_C_CHAR,
+                narrow_out.as_mut_ptr().cast(),
+                5,
+                &mut indicator,
+            )
+        });
+
+        let wide_bytes = "hi"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let wide = ColumnValues::String(SqlString::new(wide_bytes, EncodingType::Utf16));
+        let mut wide_out = [0_u16; 3];
+        assert!(unsafe {
+            try_write_complete_buffered_string(
+                &wide,
+                SQL_C_WCHAR,
+                wide_out.as_mut_ptr().cast(),
+                std::mem::size_of_val(&wide_out) as SqlLen,
+                &mut indicator,
+            )
+        });
+        assert_eq!(wide_out, [b'h' as u16, b'i' as u16, 0]);
+        assert_eq!(indicator, 4);
+    }
+
+    #[test]
+    fn complete_buffered_decimal_uses_odbc_text_without_allocating() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+
+        for (input, expected) in [
+            ("0.4500", ".4500"),
+            ("-0.1250", "-.1250"),
+            ("42.0000", "42.0000"),
+        ] {
+            let decimal = ColumnValues::Decimal(DecimalParts::from_string(input, 18, 4).unwrap());
+            let mut output = [0_u8; 16];
+            let mut indicator = 0;
+
+            assert!(unsafe {
+                try_write_complete_buffered_decimal(
+                    &decimal,
+                    output.as_mut_ptr().cast(),
+                    output.len() as SqlLen,
+                    &mut indicator,
+                )
+            });
+            assert_eq!(
+                std::str::from_utf8(&output[..expected.len()]).unwrap(),
+                expected
+            );
+            assert_eq!(output[expected.len()], 0);
+            assert_eq!(indicator, expected.len() as SqlLen);
+        }
+    }
+
+    #[test]
+    fn exact_buffered_scalar_writes_only_matching_c_type() {
+        let mut bytes = [0_u8; 9];
+        let target = unsafe { bytes.as_mut_ptr().add(1).cast() };
+        let mut indicator = 0;
+
+        assert!(unsafe {
+            try_write_exact_buffered_scalar(
+                &ColumnValues::Int(42),
+                SQL_C_SLONG,
+                target,
+                &mut indicator,
+            )
+        });
+        assert_eq!(unsafe { target.cast::<i32>().read_unaligned() }, 42);
+        assert_eq!(indicator, std::mem::size_of::<i32>() as SqlLen);
+        assert!(!unsafe {
+            try_write_exact_buffered_scalar(
+                &ColumnValues::Int(42),
+                SQL_C_SBIGINT,
+                target,
+                &mut indicator,
+            )
+        });
     }
 
     /// A zero-length SQL_C_BINARY read reports the available length and leaves

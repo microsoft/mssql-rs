@@ -638,6 +638,7 @@ fn apply_catalog_metadata(
             col.flags &= !COLMETA_NULLABLE_FLAG;
         }
     }
+    stmt_state.refresh_column_name_cache();
     Ok(())
 }
 

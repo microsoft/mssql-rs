@@ -17,7 +17,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
 };
-use crate::api::util::{copy_utf16_with_nul, write_if_some};
+use crate::api::util::{copy_utf16_with_nul, copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -137,12 +137,21 @@ fn sql_describe_col_w_safe(
 
     let meta = &stmt_state.column_metadata[(column_number - 1) as usize];
 
-    let name_len =
-        SqlSmallInt::try_from(meta.column_name.encode_utf16().count()).unwrap_or(SqlSmallInt::MAX);
+    let cached_name = stmt_state
+        .column_names_utf16
+        .get((column_number - 1) as usize);
+    let name_len = SqlSmallInt::try_from(
+        cached_name.map_or_else(|| meta.column_name.encode_utf16().count(), Vec::len),
+    )
+    .unwrap_or(SqlSmallInt::MAX);
     unsafe { write_if_some(name_length_ptr, name_len) };
 
-    let truncated =
-        unsafe { copy_utf16_with_nul(column_name, buffer_length as usize, &meta.column_name) };
+    let truncated = match cached_name {
+        Some(name) => unsafe { copy_with_nul(column_name, buffer_length as usize, name) },
+        None => unsafe {
+            copy_utf16_with_nul(column_name, buffer_length as usize, &meta.column_name)
+        },
+    };
 
     unsafe { write_if_some(data_type_ptr, odbc_sql_type(meta)) };
     unsafe { write_if_some(column_size_ptr, column_size(meta)) };

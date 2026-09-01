@@ -21,7 +21,7 @@ use std::borrow::Cow;
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::{BufferedRowPoll, CursorColumn, ResultSet};
+use mssql_tds::connection::tds_client::{BufferedRowPoll, CursorColumn, CursorPoll, ResultSet};
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -69,6 +69,7 @@ impl BufferedGetDataRow {
         let mut row = reusable.take().unwrap_or_else(|| Self {
             values: Vec::new(),
             variant_bases: Vec::new(),
+            consumed: 0,
             wire_deferred: false,
         });
         if row.values.len() != column_count {
@@ -81,8 +82,23 @@ impl BufferedGetDataRow {
         } else {
             row.variant_bases.fill(None);
         }
+        row.consumed = 0;
         row.wire_deferred = false;
         row
+    }
+
+    pub(crate) fn discard_before(&mut self, col: usize) {
+        let end = col.min(self.values.len());
+        if self.values.len() < 8 {
+            for value in self.values.iter_mut().take(end) {
+                *value = None;
+            }
+            return;
+        }
+        for value in self.values.iter_mut().take(end).skip(self.consumed) {
+            *value = None;
+        }
+        self.consumed = self.consumed.max(end);
     }
 
     fn write_value(&mut self, col: usize, value: ColumnValues) {
@@ -132,6 +148,13 @@ impl RowWriter for BufferedGetDataRow {
     }
 
     fn write_string(&mut self, col: usize, bytes: Cow<'_, [u8]>, encoding_type: EncodingType) {
+        if let Some(Some(ColumnValues::String(existing))) = self.values.get_mut(col)
+            && existing.encoding_type() == &encoding_type
+        {
+            existing.bytes.clear();
+            existing.bytes.extend_from_slice(&bytes);
+            return;
+        }
         self.write_value(
             col,
             ColumnValues::String(SqlString::new(bytes.into_owned(), encoding_type)),
@@ -640,6 +663,7 @@ fn fetch_scroll_safe(
         column_count,
         row_bind_offset_ptr,
         reusable_get_data_row,
+        buffer_trailing_utf16_plp,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
@@ -722,6 +746,11 @@ fn fetch_scroll_safe(
         // mid-write; the mutating entry points refuse while this is set.
         stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
         let reusable_get_data_row = stmt_state.spare_get_data_row.take();
+        let buffer_trailing_utf16_plp = stmt_state
+            .column_metadata
+            .last()
+            .and_then(|metadata| metadata.plp_encoding())
+            == Some(PlpEncoding::Utf16Text);
         (
             stmt_state.row_array_size,
             bindings,
@@ -730,6 +759,7 @@ fn fetch_scroll_safe(
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
             reusable_get_data_row,
+            buffer_trailing_utf16_plp,
         )
     };
 
@@ -743,6 +773,7 @@ fn fetch_scroll_safe(
         row_status_ptr,
         row_bind_offset_ptr,
         reusable_get_data_row,
+        buffer_trailing_utf16_plp,
     );
 
     // Single clearing point for the guard, so every early return inside the
@@ -765,6 +796,7 @@ fn fill_rowset(
     row_status_ptr: *mut SqlUSmallInt,
     row_bind_offset_ptr: *mut SqlULen,
     mut reusable_get_data_row: Option<BufferedGetDataRow>,
+    buffer_trailing_utf16_plp: bool,
 ) -> SqlReturn {
     // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
     // result set. Once that many have been returned the cursor stops without
@@ -936,7 +968,8 @@ fn fill_rowset(
             }
         } else if let Some(prefix_len) = buffered_prefix_len {
             let mut writer = BufferedGetDataRow::empty(&mut reusable_get_data_row, column_count);
-            let result = match client.try_next_buffered_row_prefix_into(prefix_len, &mut writer) {
+            let mut result = match client.try_next_buffered_row_prefix_into(prefix_len, &mut writer)
+            {
                 Ok(BufferedRowPoll::Complete) => Ok(()),
                 Ok(BufferedRowPoll::Partial) => dbc
                     .runtime
@@ -965,6 +998,29 @@ fn fill_rowset(
                 }
                 Err(error) => Err(error),
             };
+            let mut buffered_columns = prefix_len;
+            if result.is_ok()
+                && buffer_trailing_utf16_plp
+                && prefix_len.checked_add(1) == Some(column_count)
+            {
+                let mut payload = [0_u8; 256];
+                match client.try_read_row_plp_complete(prefix_len, &mut payload) {
+                    Ok(CursorPoll::Ready(Some(chunk))) => {
+                        writer.write_string(
+                            prefix_len,
+                            Cow::Borrowed(&payload[..chunk.read]),
+                            EncodingType::Utf16,
+                        );
+                        buffered_columns = column_count;
+                    }
+                    Ok(CursorPoll::Ready(None)) => {
+                        writer.write_null(prefix_len);
+                        buffered_columns = column_count;
+                    }
+                    Ok(CursorPoll::Pending) => {}
+                    Err(error) => result = Err(error),
+                }
+            }
             if let Err(error) = result {
                 fetch_error = Some(error);
                 outcome = RowOutcome::Error(RowIssue::Restricted);
@@ -973,7 +1029,7 @@ fn fill_rowset(
                 // UpdateTxtPtrOnly leaves unbound long data deferred
                 // (`sqlccurs.cpp`; consumed later by `sqlcdata.cpp::SQLGetData`).
                 buffered_get_data_row = Some(writer);
-                columns_read = prefix_len;
+                columns_read = buffered_columns;
             }
         } else if can_write_complete_rows {
             let mut writer = BoundRowWriter::new(bindings, rows_filled as usize, bind_offset);
@@ -1789,6 +1845,56 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut s = stmt.inner.lock().unwrap();
         s.set_state(STMT_STATE_CURSOR_OPEN);
+    }
+
+    #[test]
+    fn buffered_row_discards_each_leading_slot_once() {
+        let mut reusable = None;
+        let mut row = BufferedGetDataRow::empty(&mut reusable, 8);
+        row.values = vec![
+            Some(ColumnValues::Int(1)),
+            Some(ColumnValues::Int(2)),
+            Some(ColumnValues::Int(3)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+
+        row.discard_before(1);
+        row.values[0] = Some(ColumnValues::Int(99));
+        row.discard_before(2);
+
+        assert_eq!(row.values[0], Some(ColumnValues::Int(99)));
+        assert_eq!(row.values[1], None);
+        assert_eq!(row.values[2], Some(ColumnValues::Int(3)));
+        assert_eq!(row.consumed, 2);
+    }
+
+    #[test]
+    fn buffered_row_reuses_matching_string_storage() {
+        let mut reusable = None;
+        let mut row = BufferedGetDataRow::empty(&mut reusable, 1);
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(b"existing");
+        row.values[0] = Some(ColumnValues::String(SqlString::new(
+            bytes,
+            EncodingType::Utf8,
+        )));
+        let original = match row.values[0].as_ref().unwrap() {
+            ColumnValues::String(value) => value.bytes.as_ptr(),
+            value => panic!("unexpected value: {value:?}"),
+        };
+
+        row.write_string(0, Cow::Borrowed(b"new"), EncodingType::Utf8);
+
+        let value = match row.values[0].as_ref().unwrap() {
+            ColumnValues::String(value) => value,
+            value => panic!("unexpected value: {value:?}"),
+        };
+        assert_eq!(value.bytes, b"new");
+        assert_eq!(value.bytes.as_ptr(), original);
     }
 
     #[test]

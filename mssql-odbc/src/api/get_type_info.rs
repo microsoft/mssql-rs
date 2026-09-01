@@ -323,6 +323,7 @@ fn rename_type_info_columns(stmt: &StmtHandle, is_2x_app: bool) {
             col.column_name = name.to_string();
         }
     }
+    stmt_state.refresh_column_name_cache();
 }
 
 /// Clears the nullable flag on the type-info columns the ODBC spec guarantees
