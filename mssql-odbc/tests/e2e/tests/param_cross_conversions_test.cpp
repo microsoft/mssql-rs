@@ -496,14 +496,16 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
 
 // The cross-family pairings are bindable now, so a data-at-execution indicator
 // on one is refused at execute rather than at bind: the DAE indicator is only
-// read when the parameter list is built. Streaming would have to write the C
-// buffer's bytes to the wire untranscoded, which cannot serve an integer wire
-// type, so the pairing stays materialize-only (AB#47590).
+// read when the parameter list is built. There is no transcode from arbitrary
+// character bytes to an integer wire value, so the pairing stays
+// materialize-only.
 //
-// msodbcsql streams it: SQLExecute returns SQL_NEED_DATA (99) here rather than
-// refusing, same as the narrow-to-wide pairing in
-// execute_test.cpp/CrossFamilyDataAtExecutionIsRejected. Skipped for that
-// reason, not because the state differs.
+// msodbcsql's behavior for this pairing has not been characterized, so the
+// parity run stays skipped, as it does for the analogous
+// execute_test.cpp/CrossFamilyDataAtExecutionIsRejected. Not to be confused
+// with the narrow/wide character mismatch, which now transcodes instead of
+// refusing (execute_test.cpp/NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes
+// and WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes).
 TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
     SKIP_IF_COMPARING_MSODBCSQL();
 

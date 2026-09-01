@@ -93,15 +93,26 @@ transparent reconnects.
 - **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
   `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` as PLP
   `(n)varchar(max)` / `varbinary(max)`, matching msodbcsql sequencing.
-  Cross-family pairings are **not** streamable: the chunks go to the wire
-  untranscoded, which cannot serve an integer wire type. Since P5 made those
-  pairings bindable, the refusal moved from `SQLBindParameter` to execute - the
-  DAE indicator is only read while building the parameter list - so an
-  application gets `HYC00` from `SQLExecute` after setting up its
-  `SQLParamData` loop rather than at bind. msodbcsql streams the pairing
-  instead, returning `SQL_NEED_DATA`, so this is the same gap as the
-  narrow-to-wide case and closes with it (AB#47590). Pinned by
-  `CrossFamilyDataAtExecutionIsRejectedAtExecute`.
+  Same-family pairings always stream. A C-type/SQL-type wideness mismatch
+  within the character family (e.g. `SQL_C_WCHAR` against a narrow SQL type)
+  is buffered and transcoded once at `SQLParamData` close via the
+  connection's collation rather than rejected - msodbcsql accepts the same
+  pairing but transcodes incrementally instead of buffering the whole value,
+  a documented deviation, not a gap. The same-wideness narrow path
+  (`SQL_C_CHAR` against a narrow SQL type) still assumes UTF-8 on the wire
+  instead of reading the connection's collation (AB#47590); only the
+  wideness-mismatch half of that gap has closed.
+  Cross-*family* pairings (character/binary against an integer SQL type) are
+  still **not** streamable: there is no transcode from arbitrary bytes to an
+  integer wire value. Since P5 made those pairings bindable, the refusal
+  moved from `SQLBindParameter` to execute - the DAE indicator is only read
+  while building the parameter list - so an application gets `HYC00` from
+  `SQLExecute` after setting up its `SQLParamData` loop rather than at bind.
+  msodbcsql's behavior for this pairing has not been characterized. Pinned by
+  `CrossFamilyDataAtExecutionIsRejectedAtExecute` and, for the
+  wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
+  / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
+  `execute_test.cpp`.
 
 ## `mssql-tds` prepared API
 

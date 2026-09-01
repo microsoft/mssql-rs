@@ -237,7 +237,11 @@ pub(crate) struct DaeStream {
 /// that, and is not a regression -- this pairing previously failed outright
 /// -- but it is real cost, taken because a per-chunk carry is meaningfully
 /// more machinery (correctly splitting a UTF-16 surrogate pair or a
-/// multi-byte narrow sequence across calls) than this driver has today.
+/// multi-byte narrow sequence across calls) than this driver has today. It
+/// also means a mismatched value whose total size exceeds `u32::MAX` bytes
+/// -- `SQL_LEN_DATA_AT_EXEC` declares no upper bound -- fails late, with a
+/// clean `UsageError` from `write_streamed_chunk`'s own chunk-length check,
+/// rather than at the first oversized `SQLPutData` call.
 /// Tracked under AB#47590 alongside this file's other DAE-transcoding gaps.
 ///
 /// Known residual, also AB#47590: a same-family pairing whose wideness
