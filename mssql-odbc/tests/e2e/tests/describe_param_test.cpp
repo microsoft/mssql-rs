@@ -222,6 +222,8 @@ TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
     SQLLEN result = 0;
     GetColumn(1, &result);
     EXPECT_EQ(SQL_NULL_DATA, result);
+    GetColumn(2, &result);
+    EXPECT_EQ(SQL_NULL_DATA, result);
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
