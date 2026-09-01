@@ -32,6 +32,7 @@ async def connect(client_context, python_logger=None):
 def test_module_exposes_fetchone():
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchone")
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchmany")
+    assert hasattr(mssql_py_core.PyAsyncCursor, "fetchall")
 
 
 def test_fetchone_without_result_set_raises(mock_client_context):
@@ -43,6 +44,12 @@ def test_fetchone_without_result_set_raises(mock_client_context):
                 await cursor.fetchone()
             with pytest.raises(RuntimeError, match="No active result set"):
                 await cursor.fetchmany(1)
+            with pytest.raises(RuntimeError, match="No active result set"):
+                await cursor.fetchall()
+            with pytest.raises(TypeError):
+                cursor.fetchall(1)
+            with pytest.raises(TypeError):
+                cursor.fetchall(size=1)
         finally:
             await conn.close()
 
@@ -59,6 +66,8 @@ def test_fetchone_after_cursor_close_raises(mock_client_context):
                 await cursor.fetchone()
             with pytest.raises(RuntimeError, match="Cursor is closed"):
                 await cursor.fetchmany(0)
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                await cursor.fetchall()
         finally:
             await conn.close()
 
@@ -182,6 +191,26 @@ def test_fetchone_logs_exhaustion(client_context):
                 in message
                 for level, message, _module in logger.events
             )
+
+            await cursor.execute("SELECT 1 UNION ALL SELECT 2", use_prepare=False)
+            logger.events.clear()
+            assert await cursor.fetchall() == [(1,), (2,)]
+            assert (
+                10,
+                "PyAsyncCursor::fetchall: started",
+                "async_fetch.rs",
+            ) in logger.events
+            assert (
+                20,
+                "PyAsyncCursor::fetchall: result set exhausted",
+                "async_fetch.rs",
+            ) in logger.events
+            assert any(
+                level == 10
+                and "PyAsyncCursor::fetchall: completed; returned=2; exhausted=true; elapsed_ms="
+                in message
+                for level, message, _module in logger.events
+            )
         finally:
             await conn.close()
 
@@ -257,6 +286,100 @@ def test_fetchmany_stops_at_current_result_set(client_context):
             await owner.close()
             await other.execute("SET NOCOUNT ON", use_prepare=False)
         finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchall_returns_remaining_rows_and_releases_finished_batch(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            owner = conn.cursor()
+            other = conn.cursor()
+            await owner.execute(
+                "SELECT value FROM (VALUES (1), (2), (3), (4)) rows(value) ORDER BY value",
+                use_prepare=False,
+            )
+            description = owner.description
+
+            assert await owner.fetchone() == (1,)
+            assert await owner.fetchmany(1) == [(2,)]
+            assert await owner.fetchall() == [(3,), (4,)]
+            assert await owner.fetchall() == []
+            assert owner.description == description
+
+            await other.execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchall_empty_result_and_current_result_set_boundary(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            owner = conn.cursor()
+            other = conn.cursor()
+
+            await owner.execute("SELECT 1 WHERE 1 = 0", use_prepare=False)
+            assert await owner.fetchall() == []
+            await other.execute("SET NOCOUNT ON", use_prepare=False)
+
+            await owner.execute("SELECT 1; SELECT 2", use_prepare=False)
+            assert await owner.fetchall() == [(1,)]
+            assert await owner.fetchall() == []
+            with pytest.raises(RuntimeError, match="busy with another cursor"):
+                await other.execute("SELECT 3", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchall_keeps_event_loop_responsive(client_context):
+    async def run():
+        conn = await connect(client_context)
+        heartbeat_ticks = 0
+        stop_heartbeat = False
+
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while not stop_heartbeat:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0)
+
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                """
+                WITH numbers AS (
+                    SELECT 0 AS value
+                    UNION ALL
+                    SELECT value + 1 FROM numbers WHERE value < 4095
+                )
+                SELECT value FROM numbers ORDER BY value
+                OPTION (MAXRECURSION 4095)
+                """,
+                use_prepare=False,
+            )
+            heartbeat_task = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0)
+            ticks_before_fetch = heartbeat_ticks
+
+            rows = await cursor.fetchall()
+            ticks_during_fetch = heartbeat_ticks - ticks_before_fetch
+
+            assert rows == [(value,) for value in range(4096)]
+            assert ticks_during_fetch > 0
+        finally:
+            stop_heartbeat = True
+            if "heartbeat_task" in locals():
+                await heartbeat_task
             await conn.close()
 
     asyncio.run(run())
@@ -760,7 +883,7 @@ def test_exhausted_fetchone_after_connection_close_raises(client_context):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("operation", ["fetchone", "fetchmany"])
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
 def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation):
     async def run():
         conn = await connect(client_context)
@@ -771,12 +894,14 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
                 use_prepare=False,
             )
 
-            first = cursor.fetchone() if operation == "fetchone" else cursor.fetchmany(1)
+            operations = {
+                "fetchone": lambda: cursor.fetchone(),
+                "fetchmany": lambda: cursor.fetchmany(1),
+                "fetchall": lambda: cursor.fetchall(),
+            }
+            first = operations[operation]()
             with pytest.raises(RuntimeError, match="busy with another cursor operation"):
-                if operation == "fetchone":
-                    cursor.fetchone()
-                else:
-                    cursor.fetchmany(1)
+                operations[operation]()
             result = await first
             value = result[0] if operation == "fetchone" else result[0][0]
             assert len(value) == 8000000
@@ -788,7 +913,7 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("operation", ["fetchone", "fetchmany"])
+@pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
 def test_cancelling_blocked_fetch_breaks_session(client_context, operation):
     async def run():
         conn = await connect(client_context)
@@ -798,9 +923,12 @@ def test_cancelling_blocked_fetch_breaks_session(client_context, operation):
                 "SELECT REPLICATE(CAST('x' AS varchar(max)), 32000000)",
                 use_prepare=False,
             )
-            awaitable = (
-                cursor.fetchone() if operation == "fetchone" else cursor.fetchmany(1)
-            )
+            operations = {
+                "fetchone": lambda: cursor.fetchone(),
+                "fetchmany": lambda: cursor.fetchmany(1),
+                "fetchall": lambda: cursor.fetchall(),
+            }
+            awaitable = operations[operation]()
             task = asyncio.ensure_future(awaitable)
             await asyncio.sleep(0)
             task.cancel()

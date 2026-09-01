@@ -18,6 +18,9 @@ use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_session::{AsyncConnectionState, CursorId, OperationId};
 use crate::row_writer::PyRowWriter;
 
+const FETCH_YIELD_INTERVAL: usize = 256;
+const FETCHALL_MATERIALIZE_CHUNK_SIZE: usize = 256;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum FetchStatus {
@@ -136,6 +139,38 @@ impl Drop for FetchGuard {
     }
 }
 
+struct MaterializationGuard {
+    operation: &'static str,
+    dispatch: Option<tracing::Dispatch>,
+    completed: bool,
+}
+
+impl MaterializationGuard {
+    fn new(operation: &'static str, dispatch: Option<tracing::Dispatch>) -> Self {
+        Self {
+            operation,
+            dispatch,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for MaterializationGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::warn!(
+                "PyAsyncCursor::{}: interrupted during row materialization; connection remains usable",
+                self.operation
+            );
+        }
+    }
+}
+
 struct FetchBatch {
     rows: Vec<PyRowWriter>,
     exhausted: bool,
@@ -145,17 +180,14 @@ struct FetchBatch {
 enum FetchOutput {
     One,
     Many,
+    All,
 }
 
 impl FetchOutput {
-    fn logs_batch_summary(self) -> bool {
-        matches!(self, Self::Many)
-    }
-
     fn empty(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self {
             Self::One => Ok(py.None()),
-            Self::Many => Ok(PyList::empty(py).into_any().unbind()),
+            Self::Many | Self::All => Ok(PyList::empty(py).into_any().unbind()),
         }
     }
 
@@ -165,7 +197,7 @@ impl FetchOutput {
                 Some(writer) => Ok(writer.to_py_tuple(py)?.into_any().unbind()),
                 None => Ok(py.None()),
             },
-            Self::Many => {
+            Self::Many | Self::All => {
                 let rows = rows
                     .into_iter()
                     .map(|writer| writer.to_py_tuple(py).map(Bound::unbind))
@@ -177,13 +209,60 @@ impl FetchOutput {
 }
 
 async fn materialize_rows(output: FetchOutput, rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
+    if matches!(output, FetchOutput::All) {
+        return materialize_all_rows(rows).await;
+    }
     tokio::task::spawn_blocking(move || Python::attach(|py| output.materialize(py, rows)))
         .await
-        .map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to materialize fetched rows: {error}"
-            ))
-        })?
+        .map_err(map_materialization_join_error)?
+}
+
+async fn materialize_all_rows(rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
+    let mut rows = rows.into_iter();
+    let mut list: Option<Py<PyList>> = None;
+
+    loop {
+        let chunk = rows
+            .by_ref()
+            .take(FETCHALL_MATERIALIZE_CHUNK_SIZE)
+            .collect::<Vec<_>>();
+        let finished = chunk.len() < FETCHALL_MATERIALIZE_CHUNK_SIZE;
+        list = Some(
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    let converted = chunk
+                        .into_iter()
+                        .map(|writer| writer.to_py_tuple(py).map(Bound::unbind))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    let chunk = PyList::new(py, converted)?;
+                    let list = match list {
+                        Some(list) => {
+                            let bound = list.bind(py);
+                            let end = bound.len();
+                            bound.set_slice(end, end, chunk.as_any())?;
+                            list
+                        }
+                        None => chunk.unbind(),
+                    };
+                    Ok::<Py<PyList>, PyErr>(list)
+                })
+            })
+            .await
+            .map_err(map_materialization_join_error)??,
+        );
+        if finished {
+            return Ok(list
+                .expect("materialization always creates a list")
+                .into_any());
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+fn map_materialization_join_error(error: tokio::task::JoinError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "Failed to materialize fetched rows: {error}"
+    ))
 }
 
 async fn fetch_rows_on_client(client: &mut TdsClient, limit: usize) -> Result<FetchBatch, Error> {
@@ -205,6 +284,9 @@ async fn fetch_rows_on_client(client: &mut TdsClient, limit: usize) -> Result<Fe
             });
         }
         rows.push(writer);
+        if rows.len() % FETCH_YIELD_INTERVAL == 0 {
+            tokio::task::yield_now().await;
+        }
     }
     Ok(FetchBatch {
         rows,
@@ -246,11 +328,16 @@ fn fetch<'py>(
     let operation_id = claim.operation_id;
     let future_state = session_state.clone();
     let guard_dispatch = dispatch.clone();
+    let materialization_dispatch = dispatch.clone();
 
     let future = async move {
         let started = Instant::now();
-        if output.logs_batch_summary() {
-            tracing::debug!("PyAsyncCursor::{operation}: started; requested={limit}");
+        match output {
+            FetchOutput::Many => {
+                tracing::debug!("PyAsyncCursor::{operation}: started; requested={limit}");
+            }
+            FetchOutput::All => tracing::debug!("PyAsyncCursor::{operation}: started"),
+            FetchOutput::One => {}
         }
         // Retain the Python cursor until the row operation settles so its finalizer
         // cannot race the in-flight TDS read.
@@ -264,6 +351,7 @@ fn fetch<'py>(
             let has_open_batch = client.has_open_batch();
             (result, has_open_batch)
         };
+        let read_ms = started.elapsed().as_millis();
 
         match result {
             Ok(batch) => {
@@ -275,13 +363,23 @@ fn fetch<'py>(
                     FetchStatus::Ready
                 });
                 fetch_guard.complete(batch.exhausted, has_open_batch);
+                let materialization_started = Instant::now();
+                let mut materialization_guard =
+                    MaterializationGuard::new(operation, materialization_dispatch);
                 match materialize_rows(output, batch.rows).await {
                     Ok(rows) => {
-                        if output.logs_batch_summary() {
-                            tracing::debug!(
-                                "PyAsyncCursor::{operation}: completed; requested={limit}; returned={returned}; exhausted={exhausted}; elapsed_ms={}",
-                                started.elapsed().as_millis()
-                            );
+                        materialization_guard.complete();
+                        let materialization_ms = materialization_started.elapsed().as_millis();
+                        match output {
+                            FetchOutput::Many => tracing::debug!(
+                                "PyAsyncCursor::{operation}: completed; requested={limit}; returned={returned}; exhausted={exhausted}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={materialization_ms}",
+                                started.elapsed().as_millis(),
+                            ),
+                            FetchOutput::All => tracing::debug!(
+                                "PyAsyncCursor::{operation}: completed; returned={returned}; exhausted={exhausted}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={materialization_ms}",
+                                started.elapsed().as_millis(),
+                            ),
+                            FetchOutput::One => {}
                         }
                         if exhausted {
                             tracing::info!("PyAsyncCursor::{operation}: result set exhausted");
@@ -289,9 +387,11 @@ fn fetch<'py>(
                         Ok(rows)
                     }
                     Err(error) => {
+                        materialization_guard.complete();
                         tracing::error!(
-                            "PyAsyncCursor::{operation}: row materialization failed; returned={returned}; elapsed_ms={}; error={error}",
-                            started.elapsed().as_millis()
+                            "PyAsyncCursor::{operation}: row materialization failed; returned={returned}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}; error={error}",
+                            started.elapsed().as_millis(),
+                            materialization_started.elapsed().as_millis(),
                         );
                         Err(error)
                     }
@@ -356,6 +456,22 @@ pub(crate) fn fetchmany<'py>(
         size as usize,
         FetchOutput::Many,
         "fetchmany",
+    )
+}
+
+/// Return an awaitable resolving to all remaining rows in the current result set.
+pub(crate) fn fetchall<'py>(
+    cursor: Py<PyAsyncCursor>,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let resources = cursor.borrow(py).fetch_resources()?;
+    fetch(
+        cursor,
+        py,
+        resources,
+        usize::MAX,
+        FetchOutput::All,
+        "fetchall",
     )
 }
 

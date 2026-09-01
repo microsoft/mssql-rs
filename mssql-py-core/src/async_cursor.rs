@@ -413,6 +413,11 @@ impl PyAsyncCursor {
         crate::async_fetch::fetchmany(slf, py, size)
     }
 
+    /// Fetch all remaining rows in the current result set.
+    fn fetchall<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_fetch::fetchall(slf, py)
+    }
+
     /// Drain pending results, release prepared handles, and close this cursor.
     ///
     /// Returns an awaitable resolving to `None`. Closing an already closed
