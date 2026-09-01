@@ -951,20 +951,6 @@ TEST_F(PrepareExecuteLiveTest, IntegerParamOutOfRangeForTargetIs22003) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
 }
 
-// Integer -> character is quadrant C, still unimplemented, so the bind is
-// rejected up front with HYC00 rather than failing at execute. msodbcsql
-// supports the pairing, hence the skip; it goes away with P5 (AB#47500).
-TEST_F(PrepareExecuteLiveTest, IntegerToCharacterConversionIsRejected) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-
-    SQLINTEGER value = 42;
-    SQLLEN ind = 0;
-    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
-                                    SQL_VARCHAR, 0, 0, &value, 0, &ind);
-    EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
-}
-
 // SQL Server has no interval type, so a real-but-unsupported ParameterType is
 // HYC00 ("optional feature not implemented") rather than a conversion failure.
 // msodbcsql's IsValidSqlType returns IDS_S1_C00 for the whole interval range

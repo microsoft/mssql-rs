@@ -30,8 +30,10 @@ use crate::api::odbc_types::{
 use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
 use crate::conversion::error::{ConvError, ConvOk};
-use crate::conversion::numeric::{NumericSource, narrow_i128, parse_decimal_literal};
-use mssql_tds::datatypes::column_values::ColumnValues;
+use crate::conversion::numeric::{NumericSource, narrow_i128, parse_numeric_text};
+use mssql_tds::datatypes::column_values::{
+    ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
+};
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 
 /// Decodes a character column without the panicking paths in
@@ -134,19 +136,7 @@ fn numeric_source(value: &ColumnValues) -> Result<NumericSource, ConvError> {
 fn numeric_source_or_parse(value: &ColumnValues) -> Result<NumericSource, ConvError> {
     if let ColumnValues::String(s) = value {
         let text = sql_string_to_text(s).ok_or(ConvError::InvalidCharacterValue)?;
-        if let Some(n) = parse_decimal_literal(&text) {
-            return Ok(n);
-        }
-        let t = text.trim();
-        return match t.parse::<f64>() {
-            Ok(f) if f.is_finite() => Ok(NumericSource::Float(f)),
-            // Rust folds overflow into `Ok(inf)`, but msodbcsql's `VarR8FromStr`
-            // reports DISP_E_OVERFLOW -> 22003 and keeps the cast error for text
-            // that is not a number at all. Digits present means it was numeric.
-            Ok(_) if t.bytes().any(|b| b.is_ascii_digit()) => Err(ConvError::OutOfRange),
-            // "inf" / "infinity" / "nan" parse in Rust but are not SQL literals.
-            _ => Err(ConvError::InvalidCharacterValue),
-        };
+        return parse_numeric_text(&text);
     }
     numeric_source(value)
 }
@@ -324,22 +314,103 @@ const DAYS_0001_TO_1900: i64 = 693_595;
 /// each target C struct can be filled from a single representation.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DateTimeParts {
+    /// Proleptic Gregorian year.
     pub year: i16,
+    /// Calendar month in `1..=12`.
     pub month: u16,
+    /// Calendar day in `1..=31`.
     pub day: u16,
+    /// Hour in `0..=23`.
     pub hour: u16,
+    /// Minute in `0..=59`.
     pub minute: u16,
+    /// Second in `0..=59`.
     pub second: u16,
     /// Fractional seconds in nanoseconds.
     pub fraction_ns: u32,
     /// Declared fractional-seconds scale (0-7) of the source column. Character
     /// rendering pads to exactly this many digits, matching msodbcsql.
     pub scale: u8,
+    /// Signed timezone hour component.
     pub tz_hour: i16,
+    /// Signed timezone minute component.
     pub tz_minute: i16,
+    /// Whether the source carries a date component.
     pub has_date: bool,
+    /// Whether the source carries a time component.
     pub has_time: bool,
+    /// Whether the source carries a timezone offset.
     pub has_tz: bool,
+}
+
+/// Converts a TDS `date` into normalized calendar fields.
+pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
+    let (year, month, day) = civil_from_days_since_0001(i64::from(date.get_days()));
+    DateTimeParts {
+        year,
+        month,
+        day,
+        has_date: true,
+        ..Default::default()
+    }
+}
+
+/// Converts a TDS `time` into normalized clock fields.
+pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
+    let (hour, minute, second, fraction_ns) = hms_from_ticks_100ns(time.time_nanoseconds);
+    DateTimeParts {
+        hour,
+        minute,
+        second,
+        fraction_ns,
+        scale: time.scale,
+        has_time: true,
+        ..Default::default()
+    }
+}
+
+/// Converts a TDS `datetime2` into normalized calendar and clock fields.
+pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
+    let (year, month, day) = civil_from_days_since_0001(i64::from(datetime.days));
+    let mut parts = time_parts(&datetime.time);
+    parts.year = year;
+    parts.month = month;
+    parts.day = day;
+    parts.has_date = true;
+    parts
+}
+
+/// Converts a UTC TDS `datetimeoffset` value to its represented local time.
+///
+/// Returns `None` when applying the offset falls outside the TDS date range.
+pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateTimeParts> {
+    // The wire value is UTC; ODBC returns the local wall clock obtained by
+    // applying the stored offset.
+    let utc_ticks = datetime.datetime2.time.time_nanoseconds as i64
+        + i64::from(datetime.offset) * 60 * 10_000_000;
+    let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
+    if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
+        return None;
+    }
+
+    let (year, month, day) = civil_from_days_since_0001(days);
+    let (hour, minute, second, fraction_ns) =
+        hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
+    Some(DateTimeParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        fraction_ns,
+        scale: datetime.datetime2.time.scale,
+        tz_hour: datetime.offset / 60,
+        tz_minute: datetime.offset % 60,
+        has_date: true,
+        has_time: true,
+        has_tz: true,
+    })
 }
 
 /// (year, month, day) from a day count where day 0 = 0001-01-01, using Howard
@@ -386,64 +457,10 @@ fn hms_from_ticks_100ns(ticks: u64) -> (u16, u16, u16, u32) {
 pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimeParts> {
     let mut p = DateTimeParts::default();
     match value {
-        ColumnValues::Date(d) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(d.get_days()));
-            p.year = y;
-            p.month = m;
-            p.day = day;
-            p.has_date = true;
-        }
-        ColumnValues::Time(t) => {
-            let (h, mi, s, f) = hms_from_ticks_100ns(t.time_nanoseconds);
-            p.scale = t.scale;
-            p.hour = h;
-            p.minute = mi;
-            p.second = s;
-            p.fraction_ns = f;
-            p.has_time = true;
-        }
-        ColumnValues::DateTime2(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days));
-            let (h, mi, s, f) = hms_from_ticks_100ns(dt.time.time_nanoseconds);
-            p.scale = dt.time.scale;
-            p.year = y;
-            p.month = m;
-            p.day = day;
-            p.hour = h;
-            p.minute = mi;
-            p.second = s;
-            p.fraction_ns = f;
-            p.has_date = true;
-            p.has_time = true;
-        }
-        ColumnValues::DateTimeOffset(dto) => {
-            // The wire value is UTC; `offset` is what must be added to reach the
-            // local wall clock the application wrote, which is what the ODBC
-            // struct and the character rendering report.
-            let utc_ticks = dto.datetime2.time.time_nanoseconds as i64
-                + i64::from(dto.offset) * 60 * 10_000_000;
-            // Euclidean division so a negative offset borrows a day rather than
-            // producing a negative time-of-day.
-            let days = i64::from(dto.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
-            if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
-                return None;
-            }
-            let (y, m, day) = civil_from_days_since_0001(days);
-            let (h, mi, s, f) = hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
-            p.scale = dto.datetime2.time.scale;
-            p.year = y;
-            p.month = m;
-            p.day = day;
-            p.hour = h;
-            p.minute = mi;
-            p.second = s;
-            p.fraction_ns = f;
-            p.tz_hour = dto.offset / 60;
-            p.tz_minute = dto.offset % 60;
-            p.has_date = true;
-            p.has_time = true;
-            p.has_tz = true;
-        }
+        ColumnValues::Date(date) => return Some(date_parts(date)),
+        ColumnValues::Time(time) => return Some(time_parts(time)),
+        ColumnValues::DateTime2(datetime) => return Some(datetime2_parts(datetime)),
+        ColumnValues::DateTimeOffset(datetime) => return datetimeoffset_parts(datetime),
         ColumnValues::DateTime(dt) => {
             let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
             // `datetime` time is counted in 1/300-second ticks since midnight.
@@ -1132,6 +1149,111 @@ mod tests {
         .unwrap();
         assert_eq!(ok, ConvOk::Exact);
         assert_eq!(out, 123);
+    }
+
+    /// Only blanks are padding, in this direction too. `Convert` routes a
+    /// character source to `ConvertToFixed`'s `case SQL_C_CHAR` arm whichever
+    /// way the data moves - `SQL_C_CHAR` and `SQL_CHAR` are both `1` - so
+    /// `CharToBigint`'s blanks-only trim (`sqlccnvt.cpp:7777`) governs a column
+    /// exactly as it governs a bound parameter. Shared with the parameter path
+    /// through `parse_numeric_text`.
+    #[test]
+    fn only_blanks_pad_a_numeric_column() {
+        for text in ["  123  ", "+123", "-123"] {
+            let mut out: i32 = 0;
+            let mut ind: SqlLen = 0;
+            assert!(
+                conv(
+                    &utf8_col(text),
+                    SQL_C_SLONG,
+                    (&mut out as *mut i32).cast(),
+                    &mut ind,
+                )
+                .is_ok(),
+                "{text:?} should parse"
+            );
+        }
+
+        // A tab, an interior blank, and a non-breaking space are not padding.
+        for bad in ["\t123", "123\n", "1 23", "\u{a0}123", "1,234"] {
+            let mut out: i32 = 0;
+            let mut ind: SqlLen = 0;
+            let err = conv(
+                &utf8_col(bad),
+                SQL_C_SLONG,
+                (&mut out as *mut i32).cast(),
+                &mut ind,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                ConvError::InvalidCharacterValue,
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// A literal too wide for an exact `i128` mantissa reaches a float target at
+    /// full precision. `parse_numeric_text` reduces it for integer targets, and
+    /// routing that reduction to `as_f64` would hand `SQL_C_DOUBLE` about 1.1.
+    #[test]
+    fn wide_decimal_column_reaches_a_double_target() {
+        let mut out: f64 = 0.0;
+        let mut ind: SqlLen = 0;
+        conv_f(
+            &utf8_col("1.234567890123456789012345678901234567890"),
+            SQL_C_DOUBLE,
+            (&mut out as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert!((out - 1.234_567_890_123_456_7).abs() < 1e-15, "got {out}");
+        assert_eq!(ind, 8);
+    }
+
+    /// The same literal to an integer target keeps the dropped-fraction report
+    /// the reduction exists for.
+    #[test]
+    fn wide_decimal_column_truncating_to_an_integer_reports_truncation() {
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = 0;
+        let ok = conv(
+            &utf8_col("7.000000000000000000000000000000000000000001"),
+            SQL_C_SLONG,
+            (&mut out as *mut i32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(ok, ConvOk::Truncated);
+        assert_eq!(out, 7);
+    }
+
+    /// `SQL_C_FLOAT` narrows to 32 bits through its own arm, so it needs the
+    /// approximation too - and a wide literal past the `f32` range is `22003`
+    /// there rather than infinity.
+    #[test]
+    fn wide_decimal_column_reaches_a_single_precision_target() {
+        let mut out: f32 = 0.0;
+        let mut ind: SqlLen = 0;
+        conv_f(
+            &utf8_col("1.234567890123456789012345678901234567890"),
+            SQL_C_FLOAT,
+            (&mut out as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert!((out - 1.234_567_9_f32).abs() < 1e-6, "got {out}");
+        assert_eq!(ind, 4);
+
+        let mut big: f32 = 0.0;
+        let err = conv_f(
+            &utf8_col("400000000000000000000000000000000000000000.5"),
+            SQL_C_FLOAT,
+            (&mut big as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
     }
 
     #[test]
