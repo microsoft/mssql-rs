@@ -148,10 +148,11 @@ fn sql_describe_param_safe(
                 post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
                 return SQL_ERROR;
             };
-            // Re-assert IPD every cache-served call, not just the first: a
-            // rebind between two `SQLDescribeParam` calls could otherwise
-            // leave a stale, unrefined IPD in place while this answer keeps
-            // reporting the server's original description.
+            // Called on every cache-served answer, not just the first:
+            // `refine_ipd` itself only ever fills in a marker that has never
+            // been explicitly bound (see its doc comment), so repeating this
+            // call is idempotent for an already-bound marker and still picks
+            // up one that was unbound (or never bound) since the last call.
             let cached = stmt_state.parameter_metadata.clone();
             drop(stmt_state);
             refine_ipd(stmt, &cached);
@@ -284,12 +285,20 @@ fn sql_describe_param_safe(
 }
 
 /// Refines `stmt`'s IPD records from server-described `descriptions` — one
-/// per marker ordinal, in order — overriding whatever `SQLBindParameter`
-/// guessed at bind time: `sp_describe_undeclared_parameters` is the
-/// authoritative source once available. Grows the IPD to cover every
-/// described marker but never shrinks it, so an application that grew the
-/// IPD further itself (`SQLSetDescField(IPD, 0, SQL_DESC_COUNT, ...)`) keeps
-/// that choice.
+/// per marker ordinal, in order — filling in whatever `SQLBindParameter`
+/// has not already set: `sp_describe_undeclared_parameters` is informational
+/// (ODBC's `SQLDescribeParam` never mutates bind behavior), so a marker the
+/// application has explicitly bound is left untouched rather than
+/// overridden. `SQL_DESC_CONCISE_TYPE == 0` is `DescRecord::default_for`'s
+/// "never bound" sentinel for an IPD record (`SQLBindParameter` always
+/// writes a real, non-zero SQL type — see `BoundParam::write_to_records`),
+/// so it doubles as the "still safe to refine" check. Refining an
+/// already-bound marker would both silently change what `SQLExecute` sends
+/// for a type the application explicitly chose, and bypass the
+/// `is_supported_conversion` gate `SQLBindParameter` enforces at bind time.
+/// Grows the IPD to cover every described marker but never shrinks it, so
+/// an application that grew the IPD further itself
+/// (`SQLSetDescField(IPD, 0, SQL_DESC_COUNT, ...)`) keeps that choice.
 ///
 /// `ParameterDescription` carries no parameter direction or name — the
 /// server doesn't determine either from `sp_describe_undeclared_parameters`
@@ -313,6 +322,12 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
         let Some(record) = desc_state.record_mut(record_number) else {
             continue;
         };
+        if record.concise_type != 0 {
+            // Already bound (by SQLBindParameter or a prior SQLSetDescField/
+            // SQLSetDescRec) — informational metadata must not override an
+            // application's explicit choice.
+            continue;
+        }
         record.concise_type = description.data_type;
         record.datetime_interval_code = datetime_interval_code_for(description.data_type);
         record.scale = description.decimal_digits;
@@ -1102,5 +1117,35 @@ mod tests {
         }
         refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
         assert_eq!(ipd_records(&h)[0].parameter_type, SQL_PARAM_INPUT);
+    }
+
+    /// `SQLDescribeParam` is informational (ODBC 3.8): a marker the
+    /// application has already bound via `SQLBindParameter` must keep the
+    /// application's explicit type, size and scale rather than being
+    /// silently overwritten by the server's description — otherwise
+    /// `SQLExecute` would send a different SQL type than the one the caller
+    /// asked for and validated against at bind time.
+    #[test]
+    fn refine_ipd_leaves_an_already_bound_marker_untouched() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            state.set_record_count(1, desc.kind);
+            let record = state.record_mut(1).unwrap();
+            record.concise_type = SQL_VARCHAR;
+            record.length = 50;
+            record.scale = 7;
+        }
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 4, 0, SQL_NO_NULLS)]);
+
+        let record = &ipd_records(&h)[0];
+        assert_eq!(
+            record.concise_type, SQL_VARCHAR,
+            "an explicit SQLBindParameter type must survive SQLDescribeParam"
+        );
+        assert_eq!(record.length, 50);
+        assert_eq!(record.scale, 7);
     }
 }

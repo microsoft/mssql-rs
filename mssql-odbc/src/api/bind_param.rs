@@ -259,13 +259,6 @@ fn sql_bind_parameter_safe(
             return SQL_ERROR;
         }
 
-        // A rebind invalidates any cached server-side prepared plan: the next
-        // SQLExecute must re-prepare so the plan matches the new bindings. This
-        // mirrors msodbcsql clearing DESC_CONSISTENT → FIsReprepareRequired. The
-        // prepared SQL text is kept; the server handle is orphaned for release
-        // (via sp_unprepare) at the next execute, forcing the sp_prepexec path.
-        stmt_state.orphan_prepared_handle();
-
         (stmt_state.effective_apd(stmt), c_type)
     };
 
@@ -297,6 +290,21 @@ fn sql_bind_parameter_safe(
         }
         return SQL_ERROR;
     };
+
+    // A rebind invalidates any cached server-side prepared plan: the next
+    // SQLExecute must re-prepare so the plan matches the new bindings. This
+    // mirrors msodbcsql clearing DESC_CONSISTENT → FIsReprepareRequired. The
+    // prepared SQL text is kept; the server handle is orphaned for release
+    // (via sp_unprepare) at the next execute, forcing the sp_prepexec path.
+    // Runs only now that the write above actually succeeded — orphaning
+    // during the earlier STMT-locked validation would discard a still-valid
+    // plan for a binding that turned out to fail (e.g. a poisoned/concurrently
+    // freed APD) and never actually changed.
+    if let Ok(mut stmt_state) = stmt.inner.lock() {
+        stmt_state.orphan_prepared_handle();
+    } else {
+        error!("SQLBindParameter: stmt mutex poisoned; prepared plan not invalidated");
+    }
 
     debug!(parameter_number, "SQLBindParameter: parameter bound");
     SQL_SUCCESS
@@ -909,6 +917,70 @@ mod tests {
         assert_eq!(
             orphaned,
             mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42)
+        );
+    }
+
+    /// Panics while holding the APD lock, leaving the mutex poisoned.
+    fn poison_apd(apd: SqlHandle) {
+        let handle = unsafe { handle_from_raw::<DescHandle>(apd) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.lock().unwrap();
+            panic!("poison the apd lock");
+        }));
+    }
+
+    /// A bind that fails after the STMT-locked validation (here, a poisoned
+    /// APD makes `bind_param_records` return `Err`) must leave a cached
+    /// prepared plan alone: orphaning it for a binding that was never
+    /// actually applied would force a needless re-prepare on the next
+    /// execute for no corresponding state change.
+    #[test]
+    fn a_failed_bind_does_not_orphan_the_prepared_handle() {
+        use mssql_tds::connection::tds_client::PreparedStatement;
+
+        use crate::handles::stmt::PreparedPlan;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(PreparedPlan {
+                stmt: PreparedStatement::materialized_for_test(
+                    "SELECT @P1",
+                    mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
+                ),
+                marker_count: 0,
+            });
+        }
+        poison_apd(h.apd());
+
+        let mut buf: Vec<u8> = b"abc\0".to_vec();
+        let mut ind: SqlLen = crate::api::odbc_types::SQL_NTS as SqlLen;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.prepared.as_ref().and_then(|p| p.stmt.id()),
+            Some(mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42)),
+            "a failed bind must not orphan a plan that was never actually invalidated"
+        );
+        assert!(
+            state.pending_unprepare.is_none(),
+            "nothing should be queued for release when the bind itself failed"
         );
     }
 

@@ -1127,6 +1127,20 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
     }
 }
 
+/// Clears a stale `SQL_NULL_DATA` a split indicator pointer could still be
+/// holding from an earlier NULL row, before non-NULL data is delivered to
+/// independent length/indicator pointers — otherwise a later non-NULL row
+/// reusing the same bound array reads back as NULL, since nothing else ever
+/// writes to `indicator` once it stops aliasing `octet_length`. A no-op when
+/// the two pointers alias (the common `SQLBindCol` case, and when there is no
+/// indicator at all): the length write below lands on the same location
+/// there, so nothing stale can survive either way.
+unsafe fn clear_stale_null_indicator(indicator: *mut SqlLen, octet_length: *mut SqlLen) {
+    if !indicator.is_null() && indicator != octet_length {
+        unsafe { write_if_some(indicator, 0) };
+    }
+}
+
 /// Displaces a bound `SQL_DESC_INDICATOR_PTR` / `SQL_DESC_OCTET_LENGTH_PTR`
 /// base pointer by `bind_offset` (bytes, from `SQL_ATTR_ROW_BIND_OFFSET_PTR`)
 /// and `row_index` (elements), or returns null if the base itself is null.
@@ -1178,6 +1192,7 @@ unsafe fn deliver_bound_plp(
     // `deliver_bound`'s comment on `octet_length`. This value is never NULL
     // (that path never reaches a bound PLP delivery), so the produced length
     // always belongs on `octet_length`, not `indicator`.
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
     let octet_length =
         unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
     let slot =
@@ -1204,6 +1219,7 @@ unsafe fn deliver_bound_plp(
         drain_plp_to_end(client, runtime, scratch)?;
         return Ok(RowOutcome::Error(RowIssue::Unsupported));
     }
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
 
     let transcode = target == SQL_C_CHAR && matches!(encoding, Some(PlpEncoding::Utf16Text));
     let buf_elements = char_buf_elements(target, stride);
@@ -1383,8 +1399,10 @@ unsafe fn deliver_encoded_string(
     // `deliver_bound`'s comment on `octet_length`. This path never delivers
     // NULL (that goes through `deliver_bound` via `write_null`), so the
     // reported length always belongs on `octet_length`, not `indicator`.
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
     let octet_length =
         unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
@@ -1482,6 +1500,7 @@ unsafe fn deliver_bound(
         }
         return RowOutcome::Success;
     }
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
 
     if is_typed_c_target(binding.target_type) {
         let converted = unsafe {
@@ -1533,8 +1552,8 @@ unsafe fn deliver_bound(
 /// # Safety
 ///
 /// The binding's target pointer, after applying `bind_offset` and `row_index`,
-/// must be null or writable for `T`; its displaced octet-length pointer must be
-/// null or writable for one `SqlLen`.
+/// must be null or writable for `T`; its displaced indicator and octet-length
+/// pointers must each be null or writable for one `SqlLen`.
 unsafe fn deliver_fixed_bound<T: Copy>(
     binding: &ColumnBinding,
     row_index: usize,
@@ -1546,8 +1565,10 @@ unsafe fn deliver_fixed_bound<T: Copy>(
     // `deliver_bound`'s comment on `octet_length`. This path never delivers
     // NULL (that goes through `deliver_bound` via `write_null`), so the
     // reported size always belongs on `octet_length`, not `indicator`.
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
     let octet_length =
         unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
     if !binding.target_value_ptr.is_null() {
         let slot =
             unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
@@ -2337,11 +2358,12 @@ mod tests {
     /// `SQL_C_SLONG`), so its length report is just as reachable through a
     /// descriptor-field bind as `deliver_bound`'s. A split `SQL_DESC_INDICATOR_PTR`
     /// / `SQL_DESC_OCTET_LENGTH_PTR` pair must land the size on the octet
-    /// pointer and leave the indicator alone.
+    /// pointer and clear any stale `SQL_NULL_DATA` the indicator could still
+    /// be holding from an earlier NULL row.
     #[test]
     fn deliver_fixed_bound_reports_the_size_on_the_split_octet_length_pointer() {
         let mut value = 0_i32;
-        let mut indicator: SqlLen = -99;
+        let mut indicator: SqlLen = SQL_NULL_DATA;
         let mut octet_length: SqlLen = -99;
         let b = ColumnBinding {
             column_number: 1,
@@ -2356,8 +2378,8 @@ mod tests {
         assert_eq!(value, 7);
         assert_eq!(octet_length, 4, "the size must land on the octet pointer");
         assert_eq!(
-            indicator, -99,
-            "a non-NULL value must never touch the indicator pointer"
+            indicator, 0,
+            "a non-NULL value must clear a stale SQL_NULL_DATA on a split indicator"
         );
     }
 
@@ -2367,7 +2389,7 @@ mod tests {
     #[test]
     fn deliver_encoded_string_reports_the_length_on_the_split_octet_length_pointer() {
         let mut buf = [0u8; 8];
-        let mut indicator: SqlLen = -99;
+        let mut indicator: SqlLen = SQL_NULL_DATA;
         let mut octet_length: SqlLen = -99;
         let b = ColumnBinding {
             column_number: 1,
@@ -2383,9 +2405,30 @@ mod tests {
         assert_eq!(&buf[..2], b"hi");
         assert_eq!(octet_length, 2, "the length must land on the octet pointer");
         assert_eq!(
-            indicator, -99,
-            "a non-NULL value must never touch the indicator pointer"
+            indicator, 0,
+            "a non-NULL value must clear a stale SQL_NULL_DATA on a split indicator"
         );
+    }
+
+    /// A split indicator must not be disturbed on a row where the two
+    /// pointers happen to alias (the ordinary `SQLBindCol` shape) beyond what
+    /// the length write itself does — there is no separate "clear" step
+    /// observable in that case since both writes land on the same memory.
+    #[test]
+    fn a_non_null_value_still_overwrites_an_aliased_indicator_via_the_length_write() {
+        let mut value = 0_i32;
+        let mut shared: SqlLen = SQL_NULL_DATA;
+        let b = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_SLONG,
+            target_value_ptr: (&mut value as *mut i32).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut shared,
+            octet_length_ptr: &mut shared,
+        };
+        let outcome = unsafe { deliver_fixed_bound(&b, 0, 0, 9_i32) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(shared, 4, "the aliased pointer ends up holding the length");
     }
 
     #[test]
