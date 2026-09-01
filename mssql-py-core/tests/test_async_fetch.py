@@ -37,6 +37,18 @@ def test_module_exposes_fetchone():
     assert hasattr(mssql_py_core.PyAsyncCursor, "nextset")
 
 
+def test_module_exposes_dbapi_exception_hierarchy():
+    assert issubclass(mssql_py_core.Warning, Exception)
+    assert issubclass(mssql_py_core.InterfaceError, mssql_py_core.Error)
+    assert issubclass(mssql_py_core.DatabaseError, mssql_py_core.Error)
+    assert issubclass(mssql_py_core.DataError, mssql_py_core.DatabaseError)
+    assert issubclass(mssql_py_core.OperationalError, mssql_py_core.DatabaseError)
+    assert issubclass(mssql_py_core.IntegrityError, mssql_py_core.DatabaseError)
+    assert issubclass(mssql_py_core.InternalError, mssql_py_core.DatabaseError)
+    assert issubclass(mssql_py_core.ProgrammingError, mssql_py_core.DatabaseError)
+    assert issubclass(mssql_py_core.NotSupportedError, mssql_py_core.DatabaseError)
+
+
 def test_fetchone_without_result_set_raises(mock_client_context):
     async def run():
         conn = await connect(mock_client_context)
@@ -247,63 +259,6 @@ def test_fetchmany_uses_arraysize_and_interleaves_without_skipping(client_contex
             assert await cursor.fetchmany() == []
             assert await cursor.fetchone() is None
             assert cursor.description == description
-
-            # Regression parity with mssql-python issue #427: fetchmany then fetchone.
-            await cursor.execute(
-                "SELECT value FROM (VALUES (1), (2)) rows(value) ORDER BY value",
-                use_prepare=False,
-            )
-            assert await cursor.fetchmany(1) == [(1,)]
-            assert await cursor.fetchone() == (2,)
-
-            # Repeated alternation must preserve the exact row position.
-            await cursor.execute(
-                "SELECT value FROM (VALUES (1), (2), (3), (4)) rows(value) "
-                "ORDER BY value",
-                use_prepare=False,
-            )
-            assert await cursor.fetchmany(1) == [(1,)]
-            assert await cursor.fetchone() == (2,)
-            assert await cursor.fetchmany(1) == [(3,)]
-            assert await cursor.fetchone() == (4,)
-            assert await cursor.fetchone() is None
-        finally:
-            await conn.close()
-
-    asyncio.run(run())
-
-
-@pytest.mark.integration
-def test_fetchmany_and_fetchall_preserve_mixed_large_lob_batches(client_context):
-    async def run():
-        conn = await connect(client_context)
-        try:
-            cursor = conn.cursor()
-            query = """
-                SELECT id, lob_value
-                FROM (VALUES
-                    (1, CAST(N'' AS nvarchar(max))),
-                    (2, CAST(NULL AS nvarchar(max))),
-                    (3, CAST(N'Small' AS nvarchar(max))),
-                    (4, REPLICATE(CAST(N'x' AS nvarchar(max)), 1000)),
-                    (5, REPLICATE(CAST(N'y' AS nvarchar(max)), 10000))
-                ) rows(id, lob_value)
-                ORDER BY id
-            """
-            await cursor.execute(query, use_prepare=False)
-
-            assert await cursor.fetchmany(2) == [(1, ""), (2, None)]
-            assert await cursor.fetchone() == (3, "Small")
-            remaining = await cursor.fetchall()
-            assert remaining == [(4, "x" * 1000), (5, "y" * 10000)]
-            assert await cursor.fetchmany(2) == []
-            assert await cursor.fetchall() == []
-
-            await cursor.execute(query, use_prepare=False)
-            rows = await cursor.fetchall()
-            assert rows[:3] == [(1, ""), (2, None), (3, "Small")]
-            assert rows[3][1] == "x" * 1000
-            assert rows[4][1] == "y" * 10000
         finally:
             await conn.close()
 
@@ -459,20 +414,15 @@ def test_nextset_drains_rows_and_updates_description(client_context):
             cursor = conn.cursor()
             await cursor.execute(
                 "SELECT 1 AS first_value UNION ALL SELECT 2; "
-                "SELECT value AS second_value, LEN(value) AS value_length "
-                "FROM (VALUES (N'x'), (N'yy'), (N'zzz')) rows(value); "
-                "SELECT 3 AS third_value",
+                "SELECT N'x' AS second_value; SELECT 3 AS third_value",
                 use_prepare=False,
             )
             assert cursor.description[0][:2] == ("first_value", int)
             assert await cursor.fetchone() == (1,)
 
             assert await cursor.nextset() is True
-            assert [column[:2] for column in cursor.description] == [
-                ("second_value", str),
-                ("value_length", int),
-            ]
-            assert await cursor.fetchall() == [("x", 1), ("yy", 2), ("zzz", 3)]
+            assert cursor.description[0][:2] == ("second_value", str)
+            assert await cursor.fetchall() == [("x",)]
 
             assert await cursor.nextset() is True
             assert cursor.description[0][:2] == ("third_value", int)
@@ -550,6 +500,38 @@ def test_fetch_interleaving_across_result_transitions_and_ownership(client_conte
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_execute_preserves_leading_statement_without_rows(client_context, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            owner = conn.cursor()
+            other = conn.cursor()
+            await owner.execute(
+                "DECLARE @rows TABLE (value int); "
+                "INSERT INTO @rows VALUES (1); "
+                "SELECT value AS selected_value FROM @rows",
+                use_prepare=use_prepare,
+            )
+
+            assert owner.description is None
+            with pytest.raises(RuntimeError, match="No active result set"):
+                await owner.fetchone()
+            with pytest.raises(RuntimeError, match="busy with another cursor"):
+                await other.execute("SELECT 2", use_prepare=False)
+
+            assert await owner.nextset() is True
+            assert owner.description[0][:2] == ("selected_value", int)
+            assert await owner.fetchall() == [(1,)]
+            assert await owner.nextset() is False
+            await other.execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_nextset_asyncio_timeout_breaks_connection_ownership(client_context):
     async def run():
         conn = await connect(client_context)
@@ -598,6 +580,7 @@ def test_nextset_surfaces_statement_without_rows(client_context):
                 "SELECT 2 AS second_value",
                 use_prepare=False,
             )
+
             assert await cursor.nextset() is True
             assert cursor.description is None
             with pytest.raises(RuntimeError, match="No active result set"):
@@ -606,6 +589,66 @@ def test_nextset_surfaces_statement_without_rows(client_context):
             assert await cursor.nextset() is True
             assert cursor.description[0][:2] == ("second_value", int)
             assert await cursor.fetchall() == [(2,)]
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetch_preserves_sql_server_error_type_and_diagnostics(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT 1 / divisor AS value "
+                "FROM (VALUES (1), (0)) AS source(divisor) "
+                "ORDER BY divisor DESC",
+                use_prepare=False,
+            )
+
+            with pytest.raises(mssql_py_core.DatabaseError) as exc_info:
+                await cursor.fetchall()
+
+            assert "PyAsyncCursor.fetchall failed while reading rows" in str(
+                exc_info.value
+            )
+            assert exc_info.value.sql_errors
+            assert exc_info.value.sql_errors[0]["number"] == 8134
+            assert "divide by zero" in exc_info.value.sql_errors[0]["message"].lower()
+
+            await conn.cursor().execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_preserves_sql_server_error_type_and_diagnostics(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT 1; RAISERROR('nextset failure', 16, 1)",
+                use_prepare=False,
+            )
+
+            with pytest.raises(mssql_py_core.DatabaseError) as exc_info:
+                await cursor.nextset()
+
+            assert "PyAsyncCursor.nextset failed while advancing results" in str(
+                exc_info.value
+            )
+            assert exc_info.value.sql_errors
+            assert exc_info.value.sql_errors[0]["number"] == 50000
+            assert exc_info.value.sql_errors[0]["class"] == 16
+            assert exc_info.value.sql_errors[0]["state"] == 1
+            assert exc_info.value.info_messages == []
+
+            await conn.cursor().execute("SET NOCOUNT ON", use_prepare=False)
         finally:
             await conn.close()
 

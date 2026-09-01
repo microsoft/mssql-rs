@@ -144,12 +144,17 @@ impl ExecuteResources {
 
 enum ExecuteOutcome {
     Idle,
-    Fetching(Vec<ColumnMetadata>),
+    NoRows,
+    Rows(Vec<ColumnMetadata>),
 }
 
 impl ExecuteOutcome {
     fn has_open_batch(&self) -> bool {
-        matches!(self, Self::Fetching(_))
+        !matches!(self, Self::Idle)
+    }
+
+    fn has_rows(&self) -> bool {
+        matches!(self, Self::Rows(_))
     }
 }
 
@@ -252,13 +257,10 @@ async fn execute_on_client(
             .execute_sp_executesql(operation, rpc_parameters, options)
             .await?
     };
-    if !matches!(first, StatementResult::Rows) {
-        client.advance_to_rows().await?;
-    }
-    Ok(if client.has_open_batch() {
-        ExecuteOutcome::Fetching(client.get_metadata().clone())
-    } else {
-        ExecuteOutcome::Idle
+    Ok(match first {
+        StatementResult::Rows => ExecuteOutcome::Rows(client.get_metadata().clone()),
+        StatementResult::NoRows { .. } if client.has_open_batch() => ExecuteOutcome::NoRows,
+        StatementResult::NoRows { .. } | StatementResult::End => ExecuteOutcome::Idle,
     })
 }
 
@@ -342,13 +344,14 @@ pub(crate) fn execute<'py>(
         match result {
             Ok(outcome) => {
                 let has_open_batch = outcome.has_open_batch();
+                let has_result_set = outcome.has_rows();
                 operation_guard.finish_execute(has_open_batch);
                 let metadata = match outcome {
-                    ExecuteOutcome::Idle => None,
-                    ExecuteOutcome::Fetching(metadata) => Some(metadata),
+                    ExecuteOutcome::Rows(metadata) => Some(metadata),
+                    ExecuteOutcome::Idle | ExecuteOutcome::NoRows => None,
                 };
                 let column_count = metadata.as_ref().map_or(0, Vec::len);
-                future_fetch_state.set(if has_open_batch {
+                future_fetch_state.set(if has_result_set {
                     FetchStatus::Ready
                 } else {
                     FetchStatus::NoResultSet
@@ -372,7 +375,7 @@ pub(crate) fn execute<'py>(
                 let description_materialization_ms = description_started.elapsed().as_millis();
                 future_description_state.replace(description);
                 tracing::info!(
-                    "PyAsyncCursor::execute: query executed successfully; has_result_set={has_open_batch}; column_count={column_count}; description_materialization_ms={description_materialization_ms}"
+                    "PyAsyncCursor::execute: query executed successfully; has_result_set={has_result_set}; column_count={column_count}; description_materialization_ms={description_materialization_ms}; has_open_batch={has_open_batch}"
                 );
                 Ok(cursor)
             }

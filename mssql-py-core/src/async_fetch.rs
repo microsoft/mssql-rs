@@ -17,6 +17,7 @@ use tracing::instrument::WithSubscriber;
 
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
+use crate::async_errors::map_tds_error;
 use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
 use crate::row_writer::PyRowWriter;
 
@@ -301,16 +302,18 @@ async fn fetch_rows_on_client(client: &mut TdsClient, limit: usize) -> Result<Fe
 
 fn map_fetch_error(operation: &str, error: Error, elapsed_ms: u128) -> PyErr {
     tracing::error!("PyAsyncCursor::{operation}: failed; elapsed_ms={elapsed_ms}; error={error}");
-    pyo3::exceptions::PyRuntimeError::new_err(format!(
-        "PyAsyncCursor.{operation} failed while reading rows: {error}"
-    ))
+    map_tds_error(
+        &format!("PyAsyncCursor.{operation} failed while reading rows"),
+        error,
+    )
 }
 
 fn map_nextset_error(error: Error, elapsed_ms: u128) -> PyErr {
     tracing::error!("PyAsyncCursor::nextset: failed; elapsed_ms={elapsed_ms}; error={error}");
-    pyo3::exceptions::PyRuntimeError::new_err(format!(
-        "PyAsyncCursor.nextset failed while advancing results: {error}"
-    ))
+    map_tds_error(
+        "PyAsyncCursor.nextset failed while advancing results",
+        error,
+    )
 }
 
 fn fetch<'py>(
@@ -647,22 +650,28 @@ mod tests {
     }
 
     #[test]
-    fn maps_fetch_error_to_python_runtime_error() {
+    fn maps_fetch_protocol_error_to_python_internal_error() {
         let error = map_fetch_error(
             "fetchone",
             Error::ProtocolError("invalid row token".to_string()),
             7,
         );
 
+        pyo3::Python::attach(|py| {
+            assert!(error.is_instance_of::<crate::async_errors::InternalError>(py));
+        });
         assert!(error.to_string().contains(
             "PyAsyncCursor.fetchone failed while reading rows: Protocol Error: invalid row token"
         ));
     }
 
     #[test]
-    fn maps_nextset_error_to_python_runtime_error() {
+    fn maps_nextset_protocol_error_to_python_internal_error() {
         let error = map_nextset_error(Error::ProtocolError("invalid result token".to_string()), 7);
 
+        pyo3::Python::attach(|py| {
+            assert!(error.is_instance_of::<crate::async_errors::InternalError>(py));
+        });
         assert!(error.to_string().contains(
             "PyAsyncCursor.nextset failed while advancing results: Protocol Error: invalid result token"
         ));
