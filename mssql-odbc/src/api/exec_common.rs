@@ -467,6 +467,8 @@ pub(super) unsafe fn build_named_params(
                 value_ptr: bound_param.parameter_value_ptr,
                 expected_len: dae_expected_length(indicator),
                 needs_transcode: dae_stream.needs_transcode,
+                c_type: bound_param.c_type,
+                sql_type: bound_param.sql_type,
             });
             params.push(rpc);
         } else {
@@ -1122,7 +1124,9 @@ mod tests {
                 bound_index: 1,
                 value_ptr: std::ptr::null_mut(),
                 expected_len: None,
-                needs_transcode: false
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR
             }]
         );
     }
@@ -1155,7 +1159,9 @@ mod tests {
                 bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len: Some(7),
-                needs_transcode: false
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR
             }]
         );
     }

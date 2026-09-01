@@ -486,6 +486,15 @@ pub(crate) struct DaeParam {
     /// [`DaeProgress::pending_bytes`] instead of writing them to the wire, and
     /// they are transcoded once, as a whole, when the parameter closes.
     pub(crate) needs_transcode: bool,
+    /// `BoundParam::c_type` / `BoundParam::sql_type`, snapshotted here at the
+    /// same time as `needs_transcode` rather than re-read from
+    /// `StmtState::bound_params` at close time. `SQLFreeStmt(SQL_RESET_PARAMS)`
+    /// can clear a binding while its data-at-execution sequence is still open,
+    /// and a rebind could change the encoding after the wire placeholder was
+    /// already fixed; the snapshot can neither vanish nor drift underneath the
+    /// sequence it describes.
+    pub(crate) c_type: SqlSmallInt,
+    pub(crate) sql_type: SqlSmallInt,
 }
 
 /// How much of the open data-at-execution parameter the application has

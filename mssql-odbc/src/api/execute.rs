@@ -572,7 +572,9 @@ mod tests {
                         bound_index: 0,
                         value_ptr: std::ptr::null_mut(),
                         expected_len: None,
-                        needs_transcode: false
+                        needs_transcode: false,
+                        c_type: SQL_C_CHAR,
+                        sql_type: SQL_VARCHAR
                     }]
                 );
                 assert_eq!(dae.params.len(), 1, "one param in list");

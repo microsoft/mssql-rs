@@ -159,7 +159,12 @@ fn sql_param_data_safe(
     // Snapshot what's needed to transcode the parameter being closed -- when
     // its C type and SQL type disagreed on wideness, `SQLPutData` buffered its
     // bytes instead of streaming them (see `dae_placeholder_type`) -- and take
-    // the TDS client out of stmt_state while we do I/O.
+    // the TDS client out of stmt_state while we do I/O. `c_type`/`sql_type`
+    // come from the `DaeParam` snapshot taken at execution time, not a fresh
+    // `bound_params` lookup: `SQLFreeStmt(SQL_RESET_PARAMS)` can clear that
+    // binding while this sequence is still open, and a rebind could change the
+    // encoding after the wire placeholder was already fixed, so re-reading it
+    // here could silently commit an empty value instead of the buffered one.
     let (mut client, transcode) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned taking dae_client");
@@ -174,10 +179,9 @@ fn sql_param_data_safe(
             if !param.needs_transcode {
                 return None;
             }
-            let bound = stmt_state.bound_params.get(param.bound_index)?.as_ref()?;
             Some((
-                bound.c_type,
-                bound.sql_type,
+                param.c_type,
+                param.sql_type,
                 dae.progress.pending_bytes.clone(),
             ))
         });
@@ -202,7 +206,8 @@ fn sql_param_data_safe(
     // from an application that called `SQLPutData` once with the whole value
     // -- the wire never sees the untranscoded bytes.
     if let Some((c_type, sql_type, pending_bytes)) = transcode {
-        let wire_bytes = transcode_dae_bytes(c_type, sql_type, pending_bytes);
+        let db_collation = client.get_collation();
+        let wire_bytes = transcode_dae_bytes(c_type, sql_type, pending_bytes, db_collation);
         if let Err(e) = dbc
             .runtime
             .block_on(client.write_streamed_chunk(&wire_bytes))
@@ -324,7 +329,7 @@ fn sql_param_data_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
@@ -335,6 +340,8 @@ mod tests {
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
                 needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR,
             }],
             Some(0),
         )
@@ -372,6 +379,8 @@ mod tests {
                     value_ptr: token_ptr,
                     expected_len: None,
                     needs_transcode: false,
+                    c_type: SQL_C_CHAR,
+                    sql_type: SQL_VARCHAR,
                 }],
                 None,
             ));

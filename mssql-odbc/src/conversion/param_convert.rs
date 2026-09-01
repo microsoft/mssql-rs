@@ -18,12 +18,13 @@
 //! A `SQL_NULL_DATA` parameter is materialised as a typed TDS NULL from
 //! `sql_type` -- see [`typed_null`].
 
-use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{
     RpcParameter, RpcTypeMetadata, StatusFlags, StreamedSqlType,
 };
+use mssql_tds::token::tokens::SqlCollation;
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
@@ -254,10 +255,19 @@ pub(crate) fn dae_placeholder_type(
 /// `SQLBindParameter` call; applying that same transform to the whole
 /// streamed value at once, rather than to one `SQLPutData` chunk, is what
 /// makes it safe to call -- see `sql_param_data_safe` in `api::param_data`.
+///
+/// A wide result is already UTF-16LE, the wire encoding `write_streamed_chunk`
+/// expects verbatim. A narrow result is not: `AppText::transcode` produces
+/// UTF-8, which is this driver's own C-side convention, not a wire encoding --
+/// the materialized path re-encodes narrow output through `db_collation` at
+/// serialization time (`tds_value_serializer.rs`), and a streamed write has to
+/// do the same itself before the bytes reach the wire, or a non-ASCII value
+/// round-trips as mojibake under a non-UTF8 collation.
 pub(crate) fn transcode_dae_bytes(
     c_type: SqlSmallInt,
     sql_type: SqlSmallInt,
     bytes: Vec<u8>,
+    db_collation: SqlCollation,
 ) -> Vec<u8> {
     let source = if c_type == SQL_C_WCHAR {
         AppText::Utf16(bytes)
@@ -265,7 +275,11 @@ pub(crate) fn transcode_dae_bytes(
         AppText::Utf8(bytes)
     };
     match source.transcode(is_wide_character_sql_type(sql_type)) {
-        AppText::Utf8(bytes) | AppText::Utf16(bytes) => bytes,
+        AppText::Utf16(bytes) => bytes,
+        AppText::Utf8(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            encode_narrow(&text, db_collation)
+        }
     }
 }
 
@@ -1114,21 +1128,60 @@ mod tests {
     /// otherwise a narrow column would receive UTF-16LE bytes under a wide
     /// declaration, or vice versa, regardless of transcoding.
     #[test]
-    fn transcode_dae_bytes_round_trips_both_directions() {
+    fn transcode_dae_bytes_wide_round_trips() {
         let wide_bytes: Vec<u8> = "caf\u{e9}"
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect();
-        let narrow = transcode_dae_bytes(SQL_C_WCHAR, SQL_VARCHAR, wide_bytes);
+        let narrow = transcode_dae_bytes(SQL_C_WCHAR, SQL_VARCHAR, wide_bytes, utf8_collation());
         assert_eq!(String::from_utf8(narrow).unwrap(), "caf\u{e9}");
 
         let narrow_bytes = "caf\u{e9}".as_bytes().to_vec();
-        let wide = transcode_dae_bytes(SQL_C_CHAR, SQL_WVARCHAR, narrow_bytes);
+        let wide = transcode_dae_bytes(SQL_C_CHAR, SQL_WVARCHAR, narrow_bytes, utf8_collation());
         let wide_units: Vec<u16> = wide
             .chunks_exact(2)
             .map(|p| u16::from_le_bytes([p[0], p[1]]))
             .collect();
         assert_eq!(String::from_utf16(&wide_units).unwrap(), "caf\u{e9}");
+    }
+
+    /// The narrow direction has to land on the *connection's* collation, not
+    /// this driver's own UTF-8 C-side convention -- otherwise a non-ASCII
+    /// value silently corrupts under any collation that isn't itself UTF-8.
+    /// Windows-1252 encodes 'é' as the single byte 0xE9; naive UTF-8
+    /// passthrough would instead send 0xC3 0xA9, mojibake to a server
+    /// expecting Windows-1252.
+    #[test]
+    fn transcode_dae_bytes_narrow_uses_the_connection_collation() {
+        let wide_bytes: Vec<u8> = "caf\u{e9}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let narrow = transcode_dae_bytes(
+            SQL_C_WCHAR,
+            SQL_VARCHAR,
+            wide_bytes,
+            windows_1252_collation(),
+        );
+        assert_eq!(narrow, b"caf\xe9");
+    }
+
+    fn utf8_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40, // fUTF8
+            sort_id: 0,
+        }
+    }
+
+    fn windows_1252_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        }
     }
 
     /// A parameter that reaches value conversion still carrying a

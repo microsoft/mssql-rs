@@ -85,7 +85,7 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_INVALID_HANDLE;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_INVALID_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState, STMT_STATE_EXEC_STARTED};
     use crate::test_support::TestHandles;
 
@@ -96,6 +96,8 @@ mod tests {
                 value_ptr: std::ptr::null_mut(),
                 expected_len: None,
                 needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR,
             }],
             cursor,
         )

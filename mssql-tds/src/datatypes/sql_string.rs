@@ -51,6 +51,25 @@ fn lcid_encoding_or_fallback(collation: SqlCollation) -> &'static encoding_rs::E
     }
 }
 
+/// Encodes `text` for the wire under `collation`'s narrow encoding: UTF-8 when
+/// the collation is UTF-8-aware, or its single-byte LCID codepage otherwise
+/// (falling back to Windows-1252 for an LCID this crate does not map).
+///
+/// Mirrors the encoding step [`get_encoding_type`] and the serializer's
+/// `VARCHAR | CHAR | TEXT` arm perform for a materialized value, for a caller
+/// that must produce collation-correct wire bytes directly instead of routing
+/// through that serializer -- e.g. a data-at-execution write, which streams
+/// bytes to the wire before the normal parameter-serialization path runs.
+pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
+    if collation.utf8() {
+        return text.as_bytes().to_vec();
+    }
+    lcid_encoding_or_fallback(collation)
+        .encode(text)
+        .0
+        .into_owned()
+}
+
 impl EncodingType {
     /// The encoding these bytes are in, or `None` when the collation is not yet
     /// known ([`EncodingType::DelayedSet`]).
@@ -499,5 +518,41 @@ mod tests {
 
         let utf8_str = SqlString::new(b"test".to_vec(), EncodingType::Utf8);
         assert!(utf8_str.as_utf16_bytes().is_none());
+    }
+
+    #[test]
+    fn encode_narrow_uses_the_lcid_codepage_for_a_non_utf8_collation() {
+        let collation = SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(encode_narrow("Caf\u{e9}", collation), b"Caf\xe9");
+    }
+
+    #[test]
+    fn encode_narrow_passes_through_utf8_for_a_utf8_collation() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40, // fUTF8
+            sort_id: 0,
+        };
+        assert_eq!(
+            encode_narrow("Caf\u{e9}", collation),
+            "Caf\u{e9}".as_bytes()
+        );
+    }
+
+    #[test]
+    fn encode_narrow_falls_back_to_windows_1252_for_an_unmapped_lcid() {
+        let collation = SqlCollation {
+            info: 0x000F_FFFF,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(encode_narrow("Caf\u{e9}", collation), b"Caf\xe9");
     }
 }

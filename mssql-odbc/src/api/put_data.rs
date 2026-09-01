@@ -304,12 +304,37 @@ unsafe fn sql_put_data_safe(
             // the raw bytes instead; the whole value is transcoded once,
             // when the parameter closes (`sql_param_data_safe`).
             //
-            // Safety: caller guarantees data_ptr is readable for byte_count
-            // bytes, and byte_count > 0 here, so data_ptr is non-null (the
-            // null+nonzero-length combination was already rejected above).
-            let chunk = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) };
-            if let Some(dae) = stmt_state.dae.as_mut() {
-                dae.progress.pending_bytes.extend_from_slice(chunk);
+            // Still checked out and immediately returned, exactly like the
+            // streaming branch below: `checkout_client` is this sequence's
+            // only mutual-exclusion signal against a concurrent
+            // `SQLParamData`, which checks the client out for the whole
+            // close and snapshots `pending_bytes` to transcode under the
+            // same lock. Skipping the checkout here would let this call
+            // append after that snapshot and still report success, so the
+            // bytes it appended would be silently discarded rather than
+            // sent.
+            match stmt_state
+                .dae
+                .as_mut()
+                .and_then(|dae| dae.checkout_client())
+            {
+                Some(client) => {
+                    // Safety: caller guarantees data_ptr is readable for
+                    // byte_count bytes, and byte_count > 0 here, so
+                    // data_ptr is non-null (the null+nonzero-length
+                    // combination was already rejected above).
+                    let chunk =
+                        unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) };
+                    if let Some(dae) = stmt_state.dae.as_mut() {
+                        dae.progress.pending_bytes.extend_from_slice(chunk);
+                        dae.return_client(client);
+                    }
+                }
+                None => {
+                    error!("SQLPutData: DAE client is unavailable — internal state corruption");
+                    post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                    return SQL_ERROR;
+                }
             }
             None
         } else {
@@ -395,7 +420,7 @@ unsafe fn sql_put_data_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
@@ -407,6 +432,8 @@ mod tests {
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
                 needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR,
             }],
             Some(0),
         )
@@ -646,15 +673,19 @@ mod tests {
         assert!(!dae.progress.put_data_called);
     }
 
-    /// A parameter whose C type and SQL type disagree on wideness cannot be
-    /// transcoded one `SQLPutData` call at a time (see `dae_placeholder_type`),
-    /// so its chunks are buffered here instead of written to the wire. This
-    /// must succeed with no client parked at all -- proving the buffering path
-    /// never touches the network -- unlike a normal (streamed) chunk, which
-    /// `failed_client_checkout_leaves_progress_untouched` shows fails without
-    /// one.
+    /// A parameter whose C type and SQL type disagree on wideness still needs
+    /// the checked-out client as this sequence's only mutual-exclusion signal
+    /// against a concurrent `SQLParamData` -- even though the buffered write
+    /// itself never touches the network. `SQLParamData` checks the client out
+    /// for the whole close and snapshots `pending_bytes` to transcode under
+    /// the same lock; skipping the checkout here would let a buffered chunk
+    /// land after that snapshot and still report success, silently discarding
+    /// the bytes it appended. No client to check out is therefore the same
+    /// "something else is using this sequence" state
+    /// `failed_client_checkout_leaves_progress_untouched` covers for the
+    /// streaming path.
     #[test]
-    fn transcoded_param_buffers_chunks_without_a_client() {
+    fn transcoded_param_without_a_client_returns_hy010() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
@@ -665,27 +696,23 @@ mod tests {
                     value_ptr: std::ptr::null_mut(),
                     expected_len: None,
                     needs_transcode: true,
+                    c_type: crate::api::odbc_types::SQL_C_WCHAR,
+                    sql_type: SQL_VARCHAR,
                 }],
                 Some(0),
             ));
         }
 
-        let to_utf16le =
-            |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
-        let mut first = to_utf16le("caf\u{e9}");
-        let ret = unsafe { sql_put_data(h.stmt, first.as_mut_ptr().cast(), first.len() as SqlLen) };
-        assert_eq!(ret, SQL_SUCCESS, "a buffered chunk must not need a client");
-
-        let mut second = to_utf16le("!");
-        let ret =
-            unsafe { sql_put_data(h.stmt, second.as_mut_ptr().cast(), second.len() as SqlLen) };
-        assert_eq!(ret, SQL_SUCCESS);
+        let mut bytes: Vec<u8> = "ab".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let len = bytes.len() as SqlLen;
+        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), len) };
+        assert_eq!(ret, SQL_ERROR);
 
         let state = stmt.inner.lock().unwrap();
         let dae = state.dae.as_ref().expect("sequence still active");
-        assert!(dae.progress.put_data_called);
-        assert_eq!(dae.progress.bytes_sent, first.len() + second.len());
-        assert_eq!(dae.progress.pending_bytes, to_utf16le("caf\u{e9}!"));
+        assert_eq!(dae.progress.bytes_sent, 0);
+        assert!(!dae.progress.put_data_called);
+        assert!(dae.progress.pending_bytes.is_empty());
     }
 
     #[test]
