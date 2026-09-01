@@ -696,13 +696,52 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
     EXPECT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// Streaming writes SQLPutData chunks to the wire untranscoded - a UTF-8
-// sequence can straddle two calls - so the streamed type must be the one the C
-// buffer already holds. A cross-family binding is therefore refused at execute
-// rather than declared nvarchar and sent as UTF-8. The materialized path does
-// transcode it, so the two paths deliberately differ until AB#47590 lands.
+// Streaming used to require the C type and SQL type to agree on wideness --
+// SQL_C_CHAR only against a narrow SQL type, SQL_C_WCHAR only against a wide
+// one -- because SQLPutData writes chunks to the wire untranscoded, and a
+// chunk transcoded in isolation could split a multi-byte character across two
+// calls. That pairing is now buffered instead of streamed chunk-by-chunk, and
+// the whole value is transcoded once the parameter closes, matching what the
+// materialized path already does (AB#47590).
 //
-// msodbcsql supports the pairing, hence the skip.
+// msodbcsql has always supported this pairing, so the parity run is no longer
+// skipped here.
+TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_WVARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    const char first_chunk[] = "strea";
+    const char second_chunk[] = "med";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first_chunk), 5),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second_chunk), 3),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("streamed", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A genuine cross-*family* pairing -- character streamed against a binary SQL
+// type, or the reverse -- has no transcode to fall back on: there is nothing
+// it could mean other than one side declaring one encoding and sending
+// another, so it is still refused at execute rather than risking corruption.
+//
+// msodbcsql's behavior for this pairing has not been characterized, so the
+// parity run stays skipped, as it was before this pairing was split out from
+// the wideness-mismatch case above.
 TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -710,8 +749,8 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
     SQLCHAR token = 0;
-    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
-                                   SQL_WVARCHAR, 0, 0, &token, 0, &ind),
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY,
+                                   SQL_VARCHAR, 0, 0, &token, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
