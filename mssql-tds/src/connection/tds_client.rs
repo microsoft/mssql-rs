@@ -6489,22 +6489,48 @@ impl TdsClient {
     /// Begin a new transaction with the given isolation level and optional name.
     ///
     /// Fails if a batch is currently executing. Use [`has_active_transaction`](Self::has_active_transaction)
-    /// to check whether a transaction is already open.
+    /// to check whether a transaction is already open. Runs unbounded — see
+    /// [`begin_transaction_with_options`](Self::begin_transaction_with_options)
+    /// to bound the wait (e.g. with a statement's `SQL_ATTR_QUERY_TIMEOUT`).
     #[instrument(skip(self), level = "info")]
     pub async fn begin_transaction(
         &mut self,
         isolation_level: TransactionIsolationLevel,
         name: Option<String>,
     ) -> TdsResult<()> {
+        self.begin_transaction_with_options(isolation_level, name, ())
+            .await
+    }
+
+    /// Like [`begin_transaction`](Self::begin_transaction), but honors
+    /// `options` — in particular its timeout, so an implicit transaction begin
+    /// (e.g. the autocommit-off prologue a driver runs before every statement)
+    /// cannot wait past a caller-supplied deadline. Mirrors msodbcsql's
+    /// `CheckOptions`, which passes `GetQueryTimeOut(lpstmt)` to
+    /// `ExecTMRImmediate` (`sqlccmd.cpp:10572-10586`).
+    #[instrument(skip(self, options), level = "info")]
+    pub async fn begin_transaction_with_options<'a>(
+        &mut self,
+        isolation_level: TransactionIsolationLevel,
+        name: Option<String>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<()> {
         if self.command_is_busy() {
             return Err(UsageError(
                 "Cannot begin transaction while another batch is executing.".to_string(),
             ));
         }
+        let ExecuteOptions {
+            timeout, cancel, ..
+        } = options.into();
 
         self.begin_command();
-        // begin_transaction has no command timeout — use connect_timeout as fallback.
-        let _reconnect_elapsed = self.check_and_reconnect(None, None).await?;
+        let reconnect_elapsed = self.check_and_reconnect(timeout, cancel).await?;
+        let budget = Self::deduct_timeout(timeout, reconnect_elapsed);
+        let resolved = budget.into_timeout()?;
+        let timeout_sec = resolved.seconds();
+        self.remaining_request_timeout = resolved.duration();
+        self.cancel_handle = cancel.map(|handle| handle.child_handle());
 
         let transaction_params = TransactionManagementType::Begin(CreateTxnParams {
             level: isolation_level,
@@ -6513,7 +6539,7 @@ impl TdsClient {
         let transaction =
             TransactionManagementRequest::new(transaction_params, &self.execution_context);
         let mut packet_writer =
-            transaction.create_packet_writer(self.transport.as_writer(), None, None);
+            transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
         transaction.serialize(&mut packet_writer).await?;
 
         self.consume_transaction_response().await?;

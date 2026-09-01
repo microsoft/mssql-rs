@@ -318,9 +318,10 @@ pub(crate) struct StmtState {
     /// timeout. Seeded at allocation from the parent connection's
     /// [`DbcState::stmt_query_timeout`].
     ///
-    /// Stored and reported only — enforcement against a running query is
-    /// tracked separately (AB#46385), so a non-zero value does not yet cancel
-    /// anything. msodbcsql does enforce it and answers `HYT00` on expiry.
+    /// Enforced against a running query (AB#46385): threaded into
+    /// [`ExecuteOptions`](mssql_tds::connection::tds_client::ExecuteOptions)
+    /// for every `execute*` call, so a non-zero value bounds the wait and
+    /// surfaces `HYT00` on expiry, matching msodbcsql.
     pub(crate) query_timeout: u32,
     /// `SQL_ATTR_MAX_ROWS`: cap on the number of rows returned from each result
     /// set; `0` (the ODBC default) means no cap.

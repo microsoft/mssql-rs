@@ -11,7 +11,7 @@
 //! batch (`sqlcmisc.cpp:1760`), so the transaction-manager request carries
 //! `NoChange` and inherits the session setting.
 
-use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::connection::tds_client::{ExecuteOptions, TdsClient};
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use tracing::{debug, error};
 
@@ -266,10 +266,15 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
 /// as holding user work. Called immediately before every statement execution;
 /// on failure the caller unwinds through `fail_with_tds`.
 ///
-/// Mirrors msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`). Running it
-/// per statement — rather than only at the autocommit switch — is what recovers
-/// from a transaction the server aborted or the application rolled back with
-/// raw T-SQL.
+/// Mirrors msodbcsql's `CheckOptions` (`sqlccmd.cpp:10572-10585`), including
+/// its use of the statement's query timeout: `CheckOptions` passes
+/// `GetQueryTimeOut(lpstmt)` to `ExecTMRImmediate` so this implicit begin
+/// cannot outlast `SQL_ATTR_QUERY_TIMEOUT` any more than the statement it
+/// precedes. `timeout_secs` is that budget (already deducted for any elapsed
+/// time from earlier steps in the same call); `0` means unlimited. Running it
+/// per statement — rather than only at the autocommit switch — is what
+/// recovers from a transaction the server aborted or the application rolled
+/// back with raw T-SQL.
 ///
 /// The transaction-manager request carries `NoChange` so it inherits the
 /// session isolation level already applied by `SET TRANSACTION ISOLATION LEVEL`.
@@ -282,6 +287,7 @@ pub(super) fn begin_transaction_if_manual(
     dbc: &DbcHandle,
     client: &mut TdsClient,
     op: &str,
+    timeout_secs: u32,
 ) -> Result<(), mssql_tds::error::Error> {
     let (autocommit, already_recorded) = match dbc.inner.lock() {
         Ok(state) => (state.autocommit, state.local_tran_started),
@@ -304,8 +310,11 @@ pub(super) fn begin_transaction_if_manual(
         }
     } else {
         debug!("{op}: manual-commit mode with no active transaction — beginning one");
-        dbc.runtime
-            .block_on(client.begin_transaction(TransactionIsolationLevel::NoChange, None))?;
+        dbc.runtime.block_on(client.begin_transaction_with_options(
+            TransactionIsolationLevel::NoChange,
+            None,
+            ExecuteOptions::new().timeout_secs(timeout_secs),
+        ))?;
     }
 
     // The transaction is open on the server at this point; failing to record it

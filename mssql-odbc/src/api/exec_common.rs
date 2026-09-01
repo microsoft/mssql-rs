@@ -10,9 +10,10 @@
 use tracing::error;
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
-use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
-use mssql_tds::error::Error as TdsError;
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementId, TdsClient};
+use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::sqlstate::*;
@@ -342,12 +343,19 @@ pub(super) fn fail_with_tds(
 /// `unprepare`: a transparent reconnect already discarded it server-side, so an
 /// `sp_unprepare` would target a nonexistent handle on the new session.
 ///
+/// `timeout_secs` bounds the wait the same way `SQL_ATTR_QUERY_TIMEOUT` bounds
+/// the execute that follows — `0` means unlimited. Being best-effort, a
+/// timeout here is logged like any other failure rather than propagated: the
+/// caller's own budget (deducted by its elapsed wall-clock time) still gates
+/// the execute that follows.
+///
 /// No lock is held across the network I/O.
 pub(super) fn flush_pending_unprepare(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     client: &mut TdsClient,
     op: &str,
+    timeout_secs: u32,
 ) {
     let pending = match stmt.inner.lock() {
         Ok(mut stmt_state) => stmt_state.pending_unprepare.take(),
@@ -362,9 +370,52 @@ pub(super) fn flush_pending_unprepare(
     // `unprepare` recovers a dead connection first, then drops the handle only
     // if it still belongs to the (recovered) session — a superseded handle is
     // already gone server-side and is skipped without an RPC.
-    if let Err(e) = dbc.runtime.block_on(client.unprepare(handle, ())) {
+    if let Err(e) = dbc
+        .runtime
+        .block_on(client.unprepare(handle, ExecuteOptions::new().timeout_secs(timeout_secs)))
+    {
         error!(%e, "{op}: sp_unprepare failed — handle leaked until disconnect");
     }
+}
+
+/// Deducts elapsed wall-clock time from a `SQL_ATTR_QUERY_TIMEOUT` budget
+/// spent across multiple wire operations performed in sequence before the
+/// caller's own execute — e.g. releasing an orphaned prepared handle, then
+/// beginning an implicit transaction, then the real execute. Mirrors
+/// msodbcsql's `DropPrepHandle` / `CheckOptions`, which charge the same
+/// deducted timeout to each step (`sqlcfunc.cpp:787-828`, `sqlccmd.cpp:10572-10586`).
+///
+/// `0` means unlimited and passes through unchanged. A positive budget is
+/// reduced by `elapsed`, truncated *down* to whole seconds — unlike
+/// `mssql-tds`'s own internal `deduct_timeout`, which rounds a *measured*
+/// recovery duration up to charge it conservatively, `elapsed` here is
+/// measured across steps that may have done no I/O at all (e.g. an
+/// autocommit-on connection skips the transaction begin entirely), so its
+/// value is often a few microseconds of local bookkeeping (mutex locks,
+/// staging). Rounding that up would charge a full second against the budget
+/// for every step regardless of whether it touched the network, spuriously
+/// exhausting a small timeout (e.g. `1`) before any wire wait ever happened.
+/// Truncating instead only ever under-charges by less than one second, and
+/// elapsed time that genuinely meets or exceeds the budget still exhausts it.
+/// Returns `Err(())` once exhausted; the caller must fail with a timeout
+/// rather than send the next step unbounded.
+pub(super) fn deduct_query_timeout(timeout_secs: u32, elapsed: Duration) -> Result<u32, ()> {
+    if timeout_secs == 0 {
+        return Ok(0);
+    }
+    let elapsed_secs = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
+    match timeout_secs.checked_sub(elapsed_secs) {
+        Some(remaining) if remaining > 0 => Ok(remaining),
+        _ => Err(()),
+    }
+}
+
+/// Builds the [`TdsError`] reported when [`deduct_query_timeout`] finds the
+/// budget already exhausted ahead of the caller's own execute.
+pub(super) fn query_timeout_expired_error() -> TdsError {
+    TdsError::TimeoutError(TimeoutErrorType::String(
+        "SQL_ATTR_QUERY_TIMEOUT expired before the statement could be sent".to_string(),
+    ))
 }
 
 /// Result of [`build_named_params`]: the full RPC parameter list (with
@@ -630,6 +681,108 @@ mod tests {
         assert_eq!(dae_expected_length(sql_len_data_at_exec(0)), None);
         assert_eq!(dae_expected_length(sql_len_data_at_exec(1)), Some(1));
         assert_eq!(dae_expected_length(sql_len_data_at_exec(4)), Some(4));
+    }
+
+    #[test]
+    fn deduct_query_timeout_zero_is_unlimited() {
+        assert_eq!(deduct_query_timeout(0, Duration::from_secs(1_000)), Ok(0));
+    }
+
+    #[test]
+    fn deduct_query_timeout_truncates_sub_second_elapsed() {
+        // 1.9s truncates to 1s, so a 10s budget leaves 9s, not 8s.
+        assert_eq!(
+            deduct_query_timeout(10, Duration::from_millis(1_900)),
+            Ok(9)
+        );
+    }
+
+    #[test]
+    fn deduct_query_timeout_exhausted_at_or_past_budget_errs() {
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(5)), Err(()));
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(6)), Err(()));
+    }
+
+    /// The error `execute.rs`/`exec_direct.rs` report when a pre-execute
+    /// `deduct_query_timeout` call finds the budget already exhausted — a
+    /// `TimeoutError`, matching every other query-timeout expiry, so
+    /// `post_tds_error` maps it to `HYT00` (see `sqlstate.rs`'s
+    /// `post_tds_error_timeout_maps_to_hyt00_regardless_of_default`) the same
+    /// way whether the budget ran out before or during the wire call.
+    #[test]
+    fn query_timeout_expired_error_is_a_timeout_error() {
+        match query_timeout_expired_error() {
+            TdsError::TimeoutError(TimeoutErrorType::String(msg)) => {
+                assert!(
+                    msg.contains("SQL_ATTR_QUERY_TIMEOUT"),
+                    "message should name the attribute that expired: {msg}"
+                );
+            }
+            other => panic!("expected TimeoutError(String(_)), got: {other:?}"),
+        }
+    }
+
+    /// `SQLExecDirectW` calls `deduct_query_timeout` twice in sequence — once
+    /// after `flush_pending_unprepare`, once after `begin_transaction_if_manual`
+    /// — each time measuring the *cumulative* elapsed time since the call
+    /// began against the *original, fixed* budget (not the previous call's
+    /// return value). Composing them must charge each step's elapsed time
+    /// exactly once and must not floor away sub-second remainders
+    /// independently at each step: a 10s budget with a 3s unprepare and a 2s
+    /// implicit transaction begin must leave 5s (10 - (3+2)), not the 2s an
+    /// earlier version of this code produced by re-deducting from its own
+    /// shrinking result (`(10-3)-(3+2)=2`, double-charging the first step), or
+    /// the loss a per-step-floored version would suffer with sub-second steps
+    /// — both caught in mssql-rs#442 review by an independent reviewer tracing
+    /// the exact arithmetic; the numbers here are theirs.
+    #[test]
+    fn deduct_query_timeout_composed_twice_charges_each_step_once() {
+        let budget = 10;
+        let after_unprepare = deduct_query_timeout(budget, Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            after_unprepare, 7,
+            "remaining allowance handed to the next step"
+        );
+        let after_begin = deduct_query_timeout(budget, Duration::from_secs(3 + 2)).unwrap();
+        assert_eq!(
+            after_begin, 5,
+            "budget minus total elapsed, not double-charged"
+        );
+    }
+
+    /// Composing from a *fixed* original budget with *cumulative* elapsed
+    /// (what `SQLExecDirectW` now does) is stricter than composing from a
+    /// shrinking budget with each step's own elapsed measured in isolation:
+    /// the latter floors sub-second remainders away independently at every
+    /// step, so two 0.99s pre-execute steps against a 1s budget would each
+    /// charge nothing, letting the following execute start with a fresh 1s —
+    /// about 3x the configured timeout in wall-clock terms before any
+    /// network wait even begins. Deducting cumulatively from the original
+    /// budget catches this instead: composing across the same two steps
+    /// exhausts a 1s budget, matching msodbcsql's own millisecond-granularity
+    /// deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`) not losing
+    /// sub-second remainders.
+    #[test]
+    fn deduct_query_timeout_cumulative_composition_catches_accumulated_sub_second_cost() {
+        let budget = 1;
+        let step_1 = Duration::from_millis(990);
+        let step_2 = Duration::from_millis(990);
+
+        let per_step_reseeded =
+            deduct_query_timeout(deduct_query_timeout(budget, step_1).unwrap(), step_2);
+        assert_eq!(
+            per_step_reseeded,
+            Ok(1),
+            "per-step composition floors each sub-second cost away independently"
+        );
+
+        let cumulative_fixed_budget = deduct_query_timeout(budget, step_1)
+            .and_then(|_| deduct_query_timeout(budget, step_1 + step_2));
+        assert_eq!(
+            cumulative_fixed_budget,
+            Err(()),
+            "cumulative composition against the fixed budget must see the combined cost"
+        );
     }
 
     #[test]
