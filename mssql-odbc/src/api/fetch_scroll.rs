@@ -29,7 +29,7 @@ use mssql_tds::datatypes::column_values::{
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::row_writer::RowWriter;
 use mssql_tds::datatypes::sql_json::SqlJson;
-use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, get_encoding_type};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::error::Error as TdsError;
@@ -40,6 +40,7 @@ use super::sqlstate::*;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
     TextError, column_value_to_text, convert_typed_c, is_typed_c_target, utf16le_chunk_to_utf8,
+    widen_into_pending,
 };
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID,
@@ -62,6 +63,12 @@ use crate::handles::stmt::{
     ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+
+#[derive(Clone, Copy)]
+struct PlpColumnInfo {
+    wire_encoding: PlpEncoding,
+    text_encoding: Option<EncodingType>,
+}
 
 /// Implements SQLFetchScroll for the current forward-only result set.
 ///
@@ -718,7 +725,7 @@ fn fill_rowset(
     // inside the fill loop would make a poisoned mutex indistinguishable from a
     // column that simply is not PLP, which would silently downgrade a supported
     // column to "unsupported" and drain it.
-    let plp_encodings: Vec<Option<PlpEncoding>> = {
+    let plp_columns: Vec<Option<PlpColumnInfo>> = {
         let Ok(ss) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
             if let Ok(mut ds) = dbc.inner.lock() {
@@ -728,7 +735,19 @@ fn fill_rowset(
         };
         ss.column_metadata
             .iter()
-            .map(|m| m.plp_encoding())
+            .map(|metadata| {
+                let wire_encoding = metadata.plp_encoding()?;
+                let text_encoding = match wire_encoding {
+                    PlpEncoding::Utf16Text => Some(EncodingType::Utf16),
+                    PlpEncoding::Utf8Text => Some(EncodingType::Utf8),
+                    PlpEncoding::SingleByteText => Some(get_encoding_type(metadata)),
+                    PlpEncoding::Binary => None,
+                };
+                Some(PlpColumnInfo {
+                    wire_encoding,
+                    text_encoding,
+                })
+            })
             .collect()
     };
     // One scratch buffer for the whole fill: a bound LOB in a wide rowset would
@@ -820,7 +839,7 @@ fn fill_rowset(
                                 binding,
                                 rows_filled as usize,
                                 bind_offset,
-                                plp_encodings.get(column - 1).copied().flatten(),
+                                plp_columns.get(column - 1).copied().flatten(),
                                 &mut plp_scratch,
                             )
                         };
@@ -1054,6 +1073,18 @@ unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
 /// value itself is never materialized, only one chunk at a time.
 const PLP_BOUND_CHUNK: usize = 8 * 1024;
 
+/// Typed conversion needs the complete text literal. Numeric, GUID, and
+/// datetime literals are tiny in practice, so cap that exceptional allocation
+/// rather than letting an arbitrary MAX value exhaust the application process.
+const PLP_TYPED_MATERIALIZE_LIMIT: usize = 1024 * 1024;
+
+fn typed_plp_chunk_fits(current: usize, chunk: usize, known_total: Option<u64>) -> bool {
+    known_total.is_none_or(|total| total <= PLP_TYPED_MATERIALIZE_LIMIT as u64)
+        && current
+            .checked_add(chunk)
+            .is_some_and(|total| total <= PLP_TYPED_MATERIALIZE_LIMIT)
+}
+
 /// The length a bound PLP delivery reports in the indicator.
 ///
 /// Extracted so the rule can be tested without a live server: it was derived by
@@ -1108,9 +1139,47 @@ unsafe fn deliver_bound_plp(
     binding: &ColumnBinding,
     row_index: usize,
     bind_offset: usize,
-    encoding: Option<PlpEncoding>,
+    column_info: Option<PlpColumnInfo>,
     scratch: &mut [u8],
 ) -> Result<RowOutcome, TdsError> {
+    let Some(column_info) = column_info else {
+        drain_plp_to_end(client, runtime, scratch)?;
+        return Ok(RowOutcome::Error(RowIssue::Unsupported));
+    };
+
+    if is_typed_c_target(binding.target_type) {
+        let Some(text_encoding) = column_info.text_encoding else {
+            drain_plp_to_end(client, runtime, scratch)?;
+            return Ok(RowOutcome::Error(RowIssue::Unsupported));
+        };
+        let mut bytes = Vec::new();
+        let mut materializing = true;
+        loop {
+            let chunk = runtime.block_on(client.read_active_plp_chunk(scratch))?;
+            if materializing {
+                materializing = typed_plp_chunk_fits(bytes.len(), chunk.read, chunk.known_total)
+                    && bytes.try_reserve(chunk.read).is_ok();
+                if materializing {
+                    bytes.extend_from_slice(&scratch[..chunk.read]);
+                }
+            }
+            if chunk.reached_end {
+                break;
+            }
+        }
+        if !materializing {
+            return Ok(RowOutcome::Error(RowIssue::Unsupported));
+        }
+        return Ok(unsafe {
+            deliver_bound(
+                binding,
+                row_index,
+                bind_offset,
+                &ColumnValues::String(SqlString::new(bytes, text_encoding)),
+            )
+        });
+    }
+
     let stride = element_stride(binding.target_type, binding.buffer_length);
     let indicator = if binding.strlen_or_ind_ptr.is_null() {
         std::ptr::null_mut()
@@ -1125,20 +1194,30 @@ unsafe fn deliver_bound_plp(
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
-    // Same pairings SQLGetData supports. Three refusals are deliberate and
-    // tracked, not oversights: bound binary delivery (AB#47239), widening
-    // varchar(max)/json to SQL_C_WCHAR, and a max column bound to a typed C
-    // target -- the last two are AB#47767, and both are cases msodbcsql
-    // delivers. The typed one means varchar(50) and varchar(max) differ for the
-    // same bind, since only the non-max path reaches convert_typed_c.
+    // Same text pairings SQLGetData supports. Bound binary delivery remains
+    // tracked separately under AB#47239.
     let target = binding.target_type;
+    let encoding = column_info.wire_encoding;
+    let widen_narrow_to_utf16 = target == SQL_C_WCHAR
+        && matches!(
+            encoding,
+            PlpEncoding::SingleByteText | PlpEncoding::Utf8Text
+        );
+    let mut narrow_decoder = if widen_narrow_to_utf16 {
+        column_info
+            .text_encoding
+            .and_then(|encoding| encoding.encoding())
+            .map(|encoding| encoding.new_decoder_without_bom_handling())
+    } else {
+        None
+    };
     let compatible = matches!(
         (target, encoding),
-        (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
-            | (SQL_C_CHAR, Some(PlpEncoding::SingleByteText))
-            | (SQL_C_CHAR, Some(PlpEncoding::Utf8Text))
-            | (SQL_C_CHAR, Some(PlpEncoding::Utf16Text))
-    );
+        (SQL_C_WCHAR, PlpEncoding::Utf16Text)
+            | (SQL_C_CHAR, PlpEncoding::SingleByteText)
+            | (SQL_C_CHAR, PlpEncoding::Utf8Text)
+            | (SQL_C_CHAR, PlpEncoding::Utf16Text)
+    ) || narrow_decoder.is_some();
     if !compatible {
         // The stream still has to be consumed, or the next column decodes from
         // the middle of this value. A failure here is the caller's problem, not
@@ -1147,13 +1226,16 @@ unsafe fn deliver_bound_plp(
         return Ok(RowOutcome::Error(RowIssue::Unsupported));
     }
 
-    let transcode = target == SQL_C_CHAR && matches!(encoding, Some(PlpEncoding::Utf16Text));
+    let transcode_utf16_to_utf8 =
+        target == SQL_C_CHAR && matches!(encoding, PlpEncoding::Utf16Text);
+    let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
     let buf_elements = char_buf_elements(target, stride);
     // Room for the payload, less the terminator the copy always writes.
     let capacity_elements = buf_elements.saturating_sub(1);
 
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut out_units: Vec<u16> = Vec::new();
+    let mut decoded_units: Vec<u16> = Vec::new();
     let mut pending_byte: Option<u8> = None;
     let mut pending_high_surrogate: Option<u16> = None;
     let mut truncated = false;
@@ -1172,7 +1254,29 @@ unsafe fn deliver_bound_plp(
             continue;
         }
 
-        if target == SQL_C_WCHAR {
+        if let Some(decoder) = narrow_decoder.as_mut() {
+            decoded_units.clear();
+            widen_into_pending(
+                decoder,
+                &mut decoded_units,
+                &scratch[..chunk.read],
+                chunk.reached_end,
+                usize::MAX,
+            );
+            let remaining = capacity_elements.saturating_sub(out_units.len());
+            let mut emit = remaining.min(decoded_units.len());
+            if emit > 0
+                && emit < decoded_units.len()
+                && (0xD800..=0xDBFF).contains(&decoded_units[emit - 1])
+                && (0xDC00..=0xDFFF).contains(&decoded_units[emit])
+            {
+                emit -= 1;
+            }
+            out_units.extend_from_slice(&decoded_units[..emit]);
+            if emit < decoded_units.len() {
+                truncated = true;
+            }
+        } else if target == SQL_C_WCHAR {
             // Whole code units only; an odd tail is carried to the next chunk.
             let mut bytes = Vec::with_capacity(chunk.read + 1);
             if let Some(b) = pending_byte.take() {
@@ -1196,7 +1300,7 @@ unsafe fn deliver_bound_plp(
                     break;
                 }
             }
-        } else if transcode {
+        } else if transcode_utf16_to_utf8 {
             let utf8 = utf16le_chunk_to_utf8(
                 &scratch[..chunk.read],
                 chunk.reached_end,
@@ -1215,7 +1319,7 @@ unsafe fn deliver_bound_plp(
                     break;
                 }
             }
-        } else if matches!(encoding, Some(PlpEncoding::Utf8Text)) {
+        } else if matches!(encoding, PlpEncoding::Utf8Text) {
             for b in &scratch[..chunk.read] {
                 if out_bytes.len() < capacity_elements {
                     out_bytes.push(*b);
@@ -2761,6 +2865,22 @@ mod tests {
         assert_eq!(element_stride(SQL_C_WCHAR, 64), 64);
         // A negative length cannot become a huge stride.
         assert_eq!(element_stride(SQL_C_CHAR, -8), 0);
+    }
+
+    #[test]
+    fn typed_plp_materialization_is_bounded_for_known_and_streamed_lengths() {
+        assert!(typed_plp_chunk_fits(
+            0,
+            PLP_TYPED_MATERIALIZE_LIMIT,
+            Some(PLP_TYPED_MATERIALIZE_LIMIT as u64)
+        ));
+        assert!(!typed_plp_chunk_fits(
+            0,
+            1,
+            Some(PLP_TYPED_MATERIALIZE_LIMIT as u64 + 1)
+        ));
+        assert!(!typed_plp_chunk_fits(PLP_TYPED_MATERIALIZE_LIMIT, 1, None));
+        assert!(!typed_plp_chunk_fits(usize::MAX, 1, None));
     }
 
     /// NULL with nowhere to report it is 22002: leaving the slot untouched

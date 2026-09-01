@@ -651,6 +651,186 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedReportsFullLength) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxWidensToWchar) {
+    ExecDirect("SELECT CAST('abcdefghij' AS VARCHAR(MAX)) AS c1");
+
+    SQLWCHAR buf[32] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(20, ind) << "ten UTF-16 code units";
+    EXPECT_EQ(u'a', buf[0]);
+    EXPECT_EQ(u'j', buf[9]);
+    EXPECT_EQ(0, buf[10]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening) {
+    ExecDirect(
+        "SELECT CAST(NCHAR(233) COLLATE Latin1_General_100_CI_AS AS VARCHAR(MAX)) AS c1");
+
+    SQLWCHAR buf[4] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(2, ind);
+    EXPECT_EQ(u'\u00e9', buf[0]);
+    EXPECT_EQ(0, buf[1]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToWcharReportsNoTotal) {
+    ExecDirect("SELECT REPLICATE(CAST('y' AS VARCHAR(MAX)), 5000) AS c1");
+
+    SQLWCHAR buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(SQL_NO_TOTAL, ind) << "the converted UTF-16 length is not known while streaming";
+    EXPECT_EQ(u'y', buf[0]);
+    EXPECT_EQ(u'y', buf[14]);
+    EXPECT_EQ(0, buf[15]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundJsonWidensToWchar) {
+    if (!ServerSupportsNativeJson()) {
+        GTEST_SKIP() << "server has no native json type";
+    }
+    ExecDirect("SELECT CAST(N'[\"\u00e9\"]' AS JSON) AS c1");
+
+    SQLWCHAR buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(10, ind) << "five UTF-16 code units";
+    EXPECT_EQ(u'[', buf[0]);
+    EXPECT_EQ(u'\u00e9', buf[2]);
+    EXPECT_EQ(u']', buf[4]);
+    EXPECT_EQ(0, buf[5]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening) {
+    // msodbcsql leaves the high surrogate in the ninth payload slot here. The
+    // Rust driver deliberately applies the whole-character truncation rule used
+    // by its existing nvarchar(max) bound delivery instead.
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect(
+        "SELECT CAST(REPLICATE((NCHAR(0xD83D) + NCHAR(0xDE00)) "
+        "COLLATE Latin1_General_100_CI_AS_SC_UTF8, 500) AS VARCHAR(MAX)) AS c1");
+
+    // 9 usable units: four whole pairs, and no room for the fifth pair.
+    SQLWCHAR buf[10] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(SQL_NO_TOTAL, ind);
+    for (int i = 0; i < 8; i += 2) {
+        EXPECT_GE(buf[i], 0xD800) << "high surrogate at " << i;
+        EXPECT_LT(buf[i], 0xDC00) << "high surrogate at " << i;
+        EXPECT_GE(buf[i + 1], 0xDC00) << "low surrogate at " << (i + 1);
+        EXPECT_LT(buf[i + 1], 0xE000) << "low surrogate at " << (i + 1);
+    }
+    EXPECT_EQ(0, buf[8]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxConvertsToTypedCTargetLikeNonMax) {
+    ExecDirect(
+        "SELECT CAST('42' AS VARCHAR(50)), CAST('42' AS VARCHAR(MAX)), "
+        "CAST(N'42' AS NVARCHAR(MAX))");
+
+    SQLINTEGER regular = 0;
+    SQLINTEGER varcharMax = 0;
+    SQLINTEGER nvarcharMax = 0;
+    SQLLEN regularInd = 0;
+    SQLLEN varcharMaxInd = 0;
+    SQLLEN nvarcharMaxInd = 0;
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 1, SQL_C_SLONG, &regular, sizeof(regular), &regularInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 2, SQL_C_SLONG, &varcharMax, sizeof(varcharMax), &varcharMaxInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 3, SQL_C_SLONG, &nvarcharMax, sizeof(nvarcharMax), &nvarcharMaxInd),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(regular, varcharMax);
+    EXPECT_EQ(regular, nvarcharMax);
+    EXPECT_EQ(42, varcharMax);
+    EXPECT_EQ(regularInd, varcharMaxInd);
+    EXPECT_EQ(regularInd, nvarcharMaxInd);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), varcharMaxInd);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTypedConversionErrorStillDrainsTheRow) {
+    ExecDirect(
+        "SELECT CAST(v AS VARCHAR(MAX)), n FROM "
+        "(VALUES (1, 'not-a-number'), (2, '8')) AS t(n, v) ORDER BY n");
+
+    SQLINTEGER converted = 0;
+    SQLINTEGER tail = 0;
+    SQLLEN convertedInd = 0;
+    SQLLEN tailInd = 0;
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 1, SQL_C_SLONG, &converted, sizeof(converted), &convertedInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &tail, sizeof(tail), &tailInd),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(8, converted) << "the failed PLP conversion must leave the next row synchronized";
+    EXPECT_EQ(2, tail);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect(
+        "SELECT v, n FROM ("
+        "SELECT REPLICATE(CAST('1' AS VARCHAR(MAX)), 1048577) AS v, 1 AS n "
+        "UNION ALL SELECT CAST('8' AS VARCHAR(MAX)), 2) AS t ORDER BY n");
+
+    SQLINTEGER converted = 0;
+    SQLINTEGER n = 0;
+    SQLLEN convertedInd = 0;
+    SQLLEN nInd = 0;
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 1, SQL_C_SLONG, &converted, sizeof(converted), &convertedInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &n, sizeof(n), &nInd), SQL_HANDLE_STMT,
+                  stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_EQ(8, converted) << "the oversized PLP must be drained before the next row";
+    EXPECT_EQ(2, n);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
 // Non-ASCII, to prove the transcode is not a byte copy: each e-acute is two
 // UTF-16 bytes on the wire and two UTF-8 bytes delivered.
 //
