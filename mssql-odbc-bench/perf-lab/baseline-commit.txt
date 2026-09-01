@@ -1,10 +1,9 @@
 # Performance baseline commit for mssql-odbc.
 #
-# The initial pin is the production main commit on which the benchmark harness
-# was introduced. PR #417 changes no production driver sources, so this bootstrap
-# makes the first candidate and baseline production trees identical. Future
+# PR #417's merge commit is the production parent of the optimization diff. This
+# pin builds the merged benchmark-era driver as the comparison baseline. Future
 # advances require a pull request, so every baseline move is reviewed and recorded.
 #
 # Exactly one full 40-character commit SHA on its own line. Lines starting with
 # '#' and blank lines are ignored.
-bc4b2dc80b111c388ac8000b90f1c35290d735a0
+acb3ed1dd22a2f9277cf14636fb847273a7a454c
