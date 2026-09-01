@@ -7,11 +7,11 @@ use crate::protocol::{
     PACKET_HEADER_SIZE, PacketHeader, PacketType, ProtocolError, build_done_token,
     build_error_response, build_feature_ext_ack_fedauth, build_fedauth_challenge_response,
     build_login_ack, build_prelogin_response, build_prelogin_response_with_fedauth,
-    build_query_result, build_routing_response, build_transaction_manager_response,
-    parse_fedauth_token, parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
+    build_routing_response, build_transaction_manager_response, parse_fedauth_token,
+    parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
 };
 use crate::query_response::QueryRegistry;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use native_tls::Identity;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -179,7 +179,7 @@ impl ConnectionProcessor {
     }
 
     /// Process a single packet from the buffer and return the response
-    pub async fn process_packet(&mut self) -> Result<Option<BytesMut>, ProtocolError> {
+    pub async fn process_packet(&mut self) -> Result<Option<Bytes>, ProtocolError> {
         if self.buffer.len() < PACKET_HEADER_SIZE {
             return Ok(None);
         }
@@ -241,10 +241,7 @@ impl ConnectionProcessor {
                         "Redirecting client {} to {}:{}",
                         self.addr, redir.redirect_host, redir.redirect_port
                     );
-                    Some(build_routing_response(
-                        &redir.redirect_host,
-                        redir.redirect_port,
-                    ))
+                    Some(build_routing_response(&redir.redirect_host, redir.redirect_port).freeze())
                 } else if auth_info.has_fedauth && auth_info.access_token_bytes.is_none() {
                     self.awaiting_fedauth_token = true;
                     self.is_authenticated = false;
@@ -252,10 +249,13 @@ impl ConnectionProcessor {
                         "FedAuth login without inline token from {}; sending challenge",
                         self.addr
                     );
-                    Some(build_fedauth_challenge_response(
-                        FEDAUTH_CHALLENGE_STS_URL,
-                        FEDAUTH_CHALLENGE_SPN,
-                    ))
+                    Some(
+                        build_fedauth_challenge_response(
+                            FEDAUTH_CHALLENGE_STS_URL,
+                            FEDAUTH_CHALLENGE_SPN,
+                        )
+                        .freeze(),
+                    )
                 } else {
                     self.awaiting_fedauth_token = false;
                     self.is_authenticated = true;
@@ -300,7 +300,7 @@ impl ConnectionProcessor {
                     packet.extend_from_slice(&response);
 
                     self.record_to_store().await;
-                    Some(packet)
+                    Some(packet.freeze())
                 }
             }
 
@@ -310,7 +310,7 @@ impl ConnectionProcessor {
                         "Received unexpected FedAuthToken packet from {} without challenge",
                         self.addr
                     );
-                    Some(build_error_response("Unexpected FedAuth token"))
+                    Some(build_error_response("Unexpected FedAuth token").freeze())
                 } else {
                     debug!("Handling FedAuthToken from {}", self.addr);
                     let packet_body = &packet_data[PACKET_HEADER_SIZE..];
@@ -337,12 +337,15 @@ impl ConnectionProcessor {
                             packet.extend_from_slice(&response);
 
                             self.record_to_store().await;
-                            Some(packet)
+                            Some(packet.freeze())
                         }
                         Err(e) => {
                             warn!("Failed to parse FedAuthToken from {}: {}", self.addr, e);
                             self.awaiting_fedauth_token = false;
-                            Some(build_error_response(&format!("FedAuth parse error: {}", e)))
+                            Some(
+                                build_error_response(&format!("FedAuth parse error: {}", e))
+                                    .freeze(),
+                            )
                         }
                     }
                 }
@@ -354,7 +357,7 @@ impl ConnectionProcessor {
                         "Received SQL batch from {} before authentication",
                         self.addr
                     );
-                    Some(build_error_response("Not authenticated"))
+                    Some(build_error_response("Not authenticated").freeze())
                 } else {
                     debug!("Handling SQL batch from {}", self.addr);
 
@@ -368,10 +371,8 @@ impl ConnectionProcessor {
 
                             // Look up query in registry
                             let registry = self.query_registry.lock().await;
-                            if let Some(response_data) = registry.get(&sql) {
+                            if let Some(packet) = registry.get_wire_response(&sql) {
                                 info!("Found registered response for query");
-                                // build_query_result already wraps in a packet, so return directly
-                                let packet = build_query_result(response_data);
                                 Some(packet)
                             } else {
                                 info!("No registered response, returning empty result");
@@ -385,12 +386,12 @@ impl ConnectionProcessor {
                                 resp_header.write(&mut packet);
                                 packet.extend_from_slice(&response);
 
-                                Some(packet)
+                                Some(packet.freeze())
                             }
                         }
                         Err(e) => {
                             warn!("Failed to parse SQL batch from {}: {}", self.addr, e);
-                            Some(build_error_response(&format!("Parse error: {}", e)))
+                            Some(build_error_response(&format!("Parse error: {}", e)).freeze())
                         }
                     }
                 }
@@ -407,7 +408,7 @@ impl ConnectionProcessor {
                 resp_header.write(&mut packet);
                 packet.extend_from_slice(&response);
 
-                Some(packet)
+                Some(packet.freeze())
             }
 
             PacketType::TransactionManager => {
@@ -430,7 +431,7 @@ impl ConnectionProcessor {
                 resp_header.write(&mut packet);
                 packet.extend_from_slice(&tokens);
 
-                Some(packet)
+                Some(packet.freeze())
             }
 
             _ => {
@@ -1191,7 +1192,7 @@ async fn handle_connection(
             let response = match header.packet_type {
                 PacketType::PreLogin => {
                     debug!("Handling PreLogin");
-                    Some(build_prelogin_response())
+                    Some(build_prelogin_response().freeze())
                 }
 
                 PacketType::Login7 => {
@@ -1211,13 +1212,13 @@ async fn handle_connection(
                     resp_header.write(&mut packet);
                     packet.extend_from_slice(&response);
 
-                    Some(packet)
+                    Some(packet.freeze())
                 }
 
                 PacketType::SqlBatch => {
                     if !is_authenticated {
                         warn!("Received SQL batch before authentication");
-                        Some(build_error_response("Not authenticated"))
+                        Some(build_error_response("Not authenticated").freeze())
                     } else {
                         debug!("Handling SQL batch");
 
@@ -1231,8 +1232,8 @@ async fn handle_connection(
 
                                 // Look up query in registry
                                 let registry = query_registry.lock().await;
-                                if let Some(response) = registry.get(&sql) {
-                                    Some(build_query_result(response))
+                                if let Some(response) = registry.get_wire_response(&sql) {
+                                    Some(response)
                                 } else if sql.to_uppercase().starts_with("SELECT") {
                                     // Return empty result set with DONE for unknown SELECT queries
                                     let mut response = BytesMut::new();
@@ -1248,7 +1249,7 @@ async fn handle_connection(
                                     resp_header.write(&mut packet);
                                     packet.extend_from_slice(&response);
 
-                                    Some(packet)
+                                    Some(packet.freeze())
                                 } else {
                                     // For other commands, just return DONE
                                     let response = build_done_token(0);
@@ -1263,12 +1264,12 @@ async fn handle_connection(
                                     resp_header.write(&mut packet);
                                     packet.extend_from_slice(&response);
 
-                                    Some(packet)
+                                    Some(packet.freeze())
                                 }
                             }
                             Err(e) => {
                                 error!("Failed to parse SQL batch: {}", e);
-                                Some(build_error_response("Failed to parse SQL"))
+                                Some(build_error_response("Failed to parse SQL").freeze())
                             }
                         }
                     }
@@ -1285,7 +1286,7 @@ async fn handle_connection(
                     resp_header.write(&mut packet);
                     packet.extend_from_slice(&response);
 
-                    Some(packet)
+                    Some(packet.freeze())
                 }
 
                 PacketType::TransactionManager => {
@@ -1304,7 +1305,7 @@ async fn handle_connection(
                     resp_header.write(&mut packet);
                     packet.extend_from_slice(&tokens);
 
-                    Some(packet)
+                    Some(packet.freeze())
                 }
 
                 _ => {
