@@ -31,7 +31,7 @@ parameters:
 - name: buildOdbcNative
   type: boolean
   default: false
-  displayName: 'Build mssql-odbc native driver binaries alongside the wheels'
+  displayName: 'Also build mssql-odbc native driver'
 
 - name: isOfficial
   type: boolean
