@@ -1095,7 +1095,7 @@ unsafe fn read_bind_offset(ptr: *mut SqlULen) -> usize {
 /// value itself is never materialized, only one chunk at a time.
 const PLP_BOUND_CHUNK: usize = 8 * 1024;
 
-/// The length a bound PLP delivery reports in the indicator.
+/// The length a bound PLP delivery reports on `SQL_DESC_OCTET_LENGTH_PTR`.
 ///
 /// Extracted so the rule can be tested without a live server: it was derived by
 /// probing msodbcsql, and all four of its cases are pinned in unit tests below.
@@ -1127,6 +1127,27 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
     }
 }
 
+/// Displaces a bound `SQL_DESC_INDICATOR_PTR` / `SQL_DESC_OCTET_LENGTH_PTR`
+/// base pointer by `bind_offset` (bytes, from `SQL_ATTR_ROW_BIND_OFFSET_PTR`)
+/// and `row_index` (elements), or returns null if the base itself is null.
+/// Every delivery function resolves both pointers through this so they stay
+/// in lock step; only the two fields' *meaning* differs (NULL status vs.
+/// returned length), never how their address is computed.
+///
+/// # Safety
+/// `ptr`, once displaced, must be null or writable for one `SqlLen`.
+unsafe fn displaced_len_ptr(ptr: *mut SqlLen, bind_offset: usize, row_index: usize) -> *mut SqlLen {
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        (ptr as *mut u8)
+            .add(bind_offset)
+            .cast::<SqlLen>()
+            .add(row_index)
+    }
+}
+
 /// Drains an active PLP (max/LOB) stream into a bound column's fixed buffer.
 ///
 /// Unlike `SQLGetData`, which hands back one chunk per call and lets the caller
@@ -1153,16 +1174,12 @@ unsafe fn deliver_bound_plp(
     scratch: &mut [u8],
 ) -> Result<RowOutcome, TdsError> {
     let stride = element_stride(binding.target_type, binding.buffer_length);
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    // Independent of the indicator per the ODBC "Deferred Fields" spec: see
+    // `deliver_bound`'s comment on `octet_length`. This value is never NULL
+    // (that path never reaches a bound PLP delivery), so the produced length
+    // always belongs on `octet_length`, not `indicator`.
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
@@ -1289,7 +1306,7 @@ unsafe fn deliver_bound_plp(
     };
     unsafe {
         write_if_some(
-            indicator,
+            octet_length,
             plp_indicator(produced_bytes, truncated, transcode, wire_total),
         )
     };
@@ -1362,21 +1379,17 @@ unsafe fn deliver_encoded_string(
     }
 
     let stride = element_stride(binding.target_type, binding.buffer_length);
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    // Independent of the indicator per the ODBC "Deferred Fields" spec: see
+    // `deliver_bound`'s comment on `octet_length`. This path never delivers
+    // NULL (that goes through `deliver_bound` via `write_null`), so the
+    // reported length always belongs on `octet_length`, not `indicator`.
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
     if direct_char {
-        unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+        unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         return if unsafe { copy_with_nul(slot, stride, &bytes) } {
             RowOutcome::Info(RowIssue::StringTruncated)
         } else {
@@ -1385,7 +1398,7 @@ unsafe fn deliver_encoded_string(
     }
 
     let source_len = bytes.len() / 2;
-    unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+    unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
     if slot.is_null() {
         return RowOutcome::Success;
     }
@@ -1433,33 +1446,19 @@ unsafe fn deliver_bound(
     let stride = element_stride(binding.target_type, binding.buffer_length);
 
     // SQL_ATTR_ROW_BIND_OFFSET_PTR displaces both bases by the same byte count.
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
     // Independent of `indicator` per the ODBC "Deferred Fields" spec: this is
     // where the returned data's length is reported (SQL_DESC_OCTET_LENGTH_PTR),
     // while `indicator` carries only NULL status (SQL_DESC_INDICATOR_PTR).
     // `SQLBindCol` writes the same pointer to both (`ColumnBinding::write_to_record`),
-    // so this is the same location as `indicator` for the common case; a
-    // descriptor-field bind that sets them to different buffers now delivers
-    // to both correctly instead of one being silently skipped.
-    let octet_length = if binding.octet_length_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.octet_length_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    // so this is the same location as `indicator` for the common case. Every
+    // delivery function in this file (`deliver_fixed_bound`,
+    // `deliver_encoded_string`, `deliver_bound_plp` and this one) resolves and
+    // writes both fields the same way, so a descriptor-field bind that points
+    // them at different buffers delivers to both correctly on every path,
+    // never just this one.
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
 
     let is_null = matches!(value, ColumnValues::Null);
     if is_null && indicator.is_null() {
@@ -1534,7 +1533,7 @@ unsafe fn deliver_bound(
 /// # Safety
 ///
 /// The binding's target pointer, after applying `bind_offset` and `row_index`,
-/// must be null or writable for `T`; its displaced indicator pointer must be
+/// must be null or writable for `T`; its displaced octet-length pointer must be
 /// null or writable for one `SqlLen`.
 unsafe fn deliver_fixed_bound<T: Copy>(
     binding: &ColumnBinding,
@@ -1543,23 +1542,19 @@ unsafe fn deliver_fixed_bound<T: Copy>(
     value: T,
 ) -> RowOutcome {
     let stride = element_stride(binding.target_type, binding.buffer_length);
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    // Independent of the indicator per the ODBC "Deferred Fields" spec: see
+    // `deliver_bound`'s comment on `octet_length`. This path never delivers
+    // NULL (that goes through `deliver_bound` via `write_null`), so the
+    // reported size always belongs on `octet_length`, not `indicator`.
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
     if !binding.target_value_ptr.is_null() {
         let slot =
             unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
         unsafe { slot.cast::<T>().write_unaligned(value) };
     }
     let size = SqlLen::try_from(std::mem::size_of::<T>()).unwrap_or(SqlLen::MAX);
-    unsafe { write_if_some(indicator, size) };
+    unsafe { write_if_some(octet_length, size) };
     RowOutcome::Success
 }
 
@@ -2335,6 +2330,62 @@ mod tests {
         }
         assert_eq!(buf, [10, 20, 30, 0]);
         assert_eq!(ind[0], 4);
+    }
+
+    /// `deliver_fixed_bound` is the exact-C-type fast path `write_exact` takes
+    /// when the bound type matches (e.g. an int column bound as
+    /// `SQL_C_SLONG`), so its length report is just as reachable through a
+    /// descriptor-field bind as `deliver_bound`'s. A split `SQL_DESC_INDICATOR_PTR`
+    /// / `SQL_DESC_OCTET_LENGTH_PTR` pair must land the size on the octet
+    /// pointer and leave the indicator alone.
+    #[test]
+    fn deliver_fixed_bound_reports_the_size_on_the_split_octet_length_pointer() {
+        let mut value = 0_i32;
+        let mut indicator: SqlLen = -99;
+        let mut octet_length: SqlLen = -99;
+        let b = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_SLONG,
+            target_value_ptr: (&mut value as *mut i32).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut octet_length,
+        };
+        let outcome = unsafe { deliver_fixed_bound(&b, 0, 0, 7_i32) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(value, 7);
+        assert_eq!(octet_length, 4, "the size must land on the octet pointer");
+        assert_eq!(
+            indicator, -99,
+            "a non-NULL value must never touch the indicator pointer"
+        );
+    }
+
+    /// Same split-pointer contract as above, for the direct-copy character
+    /// path `deliver_encoded_string` takes when the wire encoding already
+    /// matches the bound C type.
+    #[test]
+    fn deliver_encoded_string_reports_the_length_on_the_split_octet_length_pointer() {
+        let mut buf = [0u8; 8];
+        let mut indicator: SqlLen = -99;
+        let mut octet_length: SqlLen = -99;
+        let b = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_CHAR,
+            target_value_ptr: buf.as_mut_ptr().cast(),
+            buffer_length: buf.len() as SqlLen,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut octet_length,
+        };
+        let outcome =
+            unsafe { deliver_encoded_string(&b, 0, 0, Cow::Borrowed(b"hi"), EncodingType::Utf8) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(&buf[..2], b"hi");
+        assert_eq!(octet_length, 2, "the length must land on the octet pointer");
+        assert_eq!(
+            indicator, -99,
+            "a non-NULL value must never touch the indicator pointer"
+        );
     }
 
     #[test]
