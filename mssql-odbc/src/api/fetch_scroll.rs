@@ -1578,6 +1578,7 @@ mod tests {
     use std::ptr;
 
     use super::*;
+    use crate::api::bind_col::sql_bind_col;
     use crate::api::odbc_types::{
         SQL_C_BINARY, SQL_C_SLONG, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST, SQL_FETCH_LAST,
         SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE,
@@ -1763,14 +1764,20 @@ mod tests {
             state.row_array_size = 4;
             state.rows_fetched_ptr = &mut rows_fetched;
             state.row_status_ptr = statuses.as_mut_ptr();
-            state.set_binding(binding(
-                1,
-                SQL_C_SLONG,
-                values.as_mut_ptr().cast(),
-                0,
-                indicators.as_mut_ptr(),
-            ));
         }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    values.as_mut_ptr().cast(),
+                    0,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
         dbc.runtime
@@ -1821,14 +1828,20 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(2));
-            state.set_binding(binding(
-                1,
-                SQL_C_SLONG,
-                (&mut value as *mut i32).cast(),
-                0,
-                &mut indicator,
-            ));
         }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut client = tds_client_from_int_rows(vec![vec![10, 20]]);
         dbc.runtime
@@ -1878,21 +1891,33 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(2));
-            state.set_binding(binding(
-                1,
-                SQL_C_SLONG,
-                first.as_mut_ptr().cast(),
-                0,
-                first_indicators.as_mut_ptr(),
-            ));
-            state.set_binding(binding(
-                2,
-                SQL_C_SLONG,
-                second.as_mut_ptr().cast(),
-                0,
-                second_indicators.as_mut_ptr(),
-            ));
         }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    first.as_mut_ptr().cast(),
+                    0,
+                    first_indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    second.as_mut_ptr().cast(),
+                    0,
+                    second_indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut client =
             tds_client_from_partial_int_rows(vec![vec![10, 20]], buffered_prefix_columns);
