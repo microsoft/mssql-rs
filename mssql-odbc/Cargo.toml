@@ -32,6 +32,7 @@ url = "2"
 # connection silently reuse a stale cached credential built from a different
 # secret.
 sha2 = "0.11.0"
+# `RowWriter` exposes UUID values without first boxing them as `ColumnValues`.
 uuid = "1"
 
 # `ActiveDirectoryInteractive` delegates the sign-in UI to `mssql-auth.dll`

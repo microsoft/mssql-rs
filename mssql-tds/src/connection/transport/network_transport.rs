@@ -12,7 +12,10 @@ use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
 };
+use crate::datatypes::column_values::ColumnValues;
+use crate::datatypes::decoder::GenericDecoder;
 use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
@@ -27,7 +30,7 @@ use crate::io::token_stream::{
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
 use crate::message::messages::{PacketStatusFlags, Request, ResetConnectionMode};
-use crate::token::tokens::{DoneStatus, Tokens};
+use crate::token::tokens::{DoneStatus, TokenType, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::cmp::min;
@@ -1716,6 +1719,197 @@ impl TdsPacketReader for NetworkTransport {
 }
 
 impl NetworkTransport {
+    /// Parses a buffered ROW/NBCROW header without refilling the network buffer.
+    pub(crate) fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        let ParserContext::ColumnMetadata(metadata, decryptor) = context else {
+            return Err(crate::error::Error::ProtocolError(
+                "Expected ColumnMetadata in context for row decoding".to_string(),
+            ));
+        };
+        let buffered = self.tds_read_buffer.get_buffered_slice();
+        let Some(&token) = buffered.first() else {
+            return Ok(None);
+        };
+
+        if token == TokenType::Row as u8 {
+            self.tds_read_buffer.consume_bytes(1)?;
+            return Ok(Some(RowPauseState {
+                next_column_index: 0,
+                metadata: Arc::clone(metadata),
+                nbc_null_bitmap: None,
+                decryptor: decryptor.clone(),
+            }));
+        }
+
+        if token != TokenType::NbcRow as u8 {
+            return Ok(None);
+        }
+
+        let bitmap_len = metadata.columns.len().div_ceil(8);
+        let Some(bitmap_bytes) = buffered.get(1..1 + bitmap_len) else {
+            return Ok(None);
+        };
+        let bitmap = if let Some(mut cached) = self.nbc_bitmap_scratch.take()
+            && cached.len() == bitmap_len
+            && let Some(buffer) = Arc::get_mut(&mut cached)
+        {
+            buffer.copy_from_slice(bitmap_bytes);
+            self.nbc_bitmap_scratch = Some(Arc::clone(&cached));
+            cached
+        } else {
+            let bitmap: Arc<[u8]> = Arc::from(bitmap_bytes);
+            self.nbc_bitmap_scratch = Some(Arc::clone(&bitmap));
+            bitmap
+        };
+        self.tds_read_buffer.consume_bytes(1 + bitmap_len)?;
+        Ok(Some(RowPauseState {
+            next_column_index: 0,
+            metadata: Arc::clone(metadata),
+            nbc_null_bitmap: Some(bitmap),
+            decryptor: decryptor.clone(),
+        }))
+    }
+
+    /// Decodes the next ordinary buffered column without consuming on a miss.
+    pub(crate) fn try_read_buffered_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        if target != pause_state.next_column_index {
+            return Ok(None);
+        }
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        if pause_state
+            .nbc_null_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        {
+            return Ok(Some(ColumnValues::Null));
+        }
+        if pause_state.decryptor.is_some() {
+            return Ok(None);
+        }
+
+        let decoder = GenericDecoder::default();
+        let Some((value, used)) =
+            decoder.try_decode_buffered(self.tds_read_buffer.get_buffered_slice(), metadata)?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some(value))
+    }
+
+    /// Decodes the next buffered column and preserves its `sql_variant` base type.
+    pub(crate) fn try_read_buffered_column_with_base(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<(ColumnValues, Option<TdsDataType>)>> {
+        if target != pause_state.next_column_index {
+            return Ok(None);
+        }
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        if pause_state
+            .nbc_null_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        {
+            return Ok(Some((ColumnValues::Null, None)));
+        }
+        if metadata.data_type != TdsDataType::SsVariant {
+            return self
+                .try_read_buffered_column(pause_state, target)
+                .map(|value| value.map(|value| (value, None)));
+        }
+        if pause_state.decryptor.is_some() {
+            return Ok(None);
+        }
+        let decoder = GenericDecoder::default();
+        let Some((base, value, used)) =
+            decoder.try_decode_buffered_variant(self.tds_read_buffer.get_buffered_slice())?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some((value, base)))
+    }
+
+    /// Decodes consecutive buffered columns directly into `writer`.
+    ///
+    /// Returns `false` after preserving the partially advanced row state when
+    /// the next value needs async continuation.
+    pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        if pause_state.decryptor.is_some() {
+            return Ok(false);
+        }
+
+        let decoder = GenericDecoder::default();
+        let mut consumed = 0usize;
+        let outcome = {
+            let buffered = self.tds_read_buffer.get_buffered_slice();
+            let mut outcome = Ok(true);
+            while let Some(metadata) = pause_state
+                .metadata
+                .columns
+                .get(pause_state.next_column_index)
+            {
+                let col = pause_state.next_column_index;
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[col / 8] & (1 << (col % 8)) != 0)
+                {
+                    writer.write_null(col);
+                    pause_state.next_column_index += 1;
+                    continue;
+                }
+
+                let Some(remaining) = buffered.get(consumed..) else {
+                    outcome = Err(crate::error::Error::ProtocolError(
+                        "Buffered row decoder consumed past the available data".to_string(),
+                    ));
+                    break;
+                };
+                match decoder.try_decode_buffered_into(remaining, metadata, col, writer) {
+                    Ok(Some(used)) => {
+                        let Some(next) = consumed.checked_add(used) else {
+                            outcome = Err(crate::error::Error::ProtocolError(
+                                "Buffered row decoder byte count overflowed".to_string(),
+                            ));
+                            break;
+                        };
+                        consumed = next;
+                        pause_state.next_column_index += 1;
+                    }
+                    Ok(None) => {
+                        outcome = Ok(false);
+                        break;
+                    }
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            outcome
+        };
+        self.tds_read_buffer.consume_bytes(consumed)?;
+        outcome
+    }
+
     pub(crate) async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -1889,6 +2083,21 @@ impl NetworkTransport {
 
 #[async_trait]
 impl TdsTokenStreamReader for NetworkTransport {
+    fn try_receive_row_header(
+        &mut self,
+        context: &ParserContext,
+    ) -> TdsResult<Option<RowPauseState>> {
+        NetworkTransport::try_receive_row_header(self, context)
+    }
+
+    fn try_read_buffered_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<ColumnValues>> {
+        NetworkTransport::try_read_buffered_column(self, pause_state, target)
+    }
+
     async fn receive_token(
         &mut self,
         context: &ParserContext,
@@ -2047,12 +2256,16 @@ pub(crate) mod tests {
     use crate::connection::transport::network_transport::Stream;
     use crate::connection::transport::ssl_handler::SslHandler;
     use crate::core::EncryptionOptions;
+    use crate::datatypes::row_writer::DefaultRowWriter;
+    use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::message::messages::PacketType;
+    use crate::query::metadata::ColumnMetadata;
     use crate::test_packet_support::{
         TestPacketBuilder, build_duplex_transport, create_network_transport_with_chunked_data,
         create_network_transport_with_data, create_network_transport_with_live_peer,
         create_network_transport_with_live_peer_capturing_writes, encode_utf16_le,
     };
+    use crate::token::tokens::ColMetadataToken;
     use bytes::Bytes;
     use futures::SinkExt;
     use futures::StreamExt;
@@ -2063,6 +2276,27 @@ pub(crate) mod tests {
     // The choice of 8192 is large enough for sending data. This stream should have a buffer large enough for send.
     // The test would keep the payload lower than this size to make sure that the duplex stream can handle it.
     pub(crate) const MAX_BUFFER_SIZE: usize = 8192;
+
+    fn int4_row_context(column_count: usize) -> ParserContext {
+        ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: u16::try_from(column_count).unwrap(),
+                columns: (0..column_count)
+                    .map(|index| ColumnMetadata {
+                        user_type: 0,
+                        flags: 0,
+                        type_info: TypeInfo::fixed_len(TdsDataType::Int4).unwrap(),
+                        data_type: TdsDataType::Int4,
+                        column_name: format!("value{index}"),
+                        multi_part_name: None,
+                        crypto_metadata: None,
+                    })
+                    .collect(),
+                cek_table: vec![],
+            }),
+            None,
+        )
+    }
 
     impl Stream for DuplexStream {
         fn tls_handshake_starting(&mut self) {
@@ -3180,6 +3414,374 @@ pub(crate) mod tests {
         let mut reader = create_network_transport_with_chunked_data(&stream, 3);
 
         assert_eq!(reader.read_uint32().await.unwrap(), 0x4433_2211);
+    }
+
+    #[tokio::test]
+    async fn buffered_cursor_reads_complete_row_header_and_column() {
+        let expected = 0x1234_5678_i32;
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend_from_slice(&expected.to_le_bytes());
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        let pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .expect("complete buffered row header");
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 0).unwrap(),
+            Some(ColumnValues::Int(expected))
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_finishes_a_complete_row_without_continuation() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let mut payload = vec![TokenType::Row as u8];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(expected.len()))
+            .unwrap()
+            .expect("complete buffered row header");
+        let mut writer = DefaultRowWriter::new(expected.len());
+
+        assert!(
+            reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_keeps_partial_column_for_async_continuation() {
+        let expected = [0x1234_5678_i32, -42_i32];
+        let second = expected[1].to_le_bytes();
+        let mut first_payload = vec![TokenType::Row as u8];
+        first_payload.extend_from_slice(&expected[0].to_le_bytes());
+        first_payload.extend_from_slice(&second[..2]);
+
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second_packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(&second_packet.append_bytes(&second[2..]).build());
+        let mut reader = create_network_transport_with_data(&stream);
+        reader.read_tds_packet().await.unwrap();
+
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(expected.len()))
+            .unwrap()
+            .expect("complete buffered row header");
+        let mut writer = DefaultRowWriter::new(expected.len());
+
+        assert!(
+            !reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(pause_state.next_column_index, 1);
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            2,
+            "the partial second value must remain buffered"
+        );
+
+        let result = reader
+            .resume_row_into(
+                pause_state,
+                None,
+                None,
+                ColumnPolicy::DecodeAll,
+                &mut writer,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_cursor_miss_preserves_bytes_for_async_continuation() {
+        let expected = 0x1234_5678_i32;
+        let value = expected.to_le_bytes();
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut first_payload = vec![TokenType::Row as u8];
+        first_payload.extend_from_slice(&value[..2]);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(&second.append_bytes(&value[2..]).build());
+        let mut reader = create_network_transport_with_data(&stream);
+        reader.read_tds_packet().await.unwrap();
+
+        let pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .expect("row header is wholly buffered");
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 2);
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            2,
+            "a miss must not consume the partial scalar"
+        );
+
+        let mut writer = DefaultRowWriter::new(1);
+        let result = reader
+            .resume_row_into(
+                pause_state,
+                None,
+                None,
+                ColumnPolicy::DecodeOne(0),
+                &mut writer,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, RowReadResult::RowWritten));
+        assert_eq!(writer.take_row(), vec![ColumnValues::Int(expected)]);
+    }
+
+    #[tokio::test]
+    async fn buffered_nbcrow_null_column_needs_no_payload_bytes() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [TokenType::NbcRow as u8, 0b0000_0001];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        let pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .expect("complete NBCROW header");
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 0).unwrap(),
+            Some(ColumnValues::Null)
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_cursor_rejects_invalid_context_and_preserves_non_rows() {
+        let mut empty_packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut empty = create_network_transport_with_data(&empty_packet.build());
+        empty.read_tds_packet().await.unwrap();
+        assert!(
+            empty
+                .try_receive_row_header(&int4_row_context(1))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [TokenType::Done as u8];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+
+        assert!(
+            reader
+                .try_receive_row_header(&ParserContext::None(()))
+                .is_err()
+        );
+        assert!(
+            reader
+                .try_receive_row_header(&int4_row_context(1))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reader.tds_read_buffer.get_remaining_byte_count(), 1);
+
+        let pause_state = RowPauseState {
+            next_column_index: 1,
+            metadata: match int4_row_context(1) {
+                ParserContext::ColumnMetadata(metadata, _) => metadata,
+                _ => unreachable!(),
+            },
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+        assert_eq!(
+            reader.try_read_buffered_column(&pause_state, 1).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_propagates_decoder_errors() {
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::var_len(TdsDataType::IntN, 8).unwrap(),
+                data_type: TdsDataType::IntN,
+                column_name: "value".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: Vec::new(),
+        });
+        let mut pause_state = RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        };
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut reader =
+            create_network_transport_with_data(&packet.append_bytes(&[3, 0, 0, 0]).build());
+        reader.read_tds_packet().await.unwrap();
+        let mut writer = DefaultRowWriter::new(1);
+
+        assert!(
+            reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_row_writer_writes_nbcrow_nulls() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [TokenType::NbcRow as u8, 0b0000_0001];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+        let mut pause_state = reader
+            .try_receive_row_header(&int4_row_context(1))
+            .unwrap()
+            .unwrap();
+        let mut writer = DefaultRowWriter::new(1);
+
+        assert!(
+            reader
+                .try_read_buffered_row_into(&mut pause_state, &mut writer)
+                .unwrap()
+        );
+        assert_eq!(writer.take_row(), vec![ColumnValues::Null]);
+    }
+
+    #[tokio::test]
+    async fn buffered_variant_column_honors_nbcrow_null_bitmap() {
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::var_len(TdsDataType::SsVariant, 8009).unwrap(),
+                data_type: TdsDataType::SsVariant,
+                column_name: "variant".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: Vec::new(),
+        });
+        let pause_state = RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: Some(Arc::from([1_u8])),
+            decryptor: None,
+        };
+        let mut reader = create_network_transport_with_data(&[]);
+
+        assert_eq!(
+            reader
+                .try_read_buffered_column_with_base(&pause_state, 0)
+                .unwrap(),
+            Some((ColumnValues::Null, None))
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_nbcrow_reuses_unaliased_bitmap_allocation() {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        let payload = [
+            TokenType::NbcRow as u8,
+            0b0000_0001,
+            0b0000_0010,
+            TokenType::NbcRow as u8,
+            0b0000_0100,
+            0b0000_1000,
+        ];
+        let mut reader = create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        reader.read_tds_packet().await.unwrap();
+        let context = int4_row_context(9);
+
+        let first = reader
+            .try_receive_row_header(&context)
+            .unwrap()
+            .expect("first NBCROW header");
+        let first_bitmap = first.nbc_null_bitmap.as_ref().expect("first bitmap");
+        assert_eq!(first_bitmap.as_ref(), &[0b0000_0001, 0b0000_0010]);
+        let first_allocation = first_bitmap.as_ptr();
+        drop(first);
+
+        let second = reader
+            .try_receive_row_header(&context)
+            .unwrap()
+            .expect("second NBCROW header");
+        let second_bitmap = second.nbc_null_bitmap.as_ref().expect("second bitmap");
+        assert_eq!(second_bitmap.as_ref(), &[0b0000_0100, 0b0000_1000]);
+        assert_eq!(
+            second_bitmap.as_ptr(),
+            first_allocation,
+            "the uniquely owned scratch bitmap should be refilled in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_nbcrow_bitmap_miss_preserves_header_for_async_continuation() {
+        let mut first = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut second = TestPacketBuilder::new(PacketType::TabularResult);
+        let mut stream = first
+            .continuation()
+            .append_bytes(&[TokenType::NbcRow as u8, 0])
+            .build();
+        stream.extend_from_slice(&second.append_bytes(&[0]).build());
+        let mut reader = create_network_transport_with_data(&stream);
+        reader.read_tds_packet().await.unwrap();
+        let context = int4_row_context(9);
+
+        assert!(reader.try_receive_row_header(&context).unwrap().is_none());
+        assert_eq!(
+            reader.tds_read_buffer.get_remaining_byte_count(),
+            2,
+            "the token and partial bitmap must remain buffered"
+        );
+
+        let header = reader
+            .receive_row_header(&context, None, None)
+            .await
+            .unwrap();
+        let RowHeader::Positioned(pause_state) = header else {
+            panic!("expected an NBCROW position");
+        };
+        assert_eq!(
+            pause_state
+                .nbc_null_bitmap
+                .as_ref()
+                .expect("NBCROW bitmap")
+                .as_ref(),
+            &[0, 0]
+        );
     }
 
     #[tokio::test]

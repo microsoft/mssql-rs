@@ -31,7 +31,9 @@ use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{NumericSource, narrow_i128, parse_numeric_text};
-use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::column_values::{
+    ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
+};
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 
 /// Decodes a character column without the panicking paths in
@@ -312,22 +314,103 @@ const DAYS_0001_TO_1900: i64 = 693_595;
 /// each target C struct can be filled from a single representation.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DateTimeParts {
+    /// Proleptic Gregorian year.
     pub year: i16,
+    /// Calendar month in `1..=12`.
     pub month: u16,
+    /// Calendar day in `1..=31`.
     pub day: u16,
+    /// Hour in `0..=23`.
     pub hour: u16,
+    /// Minute in `0..=59`.
     pub minute: u16,
+    /// Second in `0..=59`.
     pub second: u16,
     /// Fractional seconds in nanoseconds.
     pub fraction_ns: u32,
     /// Declared fractional-seconds scale (0-7) of the source column. Character
     /// rendering pads to exactly this many digits, matching msodbcsql.
     pub scale: u8,
+    /// Signed timezone hour component.
     pub tz_hour: i16,
+    /// Signed timezone minute component.
     pub tz_minute: i16,
+    /// Whether the source carries a date component.
     pub has_date: bool,
+    /// Whether the source carries a time component.
     pub has_time: bool,
+    /// Whether the source carries a timezone offset.
     pub has_tz: bool,
+}
+
+/// Converts a TDS `date` into normalized calendar fields.
+pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
+    let (year, month, day) = civil_from_days_since_0001(i64::from(date.get_days()));
+    DateTimeParts {
+        year,
+        month,
+        day,
+        has_date: true,
+        ..Default::default()
+    }
+}
+
+/// Converts a TDS `time` into normalized clock fields.
+pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
+    let (hour, minute, second, fraction_ns) = hms_from_ticks_100ns(time.time_nanoseconds);
+    DateTimeParts {
+        hour,
+        minute,
+        second,
+        fraction_ns,
+        scale: time.scale,
+        has_time: true,
+        ..Default::default()
+    }
+}
+
+/// Converts a TDS `datetime2` into normalized calendar and clock fields.
+pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
+    let (year, month, day) = civil_from_days_since_0001(i64::from(datetime.days));
+    let mut parts = time_parts(&datetime.time);
+    parts.year = year;
+    parts.month = month;
+    parts.day = day;
+    parts.has_date = true;
+    parts
+}
+
+/// Converts a UTC TDS `datetimeoffset` value to its represented local time.
+///
+/// Returns `None` when applying the offset falls outside the TDS date range.
+pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateTimeParts> {
+    // The wire value is UTC; ODBC returns the local wall clock obtained by
+    // applying the stored offset.
+    let utc_ticks = datetime.datetime2.time.time_nanoseconds as i64
+        + i64::from(datetime.offset) * 60 * 10_000_000;
+    let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
+    if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
+        return None;
+    }
+
+    let (year, month, day) = civil_from_days_since_0001(days);
+    let (hour, minute, second, fraction_ns) =
+        hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
+    Some(DateTimeParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        fraction_ns,
+        scale: datetime.datetime2.time.scale,
+        tz_hour: datetime.offset / 60,
+        tz_minute: datetime.offset % 60,
+        has_date: true,
+        has_time: true,
+        has_tz: true,
+    })
 }
 
 /// (year, month, day) from a day count where day 0 = 0001-01-01, using Howard
@@ -374,64 +457,10 @@ fn hms_from_ticks_100ns(ticks: u64) -> (u16, u16, u16, u32) {
 pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimeParts> {
     let mut p = DateTimeParts::default();
     match value {
-        ColumnValues::Date(d) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(d.get_days()));
-            p.year = y;
-            p.month = m;
-            p.day = day;
-            p.has_date = true;
-        }
-        ColumnValues::Time(t) => {
-            let (h, mi, s, f) = hms_from_ticks_100ns(t.time_nanoseconds);
-            p.scale = t.scale;
-            p.hour = h;
-            p.minute = mi;
-            p.second = s;
-            p.fraction_ns = f;
-            p.has_time = true;
-        }
-        ColumnValues::DateTime2(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days));
-            let (h, mi, s, f) = hms_from_ticks_100ns(dt.time.time_nanoseconds);
-            p.scale = dt.time.scale;
-            p.year = y;
-            p.month = m;
-            p.day = day;
-            p.hour = h;
-            p.minute = mi;
-            p.second = s;
-            p.fraction_ns = f;
-            p.has_date = true;
-            p.has_time = true;
-        }
-        ColumnValues::DateTimeOffset(dto) => {
-            // The wire value is UTC; `offset` is what must be added to reach the
-            // local wall clock the application wrote, which is what the ODBC
-            // struct and the character rendering report.
-            let utc_ticks = dto.datetime2.time.time_nanoseconds as i64
-                + i64::from(dto.offset) * 60 * 10_000_000;
-            // Euclidean division so a negative offset borrows a day rather than
-            // producing a negative time-of-day.
-            let days = i64::from(dto.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
-            if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
-                return None;
-            }
-            let (y, m, day) = civil_from_days_since_0001(days);
-            let (h, mi, s, f) = hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
-            p.scale = dto.datetime2.time.scale;
-            p.year = y;
-            p.month = m;
-            p.day = day;
-            p.hour = h;
-            p.minute = mi;
-            p.second = s;
-            p.fraction_ns = f;
-            p.tz_hour = dto.offset / 60;
-            p.tz_minute = dto.offset % 60;
-            p.has_date = true;
-            p.has_time = true;
-            p.has_tz = true;
-        }
+        ColumnValues::Date(date) => return Some(date_parts(date)),
+        ColumnValues::Time(time) => return Some(time_parts(time)),
+        ColumnValues::DateTime2(datetime) => return Some(datetime2_parts(datetime)),
+        ColumnValues::DateTimeOffset(datetime) => return datetimeoffset_parts(datetime),
         ColumnValues::DateTime(dt) => {
             let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
             // `datetime` time is counted in 1/300-second ticks since midnight.
