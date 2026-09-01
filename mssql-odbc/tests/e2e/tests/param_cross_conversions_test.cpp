@@ -210,10 +210,15 @@ TEST_F(CrossConversionLiveTest, NegativeSignCountsAgainstColumnSize) {
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
-    ResetParams();
+}
 
-    // One more character of room and the same value fits.
+// The other half of the sign rule, split out because both drivers agree on it:
+// one more character of room and the same value fits. Kept on the compare leg -
+// only the over-long case diverges.
+TEST_F(CrossConversionLiveTest, NegativeSignFitsWhenColumnSizeAllowsIt) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = -123;
+    SQLLEN ind = 0;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
                                    SQL_VARCHAR, 4, 0, &value, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
