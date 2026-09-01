@@ -142,6 +142,16 @@ def test_connection_operations_reuse_connect_logger(client_context):
         assert await conn.commit() is None
 
         logger.messages.clear()
+        cursor = conn.cursor()
+        await cursor.execute("SELECT 1 AS value", use_prepare=False)
+        assert any(
+            "PyAsyncCursor::execute: query executed successfully; "
+            "has_result_set=true; column_count=1" in message
+            for message in logger.messages
+        )
+        await cursor.close()
+
+        logger.messages.clear()
         await conn.close()
         assert any(
             "PyAsyncConnection::close: connection closed" in message

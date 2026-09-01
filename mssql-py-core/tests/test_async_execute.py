@@ -81,14 +81,16 @@ def test_execute_restores_state_when_awaitable_creation_fails(mock_client_contex
         conn = await connect(mock_client_context)
         cursor = conn.cursor()
         await cursor.execute("SELECT 1", use_prepare=False)
+        description = cursor.description
         assert await cursor.fetchone() == (1,)
         assert await cursor.fetchone() is None
-        return conn, cursor
+        return conn, cursor, description
 
-    conn, cursor = asyncio.run(create_exhausted_cursor())
+    conn, cursor, description = asyncio.run(create_exhausted_cursor())
     try:
         with pytest.raises(RuntimeError, match="no running event loop"):
             cursor.execute("SELECT 2", use_prepare=False)
+        assert cursor.description == description
 
         async def verify_restored_state():
             assert await cursor.fetchone() is None

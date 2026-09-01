@@ -33,6 +33,7 @@ use pyo3::types::PyTuple;
 use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
+use crate::async_description::DescriptionState;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
 use crate::async_fetch::FetchState;
 use crate::async_session::{
@@ -171,6 +172,7 @@ pub struct PyAsyncCursor {
     cleanup_started: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
 }
 
 impl PyAsyncCursor {
@@ -199,6 +201,7 @@ impl PyAsyncCursor {
             cleanup_started: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             fetch_state: Arc::new(FetchState::new()),
+            description_state: Arc::new(DescriptionState::new()),
         }
     }
 
@@ -242,6 +245,7 @@ impl PyAsyncCursor {
             self.input_sizes_generation,
             self.cleanup_required.clone(),
             self.fetch_state.clone(),
+            self.description_state.clone(),
         ))
     }
 
@@ -346,6 +350,15 @@ impl PyAsyncCursor {
     #[getter]
     fn timeout(&self) -> u32 {
         self.default_query_timeout
+    }
+
+    /// A seven-item DB-API descriptor for each column in the current result set.
+    #[getter]
+    fn description<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyList>>> {
+        self.description_state.to_python(py)
     }
 
     /// Set SQL type, size, and scale hints for the next successful `execute()`.

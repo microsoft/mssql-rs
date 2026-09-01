@@ -9,6 +9,7 @@ use mssql_tds::connection::client_context::DriverVersion;
 mod arrow_bulkcopy;
 mod async_connection;
 mod async_cursor;
+mod async_description;
 mod async_execute;
 mod async_fetch;
 mod async_parameters;
