@@ -20,7 +20,8 @@ use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
-use mssql_tds::connection::tds_client::{CursorColumn, PlpChunk};
+use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
+use mssql_tds::core::TdsResult;
 use mssql_tds::encoding_rs::{self, Decoder};
 
 use crate::conversion::error::{ConvError, ConvOk};
@@ -527,51 +528,74 @@ fn resume_row_to_column(
         }
     };
 
-    let mut client = {
-        let Ok(mut dbc_state) = dbc.inner.lock() else {
-            error!("SQLGetData: dbc mutex poisoned while resuming row");
-            return SQL_ERROR;
-        };
+    let target = column_number - 1; // 0-based
+    let Ok(mut dbc_state) = dbc.inner.lock() else {
+        error!("SQLGetData: dbc mutex poisoned while resuming row");
+        return SQL_ERROR;
+    };
 
-        if let Some(busy_stmt) = dbc_state.active_stmt
-            && busy_stmt != statement_handle
-        {
-            drop(dbc_state);
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
-                post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
-            }
-            return SQL_ERROR;
+    if let Some(busy_stmt) = dbc_state.active_stmt
+        && busy_stmt != statement_handle
+    {
+        drop(dbc_state);
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            post_diag(&mut stmt_state, ERR_CONNECTION_BUSY);
         }
+        return SQL_ERROR;
+    }
 
-        let Some(client) = dbc_state.client.take() else {
+    let cursor_poll = {
+        let Some(client) = dbc_state.client.as_mut() else {
             drop(dbc_state);
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_diag(&mut stmt_state, ERR_NO_ACTIVE_TDS_CLIENT);
             }
             return SQL_ERROR;
         };
-
-        // Claim while still holding this lock — see the identical fix and
-        // its rationale in more_results.rs's client-take site (AB#47508's
-        // early release can have already left this `None`).
-        dbc_state.active_stmt = Some(statement_handle);
-
-        client
+        client.try_read_row_column(target)
     };
 
-    let target = column_number - 1; // 0-based
-    let cursor_poll = client.try_read_row_column(target);
-    let cursor_result = cursor_poll
-        .and_then(|poll| poll.resolve(|| dbc.runtime.block_on(client.read_row_column(target))));
-
-    let Ok(mut dbc_state) = dbc.inner.lock() else {
-        error!("SQLGetData: dbc mutex poisoned after row resume");
-        return SQL_ERROR;
-    };
-    dbc_state.client = Some(client);
     dbc_state.active_stmt = Some(statement_handle);
-    drop(dbc_state);
+    let cursor_result = match cursor_poll {
+        Ok(CursorPoll::Ready(column)) => {
+            drop(dbc_state);
+            Ok(column)
+        }
+        Err(error) => {
+            drop(dbc_state);
+            Err(error)
+        }
+        Ok(CursorPoll::Pending) => {
+            let Some(mut client) = dbc_state.client.take() else {
+                drop(dbc_state);
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    post_diag(&mut stmt_state, ERR_NO_ACTIVE_TDS_CLIENT);
+                }
+                return SQL_ERROR;
+            };
+            drop(dbc_state);
 
+            let result = dbc.runtime.block_on(client.read_row_column(target));
+
+            let Ok(mut dbc_state) = dbc.inner.lock() else {
+                error!("SQLGetData: dbc mutex poisoned after row resume");
+                return SQL_ERROR;
+            };
+            dbc_state.client = Some(client);
+            dbc_state.active_stmt = Some(statement_handle);
+            drop(dbc_state);
+            result
+        }
+    };
+
+    apply_cursor_result(stmt, column_number, cursor_result)
+}
+
+fn apply_cursor_result(
+    stmt: &StmtHandle,
+    column_number: usize,
+    cursor_result: TdsResult<CursorColumn>,
+) -> SqlReturn {
     match cursor_result {
         Ok(CursorColumn::Value {
             value,
@@ -1902,28 +1926,52 @@ mod tests {
         s.last_captured = Some((1, value));
     }
 
-    #[test]
-    fn get_data_resolves_a_buffered_cursor_column() {
-        let h = TestHandles::with_env_dbc_stmt();
+    fn stmt_with_buffered_ints(h: &TestHandles, values: Vec<i32>) {
         h.mark_dbc_connected();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
-            state.column_metadata = int_columns(1);
+            state.column_metadata = int_columns(values.len());
             state.row_positioned = true;
         }
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
-        let mut client = tds_client_from_int_rows(vec![vec![42]]);
+        let mut client = tds_client_from_int_rows(vec![values]);
         dbc.runtime
             .block_on(client.execute("SELECT buffered row".to_string(), ()))
             .unwrap();
         assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        let mut state = dbc.inner.lock().unwrap();
+        state.client = Some(client);
+        state.active_stmt = Some(h.stmt);
+    }
+
+    #[test]
+    fn resume_row_to_column_keeps_ready_client_installed_and_captures_value() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_ints(&h, vec![42]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        assert_eq!(resume_row_to_column(stmt, h.stmt, 1), SQL_SUCCESS);
+
         {
-            let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(client);
-            state.active_stmt = Some(h.stmt);
+            let state = dbc.inner.lock().unwrap();
+            assert!(state.client.is_some());
+            assert_eq!(state.active_stmt, Some(h.stmt));
         }
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.last_captured, Some((1, ColumnValues::Int(42))));
+        assert_eq!(state.last_variant_base, None);
+        assert!(!state.row_exhausted);
+        assert_eq!(state.partial_text_offset, None);
+    }
+
+    #[test]
+    fn get_data_resolves_a_buffered_cursor_column() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_ints(&h, vec![42]);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut value = 0_i32;
         let mut indicator = 0;
 
@@ -1942,6 +1990,26 @@ mod tests {
         );
         assert_eq!(value, 42);
         assert_eq!(indicator, 4);
+        assert!(dbc.inner.lock().unwrap().client.is_some());
+    }
+
+    #[test]
+    fn resume_row_to_column_restores_client_after_pending_fallback() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_ints(&h, vec![10, 17]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        assert_eq!(resume_row_to_column(stmt, h.stmt, 2), SQL_SUCCESS);
+
+        let dbc_state = dbc.inner.lock().unwrap();
+        assert!(dbc_state.client.is_some());
+        assert_eq!(dbc_state.active_stmt, Some(h.stmt));
+        drop(dbc_state);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.last_captured, Some((2, ColumnValues::Int(10))));
+        assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+        assert!(state.diag_records.is_empty());
     }
 
     /// The byte count a probe reports for each value kind. Variable-length
