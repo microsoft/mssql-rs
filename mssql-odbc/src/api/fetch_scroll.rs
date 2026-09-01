@@ -1104,7 +1104,7 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
 /// Same contract as `deliver_bound`.
 unsafe fn deliver_bound_plp(
     client: &mut mssql_tds::connection::tds_client::TdsClient,
-    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    runtime: &tokio::runtime::Runtime,
     binding: &ColumnBinding,
     row_index: usize,
     bind_offset: usize,
@@ -1269,7 +1269,7 @@ unsafe fn deliver_bound_plp(
 /// Consumes whatever is left of the active PLP stream and discards it.
 fn drain_plp_to_end(
     client: &mut mssql_tds::connection::tds_client::TdsClient,
-    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    runtime: &tokio::runtime::Runtime,
     scratch: &mut [u8],
 ) -> Result<(), TdsError> {
     loop {
