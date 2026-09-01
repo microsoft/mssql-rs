@@ -36,11 +36,16 @@ protected:
                        SQLSMALLINT sql_type, SQLULEN column_size = 0) {
         narrow_.assign(text.begin(), text.end());
         wide_.clear();
-        for (unsigned char ch : text) {
-            wide_.push_back(ch);
-        }
         void* data;
         if (c_type == SQL_C_WCHAR) {
+            for (unsigned char ch : text) {
+                // Widened per byte, not transcoded: a UTF-8 sequence would bind
+                // as its individual bytes - U+00C2 U+00A0 for a non-breaking
+                // space. Non-ASCII belongs in a narrow-only case until this
+                // helper learns to transcode.
+                EXPECT_LT(ch, 0x80) << "BindText cannot widen non-ASCII text";
+                wide_.push_back(ch);
+            }
             indicator_ = static_cast<SQLLEN>(wide_.size() * sizeof(SQLWCHAR));
             data = wide_.data();
         } else {
