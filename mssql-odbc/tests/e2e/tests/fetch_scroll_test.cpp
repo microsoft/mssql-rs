@@ -39,6 +39,14 @@ protected:
         ExecDirect(
             "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY n");
     }
+
+    bool ServerSupportsNativeJson() {
+        SqlTString sql = ODBCTestUtils::ToSqlTStr("SELECT CAST(N'{}' AS JSON)");
+        const bool ok =
+            SQL_SUCCEEDED(SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(sql.c_str()), SQL_NTS));
+        SQLCloseCursor(stmt_);
+        return ok;
+    }
 };
 
 TEST(FetchScrollTest, NullHandle) {
@@ -688,6 +696,32 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
     EXPECT_EQ(30u, len) << "15 whole characters, not 31 bytes ending mid-sequence";
     ASSERT_EQ(0u, len % 2u);
     for (size_t i = 0; i < len; i += 2) {
+        EXPECT_EQ(0xC3u, buf[i]) << "lead byte at " << i;
+        EXPECT_EQ(0xA9u, buf[i + 1]) << "continuation byte at " << (i + 1);
+    }
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
+    if (!ServerSupportsNativeJson()) {
+        GTEST_SKIP() << "server has no native json type";
+    }
+    ExecDirect(
+        "SELECT CAST(N'[\"' + REPLICATE(NCHAR(233), 20) + N'\"]' AS JSON) AS c1");
+
+    unsigned char buf[10] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    const size_t len = std::strlen(reinterpret_cast<const char*>(buf));
+    EXPECT_EQ(8u, len) << "three whole e-acute characters after the JSON prefix";
+    EXPECT_EQ('[', buf[0]);
+    EXPECT_EQ('"', buf[1]);
+    for (size_t i = 2; i < len; i += 2) {
         EXPECT_EQ(0xC3u, buf[i]) << "lead byte at " << i;
         EXPECT_EQ(0xA9u, buf[i + 1]) << "continuation byte at " << (i + 1);
     }

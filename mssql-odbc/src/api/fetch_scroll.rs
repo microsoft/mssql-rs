@@ -696,6 +696,14 @@ fn plp_indicator(
     }
 }
 
+fn trim_partial_utf8(bytes: &mut Vec<u8>) {
+    if let Err(error) = std::str::from_utf8(bytes)
+        && error.error_len().is_none()
+    {
+        bytes.truncate(error.valid_up_to());
+    }
+}
+
 /// Drains an active PLP (max/LOB) stream into a bound column's fixed buffer.
 ///
 /// Unlike `SQLGetData`, which hands back one chunk per call and lets the caller
@@ -825,9 +833,17 @@ unsafe fn deliver_bound_plp(
                     break;
                 }
             }
+        } else if matches!(encoding, Some(PlpEncoding::Utf8Text)) {
+            for b in &scratch[..chunk.read] {
+                if out_bytes.len() < capacity_elements {
+                    out_bytes.push(*b);
+                } else {
+                    truncated = true;
+                    trim_partial_utf8(&mut out_bytes);
+                    break;
+                }
+            }
         } else {
-            // Single-byte and UTF-8 wire bytes are copied verbatim, so there is
-            // no character boundary to respect here beyond what the server sent.
             for b in &scratch[..chunk.read] {
                 if out_bytes.len() < capacity_elements {
                     out_bytes.push(*b);
@@ -1543,6 +1559,22 @@ mod tests {
 
         // A streamed value of unknown length has no total to report either.
         assert_eq!(plp_indicator(31, true, false, None), SQL_NO_TOTAL);
+    }
+
+    #[test]
+    fn utf8_truncation_drops_a_partial_character() {
+        for mut bytes in [
+            b"abc\xc3".to_vec(),
+            b"abc\xe4\xbd".to_vec(),
+            b"abc\xf0\x9f\x98".to_vec(),
+        ] {
+            trim_partial_utf8(&mut bytes);
+            assert_eq!(bytes, b"abc");
+        }
+
+        let mut complete = "abc\u{1f600}".as_bytes().to_vec();
+        trim_partial_utf8(&mut complete);
+        assert_eq!(complete, "abc\u{1f600}".as_bytes());
     }
 
     /// A zero-length character binding is a length probe, as it is for
