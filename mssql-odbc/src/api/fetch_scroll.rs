@@ -89,12 +89,6 @@ impl BufferedGetDataRow {
 
     pub(crate) fn discard_before(&mut self, col: usize) {
         let end = col.min(self.values.len());
-        if self.values.len() < 8 {
-            for value in self.values.iter_mut().take(end) {
-                *value = None;
-            }
-            return;
-        }
         for value in self.values.iter_mut().take(end).skip(self.consumed) {
             *value = None;
         }
@@ -1870,15 +1864,11 @@ mod tests {
     #[test]
     fn buffered_row_discards_each_leading_slot_once() {
         let mut reusable = None;
-        let mut row = BufferedGetDataRow::empty(&mut reusable, 8);
+        let mut row = BufferedGetDataRow::empty(&mut reusable, 4);
         row.values = vec![
             Some(ColumnValues::Int(1)),
             Some(ColumnValues::Int(2)),
             Some(ColumnValues::Int(3)),
-            None,
-            None,
-            None,
-            None,
             None,
         ];
 

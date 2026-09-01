@@ -1549,6 +1549,16 @@ impl GenericDecoder {
                     writer.write_bytes(col, Cow::Borrowed(bytes));
                 }
             }
+            TdsDataType::SsVariant => {
+                let Some((base, value, used)) = self.try_decode_buffered_variant(bytes)? else {
+                    return Ok(None);
+                };
+                if let Some(base) = base {
+                    writer.write_variant_base_type(col, base);
+                }
+                write_column_value(writer, col, value);
+                return Ok(Some(used));
+            }
             _ => {
                 let Some((value, used)) = self.try_decode_buffered(bytes, metadata)? else {
                     return Ok(None);
@@ -5064,14 +5074,31 @@ mod test {
                     .is_err()
             );
 
-            let unsupported = fixed_metadata(TdsDataType::SsVariant, 0);
+            let variant = fixed_metadata(TdsDataType::SsVariant, 0);
             let mut writer = DefaultRowWriter::new(1);
             assert_eq!(
                 decoder
-                    .try_decode_buffered_into(&[0; 4], &unsupported, 0, &mut writer)
+                    .try_decode_buffered_into(&[0; 3], &variant, 0, &mut writer)
                     .unwrap(),
                 None
             );
+            assert!(writer.take_row().is_empty());
+        }
+
+        #[test]
+        fn buffered_variant_into_preserves_base_type() {
+            let decoder = GenericDecoder::default();
+            let variant = fixed_metadata(TdsDataType::SsVariant, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            let wire = [6, 0, 0, 0, TdsDataType::Int4 as u8, 0, 42, 0, 0, 0];
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&wire, &variant, 0, &mut writer)
+                    .unwrap(),
+                Some(wire.len())
+            );
+            assert_eq!(writer.variant_base(0), Some(TdsDataType::Int4));
+            assert_eq!(writer.take_row(), vec![ColumnValues::Int(42)]);
         }
 
         #[tokio::test]

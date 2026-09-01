@@ -242,7 +242,7 @@ fn sql_get_data_safe(
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             stmt_state.current_row_last_col = col_index;
             stmt_state.partial_text_offset = None;
-            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
+            return finish_buffered_get_data(stmt_state, col_index, SQL_SUCCESS);
         }
         let direct_decimal = direct_buffered
             && target_type == SQL_C_CHAR
@@ -264,7 +264,7 @@ fn sql_get_data_safe(
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             stmt_state.current_row_last_col = col_index;
             stmt_state.partial_text_offset = None;
-            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
+            return finish_buffered_get_data(stmt_state, col_index, SQL_SUCCESS);
         }
         let direct_scalar = row
             .values
@@ -284,7 +284,7 @@ fn sql_get_data_safe(
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             stmt_state.current_row_last_col = col_index;
             stmt_state.partial_text_offset = None;
-            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
+            return finish_buffered_get_data(stmt_state, col_index, SQL_SUCCESS);
         }
         let typed_buffered = is_typed_c_target(target_type)
             && row
@@ -317,7 +317,7 @@ fn sql_get_data_safe(
                 stmt_state.current_row_last_col = col_index;
                 stmt_state.partial_text_offset = None;
             }
-            return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
+            return finish_buffered_get_data(stmt_state, col_index, rc);
         }
 
         let captured = row.values.get_mut(col_index - 1).and_then(Option::take);
@@ -341,6 +341,9 @@ fn sql_get_data_safe(
         // is already paused at that boundary, so discard the now-inaccessible
         // prefix and continue through the ordinary streaming/resume path.
         if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
+            for value in row.values.iter_mut().take(row.consumed) {
+                *value = None;
+            }
             row.wire_deferred = true;
         }
         try_complete_buffered_plp = target_type == SQL_C_WCHAR
@@ -423,6 +426,30 @@ unsafe fn try_write_complete_buffered_string(
                 SqlLen::try_from(bytes.len()).unwrap_or(SqlLen::MAX),
             );
             copy_with_nul(target_value_ptr.cast::<u8>(), buffer_length as usize, bytes);
+        }
+        return true;
+    }
+
+    let utf16_ascii = target_type == SQL_C_CHAR
+        && matches!(value.encoding_type(), EncodingType::Utf16)
+        && bytes.len().is_multiple_of(2)
+        && bytes
+            .chunks_exact(2)
+            .all(|unit| unit[1] == 0 && unit[0].is_ascii());
+    let utf16_ascii_len = bytes.len() / 2;
+    if utf16_ascii && (buffer_length as usize) > utf16_ascii_len {
+        unsafe {
+            write_if_some(
+                strlen_or_ind_ptr,
+                SqlLen::try_from(utf16_ascii_len).unwrap_or(SqlLen::MAX),
+            );
+            if !target_value_ptr.is_null() {
+                let target = target_value_ptr.cast::<u8>();
+                for (index, unit) in bytes.chunks_exact(2).enumerate() {
+                    target.add(index).write_unaligned(unit[0]);
+                }
+                target.add(utf16_ascii_len).write_unaligned(0);
+            }
         }
         return true;
     }
@@ -724,6 +751,25 @@ fn finish_get_data(
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
     release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, true);
+    rc
+}
+
+#[inline]
+fn finish_buffered_get_data(
+    mut stmt_state: MutexGuard<'_, StmtState>,
+    col_index: usize,
+    rc: SqlReturn,
+) -> SqlReturn {
+    debug_assert!(
+        stmt_state
+            .buffered_get_data_row
+            .as_ref()
+            .is_some_and(|row| !row.wire_deferred)
+    );
+    if stmt_state.current_row_last_col == col_index && col_index == stmt_state.column_metadata.len()
+    {
+        stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
+    }
     rc
 }
 
@@ -2885,6 +2931,34 @@ mod tests {
         });
         assert_eq!(wide_out, [b'h' as u16, b'i' as u16, 0]);
         assert_eq!(indicator, 4);
+
+        let mut utf8_out = [0_u8; 3];
+        assert!(unsafe {
+            try_write_complete_buffered_string(
+                &wide,
+                SQL_C_CHAR,
+                utf8_out.as_mut_ptr().cast(),
+                utf8_out.len() as SqlLen,
+                &mut indicator,
+            )
+        });
+        assert_eq!(&utf8_out, b"hi\0");
+        assert_eq!(indicator, 2);
+
+        let non_ascii_bytes = "\u{e9}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let non_ascii = ColumnValues::String(SqlString::new(non_ascii_bytes, EncodingType::Utf16));
+        assert!(!unsafe {
+            try_write_complete_buffered_string(
+                &non_ascii,
+                SQL_C_CHAR,
+                utf8_out.as_mut_ptr().cast(),
+                utf8_out.len() as SqlLen,
+                &mut indicator,
+            )
+        });
 
         let empty = ColumnValues::String(SqlString::new(Vec::new(), EncodingType::Utf16));
         let mut empty_out = [0xAA_u8; 2];
