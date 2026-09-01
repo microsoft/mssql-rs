@@ -577,6 +577,15 @@ pub(super) fn finish_execute(
         };
     }
 
+    // SQL Server can send COLMETADATA before the statement has produced its
+    // first row. Wait for that row, end-of-set, or an ERROR token so execution
+    // errors surface from SQLExecDirect/SQLExecute instead of a later SQLFetch.
+    // A row is only positioned and parked; SQLFetch still receives it normally.
+    if let Err(e) = dbc.runtime.block_on(client.peek_past_current_row()) {
+        error!(%e, "{op}: failed before the first result row");
+        return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+    }
+
     // Result-bearing query: leave the cursor open for SQLFetch.
     let info_messages = client.take_info_messages();
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -611,7 +620,8 @@ mod tests {
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::{
-        ScriptedToken, col_metadata_empty, done_more, done_no_more, tds_client_from_tokens,
+        ScriptedToken, col_metadata, col_metadata_empty, done_more, done_no_more, int_columns,
+        sql_error, tds_client_from_tokens,
     };
     use std::ffi::c_void;
 
@@ -650,6 +660,33 @@ mod tests {
         assert!(try_claim_idle_client(dbc, h.dbc).is_none());
         // The existing claim must be left untouched.
         assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+    }
+
+    #[test]
+    fn finish_execute_surfaces_an_error_before_the_first_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![
+            col_metadata(int_columns(1)),
+            sql_error(1222, 16, "Lock request time out period exceeded."),
+            done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT blocked".to_string(), ()))
+            .unwrap();
+
+        let rc = finish_execute(dbc, stmt, h.stmt, client, "SQLExecDirectW");
+
+        assert_eq!(rc, SQL_ERROR);
+        let stmt_state = stmt.inner.lock().unwrap();
+        assert!(
+            stmt_state
+                .diag_records
+                .iter()
+                .any(|record| record.native_error == 1222)
+        );
     }
 
     /// Builds a scripted client positioned on a row-returning result (empty

@@ -11,6 +11,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <chrono>
 #include <string>
 
 // SQL_TXN_SS_SNAPSHOT lives in msodbcsql.h, which these tests do not include.
@@ -544,6 +545,56 @@ TEST_F(TransactionLiveTest, IsolationIsAppliedOnTheServer) {
         EXPECT_EQ(server_level, ServerIsolation()) << "level 0x" << std::hex << odbc_level;
     }
     ASSERT_SQL_OK(SetIsolation(dbc_, SQL_TXN_READ_COMMITTED), SQL_HANDLE_DBC, dbc_);
+}
+
+// A server-side lock timeout is a statement error, not a client query timeout.
+// SQLExecDirect must consume the ERROR/DONE response and return it instead of
+// waiting indefinitely for another token (AB#47771).
+TEST_F(TransactionLiveTest, BlockedSelectReturnsServerLockTimeout) {
+    const std::string table = GlobalTempTable("lock_timeout");
+    Exec("CREATE TABLE " + table + "(id int PRIMARY KEY, value int)");
+    Exec("INSERT INTO " + table + " VALUES (1, 0)");
+
+    ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
+    Exec("UPDATE " + table + " SET value = 1 WHERE id = 1");
+
+    SQLHDBC reader = SQL_NULL_HDBC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &reader), SQL_HANDLE_ENV, env_);
+    SqlTString connstr = ODBCTestUtils::BuildConnectionString();
+    SQLTCHAR out_str[1024] = {};
+    SQLSMALLINT out_len = 0;
+    ASSERT_SQL_OK(SQLDriverConnect(reader, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
+                                   static_cast<SQLSMALLINT>(connstr.size()), out_str,
+                                   static_cast<SQLSMALLINT>(std::size(out_str)), &out_len,
+                                   SQL_DRIVER_NOPROMPT),
+                  SQL_HANDLE_DBC, reader);
+
+    SQLHSTMT reader_stmt = SQL_NULL_HSTMT;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, reader, &reader_stmt), SQL_HANDLE_DBC, reader);
+    ASSERT_SQL_OK(SQLSetStmtAttr(reader_stmt, SQL_ATTR_QUERY_TIMEOUT,
+                                 reinterpret_cast<SQLPOINTER>(static_cast<SQLULEN>(10)), 0),
+                  SQL_HANDLE_STMT, reader_stmt);
+    ASSERT_SQL_OK(Run(reader_stmt, "SET LOCK_TIMEOUT 1000"), SQL_HANDLE_STMT, reader_stmt);
+
+    const auto start = std::chrono::steady_clock::now();
+    const SQLRETURN rc = Run(reader_stmt, "SELECT value FROM " + table + " WHERE id = 1");
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    EXPECT_EQ(SQL_ERROR, rc);
+    SQLTCHAR state[6] = {};
+    SQLINTEGER native = 0;
+    SQLTCHAR message[1024] = {};
+    SQLSMALLINT length = 0;
+    ASSERT_SQL_OK(SQLGetDiagRec(SQL_HANDLE_STMT, reader_stmt, 1, state, &native, message,
+                                static_cast<SQLSMALLINT>(std::size(message)), &length),
+                  SQL_HANDLE_STMT, reader_stmt);
+    EXPECT_EQ(1222, native);
+    EXPECT_LT(elapsed, std::chrono::seconds(5));
+
+    ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
+    SQLFreeHandle(SQL_HANDLE_STMT, reader_stmt);
+    SQLDisconnect(reader);
+    SQLFreeHandle(SQL_HANDLE_DBC, reader);
 }
 
 // The isolation level survives commit and rollback — it is a session setting.
