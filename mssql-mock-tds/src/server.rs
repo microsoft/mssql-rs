@@ -366,12 +366,17 @@ impl ConnectionProcessor {
                         Ok(sql) => {
                             info!("Executing SQL from {}: {}", self.addr, sql);
 
-                            // Look up query in registry
-                            let registry = self.query_registry.lock().await;
-                            if let Some(response_data) = registry.get(&sql) {
+                            // Look up query in registry. Cloned so the lock is
+                            // released before any artificial delay below.
+                            let registered = self.query_registry.lock().await.get(&sql).cloned();
+                            if let Some(response_data) = registered {
                                 info!("Found registered response for query");
+                                if let Some(delay) = response_data.delay {
+                                    debug!(?delay, "Delaying response for query");
+                                    tokio::time::sleep(delay).await;
+                                }
                                 // build_query_result already wraps in a packet, so return directly
-                                let packet = build_query_result(response_data);
+                                let packet = build_query_result(&response_data);
                                 Some(packet)
                             } else {
                                 info!("No registered response, returning empty result");

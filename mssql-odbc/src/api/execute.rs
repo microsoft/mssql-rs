@@ -59,6 +59,9 @@ struct Execution {
     /// A prepared statement's still-live handle, superseded by a prior rebind /
     /// re-prepare, dropped by piggyback on this execute.
     orphaned: Option<StatementId>,
+    /// `SQL_ATTR_QUERY_TIMEOUT` in effect for this statement, in seconds; `0`
+    /// means no timeout.
+    query_timeout: u32,
 }
 
 /// Values gathered when at least one bound parameter carries a data-at-execution
@@ -71,6 +74,9 @@ struct DaeExecution {
     dae_params: Vec<DaeParam>,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
+    /// `SQL_ATTR_QUERY_TIMEOUT` in effect for this statement, in seconds; `0`
+    /// means no timeout.
+    query_timeout: u32,
 }
 
 enum ExecutionStaging {
@@ -91,6 +97,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             named_params,
             mut prepared,
             mut orphaned,
+            query_timeout,
         }) => {
             let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
                 Ok(client) => client,
@@ -123,13 +130,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // when it belongs to a superseded session (msodbcsql `FIsReprepareRequired`).
             // A still-live orphaned handle is released by piggyback on the re-prepare.
             //
-            // Command timeout (SQL_ATTR_QUERY_TIMEOUT) isn't wired up yet; the default
-            // `ExecuteOptions` means no per-command limit.
+            // `query_timeout` (SQL_ATTR_QUERY_TIMEOUT) bounds the whole call, including
+            // any reconnect charged above; `0` means unlimited, matching the ODBC default.
             let exec_result = dbc.runtime.block_on(client.execute_prepared(
                 &mut prepared.stmt,
                 named_params,
                 &mut orphaned,
-                ExecuteOptions::default(),
+                ExecuteOptions::new().timeout_secs(query_timeout),
             ));
 
             // Write the statement back along with any orphan that was not consumed
@@ -169,6 +176,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             dae_params,
             mut prepared,
             mut orphaned,
+            query_timeout,
         }) => {
             let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
                 Ok(client) => client,
@@ -203,7 +211,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 &mut prepared.stmt,
                 params,
                 &mut orphaned,
-                ExecuteOptions::default(),
+                ExecuteOptions::new().timeout_secs(query_timeout),
             ));
 
             match begin_result {
@@ -303,6 +311,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         .take()
         .expect("prepared checked non-None above");
     let orphaned = stmt_state.pending_unprepare.take();
+    let query_timeout = stmt_state.query_timeout;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.column_metadata.clear();
     stmt_state.reset_row_stream();
@@ -315,6 +324,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             named_params: params,
             prepared,
             orphaned,
+            query_timeout,
         }))
     } else {
         Ok(ExecutionStaging::NeedData(DaeExecution {
@@ -322,6 +332,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             dae_params,
             prepared,
             orphaned,
+            query_timeout,
         }))
     }
 }
@@ -502,6 +513,42 @@ mod tests {
         assert_eq!(exec_orphaned, None);
         assert_eq!(exec_prepared_sql, "SELECT 1");
         assert!(stmt.inner.lock().unwrap().prepared.is_none());
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` (`StmtState::query_timeout`) must be captured
+    /// during staging so the execute call can bound the wait for a response —
+    /// see mssql-rs#439: a statement blocked server-side has no client-side
+    /// escape hatch when the timeout is silently dropped on the floor.
+    #[test]
+    fn stage_execution_captures_configured_query_timeout() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = 42;
+
+        let staging = stage_execution(stmt).expect("staging should succeed");
+        let query_timeout = match staging {
+            ExecutionStaging::Ready(e) => e.query_timeout,
+            ExecutionStaging::NeedData(e) => e.query_timeout,
+        };
+        assert_eq!(query_timeout, 42);
+    }
+
+    /// The ODBC default (`0`, "no timeout") must still stage as `0`, which
+    /// `ExecuteOptions::timeout_secs` treats as unlimited — the common case
+    /// must stay behaviorally unchanged by wiring the timeout through.
+    #[test]
+    fn stage_execution_default_query_timeout_is_zero() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let staging = stage_execution(stmt).expect("staging should succeed");
+        let query_timeout = match staging {
+            ExecutionStaging::Ready(e) => e.query_timeout,
+            ExecutionStaging::NeedData(e) => e.query_timeout,
+        };
+        assert_eq!(query_timeout, 0);
     }
 
     #[test]

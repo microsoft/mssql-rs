@@ -5,7 +5,7 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::StreamedParamStatus;
+use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
@@ -86,7 +86,7 @@ fn sql_exec_direct_w_safe(
     let dbc = stmt.parent_dbc();
 
     // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count) = {
+    let (named_params, rewritten_sql, marker_count, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -129,7 +129,12 @@ fn sql_exec_direct_w_safe(
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (named_params, rewritten_sql, marker_count)
+        (
+            named_params,
+            rewritten_sql,
+            marker_count,
+            stmt_state.query_timeout,
+        )
     };
 
     let ParamsWithDae { params, dae_params } = named_params;
@@ -150,9 +155,11 @@ fn sql_exec_direct_w_safe(
     // and hand control to SQLParamData / SQLPutData. There is no prepared plan
     // to restore afterwards, so `None` is passed for it.
     if !dae_params.is_empty() {
-        let begin_result =
-            dbc.runtime
-                .block_on(client.begin_sp_executesql(rewritten_sql, params, ()));
+        let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
+            rewritten_sql,
+            params,
+            ExecuteOptions::new().timeout_secs(query_timeout),
+        ));
         return match begin_result {
             // Defensive: staging only reports DAE parameters when at least one
             // placeholder is present, so the TDS layer should not complete here.
@@ -175,17 +182,24 @@ fn sql_exec_direct_w_safe(
 
     // Parameterized text runs via sp_executesql (direct execution, no cached
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
-    // STMT lock is held during I/O.
+    // STMT lock is held during I/O. `query_timeout` (SQL_ATTR_QUERY_TIMEOUT)
+    // bounds either call; `0` means unlimited, matching the ODBC default.
     let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
         dbc.runtime
-            .block_on(client.execute_sp_executesql(rewritten_sql, params, ()))
+            .block_on(client.execute_sp_executesql(
+                rewritten_sql,
+                params,
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ))
             .map(|_| ())
     } else {
         // Statement-wise navigation: position on the batch's first statement
         // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
         // individually navigable via SQLMoreResults. finish_execute inspects the
         // resulting client state.
-        dbc.runtime.block_on(client.execute(sql, ())).map(|_| ())
+        dbc.runtime
+            .block_on(client.execute(sql, ExecuteOptions::new().timeout_secs(query_timeout)))
+            .map(|_| ())
     };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
@@ -390,6 +404,29 @@ mod tests {
         let ds = dbc.inner.lock().unwrap();
         assert_eq!(ds.active_stmt, Some(h.stmt));
         assert!(ds.client.is_some());
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` (`StmtState::query_timeout`) must reach
+    /// `ExecuteOptions` without disturbing a normal execute that completes
+    /// well inside the budget — see mssql-rs#439, where the timeout was
+    /// silently dropped on the floor instead of bounding a blocked statement.
+    #[test]
+    fn exec_direct_honors_configured_query_timeout_on_the_happy_path() {
+        use crate::api::odbc_types::SQL_SUCCESS;
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![done_no_more()]);
+        dbc.inner.lock().unwrap().client = Some(client);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = 30;
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SET LOCK_TIMEOUT 5000".to_string());
+        assert_eq!(ret, SQL_SUCCESS);
     }
 
     /// SQL Server compiles variable assignment as a SQLSELECT command carrying

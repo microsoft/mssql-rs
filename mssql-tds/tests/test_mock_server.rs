@@ -1012,4 +1012,100 @@ mod mock_server_tests {
 
         Ok(())
     }
+
+    /// Regression test for microsoft/mssql-rs#439.
+    ///
+    /// A statement blocked server-side (e.g. behind another session's row
+    /// lock) that eventually fails with a real SQL Server error — 1222, "Lock
+    /// request time out period exceeded" — must surface that error once the
+    /// server actually replies, not hang indefinitely. `execute` is called
+    /// with the same default `ExecuteOptions` (no client-side timeout) that
+    /// mssql-odbc's `SQLExecDirectW` currently uses, so this exercises exactly
+    /// the wait the ODBC driver performs.
+    #[tokio::test]
+    async fn test_delayed_statement_error_does_not_hang() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+        use std::time::{Duration, Instant};
+
+        init_tracing();
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(3);
+        const GENEROUS_BOUND: Duration = Duration::from_secs(30);
+        const SELECT_SQL: &str = "SELECT * FROM ##test_isolation WHERE id = 1";
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+
+        // The server holds the reply until RESPONSE_DELAY has elapsed, then
+        // answers with the same shape a real, lock-timed-out SELECT gets: a
+        // single ERROR token whose DONE ends the batch (no result set).
+        let registry = server.query_registry();
+        {
+            let mut reg = registry.lock().await;
+            reg.register(
+                SELECT_SQL,
+                QueryResponse::error_only(TerminalError::new(
+                    1222,
+                    16,
+                    "Lock request time out period exceeded.",
+                ))
+                .with_delay(RESPONSE_DELAY),
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        let started = Instant::now();
+        let outcome =
+            tokio::time::timeout(GENEROUS_BOUND, client.execute(SELECT_SQL.to_string(), ()))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "execute() hung past the {GENEROUS_BOUND:?} test bound waiting for a \
+                     response delayed by {RESPONSE_DELAY:?} (mssql-rs#439)"
+                    )
+                });
+        let elapsed = started.elapsed();
+
+        match outcome.expect_err("a lock-timed-out statement must surface as an error") {
+            mssql_tds::error::Error::SqlServerError { diagnostics } => {
+                assert_eq!(diagnostics.errors.len(), 1);
+                assert_eq!(diagnostics.errors[0].number, 1222);
+            }
+            other => panic!("expected a SqlServerError(1222), got: {other:?}"),
+        }
+
+        assert!(
+            elapsed >= RESPONSE_DELAY,
+            "response surfaced before the server's artificial delay even elapsed: {elapsed:?}"
+        );
+
+        client.close_connection().await?;
+
+        // Cleanup
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
 }

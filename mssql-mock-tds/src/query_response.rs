@@ -5,6 +5,7 @@
 
 use bytes::{BufMut, BytesMut};
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// SQL data types supported by the mock server
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +185,29 @@ impl LeadingError {
     }
 }
 
+/// A server error that ends the batch immediately, with no result set at all.
+///
+/// Models a statement failing outright before producing a row set — for
+/// example SQL Server error 1222 ("Lock request time out period exceeded") on
+/// a `SELECT` blocked behind another session's lock. Unlike [`LeadingError`],
+/// no ColMetadata/Row/DONE follows: the ERROR token's DONE is itself terminal.
+#[derive(Debug, Clone)]
+pub struct TerminalError {
+    pub number: u32,
+    pub severity: u8,
+    pub message: String,
+}
+
+impl TerminalError {
+    pub fn new(number: u32, severity: u8, message: impl Into<String>) -> Self {
+        Self {
+            number,
+            severity,
+            message: message.into(),
+        }
+    }
+}
+
 /// A complete query response definition
 #[derive(Debug, Clone)]
 pub struct QueryResponse {
@@ -193,6 +217,12 @@ pub struct QueryResponse {
     /// An error emitted (with a DONE MORE token) before the result set, so the
     /// server keeps streaming the row set after a statement-scoped error.
     pub leading_error: Option<LeadingError>,
+    /// An error that ends the batch immediately, in place of `columns`/`rows`.
+    /// Takes precedence over `leading_error` when both are set.
+    pub terminal_error: Option<TerminalError>,
+    /// Artificial delay before the server sends this response, simulating a
+    /// slow-to-resolve statement (e.g. blocked on a server-side lock).
+    pub delay: Option<Duration>,
 }
 
 impl QueryResponse {
@@ -203,6 +233,8 @@ impl QueryResponse {
             rows,
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 
@@ -218,6 +250,26 @@ impl QueryResponse {
         self
     }
 
+    /// Replaces any result set with a single error that ends the batch, e.g.
+    /// to model a blocked statement that fails with SQL Server error 1222.
+    pub fn error_only(error: TerminalError) -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            info_tokens: Vec::new(),
+            leading_error: None,
+            terminal_error: Some(error),
+            delay: None,
+        }
+    }
+
+    /// Delays the server's response by `duration`, simulating a statement
+    /// that blocks (e.g. on a row lock) before the server can answer it.
+    pub fn with_delay(mut self, duration: Duration) -> Self {
+        self.delay = Some(duration);
+        self
+    }
+
     /// Helper to create a response for SELECT 1
     pub fn select_one() -> Self {
         Self {
@@ -225,6 +277,8 @@ impl QueryResponse {
             rows: vec![Row::new(vec![ColumnValue::Int(1)])],
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 
@@ -243,6 +297,8 @@ impl QueryResponse {
             ])],
             info_tokens: Vec::new(),
             leading_error: None,
+            terminal_error: None,
+            delay: None,
         }
     }
 }
