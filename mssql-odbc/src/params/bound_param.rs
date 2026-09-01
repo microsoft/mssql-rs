@@ -119,6 +119,9 @@ impl BoundParam {
             ipd_record.length = self.column_size;
             ipd_record.precision = 0;
         }
+        // SQLBindParameter is an explicit application choice: describe_param.rs's
+        // refine_ipd must never override it with the server's informational answer.
+        ipd_record.explicitly_bound = true;
     }
 
     /// Reconstructs the binding an APD/IPD record pair represents, or `None`

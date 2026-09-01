@@ -84,6 +84,8 @@ fn ird_record_from_metadata(meta: &ColumnMetadata) -> DescRecord {
         data_ptr: std::ptr::null_mut(),
         indicator_ptr: std::ptr::null_mut(),
         octet_length_ptr: std::ptr::null_mut(),
+        // IRD only; the flag is meaningless outside IPD.
+        explicitly_bound: false,
     }
 }
 

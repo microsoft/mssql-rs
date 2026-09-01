@@ -300,6 +300,7 @@ mod tests {
                 data_ptr: ptr::null_mut(),
                 indicator_ptr: ptr::null_mut(),
                 octet_length_ptr: ptr::null_mut(),
+                explicitly_bound: false,
             },
         );
 
@@ -335,6 +336,7 @@ mod tests {
                 data_ptr: ptr::null_mut(),
                 indicator_ptr: ptr::null_mut(),
                 octet_length_ptr: ptr::null_mut(),
+                explicitly_bound: false,
             },
         );
 
@@ -369,6 +371,7 @@ mod tests {
                 data_ptr: ptr::null_mut(),
                 indicator_ptr: ptr::null_mut(),
                 octet_length_ptr: ptr::null_mut(),
+                explicitly_bound: false,
             },
         );
 

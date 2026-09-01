@@ -291,15 +291,24 @@ fn set_record_field(
                 post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
                 return SQL_ERROR;
             };
-            write_record_field(state, record_number, |r| r.datetime_interval_code = code)
+            write_record_field(state, record_number, |r| {
+                r.datetime_interval_code = code;
+                r.explicitly_bound = true;
+            })
         }
         SQL_DESC_LENGTH => {
             let len = value_ptr as SqlULen;
-            write_record_field(state, record_number, |r| r.length = len)
+            write_record_field(state, record_number, |r| {
+                r.length = len;
+                r.explicitly_bound = true;
+            })
         }
         SQL_DESC_OCTET_LENGTH => {
             let len = value_ptr as SqlLen;
-            write_record_field(state, record_number, |r| r.octet_length = len)
+            write_record_field(state, record_number, |r| {
+                r.octet_length = len;
+                r.explicitly_bound = true;
+            })
         }
         SQL_DESC_PRECISION => set_precision(state, record_number, value_ptr),
         SQL_DESC_SCALE => set_scale(state, record_number, value_ptr),
@@ -419,6 +428,7 @@ pub(super) fn set_type(
     write_record_field(state, record_number, |r| {
         r.concise_type = resolved;
         r.datetime_interval_code = datetime_interval_code_for(resolved);
+        r.explicitly_bound = true;
     })
 }
 
@@ -483,7 +493,10 @@ pub(super) fn set_precision(
         return SQL_ERROR;
     }
 
-    write_record_field(state, record_number, |r| r.precision = precision)
+    write_record_field(state, record_number, |r| {
+        r.precision = precision;
+        r.explicitly_bound = true;
+    })
 }
 
 /// `SQL_DESC_SCALE` write. Same `SQL_C_NUMERIC` consistency bound as
@@ -513,7 +526,10 @@ pub(super) fn set_scale(
         return SQL_ERROR;
     }
 
-    write_record_field(state, record_number, |r| r.scale = scale)
+    write_record_field(state, record_number, |r| {
+        r.scale = scale;
+        r.explicitly_bound = true;
+    })
 }
 
 /// `SQL_DESC_DATA_PTR` write (AD only). Re-validates the record's

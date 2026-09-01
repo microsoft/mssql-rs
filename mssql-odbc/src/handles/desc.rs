@@ -216,6 +216,18 @@ pub(crate) struct DescRecord {
     pub(crate) indicator_ptr: SqlPointer,
     /// `SQL_DESC_OCTET_LENGTH_PTR`. ARD/APD only. Opaque, see `data_ptr`.
     pub(crate) octet_length_ptr: SqlPointer,
+    /// IPD only: set when the application has itself written this record's
+    /// type/size (`SQL_DESC_CONCISE_TYPE`/`TYPE`, `DATETIME_INTERVAL_CODE`,
+    /// `LENGTH`, `OCTET_LENGTH`, `PRECISION` or `SCALE`) via
+    /// `SQLBindParameter` or `SQLSetDescField`/`SQLSetDescRec` — never by
+    /// `describe_param.rs`'s own `refine_ipd`, which writes these same
+    /// fields directly and bypasses this flag entirely. Distinguishes "the
+    /// application chose this" from "a previous `SQLDescribeParam` filled
+    /// this in" so `refine_ipd` can refresh what it previously auto-filled
+    /// (e.g. across a re-`SQLPrepare`) while never overriding an explicit
+    /// bind — `concise_type != 0` alone can't tell the two apart, since
+    /// `refine_ipd`'s own write leaves it non-zero too.
+    pub(crate) explicitly_bound: bool,
 }
 
 impl DescRecord {
@@ -246,6 +258,7 @@ impl DescRecord {
             data_ptr: std::ptr::null_mut(),
             indicator_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
+            explicitly_bound: false,
         }
     }
 

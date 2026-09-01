@@ -289,16 +289,20 @@ fn sql_describe_param_safe(
 /// has not already set: `sp_describe_undeclared_parameters` is informational
 /// (ODBC's `SQLDescribeParam` never mutates bind behavior), so a marker the
 /// application has explicitly bound is left untouched rather than
-/// overridden. `SQL_DESC_CONCISE_TYPE == 0` is `DescRecord::default_for`'s
-/// "never bound" sentinel for an IPD record (`SQLBindParameter` always
-/// writes a real, non-zero SQL type — see `BoundParam::write_to_records`),
-/// so it doubles as the "still safe to refine" check. Refining an
-/// already-bound marker would both silently change what `SQLExecute` sends
-/// for a type the application explicitly chose, and bypass the
-/// `is_supported_conversion` gate `SQLBindParameter` enforces at bind time.
-/// Grows the IPD to cover every described marker but never shrinks it, so
-/// an application that grew the IPD further itself
-/// (`SQLSetDescField(IPD, 0, SQL_DESC_COUNT, ...)`) keeps that choice.
+/// overridden. Refining an already-bound marker would both silently change
+/// what `SQLExecute` sends for a type the application explicitly chose, and
+/// bypass the `is_supported_conversion` gate `SQLBindParameter` enforces at
+/// bind time.
+///
+/// Guarded by `DescRecord::explicitly_bound`, not `concise_type != 0`: this
+/// function's own write below leaves `concise_type` non-zero too, so the
+/// concise type alone can't tell "the application chose this" apart from "a
+/// previous `SQLDescribeParam` filled this in" — and a re-`SQLPrepare` only
+/// resets `parameter_metadata`/the prepared handle, never the IPD's records,
+/// so a marker this function refined on an earlier prepare must still be
+/// refreshable on the next one. Grows the IPD to cover every described
+/// marker but never shrinks it, so an application that grew the IPD further
+/// itself (`SQLSetDescField(IPD, 0, SQL_DESC_COUNT, ...)`) keeps that choice.
 ///
 /// `ParameterDescription` carries no parameter direction or name — the
 /// server doesn't determine either from `sp_describe_undeclared_parameters`
@@ -322,10 +326,10 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
         let Some(record) = desc_state.record_mut(record_number) else {
             continue;
         };
-        if record.concise_type != 0 {
-            // Already bound (by SQLBindParameter or a prior SQLSetDescField/
-            // SQLSetDescRec) — informational metadata must not override an
-            // application's explicit choice.
+        if record.explicitly_bound {
+            // Bound by SQLBindParameter or SQLSetDescField/SQLSetDescRec —
+            // informational metadata must not override an application's
+            // explicit choice.
             continue;
         }
         record.concise_type = description.data_type;
@@ -1137,6 +1141,7 @@ mod tests {
             record.concise_type = SQL_VARCHAR;
             record.length = 50;
             record.scale = 7;
+            record.explicitly_bound = true;
         }
         refine_ipd(stmt, &[param_description(SQL_INTEGER, 4, 0, SQL_NO_NULLS)]);
 
@@ -1147,5 +1152,33 @@ mod tests {
         );
         assert_eq!(record.length, 50);
         assert_eq!(record.scale, 7);
+    }
+
+    /// `concise_type != 0` alone can't distinguish an application bind from
+    /// `refine_ipd`'s own earlier fill-in, since this function's write leaves
+    /// it non-zero too — the exact ambiguity `explicitly_bound` exists to
+    /// resolve. A marker `refine_ipd` filled in on one `SQLDescribeParam`
+    /// call must still be refreshable on a later one for the same marker
+    /// (e.g. after a re-`SQLPrepare`, which resets `parameter_metadata` but
+    /// never touches the IPD's own records), as long as no real
+    /// `SQLBindParameter`/`SQLSetDescField` ever ran in between.
+    #[test]
+    fn refine_ipd_refreshes_a_marker_it_previously_auto_filled_itself() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        assert_eq!(ipd_records(&h)[0].concise_type, SQL_INTEGER);
+
+        // Simulates a re-SQLPrepare landing a different query with a
+        // differently-typed marker 1, without any application bind ever
+        // touching this IPD record in between.
+        refine_ipd(stmt, &[param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS)]);
+
+        let record = &ipd_records(&h)[0];
+        assert_eq!(
+            record.concise_type, SQL_VARCHAR,
+            "a record refine_ipd filled in itself must stay refreshable"
+        );
+        assert_eq!(record.length, 80);
     }
 }

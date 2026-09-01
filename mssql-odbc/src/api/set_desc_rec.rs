@@ -172,7 +172,8 @@ fn sql_set_desc_rec_safe(
     // - DataPtr last: `set_data_ptr` reruns the SQL_C_NUMERIC precision/scale
     //   consistency check, which needs Precision/Scale already written.
     let sub_type_write = write_record_field(&mut state, record_number, |r| {
-        r.datetime_interval_code = sub_type
+        r.datetime_interval_code = sub_type;
+        r.explicitly_bound = true;
     });
     if sub_type_write != SQL_SUCCESS {
         return sub_type_write;
@@ -187,7 +188,10 @@ fn sql_set_desc_rec_safe(
     if type_write != SQL_SUCCESS {
         return type_write;
     }
-    let length_write = write_record_field(&mut state, record_number, |r| r.octet_length = length);
+    let length_write = write_record_field(&mut state, record_number, |r| {
+        r.octet_length = length;
+        r.explicitly_bound = true;
+    });
     if length_write != SQL_SUCCESS {
         return length_write;
     }
