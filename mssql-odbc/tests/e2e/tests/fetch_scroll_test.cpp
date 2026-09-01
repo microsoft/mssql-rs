@@ -704,6 +704,7 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
 }
 
 TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
+    SKIP_IF_COMPARING_MSODBCSQL();  // asserts UTF-8; see AB#47564 above
     if (!ServerSupportsNativeJson()) {
         GTEST_SKIP() << "server has no native json type";
     }
