@@ -106,6 +106,15 @@ impl BufferedGetDataRow {
             *slot = Some(value);
         }
     }
+
+    fn defer_value(&mut self, col: usize) {
+        if let Some(slot) = self.values.get_mut(col) {
+            *slot = None;
+        }
+        if let Some(slot) = self.variant_bases.get_mut(col) {
+            *slot = None;
+        }
+    }
 }
 
 impl RowWriter for BufferedGetDataRow {
@@ -1017,7 +1026,7 @@ fn fill_rowset(
                         writer.write_null(prefix_len);
                         buffered_columns = column_count;
                     }
-                    Ok(CursorPoll::Pending) => {}
+                    Ok(CursorPoll::Pending) => writer.defer_value(prefix_len),
                     Err(error) => result = Err(error),
                 }
             }
@@ -1895,6 +1904,24 @@ mod tests {
         };
         assert_eq!(value.bytes, b"new");
         assert_eq!(value.bytes.as_ptr(), original);
+    }
+
+    #[test]
+    fn deferred_trailing_value_drops_recycled_row_data() {
+        let mut reusable = None;
+        let mut row = BufferedGetDataRow::empty(&mut reusable, 8);
+        row.values[7] = Some(ColumnValues::String(SqlString::new(
+            b"previous row".to_vec(),
+            EncodingType::Utf16,
+        )));
+        row.variant_bases[7] = Some(TdsDataType::NVarChar);
+        reusable = Some(row);
+
+        let mut next = BufferedGetDataRow::empty(&mut reusable, 8);
+        next.defer_value(7);
+
+        assert_eq!(next.values[7], None);
+        assert_eq!(next.variant_bases[7], None);
     }
 
     #[test]
