@@ -764,8 +764,23 @@ TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTrans
     ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    // "café" as UTF-8, matching GetColumnChar's SQL_C_CHAR convention.
-    EXPECT_EQ("caf\xC3\xA9", GetColumnChar(1));
+    // Read back via SQL_C_WCHAR rather than GetColumnChar: narrow-PLP delivery
+    // to SQL_C_CHAR is a verbatim wire-byte copy today regardless of collation
+    // (AB#47566, a separate, pre-existing gap on the *fetch* side -- see
+    // get_data.rs's `copy_verbatim` arm for `PlpEncoding::SingleByteText`), so
+    // under the server's default non-UTF8 collation it returns the raw
+    // single-byte codepage byte instead of UTF-8, which this test would
+    // wrongly read as a failure of the *write*-side fix under test.
+    // SQL_C_WCHAR widening already decodes through the collation correctly.
+    SQLWCHAR buf[16] = {0};
+    SQLLEN wind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &wind),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLWCHAR expected[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_EQ(sizeof(expected), static_cast<size_t>(wind));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(SQLWCHAR); ++i) {
+        EXPECT_EQ(expected[i], buf[i]) << "code unit " << i;
+    }
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
