@@ -26,11 +26,13 @@ cd ..
 if [ "$BUILD_TYPE" = "Debug" ] || [ "$BUILD_TYPE" = "Both" ]; then
   echo '==> Building debug...'
   cargo build --frozen
+  bash mssql-odbc/scripts/finalize-artifact.sh debug
 fi
 
 if [ "$BUILD_TYPE" = "Release" ] || [ "$BUILD_TYPE" = "Both" ]; then
   echo '==> Building release...'
   cargo build --frozen --release
+  bash mssql-odbc/scripts/finalize-artifact.sh release
 fi
 
 # Archive nextest (used by later test stages)

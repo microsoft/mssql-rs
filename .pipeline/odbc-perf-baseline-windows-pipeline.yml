@@ -1,0 +1,47 @@
+# Fixed-baseline ODBC performance pipeline - WINDOWS (dedicated perf lab)
+#
+# Windows counterpart to odbc-perf-baseline-linux-pipeline.yml. It compares
+# candidate and pinned-baseline mssql-odbc with pinned Microsoft ODBC 18. The
+# platforms have independent measurements and must not share regression ratios.
+
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: PerfTemplates
+      type: git
+      name: InternalDriverTools/PerfTest
+      ref: refs/heads/main
+
+extends:
+  template: v1/Perf.Test.Job.yml@PerfTemplates
+  parameters:
+    platform: windows
+    testRootDir: $(Build.SourcesDirectory)/mssql-rs
+    testScript: mssql-odbc-bench/perf-lab/run-benchmarks.ps1
+    testScriptArgs: none
+    testResultsSubDir: results
+    testTimeoutMinutes: 180
+    steps:
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $path = '$(Build.ArtifactStagingDirectory)\results\comparison.json'
+          $data = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+          if ($null -eq $data.benchmarks) {
+              throw "comparison.json has no 'benchmarks' array: $path"
+          }
+          $regressions = @(foreach ($benchmark in $data.benchmarks) {
+              foreach ($key in 'name', 'regression') {
+                  if ($null -eq $benchmark.PSObject.Properties[$key]) {
+                      throw "comparison.json benchmark entry has no '$key': $path"
+                  }
+              }
+              if ($benchmark.regression) {
+                  $benchmark.name
+              }
+          })
+          if ($regressions.Count -gt 0) {
+              throw "Confirmed ODBC regressions: $($regressions -join ', ')"
+          }
+        displayName: Enforce ODBC regression gate

@@ -560,7 +560,9 @@ fn resume_row_to_column(
     };
 
     let target = column_number - 1; // 0-based
-    let cursor_result = dbc.runtime.block_on(client.read_row_column(target));
+    let cursor_poll = client.try_read_row_column(target);
+    let cursor_result = cursor_poll
+        .and_then(|poll| poll.resolve(|| dbc.runtime.block_on(client.read_row_column(target))));
 
     let Ok(mut dbc_state) = dbc.inner.lock() else {
         error!("SQLGetData: dbc mutex poisoned after row resume");
@@ -1467,7 +1469,7 @@ mod tests {
     use crate::error::diag::DiagRecord;
     use crate::handles::DbcHandle;
     use crate::test_support::TestHandles;
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{int_columns, tds_client_from_int_rows};
 
     /// Assert the most recent diagnostic matches the expected canonical
     /// SQLSTATE and message text (the message is prefixed by the driver, so we
@@ -1898,6 +1900,48 @@ mod tests {
         s.column_metadata = int_columns(2);
         s.row_positioned = true;
         s.last_captured = Some((1, value));
+    }
+
+    #[test]
+    fn get_data_resolves_a_buffered_cursor_column() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.column_metadata = int_columns(1);
+            state.row_positioned = true;
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![42]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT buffered row".to_string(), ()))
+            .unwrap();
+        assert!(dbc.runtime.block_on(client.next_row_cursor()).unwrap());
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+        let mut value = 0_i32;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 42);
+        assert_eq!(indicator, 4);
     }
 
     /// The byte count a probe reports for each value kind. Variable-length
