@@ -145,7 +145,8 @@ fn sql_exec_direct_w_safe(
         Ok(client) => client,
         Err(rc) => return rc,
     };
-    let mut started = Instant::now();
+    let budget = query_timeout;
+    let started = Instant::now();
 
     // Release any handle orphaned by the reset above before running the batch.
     // Bounded by the full budget: nothing has run yet to charge against it.
@@ -155,13 +156,15 @@ fn sql_exec_direct_w_safe(
     // call makes, not just the final execute — matching msodbcsql's
     // `DropPrepHandle` / `CheckOptions`, which charge the same deducted budget
     // to the deferred `sp_unprepare` and the implicit transaction begin. Each
-    // step's own wall-clock cost is deducted from the *remaining* budget
-    // before the next step runs; `started` is re-seeded after each deduction
-    // so the next `elapsed()` covers only the step that just ran, not the
-    // cumulative time since this call began — otherwise an earlier step's
-    // cost gets charged twice. An already-exhausted budget fails immediately
-    // with HYT00 rather than sending the next step unbounded.
-    let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
+    // step's remaining allowance is `budget` minus the *cumulative* elapsed
+    // time since this call began (`started` is fixed, never re-seeded), so
+    // every step's cost is charged exactly once against the original budget,
+    // and sub-second remainders accumulate across steps instead of each being
+    // floored away independently — matching msodbcsql's own millisecond-
+    // granularity deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`). An
+    // already-exhausted budget fails immediately with HYT00 rather than
+    // sending the next step unbounded.
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
         Ok(remaining) => remaining,
         Err(()) => {
             return fail_with_tds(
@@ -173,13 +176,12 @@ fn sql_exec_direct_w_safe(
             );
         }
     };
-    started = Instant::now();
 
     if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW", query_timeout) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
         Ok(remaining) => remaining,
         Err(()) => {
             return fail_with_tds(

@@ -703,21 +703,65 @@ mod tests {
 
     /// `SQLExecDirectW` calls `deduct_query_timeout` twice in sequence — once
     /// after `flush_pending_unprepare`, once after `begin_transaction_if_manual`
-    /// — each time measuring only the step that just ran against the
-    /// *remaining* budget the first call returned. Composing them must charge
-    /// each step's elapsed time exactly once: a 10s budget with a 3s unprepare
-    /// and a 2s implicit transaction begin must leave 5s (10 - 3 - 2), not the
-    /// 2s an earlier version of this code produced by measuring the second
-    /// step's elapsed time cumulatively from the call's start (so it
-    /// re-subtracted the first step's 3s a second time: `(10-3)-(3+2)=2`) —
-    /// caught in mssql-rs#442 review by an independent reviewer tracing the
-    /// exact arithmetic; the numbers here are theirs.
+    /// — each time measuring the *cumulative* elapsed time since the call
+    /// began against the *original, fixed* budget (not the previous call's
+    /// return value). Composing them must charge each step's elapsed time
+    /// exactly once and must not floor away sub-second remainders
+    /// independently at each step: a 10s budget with a 3s unprepare and a 2s
+    /// implicit transaction begin must leave 5s (10 - (3+2)), not the 2s an
+    /// earlier version of this code produced by re-deducting from its own
+    /// shrinking result (`(10-3)-(3+2)=2`, double-charging the first step), or
+    /// the loss a per-step-floored version would suffer with sub-second steps
+    /// — both caught in mssql-rs#442 review by an independent reviewer tracing
+    /// the exact arithmetic; the numbers here are theirs.
     #[test]
     fn deduct_query_timeout_composed_twice_charges_each_step_once() {
         let budget = 10;
         let after_unprepare = deduct_query_timeout(budget, Duration::from_secs(3)).unwrap();
-        let after_begin = deduct_query_timeout(after_unprepare, Duration::from_secs(2)).unwrap();
-        assert_eq!(after_begin, 5);
+        assert_eq!(
+            after_unprepare, 7,
+            "remaining allowance handed to the next step"
+        );
+        let after_begin = deduct_query_timeout(budget, Duration::from_secs(3 + 2)).unwrap();
+        assert_eq!(
+            after_begin, 5,
+            "budget minus total elapsed, not double-charged"
+        );
+    }
+
+    /// Composing from a *fixed* original budget with *cumulative* elapsed
+    /// (what `SQLExecDirectW` now does) is stricter than composing from a
+    /// shrinking budget with each step's own elapsed measured in isolation:
+    /// the latter floors sub-second remainders away independently at every
+    /// step, so two 0.99s pre-execute steps against a 1s budget would each
+    /// charge nothing, letting the following execute start with a fresh 1s —
+    /// about 3x the configured timeout in wall-clock terms before any
+    /// network wait even begins. Deducting cumulatively from the original
+    /// budget catches this instead: composing across the same two steps
+    /// exhausts a 1s budget, matching msodbcsql's own millisecond-granularity
+    /// deduction (`dwQueryTimeoutInMS` in `DropPrepHandle`) not losing
+    /// sub-second remainders.
+    #[test]
+    fn deduct_query_timeout_cumulative_composition_catches_accumulated_sub_second_cost() {
+        let budget = 1;
+        let step_1 = Duration::from_millis(990);
+        let step_2 = Duration::from_millis(990);
+
+        let per_step_reseeded =
+            deduct_query_timeout(deduct_query_timeout(budget, step_1).unwrap(), step_2);
+        assert_eq!(
+            per_step_reseeded,
+            Ok(1),
+            "per-step composition floors each sub-second cost away independently"
+        );
+
+        let cumulative_fixed_budget = deduct_query_timeout(budget, step_1)
+            .and_then(|_| deduct_query_timeout(budget, step_1 + step_2));
+        assert_eq!(
+            cumulative_fixed_budget,
+            Err(()),
+            "cumulative composition against the fixed budget must see the combined cost"
+        );
     }
 
     #[test]

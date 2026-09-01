@@ -28,6 +28,23 @@ use tracing::{debug, error, info, warn};
 const FEDAUTH_CHALLENGE_STS_URL: &str = "https://login.microsoftonline.com/test-tenant/";
 const FEDAUTH_CHALLENGE_SPN: &str = "https://database.windows.net/";
 
+/// Outcome of [`ConnectionProcessor::wait_out_delay_or_attention`].
+enum DelayOutcome {
+    /// `delay` elapsed (or there was none); the caller should build and send
+    /// its own response as usual.
+    Elapsed,
+    /// A client `Attention` interrupted the wait; send this acknowledgement
+    /// instead of the caller's own response.
+    Attention(BytesMut),
+    /// The connection closed while the response was delayed. The caller must
+    /// send nothing for this packet and return control to the outer read
+    /// loop, which discovers the same EOF on its own next read exactly as an
+    /// ordinary (non-delayed) close is observed — mirroring that shape
+    /// instead of surfacing a `ProtocolError` that would skip past recording
+    /// the connection (e.g. `connection_store.store`).
+    Closed,
+}
+
 /// Configuration for connection redirection
 ///
 /// When set, the server will redirect clients to a different endpoint
@@ -185,37 +202,33 @@ impl ConnectionProcessor {
     /// `socket`, so a client-sent `Attention` arriving mid-delay is answered
     /// immediately instead of sitting unread until the delay elapses.
     ///
-    /// Returns `Ok(Some(ack))` when an `Attention` interrupted the wait — the
-    /// caller must send that instead of its own response, abandoning it — or
-    /// `Ok(None)` once `delay` elapsed normally (or there was none), meaning
-    /// the caller should build and send its own response as usual.
+    /// See [`DelayOutcome`] for what each caller must do with the result.
     async fn wait_out_delay_or_attention<S>(
         &mut self,
         socket: &mut S,
         delay: Option<Duration>,
-    ) -> Result<Option<BytesMut>, ProtocolError>
+    ) -> Result<DelayOutcome, ProtocolError>
     where
         S: AsyncRead + Unpin + Send,
     {
         let Some(delay) = delay else {
-            return Ok(None);
+            return Ok(DelayOutcome::Elapsed);
         };
         debug!(?delay, "Delaying response");
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
-                () = &mut sleep => return Ok(None),
+                () = &mut sleep => return Ok(DelayOutcome::Elapsed),
                 read_result = socket.read_buf(&mut self.buffer) => {
                     let n = read_result?;
                     if n == 0 {
-                        return Err(ProtocolError::Protocol(
-                            "connection closed while a response was delayed".to_string(),
-                        ));
+                        debug!("Connection closed while a response was delayed");
+                        return Ok(DelayOutcome::Closed);
                     }
                     if let Some(ack) = self.try_take_attention()? {
                         debug!("Attention arrived during delay; abandoning the delayed response");
-                        return Ok(Some(ack));
+                        return Ok(DelayOutcome::Attention(ack));
                     }
                     // Not a (complete) Attention — keep waiting out the remaining delay.
                 }
@@ -430,11 +443,13 @@ impl ConnectionProcessor {
                             let registered = self.query_registry.lock().await.get(&sql).cloned();
                             if let Some(response_data) = registered {
                                 info!("Found registered response for query");
-                                if let Some(ack) = self
+                                match self
                                     .wait_out_delay_or_attention(socket, response_data.delay)
                                     .await?
                                 {
-                                    return Ok(Some(ack));
+                                    DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                                    DelayOutcome::Closed => return Ok(None),
+                                    DelayOutcome::Elapsed => {}
                                 }
                                 // build_query_result already wraps in a packet, so return directly
                                 let packet = build_query_result(&response_data);
@@ -486,11 +501,13 @@ impl ConnectionProcessor {
                         .cloned();
                     if let Some(response_data) = registered {
                         info!("Found registered response for RPC request");
-                        if let Some(ack) = self
+                        match self
                             .wait_out_delay_or_attention(socket, response_data.delay)
                             .await?
                         {
-                            return Ok(Some(ack));
+                            DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                            DelayOutcome::Closed => return Ok(None),
+                            DelayOutcome::Elapsed => {}
                         }
                         Some(build_query_result(&response_data))
                     } else {
@@ -536,8 +553,10 @@ impl ConnectionProcessor {
                         .await
                         .get(TM_BEGIN_DELAY_KEY)
                         .and_then(|r| r.delay);
-                    if let Some(ack) = self.wait_out_delay_or_attention(socket, delay).await? {
-                        return Ok(Some(ack));
+                    match self.wait_out_delay_or_attention(socket, delay).await? {
+                        DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                        DelayOutcome::Closed => return Ok(None),
+                        DelayOutcome::Elapsed => {}
                     }
                 }
 
