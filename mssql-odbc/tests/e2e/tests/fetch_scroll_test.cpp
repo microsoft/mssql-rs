@@ -193,6 +193,47 @@ TEST_F(FetchScrollLiveTest, BindsAnIntegerColumnAcrossARowset) {
     SQLCloseCursor(stmt_);
 }
 
+// SQL_C_DEFAULT is retained by SQLBindCol and resolved from each result
+// column's IRD type when the rowset is fetched. This covers both the fixed
+// stride of SQL_C_SLONG and the application-sized stride of SQL_C_CHAR.
+TEST_F(FetchScrollLiveTest, DefaultTargetResolvesAtFetchTime) {
+    SQLINTEGER values[3] = {-1, -1, -1};
+    SQLCHAR text[3][8] = {};
+    SQLLEN valueIndicators[3] = {-99, -99, -99};
+    SQLLEN textIndicators[3] = {-99, -99, -99};
+    SQLULEN rowsFetched = 0;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_DEFAULT, values, sizeof(SQLINTEGER),
+                            valueIndicators),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_DEFAULT, text, sizeof(text[0]), textIndicators),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ExecDirect(
+        "SELECT n, s FROM (VALUES (1, CAST('one' AS VARCHAR(8))), "
+        "(2, 'two'), (3, 'three')) AS t(n, s) ORDER BY n");
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, rowsFetched);
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(2, values[1]);
+    EXPECT_EQ(3, values[2]);
+    EXPECT_STREQ("one", reinterpret_cast<const char*>(text[0]));
+    EXPECT_STREQ("two", reinterpret_cast<const char*>(text[1]));
+    EXPECT_STREQ("three", reinterpret_cast<const char*>(text[2]));
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), valueIndicators[i]);
+    }
+    EXPECT_EQ(3, textIndicators[0]);
+    EXPECT_EQ(3, textIndicators[1]);
+    EXPECT_EQ(5, textIndicators[2]);
+    SQLCloseCursor(stmt_);
+}
+
 // Two columns of different shapes bound at once, to prove the fill loop walks
 // the binding table rather than assuming a single column.
 TEST_F(FetchScrollLiveTest, BindsSeveralColumnsOfDifferentTypes) {

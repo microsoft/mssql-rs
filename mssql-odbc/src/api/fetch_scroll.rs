@@ -37,13 +37,14 @@ use mssql_tds::query::metadata::PlpEncoding;
 use uuid::Uuid;
 
 use super::sqlstate::*;
+use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
     TextError, column_value_to_text, convert_typed_c, is_typed_c_target, utf16le_chunk_to_utf8,
 };
 use crate::api::odbc_types::{
-    SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID,
-    SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
+    SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE, SQL_C_FLOAT,
+    SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
     SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
     SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR,
     SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL, SQL_NULL_DATA, SQL_ROW_ERROR,
@@ -52,6 +53,7 @@ use crate::api::odbc_types::{
     SqlSsTime2Struct, SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlULen, SqlUSmallInt,
     SqlWChar,
 };
+use crate::api::type_rules::resolve_default_c_type;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
@@ -494,6 +496,17 @@ fn fetch_scroll_safe(
     fetch_orientation: SqlSmallInt,
     _fetch_offset: SqlLen,
 ) -> SqlReturn {
+    // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
+    // the stmt lock to preserve parent-before-child lock ordering.
+    let odbc_version = {
+        let env = stmt.parent_dbc().parent_env();
+        let Ok(env_state) = env.inner.lock() else {
+            error!("SQLFetchScroll: env mutex poisoned");
+            return SQL_ERROR;
+        };
+        env_state.odbc_version
+    };
+
     // Snapshot the rowset controls and the binding table, then release the
     // statement lock: the fill loop below blocks on the network and must not
     // hold it. The application is not allowed to rebind concurrently with a
@@ -580,7 +593,21 @@ fn fetch_scroll_safe(
             return rc;
         }
 
-        let bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
+        let mut bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
+        for binding in &mut bindings {
+            if binding.target_type != SQL_C_DEFAULT {
+                continue;
+            }
+            let Some(meta) = stmt_state
+                .column_metadata
+                .get(usize::from(binding.column_number).saturating_sub(1))
+            else {
+                continue;
+            };
+            if let Some(target_type) = resolve_default_c_type(odbc_sql_type(meta), odbc_version) {
+                binding.target_type = target_type;
+            }
+        }
         // The buffers in that snapshot belong to the application, and the fill
         // loop writes through them after this lock is released. Claiming the
         // statement here is what stops a concurrent SQLBindCol from freeing one
@@ -1804,6 +1831,50 @@ mod tests {
         );
         assert_eq!(second, 20);
         assert_eq!(second_indicator, 4);
+    }
+
+    #[test]
+    fn default_binding_resolves_from_current_result_metadata() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut values = [0_i32; 2];
+        let mut indicators = [0 as SqlLen; 2];
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+            state.row_array_size = 2;
+            state.set_binding(binding(
+                1,
+                SQL_C_DEFAULT,
+                values.as_mut_ptr().cast(),
+                0,
+                indicators.as_mut_ptr(),
+            ));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10], vec![20]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT default binding".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(values, [10, 20]);
+        assert_eq!(indicators, [4, 4]);
+        assert_eq!(
+            stmt.inner.lock().unwrap().bindings[0].target_type,
+            SQL_C_DEFAULT,
+            "the persistent binding must be resolved again for later result sets"
+        );
     }
 
     fn assert_partial_buffered_row_delivery(buffered_prefix_columns: usize) {

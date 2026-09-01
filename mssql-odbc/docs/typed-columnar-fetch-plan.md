@@ -152,7 +152,6 @@ Each of these is an error rather than a guess, because a wrong value delivered s
 | A bound PLP / LOB column | `SQL_ROW_ERROR` | Draining a LOB into a fixed buffer needs machinery `SQLGetData` owns — Task [47361](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47361) |
 | NULL at a column bound with no indicator | `22002`, `SQL_ROW_ERROR` | There is nowhere to report the NULL, and the slot would read back as the previous row's value |
 | `SQLGetData` after a rowset wider than one row | cursor left unpositioned | ODBC expects `SQLSetPos` to nominate the current row, and that is not implemented; mixed access still works at `row_array_size` 1 |
-| `SQL_C_DEFAULT` at bind time | `HY003` | **Divergence from msodbcsql**, which accepts it and resolves it at fetch time from the IRD (`sqlcfunc.cpp` `BindOffset` → `Sql2CDefault`). Deferring needs the column's SQL type threaded into the fill loop, which `ColumnBinding` does not carry. No known consumer binds `SQL_C_DEFAULT` on the fetch path — mssql-python uses it only for parameters — so this is deferred rather than blocking |
 
 Two details worth keeping in mind when extending this:
 

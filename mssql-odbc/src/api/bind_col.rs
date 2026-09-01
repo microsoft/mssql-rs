@@ -14,8 +14,8 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer,
-    SqlReturn, SqlSmallInt, SqlUSmallInt,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlUSmallInt,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_C_DATA_TYPE, ERR_INVALID_DESCRIPTOR_INDEX,
@@ -123,16 +123,6 @@ fn sql_bind_col_safe(
     if buffer_length < 0 {
         error!(buffer_length, "SQLBindCol: negative buffer length");
         post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
-        return SQL_ERROR;
-    }
-
-    // Divergence: msodbcsql accepts SQL_C_DEFAULT here and resolves it at fetch
-    // time from the IRD (`sqlcfunc.cpp` BindOffset -> Sql2CDefault). Deferring
-    // needs the column's SQL type threaded into the fill loop, which the binding
-    // does not carry today, so this is refused for now and tracked separately.
-    if target_type == SQL_C_DEFAULT {
-        error!("SQLBindCol: SQL_C_DEFAULT is not supported as a bound target");
-        post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
         return SQL_ERROR;
     }
 
@@ -391,26 +381,47 @@ mod tests {
         assert_eq!(last_state(&h), *b"HY090");
     }
 
+    /// SQL_C_DEFAULT cannot be resolved until execution supplies the IRD, so
+    /// the binding retains the placeholder for each fetch to resolve.
+    #[test]
+    fn default_target_is_deferred_until_fetch() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut buf = [0u8; 8];
+        let rc = unsafe {
+            sql_bind_col(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert_eq!(s.bindings[0].target_type, SQL_C_DEFAULT);
+    }
+
     /// An unknown target type is rejected at bind time rather than surfacing as
     /// a per-row failure on every row of the first fetch.
     #[test]
     fn an_unsupported_target_type_is_rejected() {
         let h = TestHandles::with_env_dbc_stmt();
         let mut buf = [0u8; 8];
-        for target in [SQL_C_DEFAULT, 12345] {
-            let rc = unsafe {
-                sql_bind_col(
-                    h.stmt,
-                    1,
-                    target,
-                    buf.as_mut_ptr() as SqlPointer,
-                    8,
-                    ptr::null_mut(),
-                )
-            };
-            assert_eq!(rc, SQL_ERROR, "target {target}");
-            assert_eq!(last_state(&h), *b"HY003");
-        }
+        let rc = unsafe {
+            sql_bind_col(
+                h.stmt,
+                1,
+                12345,
+                buf.as_mut_ptr() as SqlPointer,
+                8,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        assert_eq!(last_state(&h), *b"HY003");
         assert_eq!(bindings_len(&h), 0);
     }
 
