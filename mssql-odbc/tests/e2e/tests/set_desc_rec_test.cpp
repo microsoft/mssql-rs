@@ -84,6 +84,14 @@ TEST_F(SetDescRecLiveTest, RecordNumberZeroReturnsError) {
 }
 
 TEST_F(SetDescRecLiveTest, GrowsRecordCount) {
+    // msodbcsql's SQLSetDescRec does not call AllocPlex the way
+    // SQLSetDescField/SQLBindParameter do (confirmed by reading sqlcdesc.cpp:
+    // no AllocPlex call in SQLSetDescRec's own body), so it does not reliably
+    // grow SQL_DESC_COUNT for a RecNumber past the current count. Growing
+    // eagerly here is a deliberate, spec-compliant design choice for this
+    // driver (matching SQLSetDescFieldW's own per-record growth), not shared
+    // by msodbcsql for this specific API.
+    SKIP_IF_COMPARING_MSODBCSQL();
     SQLHDESC hdesc = AppParamDesc();
     EXPECT_EQ(0, GetSmallInt(hdesc, 0, SQL_DESC_COUNT));
     ASSERT_SQL_OK(
@@ -93,7 +101,12 @@ TEST_F(SetDescRecLiveTest, GrowsRecordCount) {
 }
 
 TEST_F(SetDescRecLiveTest, DatetimeSubTypeResolvesConciseType) {
-    SQLHDESC hdesc = AppParamDesc();
+    // SQL_DATETIME + SubType resolution is IPD-only: SQL_DESC_TYPE on an
+    // application descriptor (APD) means the application's C type, not a SQL
+    // type, and SQL_DATETIME(9) aliases SQL_C_DATE/SQL_DATE(9) in that space
+    // - using the APD here would resolve as a C-type alias instead of the SQL
+    // datetime family this test means to exercise.
+    SQLHDESC hdesc = ImpParamDesc();
     ASSERT_SQL_OK(SQLSetDescRec(hdesc, 1, SQL_DATETIME, SQL_CODE_TIMESTAMP, 0, 0, 0, nullptr,
                                  nullptr, nullptr),
                   SQL_HANDLE_DESC, hdesc);

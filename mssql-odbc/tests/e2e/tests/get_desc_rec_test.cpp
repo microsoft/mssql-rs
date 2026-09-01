@@ -99,6 +99,13 @@ TEST_F(GetDescRecLiveTest, ReadsBackValueSetBySetDescField) {
 }
 
 TEST_F(GetDescRecLiveTest, NameTruncationReturnsInfo) {
+    // msodbcsql does not implement SQLSetDescField(..., SQL_DESC_NAME, ...)
+    // on the IPD (confirmed by reading sqlcdesc.cpp: SQL_DESC_NAME only
+    // appears in that switch inside a commented-out "not applicable" block,
+    // so it falls through to the unknown-field default and fails with
+    // HY092). This driver implements it per spec (IPD-writable), so this
+    // test is mssql-odbc-specific.
+    SKIP_IF_COMPARING_MSODBCSQL();
     SQLHDESC hdesc = ImpParamDesc();
     // SQLSetDescFieldW/SQLGetDescRecW are explicit wide entry points: their
     // string arguments are always SQLWCHAR (UTF-16), regardless of whether
