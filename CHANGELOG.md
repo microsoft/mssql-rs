@@ -161,3 +161,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   character can straddle two calls, so such a parameter's chunks are now
   buffered instead of streamed untranscoded, and the complete value is
   transcoded once, as a whole, when `SQLParamData` closes it.
+
+- `mssql-tds`: TCP connect no longer resolves the server hostname with the
+  blocking `std::net::ToSocketAddrs`. That call never yields to the async
+  runtime, so a slow or unresponsive resolver silently escaped the
+  `ConnectTimeout`/`LoginTimeout` deadline that wraps the rest of the connect
+  sequence — on `mssql-odbc`, whose `SQLDriverConnectW` drives this via
+  `block_on` on the calling thread, this could hang the caller (and, since
+  ODBC is a blocking API, the whole calling process) indefinitely instead of
+  failing within the configured timeout. Resolution now goes through
+  `tokio::net::lookup_host`, the same async primitive already used for SSRP
+  instance lookups, so it is a genuine, cancellable `.await` point instead of
+  a blocking one. `parallel_connect` (`MultiSubnetFailover`) now also folds
+  DNS resolution into the single overall deadline its `timeout_ms` already
+  documents, instead of only timing the connection race that follows it, and
+  idle-connection reconnect (`TdsClient::reconnect`) now wraps each attempt's
+  full connect (DNS through login) in the attempt's remaining budget instead
+  of only capping the post-resolution TCP connect step.
