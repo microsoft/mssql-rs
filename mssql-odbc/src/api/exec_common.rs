@@ -701,6 +701,25 @@ mod tests {
         assert_eq!(deduct_query_timeout(5, Duration::from_secs(6)), Err(()));
     }
 
+    /// The error `execute.rs`/`exec_direct.rs` report when a pre-execute
+    /// `deduct_query_timeout` call finds the budget already exhausted — a
+    /// `TimeoutError`, matching every other query-timeout expiry, so
+    /// `post_tds_error` maps it to `HYT00` (see `sqlstate.rs`'s
+    /// `post_tds_error_timeout_maps_to_hyt00_regardless_of_default`) the same
+    /// way whether the budget ran out before or during the wire call.
+    #[test]
+    fn query_timeout_expired_error_is_a_timeout_error() {
+        match query_timeout_expired_error() {
+            TdsError::TimeoutError(TimeoutErrorType::String(msg)) => {
+                assert!(
+                    msg.contains("SQL_ATTR_QUERY_TIMEOUT"),
+                    "message should name the attribute that expired: {msg}"
+                );
+            }
+            other => panic!("expected TimeoutError(String(_)), got: {other:?}"),
+        }
+    }
+
     /// `SQLExecDirectW` calls `deduct_query_timeout` twice in sequence — once
     /// after `flush_pending_unprepare`, once after `begin_transaction_if_manual`
     /// — each time measuring the *cumulative* elapsed time since the call
