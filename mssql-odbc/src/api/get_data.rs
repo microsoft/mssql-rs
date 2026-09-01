@@ -142,11 +142,16 @@ fn sql_get_data_safe(
 
     // Continuation: app is calling SQLGetData again on the same PLP column to
     // get the next chunk from the active wire stream.
-    if stmt_state
+    if let Some(active_plp) = stmt_state
         .active_plp
         .as_ref()
-        .is_some_and(|s| s.column == col_index)
+        .filter(|stream| stream.column == col_index)
     {
+        let prepared_stream = (
+            active_plp.encoding,
+            active_plp.pending_units.len(),
+            active_plp.narrow_to_wide.is_some(),
+        );
         drop(stmt_state);
         return stream_active_plp_chunk(
             stmt,
@@ -157,6 +162,7 @@ fn sql_get_data_safe(
             buffer_length,
             strlen_or_ind_ptr,
             false,
+            Some(prepared_stream),
         );
     }
 
@@ -390,6 +396,7 @@ fn sql_get_data_safe(
             buffer_length,
             strlen_or_ind_ptr,
             true,
+            None,
         );
     }
     let rc = write_captured_column(
@@ -1142,6 +1149,7 @@ fn stream_active_plp_chunk(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
+    prepared_stream: Option<(PlpEncoding, usize, bool)>,
 ) -> SqlReturn {
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
         if let Ok(mut s) = stmt.inner.lock() {
@@ -1150,7 +1158,31 @@ fn stream_active_plp_chunk(
         return SQL_ERROR;
     }
 
-    let (plp_encoding, widen_carry_len) = {
+    let (plp_encoding, widen_carry_len) = if let Some((encoding, widen_carry_len, widening_ready)) =
+        prepared_stream
+    {
+        let compatible = match (target_type, encoding) {
+            (SQL_C_WCHAR, PlpEncoding::Utf16Text) => true,
+            (SQL_C_WCHAR, PlpEncoding::SingleByteText | PlpEncoding::Utf8Text) => widening_ready,
+            (
+                SQL_C_CHAR,
+                PlpEncoding::SingleByteText | PlpEncoding::Utf8Text | PlpEncoding::Utf16Text,
+            ) => true,
+            _ => false,
+        };
+        if !compatible {
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Target type not yet implemented for this column",
+                );
+            }
+            return SQL_ERROR;
+        }
+        (Some(encoding), widen_carry_len)
+    } else {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLGetData: stmt mutex poisoned while preparing PLP stream read");
             return SQL_ERROR;

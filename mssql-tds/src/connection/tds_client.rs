@@ -5373,7 +5373,7 @@ impl TdsClient {
         })
     }
 
-    /// Attempts to consume a complete known-length PLP value from buffered bytes.
+    /// Attempts to consume the next PLP output chunk entirely from buffered bytes.
     pub fn try_read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<CursorPoll<PlpChunk>> {
         if self
             .cancel_handle
@@ -5384,9 +5384,9 @@ impl TdsClient {
         }
         let start = self.request_timeout_start();
         let read = match &mut self.active_row_read_state {
-            ActiveRowReadState::PlpPaused(plp_state) => self
-                .transport
-                .try_read_complete_buffered_plp(plp_state, out)?,
+            ActiveRowReadState::PlpPaused(plp_state) => {
+                self.transport.try_read_buffered_plp(plp_state, out)?
+            }
             _ => {
                 return Err(UsageError(
                     "try_read_active_plp_chunk called with no active PLP stream".to_string(),

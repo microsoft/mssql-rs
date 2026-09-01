@@ -211,13 +211,13 @@ impl AnyTransport {
         }
     }
 
-    pub(crate) fn try_read_complete_buffered_plp(
+    pub(crate) fn try_read_buffered_plp(
         &mut self,
         plp_state: &mut PlpPauseState,
         out: &mut [u8],
     ) -> TdsResult<Option<usize>> {
         match self {
-            Self::Network(transport) => transport.try_read_complete_buffered_plp(plp_state, out),
+            Self::Network(transport) => transport.try_read_buffered_plp(plp_state, out),
             #[cfg(any(test, feature = "test-util", fuzzing))]
             Self::Dynamic(_) => Ok(None),
         }

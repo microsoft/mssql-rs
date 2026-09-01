@@ -531,37 +531,7 @@ impl PlpChunkStreamReader {
         Ok(Some((terminator_end, length)))
     }
 
-    pub(crate) fn total_read(&self) -> usize {
-        self.total_read
-    }
-
-    /// Declared total length of the whole PLP value in wire bytes when the
-    /// server sent a known-length PLP header; `None` for unknown-length
-    /// (streamed) PLP where the total is not known up front.
-    pub(crate) fn known_len(&self) -> Option<u64> {
-        match self.length {
-            PlpChunkReadLength::Known(n) => Some(n),
-            PlpChunkReadLength::Unknown => None,
-        }
-    }
-
-    pub(crate) fn reached_end(&self) -> bool {
-        self.reached_end
-    }
-
-    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
-    where
-        T: TdsPacketReader + Send + Sync,
-    {
-        if self.reached_end {
-            return Ok(false);
-        }
-
-        if self.chunk_remaining > 0 {
-            return Ok(true);
-        }
-
-        let chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
+    fn accept_chunk_length(&mut self, chunk_len: usize) -> TdsResult<bool> {
         if chunk_len == 0 {
             self.reached_end = true;
             if let PlpChunkReadLength::Known(known_len) = self.length
@@ -605,6 +575,138 @@ impl PlpChunkStreamReader {
 
         self.chunk_remaining = chunk_len;
         Ok(true)
+    }
+
+    fn try_ensure_active_buffered_chunk(
+        &mut self,
+        bytes: &[u8],
+        position: &mut usize,
+    ) -> TdsResult<Option<bool>> {
+        if self.reached_end {
+            return Ok(Some(false));
+        }
+        if self.chunk_remaining > 0 {
+            return Ok(Some(true));
+        }
+
+        let Some(end) = position.checked_add(4) else {
+            return Err(crate::error::Error::ProtocolError(
+                "Buffered PLP position overflowed".to_string(),
+            ));
+        };
+        let Some(header) = bytes.get(*position..end) else {
+            return Ok(None);
+        };
+        let chunk_len = u32::from_le_bytes(header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP chunk header".to_string())
+        })?) as usize;
+        *position = end;
+        self.accept_chunk_length(chunk_len).map(Some)
+    }
+
+    fn try_read_buffered_inner(
+        &mut self,
+        bytes: &[u8],
+        mut out: Option<&mut [u8]>,
+        out_len: usize,
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let mut position = 0;
+        if out_len == 0 {
+            return match self.try_ensure_active_buffered_chunk(bytes, &mut position)? {
+                Some(_) => Ok(Some((position, 0))),
+                None => Ok(None),
+            };
+        }
+
+        let mut written = 0;
+        while written < out_len {
+            let Some(active) = self.try_ensure_active_buffered_chunk(bytes, &mut position)? else {
+                return Ok(None);
+            };
+            if !active {
+                break;
+            }
+
+            let to_read = std::cmp::min(out_len - written, self.chunk_remaining);
+            let Some(end) = position.checked_add(to_read) else {
+                return Err(crate::error::Error::ProtocolError(
+                    "Buffered PLP position overflowed".to_string(),
+                ));
+            };
+            let Some(payload) = bytes.get(position..end) else {
+                return Ok(None);
+            };
+            if let Some(output) = out.as_deref_mut() {
+                let Some(target) = output.get_mut(written..written + to_read) else {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Buffered PLP output range was unavailable".to_string(),
+                    ));
+                };
+                target.copy_from_slice(payload);
+            }
+            position = end;
+            self.chunk_remaining -= to_read;
+            self.total_read += to_read;
+            written += to_read;
+        }
+
+        if written == out_len && self.chunk_remaining == 0 && !self.reached_end {
+            let Some(_) = self.try_ensure_active_buffered_chunk(bytes, &mut position)? else {
+                return Ok(None);
+            };
+        }
+
+        Ok(Some((position, written)))
+    }
+
+    fn try_read_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let out_len = out.len();
+        let mut probe = self.clone();
+        if probe
+            .try_read_buffered_inner(bytes, None, out_len)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.try_read_buffered_inner(bytes, Some(out), out_len)
+    }
+
+    pub(crate) fn total_read(&self) -> usize {
+        self.total_read
+    }
+
+    /// Declared total length of the whole PLP value in wire bytes when the
+    /// server sent a known-length PLP header; `None` for unknown-length
+    /// (streamed) PLP where the total is not known up front.
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        match self.length {
+            PlpChunkReadLength::Known(n) => Some(n),
+            PlpChunkReadLength::Unknown => None,
+        }
+    }
+
+    pub(crate) fn reached_end(&self) -> bool {
+        self.reached_end
+    }
+
+    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        if self.reached_end {
+            return Ok(false);
+        }
+
+        if self.chunk_remaining > 0 {
+            return Ok(true);
+        }
+
+        let chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
+        self.accept_chunk_length(chunk_len)
     }
 
     pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
@@ -752,6 +854,14 @@ impl PlpColumnStream {
         out: &mut [u8],
     ) -> TdsResult<Option<(usize, usize)>> {
         self.inner.try_read_complete_buffered(bytes, out)
+    }
+
+    pub(crate) fn try_read_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        self.inner.try_read_buffered(bytes, out)
     }
 
     /// The PLP-capable SQL Server type for this column.
@@ -3619,6 +3729,59 @@ mod test {
                 .unwrap(),
             Some((4, 0))
         );
+        assert!(stream.reached_end());
+    }
+
+    #[test]
+    fn buffered_plp_chunks_continue_an_active_stream() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(10));
+        let mut first = Vec::from(10_u32.to_le_bytes());
+        first.extend(0_u8..10);
+        first.extend(0_u32.to_le_bytes());
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            stream.try_read_buffered(&first, &mut out).unwrap(),
+            Some((8, 4))
+        );
+        assert_eq!(out, [0, 1, 2, 3]);
+        assert_eq!(stream.total_read(), 4);
+        assert!(!stream.reached_end());
+
+        let remaining = &first[8..];
+        assert_eq!(
+            stream.try_read_buffered(remaining, &mut out).unwrap(),
+            Some((4, 4))
+        );
+        assert_eq!(out, [4, 5, 6, 7]);
+
+        assert_eq!(
+            stream.try_read_buffered(&remaining[4..], &mut out).unwrap(),
+            Some((6, 2))
+        );
+        assert_eq!(&out[..2], &[8, 9]);
+        assert_eq!(stream.total_read(), 10);
+        assert!(stream.reached_end());
+    }
+
+    #[test]
+    fn incomplete_buffered_plp_chunk_does_not_advance() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+        let mut bytes = Vec::from(4_u32.to_le_bytes());
+        bytes.extend([1, 2]);
+        let mut out = [0_u8; 4];
+
+        assert_eq!(stream.try_read_buffered(&bytes, &mut out).unwrap(), None);
+        assert_eq!(stream.total_read(), 0);
+        assert!(!stream.reached_end());
+
+        bytes.extend([3, 4]);
+        bytes.extend(0_u32.to_le_bytes());
+        assert_eq!(
+            stream.try_read_buffered(&bytes, &mut out).unwrap(),
+            Some((12, 4))
+        );
+        assert_eq!(out, [1, 2, 3, 4]);
         assert!(stream.reached_end());
     }
 

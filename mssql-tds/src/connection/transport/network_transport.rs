@@ -1907,14 +1907,14 @@ impl NetworkTransport {
         Ok(Some(Some((written, known_total, total_read))))
     }
 
-    pub(crate) fn try_read_complete_buffered_plp(
+    pub(crate) fn try_read_buffered_plp(
         &mut self,
         plp_state: &mut PlpPauseState,
         out: &mut [u8],
     ) -> TdsResult<Option<usize>> {
         let Some((used, written)) = plp_state
             .plp_stream
-            .try_read_complete_buffered(self.tds_read_buffer.get_buffered_slice(), out)?
+            .try_read_buffered(self.tds_read_buffer.get_buffered_slice(), out)?
         else {
             return Ok(None);
         };
