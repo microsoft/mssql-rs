@@ -136,7 +136,13 @@ fn two_connections_share_a_single_worker_thread_runtime_without_hanging() {
              it once the (delayed) response arrives (mssql-rs#439)"
         )
     });
-    result.expect_err("a lock-timed-out statement must surface as an error, not succeed");
+    match result {
+        Err(mssql_tds::error::Error::SqlServerError { diagnostics }) => {
+            assert_eq!(diagnostics.errors.len(), 1);
+            assert_eq!(diagnostics.errors[0].number, 1222);
+        }
+        other => panic!("expected a SqlServerError(1222), got: {other:?}"),
+    }
     assert!(
         elapsed >= RESPONSE_DELAY,
         "response surfaced before the server's artificial delay even elapsed: {elapsed:?}"

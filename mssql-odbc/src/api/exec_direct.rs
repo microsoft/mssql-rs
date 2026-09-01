@@ -145,7 +145,7 @@ fn sql_exec_direct_w_safe(
         Ok(client) => client,
         Err(rc) => return rc,
     };
-    let started = Instant::now();
+    let mut started = Instant::now();
 
     // Release any handle orphaned by the reset above before running the batch.
     // Bounded by the full budget: nothing has run yet to charge against it.
@@ -155,9 +155,12 @@ fn sql_exec_direct_w_safe(
     // call makes, not just the final execute — matching msodbcsql's
     // `DropPrepHandle` / `CheckOptions`, which charge the same deducted budget
     // to the deferred `sp_unprepare` and the implicit transaction begin. Each
-    // step's wall-clock cost (measured cumulatively from `started`) is
-    // deducted before the next step runs; an already-exhausted budget fails
-    // immediately with HYT00 rather than sending the next step unbounded.
+    // step's own wall-clock cost is deducted from the *remaining* budget
+    // before the next step runs; `started` is re-seeded after each deduction
+    // so the next `elapsed()` covers only the step that just ran, not the
+    // cumulative time since this call began — otherwise an earlier step's
+    // cost gets charged twice. An already-exhausted budget fails immediately
+    // with HYT00 rather than sending the next step unbounded.
     let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
         Ok(remaining) => remaining,
         Err(()) => {
@@ -170,6 +173,7 @@ fn sql_exec_direct_w_safe(
             );
         }
     };
+    started = Instant::now();
 
     if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW", query_timeout) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);

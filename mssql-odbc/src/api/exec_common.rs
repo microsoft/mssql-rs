@@ -682,6 +682,45 @@ mod tests {
     }
 
     #[test]
+    fn deduct_query_timeout_zero_is_unlimited() {
+        assert_eq!(deduct_query_timeout(0, Duration::from_secs(1_000)), Ok(0));
+    }
+
+    #[test]
+    fn deduct_query_timeout_truncates_sub_second_elapsed() {
+        // 1.9s truncates to 1s, so a 10s budget leaves 9s, not 8s.
+        assert_eq!(
+            deduct_query_timeout(10, Duration::from_millis(1_900)),
+            Ok(9)
+        );
+    }
+
+    #[test]
+    fn deduct_query_timeout_exhausted_at_or_past_budget_errs() {
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(5)), Err(()));
+        assert_eq!(deduct_query_timeout(5, Duration::from_secs(6)), Err(()));
+    }
+
+    /// `SQLExecDirectW` calls `deduct_query_timeout` twice in sequence — once
+    /// after `flush_pending_unprepare`, once after `begin_transaction_if_manual`
+    /// — each time measuring only the step that just ran against the
+    /// *remaining* budget the first call returned. Composing them must charge
+    /// each step's elapsed time exactly once: a 10s budget with a 3s unprepare
+    /// and a 2s implicit transaction begin must leave 5s (10 - 3 - 2), not the
+    /// 2s an earlier version of this code produced by measuring the second
+    /// step's elapsed time cumulatively from the call's start (so it
+    /// re-subtracted the first step's 3s a second time: `(10-3)-(3+2)=2`) —
+    /// caught in mssql-rs#442 review by an independent reviewer tracing the
+    /// exact arithmetic; the numbers here are theirs.
+    #[test]
+    fn deduct_query_timeout_composed_twice_charges_each_step_once() {
+        let budget = 10;
+        let after_unprepare = deduct_query_timeout(budget, Duration::from_secs(3)).unwrap();
+        let after_begin = deduct_query_timeout(after_unprepare, Duration::from_secs(2)).unwrap();
+        assert_eq!(after_begin, 5);
+    }
+
+    #[test]
     fn try_claim_idle_client_none_when_disconnected() {
         let h = TestHandles::with_env_dbc();
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
