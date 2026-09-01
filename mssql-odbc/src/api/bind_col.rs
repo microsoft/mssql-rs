@@ -97,7 +97,7 @@ fn sql_bind_col_safe(
     // `free_desc` already walks DBC→STMT in the other direction to reset a
     // freed descriptor's associations, and holding both here in the opposite
     // order would be a classic ABBA deadlock.
-    let ard = {
+    let (ard, canonical_type) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLBindCol: stmt mutex poisoned");
             return SQL_ERROR;
@@ -186,12 +186,12 @@ fn sql_bind_col_safe(
             return SQL_ERROR;
         }
 
-        stmt_state.effective_ard(stmt)
+        (stmt_state.effective_ard(stmt), canonical_type)
     };
 
     let binding = ColumnBinding {
         column_number,
-        target_type: canonical_c_type(target_type),
+        target_type: canonical_type,
         target_value_ptr,
         buffer_length,
         strlen_or_ind_ptr,

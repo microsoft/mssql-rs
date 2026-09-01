@@ -389,11 +389,21 @@ unsafe fn sql_free_stmt_reset_params_impl(statement_handle: SqlHandle) -> SqlRet
 fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
     // Per spec (`SQLFreeStmt`'s `SQL_RESET_PARAMS` option) this sets
     // `SQL_DESC_COUNT` on the APD to 0 — a real truncation, matching
-    // `SQL_UNBIND`'s identical rule for the ARD (bind_col.rs). IPD is left
-    // alone: the spec names only the APD, and `BoundParam::from_records`
-    // gates on the APD record's `SQL_DESC_CONCISE_TYPE`, and
-    // `all_from_descriptor_states` iterates the APD's records, so a stale IPD
-    // record beyond the truncated APD range is simply never visited.
+    // `SQL_UNBIND`'s identical rule for the ARD (bind_col.rs).
+    //
+    // The IPD is truncated too, beyond what the spec text names: leaving it
+    // alone once relied on `all_from_descriptor_states` only ever iterating
+    // as far as the (now-truncated) APD, so a stale IPD record past that
+    // range was simply never visited — but that invariant broke the moment
+    // `describe_param.rs`'s `refine_ipd` stopped unconditionally overwriting
+    // a record (`DescRecord::explicitly_bound`), since a stale record now
+    // *looks* explicitly bound and no longer self-heals on the next
+    // `SQLDescribeParam`. An application that rebinds only the APD
+    // afterwards (`SQLSetDescField`/`SQLSetDescRec`, no matching IPD write)
+    // would otherwise pick the old type, direction and size back up at the
+    // next execute. `stmt.ipd` is never reassociated or independently freed
+    // (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so this needs no liveness
+    // recheck the way the APD's resolution does below.
     let apd = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFreeStmt(SQL_RESET_PARAMS): stmt mutex poisoned");
@@ -433,6 +443,17 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
         return SQL_ERROR;
     };
     desc_state.set_record_count(0, desc.kind);
+    drop(desc_state);
+
+    // Best-effort beyond the spec-mandated APD reset above: log rather than
+    // fail the whole call if the IPD mutex is poisoned, since the required
+    // behavior already succeeded.
+    let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
+    match ipd.inner.lock() {
+        Ok(mut ipd_state) => ipd_state.set_record_count(0, ipd.kind),
+        Err(_) => error!("SQLFreeStmt(SQL_RESET_PARAMS): ipd mutex poisoned; IPD left stale"),
+    }
+
     debug!("SQLFreeStmt(SQL_RESET_PARAMS): parameter bindings released");
     SQL_SUCCESS
 }
@@ -465,6 +486,12 @@ mod tests {
     fn apd_record_count(h: &TestHandles) -> usize {
         let apd = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
         apd.inner.lock().unwrap().records.len()
+    }
+
+    /// `SQL_DESC_COUNT` on `h`'s implicit IPD.
+    fn ipd_record_count(h: &TestHandles) -> usize {
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        ipd.inner.lock().unwrap().records.len()
     }
 
     #[test]
@@ -573,6 +600,45 @@ mod tests {
             "SQL_RESET_PARAMS must reset SQL_DESC_COUNT to 0"
         );
         assert!(bound_params(&h).is_empty());
+    }
+
+    /// The IPD must be truncated alongside the APD, not just left with a
+    /// stale record past the APD's now-zero range: `refine_ipd` no longer
+    /// unconditionally overwrites a record (`DescRecord::explicitly_bound`),
+    /// so a stale IPD record left behind would look explicitly bound and
+    /// stop self-healing on a later `SQLDescribeParam` — surfacing at
+    /// execute time if the application rebinds only the APD afterwards.
+    #[test]
+    fn reset_params_also_truncates_the_ipd() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut buf: Vec<u8> = b"abc\0".to_vec();
+        let mut ind: SqlLen = crate::api::odbc_types::SQL_NTS as SqlLen;
+        let _ = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(
+            ipd_record_count(&h),
+            1,
+            "parameter 1 should have grown the IPD"
+        );
+
+        assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_SUCCESS);
+        assert_eq!(
+            ipd_record_count(&h),
+            0,
+            "SQL_RESET_PARAMS must reset the IPD too, not just the APD"
+        );
     }
 
     #[test]

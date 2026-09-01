@@ -115,6 +115,19 @@ impl BoundParam {
             ipd_record.precision =
                 SqlSmallInt::try_from(self.column_size).unwrap_or(SqlSmallInt::MAX);
             ipd_record.length = 0;
+        } else if ipd_record.datetime_interval_code != 0 {
+            // Per ODBC's "Decimal Digits" appendix ("All datetime types" ->
+            // PRECISION): DecimalDigits (fractional-seconds precision) also
+            // belongs in SQL_DESC_PRECISION for the datetime family, matching
+            // `api::ird::ird_record_from_metadata`'s identical redirection
+            // (`col_attribute::precision()`) for the equivalent result
+            // column. This driver stores precision/scale as independent
+            // fields (`get_desc_field.rs` reads each directly, no type-based
+            // redirection), so leaving precision at 0 here would make
+            // SQLGetDescField/SQLGetDescRecW disagree with the IRD for the
+            // same logical type.
+            ipd_record.precision = self.decimal_digits;
+            ipd_record.length = self.column_size;
         } else {
             ipd_record.length = self.column_size;
             ipd_record.precision = 0;
@@ -312,6 +325,39 @@ mod tests {
         assert_eq!(ipd_record.concise_type, SQL_VARCHAR);
         assert_eq!(ipd_record.length, 8);
         assert_eq!(ipd_record.precision, 0);
+    }
+
+    /// Per ODBC's "Decimal Digits" appendix, `DecimalDigits` for the whole
+    /// datetime family belongs in `SQL_DESC_PRECISION`, not (only)
+    /// `SQL_DESC_SCALE` — matching `api::ird::ird_record_from_metadata`'s
+    /// identical redirection for the equivalent result column. A
+    /// `datetime2(7)` parameter (`SQL_TYPE_TIMESTAMP`, `DecimalDigits = 7`)
+    /// must report `7` from `SQL_DESC_PRECISION`, not `0`.
+    #[test]
+    fn write_to_records_puts_datetime_decimal_digits_in_precision() {
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = 8;
+        let bound = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: crate::api::odbc_types::SQL_TYPE_TIMESTAMP,
+            column_size: 27,
+            decimal_digits: 7,
+            parameter_value_ptr: buf.as_mut_ptr().cast(),
+            buffer_length: 8,
+            strlen_or_ind_ptr: &raw mut ind,
+            octet_length_ptr: &raw mut ind,
+        };
+        let mut apd_record = DescRecord::default_for(DescKind::AppParam);
+        let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
+        bound.write_to_records(&mut apd_record, &mut ipd_record);
+
+        assert_eq!(
+            ipd_record.precision, 7,
+            "fractional-seconds precision must land on SQL_DESC_PRECISION"
+        );
+        assert_eq!(ipd_record.scale, 7);
+        assert_eq!(ipd_record.length, 27, "ColumnSize still lands on length");
     }
 
     /// A freshly-grown record (never bound, just a gap created by binding a

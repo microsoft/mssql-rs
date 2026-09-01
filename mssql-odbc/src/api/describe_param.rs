@@ -340,6 +340,12 @@ fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
             record.precision =
                 SqlSmallInt::try_from(description.parameter_size).unwrap_or(SqlSmallInt::MAX);
             record.length = 0;
+        } else if record.datetime_interval_code != 0 {
+            // Per ODBC's "Decimal Digits" appendix ("All datetime types" ->
+            // PRECISION): see `BoundParam::write_to_records`'s identical fix
+            // for the same split.
+            record.precision = description.decimal_digits;
+            record.length = description.parameter_size;
         } else {
             record.length = description.parameter_size;
             record.precision = 0;
@@ -1085,6 +1091,29 @@ mod tests {
             records[1].precision, 0,
             "varchar reports length, not precision"
         );
+    }
+
+    /// Per ODBC's "Decimal Digits" appendix, the whole datetime family
+    /// reports `DecimalDigits` (fractional-seconds precision) from
+    /// `SQL_DESC_PRECISION`, matching `BoundParam::write_to_records`'s
+    /// identical fix and `api::ird::ird_record_from_metadata`'s existing
+    /// redirection for the equivalent result column.
+    #[test]
+    fn refine_ipd_puts_datetime_decimal_digits_in_precision() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_TYPE_TIMESTAMP, 27, 7, SQL_NULLABLE)],
+        );
+
+        let record = &ipd_records(&h)[0];
+        assert_eq!(
+            record.precision, 7,
+            "fractional-seconds precision must land on SQL_DESC_PRECISION"
+        );
+        assert_eq!(record.scale, 7);
+        assert_eq!(record.length, 27, "ColumnSize still lands on length");
     }
 
     /// An application that grew the IPD itself (`SQLSetDescField(IPD, 0,
