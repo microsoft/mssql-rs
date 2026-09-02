@@ -155,17 +155,34 @@ authoritative parity reference for this crate. Its source lives in the
     outstanding 18.6.2.1 measurements land - keep the running record there
     rather than growing this file per build.
   - **A bound `max`/LOB text column converted to a typed C target is refused
-    above 1 MiB.** A typed conversion needs the whole literal, and a
-    `varchar(max)` carries up to 2 GB, so `PLP_TYPED_MATERIALIZE_LIMIT`
-    (`api/fetch_scroll.rs`) caps that one allocation; past the cap the value is
-    drained to keep the row synchronized and answered `HYC00` rather than
-    converted. The cap is this driver's own resource bound with no msodbcsql
-    counterpart, so the compare leg cannot agree by construction and
+    above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
+    cap what a typed conversion may materialize - a `varchar(max)` carries up to
+    2 GB and the converter needs one contiguous literal. This driver's cap is
+    `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
+    value is drained to keep the row synchronized and answered `HYC00`.
+    msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
+    legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
+    converts that prefix and reports `01004` rather than failing.
+    **Measured on 18.06.0001**, `varchar(max)` bound to a typed target:
+    `'0'`×2000 + `'1'` returns `SQL_SUCCESS_WITH_INFO` with `01004` and a value
+    of **`0`** - the truncated prefix, not the `1` in the column - for both
+    `SQL_C_SBIGINT` and `SQL_C_SLONG`, and the same past 1 MiB; `'x'`×5000
+    returns `22018` (the parse fails before truncation is considered, so both
+    drivers agree there); a short `'42'` returns `42` on both. The skipped
+    case's own payload, `'1'`×1048577 into `SQL_C_SLONG`, overflows even the
+    clamped prefix and returns `22003` there against this driver's `HYC00` - so
+    both drivers error on it, with different states, and
     `AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained` carries
-    `SKIP_IF_COMPARING_MSODBCSQL()`. Every literal this path converts - numeric,
-    GUID, datetime - is orders of magnitude below the cap, so no realistic
-    conversion input reaches it; raise or stream it if one ever does. Tracked in
-    AB#47767.
+    `SKIP_IF_COMPARING_MSODBCSQL()` on a measured divergence rather than an
+    assumed one. Refusing is deliberate: `01004` is "string data, right
+    truncated", which application code routinely ignores on a numeric fetch
+    because scalars are not expected to be truncatable, so on the prefix-parses
+    shape msodbcsql's answer is a silently wrong number. Note the cap keys on
+    the column's byte count, not on whether the text parses, so any large
+    `varchar(max)` bound to a typed target reaches it - schema drift, not a
+    contrived input. CI compares against 18.6.2.1; this measurement is
+    18.06.0001, so re-measure there before relying on the exact prefix length.
+    Tracked in AB#47767.
   - **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
     character.** A buffer with no room for the final surrogate pair ends before
     it; msodbcsql leaves the lone high surrogate in the last payload slot on this
