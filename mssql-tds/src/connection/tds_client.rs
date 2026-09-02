@@ -5373,25 +5373,6 @@ impl TdsClient {
         })
     }
 
-    /// Returns an exhausted PLP stream to the row cursor without reading another column.
-    pub fn finish_active_plp_column(&mut self) -> bool {
-        let state = std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle);
-        match state {
-            ActiveRowReadState::PlpPaused(plp_state) if plp_state.reached_end() => {
-                let row_pause_state = plp_state.row_pause_state;
-                if row_pause_state.next_column_index < row_pause_state.columns().len() {
-                    self.active_row_read_state =
-                        ActiveRowReadState::RowPaused(Box::new(row_pause_state));
-                }
-                true
-            }
-            state => {
-                self.active_row_read_state = state;
-                false
-            }
-        }
-    }
-
     /// Attempts to consume the next PLP output chunk entirely from buffered bytes.
     pub fn try_read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<CursorPoll<PlpChunk>> {
         if self
@@ -6000,25 +5981,6 @@ impl TdsClient {
                 total_read,
             },
         )))
-    }
-
-    /// Returns the known wire length of the next PLP column when its header is buffered.
-    pub fn try_row_plp_known_len(&self, target: usize) -> TdsResult<Option<u64>> {
-        let ActiveRowReadState::RowPaused(pause_state) = &self.active_row_read_state else {
-            return Ok(None);
-        };
-        if target != pause_state.next_column_index || target >= pause_state.columns().len() {
-            return Ok(None);
-        }
-        if pause_state
-            .nbc_null_bitmap
-            .as_ref()
-            .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
-        {
-            return Ok(None);
-        }
-        self.transport
-            .try_buffered_plp_known_len(pause_state, target)
     }
 
     /// Attempts to finish the positioned row through `writer` from bytes already
@@ -8832,7 +8794,6 @@ mod tests {
             client.active_row_read_state,
             ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
         ));
-        assert_eq!(client.try_row_plp_known_len(2).unwrap(), Some(4));
 
         let mut bytes = [0_u8; 4];
         let CursorPoll::Ready(Some(chunk)) =
@@ -8843,60 +8804,6 @@ mod tests {
         assert_eq!(bytes, [b'o', 0, b'k', 0]);
         assert_eq!(chunk.read, 4);
         assert!(chunk.reached_end);
-    }
-
-    #[tokio::test]
-    async fn completed_plp_can_return_to_cursor_before_next_plp() {
-        let mut metadata = (*mixed_lob_metadata(1)).clone();
-        metadata
-            .columns
-            .push(metadata.columns.last().unwrap().clone());
-        metadata.column_count = u16::try_from(metadata.columns.len()).unwrap();
-
-        let mut payload = vec![0xff, TokenType::Row as u8];
-        payload.extend_from_slice(&10_i32.to_le_bytes());
-        for value in [[b'o', 0, b'k', 0], [b'g', 0, b'o', 0]] {
-            payload.extend_from_slice(&4_i64.to_le_bytes());
-            payload.extend_from_slice(&4_u32.to_le_bytes());
-            payload.extend_from_slice(&value);
-            payload.extend_from_slice(&0_u32.to_le_bytes());
-        }
-        let mut packet =
-            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
-        let mut transport =
-            create_network_transport_with_data(&packet.append_bytes(&payload).build());
-        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
-        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
-        client.current_metadata = Some(Arc::new(metadata));
-        client.current_result_set_has_been_read_till_end = false;
-        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
-
-        assert_eq!(
-            client
-                .try_next_buffered_row_prefix_into(1, &mut writer)
-                .unwrap(),
-            BufferedRowPoll::Complete
-        );
-        for column in 1..=2 {
-            assert_eq!(client.try_row_plp_known_len(column).unwrap(), Some(4));
-            assert!(matches!(
-                client.read_row_column(column).await.unwrap(),
-                CursorColumn::PlpStreaming { .. }
-            ));
-            let mut value = [0_u8; 4];
-            assert!(
-                client
-                    .read_active_plp_chunk(&mut value)
-                    .await
-                    .unwrap()
-                    .reached_end
-            );
-            assert!(client.finish_active_plp_column());
-        }
-        assert!(matches!(
-            client.active_row_read_state,
-            ActiveRowReadState::Idle
-        ));
     }
 
     #[tokio::test]

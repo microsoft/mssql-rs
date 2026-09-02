@@ -22,9 +22,7 @@ use std::sync::Arc;
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::{
-    BufferedRowPoll, CursorColumn, CursorPoll, ResultSet, TdsClient,
-};
+use mssql_tds::connection::tds_client::{BufferedRowPoll, CursorColumn, CursorPoll, ResultSet};
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime, SqlXml,
@@ -62,8 +60,8 @@ use crate::conversion::fetch_convert::{
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{
-    BufferedGetDataRow, BufferedPlpKind, ColumnBinding, STMT_STATE_CURSOR_OPEN,
-    STMT_STATE_FETCH_IN_PROGRESS, StmtState,
+    BufferedGetDataRow, ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS,
+    StmtState,
 };
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -112,132 +110,6 @@ impl BufferedGetDataRow {
             *slot = None;
         }
     }
-
-    fn prepare_plp(
-        &mut self,
-        col: usize,
-        kind: BufferedPlpKind,
-        len: usize,
-    ) -> Option<&mut Vec<u8>> {
-        let slot = self.values.get_mut(col)?;
-        match kind {
-            BufferedPlpKind::Text(encoding) => {
-                if !matches!(
-                    slot.as_ref(),
-                    Some(ColumnValues::String(value)) if value.encoding_type() == &encoding
-                ) {
-                    *slot = Some(ColumnValues::String(SqlString::new(Vec::new(), encoding)));
-                }
-                let Some(ColumnValues::String(value)) = slot.as_mut() else {
-                    return None;
-                };
-                value.bytes.clear();
-                value.bytes.resize(len, 0);
-                Some(&mut value.bytes)
-            }
-            BufferedPlpKind::Binary => {
-                if !matches!(slot, Some(ColumnValues::Bytes(_))) {
-                    *slot = Some(ColumnValues::Bytes(Vec::new()));
-                }
-                let Some(ColumnValues::Bytes(value)) = slot.as_mut() else {
-                    return None;
-                };
-                value.clear();
-                value.resize(len, 0);
-                Some(value)
-            }
-        }
-    }
-}
-
-const BUFFERED_GET_DATA_PLP_LIMIT: usize = 64 * 1024;
-
-async fn buffer_bounded_plp_columns(
-    client: &mut TdsClient,
-    writer: &mut BufferedGetDataRow,
-    kinds: &[Option<BufferedPlpKind>],
-    start: usize,
-) -> Result<usize, TdsError> {
-    let mut column = start;
-    let mut remaining = BUFFERED_GET_DATA_PLP_LIMIT;
-    while let Some(Some(kind)) = kinds.get(column) {
-        let mut empty = [];
-        match client.try_read_row_plp_complete(column, &mut empty)? {
-            CursorPoll::Ready(None) => {
-                writer.write_null(column);
-                column += 1;
-                continue;
-            }
-            CursorPoll::Ready(Some(chunk)) if chunk.reached_end && chunk.read == 0 => {
-                let Some(value) = writer.prepare_plp(column, *kind, 0) else {
-                    return Err(TdsError::ImplementationError(
-                        "buffered PLP column is outside the row".to_string(),
-                    ));
-                };
-                value.clear();
-                column += 1;
-                continue;
-            }
-            CursorPoll::Ready(Some(_)) | CursorPoll::Pending => {}
-        }
-
-        let Some(known_len) = client.try_row_plp_known_len(column)? else {
-            break;
-        };
-        let Ok(known_len) = usize::try_from(known_len) else {
-            break;
-        };
-        if known_len > remaining {
-            break;
-        }
-        let Some(buffer_len) = known_len.checked_add(1) else {
-            break;
-        };
-        let Some(buffer) = writer.prepare_plp(column, *kind, buffer_len) else {
-            return Err(TdsError::ImplementationError(
-                "buffered PLP column is outside the row".to_string(),
-            ));
-        };
-
-        match client.read_row_column(column).await? {
-            CursorColumn::PlpStreaming { .. } => {}
-            _ => {
-                return Err(TdsError::ImplementationError(
-                    "bounded PLP prefetch did not open a PLP stream".to_string(),
-                ));
-            }
-        }
-
-        let mut written = 0usize;
-        loop {
-            let Some(destination) = buffer.get_mut(written..) else {
-                return Err(TdsError::ProtocolError(
-                    "PLP value exceeded its declared length".to_string(),
-                ));
-            };
-            let chunk = client.read_active_plp_chunk(destination).await?;
-            written = written
-                .checked_add(chunk.read)
-                .ok_or_else(|| TdsError::ProtocolError("PLP byte count overflowed".to_string()))?;
-            if chunk.reached_end {
-                break;
-            }
-        }
-        if written != known_len {
-            return Err(TdsError::ProtocolError(format!(
-                "PLP value declared {known_len} bytes but contained {written}"
-            )));
-        }
-        if !client.finish_active_plp_column() {
-            return Err(TdsError::ImplementationError(
-                "completed PLP stream did not return to the row cursor".to_string(),
-            ));
-        }
-        buffer.truncate(known_len);
-        remaining -= known_len;
-        column += 1;
-    }
-    Ok(column)
 }
 
 impl RowWriter for BufferedGetDataRow {
@@ -795,8 +667,8 @@ fn fetch_scroll_safe(
         column_count,
         row_bind_offset_ptr,
         reusable_get_data_row,
+        buffer_trailing_utf16_plp,
         plp_encodings,
-        buffered_plp_kinds,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
@@ -882,10 +754,13 @@ fn fetch_scroll_safe(
         let reusable_get_data_row = get_data_fetch
             .then(|| stmt_state.spare_get_data_row.take())
             .flatten();
+        let buffer_trailing_utf16_plp = get_data_fetch
+            && stmt_state
+                .column_metadata
+                .last()
+                .and_then(|metadata| metadata.plp_encoding())
+                == Some(PlpEncoding::Utf16Text);
         let plp_encodings = stmt_state.plp_encodings.clone();
-        let buffered_plp_kinds = get_data_fetch
-            .then(|| stmt_state.buffered_plp_kinds.clone())
-            .flatten();
         (
             stmt_state.row_array_size,
             bindings,
@@ -894,8 +769,8 @@ fn fetch_scroll_safe(
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
             reusable_get_data_row,
+            buffer_trailing_utf16_plp,
             plp_encodings,
-            buffered_plp_kinds,
         )
     };
 
@@ -909,8 +784,8 @@ fn fetch_scroll_safe(
         row_status_ptr,
         row_bind_offset_ptr,
         reusable_get_data_row,
+        buffer_trailing_utf16_plp,
         plp_encodings,
-        buffered_plp_kinds,
     );
 
     // Single clearing point for the guard, so every early return inside the
@@ -933,8 +808,8 @@ fn fill_rowset(
     row_status_ptr: *mut SqlUSmallInt,
     row_bind_offset_ptr: *mut SqlULen,
     mut reusable_get_data_row: Option<BufferedGetDataRow>,
+    buffer_trailing_utf16_plp: bool,
     plp_encodings: Option<Arc<[Option<PlpEncoding>]>>,
-    buffered_plp_kinds: Option<Arc<[Option<BufferedPlpKind>]>>,
 ) -> SqlReturn {
     // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
     // result set. Once that many have been returned the cursor stops without
@@ -1157,15 +1032,24 @@ fn fill_rowset(
             };
             let mut buffered_columns = prefix_len;
             if result.is_ok()
-                && let Some(kinds) = buffered_plp_kinds.as_deref()
+                && buffer_trailing_utf16_plp
+                && prefix_len.checked_add(1) == Some(column_count)
             {
-                match dbc.runtime.block_on(buffer_bounded_plp_columns(
-                    &mut client,
-                    &mut writer,
-                    kinds,
-                    prefix_len,
-                )) {
-                    Ok(columns) => buffered_columns = columns,
+                let mut payload = [0_u8; 256];
+                match client.try_read_row_plp_complete(prefix_len, &mut payload) {
+                    Ok(CursorPoll::Ready(Some(chunk))) => {
+                        writer.write_string(
+                            prefix_len,
+                            Cow::Borrowed(&payload[..chunk.read]),
+                            EncodingType::Utf16,
+                        );
+                        buffered_columns = column_count;
+                    }
+                    Ok(CursorPoll::Ready(None)) => {
+                        writer.write_null(prefix_len);
+                        buffered_columns = column_count;
+                    }
+                    Ok(CursorPoll::Pending) => {}
                     Err(error) => result = Err(error),
                 }
             }
