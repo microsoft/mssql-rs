@@ -205,12 +205,14 @@ pub const SQL_API_SQLENDTRAN: SqlUSmallInt = 1005;
 pub const SQL_API_SQLFREEHANDLE: SqlUSmallInt = 1006;
 pub const SQL_API_SQLGETCONNECTATTR: SqlUSmallInt = 1007;
 pub const SQL_API_SQLGETDESCFIELD: SqlUSmallInt = 1008;
+pub const SQL_API_SQLGETDESCREC: SqlUSmallInt = 1009;
 pub const SQL_API_SQLGETDIAGFIELD: SqlUSmallInt = 1010;
 pub const SQL_API_SQLGETDIAGREC: SqlUSmallInt = 1011;
 pub const SQL_API_SQLGETENVATTR: SqlUSmallInt = 1012;
 pub const SQL_API_SQLGETSTMTATTR: SqlUSmallInt = 1014;
 pub const SQL_API_SQLSETCONNECTATTR: SqlUSmallInt = 1016;
 pub const SQL_API_SQLSETDESCFIELD: SqlUSmallInt = 1017;
+pub const SQL_API_SQLSETDESCREC: SqlUSmallInt = 1018;
 pub const SQL_API_SQLSETENVATTR: SqlUSmallInt = 1019;
 pub const SQL_API_SQLSETSTMTATTR: SqlUSmallInt = 1020;
 

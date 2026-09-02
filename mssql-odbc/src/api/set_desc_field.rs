@@ -13,6 +13,12 @@
 //! not its address) — the same convention this crate already uses for
 //! `SQLSetStmtAttrW` (`set_stmt_attr.rs`) and confirmed against msodbcsql's
 //! `SetADHeaderField` (`(SIZE_T)Value`, `sqlcdesc.cpp:4129-4149`).
+//!
+//! Unlike `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)`/`SQLSetStmtAttr`, this
+//! entry point does not check `STMT_STATE_FETCH_IN_PROGRESS` before writing
+//! `SQL_DESC_DATA_PTR`/`SQL_DESC_OCTET_LENGTH`/`SQL_DESC_CONCISE_TYPE` on an
+//! ARD/APD record a fetch may still be reading through — a known, deferred
+//! gap tracked in [#472](https://github.com/microsoft/mssql-rs/issues/472).
 
 use std::mem::size_of;
 
@@ -291,15 +297,24 @@ fn set_record_field(
                 post_diag(state, ERR_INVALID_ATTRIBUTE_VALUE);
                 return SQL_ERROR;
             };
-            write_record_field(state, record_number, |r| r.datetime_interval_code = code)
+            write_record_field(state, record_number, |r| {
+                r.datetime_interval_code = code;
+                r.explicitly_bound = true;
+            })
         }
         SQL_DESC_LENGTH => {
             let len = value_ptr as SqlULen;
-            write_record_field(state, record_number, |r| r.length = len)
+            write_record_field(state, record_number, |r| {
+                r.length = len;
+                r.explicitly_bound = true;
+            })
         }
         SQL_DESC_OCTET_LENGTH => {
             let len = value_ptr as SqlLen;
-            write_record_field(state, record_number, |r| r.octet_length = len)
+            write_record_field(state, record_number, |r| {
+                r.octet_length = len;
+                r.explicitly_bound = true;
+            })
         }
         SQL_DESC_PRECISION => set_precision(state, record_number, value_ptr),
         SQL_DESC_SCALE => set_scale(state, record_number, value_ptr),
@@ -327,7 +342,7 @@ fn set_record_field(
 /// Writes a validated value into an existing record via a closure, so
 /// validation (which needs `&mut DescState` to post diagnostics) and the
 /// mutation (which needs `&mut DescRecord`) never borrow `state` at once.
-fn write_record_field(
+pub(super) fn write_record_field(
     state: &mut DescState,
     record_number: SqlSmallInt,
     f: impl FnOnce(&mut DescRecord),
@@ -366,7 +381,7 @@ fn write_record_field(
 /// `SQL_DESC_CONCISE_TYPE`, or through `SQL_DESC_TYPE` itself — is validated
 /// the same way `SQLBindParameter` validates `ParameterType`
 /// (`classify_parameter_sql_type`).
-fn set_type(
+pub(super) fn set_type(
     state: &mut DescState,
     kind: DescKind,
     record_number: SqlSmallInt,
@@ -419,6 +434,7 @@ fn set_type(
     write_record_field(state, record_number, |r| {
         r.concise_type = resolved;
         r.datetime_interval_code = datetime_interval_code_for(resolved);
+        r.explicitly_bound = true;
     })
 }
 
@@ -447,7 +463,7 @@ fn concise_type_for_datetime_code(code: SqlSmallInt) -> Option<SqlSmallInt> {
 /// (`SQL_INTERVAL_YEAR..SQL_INTERVAL_MINUTE_TO_SECOND`) is not modeled here:
 /// SQL Server has no interval SQL type, so no concise interval value can
 /// reach a descriptor record through this driver's execution path.
-fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
+pub(crate) fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
     let code = match concise_type {
         SQL_TYPE_DATE => SQL_CODE_DATE,
         SQL_TYPE_TIME => SQL_CODE_TIME,
@@ -463,7 +479,7 @@ fn datetime_interval_code_for(concise_type: SqlSmallInt) -> SqlSmallInt {
 /// than deferring to an execute-time consistency pass this driver does not
 /// have yet — task AB#47297 calls out "numeric value representation"
 /// validation as this PR's job.
-fn set_precision(
+pub(super) fn set_precision(
     state: &mut DescState,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,
@@ -483,13 +499,16 @@ fn set_precision(
         return SQL_ERROR;
     }
 
-    write_record_field(state, record_number, |r| r.precision = precision)
+    write_record_field(state, record_number, |r| {
+        r.precision = precision;
+        r.explicitly_bound = true;
+    })
 }
 
 /// `SQL_DESC_SCALE` write. Same `SQL_C_NUMERIC` consistency bound as
 /// [`set_precision`]: scale must be non-negative and `<= precision`
 /// (`sqlcdesc.cpp:11391-11394`).
-fn set_scale(
+pub(super) fn set_scale(
     state: &mut DescState,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,
@@ -513,7 +532,10 @@ fn set_scale(
         return SQL_ERROR;
     }
 
-    write_record_field(state, record_number, |r| r.scale = scale)
+    write_record_field(state, record_number, |r| {
+        r.scale = scale;
+        r.explicitly_bound = true;
+    })
 }
 
 /// `SQL_DESC_DATA_PTR` write (AD only). Re-validates the record's
@@ -539,7 +561,7 @@ fn set_scale(
 /// (`CheckADDescConsistency`, over each record's live `rgbValue`), a
 /// different call site skipping records nothing is currently bound to —
 /// not from a single `SQLSetDescField(SQL_DESC_DATA_PTR, ...)` call.
-fn set_data_ptr(
+pub(super) fn set_data_ptr(
     state: &mut DescState,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,

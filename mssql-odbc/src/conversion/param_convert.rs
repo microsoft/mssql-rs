@@ -905,6 +905,7 @@ mod tests {
             parameter_value_ptr: ptr,
             buffer_length: 0,
             strlen_or_ind_ptr: ind,
+            octet_length_ptr: ind,
         }
     }
 

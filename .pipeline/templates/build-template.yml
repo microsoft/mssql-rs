@@ -53,6 +53,12 @@ steps:
 
 - script: cargo fetch
   displayName: Fetch Crates
+  # cargo fetch first ensures the pinned rustup toolchain/components are
+  # installed, which downloads from static.rust-lang.org - an external
+  # dependency subject to the same transient network flakiness already
+  # handled this way for Docker/ACR pulls elsewhere in this repo's pipelines
+  # (see sync-container-images.yml).
+  retryCountOnTaskFailure: 3
 
 - ${{ if and(eq(parameters.enableClippy, true), eq(parameters.osType, 'Windows')) }}:
   - pwsh: ./scripts/bclippy.ps1

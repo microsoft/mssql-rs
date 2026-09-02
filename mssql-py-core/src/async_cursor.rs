@@ -33,11 +33,14 @@ use pyo3::types::PyTuple;
 use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
+use crate::async_description::DescriptionState;
+use crate::async_errors::ProgrammingError;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
 use crate::async_fetch::FetchState;
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, SessionOperationGuard,
 };
+use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 
 /// Converts a failed session claim into a Python error with operation-specific busy text.
 fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static str) -> PyErr {
@@ -46,7 +49,7 @@ fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static s
         ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
         ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
         ClaimError::Busy => PyRuntimeError::new_err(busy_message),
-        ClaimError::NoResultSet => PyRuntimeError::new_err("No active result set"),
+        ClaimError::NoResultSet => ProgrammingError::new_err("No active result set"),
     }
 }
 
@@ -108,7 +111,10 @@ impl FinalizerCleanup {
     async fn run(mut self, claim: CursorCloseClaim) {
         let cleanup = self.cleanup.take().expect("finalizer cleanup is available");
         if let Err(error) = cleanup.run(claim).await {
+            record_result_set_status("error");
             tracing::warn!("PyAsyncCursor finalizer cleanup failed: {error}");
+        } else {
+            record_result_set_status("closed");
         }
         self.completion_guard.complete();
     }
@@ -165,12 +171,14 @@ pub struct PyAsyncCursor {
     /// `cursor()` time (`0` = no timeout). Applied by the future `execute`
     /// path unless overridden per-call.
     default_query_timeout: u32,
+    arraysize: isize,
     input_sizes: Option<Vec<crate::types::ParameterHint>>,
     input_sizes_generation: u64,
     cleanup_required: Arc<AtomicBool>,
     cleanup_started: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
 }
 
 impl PyAsyncCursor {
@@ -193,12 +201,14 @@ impl PyAsyncCursor {
             session_state,
             cursor_id,
             default_query_timeout,
+            arraysize: 1,
             input_sizes: None,
             input_sizes_generation: 0,
             cleanup_required: Arc::new(AtomicBool::new(false)),
             cleanup_started: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             fetch_state: Arc::new(FetchState::new()),
+            description_state: Arc::new(DescriptionState::new()),
         }
     }
 
@@ -223,6 +233,7 @@ impl PyAsyncCursor {
             self.session_state.clone(),
             self.cursor_id,
             self.fetch_state.clone(),
+            self.description_state.clone(),
         ))
     }
 
@@ -242,6 +253,7 @@ impl PyAsyncCursor {
             self.input_sizes_generation,
             self.cleanup_required.clone(),
             self.fetch_state.clone(),
+            self.description_state.clone(),
         ))
     }
 
@@ -288,21 +300,34 @@ impl Drop for PyAsyncCursor {
             }
             Err(ClaimError::Busy) => {
                 tracing::warn!(
+                    cursor_id = self.cursor_id,
+                    operation = "finalize",
                     "PyAsyncCursor finalizer skipped: session busy; prepared handle deferred to connection close"
                 );
                 return;
             }
             Err(error) => {
-                tracing::warn!("PyAsyncCursor finalizer could not claim cleanup: {error:?}");
+                tracing::warn!(
+                    cursor_id = self.cursor_id,
+                    operation = "finalize",
+                    "PyAsyncCursor finalizer could not claim cleanup: {error:?}"
+                );
                 session_state.abandon_cursor(self.cursor_id);
                 return;
             }
         };
+        let operation_id = claim.operation_id;
         let finalizer = FinalizerCleanup {
             cleanup: Some(cleanup),
             completion_guard: FinalizerCompletionGuard::new(session_state, self.cursor_id),
         };
-        pyo3_async_runtimes::tokio::get_runtime().spawn(finalizer.run(claim));
+        pyo3_async_runtimes::tokio::get_runtime().spawn(in_cursor_operation_span(
+            finalizer.run(claim),
+            self.cursor_id,
+            operation_id,
+            "finalize",
+            "closing",
+        ));
     }
 }
 
@@ -310,8 +335,19 @@ impl Drop for PyAsyncCursor {
 mod tests {
     use std::sync::Arc;
 
-    use super::FinalizerCompletionGuard;
+    use pyo3::Python;
+
+    use super::{FinalizerCompletionGuard, map_claim_error};
+    use crate::async_errors::ProgrammingError;
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+
+    #[test]
+    fn no_result_set_claim_maps_to_programming_error() {
+        let error = map_claim_error(ClaimError::NoResultSet);
+
+        Python::attach(|py| assert!(error.is_instance_of::<ProgrammingError>(py)));
+        assert!(error.to_string().contains("No active result set"));
+    }
 
     #[test]
     fn completed_finalizer_preserves_settled_session() {
@@ -348,6 +384,24 @@ impl PyAsyncCursor {
         self.default_query_timeout
     }
 
+    /// A seven-item DB-API descriptor for each column in the current result set.
+    #[getter]
+    fn description<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyTuple>> {
+        self.description_state.get(py)
+    }
+
+    /// Number of rows requested by `fetchmany()` when no size is supplied.
+    #[getter]
+    fn arraysize(&self) -> isize {
+        self.arraysize
+    }
+
+    /// Set the default number of rows requested by `fetchmany()`.
+    #[setter]
+    fn set_arraysize(&mut self, arraysize: isize) {
+        self.arraysize = arraysize;
+    }
+
     /// Set SQL type, size, and scale hints for the next successful `execute()`.
     ///
     /// Each item is a SQL type integer or `(sql_type, size, decimal_digits)`.
@@ -376,6 +430,27 @@ impl PyAsyncCursor {
     /// Fetch the next row and return an awaitable resolving to a tuple or `None`.
     fn fetchone<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         crate::async_fetch::fetchone(slf, py)
+    }
+
+    /// Fetch at most `size` rows, defaulting to `arraysize`.
+    #[pyo3(signature = (size=None))]
+    fn fetchmany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        size: Option<isize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let size = size.unwrap_or_else(|| slf.borrow(py).arraysize);
+        crate::async_fetch::fetchmany(slf, py, size)
+    }
+
+    /// Fetch all remaining rows in the current result set.
+    fn fetchall<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_fetch::fetchall(slf, py)
+    }
+
+    /// Advance to the next statement result, returning `True` or `False` at batch end.
+    fn nextset<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_fetch::nextset(slf, py)
     }
 
     /// Drain pending results, release prepared handles, and close this cursor.
@@ -416,13 +491,17 @@ impl PyAsyncCursor {
             }
         };
         let operation_id = claim.operation_id;
+        let cursor_id = cleanup.cursor_id;
         let future = async move {
             cleanup.run(claim).await.map_err(|error| {
+                record_result_set_status("error");
                 tracing::error!("PyAsyncCursor::close: failed: {error}");
                 PyRuntimeError::new_err(format!("Cursor close failed: {error}"))
             })?;
+            record_result_set_status("closed");
             Python::attach(|py| Ok(py.None()))
         };
+        let future = in_cursor_operation_span(future, cursor_id, operation_id, "close", "closing");
         let future = async move {
             match dispatch {
                 Some(dispatch) => future.with_subscriber(dispatch).await,

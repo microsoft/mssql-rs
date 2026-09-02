@@ -1163,6 +1163,93 @@ pub unsafe extern "C" fn SQLSetDescFieldW(
     }
 }
 
+/// Gets multiple descriptor fields for one record in a single call: name,
+/// type, datetime/interval subcode, octet length, precision, scale, and
+/// nullability.
+///
+/// # Safety
+/// - `descriptor_handle` must be a valid descriptor handle.
+/// - `record_number` must be valid for the descriptor.
+/// - `name`, if non-null, must be writable for `buffer_length` `SQLWCHAR`s.
+/// - Every other output pointer, if non-null, must be valid and writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLGetDescRecW(
+    descriptor_handle: SqlHandle,
+    record_number: SqlSmallInt,
+    name: *mut SqlWChar,
+    buffer_length: SqlSmallInt,
+    string_length_ptr: *mut SqlSmallInt,
+    type_ptr: *mut SqlSmallInt,
+    sub_type_ptr: *mut SqlSmallInt,
+    length_ptr: *mut SqlLen,
+    precision_ptr: *mut SqlSmallInt,
+    scale_ptr: *mut SqlSmallInt,
+    nullable_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::get_desc_rec::sql_get_desc_rec_w(
+            descriptor_handle,
+            record_number,
+            name,
+            buffer_length,
+            string_length_ptr,
+            type_ptr,
+            sub_type_ptr,
+            length_ptr,
+            precision_ptr,
+            scale_ptr,
+            nullable_ptr,
+        )
+    }
+}
+
+/// Sets multiple descriptor fields for one record in a single call: type,
+/// datetime/interval subcode, octet length, precision, scale, data pointer,
+/// octet-length-indicator pointer, and indicator pointer. Not valid on an
+/// IRD handle.
+///
+/// Unlike `SQLGetDescRecW`, this function has no `W`/`A` variants: none of
+/// its arguments are character data, so the ODBC spec defines only one
+/// entry point, `SQLSetDescRec` (see `sql.h`'s declaration — no `SQLSetDescRecA`
+/// exists either).
+///
+/// # Safety
+/// - `descriptor_handle` must be a valid descriptor handle, not an IRD.
+/// - `data_ptr`, if non-null, is stored verbatim and not dereferenced by this
+///   call; the caller must keep it valid for as long as it remains bound.
+/// - `string_length_ptr`/`indicator_ptr`, if non-null, are stored verbatim
+///   and not dereferenced by this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLSetDescRec(
+    descriptor_handle: SqlHandle,
+    record_number: SqlSmallInt,
+    field_type: SqlSmallInt,
+    sub_type: SqlSmallInt,
+    length: SqlLen,
+    precision: SqlSmallInt,
+    scale: SqlSmallInt,
+    data_ptr: SqlPointer,
+    string_length_ptr: *mut SqlLen,
+    indicator_ptr: *mut SqlLen,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::set_desc_rec::sql_set_desc_rec(
+            descriptor_handle,
+            record_number,
+            field_type,
+            sub_type,
+            length,
+            precision,
+            scale,
+            data_ptr,
+            string_length_ptr,
+            indicator_ptr,
+        )
+    }
+}
+
 /// Cancels the processing of the statement.
 ///
 /// # Safety

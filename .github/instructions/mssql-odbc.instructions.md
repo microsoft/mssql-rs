@@ -154,6 +154,45 @@ authoritative parity reference for this crate. Its source lives in the
     `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
     outstanding 18.6.2.1 measurements land - keep the running record there
     rather than growing this file per build.
+  - **A bound `max`/LOB text column converted to a typed C target is refused
+    above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
+    cap what a typed conversion may materialize - a `varchar(max)` carries up to
+    2 GB and the converter needs one contiguous literal. This driver's cap is
+    `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
+    value is drained to keep the row synchronized and answered `HYC00`.
+    msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
+    legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
+    converts that prefix and reports `01004` rather than failing.
+    **Measured on 18.06.0001**, `varchar(max)` bound to a typed target:
+    `'0'`×2000 + `'1'` returns `SQL_SUCCESS_WITH_INFO` with `01004` and a value
+    of **`0`** - the truncated prefix, not the `1` in the column - for both
+    `SQL_C_SBIGINT` and `SQL_C_SLONG`, and the same past 1 MiB; `'x'`×5000
+    returns `22018` (the parse fails before truncation is considered, so both
+    drivers agree there); a short `'42'` returns `42` on both. The skipped
+    case's own payload, `'1'`×1048577 into `SQL_C_SLONG`, overflows even the
+    clamped prefix and returns `22003` there against this driver's `HYC00` - so
+    both drivers error on it, with different states, and
+    `AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained` carries
+    `SKIP_IF_COMPARING_MSODBCSQL()` on a measured divergence rather than an
+    assumed one. Refusing is deliberate: `01004` is "string data, right
+    truncated", which application code routinely ignores on a numeric fetch
+    because scalars are not expected to be truncatable, so on the prefix-parses
+    shape msodbcsql's answer is a silently wrong number. Note the cap keys on
+    the column's byte count, not on whether the text parses, so any large
+    `varchar(max)` bound to a typed target reaches it - schema drift, not a
+    contrived input. CI compares against 18.6.2.1; this measurement is
+    18.06.0001, so re-measure there before relying on the exact prefix length.
+    Tracked in AB#47767.
+  - **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
+    character.** A buffer with no room for the final surrogate pair ends before
+    it; msodbcsql leaves the lone high surrogate in the last payload slot on this
+    narrow-source widening path, though its wide-source path is surrogate-safe
+    (`GetColDataSurrogateSafe`, and `TrimPartialCodePt` for partial sequences).
+    This driver's existing bound `nvarchar(max)` delivery already trims to a
+    character boundary, and handing back text that does not decode from one `max`
+    type but not the other would be worse than the divergence.
+    `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
+    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
 
 ## No panics
 
@@ -335,10 +374,42 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
 - **Free path**: Lock the parent's mutex to unregister from its child list.
 - **Lock ordering**: Always lock parent before child (ENV before DBC, DBC before
   STMT) to prevent deadlocks. Always acquire the parent lock before the child lock.
+- **DESC is a sibling of STMT, not a child**: a descriptor's parent is the DBC
+  (`DescHandle::parent_dbc`), not the statement it happens to be associated
+  with — an explicit descriptor can be reassociated across statements, or
+  shared by several at once. The free path (`free_desc`, `free_handle.rs`)
+  walks DBC → STMT to clear a freed descriptor's association from every
+  statement that had it active, so the STMT lock and a DESC lock must never
+  nest the other way: **never hold a STMT lock while acquiring a DESC lock**.
+  Every entry point that both validates STMT state and writes to a
+  descriptor (`SQLBindCol`, `SQLBindParameter`, `SQLFetchScroll`,
+  `SQLFreeStmt(SQL_UNBIND | SQL_RESET_PARAMS)`, execute's parameter
+  snapshot) follows the same two-phase shape: lock STMT, validate and
+  resolve the target descriptor handle (`effective_ard`/`effective_apd`),
+  drop the STMT lock, *then* lock the descriptor. A descriptor pointer
+  resolved this way can be freed by a concurrent `SQLFreeHandle` before it
+  is dereferenced; re-check `handles::live_type` immediately before the
+  dereference to fail cleanly instead of touching freed memory.
+- **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
+  place in this crate that holds two DESC locks at once (writing a
+  parameter's APD and IPD records together). It locks APD before IPD, and
+  that must stay the only order used anywhere both are locked together —
+  `BoundParam::all_from_descriptor_states` (used by
+  `snapshot_bound_params`) only ever reads them, never locks both
+  simultaneously, so it does not need to follow this rule itself.
 - **`debug_assert!` for DM invariants**: The free path uses `debug_assert!` to
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
+- **Known gap: `SQLSetDescRec`/`SQLSetDescFieldW` don't check
+  `STMT_STATE_FETCH_IN_PROGRESS`**: `SQLBindCol`, `SQLFreeStmt(SQL_UNBIND)`,
+  and `SQLSetStmtAttr` all refuse to touch the ARD while a fetch snapshotted
+  it and is still writing through that snapshot — but the descriptor-field
+  API writes the same records with no such guard, and (unlike those three)
+  would need a DBC → STMT walk to find every statement an explicit,
+  possibly-reassociated descriptor is currently associated with. Tracked in
+  [#472](https://github.com/microsoft/mssql-rs/issues/472); this is a
+  deliberate deferral, not an oversight.
 
 ## FFI boundary conventions
 
@@ -429,6 +500,16 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   - A success-path test.
   - A null-output-handle test.
   - An invalid-handle-type or invalid-input test.
+- **A `max`/LOB column only reaches the bound *streaming* path when it is too
+  large for the transport to buffer whole.** `try_read_buffered_column` decodes
+  any fully buffered column - PLP included - into a `ColumnValues`, so a small
+  `varchar(max)`/`varbinary(max)` is delivered by `deliver_bound`, exactly like a
+  non-max value, and never enters `deliver_bound_plp`. A few kilobytes still
+  buffers; the streaming path is reachable around a megabyte (the existing 1 MiB
+  cases in `fetch_scroll_test.cpp` prove it). Size an e2e that targets
+  `deliver_bound_plp` accordingly, or it will silently assert the non-PLP path -
+  a bound binary `max` column against a typed C target answers `22018` from the
+  typed converter when buffered, and `HYC00` when streamed.
 - Use `cargo nextest` (via `cargo btest`), not `cargo test`.
 
 ## Code style

@@ -5,23 +5,27 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
-    ExecuteOptions, PreparedStatement, StatementId, StatementResult, TdsClient,
+    ExecuteOptions, PreparedStatement, ResultSet, StatementId, StatementResult, TdsClient,
 };
-use mssql_tds::error::Error;
+use mssql_tds::error::{Error, SqlInfoMessage};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
-use pyo3::exceptions::PyRuntimeError;
+use mssql_tds::query::metadata::ColumnMetadata;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
+use crate::async_description::{DescriptionState, materialize};
+use crate::async_errors::{InternalError, map_tds_error};
 use crate::async_fetch::{FetchState, FetchStatus};
 use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
 use crate::async_session::{AsyncConnectionState, CursorId, ExecuteClaim, SessionOperationGuard};
+use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::types::ParameterHint;
 
 /// Cursor-local state for prepared execution and deferred handle cleanup.
@@ -103,6 +107,7 @@ pub(crate) struct ExecuteResources {
     input_sizes_generation: u64,
     cleanup_required: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
 }
 
 impl ExecuteResources {
@@ -119,6 +124,7 @@ impl ExecuteResources {
         input_sizes_generation: u64,
         cleanup_required: Arc<AtomicBool>,
         fetch_state: Arc<FetchState>,
+        description_state: Arc<DescriptionState>,
     ) -> Self {
         Self {
             client,
@@ -132,18 +138,39 @@ impl ExecuteResources {
             input_sizes_generation,
             cleanup_required,
             fetch_state,
+            description_state,
         }
     }
 }
 
 enum ExecuteOutcome {
-    Idle,
-    Fetching,
+    NoRows,
+    TerminalNoRows,
+    Rows(Vec<ColumnMetadata>),
 }
 
 impl ExecuteOutcome {
     fn has_open_batch(&self) -> bool {
-        matches!(self, Self::Fetching)
+        !matches!(self, Self::TerminalNoRows)
+    }
+
+    fn has_rows(&self) -> bool {
+        matches!(self, Self::Rows(_))
+    }
+
+    fn fetch_status(&self) -> FetchStatus {
+        match self {
+            Self::NoRows => FetchStatus::NoResultSet,
+            Self::TerminalNoRows => FetchStatus::TerminalNoRows,
+            Self::Rows(_) => FetchStatus::Ready,
+        }
+    }
+
+    fn result_set_status(&self) -> &'static str {
+        match self {
+            Self::NoRows | Self::TerminalNoRows => "no_rows",
+            Self::Rows(_) => "rows",
+        }
     }
 }
 
@@ -246,19 +273,20 @@ async fn execute_on_client(
             .execute_sp_executesql(operation, rpc_parameters, options)
             .await?
     };
-    if !matches!(first, StatementResult::Rows) {
-        client.advance_to_rows().await?;
-    }
-    Ok(if client.has_open_batch() {
-        ExecuteOutcome::Fetching
-    } else {
-        ExecuteOutcome::Idle
+    Ok(match first {
+        StatementResult::Rows => ExecuteOutcome::Rows(client.get_metadata().clone()),
+        StatementResult::NoRows { .. } if client.has_open_batch() => ExecuteOutcome::NoRows,
+        StatementResult::NoRows { .. } | StatementResult::End => ExecuteOutcome::TerminalNoRows,
     })
 }
 
-fn map_execute_error(error: impl std::fmt::Display) -> PyErr {
+fn map_execute_error(error: Error, info_messages: Vec<SqlInfoMessage>) -> PyErr {
     tracing::debug!("PyAsyncCursor::execute: failed: {error}");
-    PyRuntimeError::new_err(format!("Query execution failed: {error}"))
+    map_tds_error(
+        "PyAsyncCursor.execute failed while executing query",
+        error,
+        info_messages,
+    )
 }
 
 pub(crate) fn set_input_sizes(
@@ -289,6 +317,7 @@ pub(crate) fn execute<'py>(
         input_sizes_generation,
         cleanup_required,
         fetch_state,
+        description_state,
     } = resources;
     // TODO(async execute preflight): Parameter normalization and Python-to-TDS
     // conversion currently run synchronously under the GIL before the awaitable is
@@ -312,6 +341,8 @@ pub(crate) fn execute<'py>(
     let future_state = session_state.clone();
     let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
     let future_fetch_state = fetch_state.clone();
+    let previous_description = description_state.replace(None);
+    let future_description_state = description_state.clone();
 
     let future = async move {
         let mut operation_guard = SessionOperationGuard::new(future_state, operation_id);
@@ -323,36 +354,68 @@ pub(crate) fn execute<'py>(
             request.reset_cursor
         );
 
-        let (result, has_open_batch) = {
+        let (result, info_messages, has_open_batch) = {
             let mut client = client.lock().await;
             let result = execute_on_client(&mut client, &prepared_state, &claim, request).await;
+            let info_messages = if matches!(
+                result,
+                Err(ExecuteFailure {
+                    error: Error::SqlServerError { .. },
+                    ..
+                })
+            ) {
+                client.take_info_messages()
+            } else {
+                Vec::new()
+            };
             let has_open_batch = client.has_open_batch();
-            (result, has_open_batch)
+            (result, info_messages, has_open_batch)
         };
 
         match result {
             Ok(outcome) => {
-                operation_guard.finish_execute(outcome.has_open_batch());
-                future_fetch_state.set(if outcome.has_open_batch() {
-                    FetchStatus::Ready
-                } else {
-                    FetchStatus::NoResultSet
-                });
+                let has_open_batch = outcome.has_open_batch();
+                let has_result_set = outcome.has_rows();
+                let fetch_status = outcome.fetch_status();
+                record_result_set_status(outcome.result_set_status());
+                operation_guard.finish_execute(has_open_batch);
+                let metadata = match outcome {
+                    ExecuteOutcome::Rows(metadata) => Some(metadata),
+                    ExecuteOutcome::NoRows | ExecuteOutcome::TerminalNoRows => None,
+                };
+                let column_count = metadata.as_ref().map_or(0, Vec::len);
                 Python::attach(|py| {
                     let mut cursor_ref = cursor.borrow_mut(py);
                     if cursor_ref.input_sizes_generation() == input_sizes_generation {
                         cursor_ref.clear_input_sizes();
                     }
                 });
-                tracing::info!("PyAsyncCursor::execute: query executed successfully");
+                let description_started = Instant::now();
+                let description = materialize(metadata).await.map_err(|error| {
+                    tracing::error!(
+                        "PyAsyncCursor::execute: cursor description materialization failed; column_count={column_count}; elapsed_ms={}; error={error}",
+                        description_started.elapsed().as_millis()
+                    );
+                    InternalError::new_err(format!(
+                        "Query executed but cursor description materialization failed: {error}"
+                    ))
+                })?;
+                let description_materialization_ms = description_started.elapsed().as_millis();
+                future_description_state.replace(description);
+                future_fetch_state.set(fetch_status);
+                tracing::info!(
+                    "PyAsyncCursor::execute: query executed successfully; has_result_set={has_result_set}; column_count={column_count}; description_materialization_ms={description_materialization_ms}; has_open_batch={has_open_batch}"
+                );
                 Ok(cursor)
             }
             Err(error) => {
+                record_result_set_status("error");
                 operation_guard.settle(error.break_connection || has_open_batch);
-                Err(map_execute_error(error.error))
+                Err(map_execute_error(error.error, info_messages))
             }
         }
     };
+    let future = in_cursor_operation_span(future, cursor_id, operation_id, "execute", "pending");
     let future = async move {
         match dispatch {
             Some(dispatch) => future.with_subscriber(dispatch).await,
@@ -365,6 +428,7 @@ pub(crate) fn execute<'py>(
         Err(error) => {
             session_state.release_operation(operation_id);
             fetch_state.set(previous_fetch_status);
+            description_state.replace(previous_description);
             Err(error)
         }
     }

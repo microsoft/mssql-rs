@@ -10,11 +10,12 @@ use tracing::error;
 use mssql_tds::connection::tds_client::{PreparedStatement, StatementId, TdsClient};
 use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
-use super::desc::{DescHandle, DescKind};
+use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
 use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
+use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -106,9 +107,75 @@ pub(crate) struct ColumnBinding {
     pub(crate) target_value_ptr: SqlPointer,
     /// Capacity of one element of `target_value_ptr`, in bytes.
     pub(crate) buffer_length: SqlLen,
-    /// Receives the length/indicator for each row, or null if the application
-    /// does not want one.
+    /// Receives the NULL indicator for each row, or null if the application
+    /// does not want one. Independent of `octet_length_ptr` per the ODBC
+    /// "Deferred Fields" spec, though `SQLBindCol` writes the same pointer to
+    /// both — see [`Self::write_to_record`].
     pub(crate) strlen_or_ind_ptr: *mut SqlLen,
+    /// Receives the returned data's length for each row, or null if the
+    /// application does not want length information for this column
+    /// (`SQL_DESC_OCTET_LENGTH_PTR`).
+    pub(crate) octet_length_ptr: *mut SqlLen,
+}
+
+impl ColumnBinding {
+    /// Writes this binding's fields into `record`, the ARD shape `SQLBindCol`
+    /// leaves behind (AB#47437: the ARD is the storage `SQLBindCol` and
+    /// `SQLSetDescFieldW` share, not a separate copy). `SQL_DESC_INDICATOR_PTR`
+    /// and `SQL_DESC_OCTET_LENGTH_PTR` both receive the same pointer here —
+    /// `SQLBindCol`'s one `StrLen_or_Ind` argument feeds both descriptor
+    /// fields at once — but they stay two independent fields on the record,
+    /// since `SQLSetDescFieldW`/`SQLSetDescRec` can set them to different
+    /// buffers.
+    ///
+    /// Does not reset `SQL_DESC_LENGTH`/`PRECISION`/`SCALE`; msodbcsql's
+    /// `SetADRec` resets them to `SetTypeDefaults`'s C-type-keyed defaults on
+    /// every `SQLBindCol` call — tracked as a known, narrow
+    /// (metadata-introspection-only) gap in
+    /// [#470](https://github.com/microsoft/mssql-rs/issues/470).
+    pub(crate) fn write_to_record(&self, record: &mut DescRecord) {
+        record.concise_type = self.target_type;
+        record.datetime_interval_code = datetime_interval_code_for(self.target_type);
+        record.data_ptr = self.target_value_ptr;
+        record.octet_length = self.buffer_length;
+        record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
+        record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
+    }
+
+    /// Reconstructs the binding an ARD record represents, or `None` when
+    /// `SQL_DESC_DATA_PTR` is null — this driver's convention (mirroring
+    /// `SQLBindCol`'s own null-pointer-unbinds rule) for "no binding here",
+    /// whether the record was never touched, was explicitly unbound, or was
+    /// grown by a `SQL_DESC_COUNT` write that never supplied a data pointer.
+    pub(crate) fn from_record(column_number: SqlUSmallInt, record: &DescRecord) -> Option<Self> {
+        if record.data_ptr.is_null() {
+            return None;
+        }
+        Some(Self {
+            column_number,
+            target_type: record.concise_type,
+            target_value_ptr: record.data_ptr,
+            buffer_length: record.octet_length,
+            strlen_or_ind_ptr: record.indicator_ptr as *mut SqlLen,
+            octet_length_ptr: record.octet_length_ptr as *mut SqlLen,
+        })
+    }
+
+    /// Every currently-bound column in `ard_state`'s records, in column-number
+    /// order — the fetch loop's input, derived fresh from the ARD each fetch
+    /// rather than cached, so a descriptor-field bind and a `SQLBindCol` bind
+    /// are indistinguishable to it.
+    pub(crate) fn all_from_ard_state(ard_state: &DescState) -> Vec<Self> {
+        ard_state
+            .records
+            .iter()
+            .enumerate()
+            .filter_map(|(i, record)| {
+                let column_number = SqlUSmallInt::try_from(i + 1).ok()?;
+                Self::from_record(column_number, record)
+            })
+            .collect()
+    }
 }
 
 pub(crate) const STMT_STATE_EXEC_STARTED: u32 = 0x0000_0100;
@@ -291,14 +358,6 @@ pub(crate) struct StmtState {
     /// when unset. Read at fetch rather than at bind, so the application can
     /// move the whole rowset by updating the pointed-to value.
     pub(crate) row_bind_offset_ptr: *mut SqlULen,
-    /// Columns bound by `SQLBindCol`, in binding order. A column appears at
-    /// most once: rebinding replaces its entry, unbinding removes it. Bindings
-    /// outlive a result set, so they are cleared by `SQLFreeStmt(SQL_UNBIND)`
-    /// rather than by closing the cursor.
-    ///
-    /// Staying empty is a legal state: an unbound `SQLFetchScroll` still
-    /// advances the rowset and reports counts, it just delivers no data.
-    pub(crate) bindings: Vec<ColumnBinding>,
     /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
     /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
     /// an explicitly-allocated descriptor associated by
@@ -833,30 +892,19 @@ impl StmtState {
         self.pending_fetch_info.clear();
     }
 
-    /// Binds, or rebinds, one column. A column can only be bound once, so an
-    /// existing entry for the same column is replaced in place rather than
-    /// shadowed.
-    pub(crate) fn set_binding(&mut self, binding: ColumnBinding) {
-        // Kept ordered by column number: the fill loop walks a forward-only row
-        // cursor, so it can only visit bound columns in ascending order.
-        match self
-            .bindings
-            .binary_search_by_key(&binding.column_number, |b| b.column_number)
-        {
-            Ok(existing) => self.bindings[existing] = binding,
-            Err(insert_at) => self.bindings.insert(insert_at, binding),
-        }
+    /// The statement's currently *effective* ARD: the explicit descriptor
+    /// associated via `SQLSetStmtAttrW(SQL_ATTR_APP_ROW_DESC, ...)`, or the
+    /// permanent implicit `stmt.ard` when none is associated. This is the
+    /// descriptor `SQLBindCol` writes into and `SQLFetchScroll` reads from
+    /// (AB#47437) — the same resolution `SQLGetStmtAttrW` already reports
+    /// back to the application (`set_stmt_attr.rs`).
+    pub(crate) fn effective_ard(&self, stmt: &StmtHandle) -> *mut c_void {
+        self.active_ard.unwrap_or(stmt.ard)
     }
 
-    /// Removes one column's binding, which is what `SQLBindCol` does when the
-    /// application passes a null `TargetValuePtr`.
-    pub(crate) fn clear_binding(&mut self, column_number: SqlUSmallInt) {
-        self.bindings.retain(|b| b.column_number != column_number);
-    }
-
-    /// Drops every column binding — `SQLFreeStmt(SQL_UNBIND)`.
-    pub(crate) fn clear_bindings(&mut self) {
-        self.bindings.clear();
+    /// The statement's currently *effective* APD. See [`Self::effective_ard`].
+    pub(crate) fn effective_apd(&self, stmt: &StmtHandle) -> *mut c_void {
+        self.active_apd.unwrap_or(stmt.apd)
     }
 
     /// Makes `metadata` the current result set, restarting the
@@ -1057,7 +1105,6 @@ impl StmtHandle {
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 row_bind_offset_ptr: std::ptr::null_mut(),
-                bindings: Vec::new(),
                 active_ard: None,
                 active_apd: None,
                 state_flags: 0,
@@ -1111,94 +1158,127 @@ impl Drop for StmtHandle {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
+    use crate::handles::desc::{DescHeader, DescKind};
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {
             column_number,
             target_type,
-            target_value_ptr: std::ptr::null_mut(),
+            // A non-null sentinel: `data_ptr.is_null()` is this driver's
+            // "unbound" signal (`ColumnBinding::from_record`), so a genuine
+            // binding under test must use a non-null value here.
+            target_value_ptr: 0x1 as SqlPointer,
             buffer_length: 0,
             strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
         }
     }
 
-    /// Runs `f` against a fresh statement's state. The handle owns descriptor
-    /// allocations it frees on drop, so it has to outlive the borrow.
-    fn with_state(f: impl FnOnce(&mut StmtState)) {
-        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
-        let mut state = handle.inner.lock().unwrap();
+    /// Runs `f` against a fresh, empty ARD-shaped `DescState`.
+    fn with_ard_state(f: impl FnOnce(&mut DescState)) {
+        let mut state = DescState {
+            diag_records: Vec::new(),
+            header: DescHeader::default(),
+            records: Vec::new(),
+        };
         f(&mut state);
     }
 
-    /// A column can only be bound once, so rebinding replaces the entry rather
-    /// than shadowing it — otherwise the fetch loop would write the column
-    /// twice, once through a stale pointer.
+    /// Grows `state` to `column_number` records (if needed) and writes
+    /// `binding` into the one at that position — the same two-step shape
+    /// `sql_bind_col_safe` uses.
+    fn bind(state: &mut DescState, binding: ColumnBinding) {
+        let column_number = binding.column_number;
+        let target_count = state.records.len().max(usize::from(column_number));
+        state.set_record_count(target_count, DescKind::AppRow);
+        let record = state
+            .record_mut(SqlSmallInt::try_from(column_number).unwrap())
+            .expect("just grew the record list to include this column_number");
+        binding.write_to_record(record);
+    }
+
+    /// A column can only be bound once, so rebinding overwrites the same
+    /// record in place rather than adding a second one — otherwise the fetch
+    /// loop would write the column twice, once through a stale pointer.
     #[test]
     fn rebinding_a_column_replaces_its_entry() {
-        with_state(|s| {
-            s.set_binding(binding(1, SQL_C_SLONG));
-            s.set_binding(binding(2, SQL_C_SLONG));
-            s.set_binding(binding(1, SQL_C_CHAR));
+        with_ard_state(|s| {
+            bind(s, binding(1, SQL_C_SLONG));
+            bind(s, binding(2, SQL_C_SLONG));
+            bind(s, binding(1, SQL_C_CHAR));
 
-            assert_eq!(s.bindings.len(), 2);
-            let first = s.bindings.iter().find(|b| b.column_number == 1).unwrap();
+            let bindings = ColumnBinding::all_from_ard_state(s);
+            assert_eq!(bindings.len(), 2);
+            let first = bindings.iter().find(|b| b.column_number == 1).unwrap();
             assert_eq!(first.target_type, SQL_C_CHAR);
         });
     }
 
-    /// Unbinding one column leaves the others in place; this is what SQLBindCol
-    /// does with a null TargetValuePtr.
+    /// Unbinding one column (a null `data_ptr`, `SQLBindCol`'s own
+    /// null-pointer-unbinds convention) leaves the others in place.
     #[test]
     fn clearing_one_binding_leaves_the_others() {
-        with_state(|s| {
-            s.set_binding(binding(1, SQL_C_SLONG));
-            s.set_binding(binding(2, SQL_C_SLONG));
-            s.clear_binding(1);
+        with_ard_state(|s| {
+            bind(s, binding(1, SQL_C_SLONG));
+            bind(s, binding(2, SQL_C_SLONG));
+            s.record_mut(1).unwrap().data_ptr = std::ptr::null_mut();
 
-            assert_eq!(s.bindings.len(), 1);
-            assert_eq!(s.bindings[0].column_number, 2);
-            // Unbinding a column that was never bound is a no-op, not a panic.
-            s.clear_binding(99);
-            assert_eq!(s.bindings.len(), 1);
+            let bindings = ColumnBinding::all_from_ard_state(s);
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].column_number, 2);
+            // Unbinding a column that was never bound (no record yet) is a
+            // no-op, not a panic — record_mut(99) is simply None.
+            assert!(s.record_mut(99).is_none());
         });
     }
 
-    /// SQLFreeStmt(SQL_UNBIND) drops the whole table.
+    /// SQLFreeStmt(SQL_UNBIND) drops every binding by nulling every record's
+    /// `data_ptr`.
     #[test]
     fn clearing_all_bindings_empties_the_table() {
-        with_state(|s| {
-            s.set_binding(binding(1, SQL_C_SLONG));
-            s.set_binding(binding(2, SQL_C_SLONG));
-            s.clear_bindings();
-            assert!(s.bindings.is_empty());
+        with_ard_state(|s| {
+            bind(s, binding(1, SQL_C_SLONG));
+            bind(s, binding(2, SQL_C_SLONG));
+            for record in &mut s.records {
+                record.data_ptr = std::ptr::null_mut();
+            }
+            assert!(ColumnBinding::all_from_ard_state(s).is_empty());
         });
     }
 
     /// The fill loop reads a forward-only cursor, so it depends on this order
-    /// rather than re-establishing it; an application may bind in any order.
+    /// rather than re-establishing it; an application may bind in any order —
+    /// guaranteed here by `all_from_ard_state` walking records by position,
+    /// not by insertion order.
     #[test]
     fn bindings_stay_ordered_by_column_however_they_were_bound() {
-        with_state(|s| {
+        with_ard_state(|s| {
             for col in [5, 1, 3, 2, 4] {
-                s.set_binding(binding(col, SQL_C_SLONG));
+                bind(s, binding(col, SQL_C_SLONG));
             }
-            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            let cols: Vec<_> = ColumnBinding::all_from_ard_state(s)
+                .iter()
+                .map(|b| b.column_number)
+                .collect();
             assert_eq!(cols, vec![1, 2, 3, 4, 5]);
 
             // A rebind replaces in place and keeps the order.
-            s.set_binding(binding(3, SQL_C_CHAR));
-            let cols: Vec<_> = s.bindings.iter().map(|b| b.column_number).collect();
+            bind(s, binding(3, SQL_C_CHAR));
+            let bindings = ColumnBinding::all_from_ard_state(s);
+            let cols: Vec<_> = bindings.iter().map(|b| b.column_number).collect();
             assert_eq!(cols, vec![1, 2, 3, 4, 5]);
-            assert_eq!(s.bindings[2].target_type, SQL_C_CHAR);
+            assert_eq!(bindings[2].target_type, SQL_C_CHAR);
         });
     }
 
-    /// Bindings start empty, which is what makes an unbound fetch legal.
+    /// A fresh ARD has no records at all, which is what makes an unbound
+    /// fetch legal.
     #[test]
     fn a_fresh_statement_has_no_bindings() {
-        with_state(|s| {
-            assert!(s.bindings.is_empty());
-            assert!(s.row_bind_offset_ptr.is_null());
+        with_ard_state(|s| {
+            assert!(ColumnBinding::all_from_ard_state(s).is_empty());
         });
+        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
+        assert!(handle.inner.lock().unwrap().row_bind_offset_ptr.is_null());
     }
 }
