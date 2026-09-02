@@ -558,6 +558,29 @@ TEST_F(TransactionLiveTest, IsolationIsAppliedOnTheServer) {
 // path can prove neither branch regresses.
 class BlockedSelectTest : public TransactionLiveTest {
   protected:
+    // Frees the second connection's handles even when an ASSERT_* returns early
+    // from the helper below. The fixture's TearDown covers dbc_ only, so a
+    // reader left connected would trip HY010 when the environment handle is
+    // freed — turning one assertion failure into a confusing second one.
+    class ScopedConnection {
+      public:
+        ScopedConnection() = default;
+        ~ScopedConnection() {
+            if (stmt != SQL_NULL_HSTMT) {
+                SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            }
+            if (dbc != SQL_NULL_HDBC) {
+                SQLDisconnect(dbc);
+                SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+            }
+        }
+        ScopedConnection(const ScopedConnection&) = delete;
+        ScopedConnection& operator=(const ScopedConnection&) = delete;
+
+        SQLHDBC dbc = SQL_NULL_HDBC;
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+    };
+
     // Holds an exclusive row lock on |table| from dbc_, then runs a blocked
     // SELECT on a second connection via |execute_blocked| and asserts it
     // reports native error 1222 rather than hanging or succeeding.
@@ -571,20 +594,21 @@ class BlockedSelectTest : public TransactionLiveTest {
         ASSERT_SQL_OK(SetAutocommit(dbc_, SQL_AUTOCOMMIT_OFF), SQL_HANDLE_DBC, dbc_);
         Exec("UPDATE " + table + " SET value = 1 WHERE id = 1");
 
-        SQLHDBC reader = SQL_NULL_HDBC;
-        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &reader), SQL_HANDLE_ENV, env_);
+        ScopedConnection reader;
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &reader.dbc), SQL_HANDLE_ENV, env_);
         SqlTString connstr = ODBCTestUtils::BuildConnectionString();
         SQLTCHAR out_str[1024] = {};
         SQLSMALLINT out_len = 0;
-        ASSERT_SQL_OK(SQLDriverConnect(reader, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
+        ASSERT_SQL_OK(SQLDriverConnect(reader.dbc, nullptr,
+                                       const_cast<SQLTCHAR*>(connstr.c_str()),
                                        static_cast<SQLSMALLINT>(connstr.size()), out_str,
                                        static_cast<SQLSMALLINT>(std::size(out_str)), &out_len,
                                        SQL_DRIVER_NOPROMPT),
-                      SQL_HANDLE_DBC, reader);
+                      SQL_HANDLE_DBC, reader.dbc);
 
-        SQLHSTMT reader_stmt = SQL_NULL_HSTMT;
-        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, reader, &reader_stmt), SQL_HANDLE_DBC,
-                      reader);
+        ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, reader.dbc, &reader.stmt), SQL_HANDLE_DBC,
+                      reader.dbc);
+        SQLHSTMT reader_stmt = reader.stmt;
         // Bounds the wait if execution regresses to waiting for a token the
         // server will never send. This is a real deadline only once the
         // query-timeout enforcement of AB#46385 (#442) is in; this PR merges
@@ -600,20 +624,22 @@ class BlockedSelectTest : public TransactionLiveTest {
 
         EXPECT_EQ(SQL_ERROR, rc) << "the lock timeout must surface from execution, not a later "
                                     "SQLFetch";
-        SQLTCHAR state[6] = {};
         SQLINTEGER native = 0;
         SQLTCHAR message[1024] = {};
         SQLSMALLINT length = 0;
+        SQLTCHAR state[6] = {};
         ASSERT_SQL_OK(SQLGetDiagRec(SQL_HANDLE_STMT, reader_stmt, 1, state, &native, message,
                                     static_cast<SQLSMALLINT>(std::size(message)), &length),
                       SQL_HANDLE_STMT, reader_stmt);
         EXPECT_EQ(1222, native);
+        // 1222 is in neither driver's per-error table, so both fall through to
+        // their severity rule: class 16 maps to 42000. Asserted so a SQLSTATE
+        // divergence on this exact error cannot pass, and the msodbcsql parity
+        // leg validates it for free.
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, reader_stmt, "42000");
         EXPECT_LT(elapsed, std::chrono::seconds(5));
 
         ASSERT_SQL_OK(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK), SQL_HANDLE_DBC, dbc_);
-        SQLFreeHandle(SQL_HANDLE_STMT, reader_stmt);
-        SQLDisconnect(reader);
-        SQLFreeHandle(SQL_HANDLE_DBC, reader);
     }
 };
 
