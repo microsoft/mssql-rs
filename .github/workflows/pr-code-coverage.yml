@@ -45,8 +45,22 @@ on:
 # Each job opts into only the scopes it needs.
 permissions: {}
 
+# Concurrency is resolved at run creation, before the job `if:` is evaluated, so
+# a run that will skip (e.g. an ordinary PR comment) would otherwise cancel the
+# real in-flight run. Runs that will not do any work get their own unique group
+# (keyed on run_id) and cancel nothing; only runs that will actually execute
+# share the per-PR group, so a new push still supersedes a stale wait.
+# The predicate below mirrors the `coverage-report` job `if:` — keep them in sync.
 concurrency:
-  group: pr-coverage-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: >-
+    pr-coverage-${{ github.event.pull_request.number || github.event.issue.number }}${{
+    !((github.event_name == 'pull_request' &&
+    github.event.pull_request.head.repo.full_name == github.repository) ||
+    (github.event_name == 'issue_comment' &&
+    github.event.issue.pull_request != null &&
+    startsWith(github.event.comment.body, '/coverage') &&
+    contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    && format('-noop-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
