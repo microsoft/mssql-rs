@@ -924,14 +924,22 @@ impl NetworkTransport {
     /// Returns `Ok(true)` when a new packet was read and finalized synchronously (via
     /// `try_get_new_tds_packet`'s no-op-waker poll). Returns `Ok(false)` when there is
     /// nothing more to read right now: either the buffer already reached end-of-message, or
-    /// the underlying poll reported `Poll::Pending`. Callers must treat `Ok(false)` as "not
-    /// ready", not as an error or true end-of-data.
+    /// another maximum-sized packet cannot fit beside the unconsumed bytes, or the underlying
+    /// poll reported `Poll::Pending`. Callers must treat `Ok(false)` as "not ready", not as an
+    /// error or true end-of-data.
     fn try_read_tds_packet(&mut self) -> TdsResult<bool> {
         if self.tds_read_buffer.end_of_message {
             return Ok(false);
         }
 
         let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
+        // The async reader consumes this remainder while refilling; the
+        // synchronous probe cannot, so defer before another packet could overflow.
+        if remaining_bytes.saturating_add(self.tds_read_buffer.max_packet_size)
+            > self.tds_read_buffer.working_buffer.len()
+        {
+            return Ok(false);
+        }
         if remaining_bytes > 0 {
             self.tds_read_buffer.shift_data_to_front();
         } else {
@@ -2993,6 +3001,78 @@ pub(crate) mod tests {
 
         assert!(!transport.try_read_tds_packet().unwrap());
         assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"first");
+    }
+
+    #[tokio::test]
+    async fn buffered_plp_probe_defers_before_exhausting_packet_buffer() {
+        const PACKET_SIZE: usize = 512;
+        const PACKET_PAYLOAD: usize = PACKET_SIZE - PacketWriter::PACKET_HEADER_SIZE;
+        const VALUE_LEN: usize = 1600;
+
+        let mut plp_wire = Vec::with_capacity(VALUE_LEN + 8);
+        plp_wire.extend_from_slice(&u32::try_from(VALUE_LEN).unwrap().to_le_bytes());
+        plp_wire.extend(std::iter::repeat_n(0xAB, VALUE_LEN));
+        plp_wire.extend_from_slice(&0_u32.to_le_bytes());
+
+        let chunks = plp_wire.chunks(PACKET_PAYLOAD);
+        let packet_count = chunks.len();
+        let mut packets = Vec::new();
+        for (index, chunk) in chunks.enumerate() {
+            packets.extend_from_slice(&tabular_packet(chunk, index + 1 == packet_count));
+        }
+
+        let context = ClientContext {
+            packet_size: u16::try_from(PACKET_SIZE).unwrap(),
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server.write_all(&packets).await.unwrap();
+
+        let metadata = ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: TypeInfo::partial_len(
+                TdsDataType::BigVarBinary,
+                usize::from(u16::MAX),
+                None,
+            )
+            .unwrap(),
+            data_type: TdsDataType::BigVarBinary,
+            column_name: "payload".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let (stream, _) =
+            PlpColumnStream::try_begin_buffered(&metadata, &(VALUE_LEN as u64).to_le_bytes())
+                .unwrap()
+                .unwrap();
+        let mut plp_state = PlpPauseState {
+            row_pause_state: RowPauseState {
+                next_column_index: 1,
+                metadata: Arc::new(ColMetadataToken {
+                    column_count: 1,
+                    columns: vec![metadata],
+                    cek_table: Vec::new(),
+                }),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            plp_stream: stream.unwrap(),
+        };
+        let mut out = vec![0; 1300];
+
+        assert!(matches!(
+            transport.try_read_buffered_plp(&mut plp_state, &mut out),
+            Ok(None)
+        ));
+        assert_eq!(
+            transport
+                .read_active_plp_bytes(&mut plp_state, None, None, &mut out)
+                .await
+                .unwrap(),
+            out.len()
+        );
+        assert!(out.iter().all(|byte| *byte == 0xAB));
     }
 
     #[tokio::test]
