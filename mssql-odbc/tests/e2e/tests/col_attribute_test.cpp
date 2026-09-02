@@ -28,6 +28,7 @@
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
+//   23. VariantExactNumericsReportNumeric - decimal/numeric/money → SQL_C_NUMERIC
 
 #include "odbc_test_fixture.h"
 
@@ -491,5 +492,63 @@ TEST_F(ColAttributeLiveTest, VariantTypeBeforeProbeIsSequenceError) {
         SQLColAttribute(stmt_, 1, SQL_CA_SS_VARIANT_TYPE, nullptr, 0, nullptr, &value);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
+    SQLCloseCursor(stmt_);
+}
+
+// The exact numerics report SQL_C_NUMERIC, which is what tells a caller the
+// value is a decimal rather than a string. mssql-python routes on this answer
+// alone -- SQL_C_CHAR made it hand back `str` instead of `decimal.Decimal`
+// (AB#47702). `money` is included because msodbcsql answers SQL_C_NUMERIC for
+// it too, matching the SQL_DECIMAL it reports for a money column.
+//
+// This compares against msodbcsql: the value is the whole point of the test.
+TEST_F(ColAttributeLiveTest, VariantExactNumericsReportNumeric) {
+    struct Case {
+        const char* label;
+        const char* expr;
+    };
+    const Case cases[] = {
+        {"decimal", "CAST(999.99 AS DECIMAL(18, 4))"},
+        {"numeric", "CAST(888.88 AS NUMERIC(10, 2))"},
+        {"money", "CAST(12.34 AS MONEY)"},
+        // No CAST: SQL Server stores a bare decimal literal as `numeric`.
+        {"implicit numeric", "45.67"},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_NE(SQL_NULL_DATA, indicator);
+        EXPECT_EQ(SQL_C_NUMERIC, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// Reporting SQL_C_NUMERIC describes the value, not the delivery path: the
+// character fetch that mssql-python actually performs after reading the
+// attribute has to keep working, digits intact. Compared against msodbcsql,
+// which renders the same padded form.
+TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
+    ExecDirect("SELECT CAST(CAST(999.99 AS DECIMAL(18, 4)) AS SQL_VARIANT) AS v");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_C_NUMERIC, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    SQLCHAR text[64] = {0};
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, text, sizeof(text), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ("999.9900", reinterpret_cast<const char*>(text));
+
     SQLCloseCursor(stmt_);
 }

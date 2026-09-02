@@ -13,9 +13,9 @@ use tracing::{debug, error};
 use crate::api::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{
     SQL_ATTR_READWRITE_UNKNOWN, SQL_BIGINT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE,
-    SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
-    SQL_C_SSHORT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR,
-    SQL_CA_SS_VARIANT_TYPE, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
+    SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2,
+    SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP,
+    SQL_C_WCHAR, SQL_CA_SS_VARIANT_TYPE, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
     SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME, SQL_DESC_CASE_SENSITIVE,
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE,
     SQL_DESC_FIXED_PREC_SCALE, SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
@@ -513,17 +513,19 @@ fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
         TdsDataType::Bit | TdsDataType::BitN => SQL_C_BIT,
         TdsDataType::Flt4 => SQL_C_FLOAT,
         TdsDataType::Flt8 | TdsDataType::FltN => SQL_C_DOUBLE,
-        // msodbcsql reports SQL_C_NUMERIC here, but emitting SQL_NUMERIC_STRUCT
-        // is a permanent non-goal for this driver (see the divergence table), so
-        // the exact numerics are advertised as character data, which is how they
-        // are actually delivered.
+        // Measured against retail msodbcsql18 18.06.0001: decimal, numeric and
+        // money all answer SQL_C_NUMERIC. Money belongs here because it is
+        // reported as SQL_DECIMAL in the column form too.
+        //
+        // This is the type of the *value*, not a promise that SQL_NUMERIC_STRUCT
+        // is an available SQLGetData target - it is not yet (AB#47816).
         TdsDataType::Decimal
         | TdsDataType::DecimalN
         | TdsDataType::Numeric
         | TdsDataType::NumericN
         | TdsDataType::Money
         | TdsDataType::Money4
-        | TdsDataType::MoneyN => SQL_C_CHAR,
+        | TdsDataType::MoneyN => SQL_C_NUMERIC,
         TdsDataType::DateN => SQL_C_TYPE_DATE,
         TdsDataType::TimeN => SQL_C_SS_TIME2,
         TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
@@ -1221,10 +1223,9 @@ mod tests {
             (TdsDataType::Bit, SQL_C_BIT),
             (TdsDataType::Flt4, SQL_C_FLOAT),
             (TdsDataType::Flt8, SQL_C_DOUBLE),
-            // The exact numerics are advertised as character data because
-            // SQL_NUMERIC_STRUCT is a permanent non-goal.
-            (TdsDataType::Numeric, SQL_C_CHAR),
-            (TdsDataType::MoneyN, SQL_C_CHAR),
+            (TdsDataType::Numeric, SQL_C_NUMERIC),
+            (TdsDataType::DecimalN, SQL_C_NUMERIC),
+            (TdsDataType::MoneyN, SQL_C_NUMERIC),
             (TdsDataType::DateN, SQL_C_TYPE_DATE),
             (TdsDataType::TimeN, SQL_C_SS_TIME2),
             (TdsDataType::DateTimeN, SQL_C_TYPE_TIMESTAMP),

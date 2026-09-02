@@ -70,6 +70,18 @@ authoritative parity reference for this crate. Its source lives in the
     accounted for. Read the caller before concluding either way.
 - Deliberate deviations (exceed-parity) are allowed with product-owner sign-off;
   record the rationale in code comments and the tracking work item.
+- **A divergence justified by "the consumer does not need parity here" is a claim
+  about the consumer's code, and needs the same evidence as a claim about
+  msodbcsql: cite the file and function you read.** `SQL_CA_SS_VARIANT_TYPE` was
+  recorded as a *permanent* divergence returning `SQL_C_CHAR` for exact numerics
+  on the reasoning that mssql-python "requests decimal as character data, so
+  `SQL_NUMERIC_STRUCT` is not needed". mssql-python does fetch the characters —
+  but only after routing on a `SQL_C_NUMERIC` answer
+  (`ddbc_bindings.cpp`, `MapVariantCTypeToSQLType` → the `SQL_DECIMAL`/`SQL_NUMERIC`
+  case), so answering `SQL_C_CHAR` made it hand back `str` instead of
+  `decimal.Decimal` (AB#47702). The delivery path was read correctly and the
+  routing that selects it was never read at all. Never mark a divergence
+  "permanent" on an unread consumer.
 - Deliberate deviations are listed below:
   - `ActiveDirectoryManagedIdentity` is accepted as an alias for managed-identity
     authentication. msodbcsql recognizes only `ActiveDirectoryMSI`
