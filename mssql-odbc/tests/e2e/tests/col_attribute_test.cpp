@@ -28,7 +28,8 @@
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   23. VariantExactNumericsReportNumeric - decimal/numeric/money → SQL_C_NUMERIC
+//   23. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   24. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
 
 #include "odbc_test_fixture.h"
 
