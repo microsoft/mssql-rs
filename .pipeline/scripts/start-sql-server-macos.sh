@@ -43,7 +43,14 @@ PULL_BUDGET_SECONDS=${PULL_BUDGET_SECONDS:-900}
 READY_TIMEOUT_SECONDS=${READY_TIMEOUT_SECONDS:-240}
 # A container that exits immediately is abandoned in seconds, so cap the
 # attempts too — otherwise the budget alone would allow dozens of restarts.
-MAX_START_ATTEMPTS=${MAX_START_ATTEMPTS:-3}
+# Raised from 3 to 5 after build 171680 hit the documented SQLPAL crash three
+# times in a row (an unrelated PR's CI run, not a regression here): at an
+# observed ~1-in-8 per-attempt crash rate, three consecutive failures is rare
+# but not implausible, and the wall-clock budget check above already bounds
+# runaway retries regardless of this count, so the extra attempts are free
+# when the container keeps crashing quickly (as it did in that run: 3 attempts
+# used well under half of SETUP_BUDGET_SECONDS).
+MAX_START_ATTEMPTS=${MAX_START_ATTEMPTS:-5}
 # Login timeout per probe; the sqlcmd default of ~9s makes probes expensive.
 PROBE_LOGIN_TIMEOUT_SECONDS=${PROBE_LOGIN_TIMEOUT_SECONDS:-5}
 PROBE_INTERVAL_SECONDS=${PROBE_INTERVAL_SECONDS:-3}
