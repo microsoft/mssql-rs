@@ -123,23 +123,63 @@ authoritative parity reference for this crate. Its source lives in the
     and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
     deferred resolution makes it reachable without the application naming the C
     type.
-  - A zero-length `SQL_C_BINARY` `SQLGetData` on a **fixed-width** column
-    (`int`, `datetime2`, ...) reports `01004` / `SQL_SUCCESS_WITH_INFO`, where
-    msodbcsql reports `22003` / `SQL_ERROR`. The indicator carries a byte count
-    where `binary_length` knows one (`int` → 4) and `SQL_NO_TOTAL` where it does
-    not — every temporal variant falls through to `SQL_NO_TOTAL`, since this
-    driver has no binary encoding for them to promise a length for. Measured
-    against 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`): `int` and `datetime2(3)`
-    both answer `SQL_ERROR` with `22003`, while `binary(9)`, `varbinary(max)`
-    and `nvarchar(10)` answer `SQL_SUCCESS_WITH_INFO` with `01004`. This driver
-    does not distinguish a `sql_variant` column from the value it captured, and
-    mssql-python's `sql_variant` support depends on that same zero-length probe
-    succeeding (`ddbc_bindings.cpp`, `SQLGetData_ptr(hStmt, i, SQL_C_BINARY,
-    NULL, 0, ...)` gated on `SQL_SUCCEEDED`), so matching `22003` would break
-    every integer variant. The reported truncation is the important half — it is
-    what stops a caller treating an undelivered value as delivered (AB#47537) —
-    and the exact fixed-width SQLSTATE is left to AB#47239, which reworks binary
-    delivery.
+  - A zero-length `SQL_C_BINARY` `SQLGetData` on a column whose **source SQL
+    type is fixed-length** (`int`, `datetime2`, ...) reports `01004` /
+    `SQL_SUCCESS_WITH_INFO`, where msodbcsql reports `22003` / `SQL_ERROR`. The
+    indicator carries a byte count where `binary_length` knows one (`int` → 4)
+    and `SQL_NO_TOTAL` where it does not — every temporal variant falls through
+    to `SQL_NO_TOTAL`, since this driver has no binary encoding for them to
+    promise a length for.
+    **Source-verified.** msodbcsql selects between two policy classes on
+    `IsFixedSqlType()` (`Sql/Ntdbms/sqlncli/odbc/sqlcprot.h`), which
+    deliberately classifies `SQL_BINARY`, `SQL_CHAR`, `SQL_WCHAR` and every
+    partial-length type (`sqlcprot.h`, `IsPartialLenType`) as *not* fixed —
+    so the boundary is the **SQL** type, not the C type, and `binary(9)` sits
+    on the variable side. `ColDataRetriever<>::GetColData`
+    (`odbc/sqlcdata.h`) instantiates `BinaryOutputWithFixedLengthSqlType` for a
+    fixed source type, where delivery to `SQL_C_BINARY` is all-or-nothing (the
+    source comments that such data "is fetched in one call"), so a short buffer
+    is a data overflow rather than a truncation:
+    `if (... == BinaryWithFixedLengthSqlType && (SIZE_T)cbBuf < cbDataAvail)
+    { wError = IDS_22_003; }` in `InternalGetColData`, and `Error = CVT_PREC`
+    (`#define CVT_PREC IDS_22_003`, `sqlcprot.h`) out of `ConvertToBinary`
+    (`odbc/sqlccnvt.cpp`) on the converting route that `datetime2` takes.
+    `IDS_22_003` maps to `22003` in `cli_common/src/clntcomn.cpp`. A variable
+    source type instead reads `min(cbBuf, avail)` bytes and reports
+    `if (!IsFixedOrBinaryWithFixedServerType() && cbDataAvail)
+    wError = IDS_01_004;` with the full remaining length in the indicator.
+    Line numbers are deliberately omitted: the reading is from `master`
+    (`7a0c3d59`), not the 18.6.2.1 release branch, so the file + function +
+    condition are the durable part of the citation.
+    Matching runtime measurement against 18.6.2.1 (`SQL_DRIVER_VER`
+    `18.06.0002`): `int` and `datetime2(3)` both answer `SQL_ERROR` with
+    `22003`, while `binary(9)`, `varbinary(max)` and `nvarchar(10)` answer
+    `SQL_SUCCESS_WITH_INFO` with `01004`.
+    This driver does not distinguish a `sql_variant` column from the value it
+    captured, and mssql-python's `sql_variant` support depends on that same
+    zero-length probe succeeding (`ddbc_bindings.cpp`,
+    `SQLGetData_ptr(hStmt, i, SQL_C_BINARY, NULL, 0, ...)` gated on
+    `SQL_SUCCEEDED`), so matching `22003` would break every integer variant. The
+    reported truncation is the important half — it is what stops a caller
+    treating an undelivered value as delivered (AB#47537) — and the exact
+    fixed-width SQLSTATE is left to AB#47239, which reworks binary delivery.
+  - An **empty** (zero-length, non-NULL) value answers that same probe with
+    `SQL_SUCCESS` and consumes the column, so a repeat reports `SQL_NO_DATA`;
+    a value with bytes still pending stays resident and repeats its `01004`.
+    This matches msodbcsql, which short-circuits ahead of both checks above on
+    `if (!cbDataAvail) goto Return3;` (`sqlcdata.h`, `InternalGetColData`) and
+    then marks the column `STMT_ST_GETDATA_DONE` because the TDS layer reports
+    nothing remaining (`FIsLenRemaining()`, `tds/TdsParser.h`); the non-empty
+    case is never discarded because `SQLGetData` passes `fFlush = FALSE`
+    (`odbc/sqlcdata.cpp`). Measured identical on 18.6.2.1. One residual
+    divergence, deliberately not matched: a `sql_variant` wrapping an empty
+    value answers `SQL_SUCCESS_WITH_INFO` / `01004` on msodbcsql where this
+    driver answers `SQL_SUCCESS` (a bare empty `varbinary(8)` is `SQL_SUCCESS`
+    on both). It is invisible to mssql-python, whose probe is gated on
+    `SQL_SUCCEEDED`, and
+    `ColAttributeLiveTest.EmptyVariantProbeConsumesValueButKeepsBaseType`
+    accepts either so the parity leg still compares the base type and the
+    `SQL_NO_DATA` re-read.
   - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
     writes the client code page. msodbcsql uses the client code page -
     `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`

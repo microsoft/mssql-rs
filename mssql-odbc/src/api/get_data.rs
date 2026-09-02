@@ -2092,6 +2092,56 @@ mod tests {
         assert_eq!(ind, 9);
     }
 
+    /// `SQL_NO_TOTAL` is a third case, distinct from both a byte count and
+    /// zero: the value has bytes but this driver cannot say how many, which is
+    /// still a truncation. `binary_length` returns it for every temporal
+    /// variant.
+    ///
+    /// Without this the `available == 0` gate could be loosened to
+    /// `available <= 0` and the suite would stay green while `SQL_NO_TOTAL`
+    /// silently started consuming the column and claiming full delivery — the
+    /// exact confusion that caused AB#47537.
+    #[test]
+    fn get_data_binary_probe_on_unknown_length_reports_truncation() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(
+            &h,
+            ColumnValues::DateTime2(SqlDateTime2 {
+                days: 738_685,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                },
+            }),
+        );
+        // Guard the premise: this test is only meaningful while the value maps
+        // to SQL_NO_TOTAL rather than a byte count.
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt.inner.lock().unwrap();
+            let (_, value) = s.last_captured.as_ref().unwrap();
+            assert_eq!(binary_length(value), SQL_NO_TOTAL);
+        }
+
+        let mut ind: SqlLen = 0;
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, SQL_NO_TOTAL);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt.inner.lock().unwrap();
+            assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_01004);
+        }
+
+        // Unknown length means bytes remain, so the value stays resident.
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, SQL_NO_TOTAL);
+    }
+
     #[test]
     fn get_data_binary_probe_reports_null() {
         let h = TestHandles::with_env_dbc_stmt();

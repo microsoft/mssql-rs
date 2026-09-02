@@ -433,6 +433,46 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     SQLCloseCursor(stmt_);
 }
 
+// AB#47537 follow-up: the empty-value case of the zero-length SQL_C_BINARY
+// probe now *consumes* the column (there was nothing left to deliver), so this
+// pins the interaction with variant base-type tracking -- the two live in
+// different state (`last_captured` vs `last_variant_base`), and nothing else
+// would catch a future change that cleared both together.
+//
+// This is the exact sequence mssql-python runs on a sql_variant column
+// (`ddbc_bindings.cpp`): zero-length SQL_C_BINARY probe, then
+// SQLColAttribute(SQL_CA_SS_VARIANT_TYPE), then a read using the reported C
+// type. The base type must still be answerable after the probe consumed the
+// value, and the follow-up read must report SQL_NO_DATA rather than handing
+// back a stale value.
+//
+// Measured on both legs: base type SQL_C_BINARY and a SQL_NO_DATA re-read agree
+// exactly. The probe's own return code is the one divergence -- msodbcsql
+// 18.6.2.1 answers SQL_SUCCESS_WITH_INFO/01004 for a variant wrapping an empty
+// value where this driver answers SQL_SUCCESS (a bare empty `varbinary(8)`,
+// with no variant wrapper, is plain SQL_SUCCESS on both). ASSERT_SQL_OK accepts
+// either, so this test asserts the parts that matter without pinning that
+// difference; it is invisible to mssql-python, whose probe is gated on
+// SQL_SUCCEEDED.
+TEST_F(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType) {
+    ExecDirect("SELECT CAST(CAST('' AS VARBINARY(8)) AS SQL_VARIANT) AS v");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN indicator = -999;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(0, indicator) << "an empty value reports zero bytes, not SQL_NULL_DATA";
+
+    // The probe consumed the value; the base type must survive it.
+    EXPECT_EQ(SQL_C_BINARY, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    // Nothing remained, so the column is done rather than re-readable.
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator));
+
+    SQLCloseCursor(stmt_);
+}
+
 // A NULL sql_variant is just a zero length on the wire, with no base type or
 // property byte following it. Reading those anyway would consume the next
 // column's bytes, so the column after the variant is what actually proves it.
