@@ -4,14 +4,12 @@
 pub(crate) mod dbc;
 pub(crate) mod desc;
 mod env;
-mod runtime;
 pub(crate) mod stmt;
 
 pub(crate) use dbc::DbcHandle;
 pub(crate) use desc::DescHandle;
 pub(crate) use env::EnvHandle;
 pub(crate) use env::OdbcVersion;
-pub(crate) use runtime::SharedRuntime;
 pub(crate) use stmt::StmtHandle;
 
 use std::collections::HashMap;

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use mssql_tds::connection::tds_client::TdsClient;
 
-use super::{EnvHandle, HandleType, HasObjectType, SharedRuntime};
+use super::env::SharedRuntime;
+use super::{EnvHandle, HandleType, HasObjectType};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
 use crate::error::{DiagRecord, HasDiagnostics};
 

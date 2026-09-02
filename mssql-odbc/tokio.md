@@ -390,12 +390,14 @@ ODBC handles form a hierarchy: **ENV → DBC → STMT**.
 - **Per-ENV** aligns cleanly with the spec: the ENV is the app's top-level
   scope, child handles share its runtime through `Arc<SharedRuntime>`, and
   freeing the ENV drops the runtime when the last `Arc` goes away.
-  `SharedRuntime` (`handles/runtime.rs`) exists because that last drop can land
-  during process shutdown: `Runtime`'s teardown waits on its worker threads, and
-  a host that frees ODBC handles from a `DLL_PROCESS_DETACH`/`onexit` path does
-  so after Windows has already terminated them, so the wait never returns. The
-  wrapper leaks the runtime when `RtlDllShutdownInProgress` is set and drops it
-  normally otherwise.
+  `SharedRuntime` (`handles/env.rs`) exists because that last drop can land
+  during process shutdown: a host that frees ODBC handles from a
+  `DLL_PROCESS_DETACH`/`onexit` path does so after Windows has already
+  terminated the runtime's worker threads. Joining them panics (AB#47509) and
+  merely signalling them still deadlocks on the scheduler locks they died
+  holding (AB#47510), so the wrapper leaks the runtime outright once
+  `RtlDllShutdownInProgress` reports the loader is shutting the process down,
+  and calls `shutdown_background` otherwise.
 - **Per-thread `current_thread`** is attractive for a *sync-only* driver because
   it adds zero threads and sidesteps the "shared `current_thread` contends"
   problem — each thread gets its own scheduler. **The catch is reactor affinity,
