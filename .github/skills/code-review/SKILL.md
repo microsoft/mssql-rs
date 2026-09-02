@@ -21,9 +21,9 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    Azure DevOps work item — flag a PR that has neither. Resolving an `AB#` reference
    is worth it when you can: it catches a PR that drifts from what its work item
    asked, or one still open against a closed item. Attempt the lookup before treating
-   it as out of reach — the Azure DevOps MCP server answers `wit_work_item` without
-   an interactive prompt. See step 6 for what to do when a call actually fails, and
-   for unattended runs.
+   it as out of reach — on an already-authenticated host, the Azure DevOps MCP server
+   answers `wit_work_item` without an interactive prompt. See step 6 for what to do
+   when a call actually fails, and for unattended runs.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -96,12 +96,19 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      show the suite still passes.
    - **Does the platform-gated half still compile?** `cargo check` / `cargo clippy
      --target <triple>` type-checks `#[cfg(windows)]` and `#[cfg(target_os = ...)]`
-     code from any host, because neither links (`rustup target add
+     code without needing a matching host, because neither links (`rustup target add
      aarch64-pc-windows-msvc`; ~30 s warm for `-p mssqlodbc --lib`). It cannot run a
      Windows test binary, so runtime behaviour there still rests on the CI matrix —
      but "my host is Linux, so the matrix owns this" is the wrong default when
      reviewing platform-gated code, and a mutation applied to an arm your host does
-     not select proves nothing on its own.
+     not select proves nothing on its own. A failure here can still come from a
+     dependency's build script rather than the reviewed code: targeting a non-Windows
+     triple pulls `openssl-sys` in through `native-tls`, and its build script fails
+     before rustc ever sees the crate if it can't find a target OpenSSL sysroot —
+     confirmed on `mssql-odbc`, where the Windows-target direction above needs no
+     OpenSSL at all (`native-tls` routes through Schannel there). That is an
+     environment gap, not a type error; read what actually failed before attributing
+     it to the diff.
 
    ```bash
    cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
@@ -375,12 +382,14 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
 - Distinguish facts (verified in code) from concerns (worth checking). Don't state
   guesses as defects. Say what you ran and what you read.
 - **An unavailability is a claim, and it carries the same burden as a defect.** Write
-  "I could not check X" only after invoking the thing and quoting what came back.
-  Three of the four caveats closing one recent review — no ADO access, no Windows
-  host, Linux-only mutation scope — did not survive being tested. Keep two categories
-  apart: *the environment cannot do this* needs a failed invocation, while *the defect
-  is inherently untestable* (process teardown, a TOCTOU window) needs only an argument
-  and stays valid.
+  "I could not check X" only after invoking the thing and recording what happened —
+  quote the response when one comes back, or state that none did (a timeout after a
+  bounded wait, a hard error) when it doesn't; a silent hang is itself an outcome, not
+  an excuse to skip the record. Three of the four caveats closing one recent review —
+  no ADO access, no Windows host, Linux-only mutation scope — did not survive being
+  tested. Keep two categories apart: *the environment cannot do this* needs a failed
+  invocation, while *the defect is inherently untestable* (process teardown, a TOCTOU
+  window) needs only an argument and stays valid.
 - If a change is correct, don't invent problems. An empty severity group means "none
   found" — say so briefly.
 - Reviewing is not merging. The PR author owns the merge — never merge someone
