@@ -5766,7 +5766,13 @@ impl TdsClient {
         }
     }
 
-    /// Attempts to peek past the fully consumed row using buffered bytes.
+    /// Attempts to peek ahead to the next row from buffered bytes and preserves
+    /// it for the next cursor advance.
+    ///
+    /// ODBC execution uses this before its first fetch so an ERROR token sent
+    /// after COLMETADATA is reported by SQLExecDirect/SQLExecute. The ODBC busy
+    /// gate also uses it after delivering a row to discover whether another
+    /// row follows or the wire is now idle.
     ///
     /// A row found by [`CursorPoll::Ready`] is parked for the next
     /// [`next_row_cursor`](Self::next_row_cursor) call. [`CursorPoll::Pending`]
@@ -5781,8 +5787,9 @@ impl TdsClient {
 
     /// Peeks past the fully consumed row, parking the next row if one exists.
     ///
-    /// Only call this after every column of the positioned row has been read;
-    /// like [`next_row_cursor`](Self::next_row_cursor), it discards unread columns.
+    /// Call this before the first row is positioned, or after every column of
+    /// the current row has been read. Like `next_row_cursor`, it discards any
+    /// unread columns from an already-positioned row.
     pub async fn peek_past_current_row(&mut self) -> TdsResult<bool> {
         let has_row = self.next_row_cursor().await?;
         self.row_already_positioned = has_row;
