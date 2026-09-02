@@ -60,6 +60,36 @@ fn process_is_shutting_down() -> bool {
     false
 }
 
+/// How `SharedRuntime` lets go of its runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleasePolicy {
+    /// Signal the scheduler to stop and return without joining. The worker
+    /// threads wind themselves down, so nothing accumulates.
+    Detach,
+    /// Signal nothing at all and leak the runtime. The only safe option once
+    /// the loader has terminated the threads the scheduler would synchronize
+    /// with; the OS reclaims them moments later.
+    Leak,
+}
+
+/// Chooses how to let go of the runtime. Takes the loader flag as an argument
+/// rather than reading it, so both arms are reachable from a test — a live
+/// test process can never observe the shutting-down one.
+fn release_policy(process_is_shutting_down: bool) -> ReleasePolicy {
+    if process_is_shutting_down {
+        ReleasePolicy::Leak
+    } else {
+        ReleasePolicy::Detach
+    }
+}
+
+fn release(runtime: Runtime, policy: ReleasePolicy) {
+    match policy {
+        ReleasePolicy::Detach => runtime.shutdown_background(),
+        ReleasePolicy::Leak => std::mem::forget(runtime),
+    }
+}
+
 /// A Tokio runtime that never synchronizes with its worker threads when it
 /// goes away.
 ///
@@ -79,10 +109,9 @@ fn process_is_shutting_down() -> bool {
 /// the worse failure: it strands the host after its last statement already
 /// succeeded, and it does so on the main-thread teardown path that previously
 /// only printed the panic and exited. So once the loader reports the process is
-/// already going away, the runtime is leaked deliberately and nothing is
-/// signalled at all; the OS reclaims the threads moments later.
+/// already going away, [`ReleasePolicy::Leak`] signals nothing at all.
 ///
-/// Outside that window `shutdown_background` still runs, so an application that
+/// Outside that window [`ReleasePolicy::Detach`] runs, so an application that
 /// allocates and frees environments in a loop does not accumulate threads.
 ///
 /// This lives on the shared value rather than on `EnvHandle` so the guarantee
@@ -112,15 +141,11 @@ impl Drop for SharedRuntime {
     fn drop(&mut self) {
         // SAFETY: `drop` runs at most once and nothing reads `self.0` after
         // this, so taking ownership out of the `ManuallyDrop` is sound. Taking
-        // it by value is what lets us either forget the `Runtime` or call
-        // `shutdown_background`, which consumes it; the default drop glue would
-        // join instead.
+        // it by value is what lets `release` either forget the `Runtime` or
+        // call `shutdown_background`, both of which consume it; the default
+        // drop glue would join instead.
         let runtime = unsafe { ManuallyDrop::take(&mut self.0) };
-        if process_is_shutting_down() {
-            std::mem::forget(runtime);
-            return;
-        }
-        runtime.shutdown_background();
+        release(runtime, release_policy(process_is_shutting_down()));
     }
 }
 
@@ -164,15 +189,21 @@ impl HasDiagnostics for EnvState {
     }
 }
 
+/// Builds the runtime an ENV owns. Extracted from `EnvHandle::new` so the
+/// release-policy tests can construct one without an ENV around it.
+fn new_runtime() -> io::Result<Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .inspect_err(|e| {
+            error!(%e, "failed to create Tokio runtime");
+        })
+}
+
 impl EnvHandle {
     pub(crate) fn new() -> io::Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .inspect_err(|e| {
-                error!(%e, "failed to create Tokio runtime");
-            })?;
+        let runtime = new_runtime()?;
         Ok(Self {
             object_type: HandleType::Env,
             inner: Mutex::new(EnvState {
@@ -257,14 +288,66 @@ mod tests {
         });
     }
 
-    /// Pins the precondition the two tests above rely on. They assert that a
-    /// drop reaches `shutdown_background`, which only holds while the loader
-    /// reports the process is still alive — if this ever read true in-process,
-    /// they would pass by taking the leak path instead and would stop testing
-    /// anything. The leak path itself needs real `DLL_PROCESS_DETACH` teardown
-    /// and is not reproducible from a unit test (AB#47510).
+    /// The mapping `Drop` relies on. Guards the condition itself: dropping it
+    /// and always returning `Detach` restores the AB#47510 hang, and this is
+    /// the only test that can see that, since a live test process never
+    /// observes the loader flag as true.
+    #[test]
+    fn only_a_shutting_down_process_selects_the_leak_policy() {
+        assert_eq!(release_policy(true), ReleasePolicy::Leak);
+        assert_eq!(release_policy(false), ReleasePolicy::Detach);
+    }
+
+    /// The flag feeding the mapping above reads false while the process is
+    /// alive, so a normal `SQLFreeHandle(ENV)` really does take `Detach`.
     #[test]
     fn a_live_process_is_not_reported_as_shutting_down() {
         assert!(!process_is_shutting_down());
+    }
+
+    /// Runs a task on `handle` and reports whether its scheduler is still
+    /// executing work. A detached runtime stops polling, so the task never
+    /// runs and the receiver times out; a leaked one keeps its worker alive.
+    fn scheduler_still_runs_tasks(handle: &tokio::runtime::Handle) -> bool {
+        let (ran_tx, ran_rx) = mpsc::channel();
+        handle.spawn(async move {
+            let _ = ran_tx.send(());
+        });
+        ran_rx.recv_timeout(PARK / 2).is_ok()
+    }
+
+    /// The regression guard for AB#47510. `Leak` exists so that nothing is
+    /// signalled once the loader has terminated the scheduler's threads, and
+    /// the only in-process evidence of "signalled nothing" is that the
+    /// scheduler is still running afterwards. Swapping this back to
+    /// `shutdown_background` — the #459 behaviour that still hung — flips it.
+    #[test]
+    fn the_leak_policy_signals_nothing_and_leaves_the_runtime_running() {
+        let runtime = new_runtime().expect("failed to build runtime for test");
+        let handle = runtime.handle().clone();
+
+        release(runtime, ReleasePolicy::Leak);
+
+        assert!(
+            scheduler_still_runs_tasks(&handle),
+            "Leak must not signal the scheduler; a shut-down runtime stops \
+             polling, which is exactly the teardown AB#47510 hangs on"
+        );
+    }
+
+    /// The other half of the pair: outside process shutdown the runtime really
+    /// is released, so an application that allocates and frees environments in
+    /// a loop does not accumulate live schedulers.
+    #[test]
+    fn the_detach_policy_stops_the_runtime() {
+        let runtime = new_runtime().expect("failed to build runtime for test");
+        let handle = runtime.handle().clone();
+
+        release(runtime, ReleasePolicy::Detach);
+
+        assert!(
+            !scheduler_still_runs_tasks(&handle),
+            "Detach must actually shut the runtime down, not leak it"
+        );
     }
 }
