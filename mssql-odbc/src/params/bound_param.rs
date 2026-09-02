@@ -86,9 +86,15 @@ impl BoundParam {
     /// ordinal — the descriptor storage `SQLBindParameter` and
     /// `SQLSetDescFieldW` share (AB#47437). Mirrors msodbcsql's
     /// `SQLBindParameter`, which unconditionally writes both `SetADRec` (APD)
-    /// and `SetIPDRec` (IPD) on every call, so a rebind fully overwrites both
-    /// records rather than leaving fields from a previous, differently-shaped
-    /// binding behind. `SQL_DESC_INDICATOR_PTR` and `SQL_DESC_OCTET_LENGTH_PTR`
+    /// and `SetIPDRec` (IPD) on every call, so a rebind fully overwrites the
+    /// IPD's `length`/`precision`/`scale` rather than leaving fields from a
+    /// previous, differently-shaped binding behind. The APD's own
+    /// `length`/`precision`/`scale` are left untouched here, unlike
+    /// msodbcsql's `SetADRecBP`, which resets them to `SetTypeDefaults`'s
+    /// C-type-keyed defaults on every call — tracked as a known, narrow
+    /// (metadata-introspection-only) gap in
+    /// [#470](https://github.com/microsoft/mssql-rs/issues/470).
+    /// `SQL_DESC_INDICATOR_PTR` and `SQL_DESC_OCTET_LENGTH_PTR`
     /// both receive the same pointer here — `SQLBindParameter`'s one
     /// `StrLen_or_IndPtr` argument feeds both descriptor fields at once,
     /// mirroring msodbcsql's `lpbindinfo->pIndValue = lpbindinfo->pcbValue =

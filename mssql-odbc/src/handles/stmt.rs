@@ -127,6 +127,12 @@ impl ColumnBinding {
     /// fields at once — but they stay two independent fields on the record,
     /// since `SQLSetDescFieldW`/`SQLSetDescRec` can set them to different
     /// buffers.
+    ///
+    /// Does not reset `SQL_DESC_LENGTH`/`PRECISION`/`SCALE`; msodbcsql's
+    /// `SetADRec` resets them to `SetTypeDefaults`'s C-type-keyed defaults on
+    /// every `SQLBindCol` call — tracked as a known, narrow
+    /// (metadata-introspection-only) gap in
+    /// [#470](https://github.com/microsoft/mssql-rs/issues/470).
     pub(crate) fn write_to_record(&self, record: &mut DescRecord) {
         record.concise_type = self.target_type;
         record.datetime_interval_code = datetime_interval_code_for(self.target_type);
