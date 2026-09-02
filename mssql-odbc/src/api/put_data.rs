@@ -313,11 +313,20 @@ unsafe fn sql_put_data_safe(
             // append after that snapshot and still report success, so the
             // bytes it appended would be silently discarded rather than
             // sent.
-            match stmt_state
-                .dae
-                .as_mut()
-                .and_then(|dae| dae.checkout_client())
-            {
+            //
+            // Checkout and append share one `dae` borrow rather than
+            // re-fetching `stmt_state.dae.as_mut()` for the append: a
+            // second fetch that came back `None` would silently drop the
+            // checked-out client instead of returning it. Provably
+            // unreachable -- nothing between the two fetches can clear
+            // `dae` -- but sharing the borrow removes the possibility
+            // structurally instead of relying on that argument.
+            let Some(dae) = stmt_state.dae.as_mut() else {
+                error!("SQLPutData: DAE client is unavailable — internal state corruption");
+                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            };
+            match dae.checkout_client() {
                 Some(client) => {
                     // Safety: caller guarantees data_ptr is readable for
                     // byte_count bytes, and byte_count > 0 here, so
@@ -325,10 +334,8 @@ unsafe fn sql_put_data_safe(
                     // combination was already rejected above).
                     let chunk =
                         unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) };
-                    if let Some(dae) = stmt_state.dae.as_mut() {
-                        dae.progress.pending_bytes.extend_from_slice(chunk);
-                        dae.return_client(client);
-                    }
+                    dae.progress.pending_bytes.extend_from_slice(chunk);
+                    dae.return_client(client);
                 }
                 None => {
                     error!("SQLPutData: DAE client is unavailable — internal state corruption");

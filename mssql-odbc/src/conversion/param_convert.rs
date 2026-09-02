@@ -232,26 +232,32 @@ pub(crate) struct DaeStream {
 /// transcoding each `SQLPutData` chunk incrementally. Source reading
 /// suggested msodbcsql's `ProcessDAEColumnData` carries a code-point residual
 /// across calls (`sqlccmd.cpp:3864`, `:3899-3901`; `ConvertLongData`,
-/// `sqlccnvt.cpp:938-990`; residual flushed at `sqlccmd.cpp:5999-6001`), but
-/// direct measurement contradicts that for this narrow-to-wide direction: the
-/// msodbcsql parity run for a UTF-8 character split across two `SQLPutData`
-/// calls returns 5 UTF-16 code units instead of the correct 4 (see
-/// `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter`),
-/// reproducing identically across retries -- i.e. no residual survives
-/// between calls in this direction, and whole-value buffering is not merely a
-/// documented cost here but measurably more correct. Whether the residual
-/// carry the source suggests actually applies to the wide-to-narrow direction
-/// remains unmeasured: every existing wide-to-narrow test sends its value in
-/// a single `SQLPutData` call. Whole-value buffering costs memory
-/// proportional to the value on a path whose purpose is to avoid exactly
-/// that, and is not a regression -- this pairing previously failed outright
-/// -- but it is real cost, taken because a per-chunk carry is meaningfully
-/// more machinery (correctly splitting a UTF-16 surrogate pair or a
-/// multi-byte narrow sequence across calls) than this driver has today. It
-/// also means a mismatched value whose total size exceeds `u32::MAX` bytes
-/// -- `SQL_LEN_DATA_AT_EXEC` declares no upper bound -- fails late, with a
-/// clean `UsageError` from `write_streamed_chunk`'s own chunk-length check,
-/// rather than at the first oversized `SQLPutData` call.
+/// `sqlccnvt.cpp:938-990`; residual flushed at `sqlccmd.cpp:5999-6001`).
+/// A msodbcsql parity run for a UTF-8 character split across two
+/// `SQLPutData` calls measured 5 UTF-16 code units instead of the correct 4
+/// (see `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter`),
+/// reproducing identically across retries -- but this is very likely `AppText`'s
+/// documented divergence from msodbcsql, not a residual-carrying failure:
+/// msodbcsql reads `SQL_C_CHAR` bytes in the client code page rather than
+/// UTF-8, so on the parity leg's Windows default code page the two split
+/// bytes (`0xC3 0xA9`) each decode as their own Windows-1252 character
+/// instead of the one UTF-8 character they encode together -- a mismatch that
+/// would reproduce for a single-chunk value too, not only a split one, so it
+/// says nothing about whether msodbcsql carries a residual across calls.
+/// Not confirmed at the code-point level (the failing assertion aborted
+/// before the actual units were logged), so this is the more likely
+/// explanation, not a settled one; tracked under AB#47565 (client code page
+/// support), separately from this whole-value-buffering deviation. Either
+/// way, whole-value buffering costs memory proportional to the value on a
+/// path whose purpose is to avoid exactly that, and is not a regression --
+/// this pairing previously failed outright -- but it is real cost, taken
+/// because a per-chunk carry is meaningfully more machinery (correctly
+/// splitting a UTF-16 surrogate pair or a multi-byte narrow sequence across
+/// calls) than this driver has today. It also means a mismatched value whose
+/// total size exceeds `u32::MAX` bytes -- `SQL_LEN_DATA_AT_EXEC` declares no
+/// upper bound -- fails late, with a clean `UsageError` from
+/// `write_streamed_chunk`'s own chunk-length check, rather than at the first
+/// oversized `SQLPutData` call.
 /// Tracked under AB#47590 alongside this file's other DAE-transcoding gaps.
 ///
 /// Known residual, also AB#47590: a same-family pairing whose wideness

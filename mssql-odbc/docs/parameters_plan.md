@@ -97,14 +97,17 @@ transparent reconnects.
   within the character family (e.g. `SQL_C_WCHAR` against a narrow SQL type)
   is buffered and transcoded once at `SQLParamData` close via the
   connection's collation rather than rejected - msodbcsql accepts the same
-  pairing, but for the narrow-to-wide direction, direct measurement shows it
-  does not correctly carry a split multi-byte character across `SQLPutData`
-  calls the way source reading suggested: a UTF-8 character split across two
-  calls comes back as 5 UTF-16 units instead of 4
+  pairing. A msodbcsql parity run for the narrow-to-wide direction measured a
+  UTF-8 character split across two `SQLPutData` calls coming back as 5
+  UTF-16 units instead of 4
   (`NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter`,
-  skipped for msodbcsql parity for that reason). Whole-value buffering here
-  is a documented deviation, not a gap, and is measurably more correct than
-  msodbcsql for a split character in this direction. The same-wideness narrow path
+  skipped for msodbcsql parity because of it), but this is very likely
+  msodbcsql reading `SQL_C_CHAR` bytes in the client code page rather than
+  UTF-8 (AB#47565) -- a mismatch that would reproduce for a single-chunk
+  value too -- not evidence about whether msodbcsql carries a residual
+  across `SQLPutData` calls; not confirmed at the code-point level. Either
+  way, whole-value buffering here is a documented deviation from msodbcsql's
+  incremental approach, not a gap. The same-wideness narrow path
   (`SQL_C_CHAR` against a narrow SQL type) still assumes UTF-8 on the wire
   instead of reading the connection's collation (AB#47590); only the
   wideness-mismatch half of that gap has closed.
