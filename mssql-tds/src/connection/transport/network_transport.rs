@@ -46,6 +46,14 @@ use tokio::net::{self, TcpStream};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, error, event, info, trace, warn};
 
+/// Result of attempting to fully decode a buffered PLP column in one call.
+///
+/// Outer `None` means not enough bytes were buffered yet to complete the attempt (retry once
+/// more data arrives). `Some(None)` means the column is SQL NULL. `Some(Some((written,
+/// known_total, total_read)))` means the value was decoded: `written` is the payload bytes
+/// copied into the caller's output buffer this call, `known_total` is the value's declared
+/// length from the PLP header when the server sent a known length (`None` for unknown-length
+/// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
 type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
 
 #[cfg(windows)]
@@ -911,6 +919,13 @@ impl NetworkTransport {
         Ok(())
     }
 
+    /// Non-blocking attempt to append one more complete TDS packet to the working buffer.
+    ///
+    /// Returns `Ok(true)` when a new packet was read and finalized synchronously (via
+    /// `try_get_new_tds_packet`'s no-op-waker poll). Returns `Ok(false)` when there is
+    /// nothing more to read right now: either the buffer already reached end-of-message, or
+    /// the underlying poll reported `Poll::Pending`. Callers must treat `Ok(false)` as "not
+    /// ready", not as an error or true end-of-data.
     fn try_read_tds_packet(&mut self) -> TdsResult<bool> {
         if self.tds_read_buffer.end_of_message {
             return Ok(false);
@@ -1035,6 +1050,15 @@ impl NetworkTransport {
         Ok(bytes_available)
     }
 
+    /// Finalizes the packet at `base_offset` once `bytes_available` covers the full size
+    /// declared by its length header.
+    ///
+    /// Returns `Ok(None)` when fewer than a header's worth of bytes are available yet, or the
+    /// header is present but `bytes_available` doesn't yet cover the declared `packet_size`
+    /// (caller must read more before retrying). Returns `Ok(Some(packet_size))` once the
+    /// packet is complete: sets `end_of_message` from the packet's status flags and records
+    /// any bytes beyond `packet_size` as pending for the next packet. Returns `Err` for a
+    /// malformed, oversized, or out-of-bounds length header.
     fn complete_tds_packet_if_available(
         &mut self,
         base_offset: usize,
@@ -1106,6 +1130,12 @@ impl NetworkTransport {
         Ok(Some(packet_size))
     }
 
+    /// Records an in-progress, not-yet-complete packet's read position so the next call to
+    /// `try_get_new_tds_packet` resumes appending at `base_offset` with `bytes_available`
+    /// bytes already collected, instead of restarting.
+    ///
+    /// Debug-asserts that no pending bytes were already parked, since a fresh partial read
+    /// must never overwrite an unconsumed parked range.
     fn park_partial_packet(&mut self, base_offset: usize, bytes_available: usize) {
         debug_assert_eq!(self.tds_read_buffer.pending_bytes, 0);
         self.tds_read_buffer.pending_bytes = bytes_available;
@@ -1915,6 +1945,13 @@ impl NetworkTransport {
         Ok(Some((value, base)))
     }
 
+    /// Attempts to read `target`'s 8-byte PLP header from bytes already buffered in
+    /// `tds_read_buffer`, consuming those bytes only on success.
+    ///
+    /// Returns `Ok(None)` when `target` has no column metadata or the header isn't fully
+    /// buffered yet (not ready; retry once more bytes arrive). `Ok(Some(None))` means the
+    /// column is SQL NULL. `Ok(Some(Some(stream)))` returns a [`PlpColumnStream`] positioned
+    /// to read chunk payload via the buffered path.
     pub(crate) fn try_begin_buffered_plp(
         &mut self,
         pause_state: &RowPauseState,
@@ -1934,6 +1971,14 @@ impl NetworkTransport {
         Ok(Some(stream))
     }
 
+    /// Attempts to fully decode `target`'s known-length, single-chunk PLP column from bytes
+    /// already buffered in `tds_read_buffer`, in one call, without leaving a resumable
+    /// [`PlpColumnStream`] behind.
+    ///
+    /// See [`CompleteBufferedPlp`] for the exact outer/inner/tuple semantics of the result;
+    /// `Ok(None)` also covers `target` having no column metadata, and a known-length header
+    /// whose chunk isn't a single complete chunk (caller must fall back to
+    /// `try_begin_buffered_plp` + `try_read_buffered_plp`).
     pub(crate) fn try_read_complete_buffered_plp_column(
         &mut self,
         pause_state: &RowPauseState,
@@ -1968,6 +2013,13 @@ impl NetworkTransport {
         Ok(Some(Some((written, known_total, total_read))))
     }
 
+    /// Continues reading payload for an in-progress buffered `plp_state`, pulling additional
+    /// TDS packets via `try_read_tds_packet` (non-blocking) whenever the currently buffered
+    /// bytes aren't enough.
+    ///
+    /// Returns `Ok(None)` once `try_read_tds_packet` reports no more data is available right
+    /// now (not ready). Returns `Ok(Some(written))` with the number of payload bytes copied
+    /// into `out` this call.
     pub(crate) fn try_read_buffered_plp(
         &mut self,
         plp_state: &mut PlpPauseState,

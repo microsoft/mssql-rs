@@ -443,6 +443,14 @@ impl PlpChunkStreamReader {
         Ok(Some(Self::new(length)))
     }
 
+    /// Attempts to parse the 8-byte PLP length/sentinel header from already-buffered `bytes`.
+    ///
+    /// Returns `Ok(None)` when fewer than 8 bytes are buffered (not ready). `Ok(Some((None,
+    /// 8)))` means the header itself was the SQL NULL sentinel — `8` is still the number of
+    /// header bytes consumed. `Ok(Some((Some(reader), 8)))` returns a fresh chunk reader
+    /// positioned to read the first chunk-length header next, with `8` bytes consumed for
+    /// the PLP length header. Returns `Err` for a declared length that is negative or exceeds
+    /// `MAX_PLP_SIZE`.
     fn try_begin_buffered(bytes: &[u8]) -> TdsResult<Option<(Option<Self>, usize)>> {
         let Some(header) = bytes.get(..8) else {
             return Ok(None);
@@ -471,6 +479,19 @@ impl PlpChunkStreamReader {
         Ok(Some((Some(Self::new(length)), 8)))
     }
 
+    /// Attempts to decode an entire known-length, single-chunk PLP value (chunk header,
+    /// payload, zero terminator) directly from buffered `bytes` in one call, without leaving
+    /// resumable per-chunk cursor state behind.
+    ///
+    /// Only applies before any chunk has been started (`total_read == 0 && chunk_remaining ==
+    /// 0 && !reached_end`) and when the length is known. Returns `Ok(None)` for unknown-length
+    /// PLP, a reader that already began reading, `out` smaller than the declared length, a
+    /// buffered chunk header/payload/terminator that isn't fully present yet, or a chunk
+    /// length that doesn't match the declared length (caller must fall back to the general
+    /// chunked path via `try_read_buffered`). On success returns `Ok(Some((consumed,
+    /// payload_len)))`: `consumed` is the number of input `bytes` consumed (chunk header +
+    /// payload + terminator), `payload_len` is the number of bytes copied into `out` (equal
+    /// to the declared length). Marks the reader as having reached the end.
     fn try_read_complete_buffered(
         &mut self,
         bytes: &[u8],
@@ -531,6 +552,14 @@ impl PlpChunkStreamReader {
         Ok(Some((terminator_end, length)))
     }
 
+    /// Validates a chunk-length header value just read from the wire/buffer and applies it to
+    /// reader state.
+    ///
+    /// A `chunk_len` of `0` is the terminator: sets `reached_end` and returns `Ok(false)`
+    /// (erroring if a known declared length wasn't fully consumed by then). A non-zero
+    /// `chunk_len` becomes the new `chunk_remaining` and returns `Ok(true)`. Returns `Err` if
+    /// the chunk exceeds the max chunk size, would overflow the accumulated total, exceeds
+    /// `MAX_PLP_SIZE`, or would exceed a known declared length.
     fn accept_chunk_length(&mut self, chunk_len: usize) -> TdsResult<bool> {
         if chunk_len == 0 {
             self.reached_end = true;
@@ -577,6 +606,15 @@ impl PlpChunkStreamReader {
         Ok(true)
     }
 
+    /// Ensures a chunk with remaining payload bytes is active at `*position`, reading a new
+    /// 4-byte chunk-length header from `bytes` if the current chunk is exhausted.
+    ///
+    /// Returns `Ok(None)` when the chunk-length header isn't fully buffered yet (`*position`
+    /// is left unchanged so the caller can retry once more bytes arrive). Returns
+    /// `Ok(Some(false))` when the terminator was just consumed and the stream has reached its
+    /// end (`*position` advanced past the 4-byte terminator). Returns `Ok(Some(true))` when a
+    /// chunk with remaining payload bytes is active — either it was already active, or a new
+    /// chunk header was just consumed and `*position` advanced past it.
     fn try_ensure_active_buffered_chunk(
         &mut self,
         bytes: &[u8],
@@ -604,6 +642,20 @@ impl PlpChunkStreamReader {
         self.accept_chunk_length(chunk_len).map(Some)
     }
 
+    /// Core buffered-read loop shared by the dry-run probe and the real copy in
+    /// `try_read_buffered`; advances `self`'s chunk cursor (`chunk_remaining`, `total_read`,
+    /// `reached_end`) regardless of whether `out` is provided.
+    ///
+    /// `out_len` is the number of payload bytes the caller ultimately wants. `out` is `None`
+    /// for a dry run that only validates enough bytes are buffered to satisfy `out_len`
+    /// (still consuming chunk headers and advancing state) and `Some` to also copy payload
+    /// into the destination. Returns `Ok(None)` when a chunk-length header needed to make
+    /// progress isn't fully buffered yet. Returns `Ok(Some((consumed, written)))` where
+    /// `consumed` is the number of input `bytes` consumed and `written` is the number of
+    /// payload bytes produced (less than `out_len` if the stream reached its end first). When
+    /// `written == out_len` and the current chunk is exhausted but the stream hasn't ended,
+    /// also peeks ahead to confirm the next chunk's length header is buffered, so a
+    /// successful result never requires "un-consuming" state on a later call.
     fn try_read_buffered_inner(
         &mut self,
         bytes: &[u8],
@@ -659,6 +711,14 @@ impl PlpChunkStreamReader {
         Ok(Some((position, written)))
     }
 
+    /// Reads as much PLP payload as fits in `out` from already-buffered `bytes`, without
+    /// partially mutating `self` when the data isn't fully buffered.
+    ///
+    /// First dry-runs `try_read_buffered_inner` on a cloned reader to confirm every chunk
+    /// header needed to satisfy `out` is buffered; only if that succeeds does it re-run for
+    /// real on `self`, copying payload into `out`. Returns `Ok(None)` when the dry run
+    /// reports missing data (not ready; `self` left unchanged). Returns `Ok(Some((consumed,
+    /// written)))` — see `try_read_buffered_inner` for field semantics.
     fn try_read_buffered(
         &mut self,
         bytes: &[u8],
@@ -830,6 +890,13 @@ impl PlpColumnStream {
         }))
     }
 
+    /// Validates `metadata` is a PLP-capable type, then attempts to parse the 8-byte PLP
+    /// header from already-buffered `bytes`.
+    ///
+    /// See [`PlpChunkStreamReader::try_begin_buffered`] for the exact semantics: `Ok(None)`
+    /// not ready (header not fully buffered), `Ok(Some((None, used)))` SQL NULL,
+    /// `Ok(Some((Some(stream), used)))` a stream ready for buffered reads, with `used` the
+    /// header bytes consumed either way. Returns `Err` when `metadata` isn't PLP-capable.
     pub(crate) fn try_begin_buffered(
         metadata: &ColumnMetadata,
         bytes: &[u8],
@@ -848,6 +915,10 @@ impl PlpColumnStream {
         )))
     }
 
+    /// Delegates to [`PlpChunkStreamReader::try_read_complete_buffered`] — attempts to decode
+    /// this column's entire known-length, single-chunk PLP value from buffered `bytes` in one
+    /// call. See that method for the exact `Ok(None)` / `Ok(Some((consumed, payload_len)))`
+    /// semantics.
     pub(crate) fn try_read_complete_buffered(
         &mut self,
         bytes: &[u8],
@@ -856,6 +927,9 @@ impl PlpColumnStream {
         self.inner.try_read_complete_buffered(bytes, out)
     }
 
+    /// Delegates to [`PlpChunkStreamReader::try_read_buffered`] — reads as much payload as
+    /// fits in `out` from already-buffered `bytes`. Returns `Ok(None)` when a needed chunk
+    /// header isn't fully buffered yet (not ready), otherwise `Ok(Some((consumed, written)))`.
     pub(crate) fn try_read_buffered(
         &mut self,
         bytes: &[u8],

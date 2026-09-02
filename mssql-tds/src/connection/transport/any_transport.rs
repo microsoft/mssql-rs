@@ -19,6 +19,14 @@ use crate::io::token_stream::{
 };
 use crate::token::tokens::Tokens;
 
+/// Result of attempting to fully decode a buffered PLP column in one call.
+///
+/// Outer `None` means not enough bytes were buffered yet to complete the attempt (retry once
+/// more data arrives). `Some(None)` means the column is SQL NULL. `Some(Some((written,
+/// known_total, total_read)))` means the value was decoded: `written` is the payload bytes
+/// copied into the caller's output buffer this call, `known_total` is the value's declared
+/// length from the PLP header when the server sent a known length (`None` for unknown-length
+/// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
 type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
 
 /// Concrete transport representation held by [`crate::connection::tds_client::TdsClient`].
@@ -184,6 +192,15 @@ impl AnyTransport {
         }
     }
 
+    /// Attempts to read `target`'s 8-byte PLP header from bytes already buffered by the
+    /// active transport.
+    ///
+    /// Returns `Ok(None)` when `target` has no column metadata or the header isn't fully
+    /// buffered yet (not ready; retry once more bytes arrive). `Ok(Some(None))` means the
+    /// column is SQL NULL. `Ok(Some(Some(stream)))` returns a
+    /// [`crate::datatypes::decoder::PlpColumnStream`] positioned to read chunk payload via
+    /// the buffered path. The dynamic test arm never has buffered data, so it always reports
+    /// not ready.
     pub(crate) fn try_begin_buffered_plp(
         &mut self,
         pause_state: &RowPauseState,
@@ -196,6 +213,9 @@ impl AnyTransport {
         }
     }
 
+    /// Attempts to fully decode `target`'s PLP column from bytes already buffered by the
+    /// active transport, in a single call. See [`CompleteBufferedPlp`] for the exact
+    /// outer/inner/tuple semantics of the result.
     pub(crate) fn try_read_complete_buffered_plp_column(
         &mut self,
         pause_state: &RowPauseState,
@@ -211,6 +231,12 @@ impl AnyTransport {
         }
     }
 
+    /// Continues reading payload for an in-progress buffered PLP stream via the active
+    /// transport.
+    ///
+    /// Returns `Ok(None)` when the stream cannot make further progress right now (no more
+    /// buffered, or synchronously readable, packet data available). Returns
+    /// `Ok(Some(written))` with the number of payload bytes copied into `out` this call.
     pub(crate) fn try_read_buffered_plp(
         &mut self,
         plp_state: &mut PlpPauseState,
@@ -232,6 +258,11 @@ impl AnyTransport {
         self.try_read_buffered_row_prefix_into(pause_state, usize::MAX, writer)
     }
 
+    /// Decodes consecutive buffered columns before `end_column` into `writer` via the active
+    /// transport, leaving `pause_state` advanced to the last completed column.
+    ///
+    /// Returns `Ok(false)` when the next value needs async continuation (not enough buffered
+    /// data), `Ok(true)` once every column up to `end_column` has been written.
     pub(crate) fn try_read_buffered_row_prefix_into<W: RowWriter + ?Sized>(
         &mut self,
         pause_state: &mut RowPauseState,

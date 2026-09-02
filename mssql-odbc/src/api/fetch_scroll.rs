@@ -75,6 +75,10 @@ struct PlpColumnInfo {
 }
 
 impl BufferedGetDataRow {
+    /// Creates an empty row, reusing the supplied row's allocations when its
+    /// column shape permits it.
+    ///
+    /// The reusable row is consumed and all per-row state is reset.
     fn empty(reusable: &mut Option<Self>, column_count: usize) -> Self {
         let mut row = reusable.take().unwrap_or_else(|| Self {
             values: Vec::new(),
@@ -97,6 +101,9 @@ impl BufferedGetDataRow {
         row
     }
 
+    /// Drops unread buffered values before zero-based column `col`.
+    ///
+    /// Slots already covered by `consumed` are not touched again.
     pub(crate) fn discard_before(&mut self, col: usize) {
         let end = col.min(self.values.len());
         for value in self.values.iter_mut().take(end).skip(self.consumed) {
@@ -111,6 +118,8 @@ impl BufferedGetDataRow {
         }
     }
 
+    /// Clears values and variant metadata from zero-based column `col` onward
+    /// because those columns remain owned by the wire cursor.
     fn defer_from(&mut self, col: usize) {
         for slot in self.values.iter_mut().skip(col) {
             *slot = None;

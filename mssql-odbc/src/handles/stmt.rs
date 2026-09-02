@@ -66,6 +66,8 @@ pub(crate) struct ActivePlpStream {
     prefetch_error: Option<Box<TdsError>>,
 }
 
+/// Materialized values from a single-row fetch that remain available to
+/// subsequent `SQLGetData` calls.
 #[derive(Debug)]
 pub(crate) struct BufferedGetDataRow {
     pub(crate) values: Vec<Option<ColumnValues>>,
@@ -101,6 +103,9 @@ impl ActivePlpStream {
         }
     }
 
+    /// Stores a PLP read-ahead result for delivery by later application calls.
+    ///
+    /// Only the first `read` bytes of `bytes` are retained.
     pub(crate) fn set_prefetched_wire(
         &mut self,
         mut bytes: Vec<u8>,
@@ -117,6 +122,10 @@ impl ActivePlpStream {
         self.prefetched_reached_end = reached_end;
     }
 
+    /// Copies the next prefetched PLP bytes into `out`.
+    ///
+    /// Returns `(bytes_read, reached_end, known_total, total_read)`, where
+    /// `total_read` includes all wire payload consumed through this copy.
     pub(crate) fn read_prefetched_wire(
         &mut self,
         out: &mut [u8],
@@ -147,6 +156,7 @@ impl ActivePlpStream {
         ))
     }
 
+    /// Clears the prefetch bookkeeping and returns its allocation for reuse.
     pub(crate) fn take_prefetch_buffer(&mut self) -> Vec<u8> {
         self.prefetched_offset = 0;
         self.prefetched_total_read_before = 0;
@@ -157,10 +167,12 @@ impl ActivePlpStream {
         buffer
     }
 
+    /// Defers a read-ahead failure until the application's next PLP read.
     pub(crate) fn set_prefetch_error(&mut self, error: TdsError) {
         self.prefetch_error = Some(Box::new(error));
     }
 
+    /// Takes the deferred read-ahead failure for one-time delivery.
     pub(crate) fn take_prefetch_error(&mut self) -> Option<TdsError> {
         self.prefetch_error.take().map(|error| *error)
     }
@@ -1011,6 +1023,7 @@ impl StmtState {
         self.current_command += 1;
     }
 
+    /// Rebuilds result-set data derived from `column_metadata`.
     pub(crate) fn refresh_metadata_caches(&mut self) {
         self.column_names_utf16.clear();
         self.column_names_utf16.extend(
@@ -1020,6 +1033,7 @@ impl StmtState {
         );
     }
 
+    /// Clears result metadata and every cache derived from it.
     pub(crate) fn clear_result_metadata(&mut self) {
         self.column_metadata.clear();
         self.column_names_utf16.clear();

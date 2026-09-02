@@ -34,12 +34,16 @@ use crate::conversion::fetch_convert::{
     is_datetime_c_target, is_float_c_target, is_integer_c_target, money_scaled, sql_string_to_text,
     time_parts,
 };
-
-const MAX_PLP_PREFETCH_BYTES: usize = 64 * 1024;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sql_string::EncodingType;
 use mssql_tds::query::metadata::PlpEncoding;
+
+/// Maximum speculative PLP read-ahead retained by one `SQLGetData` stream.
+///
+/// Larger tails remain on the wire so one call cannot allocate in proportion
+/// to an arbitrarily large MAX value.
+const MAX_PLP_PREFETCH_BYTES: usize = 64 * 1024;
 
 /// Implements SQLGetData for current-row retrieval.
 ///
@@ -673,6 +677,15 @@ unsafe fn try_write_exact_buffered_scalar(
     }
 }
 
+/// Delivers a complete buffered UTF-16 PLP value directly as `SQL_C_WCHAR`.
+///
+/// Returns `None` when the value is not fully buffered or the connection cannot
+/// be used synchronously, leaving the caller to resume normal PLP streaming.
+/// `Some` means the column was consumed, including SQL NULL (reported through
+/// `strlen_or_ind_ptr` and terminated as an empty wide string).
+///
+/// The caller guarantees room for at least one `SqlWChar` terminator and a
+/// non-null indicator pointer before selecting this path.
 #[allow(clippy::too_many_arguments)]
 fn try_deliver_complete_buffered_unicode_plp(
     stmt: &StmtHandle,
@@ -1135,6 +1148,10 @@ unsafe fn try_write_direct_captured_string_chunk(
     Some((truncated, consumed, remaining_units))
 }
 
+/// Returns a fully delivered captured value to its buffered-row slot.
+///
+/// Keeping the value allocation in the row allows the next fetch to recycle it;
+/// values not captured from `col_index` are discarded instead.
 fn retain_completed_buffered_value(stmt_state: &mut StmtState, col_index: usize) {
     let Some((captured_column, value)) = stmt_state.last_captured.take() else {
         return;
@@ -1247,6 +1264,11 @@ fn resume_row_to_column(
     apply_cursor_result(stmt, column_number, cursor_result)
 }
 
+/// Applies one TDS cursor result to the statement's `SQLGetData` state.
+///
+/// Materialized values are captured for conversion, PLP values leave the
+/// transport stream active, and terminal/error states update diagnostics and
+/// row-exhaustion bookkeeping.
 fn apply_cursor_result(
     stmt: &StmtHandle,
     column_number: usize,
