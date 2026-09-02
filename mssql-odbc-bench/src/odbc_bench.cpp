@@ -533,10 +533,11 @@ ColumnSpec make_lob_text(std::vector<ColumnSpec>& columns, bool wide,
     return column;
 }
 
-// Build one sql_variant column. Only base types whose SQL_CA_SS_VARIANT_TYPE
-// answer is unambiguous are used: mssql-odbc deliberately reports SQL_C_CHAR
-// where msodbcsql reports SQL_C_NUMERIC for decimal/money variants, and a
-// benchmark that depended on that difference would not be the same work on both.
+// Build one sql_variant column. The exact numerics are no longer excluded for a
+// parity reason: since AB#47702 both drivers answer SQL_C_NUMERIC for
+// decimal/money variants, which `variant_read_c_type` folds onto SQL_C_CHAR on
+// either driver. The column set is left as-is so existing baselines stay
+// comparable.
 ColumnSpec make_variant(std::vector<ColumnSpec>& columns, ValueKind kind,
                         std::uint64_t null_phase) {
     ColumnSpec column;

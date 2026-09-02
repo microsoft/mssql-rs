@@ -498,8 +498,10 @@ TEST_F(ColAttributeLiveTest, VariantTypeBeforeProbeIsSequenceError) {
 // The exact numerics report SQL_C_NUMERIC, which is what tells a caller the
 // value is a decimal rather than a string. mssql-python routes on this answer
 // alone -- SQL_C_CHAR made it hand back `str` instead of `decimal.Decimal`
-// (AB#47702). `money` is included because msodbcsql answers SQL_C_NUMERIC for
-// it too, matching the SQL_DECIMAL it reports for a money column.
+// (AB#47702). `money` and `smallmoney` are included because msodbcsql answers
+// SQL_C_NUMERIC for them too, matching the SQL_DECIMAL it reports for a money
+// column, and because they arrive as distinct TDS base types (MONEYN width 8
+// and 4) that the driver maps separately.
 //
 // This compares against msodbcsql: the value is the whole point of the test.
 TEST_F(ColAttributeLiveTest, VariantExactNumericsReportNumeric) {
@@ -511,6 +513,7 @@ TEST_F(ColAttributeLiveTest, VariantExactNumericsReportNumeric) {
         {"decimal", "CAST(999.99 AS DECIMAL(18, 4))"},
         {"numeric", "CAST(888.88 AS NUMERIC(10, 2))"},
         {"money", "CAST(12.34 AS MONEY)"},
+        {"smallmoney", "CAST(12.34 AS SMALLMONEY)"},
         // No CAST: SQL Server stores a bare decimal literal as `numeric`.
         {"implicit numeric", "45.67"},
     };

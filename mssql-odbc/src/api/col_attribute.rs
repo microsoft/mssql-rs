@@ -1226,6 +1226,7 @@ mod tests {
             (TdsDataType::Numeric, SQL_C_NUMERIC),
             (TdsDataType::DecimalN, SQL_C_NUMERIC),
             (TdsDataType::MoneyN, SQL_C_NUMERIC),
+            (TdsDataType::Money4, SQL_C_NUMERIC),
             (TdsDataType::DateN, SQL_C_TYPE_DATE),
             (TdsDataType::TimeN, SQL_C_SS_TIME2),
             (TdsDataType::DateTimeN, SQL_C_TYPE_TIMESTAMP),
