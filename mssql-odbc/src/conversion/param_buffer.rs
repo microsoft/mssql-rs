@@ -60,19 +60,34 @@ pub(crate) enum Indicator {
 /// Classifies `StrLen_or_Ind` without touching the value buffer, so a caller
 /// can reject a binding before any application data is dereferenced.
 ///
+/// Per ODBC's "Deferred Fields" spec, `SQL_DESC_INDICATOR_PTR` and
+/// `SQL_DESC_OCTET_LENGTH_PTR` are independent: the indicator carries only
+/// `SQL_NULL_DATA` status, while the octet-length pointer carries the length
+/// or a data-at-execution sentinel (a null octet-length pointer means "assume
+/// NUL-terminated" for a character parameter). `SQLBindParameter` writes the
+/// same pointer to both (`BoundParam::write_to_records`), so this reduces to
+/// the historical single-pointer check for the common case; a
+/// `SQLSetDescFieldW`/`SQLSetDescRec` bind that sets them to different
+/// buffers is now read correctly instead of one of the two being discarded.
+///
 /// # Safety
-/// `param.strlen_or_ind_ptr`, if non-null, must point to one valid `SqlLen`.
+/// `param.strlen_or_ind_ptr` and `param.octet_length_ptr`, if non-null, must
+/// each point to one valid `SqlLen`.
 pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, ParamBuildError> {
-    let indicator = if param.strlen_or_ind_ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { param.strlen_or_ind_ptr.read_unaligned() })
-    };
-
-    if let Some(ind) = indicator {
+    if !param.strlen_or_ind_ptr.is_null() {
+        let ind = unsafe { param.strlen_or_ind_ptr.read_unaligned() };
         if ind == SQL_NULL_DATA {
             return Ok(Indicator::Null);
         }
+    }
+
+    let indicator = if param.octet_length_ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { param.octet_length_ptr.read_unaligned() })
+    };
+
+    if let Some(ind) = indicator {
         if ind == SQL_DEFAULT_PARAM {
             // This value is valid only in a procedure called in ODBC canonical syntax,
             // which this driver does not support yet.
@@ -89,7 +104,7 @@ pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, Par
         }
     }
 
-    // For the character C types a null indicator pointer means "null-terminated".
+    // For the character C types a null octet-length pointer means "null-terminated".
     Ok(Indicator::Length(indicator.unwrap_or(SQL_NTS as SqlLen)))
 }
 
@@ -266,6 +281,7 @@ mod tests {
             parameter_value_ptr: ptr,
             buffer_length: 0,
             strlen_or_ind_ptr: ind,
+            octet_length_ptr: ind,
         }
     }
 

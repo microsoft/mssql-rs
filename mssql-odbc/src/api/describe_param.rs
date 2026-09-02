@@ -19,9 +19,12 @@ use super::odbc_types::*;
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use super::util::write_if_some;
+use crate::api::type_rules::parameter_size_is_precision;
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ParameterDescription, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_STARTED};
-use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+
+use super::set_desc_field::datetime_interval_code_for;
 
 const DESCRIBE_PARAMETERS_PROC: &str = "sp_describe_undeclared_parameters";
 
@@ -145,6 +148,14 @@ fn sql_describe_param_safe(
                 post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
                 return SQL_ERROR;
             };
+            // Called on every cache-served answer, not just the first:
+            // `refine_ipd` itself only ever fills in a marker that has never
+            // been explicitly bound (see its doc comment), so repeating this
+            // call is idempotent for an already-bound marker and still picks
+            // up one that was unbound (or never bound) since the last call.
+            let cached = stmt_state.parameter_metadata.clone();
+            drop(stmt_state);
+            refine_ipd(stmt, &cached);
             write_description(
                 description,
                 data_type_ptr,
@@ -244,7 +255,7 @@ fn sql_describe_param_safe(
         error!("SQLDescribeParam: stmt mutex poisoned storing metadata");
         return SQL_ERROR;
     };
-    stmt_state.parameter_metadata = descriptions;
+    stmt_state.parameter_metadata = descriptions.clone();
     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
     let has_info = post_tds_info_messages(&mut stmt_state, &info_messages);
 
@@ -256,6 +267,10 @@ fn sql_describe_param_safe(
         post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_INDEX);
         return SQL_ERROR;
     };
+    // Dropped before refine_ipd locks the IPD: this crate never holds a
+    // STMT lock while acquiring a DESC lock (see bind_col.rs's rationale).
+    drop(stmt_state);
+    refine_ipd(stmt, &descriptions);
     write_description(
         description,
         data_type_ptr,
@@ -268,6 +283,75 @@ fn sql_describe_param_safe(
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
+    }
+}
+
+/// Refines `stmt`'s IPD records from server-described `descriptions` — one
+/// per marker ordinal, in order — filling in whatever `SQLBindParameter`
+/// has not already set: `sp_describe_undeclared_parameters` is informational
+/// (ODBC's `SQLDescribeParam` never mutates bind behavior), so a marker the
+/// application has explicitly bound is left untouched rather than
+/// overridden. Refining an already-bound marker would both silently change
+/// what `SQLExecute` sends for a type the application explicitly chose, and
+/// bypass the `is_supported_conversion` gate `SQLBindParameter` enforces at
+/// bind time.
+///
+/// Guarded by `DescRecord::explicitly_bound`, not `concise_type != 0`: this
+/// function's own write below leaves `concise_type` non-zero too, so the
+/// concise type alone can't tell "the application chose this" apart from "a
+/// previous `SQLDescribeParam` filled this in" — and a re-`SQLPrepare` only
+/// resets `parameter_metadata`/the prepared handle, never the IPD's records,
+/// so a marker this function refined on an earlier prepare must still be
+/// refreshable on the next one. Grows the IPD to cover every described
+/// marker but never shrinks it, so an application that grew the IPD further
+/// itself (`SQLSetDescField(IPD, 0, SQL_DESC_COUNT, ...)`) keeps that choice.
+///
+/// `ParameterDescription` carries no parameter direction or name — the
+/// server doesn't determine either from `sp_describe_undeclared_parameters`
+/// — so `SQL_DESC_PARAMETER_TYPE` and `SQL_DESC_NAME` are left exactly as
+/// `SQLBindParameter` (or the record's un-bound default) set them.
+///
+/// Call only after the STMT lock has been dropped (see `bind_col.rs`'s
+/// locking-order rationale). A poisoned IPD mutex is logged and otherwise
+/// ignored: `SQLDescribeParam`'s own answer, already written from the
+/// in-memory `descriptions`, does not depend on this refinement succeeding.
+fn refine_ipd(stmt: &StmtHandle, descriptions: &[ParameterDescription]) {
+    let desc = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
+    let Ok(mut desc_state) = desc.inner.lock() else {
+        error!("SQLDescribeParam: ipd mutex poisoned; parameter metadata left unrefined");
+        return;
+    };
+    let target_count = desc_state.records.len().max(descriptions.len());
+    desc_state.set_record_count(target_count, desc.kind);
+    for (i, description) in descriptions.iter().enumerate() {
+        let record_number = SqlSmallInt::try_from(i + 1).unwrap_or(SqlSmallInt::MAX);
+        let Some(record) = desc_state.record_mut(record_number) else {
+            continue;
+        };
+        if record.explicitly_bound {
+            // Bound by SQLBindParameter or SQLSetDescField/SQLSetDescRec —
+            // informational metadata must not override an application's
+            // explicit choice.
+            continue;
+        }
+        record.concise_type = description.data_type;
+        record.datetime_interval_code = datetime_interval_code_for(description.data_type);
+        record.scale = description.decimal_digits;
+        record.nullable = description.nullable;
+        if parameter_size_is_precision(description.data_type) {
+            record.precision =
+                SqlSmallInt::try_from(description.parameter_size).unwrap_or(SqlSmallInt::MAX);
+            record.length = 0;
+        } else if record.datetime_interval_code != 0 {
+            // Per ODBC's "Decimal Digits" appendix ("All datetime types" ->
+            // PRECISION): see `BoundParam::write_to_records`'s identical fix
+            // for the same split.
+            record.precision = description.decimal_digits;
+            record.length = description.parameter_size;
+        } else {
+            record.length = description.parameter_size;
+            record.precision = 0;
+        }
     }
 }
 
@@ -945,5 +1029,187 @@ mod tests {
         collector.accept(1, description).unwrap();
         collector.accept(0, description).unwrap();
         assert_eq!(collector.finish().unwrap().len(), 2);
+    }
+
+    fn ipd_records(h: &TestHandles) -> Vec<crate::handles::desc::DescRecord> {
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        desc.inner.lock().unwrap().records.clone()
+    }
+
+    fn param_description(
+        data_type: SqlSmallInt,
+        parameter_size: SqlULen,
+        decimal_digits: SqlSmallInt,
+        nullable: SqlSmallInt,
+    ) -> ParameterDescription {
+        ParameterDescription {
+            data_type,
+            parameter_size,
+            decimal_digits,
+            nullable,
+        }
+    }
+
+    #[test]
+    fn refine_ipd_writes_type_scale_and_nullable() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let descriptions = vec![param_description(SQL_VARCHAR, 50, 0, SQL_NULLABLE)];
+        refine_ipd(stmt, &descriptions);
+
+        let records = ipd_records(&h);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].concise_type, SQL_VARCHAR);
+        assert_eq!(records[0].length, 50);
+        assert_eq!(records[0].precision, 0);
+        assert_eq!(records[0].scale, 0);
+        assert_eq!(records[0].nullable, SQL_NULLABLE);
+    }
+
+    /// `SQL_DESC_PRECISION` and `SQL_DESC_LENGTH` are independent fields in
+    /// this driver's model (`get_desc_field.rs` reads each directly), so
+    /// exactly one must carry the server's `ColumnSize` per type: precision
+    /// for the exact numerics, length for everything else.
+    #[test]
+    fn refine_ipd_splits_precision_and_length_by_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let descriptions = vec![
+            param_description(SQL_DECIMAL, 12, 3, SQL_NULLABLE),
+            param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS),
+        ];
+        refine_ipd(stmt, &descriptions);
+
+        let records = ipd_records(&h);
+        assert_eq!(records[0].precision, 12);
+        assert_eq!(
+            records[0].length, 0,
+            "decimal reports precision, not length"
+        );
+        assert_eq!(records[0].scale, 3);
+
+        assert_eq!(records[1].length, 80);
+        assert_eq!(
+            records[1].precision, 0,
+            "varchar reports length, not precision"
+        );
+    }
+
+    /// Per ODBC's "Decimal Digits" appendix, the whole datetime family
+    /// reports `DecimalDigits` (fractional-seconds precision) from
+    /// `SQL_DESC_PRECISION`, matching `BoundParam::write_to_records`'s
+    /// identical fix and `api::ird::ird_record_from_metadata`'s existing
+    /// redirection for the equivalent result column.
+    #[test]
+    fn refine_ipd_puts_datetime_decimal_digits_in_precision() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        refine_ipd(
+            stmt,
+            &[param_description(SQL_TYPE_TIMESTAMP, 27, 7, SQL_NULLABLE)],
+        );
+
+        let record = &ipd_records(&h)[0];
+        assert_eq!(
+            record.precision, 7,
+            "fractional-seconds precision must land on SQL_DESC_PRECISION"
+        );
+        assert_eq!(record.scale, 7);
+        assert_eq!(record.length, 27, "ColumnSize still lands on length");
+    }
+
+    /// An application that grew the IPD itself (`SQLSetDescField(IPD, 0,
+    /// SQL_DESC_COUNT, ...)`) before ever calling `SQLDescribeParam` keeps
+    /// that sizing; describing fewer markers than that must not shrink it.
+    #[test]
+    fn refine_ipd_never_shrinks_an_already_larger_ipd() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            state.set_record_count(3, desc.kind);
+        }
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        assert_eq!(
+            ipd_records(&h).len(),
+            3,
+            "refining fewer markers must not shrink the IPD"
+        );
+    }
+
+    /// `ParameterDescription` carries no parameter direction; `SQLBindParameter`
+    /// is the only API that knows it, so refining must leave it alone.
+    #[test]
+    fn refine_ipd_leaves_parameter_type_untouched() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            state.set_record_count(1, desc.kind);
+            state.record_mut(1).unwrap().parameter_type = SQL_PARAM_INPUT;
+        }
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        assert_eq!(ipd_records(&h)[0].parameter_type, SQL_PARAM_INPUT);
+    }
+
+    /// `SQLDescribeParam` is informational (ODBC 3.8): a marker the
+    /// application has already bound via `SQLBindParameter` must keep the
+    /// application's explicit type, size and scale rather than being
+    /// silently overwritten by the server's description — otherwise
+    /// `SQLExecute` would send a different SQL type than the one the caller
+    /// asked for and validated against at bind time.
+    #[test]
+    fn refine_ipd_leaves_an_already_bound_marker_untouched() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let desc = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+            let mut state = desc.inner.lock().unwrap();
+            state.set_record_count(1, desc.kind);
+            let record = state.record_mut(1).unwrap();
+            record.concise_type = SQL_VARCHAR;
+            record.length = 50;
+            record.scale = 7;
+            record.explicitly_bound = true;
+        }
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 4, 0, SQL_NO_NULLS)]);
+
+        let record = &ipd_records(&h)[0];
+        assert_eq!(
+            record.concise_type, SQL_VARCHAR,
+            "an explicit SQLBindParameter type must survive SQLDescribeParam"
+        );
+        assert_eq!(record.length, 50);
+        assert_eq!(record.scale, 7);
+    }
+
+    /// `concise_type != 0` alone can't distinguish an application bind from
+    /// `refine_ipd`'s own earlier fill-in, since this function's write leaves
+    /// it non-zero too — the exact ambiguity `explicitly_bound` exists to
+    /// resolve. A marker `refine_ipd` filled in on one `SQLDescribeParam`
+    /// call must still be refreshable on a later one for the same marker
+    /// (e.g. after a re-`SQLPrepare`, which resets `parameter_metadata` but
+    /// never touches the IPD's own records), as long as no real
+    /// `SQLBindParameter`/`SQLSetDescField` ever ran in between.
+    #[test]
+    fn refine_ipd_refreshes_a_marker_it_previously_auto_filled_itself() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        refine_ipd(stmt, &[param_description(SQL_INTEGER, 0, 0, SQL_NULLABLE)]);
+        assert_eq!(ipd_records(&h)[0].concise_type, SQL_INTEGER);
+
+        // Simulates a re-SQLPrepare landing a different query with a
+        // differently-typed marker 1, without any application bind ever
+        // touching this IPD record in between.
+        refine_ipd(stmt, &[param_description(SQL_VARCHAR, 80, 0, SQL_NO_NULLS)]);
+
+        let record = &ipd_records(&h)[0];
+        assert_eq!(
+            record.concise_type, SQL_VARCHAR,
+            "a record refine_ipd filled in itself must stay refreshable"
+        );
+        assert_eq!(record.length, 80);
     }
 }

@@ -12,6 +12,7 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
     finish_execute, flush_pending_unprepare, park_dae_client, query_timeout_expired_error,
+    snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -20,6 +21,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
 };
 use crate::error::free_errors;
+use crate::error::post_sql_error;
 use crate::handles::stmt::{
     STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED, STMT_STATE_PREPARED,
 };
@@ -87,6 +89,27 @@ fn sql_exec_direct_w_safe(
 
     let dbc = stmt.parent_dbc();
 
+    // Snapshotted before the STMT lock below is taken — this crate never
+    // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
+    // rationale). Not applied to `stmt_state.bound_params` until the
+    // early-return checks below have passed, so a rejected re-entry during
+    // an active DAE sequence can't clobber that sequence's own snapshot.
+    let Ok(bound_params) = snapshot_bound_params(stmt) else {
+        error!("SQLExecDirectW: failed to snapshot parameter bindings");
+        if let Ok(mut stmt_state) = stmt.inner.lock() {
+            // Cleared first so this diagnostic lands as record 1, not
+            // appended after whatever a previous call left behind.
+            free_errors(&mut stmt_state);
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error reading parameter bindings",
+            );
+        }
+        return SQL_ERROR;
+    };
+
     // Check STMT state, gather parameter values, and reset prior context.
     let (named_params, rewritten_sql, marker_count, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -108,6 +131,7 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        stmt_state.bound_params = bound_params;
         // Rewrite markers and read the bound parameter buffers before mutating
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
@@ -256,6 +280,7 @@ fn sql_exec_direct_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
+    use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -403,6 +428,48 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
         // A binding error must leave the statement unchanged — no EXEC_STARTED.
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    /// Panics while holding the APD lock, leaving the mutex poisoned —
+    /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
+    fn poison_apd(apd: crate::api::odbc_types::SqlHandle) {
+        let handle = unsafe { handle_from_raw::<DescHandle>(apd) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.lock().unwrap();
+            panic!("poison the apd lock");
+        }));
+    }
+
+    /// A `snapshot_bound_params` failure (here, a poisoned APD) must still
+    /// post an HY000 diagnostic, and post it as record 1 — not leave
+    /// `SQLGetDiagRec` reporting `SQL_NO_DATA`, and not append after a stale
+    /// record a previous call left behind (`free_errors` must run first).
+    #[test]
+    fn snapshot_failure_posts_hy000_as_the_first_diagnostic_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        poison_apd(h.apd());
+
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1, "stale record must be cleared");
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("Internal error reading parameter bindings")
+        );
     }
 
     /// A plain batch whose first statement is a no-row result (DML row count)
