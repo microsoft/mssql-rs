@@ -180,6 +180,10 @@ A column whose SQL type has no default keeps `SQL_C_DEFAULT` and is reported per
 
 The resolution is ODBC-version aware, and the version is read from the environment on each fetch: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET` default to `SQL_C_BINARY` below ODBC 3.8 and to their `SQL_C_SS_*` types at 3.8.
 
+That 3.8 mapping brings a third divergence into reach, in the stride rather than the resolved type. Both drivers resolve `time` and `datetimeoffset` to the same C types (`rgbTRANSTYPE380`, `sqlcmisc.cpp:220-221`), but msodbcsql's `BindOffset` switch has no case for `SQL_C_SS_TIME2` / `SQL_C_SS_TIMESTAMPOFFSET` and falls through to `default: dwOffset = lpbindinfo->cbValueMax` (`sqlcfunc.cpp:2280-2283`), where `element_stride` returns 12 and 20. Measured: a two-row rowset bound `SQL_C_DEFAULT` with `BufferLength` 40 puts msodbcsql's second row at byte offset `40` and this driver's at `12`, with indicator `12` in both — only the stride differs. The behaviour is kept because this is the safer direction: msodbcsql with `BufferLength` 0 strides 0 and stacks every row in slot 0. It is pre-existing for an explicit `SQL_C_SS_TIME2` bind; deferred resolution is what makes it reachable without the application naming the C type.
+
+`SQLGetData` does *not* accept `SQL_C_DEFAULT` — `get_data.rs` answers `HYC00`, where msodbcsql resolves the placeholder in the same `GetColData` that serves both paths. The driver therefore answers the same placeholder two ways depending on how a column is read: a bound column resolves, `SQLGetData` refuses. Pre-existing and untouched here, but worth closing now that `odbc_sql_type` and `resolve_default_c_type` are wired together on the fetch side. Not currently tracked by a work item.
+
 ### P4 — Exports & driver-load compatibility — Task [46581](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46581)
 
 - Export `SQLBindCol`, `SQLFetchScroll`, `SQLColAttributeW` (exact names incl. the `W` variant) so `ddbc_bindings.cpp` `GetFunctionPointer` succeeds.
