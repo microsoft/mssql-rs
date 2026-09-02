@@ -373,8 +373,8 @@ fn write_captured_column(
 
     // A zero-length SQL_C_BINARY read is a length probe rather than a data read;
     // mssql-python issues one per sql_variant column to expose the underlying
-    // type to SQLColAttribute. Binary data delivery is still unimplemented
-    // (AB#47239).
+    // type to SQLColAttribute, and one per binary column on its Arrow fetch
+    // path. Binary data delivery is still unimplemented (AB#47239).
     let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
     let typed_target = is_typed_c_target(target_type);
     let deliverable_target =
@@ -410,9 +410,22 @@ fn write_captured_column(
     // shared conversion core; only the character targets chunk.
     if binary_probe {
         // Report what is available and leave the value resident — the caller
-        // reads it for real on a following call.
-        unsafe { write_if_some(strlen_or_ind_ptr, binary_length(value)) };
-        return SQL_SUCCESS;
+        // reads it for real on a following call. Bytes left undelivered make
+        // this a truncation, and saying so is what tells the caller a second
+        // call is needed: `SQL_SUCCESS` claims its zero-length buffer now holds
+        // the value, and mssql-python then copies `indicator` bytes out of the
+        // empty buffer it passed, crashing the interpreter (AB#47537).
+        // `SQL_NO_TOTAL` is a truncation too — bytes remain, the count is just
+        // not known. Measured identical on msodbcsql 18.6.2.1: a `binary(9)`
+        // column answers `SQLGetData(SQL_C_BINARY, NULL, 0)` with
+        // `SQL_SUCCESS_WITH_INFO`, `01004` and indicator 9.
+        let available = binary_length(value);
+        unsafe { write_if_some(strlen_or_ind_ptr, available) };
+        if available == 0 {
+            return SQL_SUCCESS;
+        }
+        post_diag(stmt_state, WARN_STRING_TRUNCATION);
+        return SQL_SUCCESS_WITH_INFO;
     }
 
     if typed_target {
@@ -1984,7 +1997,12 @@ mod tests {
 
     /// A zero-length SQL_C_BINARY read reports the available length and leaves
     /// the value resident, so the caller can still read it for real afterwards.
-    /// This is the probe mssql-python issues on every sql_variant column.
+    /// This is the probe mssql-python issues on every sql_variant column, and on
+    /// every binary column of its Arrow fetch path.
+    ///
+    /// Bytes were left undelivered, so it is a truncation: reporting plain
+    /// SQL_SUCCESS told mssql-python the value had landed in the zero-length
+    /// buffer it passed, which it then read out of bounds (AB#47537).
     #[test]
     fn get_data_binary_probe_reports_length_without_consuming() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -1993,8 +2011,13 @@ mod tests {
         let mut ind: SqlLen = 0;
         let ret =
             unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
-        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert_eq!(ind, 4);
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt.inner.lock().unwrap();
+            assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_01004);
+        }
 
         // The value survived the probe.
         let mut out: i32 = 0;
@@ -2010,6 +2033,37 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(out, 7);
+    }
+
+    /// A value with no bytes has nothing left to deliver, so the probe is not a
+    /// truncation.
+    #[test]
+    fn get_data_binary_probe_on_empty_value_succeeds_without_truncation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Bytes(Vec::new()));
+
+        let mut ind: SqlLen = 1;
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 0);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        assert!(s.diag_records.is_empty());
+    }
+
+    /// The shape mssql-python's Arrow fetch hits on a `binary(9)` column: the
+    /// probe must not report the bytes as delivered.
+    #[test]
+    fn get_data_binary_probe_on_bytes_reports_truncation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Bytes(b"asdfghjkl".to_vec()));
+
+        let mut ind: SqlLen = 0;
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 9);
     }
 
     #[test]

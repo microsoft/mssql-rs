@@ -1616,6 +1616,55 @@ TEST_F(GetDataLiveTest, NullVarbinaryMaxToBinaryTargetReportsNull) {
     SQLCloseCursor(stmt_);
 }
 
+// tests/test_004_cursor_arrow.py::test_arrow_lob_wide (AB#47537) -- the shape
+// that crashed the interpreter. mssql-python's Arrow fetch takes the SQLGetData
+// branch whenever the result set holds a MAX column, and reads every column of
+// the row that way, including a fixed `binary(9)`. Its GetDataVar helper starts
+// each SQL_C_BINARY read with an empty buffer, so the first call arrives with
+// BufferLength 0, and it grows and retries only while the driver reports there
+// is more to come.
+//
+// Reporting SQL_SUCCESS there says the value fits in a zero-length buffer, so
+// the caller stops retrying and copies `indicator` bytes out of a buffer it
+// never grew. A truncation warning is what tells it to retry. Measured on
+// msodbcsql 18.6.2.1 (SQL_DRIVER_VER 18.06.0002): SQL_SUCCESS_WITH_INFO with
+// 01004 and indicator 9.
+//
+// This only asserts the probe contract; delivering the bytes on the retry is
+// AB#47239.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationWhenBytesRemain) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('asdfghjkl' AS BINARY(9)) AS c1"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // The probe is keyed on a zero buffer length, not on a null pointer:
+    // mssql-python passes NULL because it dlopen's the driver directly, while
+    // these tests go through the Driver Manager, which rejects a null
+    // TargetValuePtr with HY009 before the driver ever sees the call.
+    SQLCHAR probe = 0;
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(9, ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// The other half of the contract: an empty value has nothing left to deliver, so
+// the same probe is a plain success and the caller correctly stops. Measured
+// identically on msodbcsql 18.6.2.1 (SQL_SUCCESS, indicator 0, no diagnostic).
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceeds) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARBINARY(8)) AS c1"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN ind = -1;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_EQ(0, ind);
+
+    SQLCloseCursor(stmt_);
+}
+
 // An integer column delivered to its natural fixed-width C target, rather than
 // being rendered as text.
 TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {
