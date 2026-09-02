@@ -4184,6 +4184,7 @@ impl TdsClient {
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
                     self.current_result_set_has_been_read_till_end = true;
+                    self.current_result_ended_with_done_in_proc = is_done_in_proc;
 
                     let is_last = !done.has_more();
 
@@ -4242,6 +4243,7 @@ impl TdsClient {
                             // trailing DONEPROC; find out before the caller
                             // treats it as another result.
                             self.settle_rpc_terminator(&parser_context).await?;
+                            self.current_result_ended_with_done_in_proc = false;
                         }
                         return Ok(ResultBoundaryKind::NoRows {
                             rows_affected: if has_update_count {
@@ -4399,11 +4401,14 @@ impl TdsClient {
         }
     }
 
-    /// Returns `true` while the current batch still has unconsumed results on
-    /// the wire or in [`parked_token`](Self::parked_token) (a positioned result
-    /// set, an RPC-tail look-ahead token, or further statements to navigate to).
+    /// Returns `true` while the current batch still has unconsumed results (a
+    /// positioned result set, or further statements to navigate to).
     /// Used by the ODBC layer to decide whether the connection stays busy after
     /// positioning on a no-row statement result.
+    ///
+    /// A token parked by the RPC-terminator look-ahead is covered without being
+    /// inspected here: parking means the terminal DONEPROC was not reached, so
+    /// the flag this reads is still set.
     pub fn has_open_batch(&self) -> bool {
         self.execution_context.has_open_batch()
     }
@@ -4532,7 +4537,8 @@ impl TdsClient {
 
     /// Returns `true` when an open result batch or streamed write blocks a new command.
     pub(in crate::connection) fn command_is_busy(&self) -> bool {
-        self.has_open_batch() || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
+        self.execution_context.has_open_batch()
+            || !matches!(self.streamed_write_state, StreamedWriteState::Idle)
     }
 
     /// Returns `true` when the client is currently positioned on a row-returning
@@ -4608,6 +4614,11 @@ impl TdsClient {
     /// `DONEINPROC`, [`settle_rpc_terminator`](Self::settle_rpc_terminator)
     /// consumes only that control-token tail and parks the first non-tail token
     /// for [`advance`](Self::advance). Plain batch DONE tokens are never probed.
+    ///
+    /// The `DONEINPROC` gate is msodbcsql's: `OnDone` probes the tail only for
+    /// `RS_SELECTION && DONEINPROC && DONE_MORE` (`sqlctokn.cpp:2208-2240`).
+    /// Widening it to every DONE would make an ordinary multi-statement batch
+    /// block here on the next statement's result.
     ///
     /// Returns `true` only when the batch is fully exhausted.
     pub async fn complete_current_result(&mut self) -> TdsResult<bool> {
@@ -6801,6 +6812,7 @@ impl TdsClient {
         self.cancel_handle = None;
         self.active_row_read_state = ActiveRowReadState::Idle;
         self.row_already_positioned = false;
+        self.parked_token = None;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
 
@@ -9989,6 +10001,32 @@ mod tests {
         assert!(!client.has_open_batch());
         assert!(client.is_connection_dead());
         assert!(client.current_result_set_has_been_read_till_end);
+    }
+
+    #[tokio::test]
+    async fn advancing_to_a_no_row_result_clears_the_rpc_tail_gate() {
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            done_count(CurrentCommand::Update, 3, true),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.current_result_ended_with_done_in_proc);
+
+        assert!(matches!(
+            client.advance().await,
+            Ok(StatementResult::NoRows {
+                rows_affected: Some(3)
+            })
+        ));
+        assert!(
+            !client.current_result_ended_with_done_in_proc,
+            "a plain batch DONE must not leave the previous RPC's tail gate armed"
+        );
     }
 
     #[tokio::test]

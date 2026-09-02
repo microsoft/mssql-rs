@@ -123,7 +123,7 @@ TEST_F(ConnectionBusyLiveTest, PreparedParameterFetchToNoDataReleasesConnection)
 TEST_F(ConnectionBusyLiveTest, PreparedParameterMultiRowReleasesAfterLastRow) {
     SQLHSTMT b = AllocStmt();
 
-    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? FROM (VALUES (1), (2)) AS v(n) ORDER BY n"),
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ?, v.n FROM (VALUES (1), (2)) AS v(n) ORDER BY v.n"),
                   SQL_HANDLE_STMT, stmt_);
     SQLINTEGER parameter = 42;
     SQLLEN parameter_ind = 0;
@@ -131,15 +131,19 @@ TEST_F(ConnectionBusyLiveTest, PreparedParameterMultiRowReleasesAfterLastRow) {
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
 
     SQLINTEGER value = 0;
+    SQLINTEGER row_number = 0;
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &row_number, sizeof(row_number), nullptr),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(42, value);
+    EXPECT_EQ(1, row_number);
     EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ(42, value);
+    EXPECT_EQ(2, row_number);
     EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
 }
 
