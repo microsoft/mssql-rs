@@ -2029,7 +2029,7 @@ fn stream_active_plp_chunk<'a>(
 /// carries code units the caller's buffer had no room for. Both are needed:
 /// the wire and the caller advance at rates that are unrelated when the
 /// encoding is variable-width.
-fn widen_into_pending(
+pub(crate) fn widen_into_pending(
     decoder: &mut Decoder,
     pending: &mut Vec<u16>,
     payload: &[u8],

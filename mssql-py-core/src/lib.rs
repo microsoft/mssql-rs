@@ -9,11 +9,14 @@ use mssql_tds::connection::client_context::DriverVersion;
 mod arrow_bulkcopy;
 mod async_connection;
 mod async_cursor;
+mod async_description;
+mod async_errors;
 mod async_execute;
 mod async_fetch;
 mod async_parameters;
 mod async_runtime;
 mod async_session;
+mod async_tracing;
 mod bulkcopy;
 mod connection;
 mod cursor;
@@ -97,6 +100,7 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<async_connection::PyAsyncConnection>()?;
     m.add_class::<async_cursor::PyAsyncCursor>()?;
     m.add_class::<async_parameters::PyTableValuedParameter>()?;
+    async_errors::add_exceptions(m)?;
     // SQL Server-specific TDS type tokens accepted by setinputsizes().
     m.add("SQL_MONEY", 60)?;
     m.add("SQL_SMALLMONEY", 122)?;

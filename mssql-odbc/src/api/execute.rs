@@ -15,12 +15,13 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, park_dae_client, query_timeout_expired_error,
+    finish_execute, park_dae_client, query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
+use crate::error::post_sql_error;
 use crate::handles::stmt::{
     DaeParam, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED,
@@ -308,6 +309,35 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
 /// setting `EXEC_STARTED` on success. Application value buffers are read here by
 /// reference (no network I/O).
 fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
+    // Snapshotted before the STMT lock below is taken — this crate never
+    // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
+    // rationale). Not applied to `stmt_state.bound_params` until every
+    // early-return check below has passed: a statement already mid-DAE-
+    // sequence must keep that sequence's own frozen snapshot if this call
+    // turns out to be a rejected re-entry rather than a real new execute.
+    //
+    // A snapshot failure (poisoned mutex, or an explicit APD freed out from
+    // under a concurrent reassociation) must still post a diagnostic —
+    // mirroring `SQLExecDirectW`'s handling of the same failure — rather
+    // than leave `SQLGetDiagRec` reporting `SQL_NO_DATA` or a stale record
+    // from a previous call.
+    let bound_params = match snapshot_bound_params(stmt) {
+        Ok(params) => params,
+        Err(rc) => {
+            error!("SQLExecute: failed to snapshot parameter bindings");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                free_errors(&mut stmt_state);
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error reading parameter bindings",
+                );
+            }
+            return Err(rc);
+        }
+    };
+
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecute: stmt mutex poisoned");
         return Err(SQL_ERROR);
@@ -352,6 +382,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         .expect("prepared checked non-None above")
         .marker_count;
 
+    // All state-sequencing checks passed: this is a real new execute, so the
+    // fresh snapshot now becomes the one `build_named_params` and any DAE
+    // sequence it opens will read for the rest of this execute.
+    stmt_state.bound_params = bound_params;
+
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
     let ParamsWithDae { params, dae_params } =
@@ -393,11 +428,13 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::bind_param::sql_bind_parameter;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen,
+        SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SQL_VARCHAR,
+        SqlLen,
     };
     use crate::api::util::rewrite_param_markers;
-    use crate::params::BoundParam;
+    use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
@@ -409,6 +446,16 @@ mod tests {
             stmt: PreparedStatement::new(rewritten),
             marker_count,
         });
+    }
+
+    /// Panics while holding the APD lock, leaving the mutex poisoned —
+    /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
+    fn poison_apd(apd: SqlHandle) {
+        let handle = unsafe { handle_from_raw::<DescHandle>(apd) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.lock().unwrap();
+            panic!("poison the apd lock");
+        }));
     }
 
     #[test]
@@ -429,6 +476,35 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
         // EXEC_STARTED must not leak on this pre-I/O failure.
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    /// A `snapshot_bound_params` failure (here, a poisoned APD) must still
+    /// post an HY000 diagnostic, and post it as record 1 — not leave
+    /// `SQLGetDiagRec` reporting `SQL_NO_DATA`, and not append after a stale
+    /// record a previous call left behind (`free_errors` must run first).
+    #[test]
+    fn snapshot_failure_posts_hy000_as_the_first_diagnostic_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        poison_apd(h.apd());
+
+        let ret = unsafe { sql_execute(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1, "stale record must be cleared");
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("Internal error reading parameter bindings")
+        );
     }
 
     #[test]
@@ -496,20 +572,21 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
-        stmt.inner
-            .lock()
-            .unwrap()
-            .bound_params
-            .push(Some(BoundParam {
-                input_output_type: SQL_PARAM_INPUT,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR,
-                column_size: 0,
-                decimal_digits: 0,
-                parameter_value_ptr: std::ptr::null_mut(),
-                buffer_length: 0,
-                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
-            }));
+        let bind_ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(bind_ret, SQL_SUCCESS);
 
         let ret = unsafe { sql_execute(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
@@ -712,20 +789,21 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
 
         let mut ind: SqlLen = SQL_DATA_AT_EXEC;
-        stmt.inner
-            .lock()
-            .unwrap()
-            .bound_params
-            .push(Some(BoundParam {
-                input_output_type: SQL_PARAM_INPUT,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR,
-                column_size: 0,
-                decimal_digits: 0,
-                parameter_value_ptr: std::ptr::null_mut(),
-                buffer_length: 0,
-                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
-            }));
+        let bind_ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(bind_ret, SQL_SUCCESS);
 
         let staging = stage_execution(stmt).expect("staging should succeed");
         match staging {

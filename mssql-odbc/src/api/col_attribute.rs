@@ -295,7 +295,7 @@ fn datetime_interval_code(meta: &ColumnMetadata) -> SqlLen {
 
 /// `SQL_DESC_LENGTH`: the column size, except that the approximate numerics
 /// report binary precision.
-fn desc_length(meta: &ColumnMetadata) -> SqlLen {
+pub(super) fn desc_length(meta: &ColumnMetadata) -> SqlLen {
     if let Some(binary) = binary_precision(meta) {
         return SqlLen::from(binary);
     }
@@ -395,7 +395,7 @@ fn display_size(meta: &ColumnMetadata) -> SqlLen {
 /// `SQL_DESC_OCTET_LENGTH`: the size in bytes of the value's ODBC *transfer*
 /// representation, which for the temporal types is the C struct the driver
 /// hands back, not the TDS payload width.
-fn octet_length(meta: &ColumnMetadata) -> SqlLen {
+pub(super) fn octet_length(meta: &ColumnMetadata) -> SqlLen {
     if meta.is_plp() {
         return 0;
     }
@@ -430,7 +430,7 @@ fn octet_length(meta: &ColumnMetadata) -> SqlLen {
 /// `SQL_DESC_PRECISION`: fractional-seconds precision for the temporal types,
 /// binary precision for the approximate numerics, otherwise the number of
 /// significant digits.
-fn precision(meta: &ColumnMetadata) -> SqlSmallInt {
+pub(super) fn precision(meta: &ColumnMetadata) -> SqlSmallInt {
     if matches!(
         meta.data_type,
         TdsDataType::DateN

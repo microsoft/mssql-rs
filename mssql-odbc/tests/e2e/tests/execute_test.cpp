@@ -1710,3 +1710,50 @@ TEST_F(PrepareExecuteLiveTest, PreparedParamSelectMultipleRows) {
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
+
+// AB#47437: once a result set is positioned by a real execute, the IRD
+// (SQL_ATTR_IMP_ROW_DESC) must describe it the same way SQLDescribeCol does
+// — both are driven by the exact same column_metadata/field-mapping
+// functions (api::ird::populate_ird, describe_col.rs, col_attribute.rs).
+// Before a prepare has ever executed, the IRD stays empty
+// (get_desc_field_test.cpp's ImpRowDescRecordPastCountReturnsNoData) — this
+// is the complementary "after execute" case.
+TEST_F(PrepareExecuteLiveTest, ImpRowDescMatchesDescribeColAfterExecute) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS INT) AS i, "
+                             "CAST('abc' AS VARCHAR(10)) AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC ird = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_IMP_ROW_DESC, &ird, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLSMALLINT ird_count = -1;
+    ASSERT_SQL_OK(SQLGetDescFieldW(ird, 0, SQL_DESC_COUNT, &ird_count, sizeof(ird_count), nullptr),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_EQ(2, ird_count);
+
+    for (SQLUSMALLINT col = 1; col <= 2; ++col) {
+        SQLTCHAR name[64] = {};
+        SQLSMALLINT name_len = 0;
+        SQLSMALLINT data_type = 0;
+        SQLULEN col_size = 0;
+        SQLSMALLINT dec_digits = 0;
+        SQLSMALLINT nullable = 0;
+        ASSERT_SQL_OK(SQLDescribeCol(stmt_, col, name, 64, &name_len, &data_type, &col_size,
+                                      &dec_digits, &nullable),
+                      SQL_HANDLE_STMT, stmt_);
+
+        SQLSMALLINT ird_type = -1;
+        ASSERT_SQL_OK(SQLGetDescFieldW(ird, col, SQL_DESC_CONCISE_TYPE, &ird_type,
+                                        sizeof(ird_type), nullptr),
+                      SQL_HANDLE_DESC, ird);
+        EXPECT_EQ(data_type, ird_type) << "column " << col;
+
+        SQLSMALLINT ird_nullable = -1;
+        ASSERT_SQL_OK(SQLGetDescFieldW(ird, col, SQL_DESC_NULLABLE, &ird_nullable,
+                                        sizeof(ird_nullable), nullptr),
+                      SQL_HANDLE_DESC, ird);
+        EXPECT_EQ(nullable, ird_nullable) << "column " << col;
+    }
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
