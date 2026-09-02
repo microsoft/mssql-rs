@@ -111,18 +111,19 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      Either way, confirm the specific CI job for that platform actually ran and passed
      on the PR's head commit rather than assuming "the matrix owns this" without
      looking; a local check only adds a faster answer to the same question CI already
-     gates. Neither approach can run a Windows test binary, and a mutation applied to
-     an arm your invocation doesn't select — the wrong target, or `--lib` over
-     `--all-targets` — proves nothing on its own; that still rests on CI. A local
-     check can also fail in a dependency's build script rather than the reviewed
-     code: targeting a non-Windows, non-macOS triple pulls in `openssl-sys` — through
-     `native-tls`'s backend choice and, in `mssql-tds`, through a direct `openssl`
-     dependency for the Always Encrypted primitives — and its build script fails
-     before rustc ever sees the crate if it can't find a target OpenSSL sysroot.
-     Confirmed on `mssql-tds`: the Windows-target direction above needs none at all
-     (`native-tls` routes through Schannel on Windows, Security.framework on macOS).
-     That is an environment gap, not a type error; read what actually failed before
-     attributing it to the diff.
+     gates, since neither `cargo check` nor `cargo clippy` executes a compiled test
+     binary — only CI's Windows job actually runs the `#[cfg(windows)]` tests. A
+     mutation applied to an arm your invocation doesn't select — the wrong target, or
+     `--lib` over `--all-targets` — proves nothing on its own. A local check can also
+     fail in a dependency's build script rather than the reviewed code: targeting a
+     non-Windows, non-macOS triple pulls in `openssl-sys` — through `native-tls`'s
+     backend choice and, in `mssql-tds`, through a direct `openssl` dependency for the
+     Always Encrypted primitives — and its build script fails before rustc ever sees
+     the crate if it can't find a target OpenSSL sysroot. Confirmed on `mssql-tds`:
+     the Windows-target direction above needs none at all (`native-tls` routes
+     through Schannel on Windows, Security.framework on macOS). That is an
+     environment gap, not a type error; read what actually failed before attributing
+     it to the diff.
 
    ```bash
    cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
