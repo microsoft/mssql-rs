@@ -451,6 +451,16 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   - A success-path test.
   - A null-output-handle test.
   - An invalid-handle-type or invalid-input test.
+- **A `max`/LOB column only reaches the bound *streaming* path when it is too
+  large for the transport to buffer whole.** `try_read_buffered_column` decodes
+  any fully buffered column - PLP included - into a `ColumnValues`, so a small
+  `varchar(max)`/`varbinary(max)` is delivered by `deliver_bound`, exactly like a
+  non-max value, and never enters `deliver_bound_plp`. A few kilobytes still
+  buffers; the streaming path is reachable around a megabyte (the existing 1 MiB
+  cases in `fetch_scroll_test.cpp` prove it). Size an e2e that targets
+  `deliver_bound_plp` accordingly, or it will silently assert the non-PLP path -
+  a bound binary `max` column against a typed C target answers `22018` from the
+  typed converter when buffered, and `HYC00` when streamed.
 - Use `cargo nextest` (via `cargo btest`), not `cargo test`.
 
 ## Code style

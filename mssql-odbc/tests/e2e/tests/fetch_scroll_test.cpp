@@ -989,11 +989,16 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
 // binary PLP column has no source encoding to convert from, so it is drained and
 // refused before any conversion is attempted. Same AB#47239 gap as above, so it
 // likewise asserts our own answer rather than parity.
-TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxToTypedCTargetIsStillUnsupported) {
+//
+// The value has to exceed what the transport can buffer for a whole column,
+// otherwise `try_read_buffered_column` materializes it and the row takes the
+// ordinary non-PLP delivery path instead of the streaming one under test -- a
+// small varbinary(max) here answers 22018 from the typed converter, not HYC00.
+TEST_F(FetchScrollLiveTest, ABoundStreamedVarbinaryMaxToTypedCTargetIsStillUnsupported) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
-        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS lob, n * 11 AS tail "
-        "FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
+        "SELECT n, CONVERT(varbinary(max), REPLICATE(CONVERT(varchar(max), 'a'), 1100000)) "
+        "AS lob, n * 11 AS tail FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
 
     SQLINTEGER n = -1;
     SQLINTEGER converted = -1;
