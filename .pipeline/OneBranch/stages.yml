@@ -526,7 +526,7 @@ stages:
             }
 
             # Windows_ARM64/Linux_ARM64 jobs only run when buildAllTargets is
-            # true (see the job-level ${{ if }} guards above); skip these
+            # true (see the job-level conditional guards above); skip these
             # entries otherwise, or the Test-Path check below always fails.
             if ($buildAllTargets) {
               $platforms['drop_Build_Linux_ARM64_linux_arm64/odbc_glibc_arm64']       = @{ tag = 'linux_arm64';    file = 'mssqlodbc.so' }
