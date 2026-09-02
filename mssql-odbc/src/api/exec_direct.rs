@@ -97,6 +97,9 @@ fn sql_exec_direct_w_safe(
     let Ok(bound_params) = snapshot_bound_params(stmt) else {
         error!("SQLExecDirectW: failed to snapshot parameter bindings");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
+            // Cleared first so this diagnostic lands as record 1, not
+            // appended after whatever a previous call left behind.
+            free_errors(&mut stmt_state);
             post_sql_error(
                 &mut stmt_state,
                 SQLSTATE_HY000,
@@ -277,6 +280,7 @@ fn sql_exec_direct_w_safe(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
+    use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -424,6 +428,48 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
         // A binding error must leave the statement unchanged — no EXEC_STARTED.
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    /// Panics while holding the APD lock, leaving the mutex poisoned —
+    /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
+    fn poison_apd(apd: crate::api::odbc_types::SqlHandle) {
+        let handle = unsafe { handle_from_raw::<DescHandle>(apd) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.lock().unwrap();
+            panic!("poison the apd lock");
+        }));
+    }
+
+    /// A `snapshot_bound_params` failure (here, a poisoned APD) must still
+    /// post an HY000 diagnostic, and post it as record 1 — not leave
+    /// `SQLGetDiagRec` reporting `SQL_NO_DATA`, and not append after a stale
+    /// record a previous call left behind (`free_errors` must run first).
+    #[test]
+    fn snapshot_failure_posts_hy000_as_the_first_diagnostic_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        poison_apd(h.apd());
+
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1, "stale record must be cleared");
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("Internal error reading parameter bindings")
+        );
     }
 
     /// A plain batch whose first statement is a no-row result (DML row count)

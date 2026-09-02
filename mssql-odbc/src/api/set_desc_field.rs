@@ -13,6 +13,12 @@
 //! not its address) — the same convention this crate already uses for
 //! `SQLSetStmtAttrW` (`set_stmt_attr.rs`) and confirmed against msodbcsql's
 //! `SetADHeaderField` (`(SIZE_T)Value`, `sqlcdesc.cpp:4129-4149`).
+//!
+//! Unlike `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)`/`SQLSetStmtAttr`, this
+//! entry point does not check `STMT_STATE_FETCH_IN_PROGRESS` before writing
+//! `SQL_DESC_DATA_PTR`/`SQL_DESC_OCTET_LENGTH`/`SQL_DESC_CONCISE_TYPE` on an
+//! ARD/APD record a fetch may still be reading through — a known, deferred
+//! gap tracked in [#472](https://github.com/microsoft/mssql-rs/issues/472).
 
 use std::mem::size_of;
 

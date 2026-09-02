@@ -16,6 +16,11 @@
 //! (unlike `SQLGetDescRecW`'s `Name`), so the ODBC spec defines only the one
 //! entry point — `sql.h` declares `SQLSetDescRec` directly, with no
 //! `SQLSetDescRecW`/`SQLSetDescRecA` pair.
+//!
+//! Shares `SQLSetDescFieldW`'s known, deferred gap: no
+//! `STMT_STATE_FETCH_IN_PROGRESS` check before writing an ARD/APD record a
+//! fetch may still be reading through — see
+//! [#472](https://github.com/microsoft/mssql-rs/issues/472).
 
 use tracing::{debug, error};
 

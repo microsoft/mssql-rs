@@ -362,6 +362,15 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   verify the DM upheld its guarantees (e.g., no outstanding children). These
   fire in debug builds only — in release builds the driver trusts the DM and
   frees unconditionally, matching msodbcsql.
+- **Known gap: `SQLSetDescRec`/`SQLSetDescFieldW` don't check
+  `STMT_STATE_FETCH_IN_PROGRESS`**: `SQLBindCol`, `SQLFreeStmt(SQL_UNBIND)`,
+  and `SQLSetStmtAttr` all refuse to touch the ARD while a fetch snapshotted
+  it and is still writing through that snapshot — but the descriptor-field
+  API writes the same records with no such guard, and (unlike those three)
+  would need a DBC → STMT walk to find every statement an explicit,
+  possibly-reassociated descriptor is currently associated with. Tracked in
+  [#472](https://github.com/microsoft/mssql-rs/issues/472); this is a
+  deliberate deferral, not an oversight.
 
 ## FFI boundary conventions
 

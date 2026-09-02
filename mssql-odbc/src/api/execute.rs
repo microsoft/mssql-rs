@@ -21,6 +21,7 @@ use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
 use crate::error::free_errors;
+use crate::error::post_sql_error;
 use crate::handles::stmt::{
     DaeParam, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED,
@@ -314,7 +315,28 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // early-return check below has passed: a statement already mid-DAE-
     // sequence must keep that sequence's own frozen snapshot if this call
     // turns out to be a rejected re-entry rather than a real new execute.
-    let bound_params = snapshot_bound_params(stmt)?;
+    //
+    // A snapshot failure (poisoned mutex, or an explicit APD freed out from
+    // under a concurrent reassociation) must still post a diagnostic —
+    // mirroring `SQLExecDirectW`'s handling of the same failure — rather
+    // than leave `SQLGetDiagRec` reporting `SQL_NO_DATA` or a stale record
+    // from a previous call.
+    let bound_params = match snapshot_bound_params(stmt) {
+        Ok(params) => params,
+        Err(rc) => {
+            error!("SQLExecute: failed to snapshot parameter bindings");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                free_errors(&mut stmt_state);
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error reading parameter bindings",
+                );
+            }
+            return Err(rc);
+        }
+    };
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLExecute: stmt mutex poisoned");
@@ -412,6 +434,7 @@ mod tests {
         SqlLen,
     };
     use crate::api::util::rewrite_param_markers;
+    use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
     use mssql_tds::connection::tds_client::{PreparedStatement, StatementId};
 
@@ -423,6 +446,16 @@ mod tests {
             stmt: PreparedStatement::new(rewritten),
             marker_count,
         });
+    }
+
+    /// Panics while holding the APD lock, leaving the mutex poisoned —
+    /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
+    fn poison_apd(apd: SqlHandle) {
+        let handle = unsafe { handle_from_raw::<DescHandle>(apd) };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.inner.lock().unwrap();
+            panic!("poison the apd lock");
+        }));
     }
 
     #[test]
@@ -443,6 +476,35 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
         // EXEC_STARTED must not leak on this pre-I/O failure.
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    /// A `snapshot_bound_params` failure (here, a poisoned APD) must still
+    /// post an HY000 diagnostic, and post it as record 1 — not leave
+    /// `SQLGetDiagRec` reporting `SQL_NO_DATA`, and not append after a stale
+    /// record a previous call left behind (`free_errors` must run first).
+    #[test]
+    fn snapshot_failure_posts_hy000_as_the_first_diagnostic_record() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        poison_apd(h.apd());
+
+        let ret = unsafe { sql_execute(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1, "stale record must be cleared");
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY000);
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("Internal error reading parameter bindings")
+        );
     }
 
     #[test]
