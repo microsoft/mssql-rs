@@ -402,13 +402,14 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
   response when one comes back, state that none did (a timeout after a bounded wait, a
   hard error) when it doesn't, or say the tool isn't exposed in this session's
   inventory at all when there was nothing to call — a silent hang or a missing tool is
-  an outcome, not an excuse to skip the record. Three of the four caveats closing a
+  an outcome, not an excuse to skip the record. Two of the four caveats closing a
   2026-09-02 review of #459 (AB#47509) — no ADO access, type-checking Windows-gated
-  code without a Windows host, Linux-only mutation scope — did not survive being
-  tested; running a Windows test binary did. Keep two categories apart: *the environment
-  cannot do this* needs a failed invocation or a confirmed absence, while *the defect
-  is inherently untestable* (process teardown, a TOCTOU window) needs only an argument
-  and stays valid.
+  code without a Windows host — did not survive being tested; Linux-only mutation
+  scope and running a Windows test binary both did, since neither invoking
+  `wit_work_item` nor cross-target `clippy` executes a test. Keep two categories
+  apart: *the environment cannot do this* needs a failed invocation or a confirmed
+  absence, while *the defect is inherently untestable* (process teardown, a TOCTOU
+  window) needs only an argument and stays valid.
 - If a change is correct, don't invent problems. An empty severity group means "none
   found" — say so briefly.
 - Reviewing is not merging. The PR author owns the merge — never merge someone
