@@ -414,6 +414,19 @@ fn sql_get_data_safe(
     finish_get_data(stmt, statement_handle, reopened_stmt_state, col_index, rc)
 }
 
+/// Delivers a buffered string straight into the application buffer when the
+/// stored encoding already matches `target_type`, skipping the decode and
+/// intermediate allocation that the general conversion path performs.
+///
+/// Returns `false` when the value cannot be delivered verbatim, leaving the
+/// application buffer untouched so the caller can fall back.
+///
+/// # Safety
+/// - `target_value_ptr`, if non-null, must be writable for `buffer_length`
+///   bytes. `buffer_length` is a byte count for both `SQL_C_CHAR` and
+///   `SQL_C_WCHAR`, per the ODBC contract.
+/// - `strlen_or_ind_ptr`, if non-null, must be writable for one `SqlLen`.
+/// - Neither pointer may alias `value`.
 #[inline(never)]
 unsafe fn try_write_complete_buffered_string(
     value: &ColumnValues,
@@ -500,6 +513,16 @@ unsafe fn try_write_complete_buffered_string(
     true
 }
 
+/// Renders a buffered decimal or numeric into the application buffer through a
+/// stack scratch array, avoiding the `String` the general path would allocate.
+///
+/// Returns `false` when the value is not decimal or does not fit, leaving the
+/// application buffer untouched so the caller can fall back.
+///
+/// # Safety
+/// - `target_value_ptr`, if non-null, must be writable for `buffer_length` bytes.
+/// - `strlen_or_ind_ptr`, if non-null, must be writable for one `SqlLen`.
+/// - Neither pointer may alias `value`.
 #[inline(never)]
 unsafe fn try_write_complete_buffered_decimal(
     value: &ColumnValues,
@@ -541,6 +564,18 @@ unsafe fn try_write_complete_buffered_decimal(
     true
 }
 
+/// Writes a buffered scalar whose stored representation is bit-identical to the
+/// requested C type, so no conversion is needed.
+///
+/// Only exact type pairs match; anything else returns `false` with the
+/// application buffer untouched. There is no length parameter because each arm
+/// writes a fixed-size value that ODBC defines as needing no buffer length.
+///
+/// # Safety
+/// - `target_value_ptr`, if non-null, must be writable for the size of the C
+///   type named by `target_type`.
+/// - `strlen_or_ind_ptr`, if non-null, must be writable for one `SqlLen`.
+/// - Neither pointer may alias `value`.
 #[inline(never)]
 unsafe fn try_write_exact_buffered_scalar(
     value: &ColumnValues,
@@ -992,6 +1027,24 @@ fn write_captured_column(
     rc
 }
 
+/// Delivers one chunk of an already-buffered string from `offset` onward without
+/// re-decoding it. The general path rebuilds and re-transcodes the whole value on
+/// every call, which is quadratic across a chunked `SQLGetData` loop.
+///
+/// `validated` reports that eligibility was already established for this
+/// column and target type, so the encoding scan is skipped on later chunks;
+/// see `StmtState::direct_text_target`.
+///
+/// Returns `None` when the value cannot be delivered verbatim, leaving the
+/// application buffer untouched. On success returns whether the chunk was
+/// truncated, how many elements were consumed, and how many remained.
+///
+/// # Safety
+/// - `target_value_ptr`, if non-null, must be writable for `buf_elements`
+///   elements: bytes for `SQL_C_CHAR`, `SqlWChar`s for `SQL_C_WCHAR`. Note this
+///   is an element count, unlike the byte-count `buffer_length` elsewhere.
+/// - `strlen_or_ind_ptr`, if non-null, must be writable for one `SqlLen`.
+/// - Neither pointer may alias `value`.
 unsafe fn try_write_direct_captured_string_chunk(
     value: &ColumnValues,
     target_type: SqlSmallInt,
