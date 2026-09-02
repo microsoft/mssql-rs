@@ -483,6 +483,24 @@ pub fn done_more() -> ScriptedToken {
     }))
 }
 
+/// A `DONEINPROC` token with MORE set, ending a row set inside an RPC.
+pub fn done_in_proc_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneInProc(DoneToken {
+        status: DoneStatus::MORE,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
+/// A terminal `DONEPROC` token ending an RPC response.
+pub fn done_proc_no_more() -> ScriptedToken {
+    ScriptedToken(Tokens::DoneProc(DoneToken {
+        status: DoneStatus::FINAL,
+        cur_cmd: CurrentCommand::Select,
+        row_count: 0,
+    }))
+}
+
 /// A terminal DONE token (no more results — end of batch).
 pub fn done_no_more() -> ScriptedToken {
     ScriptedToken(Tokens::Done(DoneToken {

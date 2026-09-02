@@ -120,6 +120,41 @@ TEST_F(ConnectionBusyLiveTest, PreparedParameterFetchToNoDataReleasesConnection)
     EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
 }
 
+TEST_F(ConnectionBusyLiveTest, PreparedParameterMultiRowReleasesAfterLastRow) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? FROM (VALUES (1), (2)) AS v(n) ORDER BY n"),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(42, value);
+    EXPECT_SQLSTATE(SQL_ERROR, Run(b, "SELECT 2"), "HY000", SQL_HANDLE_STMT, b);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(42, value);
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
+TEST_F(ConnectionBusyLiveTest, PreparedParameterZeroRowReleasesConnection) {
+    SQLHSTMT b = AllocStmt();
+
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? WHERE 1 = 0"), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER parameter = 42;
+    SQLLEN parameter_ind = 0;
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &parameter_ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+
+    EXPECT_SQL_OK(Run(b, "SELECT 2"), SQL_HANDLE_STMT, b);
+}
+
 // SQLExecDirect with bound parameters uses sp_executesql rather than the
 // prepared sp_prepexec path. Its RPC completion tokens must obey the same
 // release rule after the single row is consumed.

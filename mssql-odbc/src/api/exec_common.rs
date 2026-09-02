@@ -227,8 +227,10 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// delivered, so posting now would never reach the caller. The next call
 /// that would otherwise short-circuit past the wire believing there is
 /// nothing left (`SQLFetch`'s `result_set_exhausted` fast path,
-/// If the row-set DONE carries MORE, the TDS layer consumes trailing RPC
-/// completion tokens and parks any genuine next result boundary for
+/// `SQLMoreResults`) drains and reports it instead.
+///
+/// If an RPC row set ends on `DONEINPROC` with MORE, the TDS layer consumes
+/// only trailing RPC control tokens and parks the first non-tail token for
 /// `SQLMoreResults`. A failure while consuming that completion tail abandons
 /// the batch: timeout/cancellation has already drained through ATTENTION, and
 /// other failures retire the connection. The error is deferred to the next
@@ -281,10 +283,11 @@ pub(super) fn release_busy_if_row_exhausted(
         Err(_) => !client.has_open_batch(),
     };
 
-    // A row-returning RPC can end its visible row set with DONE_MORE because
+    // A row-returning RPC can end its visible row set with DONEINPROC MORE because
     // RETURNVALUE, RETURNSTATUS, and a terminal DONE still follow. Consume
-    // those protocol-only tokens now. A genuine next result is parked inside
-    // TdsClient, so SQLMoreResults still observes it in order.
+    // those protocol-only tokens now. The first non-tail token is parked inside
+    // TdsClient, so SQLMoreResults still observes it in order. Plain batch DONE
+    // tokens return immediately without probing the next result.
     let completion_result = if result_set_exhausted && peek_result.is_ok() {
         Some(dbc.runtime.block_on(client.complete_current_result()))
     } else {
@@ -294,6 +297,7 @@ pub(super) fn release_busy_if_row_exhausted(
         Some(Ok(done)) => *done,
         _ => !client.has_open_batch(),
     };
+    let completion_failed = matches!(&completion_result, Some(Err(_)));
     let release = result_set_exhausted && batch_done;
 
     let mut read_error = peek_result.err();
@@ -324,7 +328,7 @@ pub(super) fn release_busy_if_row_exhausted(
         }
         if let Some(e) = read_error {
             error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
-            if batch_done {
+            if batch_done || completion_failed {
                 stmt_state.pending_fetch_error = Some(e);
             }
         }
@@ -820,8 +824,8 @@ mod tests {
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::{
-        ScriptedToken, col_metadata, col_metadata_empty, done_more, done_no_more, int_columns,
-        sql_error, tds_client_from_tokens,
+        ScriptedToken, col_metadata, col_metadata_empty, done_in_proc_more, done_more,
+        done_no_more, done_proc_no_more, int_columns, sql_error, tds_client_from_tokens,
     };
     use std::ffi::c_void;
 
@@ -1086,7 +1090,14 @@ mod tests {
         // when no application-visible result follows. The RPC's terminal DONE
         // must be consumed before another statement can safely use the wire.
         let h = TestHandles::with_env_dbc_stmt();
-        position_and_inject(&h, vec![col_metadata_empty(), done_more(), done_no_more()]);
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                done_in_proc_more(),
+                done_proc_no_more(),
+            ],
+        );
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -1103,7 +1114,7 @@ mod tests {
     #[test]
     fn release_busy_if_row_exhausted_defers_a_truncated_rpc_tail() {
         let h = TestHandles::with_env_dbc_stmt();
-        position_and_inject(&h, vec![col_metadata_empty(), done_more()]);
+        position_and_inject(&h, vec![col_metadata_empty(), done_in_proc_more()]);
 
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
