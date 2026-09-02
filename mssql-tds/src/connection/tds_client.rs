@@ -5678,13 +5678,12 @@ impl TdsClient {
         }
     }
 
-    /// Peeks past the row just fully consumed to discover whether another
-    /// row follows, without losing it if one does. Callers (the ODBC busy
-    /// gate) use this once every column of the current row has been
-    /// delivered to learn — one call earlier than they otherwise would —
-    /// whether the wire is now idle for this statement, matching msodbcsql's
-    /// wire-state busy gate rather than holding the connection busy for the
-    /// statement's entire cursor lifetime.
+    /// Peeks ahead to the next row and preserves it for the next cursor advance.
+    ///
+    /// ODBC execution uses this before its first fetch so an ERROR token sent
+    /// after COLMETADATA is reported by SQLExecDirect/SQLExecute. The ODBC busy
+    /// gate also uses it after delivering a row to discover whether another
+    /// row follows or the wire is now idle.
     ///
     /// Returns `Ok(true)` if another row is now positioned: it is parked
     /// exactly as [`next_row_cursor`](Self::next_row_cursor) parks any
@@ -5694,11 +5693,9 @@ impl TdsClient {
     /// `next_row_cursor` call would eventually report, just discovered now
     /// because the wire happened to already have the answer.
     ///
-    /// # Caller obligation
-    /// Only call this once every column of the row positioned before this
-    /// call has been read (all bound columns, or `SQLGetData` through the
-    /// last column) — like `next_row_cursor`, this discards anything left
-    /// unread on that row.
+    /// Call this before the first row is positioned, or after every column of
+    /// the current row has been read. Like `next_row_cursor`, it discards any
+    /// unread columns from an already-positioned row.
     pub async fn peek_past_current_row(&mut self) -> TdsResult<bool> {
         let has_row = self.next_row_cursor().await?;
         self.row_already_positioned = has_row;
