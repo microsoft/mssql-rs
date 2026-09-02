@@ -388,8 +388,14 @@ ODBC handles form a hierarchy: **ENV → DBC → STMT**.
 ### Notes
 
 - **Per-ENV** aligns cleanly with the spec: the ENV is the app's top-level
-  scope, child handles share its runtime through `Arc<Runtime>`, and freeing the
-  ENV drops the runtime when the last `Arc` goes away.
+  scope, child handles share its runtime through `Arc<SharedRuntime>`, and
+  freeing the ENV drops the runtime when the last `Arc` goes away.
+  `SharedRuntime` (`handles/runtime.rs`) exists because that last drop can land
+  during process shutdown: `Runtime`'s teardown waits on its worker threads, and
+  a host that frees ODBC handles from a `DLL_PROCESS_DETACH`/`onexit` path does
+  so after Windows has already terminated them, so the wait never returns. The
+  wrapper leaks the runtime when `RtlDllShutdownInProgress` is set and drops it
+  normally otherwise.
 - **Per-thread `current_thread`** is attractive for a *sync-only* driver because
   it adds zero threads and sidesteps the "shared `current_thread` contends"
   problem — each thread gets its own scheduler. **The catch is reactor affinity,
@@ -446,7 +452,7 @@ let runtime = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(1)      // floor; raise if async ODBC runs many concurrent ops
     .enable_all()
     .build()?;
-// stored as Arc<Runtime> on EnvHandle, shared with child DBC/STMT handles
+// stored as Arc<SharedRuntime> on EnvHandle, shared with child DBC/STMT handles
 ```
 
 Why this is the right default:
@@ -457,7 +463,7 @@ Why this is the right default:
 | Async ODBC (`SQL_STILL_EXECUTING`) | Worker thread drives spawned tasks while the app thread is away; `JoinHandle::is_finished()` is the poll primitive. |
 | `parallel_connect` parallelism | Real parallel IP race on the worker(s). |
 | Thread footprint | One small worker pool per ENV, regardless of how many app threads call in. |
-| Lifetime | Tied to ENV; dropped on `SQLFreeHandle(ENV)`. |
+| Lifetime | Tied to ENV; dropped on `SQLFreeHandle(ENV)`, through the `SharedRuntime` wrapper that skips teardown once the process is already exiting. |
 
 ### Why a fixed pool, not a sync-1 / async-N split
 

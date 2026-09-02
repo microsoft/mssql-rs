@@ -5,9 +5,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use mssql_tds::connection::tds_client::TdsClient;
-use tokio::runtime::Runtime;
 
-use super::{EnvHandle, HandleType, HasObjectType};
+use super::{EnvHandle, HandleType, HasObjectType, SharedRuntime};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -36,7 +35,7 @@ pub(crate) struct DbcHandle {
     /// the ENV owns the DBC's lifetime, not the other way around.
     pub(crate) parent_env: *mut c_void,
     /// Shared Tokio runtime from the parent ENV.
-    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<SharedRuntime>,
     pub(crate) inner: Mutex<DbcState>,
 }
 
@@ -213,7 +212,7 @@ impl HasDiagnostics for DbcState {
 }
 
 impl DbcHandle {
-    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(parent_env: *mut c_void, runtime: Arc<SharedRuntime>) -> Self {
         Self {
             object_type: HandleType::Dbc,
             parent_env,

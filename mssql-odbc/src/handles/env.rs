@@ -5,10 +5,7 @@ use std::ffi::c_void;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use tokio::runtime::Runtime;
-use tracing::error;
-
-use super::{HandleType, HasObjectType};
+use super::{HandleType, HasObjectType, SharedRuntime};
 use crate::api::odbc_types::{SQL_OV_ODBC2, SQL_OV_ODBC3, SQL_OV_ODBC3_80};
 use crate::error::{DiagRecord, HasDiagnostics};
 
@@ -50,7 +47,7 @@ pub(crate) struct EnvHandle {
     pub(crate) inner: Mutex<EnvState>,
     /// Shared Tokio runtime for all connections on this ENV.
     /// Wrapped in `Arc` so DBCs can hold a reference without lifetime issues.
-    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<SharedRuntime>,
 }
 
 /// Mutable state within an environment handle, protected by `inner`.
@@ -75,13 +72,7 @@ impl HasDiagnostics for EnvState {
 
 impl EnvHandle {
     pub(crate) fn new() -> io::Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .inspect_err(|e| {
-                error!(%e, "failed to create Tokio runtime");
-            })?;
+        let runtime = SharedRuntime::new()?;
         Ok(Self {
             object_type: HandleType::Env,
             inner: Mutex::new(EnvState {
