@@ -1142,6 +1142,17 @@ unsafe fn deliver_bound_plp(
     column_info: Option<PlpColumnInfo>,
     scratch: &mut [u8],
 ) -> Result<RowOutcome, TdsError> {
+    // Unreachable today, kept as a guard rather than an `unreachable!()`.
+    // Getting here means the cursor classified this column as
+    // `CursorColumn::PlpStreaming` while `plp_encoding()` answered `None` for
+    // the same column. Both decide on `ColumnMetadata::is_plp()` over the same
+    // COLMETADATA (`plp_columns` snapshots the statement's copy, whose length
+    // also fixes `column_count`, so the lookup is always in range), and
+    // `plp_encoding` maps every PLP type to `Some` -- new ones included, via its
+    // catch-all to `Binary`. So the two cannot disagree unless a future type
+    // makes PLP-ness visible only in the wire framing and not in TYPE_INFO.
+    // Draining keeps the row synchronized if that day comes; a panic would take
+    // the application down for a column it could simply refuse.
     let Some(column_info) = column_info else {
         drain_plp_to_end(client, runtime, scratch)?;
         return Ok(RowOutcome::Error(RowIssue::Unsupported));
