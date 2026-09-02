@@ -104,10 +104,13 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      inside inline `#[cfg(test)] mod tests` blocks, which `--lib` compiles without the
      `test` cfg and so skips silently, `--target` notwithstanding — confirmed by
      mutating a `#[cfg(windows)]` test in `datasource_parser.rs`, which `--lib` missed
-     and `--all-targets` caught. `mssql-tds` is also the crate to reach for here, not
-     `mssql-odbc`: it carries roughly 120 `cfg(windows)`/`cfg(target_os)` sites against
-     `mssql-odbc`'s ~18. This is a convenience, not a requirement — installing a
-     target and building locally isn't something every reviewer wants or needs to do.
+     and `--all-targets` caught. (This example measures `mssql-tds`, not `mssql-odbc`,
+     because it carries far more platform-gated surface to demonstrate against —
+     roughly 120 `cfg(windows)`/`cfg(target_os)` sites against `mssql-odbc`'s ~18 —
+     not because it's a crate to default to: check whichever crate the diff actually
+     touches, per the crate-selection rule below.) This is a convenience, not a
+     requirement — installing a target and building locally isn't something every
+     reviewer wants or needs to do.
      Either way, confirm the specific CI job for that platform actually ran and passed
      on the PR's head commit rather than assuming "the matrix owns this" without
      looking; a local check only adds a faster answer to the same question CI already
