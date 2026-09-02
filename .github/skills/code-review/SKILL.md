@@ -95,19 +95,23 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      `$BASE` and compare failure sets; only the difference belongs in the review.
    - **Is this coverage gap real?** Introduce the bug the missing test would catch and
      show the suite still passes.
-   - **Does the platform-gated half still compile?** `cargo check --target <triple>` /
-     `cargo clippy --target <triple>` type-checks `#[cfg(windows)]` and
-     `#[cfg(target_os = ...)]` code without needing a matching host, because neither
-     links (`rustup target add aarch64-pc-windows-msvc`; ~30 s warm for
-     `-p mssqlodbc --lib`). It cannot run a Windows test binary, so runtime behaviour
-     there still rests on the CI matrix — but "my host is Linux, so the matrix owns
-     this" is the wrong default when reviewing platform-gated code, and a mutation
-     applied to an arm your host does not select proves nothing on its own. A failure
-     here can still come from a dependency's build script rather than the reviewed
-     code: targeting a Linux triple pulls `openssl-sys` in through `native-tls`, and
-     its build script fails before rustc ever sees the crate if it can't find a target
-     OpenSSL sysroot — confirmed on `mssql-odbc`, where the Windows-target direction
-     above needs no OpenSSL at all (`native-tls` routes through Schannel on Windows,
+   - **Does the platform-gated half still compile?** Where the toolchain is already
+     available, `cargo check --target <triple>` / `cargo clippy --target <triple>`
+     type-checks `#[cfg(windows)]` and `#[cfg(target_os = ...)]` code without a
+     matching host, because neither links (`rustup target add
+     aarch64-pc-windows-msvc`; ~30 s warm for `-p mssqlodbc --lib`). This is a
+     convenience, not a requirement — installing a target and building locally isn't
+     something every reviewer wants or needs to do. Either way, confirm the specific
+     CI job for that platform actually ran and passed on the PR's head commit rather
+     than assuming "the matrix owns this" without looking; a local check only adds a
+     faster answer to the same question CI already gates. Neither approach can run a
+     Windows test binary, and a mutation applied to an arm your host does not select
+     proves nothing on its own — that still rests on CI. A local check can also fail
+     in a dependency's build script rather than the reviewed code: targeting a Linux
+     triple pulls `openssl-sys` in through `native-tls`, and its build script fails
+     before rustc ever sees the crate if it can't find a target OpenSSL sysroot —
+     confirmed on `mssql-odbc`, where the Windows-target direction above needs no
+     OpenSSL at all (`native-tls` routes through Schannel on Windows,
      Security.framework on macOS — only Linux targets hit the sysroot lookup). That is
      an environment gap, not a type error; read what actually failed before
      attributing it to the diff.
