@@ -504,11 +504,11 @@ impl RowWriter for BoundRowWriter<'_> {
 /// fetch path too. Both were confirmed by probing msodbcsql18, which resolves
 /// each to `SQL_C_CHAR`, and both are kept:
 ///
-/// - The wide character types (and `SQL_SS_XML`) resolve to `SQL_C_WCHAR`. The
-///   narrow default is an ANSI-transfer artifact of a driver shipped in both an
-///   ANSI and a Unicode build; this driver has only the Unicode one, and its
-///   `SQL_C_CHAR` is UTF-8, so following msodbcsql would transcode every wide
-///   column by default.
+/// - The wide character types resolve to `SQL_C_WCHAR`. The narrow default is
+///   an ANSI-transfer artifact of a driver shipped in both an ANSI and a
+///   Unicode build; this driver has only the Unicode one, and its `SQL_C_CHAR`
+///   is UTF-8, so following msodbcsql would transcode every wide column by
+///   default.
 /// - `SQL_GUID` resolves to `SQL_C_GUID`, following the ODBC 3.x
 ///   default-C-type table. This is the one deviation that also changes the
 ///   rowset layout, because a fixed-width target takes its stride from the C
@@ -517,9 +517,16 @@ impl RowWriter for BoundRowWriter<'_> {
 ///   the caller's slot size. The narrower stride stays inside the
 ///   application's array either way.
 ///
-/// A column with no metadata, or a SQL type with no default, is left at
-/// `SQL_C_DEFAULT`, which [`deliver_bound`] reports as an unsupported target
-/// per row rather than guessing at a layout.
+/// `SQL_SS_XML` is deliberately not in that list: msodbcsql maps it to
+/// `SQL_C_WCHAR` too, so there is no deviation to record, and it is unreachable
+/// here anyway because [`odbc_sql_type`] reports xml and json columns as
+/// `SQL_WLONGVARCHAR`.
+///
+/// A column whose SQL type has no default is left at `SQL_C_DEFAULT`, which
+/// [`deliver_bound`] reports as an unsupported target per row rather than
+/// guessing at a layout. A binding whose ordinal is past the end of the result
+/// set also stays unresolved, but never reaches delivery: the fill loop skips
+/// it, matching msodbcsql.
 fn resolve_default_bindings(
     bindings: &mut [ColumnBinding],
     column_metadata: &[ColumnMetadata],
@@ -1588,6 +1595,7 @@ mod tests {
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
     use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
+    use crate::handles::EnvHandle;
     use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
     use crate::test_support::TestHandles;
@@ -1617,6 +1625,12 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut s = stmt.inner.lock().unwrap();
         s.set_state(STMT_STATE_CURSOR_OPEN);
+    }
+
+    fn last_state(h: &TestHandles) -> [u8; 5] {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = stmt.inner.lock().unwrap();
+        s.diag_records.last().unwrap().sql_state
     }
 
     #[test]
@@ -1939,9 +1953,76 @@ mod tests {
         assert_eq!(element_stride(bindings[1].target_type, 64), 64);
     }
 
+    /// The declared ODBC version has to reach the resolver through the fetch,
+    /// not just through a direct `resolve_default_bindings` call: `SQL_SS_TIME2`
+    /// is the only mapping that moves with it, defaulting to `SQL_C_SS_TIME2` at
+    /// 3.8 and `SQL_C_BINARY` below it.
+    ///
+    /// Both versions fail this row -- the mock only carries `int` payloads, and
+    /// bound `SQL_C_BINARY` delivery is unimplemented (AB#47239) -- so the
+    /// resolved target is observed through *which* diagnostic comes back:
+    /// `07006` for the typed 3.8 target that cannot take an int, `HYC00` for the
+    /// binary 3.0 one this driver does not deliver. Hardcoding either version in
+    /// `fetch_scroll_safe` flips one of these and fails the test.
+    fn fetch_time_column_row_state(version: OdbcVersion) -> [u8; 5] {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        {
+            let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+            env.inner.lock().unwrap().odbc_version = version;
+        }
+
+        let mut metadata = int_columns(1);
+        metadata[0].data_type = TdsDataType::TimeN;
+        metadata[0].type_info.tds_type = TdsDataType::TimeN;
+
+        let mut value = [0u8; 32];
+        let mut indicator = [0 as SqlLen; 1];
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(metadata);
+            state.set_binding(binding(
+                1,
+                SQL_C_DEFAULT,
+                value.as_mut_ptr().cast(),
+                value.len() as SqlLen,
+                indicator.as_mut_ptr(),
+            ));
+        }
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT time column".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        last_state(&h)
+    }
+
+    #[test]
+    fn a_default_binding_follows_the_declared_odbc_version() {
+        assert_eq!(
+            fetch_time_column_row_state(OdbcVersion::Odbc3_80),
+            *b"07006",
+            "3.8 resolves SQL_SS_TIME2 to the typed SQL_C_SS_TIME2"
+        );
+        assert_eq!(
+            fetch_time_column_row_state(OdbcVersion::Odbc3),
+            *b"HYC00",
+            "3.0 resolves SQL_SS_TIME2 to SQL_C_BINARY, which is not delivered yet"
+        );
+    }
+
     /// A binding whose column is past the end of the result set keeps the
-    /// placeholder instead of borrowing another column's type; `deliver_bound`
-    /// then reports it per row.
+    /// placeholder. The fill loop skips it before delivery, matching msodbcsql,
+    /// so the unresolved target is never reported.
     #[test]
     fn a_default_binding_without_metadata_stays_unresolved() {
         let mut bindings = vec![binding(

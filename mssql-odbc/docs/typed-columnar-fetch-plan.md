@@ -166,15 +166,19 @@ The mapping is `type_rules::resolve_default_c_type`, shared with `SQLBindParamet
 
 | SQL type | This driver | msodbcsql | Why the deviation is kept |
 | --- | --- | --- | --- |
-| `SQL_WCHAR`, `SQL_WVARCHAR`, `SQL_WLONGVARCHAR`, `SQL_SS_XML` | `SQL_C_WCHAR` | `SQL_C_CHAR` | The narrow default is an artifact of a driver shipped in both ANSI and Unicode builds. This driver has only the Unicode one and its `SQL_C_CHAR` is UTF-8, so following msodbcsql would transcode every wide column by default |
+| `SQL_WCHAR`, `SQL_WVARCHAR`, `SQL_WLONGVARCHAR` | `SQL_C_WCHAR` | `SQL_C_CHAR` | The narrow default is an artifact of a driver shipped in both ANSI and Unicode builds. This driver has only the Unicode one and its `SQL_C_CHAR` is UTF-8, so following msodbcsql would transcode every wide column by default |
 | `SQL_GUID` | `SQL_C_GUID` | `SQL_C_CHAR` | Follows the ODBC 3.x default-C-type table. This is the one deviation that also changes the rowset layout: the stride becomes `sizeof(SQLGUID)` rather than `BufferLength`, per the fixed-width rule above. A slot sized for the 36-character text form is wider than 16 bytes, so the narrower stride stays inside the application's array |
+
+`SQL_SS_XML` is *not* in that table. msodbcsql maps it to `SQL_C_WCHAR` as well (`rgbTRANSTYPE` and `rgbTRANSTYPE380` both read `SQL_C_WCHAR, // SQL_XML_MAPPED`, `sqlcmisc.cpp:179` and `:218`), which a probe confirms: an `xml` column bound `SQL_C_DEFAULT` against msodbcsql18 comes back as UTF-16 (`3C 00 72 00 …`, indicator `30` for 15 characters), not narrow bytes. It is unreachable on this path in any case — `describe_col.rs` reports xml and json columns as `SQL_WLONGVARCHAR`, never `SQL_SS_XML`.
 
 The msodbcsql column is measured, not inferred from `Sql2CDefault`. Binding an `nvarchar` and a `uniqueidentifier` column with `SQL_C_DEFAULT` and `BufferLength` 64 against msodbcsql18 produces, for `N'one'` and `01020304-0506-0708-090A-0B0C0D0E0F10`:
 
 - the wide column as the three narrow bytes `6F 6E 65` with indicator `3`, not six bytes of UTF-16 with indicator `6`;
 - the GUID column as the 36-character text form with indicator `36`, the rowset striding by the full `BufferLength` of 64 rather than by `sizeof(SQLGUID)`.
 
-A bound column with no matching result column, or a SQL type with no default, keeps `SQL_C_DEFAULT` and is reported per row as an unsupported target rather than guessed at.
+A column whose SQL type has no default keeps `SQL_C_DEFAULT` and is reported per row as an unsupported target rather than guessed at. A binding whose ordinal is past the end of the result set also stays unresolved, but never reaches delivery — the fill loop skips it and reports nothing, matching msodbcsql.
+
+The resolution is ODBC-version aware, and the version is read from the environment on each fetch: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET` default to `SQL_C_BINARY` below ODBC 3.8 and to their `SQL_C_SS_*` types at 3.8.
 
 ### P4 — Exports & driver-load compatibility — Task [46581](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46581)
 
