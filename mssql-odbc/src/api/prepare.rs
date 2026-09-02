@@ -48,6 +48,10 @@ pub(crate) unsafe fn sql_prepare_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `statement_text` must be readable for `text_length` UTF-16 code units, or
+/// through a NUL terminator when `text_length` is `SQL_NTS`.
 unsafe fn sql_prepare_w_impl(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,

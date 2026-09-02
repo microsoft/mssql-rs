@@ -40,6 +40,12 @@ use mssql_tds::query::metadata::PlpEncoding;
 /// - Supports `SQL_C_CHAR` and `SQL_C_WCHAR` for text retrieval.
 /// - Supports incremental row resume and chunked PLP retrieval via
 ///   `read_active_plp_chunk`.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `target_value_ptr`, when non-null, must be writable for `buffer_length`
+/// bytes, including when `target_type` is `SQL_C_WCHAR`. `strlen_or_ind_ptr`,
+/// when non-null, must be writable for one `SqlLen`.
 pub(crate) unsafe fn sql_get_data(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,
@@ -70,6 +76,11 @@ pub(crate) unsafe fn sql_get_data(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `target_value_ptr`, when non-null, must be writable for `buffer_length`
+/// bytes, including when `target_type` is `SQL_C_WCHAR`. `strlen_or_ind_ptr`,
+/// when non-null, must be writable for one `SqlLen`.
 unsafe fn sql_get_data_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,

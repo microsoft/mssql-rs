@@ -530,6 +530,10 @@ pub unsafe extern "C" fn SQLDescribeParam(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `statement_text`, if non-null, must be readable for `text_length` `SQLWCHAR`s.
 ///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
+/// - Each non-data-at-execution parameter's currently bound value and length
+///   buffers must remain readable according to its C type and declared lengths.
+/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR`, when set, must remain readable for one
+///   `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecDirectW(
     statement_handle: SqlHandle,
@@ -558,6 +562,10 @@ pub unsafe extern "C" fn SQLGetTypeInfoW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each non-data-at-execution parameter's currently bound value and length
+///   buffers must remain readable according to its C type and declared lengths.
+/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR`, when set, must remain readable for one
+///   `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecute(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
@@ -612,6 +620,14 @@ pub unsafe extern "C" fn SQLPutData(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Every active bound-column data buffer must be writable for the configured
+///   rowset according to its C type and `BufferLength`; its indicator and
+///   octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
+///   `SqlLen` values.
+/// - Non-null rowset pointer attributes must satisfy their declared extents:
+///   one `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
+///   `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
+///   `SqlUSmallInt` values for `SQL_ATTR_ROW_STATUS_PTR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
@@ -656,6 +672,13 @@ pub unsafe extern "C" fn SQLBindCol(
 ///
 /// # Safety
 /// `statement_handle` must be a valid statement handle or null.
+/// Every active bound-column data buffer must be writable for the configured
+/// rowset according to its C type and `BufferLength`; its indicator and
+/// octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
+/// `SqlLen` values. Non-null rowset pointer attributes must satisfy their
+/// declared extents: one `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
+/// `SqlUSmallInt` values for `SQL_ATTR_ROW_STATUS_PTR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFetchScroll(
     statement_handle: SqlHandle,

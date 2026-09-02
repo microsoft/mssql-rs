@@ -69,6 +69,10 @@ pub(crate) unsafe fn sql_bind_parameter(
     })
 }
 
+/// # Safety
+/// `statement_handle` must point to a live `StmtHandle`.
+/// `parameter_value_ptr` and `strlen_or_ind_ptr`, when non-null, must remain
+/// valid until the parameter is unbound or the statement is freed.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_bind_parameter_impl(
     statement_handle: SqlHandle,
@@ -376,6 +380,8 @@ pub(crate) unsafe fn sql_free_stmt_reset_params(statement_handle: SqlHandle) -> 
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_free_stmt_reset_params_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLFreeStmt(SQL_RESET_PARAMS): statement_handle is null");

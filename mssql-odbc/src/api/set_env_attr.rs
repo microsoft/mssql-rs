@@ -39,6 +39,9 @@ pub(crate) unsafe fn sql_set_env_attr(
     })
 }
 
+/// # Safety
+/// `environment_handle` must be null or point to a live `EnvHandle`.
+/// `value_ptr` must contain the ODBC tagged integer value for `attribute`.
 unsafe fn sql_set_env_attr_impl(
     environment_handle: SqlHandle,
     attribute: SqlInteger,

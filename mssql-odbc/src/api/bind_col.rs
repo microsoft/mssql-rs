@@ -55,6 +55,10 @@ pub(crate) unsafe fn sql_bind_col(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. When
+/// non-null, `target_value_ptr` and `strlen_or_ind_ptr` must remain valid for
+/// the bound rowset until the column is unbound or the statement is freed.
 unsafe fn sql_bind_col_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,

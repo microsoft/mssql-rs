@@ -362,6 +362,10 @@ unsafe fn diag_record_count(
 /// TODO: Add an OOM-resilient fallback diagnostic path for out-of-memory:
 /// store a non-allocating OOM flag on the handle and return
 /// static HY001 text for record 1 without heap allocation.
+///
+/// # Safety
+/// `handle` must be a valid, non-null handle pointer of the type identified by
+/// `handle_type`.
 unsafe fn snapshot_record(
     handle_type: SqlSmallInt,
     handle: SqlHandle,

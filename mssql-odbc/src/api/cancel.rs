@@ -34,6 +34,8 @@ pub(crate) unsafe fn sql_cancel(statement_handle: SqlHandle) -> SqlReturn {
     crate::ffi_entry!("SQLCancel", unsafe { sql_cancel_impl(statement_handle) })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLCancel: statement_handle is null");

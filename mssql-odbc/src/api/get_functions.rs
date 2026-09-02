@@ -50,6 +50,12 @@ pub(crate) unsafe fn sql_get_functions(
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
+/// `supported_ptr`, when non-null, must be writable for one `SqlUSmallInt`, for
+/// `SQL_API_ALL_FUNCTIONS_SIZE` elements when requesting
+/// `SQL_API_ALL_FUNCTIONS`, or for the ODBC 3 function bitmap when requesting
+/// `SQL_API_ODBC3_ALL_FUNCTIONS`.
 unsafe fn sql_get_functions_impl(
     connection_handle: SqlHandle,
     function_id: SqlUSmallInt,

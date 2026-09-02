@@ -29,11 +29,11 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// - `data_ptr`, when `strlen_or_ind` is a positive byte count, must be
 ///   readable for that many bytes and must remain valid for the duration of
 ///   this call.
-/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null, aligned
-///   for the bound parameter's C type, and NUL-terminated within an allocation
-///   it owns: the terminator search reads `u16` units for `SQL_C_WCHAR` and
-///   `u8` units otherwise, and runs off the end of the allocation if no
-///   terminator is present.
+/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null and
+///   NUL-terminated within an allocation it owns: the terminator search
+///   reads potentially unaligned `u16` units for `SQL_C_WCHAR` and `u8` units
+///   otherwise, and runs off the end of the allocation if no terminator is
+///   present.
 pub(crate) unsafe fn sql_put_data(
     statement_handle: SqlHandle,
     data_ptr: SqlPointer,
@@ -50,6 +50,11 @@ pub(crate) unsafe fn sql_put_data(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. For a
+/// positive `strlen_or_ind`, `data_ptr` must be readable for that many bytes.
+/// For `SQL_NTS`, it must be non-null and readable through a NUL terminator as
+/// the bound C type.
 unsafe fn sql_put_data_impl(
     statement_handle: SqlHandle,
     data_ptr: SqlPointer,
@@ -70,11 +75,15 @@ unsafe fn sql_put_data_impl(
     unsafe { sql_put_data_safe(statement_handle, stmt, data_ptr, strlen_or_ind) }
 }
 
+/// # Safety
+/// `data_ptr` must be non-null and point to an allocation readable through a
+/// NUL terminator. The allocation is read as potentially unaligned `u16` units
+/// when `c_type` is `SQL_C_WCHAR`, and as `u8` units otherwise.
 unsafe fn nts_byte_count(data_ptr: SqlPointer, c_type: i16) -> usize {
     if c_type == SQL_C_WCHAR {
         let ptr = data_ptr as *const u16;
         let mut units = 0usize;
-        while unsafe { *ptr.add(units) } != 0 {
+        while unsafe { ptr.add(units).read_unaligned() } != 0 {
             units += 1;
         }
         units * std::mem::size_of::<u16>()
@@ -88,6 +97,11 @@ unsafe fn nts_byte_count(data_ptr: SqlPointer, c_type: i16) -> usize {
     }
 }
 
+/// # Safety
+/// `statement_handle` must identify the live `stmt`. For a positive
+/// `strlen_or_ind`, `data_ptr` must be readable for that many bytes. For
+/// `SQL_NTS`, it must be non-null and readable through a NUL terminator as the
+/// currently bound C type.
 unsafe fn sql_put_data_safe(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,

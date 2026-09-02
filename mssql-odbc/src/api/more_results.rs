@@ -38,6 +38,8 @@ pub(crate) unsafe fn sql_more_results(statement_handle: SqlHandle) -> SqlReturn 
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_more_results_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLMoreResults: statement_handle is null");
