@@ -34,6 +34,8 @@ use crate::conversion::fetch_convert::{
     is_datetime_c_target, is_float_c_target, is_integer_c_target, money_scaled, sql_string_to_text,
     time_parts,
 };
+
+const MAX_PLP_PREFETCH_BYTES: usize = 64 * 1024;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::decoder::DECIMAL_STR_LEN;
 use mssql_tds::datatypes::sql_string::EncodingType;
@@ -152,7 +154,6 @@ fn sql_get_data_safe(
             active_plp.pending_units.len(),
             active_plp.narrow_to_wide.is_some(),
         );
-        drop(stmt_state);
         return stream_active_plp_chunk(
             stmt,
             statement_handle,
@@ -163,6 +164,7 @@ fn sql_get_data_safe(
             strlen_or_ind_ptr,
             false,
             Some(prepared_stream),
+            Some(stmt_state),
         );
     }
 
@@ -388,7 +390,6 @@ fn sql_get_data_safe(
     };
     // last_captured is None only when the decoder paused at a PLP column.
     if reopened_stmt_state.last_captured.is_none() && !reopened_stmt_state.row_exhausted {
-        drop(reopened_stmt_state);
         return stream_active_plp_chunk(
             stmt,
             statement_handle,
@@ -399,6 +400,7 @@ fn sql_get_data_safe(
             strlen_or_ind_ptr,
             true,
             None,
+            Some(reopened_stmt_state),
         );
     }
     let rc = write_captured_column(
@@ -1116,11 +1118,12 @@ fn apply_cursor_result(
 
 /// Reads and returns one SQLGetData chunk directly from the active PLP stream.
 ///
-/// This never buffers the full PLP payload in ODBC-layer memory. The TDS
-/// client remains the owner of stream state between repeated calls.
+/// Small known-length values may carry their remaining wire bytes in the
+/// statement after the first async read. Larger values continue to stream
+/// directly from the TDS client.
 #[allow(clippy::too_many_arguments)]
-fn stream_active_plp_chunk(
-    stmt: &StmtHandle,
+fn stream_active_plp_chunk<'a>(
+    stmt: &'a StmtHandle,
     statement_handle: SqlHandle,
     col_index: usize,
     target_type: SqlSmallInt,
@@ -1129,10 +1132,23 @@ fn stream_active_plp_chunk(
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
     prepared_stream: Option<(PlpEncoding, usize, bool)>,
+    mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
-        if let Ok(mut s) = stmt.inner.lock() {
-            post_sql_error(&mut s, SQLSTATE_HYC00, 0, "Target type not yet implemented");
+        if let Some(mut state) = retained_stmt_state.take() {
+            post_sql_error(
+                &mut state,
+                SQLSTATE_HYC00,
+                0,
+                "Target type not yet implemented",
+            );
+        } else if let Ok(mut state) = stmt.inner.lock() {
+            post_sql_error(
+                &mut state,
+                SQLSTATE_HYC00,
+                0,
+                "Target type not yet implemented",
+            );
         }
         return SQL_ERROR;
     }
@@ -1150,7 +1166,14 @@ fn stream_active_plp_chunk(
             _ => false,
         };
         if !compatible {
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
+            if let Some(mut stmt_state) = retained_stmt_state.take() {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Target type not yet implemented for this column",
+                );
+            } else if let Ok(mut stmt_state) = stmt.inner.lock() {
                 post_sql_error(
                     &mut stmt_state,
                     SQLSTATE_HYC00,
@@ -1162,9 +1185,15 @@ fn stream_active_plp_chunk(
         }
         (Some(encoding), widen_carry_len)
     } else {
-        let Ok(mut stmt_state) = stmt.inner.lock() else {
-            error!("SQLGetData: stmt mutex poisoned while preparing PLP stream read");
-            return SQL_ERROR;
+        let mut stmt_state = match retained_stmt_state.take() {
+            Some(state) => state,
+            None => {
+                let Ok(state) = stmt.inner.lock() else {
+                    error!("SQLGetData: stmt mutex poisoned while preparing PLP stream read");
+                    return SQL_ERROR;
+                };
+                state
+            }
         };
 
         if starting_new_stream {
@@ -1255,10 +1284,12 @@ fn stream_active_plp_chunk(
             );
             return SQL_ERROR;
         }
-        (
+        let stream_state = (
             stream.map(|s| s.encoding),
             stream.map_or(0, |s| s.pending_units.len()),
-        )
+        );
+        retained_stmt_state = Some(stmt_state);
+        stream_state
     };
     let is_unicode_plp = matches!(plp_encoding, Some(PlpEncoding::Utf16Text));
     // SQL_C_CHAR delivery of a UTF-16 PLP column must transcode on the fly.
@@ -1355,7 +1386,14 @@ fn stream_active_plp_chunk(
         max_read == 0
     };
     if makes_no_progress && !is_length_probe {
-        if let Ok(mut s) = stmt.inner.lock() {
+        if let Some(mut state) = retained_stmt_state.take() {
+            post_sql_error(
+                &mut state,
+                SQLSTATE_HY090,
+                0,
+                "Buffer length too small to hold a single character and null terminator",
+            );
+        } else if let Ok(mut s) = stmt.inner.lock() {
             post_sql_error(
                 &mut s,
                 SQLSTATE_HY090,
@@ -1393,60 +1431,165 @@ fn stream_active_plp_chunk(
         heap_payload.resize(max_read, 0);
         heap_payload.as_mut_slice()
     };
-    let dbc = stmt.parent_dbc();
-    let mut dbc_state = match dbc.inner.lock() {
-        Ok(state) => state,
-        Err(_) => {
-            error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
-            return SQL_ERROR;
+    let (prefetch_error, prefetched_read) = if let Some(stmt_state) = retained_stmt_state.as_mut() {
+        if let Some(stream) = stmt_state.active_plp.as_mut() {
+            (
+                stream.take_prefetch_error(),
+                stream.read_prefetched_wire(payload),
+            )
+        } else {
+            (None, None)
         }
-    };
-    if let Some(busy_stmt) = dbc_state.active_stmt
-        && busy_stmt != statement_handle
-    {
-        drop(dbc_state);
-        if let Ok(mut s) = stmt.inner.lock() {
-            post_diag(&mut s, ERR_CONNECTION_BUSY);
-        }
-        return SQL_ERROR;
-    }
-    let buffered_read = {
-        let Some(client) = dbc_state.client.as_mut() else {
-            drop(dbc_state);
-            if let Ok(mut s) = stmt.inner.lock() {
-                post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
-            }
+    } else {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLGetData: stmt mutex poisoned while reading prefetched PLP bytes");
             return SQL_ERROR;
         };
-        client.try_read_active_plp_chunk(payload)
+        if let Some(stream) = stmt_state.active_plp.as_mut() {
+            (
+                stream.take_prefetch_error(),
+                stream.read_prefetched_wire(payload),
+            )
+        } else {
+            (None, None)
+        }
     };
-    dbc_state.active_stmt = Some(statement_handle);
-    let read_result = match buffered_read {
-        Ok(CursorPoll::Ready(chunk)) => {
+
+    let read_result = if let Some(error) = prefetch_error {
+        Err(error)
+    } else if let Some((read, reached_end, known_total, total_read)) = prefetched_read {
+        Ok(PlpChunk {
+            read,
+            reached_end,
+            known_total,
+            total_read,
+        })
+    } else {
+        drop(retained_stmt_state.take());
+        let dbc = stmt.parent_dbc();
+        let mut dbc_state = match dbc.inner.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                error!("SQLGetData: dbc mutex poisoned while reading PLP stream");
+                return SQL_ERROR;
+            }
+        };
+        if let Some(busy_stmt) = dbc_state.active_stmt
+            && busy_stmt != statement_handle
+        {
             drop(dbc_state);
-            Ok(chunk)
+            if let Ok(mut s) = stmt.inner.lock() {
+                post_diag(&mut s, ERR_CONNECTION_BUSY);
+            }
+            return SQL_ERROR;
         }
-        Err(error) => {
-            drop(dbc_state);
-            Err(error)
-        }
-        Ok(CursorPoll::Pending) => {
-            let Some(mut client) = dbc_state.client.take() else {
+        let buffered_read = {
+            let Some(client) = dbc_state.client.as_mut() else {
                 drop(dbc_state);
                 if let Ok(mut s) = stmt.inner.lock() {
                     post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
                 }
                 return SQL_ERROR;
             };
-            drop(dbc_state);
-            let result = dbc.runtime.block_on(client.read_active_plp_chunk(payload));
-            let Ok(mut dbc_state) = dbc.inner.lock() else {
-                error!("SQLGetData: dbc mutex poisoned after PLP read");
-                return SQL_ERROR;
-            };
-            dbc_state.client = Some(client);
-            dbc_state.active_stmt = Some(statement_handle);
-            result
+            client.try_read_active_plp_chunk(payload)
+        };
+        dbc_state.active_stmt = Some(statement_handle);
+        match buffered_read {
+            Ok(CursorPoll::Ready(chunk)) => {
+                drop(dbc_state);
+                Ok(chunk)
+            }
+            Err(error) => {
+                drop(dbc_state);
+                Err(error)
+            }
+            Ok(CursorPoll::Pending) => {
+                let Some(mut client) = dbc_state.client.take() else {
+                    drop(dbc_state);
+                    if let Ok(mut s) = stmt.inner.lock() {
+                        post_diag(&mut s, ERR_NO_ACTIVE_TDS_CLIENT);
+                    }
+                    return SQL_ERROR;
+                };
+                drop(dbc_state);
+                let mut prefetch_scratch = {
+                    let Ok(mut stmt_state) = stmt.inner.lock() else {
+                        error!("SQLGetData: stmt mutex poisoned while taking PLP prefetch buffer");
+                        return SQL_ERROR;
+                    };
+                    std::mem::take(&mut stmt_state.plp_prefetch_scratch)
+                };
+                let result = dbc.runtime.block_on(async {
+                    let chunk = client.read_active_plp_chunk(payload).await?;
+                    let remaining = chunk
+                        .known_total
+                        .and_then(|total| total.checked_sub(chunk.total_read as u64))
+                        .and_then(|bytes| usize::try_from(bytes).ok());
+                    let prefetch_len = remaining.filter(|remaining| {
+                        direct_wire_output
+                            && *remaining > 0
+                            && *remaining <= MAX_PLP_PREFETCH_BYTES
+                            && !chunk.reached_end
+                    });
+                    let Some(prefetch_len) = prefetch_len else {
+                        return Ok((chunk, None, Some(prefetch_scratch), None));
+                    };
+
+                    prefetch_scratch.resize(prefetch_len, 0);
+                    match client.read_active_plp_chunk(&mut prefetch_scratch).await {
+                        Ok(tail) => {
+                            let carry = (prefetch_scratch, tail, chunk.total_read);
+                            Ok((chunk, Some(carry), None, None))
+                        }
+                        Err(error) => Ok((chunk, None, Some(prefetch_scratch), Some(error))),
+                    }
+                });
+                let Ok(mut dbc_state) = dbc.inner.lock() else {
+                    error!("SQLGetData: dbc mutex poisoned after PLP read");
+                    return SQL_ERROR;
+                };
+                dbc_state.client = Some(client);
+                dbc_state.active_stmt = Some(statement_handle);
+                drop(dbc_state);
+                match result {
+                    Ok((chunk, carry, unused_scratch, prefetch_error)) => {
+                        let Ok(mut stmt_state) = stmt.inner.lock() else {
+                            error!(
+                                "SQLGetData: stmt mutex poisoned while saving PLP prefetch buffer"
+                            );
+                            return SQL_ERROR;
+                        };
+                        if let Some((bytes, tail, total_read_before)) = carry {
+                            let Some(stream) = stmt_state.active_plp.as_mut() else {
+                                error!(
+                                    "SQLGetData: PLP stream vanished while saving prefetched bytes"
+                                );
+                                return SQL_ERROR;
+                            };
+                            stream.set_prefetched_wire(
+                                bytes,
+                                tail.read,
+                                total_read_before,
+                                tail.known_total,
+                                tail.reached_end,
+                            );
+                        } else if let Some(buffer) = unused_scratch {
+                            stmt_state.plp_prefetch_scratch = buffer;
+                        }
+                        if let Some(error) = prefetch_error {
+                            let Some(stream) = stmt_state.active_plp.as_mut() else {
+                                error!(
+                                    "SQLGetData: PLP stream vanished while saving prefetch error"
+                                );
+                                return SQL_ERROR;
+                            };
+                            stream.set_prefetch_error(error);
+                        }
+                        Ok(chunk)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         }
     };
 
@@ -1458,13 +1601,20 @@ fn stream_active_plp_chunk(
     } = match read_result {
         Ok(chunk) => chunk,
         Err(e) => {
-            if let Ok(mut s) = stmt.inner.lock() {
+            if let Some(mut s) = retained_stmt_state.take() {
+                s.clear_state(STMT_STATE_CURSOR_OPEN);
+                post_tds_error(&mut s, &e, SQLSTATE_HY000);
+            } else if let Ok(mut s) = stmt.inner.lock() {
                 s.clear_state(STMT_STATE_CURSOR_OPEN);
                 post_tds_error(&mut s, &e, SQLSTATE_HY000);
             }
             return SQL_ERROR;
         }
     };
+
+    if widen_narrow_to_utf16 || transcode_utf16_to_utf8 {
+        drop(retained_stmt_state.take());
+    }
 
     if widen_narrow_to_utf16 {
         // varchar(max)/json wire bytes are narrow; widen them to UTF-16LE for
@@ -1613,9 +1763,15 @@ fn stream_active_plp_chunk(
         }
     }
 
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
-        error!("SQLGetData: stmt mutex poisoned while finalizing PLP stream read");
-        return SQL_ERROR;
+    let mut stmt_state = match retained_stmt_state {
+        Some(state) => state,
+        None => {
+            let Ok(state) = stmt.inner.lock() else {
+                error!("SQLGetData: stmt mutex poisoned while finalizing PLP stream read");
+                return SQL_ERROR;
+            };
+            state
+        }
     };
 
     // The wire being exhausted is not the same as the value being delivered: the
@@ -1627,7 +1783,12 @@ fn stream_active_plp_chunk(
         .is_some_and(|s| !s.pending_units.is_empty());
 
     if reached_end && !widen_units_still_held {
-        stmt_state.active_plp = None;
+        if let Some(mut stream) = stmt_state.active_plp.take() {
+            let buffer = stream.take_prefetch_buffer();
+            if buffer.capacity() > stmt_state.plp_prefetch_scratch.capacity() {
+                stmt_state.plp_prefetch_scratch = buffer;
+            }
+        }
         return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
     }
 

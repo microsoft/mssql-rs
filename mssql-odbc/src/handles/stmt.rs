@@ -54,6 +54,15 @@ pub(crate) struct ActivePlpStream {
     /// having consumed nothing). Holding the surplus here lets a caller ask for
     /// one character at a time without stalling the stream.
     pub(crate) pending_units: Vec<u16>,
+    /// Wire bytes read ahead while the first async read for this value was
+    /// already in flight. Later SQLGetData calls consume these without entering
+    /// the runtime again.
+    prefetched_wire: Vec<u8>,
+    prefetched_offset: usize,
+    prefetched_total_read_before: usize,
+    prefetched_known_total: Option<u64>,
+    prefetched_reached_end: bool,
+    prefetch_error: Option<Box<TdsError>>,
 }
 
 #[derive(Debug)]
@@ -82,7 +91,77 @@ impl ActivePlpStream {
             pending_high_surrogate: None,
             narrow_to_wide,
             pending_units: Vec::new(),
+            prefetched_wire: Vec::new(),
+            prefetched_offset: 0,
+            prefetched_total_read_before: 0,
+            prefetched_known_total: None,
+            prefetched_reached_end: false,
+            prefetch_error: None,
         }
+    }
+
+    pub(crate) fn set_prefetched_wire(
+        &mut self,
+        mut bytes: Vec<u8>,
+        read: usize,
+        total_read_before: usize,
+        known_total: Option<u64>,
+        reached_end: bool,
+    ) {
+        bytes.truncate(read);
+        self.prefetched_wire = bytes;
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = total_read_before;
+        self.prefetched_known_total = known_total;
+        self.prefetched_reached_end = reached_end;
+    }
+
+    pub(crate) fn read_prefetched_wire(
+        &mut self,
+        out: &mut [u8],
+    ) -> Option<(usize, bool, Option<u64>, usize)> {
+        let remaining = self
+            .prefetched_wire
+            .len()
+            .saturating_sub(self.prefetched_offset);
+        if remaining == 0 {
+            return None;
+        }
+
+        let read = remaining.min(out.len());
+        let end = self.prefetched_offset.saturating_add(read);
+        let source = self.prefetched_wire.get(self.prefetched_offset..end)?;
+        let target = out.get_mut(..read)?;
+        target.copy_from_slice(source);
+        self.prefetched_offset = end;
+
+        let reached_end =
+            self.prefetched_reached_end && self.prefetched_offset == self.prefetched_wire.len();
+        Some((
+            read,
+            reached_end,
+            self.prefetched_known_total,
+            self.prefetched_total_read_before
+                .saturating_add(self.prefetched_offset),
+        ))
+    }
+
+    pub(crate) fn take_prefetch_buffer(&mut self) -> Vec<u8> {
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = 0;
+        self.prefetched_known_total = None;
+        self.prefetched_reached_end = false;
+        let mut buffer = std::mem::take(&mut self.prefetched_wire);
+        buffer.clear();
+        buffer
+    }
+
+    pub(crate) fn set_prefetch_error(&mut self, error: TdsError) {
+        self.prefetch_error = Some(Box::new(error));
+    }
+
+    pub(crate) fn take_prefetch_error(&mut self) -> Option<TdsError> {
+        self.prefetch_error.take().map(|error| *error)
     }
 }
 
@@ -96,6 +175,14 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("pending_high_surrogate", &self.pending_high_surrogate)
             .field("narrow_to_wide", &self.narrow_to_wide.is_some())
             .field("pending_units", &self.pending_units.len())
+            .field(
+                "prefetched_wire_remaining",
+                &self
+                    .prefetched_wire
+                    .len()
+                    .saturating_sub(self.prefetched_offset),
+            )
+            .field("prefetch_error", &self.prefetch_error.is_some())
             .finish()
     }
 }
@@ -169,6 +256,9 @@ pub(crate) struct StmtState {
     /// UTF-16 column names built once when result metadata changes.
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
     pub(crate) plp_encodings: Option<Arc<[Option<PlpEncoding>]>>,
+    /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
+    /// fresh carry buffer.
+    pub(crate) plp_prefetch_scratch: Vec<u8>,
     /// Set once a fetch has confirmed — possibly by peeking one token past
     /// the row it just delivered — that no further rows exist for the
     /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
@@ -1060,6 +1150,7 @@ impl StmtHandle {
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
                 plp_encodings: None,
+                plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,
@@ -1280,5 +1371,46 @@ mod tests {
             assert!(s.column_names_utf16.is_empty());
             assert!(s.plp_encodings.is_none());
         });
+    }
+
+    #[test]
+    fn prefetched_plp_wire_spans_application_calls() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.set_prefetched_wire(vec![1, 2, 3, 4, 5, 6], 6, 8, Some(14), true);
+
+        let mut first = [0; 2];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut first),
+            Some((2, false, Some(14), 10))
+        );
+        assert_eq!(first, [1, 2]);
+
+        let mut second = [0; 8];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut second),
+            Some((4, true, Some(14), 14))
+        );
+        assert_eq!(&second[..4], &[3, 4, 5, 6]);
+        assert_eq!(stream.read_prefetched_wire(&mut second), None);
+    }
+
+    #[test]
+    fn prefetched_plp_wire_preserves_unknown_length_and_incomplete_tail() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.set_prefetched_wire(vec![7, 8, 9], 2, 5, None, false);
+
+        let mut probe = [];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut probe),
+            Some((0, false, None, 5))
+        );
+
+        let mut output = [0; 4];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut output),
+            Some((2, false, None, 7))
+        );
+        assert_eq!(&output[..2], &[7, 8]);
+        assert_eq!(stream.read_prefetched_wire(&mut output), None);
     }
 }
