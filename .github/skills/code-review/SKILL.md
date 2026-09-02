@@ -20,8 +20,10 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    missing or doesn't match the diff. This repo requires a linked GitHub issue or
    Azure DevOps work item — flag a PR that has neither. Resolving an `AB#` reference
    is worth it when you can: it catches a PR that drifts from what its work item
-   asked, or one still open against a closed item. See step 6 for handling ADO in an
-   unattended run.
+   asked, or one still open against a closed item. Attempt the lookup before treating
+   it as out of reach — the Azure DevOps MCP server answers `wit_work_item` without
+   an interactive prompt. See step 6 for what to do when a call actually fails, and
+   for unattended runs.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -92,6 +94,14 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      `$BASE` and compare failure sets; only the difference belongs in the review.
    - **Is this coverage gap real?** Introduce the bug the missing test would catch and
      show the suite still passes.
+   - **Does the platform-gated half still compile?** `cargo check` / `cargo clippy
+     --target <triple>` type-checks `#[cfg(windows)]` and `#[cfg(target_os = ...)]`
+     code from any host, because neither links (`rustup target add
+     aarch64-pc-windows-msvc`; ~30 s warm for `-p mssqlodbc --lib`). It cannot run a
+     Windows test binary, so runtime behaviour there still rests on the CI matrix —
+     but "my host is Linux, so the matrix owns this" is the wrong default when
+     reviewing platform-gated code, and a mutation applied to an arm your host does
+     not select proves nothing on its own.
 
    ```bash
    cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
@@ -120,18 +130,28 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    - notes in the body that it came from an unattended run, so the author knows the
      findings were not checked by a human first.
    - never merges, and never resolves a thread it did not open.
-   - treats every interactive authentication path as unavailable, and prefers a tool
-     that fails loudly over one that waits politely. The Azure DevOps MCP server is the
-     known trap: its OAuth flow blocks on a browser nobody will open, and the run keeps
-     reporting itself as healthy while it hangs. Use whatever non-interactive ADO access
-     you have instead, bound it with a timeout, and mark ADO unavailable for the rest of
-     the run on the first failure rather than retrying per PR.
+   - treats every *interactive* authentication path as unavailable, and prefers a tool
+     that fails loudly over one that waits politely. The hazard belongs to the context
+     rather than to any one server: a flow that would open a browser has nobody to
+     answer it, and the run can keep reporting itself as healthy while it hangs. Bound
+     each such call with a timeout, and on a real failure mark that dependency
+     unavailable for the rest of the run instead of retrying per PR.
 
-   **Fail open.** ADO is context, not a gate: it confirms a PR does what its work item
-   asked. When it is unreachable, take an `AB#<number>` at face value as satisfying the
-   linked-work-item requirement in step 1 and review normally. Report the skipped
-   cross-check in the run log, not in the PR — a reviewer's infrastructure trouble is
-   not the author's problem.
+     This does **not** describe the Azure DevOps MCP server in ordinary use. It answers
+     `wit_work_item` and `wit_query` non-interactively on an already-authenticated
+     host — verified 2026-09-02, an `action: get` on a work item returned immediately
+     with no prompt and no hang. Earlier revisions of this file named it as a known
+     trap; that has since been read as a standing fact about the tool and has cost
+     real cross-checks. Call it, then decide.
+
+   **Fail open — after a failed call, not instead of one.** ADO is context, not a
+   gate: it confirms a PR does what its work item asked. When a lookup *actually*
+   fails, take an `AB#<number>` at face value as satisfying the linked-work-item
+   requirement in step 1, review normally, and report the skipped cross-check in the
+   run log rather than in the PR — a reviewer's infrastructure trouble is not the
+   author's problem. Reaching for this paragraph without having attempted the lookup
+   is the failure mode it exists to bound, and it silently drops the one check that
+   catches a PR drifting from what its work item asked.
 7. Ground yourself in reference code and public/private documentation/specifications.
    If you don't know the codebase, or which references to use, ask for context before
    reviewing.
@@ -354,6 +374,13 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
   that contradiction *is* the finding.
 - Distinguish facts (verified in code) from concerns (worth checking). Don't state
   guesses as defects. Say what you ran and what you read.
+- **An unavailability is a claim, and it carries the same burden as a defect.** Write
+  "I could not check X" only after invoking the thing and quoting what came back.
+  Three of the four caveats closing one recent review — no ADO access, no Windows
+  host, Linux-only mutation scope — did not survive being tested. Keep two categories
+  apart: *the environment cannot do this* needs a failed invocation, while *the defect
+  is inherently untestable* (process teardown, a TOCTOU window) needs only an argument
+  and stays valid.
 - If a change is correct, don't invent problems. An empty severity group means "none
   found" — say so briefly.
 - Reviewing is not merging. The PR author owns the merge — never merge someone
