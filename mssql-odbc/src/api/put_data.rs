@@ -449,6 +449,23 @@ mod tests {
         assert_eq!(unsafe { nts_byte_count(ptr, 0) }, 1);
     }
 
+    #[test]
+    fn nts_byte_count_reads_a_misaligned_wide_buffer() {
+        let mut storage = [0u8; 8];
+        let ptr = unsafe { storage.as_mut_ptr().add(1) };
+        assert_ne!(
+            ptr as usize % std::mem::align_of::<u16>(),
+            0,
+            "test pointer must be misaligned"
+        );
+        unsafe {
+            ptr.cast::<u16>().write_unaligned(0x0041);
+            ptr.add(2).cast::<u16>().write_unaligned(0x0000);
+        }
+
+        assert_eq!(unsafe { nts_byte_count(ptr.cast(), SQL_C_WCHAR) }, 2);
+    }
+
     /// A binding can disappear under an open sequence via
     /// `SQLFreeStmt(SQL_RESET_PARAMS)`, leaving no C type to size `SQL_NTS`
     /// with. The call is rejected instead of guessing.
