@@ -377,6 +377,8 @@ pub(crate) struct StmtState {
     /// the column is being read as (bytes for `SQL_C_CHAR`, UTF-16 code units
     /// for `SQL_C_WCHAR`); a single column's chunk loop uses one target type.
     pub(crate) partial_text_offset: Option<(usize, usize)>,
+    /// Direct string path already validated for `(1-based column, C target type)`.
+    pub(crate) direct_text_target: Option<(usize, SqlSmallInt)>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -1049,6 +1051,7 @@ impl StmtState {
         self.active_plp = None;
         self.current_row_last_col = 0;
         self.partial_text_offset = None;
+        self.direct_text_target = None;
     }
 
     /// Positions the row stream on a freshly fetched row: clears all per-row
@@ -1202,6 +1205,7 @@ impl StmtHandle {
                 active_plp: None,
                 current_row_last_col: 0,
                 partial_text_offset: None,
+                direct_text_target: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,

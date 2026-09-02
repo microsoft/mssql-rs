@@ -891,6 +891,42 @@ fn write_captured_column(
         return rc;
     }
 
+    let offset = stmt_state
+        .partial_text_offset
+        .filter(|(c, _)| *c == col_index)
+        .map(|(_, o)| o)
+        .unwrap_or(0);
+    let direct_validated = stmt_state.direct_text_target == Some((col_index, target_type));
+    if let Some((truncated, consumed, remaining)) = unsafe {
+        try_write_direct_captured_string_chunk(
+            value,
+            target_type,
+            target_value_ptr,
+            buf_elements,
+            strlen_or_ind_ptr,
+            offset,
+            direct_validated,
+        )
+    } {
+        let rc = if truncated {
+            post_diag(stmt_state, WARN_STRING_TRUNCATION);
+            SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_SUCCESS
+        };
+        if truncated && consumed < remaining {
+            stmt_state.partial_text_offset = Some((col_index, offset + consumed));
+            stmt_state.direct_text_target = Some((col_index, target_type));
+        } else {
+            stmt_state.current_row_last_col = col_index;
+            retain_completed_buffered_value(stmt_state, col_index);
+            stmt_state.partial_text_offset = None;
+            stmt_state.direct_text_target = None;
+        }
+        return rc;
+    }
+    stmt_state.direct_text_target = None;
+
     let as_text = match column_value_to_text(value) {
         Ok(t) => t,
         Err(TextError::Malformed) => {
@@ -918,12 +954,6 @@ fn write_captured_column(
     // Resume from where a prior truncated read of this column left off. The
     // offset unit matches the target C type (bytes for CHAR, UTF-16 code units
     // for WCHAR); a single column's chunk loop uses one target type throughout.
-    let offset = stmt_state
-        .partial_text_offset
-        .filter(|(c, _)| *c == col_index)
-        .map(|(_, o)| o)
-        .unwrap_or(0);
-
     let (rc, consumed, remaining) = if target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = as_text.encode_utf16().skip(offset).collect();
         let consumed = buf_elements.saturating_sub(1).min(utf16.len());
@@ -960,6 +990,106 @@ fn write_captured_column(
         stmt_state.partial_text_offset = None;
     }
     rc
+}
+
+unsafe fn try_write_direct_captured_string_chunk(
+    value: &ColumnValues,
+    target_type: SqlSmallInt,
+    target_value_ptr: SqlPointer,
+    buf_elements: usize,
+    strlen_or_ind_ptr: *mut SqlLen,
+    offset: usize,
+    validated: bool,
+) -> Option<(bool, usize, usize)> {
+    let ColumnValues::String(value) = value else {
+        return None;
+    };
+    let bytes = &value.bytes;
+    if target_type == SQL_C_CHAR {
+        let direct = match value.encoding_type() {
+            EncodingType::Utf8 => validated || std::str::from_utf8(bytes).is_ok(),
+            EncodingType::LcidBased(_) => validated || bytes.is_ascii(),
+            _ => false,
+        };
+        if !direct {
+            return None;
+        }
+        let remaining = bytes.get(offset.min(bytes.len())..)?;
+        unsafe {
+            write_if_some(
+                strlen_or_ind_ptr,
+                SqlLen::try_from(remaining.len()).unwrap_or(SqlLen::MAX),
+            );
+        }
+        let consumed = buf_elements.saturating_sub(1).min(remaining.len());
+        let truncated =
+            unsafe { copy_with_nul(target_value_ptr.cast::<u8>(), buf_elements, remaining) };
+        return Some((truncated, consumed, remaining.len()));
+    }
+
+    if target_type != SQL_C_WCHAR
+        || !matches!(value.encoding_type(), EncodingType::Utf16)
+        || !bytes.len().is_multiple_of(2)
+        || !validated
+            && !std::char::decode_utf16(
+                bytes
+                    .chunks_exact(2)
+                    .map(|unit| u16::from_le_bytes([unit[0], unit[1]])),
+            )
+            .all(|unit| unit.is_ok())
+    {
+        return None;
+    }
+
+    let total_units = bytes.len() / 2;
+    let offset = offset.min(total_units);
+    let remaining_units = total_units - offset;
+    let remaining_bytes = remaining_units.saturating_mul(std::mem::size_of::<SqlWChar>());
+    unsafe {
+        write_if_some(
+            strlen_or_ind_ptr,
+            SqlLen::try_from(remaining_bytes).unwrap_or(SqlLen::MAX),
+        );
+    }
+    let consumed = buf_elements.saturating_sub(1).min(remaining_units);
+    let target = target_value_ptr.cast::<SqlWChar>();
+    let truncated = if target.is_null() {
+        false
+    } else if buf_elements == 0 {
+        remaining_units != 0
+    } else {
+        let start = offset.saturating_mul(2);
+        for (index, unit) in bytes[start..].chunks_exact(2).take(consumed).enumerate() {
+            unsafe {
+                target
+                    .add(index)
+                    .write_unaligned(u16::from_le_bytes([unit[0], unit[1]]));
+            }
+        }
+        unsafe { target.add(consumed).write_unaligned(0) };
+        consumed < remaining_units
+    };
+    Some((truncated, consumed, remaining_units))
+}
+
+fn retain_completed_buffered_value(stmt_state: &mut StmtState, col_index: usize) {
+    let Some((captured_column, value)) = stmt_state.last_captured.take() else {
+        return;
+    };
+    if captured_column != col_index {
+        return;
+    }
+    let Some(slot_index) = col_index.checked_sub(1) else {
+        return;
+    };
+    let Some(slot) = stmt_state
+        .buffered_get_data_row
+        .as_mut()
+        .and_then(|row| row.values.get_mut(slot_index))
+    else {
+        return;
+    };
+    *slot = Some(value);
 }
 
 fn resume_row_to_column(
@@ -2191,6 +2321,7 @@ mod tests {
     use crate::handles::DbcHandle;
     use crate::handles::stmt::BufferedGetDataRow;
     use crate::test_support::TestHandles;
+    use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
     use mssql_tds::test_client_support::{int_columns, tds_client_from_int_rows};
 
@@ -2206,6 +2337,86 @@ mod tests {
             d.message,
             expected.text
         );
+    }
+
+    #[test]
+    fn direct_captured_utf8_chunks_without_transcoding() {
+        let value = ColumnValues::String(SqlString::new(b"abcdef".to_vec(), EncodingType::Utf8));
+        let mut first = [0_u8; 4];
+        let mut indicator = 0;
+
+        let result = unsafe {
+            try_write_direct_captured_string_chunk(
+                &value,
+                SQL_C_CHAR,
+                first.as_mut_ptr().cast(),
+                first.len(),
+                &mut indicator,
+                0,
+                false,
+            )
+        };
+        assert_eq!(result, Some((true, 3, 6)));
+        assert_eq!(indicator, 6);
+        assert_eq!(first, [b'a', b'b', b'c', 0]);
+
+        let mut second = [0_u8; 4];
+        let result = unsafe {
+            try_write_direct_captured_string_chunk(
+                &value,
+                SQL_C_CHAR,
+                second.as_mut_ptr().cast(),
+                second.len(),
+                &mut indicator,
+                3,
+                true,
+            )
+        };
+        assert_eq!(result, Some((false, 3, 3)));
+        assert_eq!(indicator, 3);
+        assert_eq!(second, [b'd', b'e', b'f', 0]);
+    }
+
+    #[test]
+    fn direct_captured_utf16_chunks_in_code_units() {
+        let units: Vec<u16> = "a😀b".encode_utf16().collect();
+        let value = ColumnValues::String(SqlString::new(
+            units.iter().flat_map(|unit| unit.to_le_bytes()).collect(),
+            EncodingType::Utf16,
+        ));
+        let mut first = [0_u16; 3];
+        let mut indicator = 0;
+
+        let result = unsafe {
+            try_write_direct_captured_string_chunk(
+                &value,
+                SQL_C_WCHAR,
+                first.as_mut_ptr().cast(),
+                first.len(),
+                &mut indicator,
+                0,
+                false,
+            )
+        };
+        assert_eq!(result, Some((true, 2, 4)));
+        assert_eq!(indicator, 8);
+        assert_eq!(first, [units[0], units[1], 0]);
+
+        let mut second = [0_u16; 3];
+        let result = unsafe {
+            try_write_direct_captured_string_chunk(
+                &value,
+                SQL_C_WCHAR,
+                second.as_mut_ptr().cast(),
+                second.len(),
+                &mut indicator,
+                2,
+                true,
+            )
+        };
+        assert_eq!(result, Some((false, 2, 2)));
+        assert_eq!(indicator, 4);
+        assert_eq!(second, [units[2], units[3], 0]);
     }
 
     #[test]
@@ -2662,6 +2873,20 @@ mod tests {
         });
     }
 
+    fn stmt_with_buffered_string(h: &TestHandles, value: SqlString) {
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        state.set_state(STMT_STATE_CURSOR_OPEN);
+        state.column_metadata = int_columns(1);
+        state.row_positioned = true;
+        state.buffered_get_data_row = Some(BufferedGetDataRow {
+            variant_bases: vec![None],
+            values: vec![Some(ColumnValues::String(value))],
+            consumed: 0,
+            wire_deferred: false,
+        });
+    }
+
     fn stmt_with_buffered_prefix_and_deferred_client(h: &TestHandles) {
         h.mark_dbc_connected();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -2723,6 +2948,58 @@ mod tests {
         assert_eq!(state.current_row_last_col, 2);
         assert!(state.last_captured.is_none());
         assert!(state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn completed_direct_string_returns_its_allocation_to_the_spare_row() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_string(&h, SqlString::new(b"abcdef".to_vec(), EncodingType::Utf8));
+        let mut first = [0_u8; 4];
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    first.as_mut_ptr().cast(),
+                    first.len() as SqlLen,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.partial_text_offset, Some((1, 3)));
+            assert_eq!(state.direct_text_target, Some((1, SQL_C_CHAR)));
+        }
+        let mut second = [0_u8; 4];
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    second.as_mut_ptr().cast(),
+                    second.len() as SqlLen,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.direct_text_target, None);
+        let value = state
+            .spare_get_data_row
+            .as_ref()
+            .and_then(|row| row.values.first())
+            .and_then(Option::as_ref);
+        assert!(matches!(value, Some(ColumnValues::String(value)) if value.bytes == b"abcdef"));
     }
 
     #[test]
