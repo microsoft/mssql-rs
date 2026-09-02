@@ -154,6 +154,28 @@ authoritative parity reference for this crate. Its source lives in the
     `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
     outstanding 18.6.2.1 measurements land - keep the running record there
     rather than growing this file per build.
+  - **A bound `max`/LOB text column converted to a typed C target is refused
+    above 1 MiB.** A typed conversion needs the whole literal, and a
+    `varchar(max)` carries up to 2 GB, so `PLP_TYPED_MATERIALIZE_LIMIT`
+    (`api/fetch_scroll.rs`) caps that one allocation; past the cap the value is
+    drained to keep the row synchronized and answered `HYC00` rather than
+    converted. The cap is this driver's own resource bound with no msodbcsql
+    counterpart, so the compare leg cannot agree by construction and
+    `AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained` carries
+    `SKIP_IF_COMPARING_MSODBCSQL()`. Every literal this path converts - numeric,
+    GUID, datetime - is orders of magnitude below the cap, so no realistic
+    conversion input reaches it; raise or stream it if one ever does. Tracked in
+    AB#47767.
+  - **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
+    character.** A buffer with no room for the final surrogate pair ends before
+    it; msodbcsql leaves the lone high surrogate in the last payload slot on this
+    narrow-source widening path, though its wide-source path is surrogate-safe
+    (`GetColDataSurrogateSafe`, and `TrimPartialCodePt` for partial sequences).
+    This driver's existing bound `nvarchar(max)` delivery already trims to a
+    character boundary, and handing back text that does not decode from one `max`
+    type but not the other would be worse than the divergence.
+    `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
+    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
 
 ## No panics
 

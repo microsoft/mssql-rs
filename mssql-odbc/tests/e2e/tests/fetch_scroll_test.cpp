@@ -723,7 +723,9 @@ TEST_F(FetchScrollLiveTest, ABoundJsonWidensToWchar) {
 TEST_F(FetchScrollLiveTest, ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening) {
     // msodbcsql leaves the high surrogate in the ninth payload slot here. The
     // Rust driver deliberately applies the whole-character truncation rule used
-    // by its existing nvarchar(max) bound delivery instead.
+    // by its existing nvarchar(max) bound delivery instead. Recorded as a
+    // deliberate deviation in .github/instructions/mssql-odbc.instructions.md
+    // and tracked in AB#47767.
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
         "SELECT CAST(REPLICATE((NCHAR(0xD83D) + NCHAR(0xDE00)) "
@@ -805,6 +807,10 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTypedConversionErrorStillDrainsTheRo
 }
 
 TEST_F(FetchScrollLiveTest, AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained) {
+    // The 1 MiB materialization cap is this driver's own resource bound and has
+    // no msodbcsql counterpart, so parity cannot hold here by construction.
+    // Recorded as a deliberate deviation in
+    // .github/instructions/mssql-odbc.instructions.md and tracked in AB#47767.
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
         "SELECT v, n FROM ("
@@ -972,6 +978,41 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
     // And the next row too: a drain that stopped short would misread it.
     EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
     EXPECT_EQ(2, n);
+    EXPECT_EQ(22, tail);
+
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// The typed-conversion path reaches the same refusal by a different route: a
+// binary PLP column has no source encoding to convert from, so it is drained and
+// refused before any conversion is attempted. Same AB#47239 gap as above, so it
+// likewise asserts our own answer rather than parity.
+TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxToTypedCTargetIsStillUnsupported) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect(
+        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS lob, n * 11 AS tail "
+        "FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
+
+    SQLINTEGER n = -1;
+    SQLINTEGER converted = -1;
+    SQLINTEGER tail = -1;
+    SQLLEN nInd = 0, convertedInd = 0, tailInd = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &n, sizeof(n), &nInd), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 2, SQL_C_SLONG, &converted, sizeof(converted), &convertedInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 3, SQL_C_SLONG, &tail, sizeof(tail), &tailInd),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    EXPECT_EQ(11, tail) << "the column after a refused LOB must still decode";
+
+    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_EQ(2, n) << "the drain must leave the next row synchronized";
     EXPECT_EQ(22, tail);
 
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
