@@ -2484,6 +2484,93 @@ pub(crate) mod tests {
         )
     }
 
+    /// A stream whose reads always fail, used to exercise the I/O-error arm of
+    /// `try_get_new_tds_packet` that a duplex stream's plain EOF can't reach.
+    struct ErroringStream;
+
+    impl AsyncRead for ErroringStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(Error::new(
+                ErrorKind::ConnectionReset,
+                "synthetic read failure",
+            )))
+        }
+    }
+
+    impl AsyncWrite for ErroringStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for ErroringStream {
+        fn tls_handshake_starting(&mut self) {}
+        fn tls_handshake_completed(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn get_new_tds_packet_surfaces_a_read_error_and_marks_the_connection_dead() {
+        let context = ClientContext::default();
+        let ssl_handler = SslHandler {
+            server_host_name: context.transport_context.get_server_name().clone(),
+            encryption_options: context.encryption_options.clone(),
+        };
+        let mut transport = NetworkTransport::new(
+            Box::new(ErroringStream),
+            ssl_handler,
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        );
+
+        let err = transport
+            .read_tds_packet()
+            .await
+            .expect_err("a failing stream must surface its read error");
+        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(transport.known_dead);
+    }
+
+    #[tokio::test]
+    async fn try_get_new_tds_packet_surfaces_a_read_error_and_marks_the_connection_dead() {
+        // Same as above, but through the synchronous, non-blocking
+        // `try_get_new_tds_packet` poll used by the buffered PLP read loop.
+        let context = ClientContext::default();
+        let ssl_handler = SslHandler {
+            server_host_name: context.transport_context.get_server_name().clone(),
+            encryption_options: context.encryption_options.clone(),
+        };
+        let mut transport = NetworkTransport::new(
+            Box::new(ErroringStream),
+            ssl_handler,
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        );
+
+        let err = transport
+            .try_read_tds_packet()
+            .expect_err("a failing stream must surface its read error");
+        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(transport.known_dead);
+    }
+
     #[tokio::test]
     async fn test_network_transport_send() {
         let context = ClientContext {

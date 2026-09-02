@@ -2473,6 +2473,124 @@ mod tests {
     }
 
     #[test]
+    fn direct_captured_string_requires_a_valid_matching_encoding() {
+        let mut indicator = 0;
+        assert_eq!(
+            unsafe {
+                try_write_direct_captured_string_chunk(
+                    &ColumnValues::Int(1),
+                    SQL_C_CHAR,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut indicator,
+                    0,
+                    false,
+                )
+            },
+            None
+        );
+
+        let invalid_utf8 = ColumnValues::String(SqlString::new(vec![0xFF], EncodingType::Utf8));
+        let mut narrow = [0_u8; 2];
+        assert_eq!(
+            unsafe {
+                try_write_direct_captured_string_chunk(
+                    &invalid_utf8,
+                    SQL_C_CHAR,
+                    narrow.as_mut_ptr().cast(),
+                    narrow.len(),
+                    &mut indicator,
+                    0,
+                    false,
+                )
+            },
+            None
+        );
+        assert_eq!(
+            unsafe {
+                try_write_direct_captured_string_chunk(
+                    &invalid_utf8,
+                    SQL_C_CHAR,
+                    narrow.as_mut_ptr().cast(),
+                    narrow.len(),
+                    &mut indicator,
+                    0,
+                    true,
+                )
+            },
+            Some((false, 1, 1))
+        );
+        assert_eq!(narrow, [0xFF, 0]);
+
+        let odd_utf16 = ColumnValues::String(SqlString::new(vec![b'a'], EncodingType::Utf16));
+        assert_eq!(
+            unsafe {
+                try_write_direct_captured_string_chunk(
+                    &odd_utf16,
+                    SQL_C_WCHAR,
+                    std::ptr::null_mut(),
+                    2,
+                    &mut indicator,
+                    0,
+                    true,
+                )
+            },
+            None
+        );
+
+        let unpaired_surrogate = ColumnValues::String(SqlString::new(
+            0xD800_u16.to_le_bytes().to_vec(),
+            EncodingType::Utf16,
+        ));
+        assert_eq!(
+            unsafe {
+                try_write_direct_captured_string_chunk(
+                    &unpaired_surrogate,
+                    SQL_C_WCHAR,
+                    std::ptr::null_mut(),
+                    2,
+                    &mut indicator,
+                    0,
+                    false,
+                )
+            },
+            None
+        );
+        assert_eq!(
+            unsafe {
+                try_write_direct_captured_string_chunk(
+                    &unpaired_surrogate,
+                    SQL_C_WCHAR,
+                    std::ptr::null_mut(),
+                    2,
+                    &mut indicator,
+                    0,
+                    true,
+                )
+            },
+            Some((false, 1, 1))
+        );
+
+        let mut wide = [0xAAAA_u16; 1];
+        assert_eq!(
+            unsafe {
+                try_write_direct_captured_string_chunk(
+                    &unpaired_surrogate,
+                    SQL_C_WCHAR,
+                    wide.as_mut_ptr().cast(),
+                    0,
+                    &mut indicator,
+                    0,
+                    true,
+                )
+            },
+            Some((true, 0, 1))
+        );
+        assert_eq!(wide, [0xAAAA]);
+        assert_eq!(indicator, 2);
+    }
+
+    #[test]
     fn get_data_null_handle() {
         let ret = unsafe {
             sql_get_data(
@@ -2909,7 +3027,7 @@ mod tests {
         state.active_stmt = Some(h.stmt);
     }
 
-    fn stmt_with_buffered_get_data_row(h: &TestHandles, values: Vec<i32>) {
+    fn stmt_with_buffered_values(h: &TestHandles, values: Vec<ColumnValues>) {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
         state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -2917,13 +3035,14 @@ mod tests {
         state.row_positioned = true;
         state.buffered_get_data_row = Some(BufferedGetDataRow {
             variant_bases: vec![None; values.len()],
-            values: values
-                .into_iter()
-                .map(|value| Some(ColumnValues::Int(value)))
-                .collect(),
+            values: values.into_iter().map(Some).collect(),
             consumed: 0,
             wire_deferred: false,
         });
+    }
+
+    fn stmt_with_buffered_get_data_row(h: &TestHandles, values: Vec<i32>) {
+        stmt_with_buffered_values(h, values.into_iter().map(ColumnValues::Int).collect());
     }
 
     fn stmt_with_buffered_string(h: &TestHandles, value: SqlString) {
@@ -3001,6 +3120,115 @@ mod tests {
         assert_eq!(state.current_row_last_col, 2);
         assert!(state.last_captured.is_none());
         assert!(state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn buffered_utf16_ascii_delivers_in_one_call() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let utf16 = "hi"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut values = vec![ColumnValues::Null; 8];
+        values[0] = ColumnValues::String(SqlString::new(utf16, EncodingType::Utf16));
+        stmt_with_buffered_values(&h, values);
+        let mut output = [0_u8; 3];
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    SqlLen::try_from(output.len()).unwrap(),
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(&output, b"hi\0");
+        assert_eq!(indicator, 2);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        let row = state.buffered_get_data_row.as_ref().unwrap();
+        assert_eq!(row.consumed, 1);
+        assert!(state.last_captured.is_none());
+    }
+
+    #[test]
+    fn buffered_decimal_delivers_odbc_text_in_one_call() {
+        use mssql_tds::datatypes::decoder::DecimalParts;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut values = vec![ColumnValues::Null; 8];
+        values[0] = ColumnValues::Decimal(DecimalParts::from_string("0.4500", 18, 4).unwrap());
+        stmt_with_buffered_values(&h, values);
+        let mut output = [0_u8; 6];
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_CHAR,
+                    output.as_mut_ptr().cast(),
+                    SqlLen::try_from(output.len()).unwrap(),
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(&output, b".4500\0");
+        assert_eq!(indicator, 5);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .buffered_get_data_row
+                .as_ref()
+                .unwrap()
+                .consumed,
+            1
+        );
+    }
+
+    #[test]
+    fn buffered_typed_conversion_handles_a_non_exact_target() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_values(&h, vec![ColumnValues::Int(42)]);
+        let mut output = 0_i64;
+        let mut indicator = 0;
+
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_SBIGINT,
+                    (&mut output as *mut i64).cast(),
+                    SqlLen::try_from(std::mem::size_of_val(&output)).unwrap(),
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(output, 42);
+        assert_eq!(
+            indicator,
+            SqlLen::try_from(std::mem::size_of::<i64>()).unwrap()
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        let row = state.spare_get_data_row.as_ref().unwrap();
+        assert_eq!(row.values[0], None);
+        assert_eq!(row.consumed, 1);
     }
 
     #[test]
@@ -3543,6 +3771,113 @@ mod tests {
                 &mut indicator,
             )
         });
+    }
+
+    #[test]
+    fn exact_buffered_scalars_write_each_supported_layout() {
+        use std::mem::MaybeUninit;
+
+        use mssql_tds::datatypes::column_values::{
+            SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
+        };
+
+        macro_rules! check {
+            ($value:expr, $target_type:expr, $target_rust_type:ty, $expected:expr) => {{
+                let value = $value;
+                let mut output = MaybeUninit::<$target_rust_type>::uninit();
+                let mut indicator = 0;
+                assert!(unsafe {
+                    try_write_exact_buffered_scalar(
+                        &value,
+                        $target_type,
+                        output.as_mut_ptr().cast(),
+                        &mut indicator,
+                    )
+                });
+                assert_eq!(
+                    indicator,
+                    SqlLen::try_from(std::mem::size_of::<$target_rust_type>()).unwrap()
+                );
+                assert_eq!(unsafe { output.assume_init() }, $expected);
+            }};
+        }
+
+        check!(ColumnValues::Bit(true), SQL_C_BIT, u8, 1);
+        check!(ColumnValues::TinyInt(2), SQL_C_UTINYINT, u8, 2);
+        check!(ColumnValues::SmallInt(-3), SQL_C_SSHORT, i16, -3);
+        check!(ColumnValues::BigInt(-4), SQL_C_SBIGINT, i64, -4);
+        check!(ColumnValues::Real(5.5), SQL_C_FLOAT, f32, 5.5);
+        check!(ColumnValues::Float(-6.5), SQL_C_DOUBLE, f64, -6.5);
+
+        let date = SqlDate::create(0).unwrap();
+        check!(
+            ColumnValues::Date(date),
+            SQL_C_TYPE_DATE,
+            SqlDateStruct,
+            SqlDateStruct {
+                year: 1,
+                month: 1,
+                day: 1,
+            }
+        );
+        let time = SqlTime {
+            time_nanoseconds: 0,
+            scale: 7,
+        };
+        check!(
+            ColumnValues::Time(time.clone()),
+            SQL_C_SS_TIME2,
+            SqlSsTime2Struct,
+            SqlSsTime2Struct::default()
+        );
+        let datetime2 = SqlDateTime2 {
+            days: 0,
+            time: time.clone(),
+        };
+        check!(
+            ColumnValues::DateTime2(datetime2.clone()),
+            SQL_C_TYPE_TIMESTAMP,
+            SqlTimestampStruct,
+            SqlTimestampStruct {
+                year: 1,
+                month: 1,
+                day: 1,
+                ..SqlTimestampStruct::default()
+            }
+        );
+        let datetimeoffset = SqlDateTimeOffset {
+            datetime2,
+            offset: 90,
+        };
+        check!(
+            ColumnValues::DateTimeOffset(datetimeoffset),
+            SQL_C_SS_TIMESTAMPOFFSET,
+            SqlSsTimestampoffsetStruct,
+            SqlSsTimestampoffsetStruct {
+                year: 1,
+                month: 1,
+                day: 1,
+                hour: 1,
+                minute: 30,
+                timezone_hour: 1,
+                timezone_minute: 30,
+                ..SqlSsTimestampoffsetStruct::default()
+            }
+        );
+
+        let uuid = uuid::Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+        let (data1, data2, data3, data4) = uuid.as_fields();
+        check!(
+            ColumnValues::Uuid(uuid),
+            SQL_C_GUID,
+            SqlGuid,
+            SqlGuid {
+                data1,
+                data2,
+                data3,
+                data4: *data4,
+            }
+        );
     }
 
     /// A zero-length SQL_C_BINARY read reports the available length and leaves

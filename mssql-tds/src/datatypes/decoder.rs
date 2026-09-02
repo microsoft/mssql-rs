@@ -6080,6 +6080,182 @@ mod test {
         }
 
         // -------------------------------------------------------------------
+        // PlpChunkStreamReader buffered-path tests — synchronous helpers used
+        // when a full row can be decoded straight from already-buffered bytes.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn try_begin_buffered_returns_none_for_a_short_header() {
+            assert!(
+                PlpChunkStreamReader::try_begin_buffered(&[0; 7])
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn try_begin_buffered_reports_a_null_plp_value() {
+            let header = 0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes();
+            let result = PlpChunkStreamReader::try_begin_buffered(&header).unwrap();
+            assert!(matches!(result, Some((None, 8))));
+        }
+
+        #[test]
+        fn try_begin_buffered_rejects_a_declared_length_over_the_maximum() {
+            let header = (MAX_PLP_SIZE as u64 + 1).to_le_bytes();
+            assert!(PlpChunkStreamReader::try_begin_buffered(&header).is_err());
+        }
+
+        #[test]
+        fn try_read_complete_buffered_ignores_unknown_length_streams() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Unknown);
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_skips_once_already_finished() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(0));
+            let mut out = [];
+            assert!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_an_output_buffer_too_small() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 2];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(0u32.to_le_bytes());
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_a_full_chunk_header() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[1, 2, 3], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_a_chunk_length_mismatch() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(5u32.to_le_bytes()); // declared 4, chunk says 5
+            bytes.extend([1, 2, 3, 4, 5]);
+            bytes.extend(0u32.to_le_bytes());
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_the_full_payload() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2]); // only 2 of 4 payload bytes present
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_the_full_terminator() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend([0, 0]); // only 2 of 4 terminator bytes present
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_a_non_zero_terminator() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(1u32.to_le_bytes()); // non-zero terminator
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_ensure_active_buffered_chunk_detects_position_overflow() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut position = usize::MAX - 2;
+            let err = stream
+                .try_ensure_active_buffered_chunk(&[], &mut position)
+                .unwrap_err();
+            assert!(matches!(err, crate::error::Error::ProtocolError(_)));
+        }
+
+        #[test]
+        fn try_read_buffered_inner_zero_output_reports_missing_header() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            assert_eq!(stream.try_read_buffered_inner(&[], None, 0).unwrap(), None);
+        }
+
+        #[test]
+        fn try_read_buffered_inner_rejects_an_inconsistent_output_length() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(0u32.to_le_bytes());
+            let mut out = [0u8; 2];
+            let err = stream
+                .try_read_buffered_inner(&bytes, Some(&mut out), 4)
+                .unwrap_err();
+            assert!(matches!(err, crate::error::Error::ProtocolError(_)));
+        }
+
+        #[test]
+        fn try_read_buffered_inner_reports_missing_trailing_header_after_exact_fill() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]); // no terminator/next-chunk header follows
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_buffered_inner(&bytes, Some(&mut out), 4)
+                    .unwrap(),
+                None
+            );
+        }
+
+        // -------------------------------------------------------------------
         // PlpColumnStream tests — type-aware wrapper over PlpChunkStreamReader
         // -------------------------------------------------------------------
 
@@ -6130,6 +6306,20 @@ mod test {
             let mut reader = ByteReader::new(buf);
             let result = PlpColumnStream::begin(&md, &mut reader).await.unwrap();
             assert!(result.is_none());
+        }
+
+        #[test]
+        fn plp_column_stream_try_begin_buffered_returns_none_for_a_short_header() {
+            let md = plp_metadata(
+                TdsDataType::BigVarBinary,
+                PartialLengthType::BigVarBinary,
+                None,
+            );
+            assert!(
+                PlpColumnStream::try_begin_buffered(&md, &[0; 4])
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[tokio::test]

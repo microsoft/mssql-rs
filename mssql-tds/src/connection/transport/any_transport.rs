@@ -468,6 +468,7 @@ mod tests {
 
     use super::*;
     use crate::datatypes::column_values::ColumnValues;
+    use crate::datatypes::decoder::PlpColumnStream;
     use crate::datatypes::row_writer::DefaultRowWriter;
     use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
     use crate::message::messages::PacketType;
@@ -638,5 +639,75 @@ mod tests {
 
         assert!(matches!(result, RowReadResult::RowWritten));
         assert_eq!(writer.take_row(), vec![ColumnValues::Int(42)]);
+    }
+
+    fn plp_metadata_column() -> ColumnMetadata {
+        use crate::datatypes::sqldatatypes::{PartialLengthType, TypeInfoVariant};
+
+        ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            data_type: TdsDataType::BigVarBinary,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::BigVarBinary,
+                length: 0xFFFF,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarBinary,
+                    Some(0xFFFF),
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            column_name: "col".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        }
+    }
+
+    fn int_row_pause_state() -> RowPauseState {
+        let ParserContext::ColumnMetadata(metadata, _) = int_row_context() else {
+            unreachable!()
+        };
+        RowPauseState {
+            next_column_index: 0,
+            metadata,
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }
+    }
+
+    /// The dynamic arm never has buffered-transport access to raw PLP bytes,
+    /// so it always reports "not enough buffered data" rather than guessing.
+    #[tokio::test]
+    async fn dynamic_arm_never_begins_a_buffered_plp_column() {
+        let mut transport = AnyTransport::dynamic(create_network_transport_with_data(&[]));
+        let pause_state = int_row_pause_state();
+
+        assert!(matches!(
+            transport.try_begin_buffered_plp(&pause_state, 0),
+            Ok(None)
+        ));
+    }
+
+    /// Same rationale as above but for continuing an already-active PLP
+    /// stream: the dynamic arm always defers to the async path.
+    #[tokio::test]
+    async fn dynamic_arm_never_continues_a_buffered_plp_stream() {
+        let mut transport = AnyTransport::dynamic(create_network_transport_with_data(&[]));
+        let (stream, _) =
+            PlpColumnStream::try_begin_buffered(&plp_metadata_column(), &4u64.to_le_bytes())
+                .unwrap()
+                .unwrap();
+        let mut plp_state = PlpPauseState {
+            row_pause_state: int_row_pause_state(),
+            plp_stream: stream.unwrap(),
+        };
+        let mut out = [0u8; 4];
+
+        assert!(matches!(
+            transport.try_read_buffered_plp(&mut plp_state, &mut out),
+            Ok(None)
+        ));
     }
 }

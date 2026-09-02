@@ -1897,6 +1897,102 @@ mod tests {
     }
 
     #[test]
+    fn reused_buffered_row_captures_every_value_kind() {
+        let mut reusable = Some(BufferedGetDataRow {
+            values: vec![Some(ColumnValues::Int(99))],
+            variant_bases: vec![Some(TdsDataType::Int4)],
+            consumed: 1,
+            wire_deferred: true,
+        });
+        let mut row = BufferedGetDataRow::empty(&mut reusable, 24);
+        let decimal = DecimalParts::new(true, 18, 4, 1_234_500);
+        let date = SqlDate::create(0).unwrap();
+        let time = SqlTime {
+            time_nanoseconds: 0,
+            scale: 7,
+        };
+        let datetime = SqlDateTime { days: 1, time: 2 };
+        let smalldatetime = SqlSmallDateTime { days: 3, time: 4 };
+        let datetime2 = SqlDateTime2 {
+            days: 0,
+            time: time.clone(),
+        };
+        let datetimeoffset = SqlDateTimeOffset {
+            datetime2: datetime2.clone(),
+            offset: 90,
+        };
+        let money = SqlMoney::from((5, 6));
+        let smallmoney = SqlSmallMoney::from(7);
+        let uuid = Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+        let xml = SqlXml::from("<x/>".to_string());
+        let json = SqlJson::new(br#"{"x":1}"#.to_vec());
+        let vector = SqlVector::try_from_f32(vec![1.0, 2.0]).unwrap();
+
+        row.write_null(0);
+        row.write_variant_base_type(1, TdsDataType::Int4);
+        row.write_bool(1, true);
+        row.write_u8(2, 2);
+        row.write_i16(3, -3);
+        row.write_i32(4, -4);
+        row.write_i64(5, -5);
+        row.write_f32(6, 6.5);
+        row.write_f64(7, -7.5);
+        row.write_string(8, Cow::Borrowed(b"text"), EncodingType::Utf8);
+        row.write_bytes(9, Cow::Borrowed(b"bytes"));
+        row.write_decimal(10, decimal);
+        row.write_numeric(11, decimal);
+        row.write_date(12, date.clone());
+        row.write_time(13, time.clone());
+        row.write_datetime(14, datetime.clone());
+        row.write_smalldatetime(15, smalldatetime.clone());
+        row.write_datetime2(16, datetime2.clone());
+        row.write_datetimeoffset(17, datetimeoffset.clone());
+        row.write_money(18, money.clone());
+        row.write_smallmoney(19, smallmoney.clone());
+        row.write_uuid(20, uuid);
+        row.write_xml(21, xml.clone());
+        row.write_json(22, json.clone());
+        row.write_vector(23, vector.clone());
+        row.end_row();
+
+        assert_eq!(
+            row.values,
+            vec![
+                Some(ColumnValues::Null),
+                Some(ColumnValues::Bit(true)),
+                Some(ColumnValues::TinyInt(2)),
+                Some(ColumnValues::SmallInt(-3)),
+                Some(ColumnValues::Int(-4)),
+                Some(ColumnValues::BigInt(-5)),
+                Some(ColumnValues::Real(6.5)),
+                Some(ColumnValues::Float(-7.5)),
+                Some(ColumnValues::String(SqlString::new(
+                    b"text".to_vec(),
+                    EncodingType::Utf8,
+                ))),
+                Some(ColumnValues::Bytes(b"bytes".to_vec())),
+                Some(ColumnValues::Decimal(decimal)),
+                Some(ColumnValues::Numeric(decimal)),
+                Some(ColumnValues::Date(date)),
+                Some(ColumnValues::Time(time)),
+                Some(ColumnValues::DateTime(datetime)),
+                Some(ColumnValues::SmallDateTime(smalldatetime)),
+                Some(ColumnValues::DateTime2(datetime2)),
+                Some(ColumnValues::DateTimeOffset(datetimeoffset)),
+                Some(ColumnValues::Money(money)),
+                Some(ColumnValues::SmallMoney(smallmoney)),
+                Some(ColumnValues::Uuid(uuid)),
+                Some(ColumnValues::Xml(xml)),
+                Some(ColumnValues::Json(json)),
+                Some(ColumnValues::Vector(vector)),
+            ]
+        );
+        assert_eq!(row.variant_bases[1], Some(TdsDataType::Int4));
+        assert_eq!(row.consumed, 0);
+        assert!(!row.wire_deferred);
+    }
+
+    #[test]
     fn deferred_columns_drop_recycled_row_data() {
         let mut reusable = None;
         let mut row = BufferedGetDataRow::empty(&mut reusable, 8);

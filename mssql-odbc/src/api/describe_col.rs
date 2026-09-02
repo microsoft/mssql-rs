@@ -323,6 +323,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::int_columns;
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
@@ -416,5 +417,37 @@ mod tests {
             stmt_state.diag_records[0].sql_state,
             ERR_INVALID_DESCRIPTOR_INDEX.state
         );
+    }
+
+    #[test]
+    fn uncached_column_name_is_encoded_on_demand() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_CONTEXT);
+            state.column_metadata = int_columns(1);
+            assert!(state.column_names_utf16.is_empty());
+        }
+
+        let mut name = [0_u16; 3];
+        let mut name_len = 0;
+        let rc = unsafe {
+            sql_describe_col_w(
+                h.stmt,
+                1,
+                name.as_mut_ptr(),
+                SqlSmallInt::try_from(name.len()).unwrap(),
+                &mut name_len,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(name, [u16::from(b'c'), u16::from(b'1'), 0]);
+        assert_eq!(name_len, 2);
     }
 }
