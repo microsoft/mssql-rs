@@ -18,6 +18,7 @@ use crate::api::odbc_types::{
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::EncodingType;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
@@ -73,6 +74,12 @@ pub(crate) struct BufferedGetDataRow {
     pub(crate) consumed: usize,
     /// The TDS cursor still owns deferred columns after the captured prefix.
     pub(crate) wire_deferred: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BufferedPlpKind {
+    Text(EncodingType),
+    Binary,
 }
 
 impl ActivePlpStream {
@@ -256,6 +263,7 @@ pub(crate) struct StmtState {
     /// UTF-16 column names built once when result metadata changes.
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
     pub(crate) plp_encodings: Option<Arc<[Option<PlpEncoding>]>>,
+    pub(crate) buffered_plp_kinds: Option<Arc<[Option<BufferedPlpKind>]>>,
     /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
     /// fresh carry buffer.
     pub(crate) plp_prefetch_scratch: Vec<u8>,
@@ -978,12 +986,37 @@ impl StmtState {
                     .map(ColumnMetadata::plp_encoding)
                     .collect::<Arc<[_]>>()
             });
+        self.buffered_plp_kinds = self.plp_encodings.as_ref().map(|encodings| {
+            encodings
+                .iter()
+                .zip(&self.column_metadata)
+                .map(|(encoding, metadata)| match encoding {
+                    Some(PlpEncoding::Utf16Text) => {
+                        Some(BufferedPlpKind::Text(EncodingType::Utf16))
+                    }
+                    Some(PlpEncoding::Utf8Text) => Some(BufferedPlpKind::Text(EncodingType::Utf8)),
+                    Some(PlpEncoding::SingleByteText) => {
+                        metadata.get_collation().map(|collation| {
+                            let encoding = if collation.utf8() {
+                                EncodingType::Utf8
+                            } else {
+                                EncodingType::LcidBased(collation)
+                            };
+                            BufferedPlpKind::Text(encoding)
+                        })
+                    }
+                    Some(PlpEncoding::Binary) => Some(BufferedPlpKind::Binary),
+                    None => None,
+                })
+                .collect()
+        });
     }
 
     pub(crate) fn clear_result_metadata(&mut self) {
         self.column_metadata.clear();
         self.column_names_utf16.clear();
         self.plp_encodings = None;
+        self.buffered_plp_kinds = None;
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -1150,6 +1183,7 @@ impl StmtHandle {
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
                 plp_encodings: None,
+                buffered_plp_kinds: None,
                 plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
@@ -1364,12 +1398,14 @@ mod tests {
             metadata[0].column_name = "value".to_string();
             s.begin_result_set(metadata);
             s.plp_encodings = Some(Arc::from([None]));
+            s.buffered_plp_kinds = Some(Arc::from([None]));
 
             s.clear_result_metadata();
 
             assert!(s.column_metadata.is_empty());
             assert!(s.column_names_utf16.is_empty());
             assert!(s.plp_encodings.is_none());
+            assert!(s.buffered_plp_kinds.is_none());
         });
     }
 

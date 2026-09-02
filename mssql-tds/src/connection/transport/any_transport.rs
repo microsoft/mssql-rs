@@ -211,6 +211,18 @@ impl AnyTransport {
         }
     }
 
+    pub(crate) fn try_buffered_plp_known_len(
+        &self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<u64>> {
+        match self {
+            Self::Network(transport) => transport.try_buffered_plp_known_len(pause_state, target),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => Ok(None),
+        }
+    }
+
     pub(crate) fn try_read_buffered_plp(
         &mut self,
         plp_state: &mut PlpPauseState,

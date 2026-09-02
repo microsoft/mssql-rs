@@ -1962,6 +1962,24 @@ impl NetworkTransport {
         Ok(Some(Some((written, known_total, total_read))))
     }
 
+    pub(crate) fn try_buffered_plp_known_len(
+        &self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<u64>> {
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        let Some((stream, _)) = PlpColumnStream::try_begin_buffered(
+            metadata,
+            self.tds_read_buffer.get_buffered_slice(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(stream.and_then(|stream| stream.known_len()))
+    }
+
     pub(crate) fn try_read_buffered_plp(
         &mut self,
         plp_state: &mut PlpPauseState,
