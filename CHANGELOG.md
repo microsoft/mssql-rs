@@ -55,6 +55,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Changed
 
+- `mssql-odbc`: `SQLBindCol` now accepts `SQL_C_DEFAULT` and resolves it at
+  fetch time from the current result column's SQL type, using the same mapping
+  as `SQLBindParameter`. Wide character columns resolve to `SQL_C_WCHAR` and
+  `uniqueidentifier` to `SQL_C_GUID`, where msodbcsql resolves both to its ANSI
+  `SQL_C_CHAR`.
+
 - `mssql-tds`: LOGIN7 now encodes Unicode field lengths as UTF-16 code units
   and rejects oversized records instead of producing malformed packets. This
   fixes login failures with non-ASCII usernames, passwords, database names,

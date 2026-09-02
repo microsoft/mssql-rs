@@ -76,13 +76,53 @@ authoritative parity reference for this crate. Its source lives in the
     (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h` → `OPTIONADMSI L"ActiveDirectoryMSI"`);
     `ActiveDirectoryManagedIdentity` does not appear anywhere in the msodbcsql source.
     Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
-  - `SQL_C_DEFAULT` in SQLBindParameter resolves the wide character SQL types to `SQL_C_WCHAR`, and
+  - `SQL_C_DEFAULT` resolves the wide character SQL types to `SQL_C_WCHAR`, and
     `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
+    Applies to both directions: `SQLBindParameter` resolves at bind time, and
+    `SQLFetchScroll` resolves a bound column per fetch from the IRD, through the
+    same `type_rules::resolve_default_c_type`.
     msodbcsql's `Sql2CDefault` reads `rgbTRANSTYPE380`
     (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which resolves both to `SQL_C_CHAR`
     — an ANSI-transfer default this driver has no equivalent for, since its
     `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
-    type would silently corrupt data. Tracked in AB#47365.
+    type would silently corrupt data. On the fetch side the same choice avoids
+    transcoding every wide column by default. Confirmed against msodbcsql18 for
+    `nvarchar` (three narrow bytes, indicator 3) and `uniqueidentifier` (the
+    36-character text form, indicator 36). Note this covers only those two rows:
+    `SQL_SS_XML` resolves to `SQL_C_WCHAR` in *both* drivers
+    (`sqlcmisc.cpp:179` and `:218`, measured as UTF-16 with indicator 30), so it
+    is **not** a deviation. Tracked in AB#47365.
+  - A bound `time` / `datetimeoffset` column strides by `sizeof(SQL_SS_TIME2_STRUCT)`
+    (12) and `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by
+    `BufferLength`. Both drivers resolve these to the same C types under ODBC 3.8
+    (`rgbTRANSTYPE380`, `sqlcmisc.cpp:220-221`), but msodbcsql's `BindOffset`
+    switch has no case for them and falls through to
+    `default: dwOffset = lpbindinfo->cbValueMax` (`sqlcfunc.cpp:2280-2283`).
+    Measured: a two-row rowset bound `SQL_C_DEFAULT` with `BufferLength` 40 puts
+    msodbcsql's second row at byte offset 40, where this driver puts it at 12;
+    the indicator is 12 in both, so only the stride differs. This is the safer
+    direction — msodbcsql with `BufferLength` 0 strides 0 and stacks every row in
+    slot 0 — so the behaviour is kept and registered rather than matched.
+    Pre-existing for an explicit `SQL_C_SS_TIME2` bind; deferred
+    `SQL_C_DEFAULT` resolution makes it reachable without the application naming
+    the C type.
+  - A `SQL_C_DEFAULT` binding that resolves to a fixed-width C type wider than
+    the application's declared `BufferLength` is left unresolved and fails the
+    row (`HYC00`) rather than writing. `BufferLength` is ignored for a
+    fixed-width target, which is safe when the application named that type; a
+    `SQL_C_DEFAULT` binding names nothing, so honouring the C type's width would
+    put 16 bytes into a 4-byte slot for a `uniqueidentifier` column, where
+    msodbcsql resolves to `SQL_C_CHAR` and truncates inside `BufferLength`.
+    `BufferLength` 0 is exempt — the documented idiom for a fixed-width target,
+    carrying no width claim. Whether these should instead report `01004` with a
+    truncated value, closer to msodbcsql, is open and untracked.
+  - A `varbinary` / `image` column bound `SQL_C_DEFAULT` resolves to
+    `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY`,
+    then `resolve_default_c_type`), which bound delivery does not implement yet
+    (AB#47239), so it fails per row with `HYC00`. msodbcsql resolves identically
+    and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
+    deferred resolution makes it reachable without the application naming the C
+    type.
   - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
     writes the client code page. msodbcsql uses the client code page -
     `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
