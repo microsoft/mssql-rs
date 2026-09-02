@@ -11,7 +11,7 @@ use tracing::error;
 
 use std::collections::VecDeque;
 
-use mssql_tds::connection::tds_client::{ResultSet, StatementId, TdsClient};
+use mssql_tds::connection::tds_client::{CursorPoll, ResultSet, StatementId, TdsClient};
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
@@ -258,7 +258,11 @@ pub(super) fn release_busy_if_row_exhausted(
     mut client: TdsClient,
     row_delivered: bool,
 ) {
-    let peek_result = dbc.runtime.block_on(client.peek_past_current_row());
+    let peek_result = match client.try_peek_past_current_row() {
+        Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
+        Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
+        Err(error) => Err(error),
+    };
     let batch_done = !client.has_open_batch();
 
     // `Ok(true)`: another row, already parked for the next fetch — never

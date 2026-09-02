@@ -5766,27 +5766,23 @@ impl TdsClient {
         }
     }
 
-    /// Peeks past the row just fully consumed to discover whether another
-    /// row follows, without losing it if one does. Callers (the ODBC busy
-    /// gate) use this once every column of the current row has been
-    /// delivered to learn — one call earlier than they otherwise would —
-    /// whether the wire is now idle for this statement, matching msodbcsql's
-    /// wire-state busy gate rather than holding the connection busy for the
-    /// statement's entire cursor lifetime.
+    /// Attempts to peek past the fully consumed row using buffered bytes.
     ///
-    /// Returns `Ok(true)` if another row is now positioned: it is parked
-    /// exactly as [`next_row_cursor`](Self::next_row_cursor) parks any
-    /// positioned row, so the very next call to it returns this same row
-    /// immediately, without re-reading the wire. Returns `Ok(false)` if the
-    /// result set is now known exhausted — the same thing a later
-    /// `next_row_cursor` call would eventually report, just discovered now
-    /// because the wire happened to already have the answer.
+    /// A row found by [`CursorPoll::Ready`] is parked for the next
+    /// [`next_row_cursor`](Self::next_row_cursor) call. [`CursorPoll::Pending`]
+    /// leaves the peek for [`peek_past_current_row`](Self::peek_past_current_row).
+    pub fn try_peek_past_current_row(&mut self) -> TdsResult<CursorPoll<bool>> {
+        let poll = self.try_next_row_cursor()?;
+        if let CursorPoll::Ready(has_row) = poll {
+            self.row_already_positioned = has_row;
+        }
+        Ok(poll)
+    }
+
+    /// Peeks past the fully consumed row, parking the next row if one exists.
     ///
-    /// # Caller obligation
-    /// Only call this once every column of the row positioned before this
-    /// call has been read (all bound columns, or `SQLGetData` through the
-    /// last column) — like `next_row_cursor`, this discards anything left
-    /// unread on that row.
+    /// Only call this after every column of the positioned row has been read;
+    /// like [`next_row_cursor`](Self::next_row_cursor), it discards unread columns.
     pub async fn peek_past_current_row(&mut self) -> TdsResult<bool> {
         let has_row = self.next_row_cursor().await?;
         self.row_already_positioned = has_row;
@@ -8638,6 +8634,25 @@ mod tests {
             client.try_read_row_column(1).unwrap(),
             CursorPoll::Ready(CursorColumn::RowEnded)
         );
+    }
+
+    #[tokio::test]
+    async fn sync_peek_parks_the_buffered_row_for_the_next_cursor_call() {
+        let metadata = int_column_metadata(1);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(
+            client.try_peek_past_current_row().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert!(client.row_already_positioned);
+
+        assert!(client.next_row_cursor().await.unwrap());
+        assert!(!client.row_already_positioned);
     }
 
     #[tokio::test]

@@ -222,6 +222,8 @@ fn sql_get_data_safe(
             return SQL_SUCCESS;
         }
 
+        // The eight-column cutoff is only a performance gate: below it, the
+        // extra complete-value probe costs more than the allocation it avoids.
         let direct_buffered = row.values.len() >= 8
             || row
                 .variant_bases
@@ -248,7 +250,7 @@ fn sql_get_data_safe(
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             stmt_state.current_row_last_col = col_index;
             stmt_state.partial_text_offset = None;
-            return finish_buffered_get_data(stmt_state, col_index, SQL_SUCCESS);
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
         }
         let direct_decimal = direct_buffered
             && target_type == SQL_C_CHAR
@@ -270,7 +272,7 @@ fn sql_get_data_safe(
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             stmt_state.current_row_last_col = col_index;
             stmt_state.partial_text_offset = None;
-            return finish_buffered_get_data(stmt_state, col_index, SQL_SUCCESS);
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
         }
         let direct_scalar = row
             .values
@@ -290,7 +292,7 @@ fn sql_get_data_safe(
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
             stmt_state.current_row_last_col = col_index;
             stmt_state.partial_text_offset = None;
-            return finish_buffered_get_data(stmt_state, col_index, SQL_SUCCESS);
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, SQL_SUCCESS);
         }
         let typed_buffered = is_typed_c_target(target_type)
             && row
@@ -323,7 +325,7 @@ fn sql_get_data_safe(
                 stmt_state.current_row_last_col = col_index;
                 stmt_state.partial_text_offset = None;
             }
-            return finish_buffered_get_data(stmt_state, col_index, rc);
+            return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
         }
 
         let captured = row.values.get_mut(col_index - 1).and_then(Option::take);
@@ -731,15 +733,11 @@ fn finish_get_data(
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
-    let row_was_buffered = stmt_state
-        .buffered_get_data_row
-        .as_ref()
-        .is_some_and(|row| !row.wire_deferred);
     if ready {
         stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
     }
     drop(stmt_state);
-    if !ready || row_was_buffered {
+    if !ready {
         return rc;
     }
 
@@ -758,25 +756,6 @@ fn finish_get_data(
     // requires it), so a row was always delivered here — unlike
     // `fetch_scroll.rs`'s zero-row fetch case.
     release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, true);
-    rc
-}
-
-#[inline]
-fn finish_buffered_get_data(
-    mut stmt_state: MutexGuard<'_, StmtState>,
-    col_index: usize,
-    rc: SqlReturn,
-) -> SqlReturn {
-    debug_assert!(
-        stmt_state
-            .buffered_get_data_row
-            .as_ref()
-            .is_some_and(|row| !row.wire_deferred)
-    );
-    if stmt_state.current_row_last_col == col_index && col_index == stmt_state.column_metadata.len()
-    {
-        stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
-    }
     rc
 }
 
@@ -3684,6 +3663,45 @@ mod tests {
         };
 
         assert_eq!(rc, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);
+    }
+
+    #[test]
+    fn buffered_get_data_releases_busy_after_delivering_the_lone_column() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_get_data_row(&h, vec![42]);
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = mssql_tds::test_client_support::tds_client_from_tokens(vec![
+            mssql_tds::test_client_support::col_metadata_empty(),
+            mssql_tds::test_client_support::done_no_more(),
+        ]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 42;".to_string(), ()))
+            .unwrap();
+        {
+            let mut dbc_state = dbc.inner.lock().unwrap();
+            dbc_state.client = Some(client);
+            dbc_state.active_stmt = Some(h.stmt);
+        }
+
+        let mut value = 0_i32;
+        let mut ind: SqlLen = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_SLONG,
+                (&mut value as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, 42);
         assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
         let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         assert!(stmt_handle.inner.lock().unwrap().result_set_exhausted);

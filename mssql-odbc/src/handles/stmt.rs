@@ -890,6 +890,12 @@ impl StmtState {
             });
     }
 
+    pub(crate) fn clear_result_metadata(&mut self) {
+        self.column_metadata.clear();
+        self.column_names_utf16.clear();
+        self.plp_encodings = None;
+    }
+
     /// Makes `metadata` the first result set of a new execution.
     ///
     /// Identical to [`Self::begin_result_set`] except that the batch command
@@ -1257,6 +1263,22 @@ mod tests {
                     "beta\u{1f642}".encode_utf16().collect::<Vec<_>>(),
                 ]
             );
+        });
+    }
+
+    #[test]
+    fn clearing_result_metadata_clears_all_derived_caches() {
+        with_state(|s| {
+            let mut metadata = int_columns(1);
+            metadata[0].column_name = "value".to_string();
+            s.begin_result_set(metadata);
+            s.plp_encodings = Some(Arc::from([None]));
+
+            s.clear_result_metadata();
+
+            assert!(s.column_metadata.is_empty());
+            assert!(s.column_names_utf16.is_empty());
+            assert!(s.plp_encodings.is_none());
         });
     }
 }
