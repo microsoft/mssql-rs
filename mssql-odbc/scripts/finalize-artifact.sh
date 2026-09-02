@@ -7,8 +7,12 @@ set -euo pipefail
 PROFILE="${1:-debug}"
 case "$PROFILE" in
     debug|release) ;;
-    *) echo "Usage: $0 [debug|release]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [debug|release] [target-triple]" >&2; exit 2 ;;
 esac
+# Optional cross-compile target triple (e.g. x86_64-apple-darwin), for building
+# a single macOS architecture slice on an Apple Silicon host. Empty = native
+# build, artifact lives directly under $TARGET_DIR/$PROFILE (existing behavior).
+TARGET_TRIPLE="${2:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ODBC_CRATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -38,8 +42,8 @@ case "$(uname -s)" in
         ;;
 esac
 
-SOURCE_PATH="$TARGET_DIR/$PROFILE/$CARGO_ARTIFACT"
-PRODUCT_PATH="$TARGET_DIR/$PROFILE/$PRODUCT_ARTIFACT"
+SOURCE_PATH="$TARGET_DIR/${TARGET_TRIPLE:+$TARGET_TRIPLE/}$PROFILE/$CARGO_ARTIFACT"
+PRODUCT_PATH="$TARGET_DIR/${TARGET_TRIPLE:+$TARGET_TRIPLE/}$PROFILE/$PRODUCT_ARTIFACT"
 if [ ! -f "$SOURCE_PATH" ]; then
     echo "Error: Cargo artifact not found at $SOURCE_PATH" >&2
     echo "Hint: if the [lib] name changed, update the CopyFiles exclusion in .pipeline/templates/build-template-container.yml" >&2

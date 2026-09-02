@@ -8,7 +8,9 @@
 #                                                                               #
 # When buildOdbcNative is true, the Windows/Linux x64+ARM64 jobs also build   #
 # the mssql-odbc native driver (glibc/musl/glibc-2.28 on Linux) and publish   #
-# it as a separate mssql-odbc-native NuGet package. No macOS lane yet.         #
+# it as a separate mssql-odbc-native NuGet package. The macOS job builds both  #
+# arch slices as SEPARATE binaries (no lipo fusion), matching mssql-python's  #
+# expected libs/macos/{arm64,x86_64} layout for this driver.                   #
 #                                                                               #
 # Build jobs use custom 1ES pools (Rust, Docker, Python pre-installed).        #
 # Publish job uses managed OneBranch pool with ob_nugetPublishing_enabled.     #
@@ -366,6 +368,29 @@ stages:
             osType: MacOS
             architecture: universal2
             publishArtifacts: false
+      - ${{ if eq(parameters.buildOdbcNative, true) }}:
+        - template: /.pipeline/templates/build-odbc-macos-template.yml
+          parameters:
+            architecture: x64
+            artifactName: 'Odbc_MacOS_x64'
+            publishArtifacts: false
+        - task: CopyFiles@2
+          displayName: 'Collect ODBC native driver (macOS x64)'
+          inputs:
+            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+            targetFolder: '$(ob_outputDirectory)/odbc_macos_x64'
+            contents: '**'
+        - template: /.pipeline/templates/build-odbc-macos-template.yml
+          parameters:
+            architecture: ARM64
+            artifactName: 'Odbc_MacOS_ARM64'
+            publishArtifacts: false
+        - task: CopyFiles@2
+          displayName: 'Collect ODBC native driver (macOS ARM64)'
+          inputs:
+            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
+            targetFolder: '$(ob_outputDirectory)/odbc_macos_arm64'
+            contents: '**'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish macOS Artifacts'
         inputs:
@@ -514,10 +539,9 @@ stages:
 
             # source artifact/subfolder -> (platform tag, driver filename).
             # Subfolder names match the CopyFiles targetFolder used in each
-            # Build job (see Windows_x64/Windows_ARM64/Linux_x64/Linux_ARM64
-            # above); every source path shares the build/<file> layout that
-            # build-odbc-*-template.yml and build-odbc-windows-template.yml
-            # stage the driver into.
+            # Build job (see Windows_x64/Windows_ARM64/Linux_x64/Linux_ARM64/
+            # MacOS_universal2 above); every source path shares the build/<file>
+            # layout that build-odbc-*-template.yml stages the driver into.
             $platforms = [ordered]@{
               'drop_Build_Linux_x64_linux_x64/odbc_glibc_x64'             = @{ tag = 'linux_x64';      file = 'mssqlodbc.so' }
               'drop_Build_Linux_x64_linux_x64/odbc_musl_x64'              = @{ tag = 'musl_x64';       file = 'mssqlodbc.so' }
@@ -525,14 +549,19 @@ stages:
               'drop_Build_Windows_x64_windows_x64/odbc_windows_x64'       = @{ tag = 'windows_x64';    file = 'mssqlodbc.dll' }
             }
 
-            # Windows_ARM64/Linux_ARM64 jobs only run when buildAllTargets is
-            # true (see the job-level conditional guards above); skip these
-            # entries otherwise, or the Test-Path check below always fails.
+            # Windows_ARM64/Linux_ARM64/MacOS_universal2 jobs only run when
+            # buildAllTargets is true (see the job-level conditional guards
+            # above); skip these entries otherwise, or the Test-Path check
+            # below always fails.
             if ($buildAllTargets) {
               $platforms['drop_Build_Linux_ARM64_linux_arm64/odbc_glibc_arm64']       = @{ tag = 'linux_arm64';    file = 'mssqlodbc.so' }
               $platforms['drop_Build_Linux_ARM64_linux_arm64/odbc_musl_arm64']        = @{ tag = 'musl_arm64';     file = 'mssqlodbc.so' }
               $platforms['drop_Build_Linux_ARM64_linux_arm64/odbc_glibc228_arm64']    = @{ tag = 'glibc228_arm64'; file = 'mssqlodbc.so' }
               $platforms['drop_Build_Windows_ARM64_windows_arm64/odbc_windows_arm64'] = @{ tag = 'windows_arm64';  file = 'mssqlodbc.dll' }
+              # Separate per-arch dylibs (no lipo fusion) - mssql-python expects
+              # two distinct binaries, mirroring msodbcsql's libs/macos/{arm64,x86_64}.
+              $platforms['drop_Build_MacOS_universal2_macos_universal2/odbc_macos_x64']   = @{ tag = 'macos_x64';   file = 'mssqlodbc.dylib' }
+              $platforms['drop_Build_MacOS_universal2_macos_universal2/odbc_macos_arm64'] = @{ tag = 'macos_arm64'; file = 'mssqlodbc.dylib' }
             }
 
             foreach ($key in $platforms.Keys) {

@@ -1,0 +1,65 @@
+# filepath: .pipeline/templates/build-odbc-macos-template.yml
+#
+# Cross-compile ONE mssql-odbc driver architecture slice (mssqlodbc.dylib) on
+# the shared macOS-14 (Apple Silicon) agent and publish it as a pipeline
+# artifact for the native NuGet package Publish stage.
+#
+# Unlike Windows/Linux, macOS has no separate per-architecture pool, so both
+# slices are built here via `cargo build --target`, one job invocation per
+# architecture. mssql-python expects two SEPARATE per-arch binaries (see its
+# sync-mssql-odbc-native-libs.py / setup_rust_odbc.py, mirroring how the
+# msodbcsql C++ driver ships libs/macos/arm64 + libs/macos/x86_64), not a
+# lipo-fused universal binary, so this deliberately does not lipo.
+#
+# Driver only - no C++ gtest e2e binaries, matching build-odbc-windows-template.yml.
+#
+# CI (non-PR) only.
+
+parameters:
+  # 'x64' or 'ARM64' - selects the cargo target triple below.
+  - name: architecture
+    type: string
+  # Pipeline artifact name, e.g. 'Odbc_MacOS_x64' / 'Odbc_MacOS_ARM64'.
+  - name: artifactName
+    type: string
+  # Publish this template's own artifact (disable when the caller does one
+  # combined publish for the whole job, e.g. OneBranch's stages.yml).
+  - name: publishArtifacts
+    type: boolean
+    default: true
+
+steps:
+  - script: |
+      set -e
+      case "${{ parameters.architecture }}" in
+        x64) TARGET_TRIPLE="x86_64-apple-darwin" ;;
+        ARM64) TARGET_TRIPLE="aarch64-apple-darwin" ;;
+        *) echo "Unknown architecture: ${{ parameters.architecture }}" >&2; exit 2 ;;
+      esac
+      echo "##vso[task.setvariable variable=odbcTargetTriple]$TARGET_TRIPLE"
+      rustup target add "$TARGET_TRIPLE"
+    displayName: 'Add cargo target (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  - script: |
+      set -e
+      cargo build --release --target "$(odbcTargetTriple)" --package mssqlodbc
+    displayName: 'Build mssql-odbc driver (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  - script: |
+      set -e
+      DROP_DIR="$(Build.SourcesDirectory)/odbc-drop/build"
+      mkdir -p "$DROP_DIR"
+      DRIVER_PATH="$(bash mssql-odbc/scripts/finalize-artifact.sh release "$(odbcTargetTriple)")"
+      cp "$DRIVER_PATH" "$DROP_DIR/mssqlodbc.dylib"
+    displayName: 'Stage driver into drop (${{ parameters.architecture }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  - ${{ if eq(parameters.publishArtifacts, true) }}:
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish ${{ parameters.artifactName }}'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/odbc-drop'
+        artifact: ${{ parameters.artifactName }}
