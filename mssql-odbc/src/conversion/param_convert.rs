@@ -1214,17 +1214,25 @@ mod tests {
     /// chunk streamed as-is.
     #[test]
     fn same_family_dae_always_streams() {
-        for (c_type, sql_type) in [
-            (SQL_C_CHAR, SQL_CHAR),
-            (SQL_C_CHAR, SQL_LONGVARCHAR),
-            (SQL_C_WCHAR, SQL_WCHAR),
-            (SQL_C_WCHAR, SQL_WLONGVARCHAR),
-            (SQL_C_BINARY, SQL_BINARY),
-            (SQL_C_BINARY, SQL_LONGVARBINARY),
+        for (c_type, sql_type, streamed) in [
+            (SQL_C_CHAR, SQL_CHAR, StreamedSqlType::VarcharMax),
+            (SQL_C_CHAR, SQL_LONGVARCHAR, StreamedSqlType::VarcharMax),
+            (SQL_C_WCHAR, SQL_WCHAR, StreamedSqlType::NVarcharMax),
+            (SQL_C_WCHAR, SQL_WLONGVARCHAR, StreamedSqlType::NVarcharMax),
+            (SQL_C_BINARY, SQL_BINARY, StreamedSqlType::VarBinaryMax),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARBINARY,
+                StreamedSqlType::VarBinaryMax,
+            ),
         ] {
-            assert!(
-                dae_placeholder_type(c_type, sql_type).is_ok(),
-                "{c_type} -> {sql_type} should stream"
+            assert_eq!(
+                dae_placeholder_type(c_type, sql_type),
+                Ok(DaeStream {
+                    sql_type: streamed,
+                    needs_transcode: false
+                }),
+                "{c_type} -> {sql_type} should stream untranscoded"
             );
         }
     }

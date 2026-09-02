@@ -498,12 +498,12 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
 // on one is refused at execute rather than at bind: the DAE indicator is only
 // read when the parameter list is built.
 //
-// msodbcsql returns SQL_NEED_DATA for this pairing rather than refusing --
-// unlike the character wideness mismatch (now transcoded, see
-// execute_test.cpp/NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes and
-// WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes), there is no
-// transcode from arbitrary bytes to an integer wire value, so this driver's
-// refusal stands and the parity run stays skipped.
+// msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute, but does not
+// actually stream it: SQLPutData itself then rejects with HY019 ("Processing
+// of fixed length targets cannot be spread over multiple calls to
+// SQLPutData"). Both drivers agree the pairing cannot stream through -- they
+// just detect it one call apart -- so the parity run stays skipped rather
+// than comparing error codes that differ by construction.
 TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
     SKIP_IF_COMPARING_MSODBCSQL();
 

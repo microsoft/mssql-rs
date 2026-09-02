@@ -734,6 +734,50 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTrans
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// The whole reason this pairing buffers rather than transcodes chunk-by-chunk:
+// a multi-byte UTF-8 sequence can straddle two SQLPutData calls. Splits "caf"
+// + U+00E9 (UTF-8 0xC3 0xA9) so the first chunk ends with the lead byte and
+// the second chunk supplies only the trailing byte -- transcoding each chunk
+// in isolation would decode two invalid/incomplete code points instead of one
+// U+00E9, since neither half is valid UTF-8 on its own.
+TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_WVARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    const SQLCHAR first_chunk[] = {'c', 'a', 'f', 0xC3};
+    const SQLCHAR second_chunk[] = {0xA9};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(first_chunk),
+                             sizeof(first_chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(second_chunk),
+                             sizeof(second_chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR buf[16] = {0};
+    SQLLEN wind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &wind),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLWCHAR expected[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_EQ(sizeof(expected), static_cast<size_t>(wind));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(SQLWCHAR); ++i) {
+        EXPECT_EQ(expected[i], buf[i]) << "code unit " << i;
+    }
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // The pairing this fix actually targets: mssql-python always declares
 // SQL_C_WCHAR for a streamed character parameter, including ASCII values it
 // also declares as the *narrow* SQL_VARCHAR (a documented convention in its
@@ -795,11 +839,14 @@ TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTrans
 // binding; DAE has no equivalent, so the refusal for this one pairing moves
 // from bind time to here.
 //
-// msodbcsql returns SQL_NEED_DATA for this pairing rather than refusing (see
-// param_cross_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute).
-// Unlike the character wideness mismatch above, there is no transcode from
-// arbitrary bytes to an integer wire value, so this driver's refusal stands
-// and the parity run stays skipped.
+// msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute (see
+// param_cross_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute),
+// but does not actually stream it: SQLPutData itself then rejects with
+// HY019 ("Processing of fixed length targets cannot be spread over multiple
+// calls to SQLPutData"). Both drivers agree the pairing cannot stream
+// through -- they just detect it one call apart, this driver at SQLExecute
+// -- so the parity run stays skipped rather than comparing error codes that
+// differ by construction.
 TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
     SKIP_IF_COMPARING_MSODBCSQL();
 

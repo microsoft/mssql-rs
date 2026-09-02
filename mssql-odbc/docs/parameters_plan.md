@@ -108,7 +108,16 @@ transparent reconnects.
   moved from `SQLBindParameter` to execute - the DAE indicator is only read
   while building the parameter list - so an application gets `HYC00` from
   `SQLExecute` after setting up its `SQLParamData` loop rather than at bind.
-  msodbcsql returns `SQL_NEED_DATA` for this pairing instead of refusing it.
+  msodbcsql returns `SQL_NEED_DATA` for this pairing at `SQLExecute` rather
+  than refusing there, but it does not actually stream it: `SQLPutData`
+  itself then rejects with `HY019` ("Processing of fixed length targets
+  cannot be spread over multiple calls to SQLPutData",
+  `sqlccmd.cpp:11079-11082`, `:11185-11188`) once the streamed value's
+  integer target is a fixed-length one. So the two drivers agree that this
+  pairing cannot stream a value through, they just detect it one call apart
+  -- msodbcsql at `SQLPutData`, this driver at `SQLExecute` -- which is why
+  the parity run stays skipped rather than comparing error codes that
+  differ by construction.
   Pinned by `CrossFamilyDataAtExecutionIsRejectedAtExecute` and, for the
   wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
   / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
