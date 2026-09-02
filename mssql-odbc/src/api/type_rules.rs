@@ -141,6 +141,22 @@ pub(crate) fn parameter_column_size_is_valid(sql_type: SqlSmallInt, column_size:
     valid.contains(&column_size)
 }
 
+/// Whether an IPD record's bound `ColumnSize` belongs in `SQL_DESC_PRECISION`
+/// rather than `SQL_DESC_LENGTH`.
+///
+/// This driver stores the two as independent `DescRecord` fields
+/// (`get_desc_field.rs` reads each one back directly, with no type-based
+/// redirection), unlike msodbcsql's single overloaded `cbColDef`, so
+/// `SQLBindParameter`'s IPD auto-population has to pick one. Only the
+/// exact-numeric types read `ColumnSize` as a digit count — the same split
+/// [`parameter_column_size_is_valid`] already validates against
+/// (`1..=SQL_PREC_NUMERIC`); every other type, including the fixed-length
+/// numerics where ODBC does not constrain `ColumnSize` at all, is stored as
+/// a length.
+pub(crate) fn parameter_size_is_precision(sql_type: SqlSmallInt) -> bool {
+    matches!(sql_type, SQL_DECIMAL | SQL_NUMERIC)
+}
+
 /// Known ODBC C type identifiers in canonical form, including the SQL Server
 /// extensions.
 ///
@@ -525,6 +541,26 @@ mod tests {
         for sql_type in [SQL_INTEGER, SQL_SMALLINT, SQL_TINYINT, SQL_BIT, SQL_GUID] {
             assert!(parameter_column_size_is_valid(sql_type, 0));
             assert!(parameter_column_size_is_valid(sql_type, 999_999));
+        }
+    }
+
+    #[test]
+    fn parameter_size_is_precision_only_for_exact_numerics() {
+        assert!(parameter_size_is_precision(SQL_DECIMAL));
+        assert!(parameter_size_is_precision(SQL_NUMERIC));
+        for sql_type in [
+            SQL_CHAR,
+            SQL_VARCHAR,
+            SQL_WCHAR,
+            SQL_BINARY,
+            SQL_INTEGER,
+            SQL_FLOAT,
+            SQL_GUID,
+        ] {
+            assert!(
+                !parameter_size_is_precision(sql_type),
+                "{sql_type} should be stored as a length"
+            );
         }
     }
 }

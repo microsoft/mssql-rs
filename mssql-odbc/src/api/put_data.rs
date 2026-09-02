@@ -550,6 +550,7 @@ mod tests {
                     parameter_value_ptr: std::ptr::null_mut(),
                     buffer_length: 0,
                     strlen_or_ind_ptr: std::ptr::null_mut(),
+                    octet_length_ptr: std::ptr::null_mut(),
                 }));
             }
 
@@ -587,6 +588,7 @@ mod tests {
                     parameter_value_ptr: std::ptr::null_mut(),
                     buffer_length: 0,
                     strlen_or_ind_ptr: std::ptr::null_mut(),
+                    octet_length_ptr: std::ptr::null_mut(),
                 }));
             }
 

@@ -62,7 +62,7 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{
     ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS, StmtState,
 };
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 
 #[derive(Clone, Copy)]
 struct PlpColumnInfo {
@@ -501,18 +501,11 @@ fn fetch_scroll_safe(
     fetch_orientation: SqlSmallInt,
     _fetch_offset: SqlLen,
 ) -> SqlReturn {
-    // Snapshot the rowset controls and the binding table, then release the
+    // Snapshot the rowset controls and the effective ARD, then release the
     // statement lock: the fill loop below blocks on the network and must not
     // hold it. The application is not allowed to rebind concurrently with a
     // fetch on the same statement, so the snapshot cannot go stale under us.
-    let (
-        row_array_size,
-        bindings,
-        rows_fetched_ptr,
-        row_status_ptr,
-        column_count,
-        row_bind_offset_ptr,
-    ) = {
+    let (ard, row_array_size, rows_fetched_ptr, row_status_ptr, column_count, row_bind_offset_ptr) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
             return SQL_ERROR;
@@ -587,20 +580,68 @@ fn fetch_scroll_safe(
             return rc;
         }
 
-        let bindings: Vec<ColumnBinding> = stmt_state.bindings.clone();
-        // The buffers in that snapshot belong to the application, and the fill
-        // loop writes through them after this lock is released. Claiming the
-        // statement here is what stops a concurrent SQLBindCol from freeing one
-        // mid-write; the mutating entry points refuse while this is set.
+        // The ARD lock is taken after this one is released (below), never
+        // while it is held — see ".github/instructions/mssql-odbc.instructions.md",
+        // "Locking rules": a STMT lock must never be held while acquiring a
+        // DESC lock.
+        let ard = stmt_state.effective_ard(stmt);
+        // Claiming the statement here is what stops a concurrent SQLBindCol
+        // from freeing an application buffer the fill loop is still reading
+        // through after this lock is released; the mutating entry points
+        // refuse while this is set.
         stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
         (
+            ard,
             stmt_state.row_array_size,
-            bindings,
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
         )
+    };
+
+    // AB#47437: the ARD is the fill loop's single source of truth, derived
+    // fresh from its records every fetch rather than cached, so a
+    // descriptor-field bind (`SQLSetDescFieldW`) and a `SQLBindCol` bind are
+    // indistinguishable here. A poisoned ARD mutex now fails the fetch
+    // outright (SQL_ERROR), clearing STMT_STATE_FETCH_IN_PROGRESS so the
+    // statement is not left permanently stuck mid-fetch: silently treating it
+    // as "nothing bound" would advance the cursor and report success for a
+    // rowset the application never actually got the columns it asked for.
+    let bindings: Vec<ColumnBinding> = {
+        // `ard` can be an explicit descriptor resolved under the STMT lock,
+        // already dropped by now — re-check liveness right before
+        // dereferencing to narrow (not fully close) the race against a
+        // concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` on that same
+        // descriptor.
+        if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
+            error!("SQLFetchScroll: ard freed concurrently; failing the fetch");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error reading column bindings",
+                );
+            }
+            return SQL_ERROR;
+        }
+        let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
+        let Ok(desc_state) = desc.inner.lock() else {
+            error!("SQLFetchScroll: ard mutex poisoned; failing the fetch");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HY000,
+                    0,
+                    "Internal error reading column bindings",
+                );
+            }
+            return SQL_ERROR;
+        };
+        ColumnBinding::all_from_ard_state(&desc_state)
     };
 
     let rc = fill_rowset(
@@ -1085,7 +1126,7 @@ fn typed_plp_chunk_fits(current: usize, chunk: usize, known_total: Option<u64>) 
             .is_some_and(|total| total <= PLP_TYPED_MATERIALIZE_LIMIT)
 }
 
-/// The length a bound PLP delivery reports in the indicator.
+/// The length a bound PLP delivery reports on `SQL_DESC_OCTET_LENGTH_PTR`.
 ///
 /// Extracted so the rule can be tested without a live server: it was derived by
 /// probing msodbcsql, and all four of its cases are pinned in unit tests below.
@@ -1114,6 +1155,41 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
         && error.error_len().is_none()
     {
         bytes.truncate(error.valid_up_to());
+    }
+}
+
+/// Clears a stale `SQL_NULL_DATA` a split indicator pointer could still be
+/// holding from an earlier NULL row, before non-NULL data is delivered to
+/// independent length/indicator pointers — otherwise a later non-NULL row
+/// reusing the same bound array reads back as NULL, since nothing else ever
+/// writes to `indicator` once it stops aliasing `octet_length`. A no-op when
+/// the two pointers alias (the common `SQLBindCol` case, and when there is no
+/// indicator at all): the length write below lands on the same location
+/// there, so nothing stale can survive either way.
+unsafe fn clear_stale_null_indicator(indicator: *mut SqlLen, octet_length: *mut SqlLen) {
+    if !indicator.is_null() && indicator != octet_length {
+        unsafe { write_if_some(indicator, 0) };
+    }
+}
+
+/// Displaces a bound `SQL_DESC_INDICATOR_PTR` / `SQL_DESC_OCTET_LENGTH_PTR`
+/// base pointer by `bind_offset` (bytes, from `SQL_ATTR_ROW_BIND_OFFSET_PTR`)
+/// and `row_index` (elements), or returns null if the base itself is null.
+/// Every delivery function resolves both pointers through this so they stay
+/// in lock step; only the two fields' *meaning* differs (NULL status vs.
+/// returned length), never how their address is computed.
+///
+/// # Safety
+/// `ptr`, once displaced, must be null or writable for one `SqlLen`.
+unsafe fn displaced_len_ptr(ptr: *mut SqlLen, bind_offset: usize, row_index: usize) -> *mut SqlLen {
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        (ptr as *mut u8)
+            .add(bind_offset)
+            .cast::<SqlLen>()
+            .add(row_index)
     }
 }
 
@@ -1192,16 +1268,13 @@ unsafe fn deliver_bound_plp(
     }
 
     let stride = element_stride(binding.target_type, binding.buffer_length);
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    // Independent of the indicator per the ODBC "Deferred Fields" spec: see
+    // `deliver_bound`'s comment on `octet_length`. This value is never NULL
+    // (that path never reaches a bound PLP delivery), so the produced length
+    // always belongs on `octet_length`, not `indicator`.
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
@@ -1236,6 +1309,7 @@ unsafe fn deliver_bound_plp(
         drain_plp_to_end(client, runtime, scratch)?;
         return Ok(RowOutcome::Error(RowIssue::Unsupported));
     }
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
 
     let transcode_utf16_to_utf8 =
         target == SQL_C_CHAR && matches!(encoding, PlpEncoding::Utf16Text);
@@ -1363,7 +1437,7 @@ unsafe fn deliver_bound_plp(
     };
     unsafe {
         write_if_some(
-            indicator,
+            octet_length,
             plp_indicator(produced_bytes, truncated, transcode, wire_total),
         )
     };
@@ -1436,21 +1510,19 @@ unsafe fn deliver_encoded_string(
     }
 
     let stride = element_stride(binding.target_type, binding.buffer_length);
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    // Independent of the indicator per the ODBC "Deferred Fields" spec: see
+    // `deliver_bound`'s comment on `octet_length`. This path never delivers
+    // NULL (that goes through `deliver_bound` via `write_null`), so the
+    // reported length always belongs on `octet_length`, not `indicator`.
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
     if direct_char {
-        unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+        unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         return if unsafe { copy_with_nul(slot, stride, &bytes) } {
             RowOutcome::Info(RowIssue::StringTruncated)
         } else {
@@ -1459,7 +1531,7 @@ unsafe fn deliver_encoded_string(
     }
 
     let source_len = bytes.len() / 2;
-    unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+    unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
     if slot.is_null() {
         return RowOutcome::Success;
     }
@@ -1507,16 +1579,19 @@ unsafe fn deliver_bound(
     let stride = element_stride(binding.target_type, binding.buffer_length);
 
     // SQL_ATTR_ROW_BIND_OFFSET_PTR displaces both bases by the same byte count.
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
+    // Independent of `indicator` per the ODBC "Deferred Fields" spec: this is
+    // where the returned data's length is reported (SQL_DESC_OCTET_LENGTH_PTR),
+    // while `indicator` carries only NULL status (SQL_DESC_INDICATOR_PTR).
+    // `SQLBindCol` writes the same pointer to both (`ColumnBinding::write_to_record`),
+    // so this is the same location as `indicator` for the common case. Every
+    // delivery function in this file (`deliver_fixed_bound`,
+    // `deliver_encoded_string`, `deliver_bound_plp` and this one) resolves and
+    // writes both fields the same way, so a descriptor-field bind that points
+    // them at different buffers delivers to both correctly on every path,
+    // never just this one.
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
 
     let is_null = matches!(value, ColumnValues::Null);
     if is_null && indicator.is_null() {
@@ -1540,10 +1615,12 @@ unsafe fn deliver_bound(
         }
         return RowOutcome::Success;
     }
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
 
     if is_typed_c_target(binding.target_type) {
-        let converted =
-            unsafe { convert_typed_c(value, binding.target_type, slot as SqlPointer, indicator) };
+        let converted = unsafe {
+            convert_typed_c(value, binding.target_type, slot as SqlPointer, octet_length)
+        };
         return match converted {
             Ok(ConvOk::Exact) => RowOutcome::Success,
             Ok(ConvOk::Truncated) => RowOutcome::Info(RowIssue::FractionalTruncated),
@@ -1569,14 +1646,14 @@ unsafe fn deliver_bound(
     let buf_elements = char_buf_elements(binding.target_type, stride);
     if binding.target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = text.encode_utf16().collect();
-        unsafe { write_if_some(indicator, (utf16.len() * 2) as SqlLen) };
+        unsafe { write_if_some(octet_length, (utf16.len() * 2) as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &utf16) };
         if truncated {
             return RowOutcome::Info(RowIssue::StringTruncated);
         }
     } else {
         let bytes = text.as_bytes();
-        unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+        unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot, buf_elements, bytes) };
         if truncated {
             return RowOutcome::Info(RowIssue::StringTruncated);
@@ -1590,8 +1667,8 @@ unsafe fn deliver_bound(
 /// # Safety
 ///
 /// The binding's target pointer, after applying `bind_offset` and `row_index`,
-/// must be null or writable for `T`; its displaced indicator pointer must be
-/// null or writable for one `SqlLen`.
+/// must be null or writable for `T`; its displaced indicator and octet-length
+/// pointers must each be null or writable for one `SqlLen`.
 unsafe fn deliver_fixed_bound<T: Copy>(
     binding: &ColumnBinding,
     row_index: usize,
@@ -1599,23 +1676,21 @@ unsafe fn deliver_fixed_bound<T: Copy>(
     value: T,
 ) -> RowOutcome {
     let stride = element_stride(binding.target_type, binding.buffer_length);
-    let indicator = if binding.strlen_or_ind_ptr.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            (binding.strlen_or_ind_ptr as *mut u8)
-                .add(bind_offset)
-                .cast::<SqlLen>()
-                .add(row_index)
-        }
-    };
+    // Independent of the indicator per the ODBC "Deferred Fields" spec: see
+    // `deliver_bound`'s comment on `octet_length`. This path never delivers
+    // NULL (that goes through `deliver_bound` via `write_null`), so the
+    // reported size always belongs on `octet_length`, not `indicator`.
+    let indicator = unsafe { displaced_len_ptr(binding.strlen_or_ind_ptr, bind_offset, row_index) };
+    let octet_length =
+        unsafe { displaced_len_ptr(binding.octet_length_ptr, bind_offset, row_index) };
+    unsafe { clear_stale_null_indicator(indicator, octet_length) };
     if !binding.target_value_ptr.is_null() {
         let slot =
             unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
         unsafe { slot.cast::<T>().write_unaligned(value) };
     }
     let size = SqlLen::try_from(std::mem::size_of::<T>()).unwrap_or(SqlLen::MAX);
-    unsafe { write_if_some(indicator, size) };
+    unsafe { write_if_some(octet_length, size) };
     RowOutcome::Success
 }
 
@@ -1634,6 +1709,7 @@ mod tests {
     use std::ptr;
 
     use super::*;
+    use crate::api::bind_col::sql_bind_col;
     use crate::api::odbc_types::{
         SQL_C_BINARY, SQL_C_SLONG, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST, SQL_FETCH_LAST,
         SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE,
@@ -1662,6 +1738,7 @@ mod tests {
             target_value_ptr,
             buffer_length,
             strlen_or_ind_ptr,
+            octet_length_ptr: strlen_or_ind_ptr,
         }
     }
 
@@ -1818,14 +1895,20 @@ mod tests {
             state.row_array_size = 4;
             state.rows_fetched_ptr = &mut rows_fetched;
             state.row_status_ptr = statuses.as_mut_ptr();
-            state.set_binding(binding(
-                1,
-                SQL_C_SLONG,
-                values.as_mut_ptr().cast(),
-                0,
-                indicators.as_mut_ptr(),
-            ));
         }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    values.as_mut_ptr().cast(),
+                    0,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
         dbc.runtime
@@ -1876,14 +1959,20 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(2));
-            state.set_binding(binding(
-                1,
-                SQL_C_SLONG,
-                (&mut value as *mut i32).cast(),
-                0,
-                &mut indicator,
-            ));
         }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut client = tds_client_from_int_rows(vec![vec![10, 20]]);
         dbc.runtime
@@ -1921,6 +2010,76 @@ mod tests {
         assert_eq!(second_indicator, 4);
     }
 
+    /// After `SQLSetStmtAttrW` reassociates the ARD, `SQLFetchScroll` must
+    /// deliver into the buffer bound on the *new* explicit descriptor, not
+    /// the implicit one it replaced — the fetch-side counterpart of
+    /// `bind_col.rs`'s `bind_col_writes_through_a_reassociated_ard`, which
+    /// only checks that the bind lands on the right descriptor, not that a
+    /// later fetch actually reads from it.
+    #[test]
+    fn fetch_scroll_reads_through_a_reassociated_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let explicit_ard = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe {
+                crate::api::set_stmt_attr::sql_set_stmt_attr_w(
+                    h.stmt,
+                    crate::api::odbc_types::SQL_ATTR_APP_ROW_DESC,
+                    explicit_ard as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let mut value = 0_i32;
+        let mut indicator = 0;
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+        }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    (&mut value as *mut i32).cast(),
+                    0,
+                    &mut indicator,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![42]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT reassociated ard".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 42, "the fetch must read the reassociated ARD");
+        assert_eq!(indicator, 4);
+
+        let implicit = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        assert_eq!(
+            implicit.inner.lock().unwrap().records.len(),
+            0,
+            "the implicit ARD it replaced must never have been bound"
+        );
+    }
+
     fn assert_partial_buffered_row_delivery(buffered_prefix_columns: usize) {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
@@ -1933,21 +2092,33 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(2));
-            state.set_binding(binding(
-                1,
-                SQL_C_SLONG,
-                first.as_mut_ptr().cast(),
-                0,
-                first_indicators.as_mut_ptr(),
-            ));
-            state.set_binding(binding(
-                2,
-                SQL_C_SLONG,
-                second.as_mut_ptr().cast(),
-                0,
-                second_indicators.as_mut_ptr(),
-            ));
         }
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    1,
+                    SQL_C_SLONG,
+                    first.as_mut_ptr().cast(),
+                    0,
+                    first_indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_bind_col(
+                    h.stmt,
+                    2,
+                    SQL_C_SLONG,
+                    second.as_mut_ptr().cast(),
+                    0,
+                    second_indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let mut client =
             tds_client_from_partial_int_rows(vec![vec![10, 20]], buffered_prefix_columns);
@@ -2295,6 +2466,84 @@ mod tests {
         }
         assert_eq!(buf, [10, 20, 30, 0]);
         assert_eq!(ind[0], 4);
+    }
+
+    /// `deliver_fixed_bound` is the exact-C-type fast path `write_exact` takes
+    /// when the bound type matches (e.g. an int column bound as
+    /// `SQL_C_SLONG`), so its length report is just as reachable through a
+    /// descriptor-field bind as `deliver_bound`'s. A split `SQL_DESC_INDICATOR_PTR`
+    /// / `SQL_DESC_OCTET_LENGTH_PTR` pair must land the size on the octet
+    /// pointer and clear any stale `SQL_NULL_DATA` the indicator could still
+    /// be holding from an earlier NULL row.
+    #[test]
+    fn deliver_fixed_bound_reports_the_size_on_the_split_octet_length_pointer() {
+        let mut value = 0_i32;
+        let mut indicator: SqlLen = SQL_NULL_DATA;
+        let mut octet_length: SqlLen = -99;
+        let b = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_SLONG,
+            target_value_ptr: (&mut value as *mut i32).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut octet_length,
+        };
+        let outcome = unsafe { deliver_fixed_bound(&b, 0, 0, 7_i32) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(value, 7);
+        assert_eq!(octet_length, 4, "the size must land on the octet pointer");
+        assert_eq!(
+            indicator, 0,
+            "a non-NULL value must clear a stale SQL_NULL_DATA on a split indicator"
+        );
+    }
+
+    /// Same split-pointer contract as above, for the direct-copy character
+    /// path `deliver_encoded_string` takes when the wire encoding already
+    /// matches the bound C type.
+    #[test]
+    fn deliver_encoded_string_reports_the_length_on_the_split_octet_length_pointer() {
+        let mut buf = [0u8; 8];
+        let mut indicator: SqlLen = SQL_NULL_DATA;
+        let mut octet_length: SqlLen = -99;
+        let b = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_CHAR,
+            target_value_ptr: buf.as_mut_ptr().cast(),
+            buffer_length: buf.len() as SqlLen,
+            strlen_or_ind_ptr: &mut indicator,
+            octet_length_ptr: &mut octet_length,
+        };
+        let outcome =
+            unsafe { deliver_encoded_string(&b, 0, 0, Cow::Borrowed(b"hi"), EncodingType::Utf8) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(&buf[..2], b"hi");
+        assert_eq!(octet_length, 2, "the length must land on the octet pointer");
+        assert_eq!(
+            indicator, 0,
+            "a non-NULL value must clear a stale SQL_NULL_DATA on a split indicator"
+        );
+    }
+
+    /// A split indicator must not be disturbed on a row where the two
+    /// pointers happen to alias (the ordinary `SQLBindCol` shape) beyond what
+    /// the length write itself does — there is no separate "clear" step
+    /// observable in that case since both writes land on the same memory.
+    #[test]
+    fn a_non_null_value_still_overwrites_an_aliased_indicator_via_the_length_write() {
+        let mut value = 0_i32;
+        let mut shared: SqlLen = SQL_NULL_DATA;
+        let b = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_SLONG,
+            target_value_ptr: (&mut value as *mut i32).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut shared,
+            octet_length_ptr: &mut shared,
+        };
+        let outcome = unsafe { deliver_fixed_bound(&b, 0, 0, 9_i32) };
+        assert!(matches!(outcome, RowOutcome::Success));
+        assert_eq!(shared, 4, "the aliased pointer ends up holding the length");
     }
 
     #[test]
