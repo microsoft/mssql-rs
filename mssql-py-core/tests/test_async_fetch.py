@@ -5,7 +5,10 @@
 
 import asyncio
 import datetime
+import importlib.abc
+import importlib.machinery
 import sys
+import threading
 import uuid
 import warnings
 from decimal import Decimal
@@ -54,17 +57,25 @@ def test_fetchone_without_result_set_raises(mock_client_context):
         conn = await connect(mock_client_context)
         try:
             cursor = conn.cursor()
-            with pytest.raises(RuntimeError, match="No active result set"):
+            with pytest.raises(mssql_py_core.Error) as exc_info:
                 await cursor.fetchone()
-            with pytest.raises(RuntimeError, match="No active result set"):
+            assert isinstance(exc_info.value, mssql_py_core.ProgrammingError)
+            assert "No active result set" in str(exc_info.value)
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
                 await cursor.fetchmany(1)
-            with pytest.raises(RuntimeError, match="No active result set"):
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
                 await cursor.fetchall()
             with pytest.raises(TypeError):
                 cursor.fetchall(1)
             with pytest.raises(TypeError):
                 cursor.fetchall(size=1)
-            with pytest.raises(RuntimeError, match="No active result set"):
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
                 await cursor.nextset()
             with pytest.raises(TypeError):
                 cursor.nextset(1)
@@ -103,13 +114,27 @@ def test_fetchmany_argument_and_arraysize_contract(mock_client_context):
             cursor.arraysize = 3
             assert cursor.arraysize == 3
 
-            assert await cursor.fetchmany(0) == []
-            assert await cursor.fetchmany(-1) == []
-            assert await cursor.fetchmany(False) == []
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchmany(0)
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchmany(-1)
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchmany(False)
             cursor.arraysize = -2
-            assert await cursor.fetchmany() == []
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchmany()
 
-            with pytest.raises(RuntimeError, match="No active result set"):
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
                 await cursor.fetchmany(True)
             with pytest.raises(TypeError):
                 cursor.fetchmany(1.5)
@@ -513,7 +538,9 @@ def test_fetch_interleaving_across_result_transitions_and_ownership(client_conte
 
             assert await owner.nextset() is True
             assert owner.description is None
-            with pytest.raises(RuntimeError, match="No active result set"):
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
                 await owner.fetchall()
 
             assert await owner.nextset() is True
@@ -561,7 +588,9 @@ def test_execute_preserves_leading_statement_without_rows(client_context, use_pr
             )
 
             assert owner.description is None
-            with pytest.raises(RuntimeError, match="No active result set"):
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
                 await owner.fetchone()
             with pytest.raises(RuntimeError, match="busy with another cursor"):
                 await other.execute("SELECT 2", use_prepare=False)
@@ -571,6 +600,91 @@ def test_execute_preserves_leading_statement_without_rows(client_context, use_pr
             assert await owner.fetchall() == [(1,)]
             assert await owner.nextset() is False
             await other.execute("SET NOCOUNT ON", use_prepare=False)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_nextset_reports_batch_end_after_terminal_no_rows(client_context, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            other = conn.cursor()
+
+            await cursor.execute(
+                "CREATE TABLE #async_terminal_no_rows (value int)",
+                use_prepare=False,
+            )
+            assert cursor.description is None
+            await other.execute("SELECT 0", use_prepare=False)
+            assert await other.fetchall() == [(0,)]
+            assert await cursor.nextset() is False
+            assert await cursor.nextset() is False
+
+            await cursor.execute(
+                "INSERT INTO #async_terminal_no_rows VALUES (?)",
+                1,
+                use_prepare=use_prepare,
+            )
+            assert cursor.description is None
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchone()
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchmany()
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchall()
+            assert await cursor.nextset() is False
+            assert await cursor.nextset() is False
+
+            await cursor.execute(
+                "SELECT 2 AS selected_value; "
+                "INSERT INTO #async_terminal_no_rows VALUES (2)",
+                use_prepare=False,
+            )
+            assert await cursor.fetchall() == [(2,)]
+            assert await cursor.nextset() is True
+            assert cursor.description is None
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchone()
+            assert await cursor.nextset() is False
+            assert await cursor.nextset() is False
+
+            await cursor.execute("PRINT 'terminal information'", use_prepare=False)
+            assert cursor.description is None
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchone()
+            assert await cursor.nextset() is False
+
+            await other.execute(
+                "SELECT value FROM #async_terminal_no_rows ORDER BY value",
+                use_prepare=False,
+            )
+            assert await other.fetchall() == [(1,), (2,)]
+
+            await cursor.execute("SET NOCOUNT ON", use_prepare=False)
+            assert cursor.description is None
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchone()
+            await other.execute("SELECT 3", use_prepare=False)
+            assert await other.fetchall() == [(3,)]
+            assert await cursor.nextset() is False
+            assert await cursor.nextset() is False
         finally:
             await conn.close()
 
@@ -629,7 +743,9 @@ def test_nextset_surfaces_statement_without_rows(client_context):
 
             assert await cursor.nextset() is True
             assert cursor.description is None
-            with pytest.raises(RuntimeError, match="No active result set"):
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
                 await cursor.fetchone()
 
             assert await cursor.nextset() is True
@@ -678,9 +794,14 @@ def test_nextset_preserves_sql_server_error_type_and_diagnostics(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
-                "SELECT 1; RAISERROR('nextset failure', 16, 1)",
+                "SELECT 1; "
+                "RAISERROR('nextset information', 10, 2); "
+                "RAISERROR('nextset failure', 16, 1)",
                 use_prepare=False,
             )
+
+            assert await cursor.nextset() is True
+            assert cursor.description is None
 
             with pytest.raises(mssql_py_core.DatabaseError) as exc_info:
                 await cursor.nextset()
@@ -692,7 +813,14 @@ def test_nextset_preserves_sql_server_error_type_and_diagnostics(client_context)
             assert exc_info.value.sql_errors[0]["number"] == 50000
             assert exc_info.value.sql_errors[0]["class"] == 16
             assert exc_info.value.sql_errors[0]["state"] == 1
-            assert exc_info.value.info_messages == []
+            assert len(exc_info.value.info_messages) == 1
+            assert exc_info.value.info_messages[0]["number"] == 50000
+            assert exc_info.value.info_messages[0]["class"] == 0
+            assert exc_info.value.info_messages[0]["state"] == 2
+            assert (
+                exc_info.value.info_messages[0]["message"]
+                == "nextset information"
+            )
 
             await conn.cursor().execute("SET NOCOUNT ON", use_prepare=False)
         finally:
@@ -732,7 +860,8 @@ def test_nextset_logs_result_transitions(client_context):
             ) in logger.events
 
             await cursor.execute(
-                "SELECT 1; SELECT CAST(1 AS decimal(10, 2)) AS value",
+                "SELECT 1; SELECT CAST(1 AS decimal(10, 2)) AS value; "
+                "SELECT 3 AS recovered_value",
                 use_prepare=False,
             )
             decimal_module = sys.modules["decimal"]
@@ -740,14 +869,21 @@ def test_nextset_logs_result_transitions(client_context):
             logger.events.clear()
             try:
                 with pytest.raises(
-                    RuntimeError,
+                    mssql_py_core.InternalError,
                     match="Advanced result set but cursor description materialization failed",
                 ):
                     await cursor.nextset()
             finally:
                 sys.modules["decimal"] = decimal_module
             assert cursor.description is None
-            assert await cursor.fetchone() == (Decimal("1.00"),)
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchone()
+            assert await cursor.nextset() is True
+            assert cursor.description[0][:2] == ("recovered_value", int)
+            assert await cursor.fetchone() == (3,)
+            assert await cursor.nextset() is False
             assert any(
                 level == 40
                 and "PyAsyncCursor::nextset: description materialization failed; "
@@ -757,6 +893,78 @@ def test_nextset_logs_result_transitions(client_context):
                 for level, message, _module in logger.events
             )
         finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_nextset_cancellation_during_description_materialization_does_not_publish_rows(
+    client_context,
+):
+    class BlockingDecimalFinder(importlib.abc.MetaPathFinder):
+        def __init__(self, entered, release):
+            self.entered = entered
+            self.release = release
+
+        def find_spec(self, fullname, path, target=None):
+            if fullname != "decimal":
+                return None
+            self.entered.set()
+            self.release.wait()
+            return importlib.machinery.PathFinder.find_spec(fullname, path, target)
+
+    async def run():
+        conn = await connect(client_context)
+        entered = threading.Event()
+        release = threading.Event()
+        finder = BlockingDecimalFinder(entered, release)
+        decimal_module = sys.modules.pop("decimal")
+        sys.meta_path.insert(0, finder)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT 1; SELECT CAST(2 AS decimal(10, 2)) AS value",
+                use_prepare=False,
+            )
+            task = asyncio.ensure_future(cursor.nextset())
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Description materialization did not start")
+
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert cursor.description is None
+            probe = conn.cursor()
+            for _ in range(100):
+                try:
+                    await probe.execute("SELECT 3", use_prepare=False)
+                except RuntimeError as error:
+                    if "busy" in str(error).lower():
+                        await asyncio.sleep(0.01)
+                        continue
+                    assert "broken" in str(error).lower()
+                    break
+                else:
+                    pytest.fail(
+                        "Cancelled description materialization left the connection reusable"
+                    )
+            else:
+                pytest.fail(
+                    "Cancelled description materialization left the connection permanently busy"
+                )
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            sys.modules["decimal"] = decimal_module
             await conn.close()
 
     asyncio.run(run())

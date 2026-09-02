@@ -5,7 +5,7 @@
 
 use std::sync::Mutex as StdMutex;
 
-use mssql_tds::datatypes::sqldatatypes::TdsDataType;
+use mssql_tds::datatypes::sqldatatypes::{TdsDataType, VectorBaseType};
 use mssql_tds::query::metadata::ColumnMetadata;
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -14,14 +14,14 @@ use pyo3::types::{
 };
 
 /// Cursor-local Python snapshot of the current result-set metadata.
-pub(crate) struct DescriptionState(StdMutex<Option<Py<PyList>>>);
+pub(crate) struct DescriptionState(StdMutex<Option<Py<PyTuple>>>);
 
 impl DescriptionState {
     pub(crate) fn new() -> Self {
         Self(StdMutex::new(None))
     }
 
-    pub(crate) fn replace(&self, description: Option<Py<PyList>>) -> Option<Py<PyList>> {
+    pub(crate) fn replace(&self, description: Option<Py<PyTuple>>) -> Option<Py<PyTuple>> {
         std::mem::replace(
             &mut self
                 .0
@@ -31,7 +31,7 @@ impl DescriptionState {
         )
     }
 
-    pub(crate) fn get<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyList>> {
+    pub(crate) fn get<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyTuple>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -42,7 +42,7 @@ impl DescriptionState {
 
 pub(crate) async fn materialize(
     metadata: Option<Vec<ColumnMetadata>>,
-) -> PyResult<Option<Py<PyList>>> {
+) -> PyResult<Option<Py<PyTuple>>> {
     let Some(metadata) = metadata else {
         return Ok(None);
     };
@@ -86,10 +86,18 @@ fn python_type<'py>(py: Python<'py>, metadata: &ColumnMetadata) -> PyResult<Boun
         | TdsDataType::BigVarBinary
         | TdsDataType::Image
         | TdsDataType::Udt => py.get_type::<PyBytes>(),
+        TdsDataType::Vector => vector_python_type(py, metadata.get_scale()),
         TdsDataType::Guid => imported_python_type(py, "uuid", "UUID")?,
         _ => py.get_type::<PyString>(),
     };
     Ok(python_type)
+}
+
+fn vector_python_type(py: Python<'_>, base_type: Option<u8>) -> Bound<'_, PyType> {
+    match base_type.and_then(|value| VectorBaseType::try_from(value).ok()) {
+        Some(VectorBaseType::Float32) => py.get_type::<PyList>(),
+        Some(VectorBaseType::Float16) | None => py.get_type::<PyString>(),
+    }
 }
 
 fn imported_python_type<'py>(
@@ -177,7 +185,7 @@ fn decimal_digits(metadata: &ColumnMetadata) -> u8 {
 fn description_to_python<'py>(
     py: Python<'py>,
     metadata: &[ColumnMetadata],
-) -> PyResult<Bound<'py, PyList>> {
+) -> PyResult<Bound<'py, PyTuple>> {
     let mut description = Vec::with_capacity(metadata.len());
     for column in metadata {
         let size = column_size(column);
@@ -198,5 +206,29 @@ fn description_to_python<'py>(
             ],
         )?);
     }
-    PyList::new(py, description)
+    PyTuple::new(py, description)
+}
+
+#[cfg(test)]
+mod tests {
+    use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
+    use pyo3::Python;
+    use pyo3::types::{PyAnyMethods, PyList, PyString};
+
+    use super::vector_python_type;
+
+    #[test]
+    fn vector_python_type_matches_row_conversion() {
+        Python::attach(|py| {
+            assert!(
+                vector_python_type(py, Some(VectorBaseType::Float32 as u8))
+                    .is(py.get_type::<PyList>())
+            );
+            assert!(
+                vector_python_type(py, Some(VectorBaseType::Float16 as u8))
+                    .is(py.get_type::<PyString>())
+            );
+            assert!(vector_python_type(py, None).is(py.get_type::<PyString>()));
+        });
+    }
 }

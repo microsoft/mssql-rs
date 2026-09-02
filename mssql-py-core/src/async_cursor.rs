@@ -34,6 +34,7 @@ use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 use crate::async_description::DescriptionState;
+use crate::async_errors::ProgrammingError;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
 use crate::async_fetch::FetchState;
 use crate::async_session::{
@@ -48,7 +49,7 @@ fn map_claim_error_with_busy_message(error: ClaimError, busy_message: &'static s
         ClaimError::Closed => PyRuntimeError::new_err("Connection is closed"),
         ClaimError::Broken => PyRuntimeError::new_err("Connection is broken"),
         ClaimError::Busy => PyRuntimeError::new_err(busy_message),
-        ClaimError::NoResultSet => PyRuntimeError::new_err("No active result set"),
+        ClaimError::NoResultSet => ProgrammingError::new_err("No active result set"),
     }
 }
 
@@ -334,8 +335,19 @@ impl Drop for PyAsyncCursor {
 mod tests {
     use std::sync::Arc;
 
-    use super::FinalizerCompletionGuard;
+    use pyo3::Python;
+
+    use super::{FinalizerCompletionGuard, map_claim_error};
+    use crate::async_errors::ProgrammingError;
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+
+    #[test]
+    fn no_result_set_claim_maps_to_programming_error() {
+        let error = map_claim_error(ClaimError::NoResultSet);
+
+        Python::attach(|py| assert!(error.is_instance_of::<ProgrammingError>(py)));
+        assert!(error.to_string().contains("No active result set"));
+    }
 
     #[test]
     fn completed_finalizer_preserves_settled_session() {
@@ -374,7 +386,7 @@ impl PyAsyncCursor {
 
     /// A seven-item DB-API descriptor for each column in the current result set.
     #[getter]
-    fn description<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyList>> {
+    fn description<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyTuple>> {
         self.description_state.get(py)
     }
 

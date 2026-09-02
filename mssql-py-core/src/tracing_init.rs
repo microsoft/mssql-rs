@@ -13,6 +13,8 @@ use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFi
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
 
+use crate::async_tracing::{CURSOR_OPERATION_SPAN_NAME, CURSOR_OPERATION_SPAN_TARGET};
+
 static INIT: Once = Once::new();
 static GUARD: OnceCell<tracing_appender::non_blocking::WorkerGuard> = OnceCell::new();
 
@@ -72,6 +74,11 @@ where
 
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
+                if span.name() != CURSOR_OPERATION_SPAN_NAME
+                    || span.metadata().target() != CURSOR_OPERATION_SPAN_TARGET
+                {
+                    continue;
+                }
                 let extensions = span.extensions();
                 if let Some(fields) = extensions.get::<FormattedFields<N>>()
                     && !fields.is_empty()
@@ -339,6 +346,7 @@ mod tests {
             tracing::warn!("Warn message");
             tracing::info!("Info message");
             let span = tracing::info_span!(
+                target: CURSOR_OPERATION_SPAN_TARGET,
                 "async_cursor_operation",
                 cursor_id = 41_u64,
                 operation_id = 73_u64,
@@ -346,6 +354,12 @@ mod tests {
                 result_set_status = "reading",
             );
             let _entered = span.enter();
+            let sensitive_span = tracing::info_span!(
+                target: "mssql_tds::connection::tds_client",
+                "execute",
+                sql_command = "SELECT 'SECRET_SQL_LITERAL'",
+            );
+            let _sensitive_entered = sensitive_span.enter();
             tracing::info!("Correlated message");
             tracing::debug!("Debug message - should not appear");
             tracing::trace!("Trace message - should not appear");
@@ -391,6 +405,8 @@ mod tests {
             assert!(log_content.contains("operation_id=73"));
             assert!(log_content.contains("operation=\"fetchmany\""));
             assert!(log_content.contains("result_set_status=\"reading\""));
+            assert!(!log_content.contains("sql_command"));
+            assert!(!log_content.contains("SECRET_SQL_LITERAL"));
 
             // Should NOT contain DEBUG or TRACE (filtered out by the default 'info' level)
             assert!(!log_content.contains("Debug message"));

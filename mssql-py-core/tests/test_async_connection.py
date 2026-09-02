@@ -158,7 +158,7 @@ def test_connection_operations_reuse_connect_logger(client_context):
         logger.messages.clear()
         try:
             with pytest.raises(
-                RuntimeError,
+                mssql_py_core.InternalError,
                 match="Query executed but cursor description materialization failed",
             ):
                 await cursor.execute(

@@ -272,6 +272,67 @@ def test_execute_accepts_empty_mapping_without_markers(mock_client_context):
     asyncio.run(run())
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_execute_server_error_uses_dbapi_hierarchy_and_diagnostics(
+    client_context, use_prepare
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute("SELECT 1 AS previous_value", use_prepare=False)
+
+            with pytest.raises(mssql_py_core.Error) as exc_info:
+                await cursor.execute(
+                    "SELECT * FROM __missing_async_execute_table__",
+                    use_prepare=use_prepare,
+                )
+
+            assert isinstance(exc_info.value, mssql_py_core.DatabaseError)
+            assert "PyAsyncCursor.execute failed while executing query" in str(
+                exc_info.value
+            )
+            assert exc_info.value.sql_errors
+            assert exc_info.value.sql_errors[0]["number"] == 208
+            assert "invalid object name" in exc_info.value.sql_errors[0][
+                "message"
+            ].lower()
+            assert exc_info.value.info_messages == []
+            assert cursor.description is None
+
+            await cursor.execute("SELECT 2 AS recovered", use_prepare=False)
+            assert await cursor.fetchone() == (2,)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_execute_syntax_error_preserves_server_diagnostics(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            with pytest.raises(mssql_py_core.DatabaseError) as exc_info:
+                await cursor.execute(
+                    "SELECT 1 +",
+                    use_prepare=False,
+                )
+
+            assert exc_info.value.sql_errors
+            assert exc_info.value.sql_errors[0]["number"] == 102
+            assert "incorrect syntax" in exc_info.value.sql_errors[0][
+                "message"
+            ].lower()
+            assert exc_info.value.info_messages == []
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
 def test_execute_rejects_missing_named_parameter(mock_client_context):
     async def run():
         conn = await connect(mock_client_context)
@@ -399,7 +460,7 @@ def test_setinputsizes_survives_asynchronous_execution_failure(client_context):
         try:
             cursor = conn.cursor()
             cursor.setinputsizes([(-9, 20, 0)])  # SQL_WVARCHAR
-            with pytest.raises(RuntimeError, match="expected failure"):
+            with pytest.raises(mssql_py_core.DatabaseError, match="expected failure"):
                 await cursor.execute("THROW 50000, 'expected failure', 1; SELECT ?", "ascii")
 
             await cursor.execute(

@@ -9,6 +9,9 @@ use tracing::Instrument;
 
 use crate::async_session::{CursorId, OperationId};
 
+pub(crate) const CURSOR_OPERATION_SPAN_NAME: &str = "async_cursor_operation";
+pub(crate) const CURSOR_OPERATION_SPAN_TARGET: &str = "mssql_py_core::async_tracing";
+
 pub(crate) async fn in_cursor_operation_span<F>(
     future: F,
     cursor_id: CursorId,

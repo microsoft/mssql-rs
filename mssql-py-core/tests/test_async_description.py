@@ -45,11 +45,25 @@ def test_description_matches_sync_cursor_contract(client_context):
             await cursor.execute(
                 "SELECT database_id, name FROM sys.databases", use_prepare=False
             )
-            assert cursor.description == [
+            assert cursor.description == (
                 ("database_id", int, None, 10, 10, 0, False),
                 ("name", str, None, 128, 128, 0, False),
-            ]
+            )
+            assert isinstance(cursor.description, tuple)
+            assert all(isinstance(column, tuple) for column in cursor.description)
             assert cursor.description is cursor.description
+
+            description = cursor.description
+            with pytest.raises(AttributeError):
+                description.append(("injected", str, None, 0, 0, 0, True))
+            with pytest.raises(TypeError):
+                description[0] = ("replaced", int, None, 10, 10, 0, False)
+            with pytest.raises(TypeError):
+                del description[0]
+            assert cursor.description == (
+                ("database_id", int, None, 10, 10, 0, False),
+                ("name", str, None, 128, 128, 0, False),
+            )
         finally:
             await conn.close()
 
@@ -149,6 +163,27 @@ def test_description_type_size_precision_scale_and_nullability(client_context):
 
 
 @pytest.mark.integration
+def test_description_vector_type_matches_fetched_value(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT CAST('[1,2,3]' AS vector(3)) AS vector_value",
+                use_prepare=False,
+            )
+
+            assert cursor.description[0][0:2] == ("vector_value", list)
+            row = await cursor.fetchone()
+            assert isinstance(row[0], list)
+            assert row[0] == pytest.approx([1.0, 2.0, 3.0])
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_description_survives_fetch_empty_result_exhaustion_and_close(client_context):
     async def run():
         conn = await connect(client_context)
@@ -166,7 +201,7 @@ def test_description_survives_fetch_empty_result_exhaustion_and_close(client_con
                 "SELECT CAST(1 AS int) AS value WHERE 1 = 0", use_prepare=False
             )
             description = cursor.description
-            assert description == [("value", int, None, 10, 10, 0, True)]
+            assert description == (("value", int, None, 10, 10, 0, True),)
             assert await cursor.fetchone() is None
             assert await cursor.fetchone() is None
             assert cursor.description == description
@@ -212,8 +247,10 @@ def test_description_is_replaced_or_cleared_by_execute(client_context):
             assert cursor.description is None
 
             await cursor.execute("SELECT 1 AS recovered", use_prepare=False)
-            with pytest.raises(RuntimeError, match="Query execution failed"):
+            with pytest.raises(mssql_py_core.DatabaseError) as exc_info:
                 await cursor.execute("SELECT * FROM __missing_async_description_table__")
+            assert exc_info.value.sql_errors
+            assert exc_info.value.sql_errors[0]["number"] == 208
             assert cursor.description is None
         finally:
             await conn.close()

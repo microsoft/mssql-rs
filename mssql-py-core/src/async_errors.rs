@@ -35,10 +35,15 @@ pub(crate) fn add_exceptions(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-pub(crate) fn map_tds_error(context: &str, error: TdsError) -> PyErr {
+pub(crate) fn map_tds_error(
+    context: &str,
+    error: TdsError,
+    statement_info_messages: Vec<SqlInfoMessage>,
+) -> PyErr {
     let message = format!("{context}: {error}");
     match error {
-        TdsError::SqlServerError { diagnostics } => {
+        TdsError::SqlServerError { mut diagnostics } => {
+            diagnostics.info_messages.extend(statement_info_messages);
             database_error_with_diagnostics(message, diagnostics)
         }
         TdsError::UsageError(_) => ProgrammingError::new_err(message),
@@ -147,7 +152,7 @@ fn diagnostic_dict<'py>(
 
 #[cfg(test)]
 mod tests {
-    use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlServerDiagnostics};
+    use mssql_tds::error::{Error as TdsError, SqlErrorInfo, SqlInfoMessage, SqlServerDiagnostics};
     use pyo3::types::PyAnyMethods;
     use pyo3::{Py, PyAny, Python};
 
@@ -163,6 +168,7 @@ mod tests {
             TdsError::TimeoutError(mssql_tds::error::TimeoutErrorType::String(
                 "deadline exceeded".to_string(),
             )),
+            Vec::new(),
         );
 
         Python::attach(|py| assert!(error.is_instance_of::<OperationalError>(py)));
@@ -172,12 +178,17 @@ mod tests {
     #[test]
     fn maps_client_error_categories() {
         Python::attach(|py| {
-            let usage = map_tds_error("operation failed", TdsError::UsageError("usage".into()));
+            let usage = map_tds_error(
+                "operation failed",
+                TdsError::UsageError("usage".into()),
+                Vec::new(),
+            );
             assert!(usage.is_instance_of::<ProgrammingError>(py));
 
             let conversion = map_tds_error(
                 "operation failed",
                 TdsError::TypeConversionError("conversion".into()),
+                Vec::new(),
             );
             assert!(conversion.is_instance_of::<DataError>(py));
 
@@ -187,18 +198,21 @@ mod tests {
                     feature: "feature".into(),
                     context: "context".into(),
                 },
+                Vec::new(),
             );
             assert!(unsupported.is_instance_of::<NotSupportedError>(py));
 
             let protocol = map_tds_error(
                 "operation failed",
                 TdsError::ProtocolError("protocol".into()),
+                Vec::new(),
             );
             assert!(protocol.is_instance_of::<InternalError>(py));
 
             let connection = map_tds_error(
                 "operation failed",
                 TdsError::ConnectionClosed("closed".into()),
+                Vec::new(),
             );
             assert!(connection.is_instance_of::<OperationalError>(py));
         });
@@ -216,11 +230,28 @@ mod tests {
                 proc_name: Some("procedure".to_string()),
                 line_number: Some(7),
             }],
-            Vec::new(),
+            vec![SqlInfoMessage {
+                message: "existing info".to_string(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: Some("server".to_string()),
+                proc_name: None,
+                line_number: Some(5),
+            }],
         );
         let error = map_tds_error(
             "PyAsyncCursor.nextset failed while advancing results",
             TdsError::SqlServerError { diagnostics },
+            vec![SqlInfoMessage {
+                message: "statement info".to_string(),
+                state: 1,
+                class: 10,
+                number: 50_000,
+                server_name: Some("server".to_string()),
+                proc_name: Some("procedure".to_string()),
+                line_number: Some(6),
+            }],
         );
 
         Python::attach(|py| {
@@ -240,6 +271,40 @@ mod tests {
                     .extract::<u32>()
                     .unwrap(),
                 50_001
+            );
+            let info_messages = error
+                .value(py)
+                .getattr("info_messages")
+                .unwrap()
+                .extract::<Vec<Py<PyAny>>>()
+                .unwrap();
+            assert_eq!(info_messages.len(), 2);
+            assert_eq!(
+                info_messages[0]
+                    .bind(py)
+                    .get_item("message")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "existing info"
+            );
+            assert_eq!(
+                info_messages[1]
+                    .bind(py)
+                    .get_item("message")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "statement info"
+            );
+            assert_eq!(
+                info_messages[1]
+                    .bind(py)
+                    .get_item("number")
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                50_000
             );
         });
     }

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
-use mssql_tds::error::Error;
+use mssql_tds::error::{Error, SqlInfoMessage};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use tokio::sync::Mutex;
@@ -17,7 +17,7 @@ use tracing::instrument::WithSubscriber;
 
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
-use crate::async_errors::map_tds_error;
+use crate::async_errors::{InternalError, map_tds_error};
 use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
 use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::row_writer::PyRowWriter;
@@ -31,6 +31,7 @@ pub(crate) enum FetchStatus {
     NoResultSet,
     Ready,
     Exhausted,
+    TerminalNoRows,
 }
 
 pub(crate) struct FetchState(AtomicU8);
@@ -44,6 +45,7 @@ impl FetchState {
         match self.0.load(Ordering::Acquire) {
             value if value == FetchStatus::Ready as u8 => FetchStatus::Ready,
             value if value == FetchStatus::Exhausted as u8 => FetchStatus::Exhausted,
+            value if value == FetchStatus::TerminalNoRows as u8 => FetchStatus::TerminalNoRows,
             _ => FetchStatus::NoResultSet,
         }
     }
@@ -53,6 +55,7 @@ impl FetchState {
         match previous {
             value if value == FetchStatus::Ready as u8 => FetchStatus::Ready,
             value if value == FetchStatus::Exhausted as u8 => FetchStatus::Exhausted,
+            value if value == FetchStatus::TerminalNoRows as u8 => FetchStatus::TerminalNoRows,
             _ => FetchStatus::NoResultSet,
         }
     }
@@ -290,19 +293,26 @@ async fn fetch_rows_on_client(client: &mut TdsClient, limit: usize) -> Result<Fe
     })
 }
 
-fn map_fetch_error(operation: &str, error: Error, elapsed_ms: u128) -> PyErr {
+fn map_fetch_error(
+    operation: &str,
+    error: Error,
+    info_messages: Vec<SqlInfoMessage>,
+    elapsed_ms: u128,
+) -> PyErr {
     tracing::error!("PyAsyncCursor::{operation}: failed; elapsed_ms={elapsed_ms}; error={error}");
     map_tds_error(
         &format!("PyAsyncCursor.{operation} failed while reading rows"),
         error,
+        info_messages,
     )
 }
 
-fn map_nextset_error(error: Error, elapsed_ms: u128) -> PyErr {
+fn map_nextset_error(error: Error, info_messages: Vec<SqlInfoMessage>, elapsed_ms: u128) -> PyErr {
     tracing::error!("PyAsyncCursor::nextset: failed; elapsed_ms={elapsed_ms}; error={error}");
     map_tds_error(
         "PyAsyncCursor.nextset failed while advancing results",
         error,
+        info_messages,
     )
 }
 
@@ -322,7 +332,10 @@ fn fetch<'py>(
         fetch_state,
         description_state: _,
     } = resources;
-    if fetch_state.status() == FetchStatus::NoResultSet {
+    if matches!(
+        fetch_state.status(),
+        FetchStatus::NoResultSet | FetchStatus::TerminalNoRows
+    ) {
         session_state.ensure_open().map_err(map_claim_error)?;
         return Err(map_claim_error(ClaimError::NoResultSet));
     }
@@ -355,11 +368,16 @@ fn fetch<'py>(
         let mut fetch_guard =
             FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
 
-        let (result, has_open_batch) = {
+        let (result, info_messages, has_open_batch) = {
             let mut client = client.lock().await;
             let result = fetch_rows_on_client(&mut client, limit).await;
+            let info_messages = if matches!(result, Err(Error::SqlServerError { .. })) {
+                client.take_info_messages()
+            } else {
+                Vec::new()
+            };
             let has_open_batch = client.has_open_batch();
-            (result, has_open_batch)
+            (result, info_messages, has_open_batch)
         };
         let read_ms = started.elapsed().as_millis();
 
@@ -415,6 +433,7 @@ fn fetch<'py>(
                 Err(map_fetch_error(
                     operation,
                     error,
+                    info_messages,
                     started.elapsed().as_millis(),
                 ))
             }
@@ -458,6 +477,12 @@ pub(crate) fn fetchmany<'py>(
             .session_state
             .ensure_open()
             .map_err(map_claim_error)?;
+        if matches!(
+            resources.fetch_state.status(),
+            FetchStatus::NoResultSet | FetchStatus::TerminalNoRows
+        ) {
+            return Err(map_claim_error(ClaimError::NoResultSet));
+        }
         return pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Python::attach(|py| FetchOutput::Many.empty(py))
         });
@@ -504,7 +529,12 @@ pub(crate) fn nextset<'py>(
     } = resources;
     let claim = match session_state.claim_fetch(cursor_id) {
         Ok(claim) => claim,
-        Err(ClaimError::NoResultSet) if fetch_state.status() == FetchStatus::Exhausted => {
+        Err(ClaimError::NoResultSet)
+            if matches!(
+                fetch_state.status(),
+                FetchStatus::Exhausted | FetchStatus::TerminalNoRows
+            ) =>
+        {
             return pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(false) });
         }
         Err(error) => return Err(map_claim_error(error)),
@@ -516,7 +546,6 @@ pub(crate) fn nextset<'py>(
     let future_fetch_state = fetch_state.clone();
     let future_description_state = description_state.clone();
     let guard_dispatch = dispatch.clone();
-    let materialization_dispatch = dispatch.clone();
 
     let future = async move {
         let started = Instant::now();
@@ -525,14 +554,19 @@ pub(crate) fn nextset<'py>(
         let mut fetch_guard =
             FetchGuard::new(future_state, operation_id, "nextset", guard_dispatch);
 
-        let (result, has_open_batch) = {
+        let (result, info_messages, has_open_batch) = {
             let mut client = client.lock().await;
             let result = client.advance().await.map(|result| {
                 let metadata =
                     matches!(result, StatementResult::Rows).then(|| client.get_metadata().clone());
                 (result, metadata)
             });
-            (result, client.has_open_batch())
+            let info_messages = if matches!(result, Err(Error::SqlServerError { .. })) {
+                client.take_info_messages()
+            } else {
+                Vec::new()
+            };
+            (result, info_messages, client.has_open_batch())
         };
         let read_ms = started.elapsed().as_millis();
 
@@ -546,20 +580,19 @@ pub(crate) fn nextset<'py>(
                     StatementResult::End => "exhausted",
                 });
                 let column_count = metadata.as_ref().map_or(0, Vec::len);
-                future_fetch_state.set(match result {
+                let next_fetch_status = match result {
                     StatementResult::Rows => FetchStatus::Ready,
-                    StatementResult::NoRows { .. } => FetchStatus::NoResultSet,
+                    StatementResult::NoRows { .. } if has_open_batch => FetchStatus::NoResultSet,
+                    StatementResult::NoRows { .. } => FetchStatus::TerminalNoRows,
                     StatementResult::End => FetchStatus::Exhausted,
-                });
-                fetch_guard.complete(!has_rows, has_open_batch);
+                };
 
                 let materialization_started = Instant::now();
-                let mut materialization_guard =
-                    MaterializationGuard::new("nextset", materialization_dispatch);
                 match materialize(metadata).await {
                     Ok(description) => {
-                        materialization_guard.complete();
                         future_description_state.replace(description);
+                        future_fetch_state.set(next_fetch_status);
+                        fetch_guard.complete(!has_rows, has_open_batch);
                         tracing::debug!(
                             "PyAsyncCursor::nextset: completed; has_result={has_result}; has_rows={has_rows}; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}",
                             started.elapsed().as_millis(),
@@ -571,13 +604,14 @@ pub(crate) fn nextset<'py>(
                         Ok(has_result)
                     }
                     Err(error) => {
-                        materialization_guard.complete();
+                        future_fetch_state.set(FetchStatus::NoResultSet);
+                        fetch_guard.complete(true, has_open_batch);
                         tracing::error!(
                             "PyAsyncCursor::nextset: description materialization failed; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}; error={error}",
                             started.elapsed().as_millis(),
                             materialization_started.elapsed().as_millis(),
                         );
-                        Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        Err(InternalError::new_err(format!(
                             "Advanced result set but cursor description materialization failed: {error}"
                         )))
                     }
@@ -587,7 +621,7 @@ pub(crate) fn nextset<'py>(
                 record_result_set_status("error");
                 fetch_guard.fail(has_open_batch);
                 future_fetch_state.set(FetchStatus::NoResultSet);
-                Err(map_nextset_error(error, read_ms))
+                Err(map_nextset_error(error, info_messages, read_ms))
             }
         }
     };
@@ -654,6 +688,7 @@ mod tests {
         let error = map_fetch_error(
             "fetchone",
             Error::ProtocolError("invalid row token".to_string()),
+            Vec::new(),
             7,
         );
 
@@ -667,7 +702,11 @@ mod tests {
 
     #[test]
     fn maps_nextset_protocol_error_to_python_internal_error() {
-        let error = map_nextset_error(Error::ProtocolError("invalid result token".to_string()), 7);
+        let error = map_nextset_error(
+            Error::ProtocolError("invalid result token".to_string()),
+            Vec::new(),
+            7,
+        );
 
         pyo3::Python::attach(|py| {
             assert!(error.is_instance_of::<crate::async_errors::InternalError>(py));
