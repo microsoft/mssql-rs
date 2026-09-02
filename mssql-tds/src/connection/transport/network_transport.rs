@@ -37,9 +37,11 @@ use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{self, TcpStream};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, error, event, info, trace, warn};
@@ -909,6 +911,25 @@ impl NetworkTransport {
         Ok(())
     }
 
+    fn try_read_tds_packet(&mut self) -> TdsResult<bool> {
+        if self.tds_read_buffer.end_of_message {
+            return Ok(false);
+        }
+
+        let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
+        if remaining_bytes > 0 {
+            self.tds_read_buffer.shift_data_to_front();
+        } else {
+            self.tds_read_buffer.reset_to_length(0);
+        }
+        let Some(new_packet_size) = self.try_get_new_tds_packet()? else {
+            return Ok(false);
+        };
+        self.tds_read_buffer
+            .remove_header_from_packet(new_packet_size);
+        Ok(true)
+    }
+
     /// Reads a complete TDS packet from the network into the working buffer.
     ///
     /// This method handles the case where a single `read()` call returns data for multiple
@@ -991,139 +1012,80 @@ impl NetworkTransport {
     /// - Shared Memory: Same as Named Pipes (uses Named Pipes internally)
     ///
     /// The fix ensures all bytes from `read()` are accounted for, not just the first packet.
-    async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
-        let base_offset = self.tds_read_buffer.buffer_length;
-
-        // Check if we have pending bytes from a previous read that included multiple packets
-        let mut bytes_available = self.tds_read_buffer.pending_bytes;
+    fn move_pending_packet_bytes(&mut self, base_offset: usize) -> TdsResult<usize> {
+        let bytes_available = self.tds_read_buffer.pending_bytes;
         let pending_offset = self.tds_read_buffer.pending_bytes_offset;
 
         if bytes_available > 0 {
-            // Validate bounds before copy_within to avoid panic on malformed data.
-            // These values are derived from packet lengths on the wire, so we must
-            // guard against corrupted or malicious packets.
             let src_end = pending_offset.saturating_add(bytes_available);
             let dest_end = base_offset.saturating_add(bytes_available);
             let buffer_len = self.tds_read_buffer.working_buffer.len();
-
             if src_end > buffer_len || dest_end > buffer_len {
                 return Err(crate::error::Error::ProtocolError(format!(
                     "Invalid pending bytes range: src {}..{}, dest {}, buffer_len {}",
                     pending_offset, src_end, base_offset, buffer_len
                 )));
             }
-
-            // We have pending bytes - move them to base_offset
             self.tds_read_buffer
                 .working_buffer
                 .copy_within(pending_offset..src_end, base_offset);
             self.tds_read_buffer.pending_bytes = 0;
             self.tds_read_buffer.pending_bytes_offset = 0;
         }
+        Ok(bytes_available)
+    }
 
-        let stream = self.stream.as_mut().ok_or_else(|| {
-            crate::error::Error::ConnectionClosed(
-                "Cannot read TDS packet: connection has been closed".to_string(),
-            )
-        })?;
-
-        // Read more data if we don't have enough for the header
-        while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
-            let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    // A read failure means the socket is broken; record it so the
-                    // cached liveness check reports the connection as dead.
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet header".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
+    fn complete_tds_packet_if_available(
+        &mut self,
+        base_offset: usize,
+        bytes_available: usize,
+    ) -> TdsResult<Option<usize>> {
+        if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+            return Ok(None);
         }
 
         let length_from_packet_header = BigEndian::read_u16(
             &self.tds_read_buffer.working_buffer[base_offset + 2..base_offset + 4],
         );
-
-        let packet_size_from_header: usize = length_from_packet_header as usize;
-
-        // Validate packet_size_from_header against protocol constraints.
-        // A malicious or corrupted server could send invalid lengths.
-        if packet_size_from_header < PacketWriter::PACKET_HEADER_SIZE {
+        let packet_size = usize::from(length_from_packet_header);
+        if packet_size < PacketWriter::PACKET_HEADER_SIZE {
             return Err(crate::error::Error::ProtocolError(format!(
                 "Invalid TDS packet length {}: must be at least {} bytes (header size)",
-                packet_size_from_header,
+                packet_size,
                 PacketWriter::PACKET_HEADER_SIZE
             )));
         }
+        if packet_size > self.tds_read_buffer.max_packet_size {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "TDS packet length {} exceeds negotiated max packet size {}",
+                packet_size, self.tds_read_buffer.max_packet_size
+            )));
+        }
+        let buffer_len = self.tds_read_buffer.working_buffer.len();
+        if base_offset.saturating_add(packet_size) > buffer_len {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "TDS packet length {} at offset {} exceeds buffer capacity {}",
+                packet_size, base_offset, buffer_len
+            )));
+        }
+        if bytes_available < packet_size {
+            return Ok(None);
+        }
 
-        // A payload-free packet that is not the end of its message is
-        // malformed: it neither carries payload nor terminates a message. An
-        // empty EOM packet is legal (it terminates a message), so only non-EOM
-        // ones are rejected.
         let is_end_of_message = self.tds_read_buffer.working_buffer[base_offset + 1]
             & PacketStatusFlags::Eom as u8
             != 0;
-        self.tds_read_buffer.end_of_message = is_end_of_message;
-        if packet_size_from_header == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
+        if packet_size == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
             return Err(crate::error::Error::ProtocolError(
                 "Received a payload-free TDS packet that is not end-of-message".to_string(),
             ));
         }
+        self.tds_read_buffer.end_of_message = is_end_of_message;
 
-        if packet_size_from_header > self.tds_read_buffer.max_packet_size {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} exceeds negotiated max packet size {}",
-                packet_size_from_header, self.tds_read_buffer.max_packet_size
-            )));
-        }
-
-        // Also ensure we won't exceed buffer capacity
-        let buffer_len = self.tds_read_buffer.working_buffer.len();
-        if base_offset.saturating_add(packet_size_from_header) > buffer_len {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} at offset {} exceeds buffer capacity {}",
-                packet_size_from_header, base_offset, buffer_len
-            )));
-        }
-
-        // Keep reading until we have the complete packet in memory.
-        while bytes_available < packet_size_from_header {
-            let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet payload".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
-        }
-
-        // Calculate how many extra bytes we read beyond this packet
-        let extra_bytes = bytes_available - packet_size_from_header;
-
+        let extra_bytes = bytes_available - packet_size;
         if extra_bytes > 0 {
-            // Track where the extra bytes are - they're right after this packet in the buffer
             self.tds_read_buffer.pending_bytes = extra_bytes;
-            self.tds_read_buffer.pending_bytes_offset = base_offset + packet_size_from_header;
+            self.tds_read_buffer.pending_bytes_offset = base_offset + packet_size;
         } else {
             self.tds_read_buffer.pending_bytes = 0;
             self.tds_read_buffer.pending_bytes_offset = 0;
@@ -1132,19 +1094,112 @@ impl NetworkTransport {
         event!(
             tracing::Level::DEBUG,
             "Received packet of size: {:?}",
-            packet_size_from_header
+            packet_size
         );
-
         use pretty_hex::PrettyHex;
-
         event!(
             tracing::Level::DEBUG,
             "Packet content: {:?}",
-            &mut self.tds_read_buffer.working_buffer
-                [base_offset..base_offset + packet_size_from_header]
+            &mut self.tds_read_buffer.working_buffer[base_offset..base_offset + packet_size]
                 .hex_dump()
         );
-        Ok(packet_size_from_header)
+        Ok(Some(packet_size))
+    }
+
+    fn park_partial_packet(&mut self, base_offset: usize, bytes_available: usize) {
+        debug_assert_eq!(self.tds_read_buffer.pending_bytes, 0);
+        self.tds_read_buffer.pending_bytes = bytes_available;
+        self.tds_read_buffer.pending_bytes_offset = base_offset;
+    }
+
+    fn try_get_new_tds_packet(&mut self) -> TdsResult<Option<usize>> {
+        let base_offset = self.tds_read_buffer.buffer_length;
+        let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        loop {
+            if let Some(packet_size) =
+                self.complete_tds_packet_if_available(base_offset, bytes_available)?
+            {
+                return Ok(Some(packet_size));
+            }
+
+            let stream = self.stream.as_mut().ok_or_else(|| {
+                crate::error::Error::ConnectionClosed(
+                    "Cannot read TDS packet: connection has been closed".to_string(),
+                )
+            })?;
+            let mut read_buffer = ReadBuf::new(
+                &mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..],
+            );
+            match Pin::new(stream).poll_read(&mut context, &mut read_buffer) {
+                Poll::Pending => {
+                    self.park_partial_packet(base_offset, bytes_available);
+                    return Ok(None);
+                }
+                Poll::Ready(Err(error)) => {
+                    self.known_dead = true;
+                    return Err(error.into());
+                }
+                Poll::Ready(Ok(())) => {
+                    let bytes_read = read_buffer.filled().len();
+                    if bytes_read == 0 {
+                        self.known_dead = true;
+                        let section = if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+                            "header"
+                        } else {
+                            "payload"
+                        };
+                        return Err(crate::error::Error::ConnectionClosed(format!(
+                            "Connection closed by server while reading TDS packet {section}"
+                        )));
+                    }
+                    bytes_available += bytes_read;
+                }
+            }
+        }
+    }
+
+    async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
+        let base_offset = self.tds_read_buffer.buffer_length;
+        let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
+
+        loop {
+            if let Some(packet_size) =
+                self.complete_tds_packet_if_available(base_offset, bytes_available)?
+            {
+                return Ok(packet_size);
+            }
+
+            let stream = self.stream.as_mut().ok_or_else(|| {
+                crate::error::Error::ConnectionClosed(
+                    "Cannot read TDS packet: connection has been closed".to_string(),
+                )
+            })?;
+            let bytes_read = match stream
+                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
+                .await
+            {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    self.known_dead = true;
+                    return Err(error.into());
+                }
+            };
+            if bytes_read == 0 {
+                self.known_dead = true;
+                let section = if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+                    "header"
+                } else {
+                    "payload"
+                };
+                return Err(crate::error::Error::ConnectionClosed(format!(
+                    "Connection closed by server while reading TDS packet {section}"
+                )));
+            }
+            bytes_available += bytes_read;
+        }
     }
 
     /// Tells the server to stop sending tokens for the token stream being read
@@ -1912,14 +1967,18 @@ impl NetworkTransport {
         plp_state: &mut PlpPauseState,
         out: &mut [u8],
     ) -> TdsResult<Option<usize>> {
-        let Some((used, written)) = plp_state
-            .plp_stream
-            .try_read_buffered(self.tds_read_buffer.get_buffered_slice(), out)?
-        else {
-            return Ok(None);
-        };
-        self.tds_read_buffer.consume_bytes(used)?;
-        Ok(Some(written))
+        loop {
+            if let Some((used, written)) = plp_state
+                .plp_stream
+                .try_read_buffered(self.tds_read_buffer.get_buffered_slice(), out)?
+            {
+                self.tds_read_buffer.consume_bytes(used)?;
+                return Ok(Some(written));
+            }
+            if !self.try_read_tds_packet()? {
+                return Ok(None);
+            }
+        }
     }
 
     /// Decodes consecutive buffered columns directly into `writer`.
@@ -2738,6 +2797,122 @@ pub(crate) mod tests {
 
         // No pending bytes
         assert_eq!(transport.tds_read_buffer.pending_bytes, 0);
+    }
+
+    fn tabular_packet(payload: &[u8], end_of_message: bool) -> Vec<u8> {
+        let packet_len = PacketWriter::PACKET_HEADER_SIZE + payload.len();
+        let mut packet = vec![0; packet_len];
+        packet[0] = PacketType::TabularResult as u8;
+        packet[1] = u8::from(end_of_message);
+        BigEndian::write_u16(&mut packet[2..4], u16::try_from(packet_len).unwrap());
+        packet[PacketWriter::PACKET_HEADER_SIZE..].copy_from_slice(payload);
+        packet
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_appends_an_available_packet() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        server
+            .write_all(&tabular_packet(b"second", true))
+            .await
+            .unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_returns_pending_without_losing_payload() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        assert!(!transport.try_read_tds_packet().unwrap());
+        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"first");
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_preserves_a_fragmented_header() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        let second = tabular_packet(b"second", true);
+        server.write_all(&second[..4]).await.unwrap();
+        assert!(!transport.try_read_tds_packet().unwrap());
+        server.write_all(&second[4..]).await.unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_preserves_a_fragmented_payload() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        let second = tabular_packet(b"second", true);
+        server.write_all(&second[..10]).await.unwrap();
+        assert!(!transport.try_read_tds_packet().unwrap());
+        server.write_all(&second[10..]).await.unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_stops_at_end_of_message() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"only", true))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        assert!(!transport.try_read_tds_packet().unwrap());
+        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"only");
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.
