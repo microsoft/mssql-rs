@@ -1224,7 +1224,8 @@ impl TdsClient {
         // with recovery disabled (including intentionally closed clients and
         // clients retired after protocol desynchronization) would fall through
         // and write another request to the unusable transport.
-        if self.transport.connection_known_dead()
+        let known_dead = self.transport.connection_known_dead();
+        if known_dead
             && (!self.recovery_context.session_recovery_negotiated || connect_retry_count == 0)
         {
             return Err(crate::error::Error::ConnectionClosed(
@@ -1241,8 +1242,10 @@ impl TdsClient {
             return Ok(Duration::ZERO);
         }
 
-        // Non-blocking poll — returns immediately.
-        if !self.transport.is_connection_dead() {
+        // Non-blocking poll — returns immediately. Skipped once the verdict is
+        // already in: a session retired by a fatal ERROR token or a failed drain
+        // stays unusable however healthy its socket still looks.
+        if !known_dead && !self.transport.is_connection_dead() {
             return Ok(Duration::ZERO);
         }
 
@@ -10826,6 +10829,26 @@ mod tests {
         assert!(
             err.to_string().contains("Session recovery failed"),
             "Expected reconnect attempt resulting in SessionRecoveryFailed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_and_reconnect_recovers_a_retired_session_on_a_live_socket() {
+        // A fatal ERROR token or a failed drain retires the session while the
+        // socket still polls healthy. Trusting that poll would send the next
+        // command over a connection the client already reports as dead.
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.transport.mark_known_dead();
+        assert!(
+            !client.transport.is_connection_dead(),
+            "socket is still open"
+        );
+
+        let err = client.check_and_reconnect(Some(1), None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Session recovery failed"),
+            "Expected a reconnect attempt, got: {err}"
         );
     }
 
