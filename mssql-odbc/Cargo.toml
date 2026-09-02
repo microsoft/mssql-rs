@@ -8,6 +8,9 @@ publish = false
 name = "mssqlodbc"
 crate-type = ["cdylib"]
 
+[lints]
+workspace = true
+
 [dependencies]
 mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

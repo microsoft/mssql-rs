@@ -152,12 +152,43 @@ Each of these is an error rather than a guess, because a wrong value delivered s
 | A bound PLP / LOB column | `SQL_ROW_ERROR` | Draining a LOB into a fixed buffer needs machinery `SQLGetData` owns — Task [47361](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47361) |
 | NULL at a column bound with no indicator | `22002`, `SQL_ROW_ERROR` | There is nowhere to report the NULL, and the slot would read back as the previous row's value |
 | `SQLGetData` after a rowset wider than one row | cursor left unpositioned | ODBC expects `SQLSetPos` to nominate the current row, and that is not implemented; mixed access still works at `row_array_size` 1 |
-| `SQL_C_DEFAULT` at bind time | `HY003` | **Divergence from msodbcsql**, which accepts it and resolves it at fetch time from the IRD (`sqlcfunc.cpp` `BindOffset` → `Sql2CDefault`). Deferring needs the column's SQL type threaded into the fill loop, which `ColumnBinding` does not carry. No known consumer binds `SQL_C_DEFAULT` on the fetch path — mssql-python uses it only for parameters — so this is deferred rather than blocking |
 
 Two details worth keeping in mind when extending this:
 
 - **`BufferLength` is ignored for fixed-width C targets.** The stride comes from the C type; only the character and binary targets are sized by the application. Honouring a caller's `sizeof(array)` would place later rows outside it.
 - **`SQL_ATTR_ROW_BIND_OFFSET_PTR` is read per fetch, not per bind,** and displaces the data *and* indicator bases by the same byte count — so the offset has to keep both naturally aligned.
+
+#### `SQL_C_DEFAULT` bindings
+
+`SQLBindCol` accepts `SQL_C_DEFAULT` and stores it unresolved, the way msodbcsql does (`sqlcfunc.cpp` `BindOffset` → `Sql2CDefault`): the answer depends on the IRD, which does not exist until a statement executes, and one binding can outlive several result sets. Each `SQLFetchScroll` resolves the placeholder on its own snapshot of the binding table, so the stored binding still says `SQL_C_DEFAULT` for the next result set.
+
+This also closes a bind/descriptor inconsistency. Since AB#47437 the ARD is the fetch's single source of truth, and `SQLBindCol` and an equivalent `SQLSetDescField` sequence are meant to be indistinguishable. `SQL_C_DEFAULT` was the exception: `set_type` accepts it on an application descriptor (it is in `is_valid_c_type`, and `canonical_c_type` leaves it alone), and `ColumnBinding::from_record` keys "bound" off a non-null `SQL_DESC_DATA_PTR` rather than the concise type — so the descriptor route reached the fill loop and failed per row with `HYC00`, while `SQLBindCol` refused the same value outright with `HY003`. Both now resolve identically.
+
+The mapping is `type_rules::resolve_default_c_type`, shared with `SQLBindParameter` so the driver gives one answer for what `SQL_C_DEFAULT` means. It carries two deliberate deviations from msodbcsql, and they apply here too:
+
+| SQL type | This driver | msodbcsql | Why the deviation is kept |
+| --- | --- | --- | --- |
+| `SQL_WCHAR`, `SQL_WVARCHAR`, `SQL_WLONGVARCHAR` | `SQL_C_WCHAR` | `SQL_C_CHAR` | The narrow default is an artifact of a driver shipped in both ANSI and Unicode builds. This driver has only the Unicode one and its `SQL_C_CHAR` is UTF-8, so following msodbcsql would transcode every wide column by default |
+| `SQL_GUID` | `SQL_C_GUID` | `SQL_C_CHAR` | Follows the ODBC 3.x default-C-type table. This is the one deviation that also changes the rowset layout: the stride becomes `sizeof(SQLGUID)` rather than `BufferLength`, per the fixed-width rule above. A slot at least 16 bytes wide — including the 36-character text form msodbcsql would fill — takes the narrower stride and stays inside the application's array; a narrower declared slot is refused rather than resolved (see below) |
+
+`SQL_SS_XML` is *not* in that table. msodbcsql maps it to `SQL_C_WCHAR` as well (`rgbTRANSTYPE` and `rgbTRANSTYPE380` both read `SQL_C_WCHAR, // SQL_XML_MAPPED`, `sqlcmisc.cpp:179` and `:218`), which a probe confirms: an `xml` column bound `SQL_C_DEFAULT` against msodbcsql18 comes back as UTF-16 (`3C 00 72 00 …`, indicator `30` for 15 characters), not narrow bytes. It is unreachable on this path in any case — `describe_col.rs` reports xml and json columns as `SQL_WLONGVARCHAR`, never `SQL_SS_XML`.
+
+The msodbcsql column is measured, not inferred from `Sql2CDefault`. Binding an `nvarchar` and a `uniqueidentifier` column with `SQL_C_DEFAULT` and `BufferLength` 64 against msodbcsql18 produces, for `N'one'` and `01020304-0506-0708-090A-0B0C0D0E0F10`:
+
+- the wide column as the three narrow bytes `6F 6E 65` with indicator `3`, not six bytes of UTF-16 with indicator `6`;
+- the GUID column as the 36-character text form with indicator `36`, the rowset striding by the full `BufferLength` of 64 rather than by `sizeof(SQLGUID)`.
+
+A column whose SQL type has no default keeps `SQL_C_DEFAULT` and is reported as an unsupported target for any row carrying a value; a NULL row still reports `SQL_NULL_DATA` through its indicator, because nothing needs converting. A binding whose ordinal is past the end of the result set also stays unresolved, but never reaches delivery — the fill loop skips it and reports nothing, matching msodbcsql.
+
+A resolved *fixed-width* target is also left unresolved when the application declared a `BufferLength` too small to hold it. `BufferLength` is normally ignored for a fixed-width target, which is safe when the application named that type and so accepted its width contract; a `SQL_C_DEFAULT` binding names nothing, so honouring the C type's width would write past a slot the application did size — 16 bytes into a 4-byte buffer for a `uniqueidentifier` column, where msodbcsql resolves to `SQL_C_CHAR` and truncates within `BufferLength`. `BufferLength` 0 is exempt: that is the documented idiom for a fixed-width target and makes no width claim. Whether these should instead report `01004` and deliver a truncated value, matching msodbcsql more closely, is a separate question and is not tracked yet.
+
+A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which bound delivery does not implement yet (AB#47239), so it fails per row with `HYC00`. Pre-existing for an explicit `SQL_C_BINARY` bind, but deferred resolution makes it reachable without the application naming the C type, and it covers more common column types than the `time` / `datetimeoffset` stride case above. msodbcsql resolves identically and delivers the bytes.
+
+The resolution is ODBC-version aware, and the version is read from the environment on each fetch: `SQL_SS_TIME2` and `SQL_SS_TIMESTAMPOFFSET` default to `SQL_C_BINARY` below ODBC 3.8 and to their `SQL_C_SS_*` types at 3.8.
+
+That 3.8 mapping brings a third divergence into reach, in the stride rather than the resolved type. Both drivers resolve `time` and `datetimeoffset` to the same C types (`rgbTRANSTYPE380`, `sqlcmisc.cpp:220-221`), but msodbcsql's `BindOffset` switch has no case for `SQL_C_SS_TIME2` / `SQL_C_SS_TIMESTAMPOFFSET` and falls through to `default: dwOffset = lpbindinfo->cbValueMax` (`sqlcfunc.cpp:2280-2283`), where `element_stride` returns 12 and 20. Measured: a two-row rowset bound `SQL_C_DEFAULT` with `BufferLength` 40 puts msodbcsql's second row at byte offset `40` and this driver's at `12`, with indicator `12` in both — only the stride differs. The behaviour is kept because this is the safer direction: msodbcsql with `BufferLength` 0 strides 0 and stacks every row in slot 0. It is pre-existing for an explicit `SQL_C_SS_TIME2` bind; deferred resolution is what makes it reachable without the application naming the C type.
+
+`SQLGetData` does *not* accept `SQL_C_DEFAULT` — `get_data.rs` answers `HYC00`, where msodbcsql resolves the placeholder in the same `GetColData` that serves both paths. The driver therefore answers the same placeholder two ways depending on how a column is read: a bound column resolves, `SQLGetData` refuses. Pre-existing and untouched here, but worth closing now that `odbc_sql_type` and `resolve_default_c_type` are wired together on the fetch side. Not currently tracked by a work item.
 
 ### P4 — Exports & driver-load compatibility — Task [46581](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46581)
 
