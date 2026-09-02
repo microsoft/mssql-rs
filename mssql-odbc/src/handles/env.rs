@@ -43,6 +43,10 @@ impl TryFrom<u32> for OdbcVersion {
 /// already been terminated — at an arbitrary instruction, possibly holding a
 /// lock. Synchronizing with those threads is what the loader documentation
 /// forbids during detach.
+///
+/// Declared by hand rather than taken from the `windows` crate this crate
+/// already depends on: the flag is an `ntdll` export that the Win32 metadata
+/// does not cover, so neither `windows` 0.58 nor `windows-sys` 0.59 exposes it.
 #[cfg(windows)]
 fn process_is_shutting_down() -> bool {
     #[link(name = "ntdll")]
