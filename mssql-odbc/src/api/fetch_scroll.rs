@@ -514,8 +514,9 @@ impl RowWriter for BoundRowWriter<'_> {
 ///   rowset layout, because a fixed-width target takes its stride from the C
 ///   type rather than from `BufferLength` ([`element_stride`]): 16 bytes per
 ///   row where msodbcsql delivers the 36-character text form and strides by
-///   the caller's slot size. The narrower stride stays inside the
-///   application's array either way.
+///   the caller's slot size. A slot at least `sizeof(SQLGUID)` wide therefore
+///   takes the narrower stride and stays inside the application's array; a
+///   narrower one is refused outright rather than resolved, see below.
 ///
 /// `SQL_SS_XML` is deliberately not in that list: msodbcsql maps it to
 /// `SQL_C_WCHAR` too, so there is no deviation to record, and it is unreachable
@@ -523,10 +524,29 @@ impl RowWriter for BoundRowWriter<'_> {
 /// `SQL_WLONGVARCHAR`.
 ///
 /// A column whose SQL type has no default is left at `SQL_C_DEFAULT`, which
-/// [`deliver_bound`] reports as an unsupported target per row rather than
-/// guessing at a layout. A binding whose ordinal is past the end of the result
-/// set also stays unresolved, but never reaches delivery: the fill loop skips
-/// it, matching msodbcsql.
+/// [`deliver_bound`] reports as an unsupported target for any row carrying a
+/// value; a NULL row still reports `SQL_NULL_DATA` through the indicator,
+/// because nothing needs converting. A binding whose ordinal is past the end of
+/// the result set also stays unresolved, but never reaches delivery: the fill
+/// loop skips it, matching msodbcsql.
+///
+/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which bound
+/// delivery does not implement yet (AB#47239), so it fails per row with
+/// `HYC00`. That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred
+/// resolution makes it reachable without the application naming the C type, and
+/// it covers more common column types than the `time` / `datetimeoffset` stride
+/// case. msodbcsql resolves identically and delivers the bytes.
+///
+/// A resolved fixed-width target is left unresolved as well when the
+/// application declared a `BufferLength` too small to hold it. `BufferLength`
+/// is normally ignored for a fixed-width target ([`element_stride`]), which is
+/// safe when the application *named* that type and therefore accepted its width
+/// contract. A `SQL_C_DEFAULT` binding names nothing, so honouring the C type's
+/// width there would write past a slot the application did in fact size — 16
+/// bytes into a 4-byte buffer for a `uniqueidentifier` column, where msodbcsql
+/// resolves to `SQL_C_CHAR` and stays within `BufferLength`. `BufferLength` 0
+/// is exempt: that is the documented idiom for a fixed-width target and carries
+/// no width claim to violate.
 fn resolve_default_bindings(
     bindings: &mut [ColumnBinding],
     column_metadata: &[ColumnMetadata],
@@ -540,9 +560,27 @@ fn resolve_default_bindings(
         else {
             continue;
         };
-        if let Some(target_type) = resolve_default_c_type(odbc_sql_type(meta), odbc_version) {
-            binding.target_type = target_type;
+        let Some(target_type) = resolve_default_c_type(odbc_sql_type(meta), odbc_version) else {
+            continue;
+        };
+        // Zero for a character or binary target, which is sized by the
+        // application and needs no check.
+        let fixed_width = element_stride(target_type, 0);
+        if fixed_width > 0
+            && binding.buffer_length > 0
+            && (binding.buffer_length as usize) < fixed_width
+        {
+            error!(
+                column_number = binding.column_number,
+                target_type,
+                buffer_length = binding.buffer_length,
+                fixed_width,
+                "SQLFetchScroll: SQL_C_DEFAULT resolved to a fixed-width target wider than the \
+                 bound buffer; leaving it unresolved rather than overrunning the slot"
+            );
+            continue;
         }
+        binding.target_type = target_type;
     }
 }
 
@@ -553,7 +591,15 @@ fn fetch_scroll_safe(
     _fetch_offset: SqlLen,
 ) -> SqlReturn {
     // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
-    // the stmt lock to preserve parent-before-child lock ordering.
+    // the stmt lock to preserve parent-before-child lock ordering (the same
+    // order as `bind_param.rs` and `catalog.rs`).
+    //
+    // Read per fetch, deliberately, not cached on the DBC at alloc. Gating it on
+    // "does any binding use SQL_C_DEFAULT" would need the bindings first, which
+    // inverts the lock order; caching at alloc would instead bake in a value
+    // that `SQLSetEnvAttr` can still overwrite afterwards. It is an uncontended
+    // read of one `Copy` field, taken before validation so there is exactly one
+    // acquisition site rather than one per early-return path.
     let odbc_version = {
         let env = stmt.parent_dbc().parent_env();
         let Ok(env_state) = env.inner.lock() else {
@@ -1633,6 +1679,17 @@ mod tests {
         s.diag_records.last().unwrap().sql_state
     }
 
+    /// `int_columns` retyped to `uniqueidentifier`, the only default-resolved
+    /// target wide enough to overrun a plausibly-sized application slot.
+    fn guid_columns(n: usize) -> Vec<ColumnMetadata> {
+        let mut cols = int_columns(n);
+        for col in &mut cols {
+            col.data_type = TdsDataType::Guid;
+            col.type_info.tds_type = TdsDataType::Guid;
+        }
+        cols
+    }
+
     #[test]
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { sql_fetch_scroll(ptr::null_mut(), SQL_FETCH_NEXT, 0) };
@@ -1964,7 +2021,7 @@ mod tests {
     /// `07006` for the typed 3.8 target that cannot take an int, `HYC00` for the
     /// binary 3.0 one this driver does not deliver. Hardcoding either version in
     /// `fetch_scroll_safe` flips one of these and fails the test.
-    fn fetch_time_column_row_state(version: OdbcVersion) -> [u8; 5] {
+    fn fetch_time_column_row_state(version: OdbcVersion) -> (SqlReturn, [u8; 5]) {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
         {
@@ -2002,21 +2059,103 @@ mod tests {
             state.active_stmt = Some(h.stmt);
         }
 
-        unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
-        last_state(&h)
+        let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
+        (rc, last_state(&h))
     }
 
     #[test]
     fn a_default_binding_follows_the_declared_odbc_version() {
+        // Asserting the return code alongside the SQLSTATE keeps this pinned to
+        // the per-row outcome: an earlier, unrelated failure would report its
+        // own diagnostic last and could otherwise masquerade as a match.
         assert_eq!(
             fetch_time_column_row_state(OdbcVersion::Odbc3_80),
-            *b"07006",
+            (SQL_ERROR, *b"07006"),
             "3.8 resolves SQL_SS_TIME2 to the typed SQL_C_SS_TIME2"
         );
         assert_eq!(
             fetch_time_column_row_state(OdbcVersion::Odbc3),
-            *b"HYC00",
+            (SQL_ERROR, *b"HYC00"),
             "3.0 resolves SQL_SS_TIME2 to SQL_C_BINARY, which is not delivered yet"
+        );
+    }
+
+    /// A `SQL_C_DEFAULT` binding names no C type, so it carries no width
+    /// contract: resolving a `uniqueidentifier` column to `SQL_C_GUID` must not
+    /// write `sizeof(SQLGUID)` into a slot the application declared as 4 bytes.
+    /// msodbcsql resolves the same column to `SQL_C_CHAR` and stays inside
+    /// `BufferLength`, so writing past it would be both a divergence and an
+    /// application-memory overrun.
+    ///
+    /// The backing array here is deliberately larger than the declared
+    /// `BufferLength` so a regression is caught as bytes written past the
+    /// declared width, not as a crash.
+    #[test]
+    fn a_default_binding_too_narrow_for_its_fixed_target_stays_unresolved() {
+        let mut bindings = vec![binding(
+            1,
+            SQL_C_DEFAULT,
+            ptr::null_mut(),
+            4,
+            ptr::null_mut(),
+        )];
+        resolve_default_bindings(&mut bindings, &guid_columns(1), OdbcVersion::Odbc3_80);
+        assert_eq!(
+            bindings[0].target_type, SQL_C_DEFAULT,
+            "a 4-byte slot cannot hold the 16-byte SQL_C_GUID this would resolve to"
+        );
+
+        // BufferLength 0 is the documented idiom for a fixed-width target and
+        // claims nothing about width, so it still resolves.
+        let mut zero = vec![binding(
+            1,
+            SQL_C_DEFAULT,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+        )];
+        resolve_default_bindings(&mut zero, &guid_columns(1), OdbcVersion::Odbc3_80);
+        assert_eq!(zero[0].target_type, SQL_C_GUID);
+
+        // A slot wide enough resolves normally.
+        let mut wide = vec![binding(
+            1,
+            SQL_C_DEFAULT,
+            ptr::null_mut(),
+            16,
+            ptr::null_mut(),
+        )];
+        resolve_default_bindings(&mut wide, &guid_columns(1), OdbcVersion::Odbc3_80);
+        assert_eq!(wide[0].target_type, SQL_C_GUID);
+    }
+
+    /// The narrow-slot guard must actually stop the write: a regression that
+    /// resolved anyway would put 16 bytes into the 4 the application declared.
+    #[test]
+    fn a_narrow_default_guid_binding_never_writes_past_the_declared_buffer() {
+        const DECLARED: usize = 4;
+        let mut backing = [0xEE_u8; 64];
+        let mut indicator = [0 as SqlLen; 1];
+        let mut bindings = vec![binding(
+            1,
+            SQL_C_DEFAULT,
+            backing.as_mut_ptr().cast(),
+            DECLARED as SqlLen,
+            indicator.as_mut_ptr(),
+        )];
+        resolve_default_bindings(&mut bindings, &guid_columns(1), OdbcVersion::Odbc3_80);
+
+        let value = ColumnValues::Uuid(uuid::Uuid::from_u128(
+            0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
+        ));
+        let outcome = unsafe { deliver_bound(&bindings[0], 0, 0, &value) };
+        assert!(
+            matches!(outcome, RowOutcome::Error(RowIssue::Unsupported)),
+            "the row must fail rather than overrun the slot, got {outcome:?}"
+        );
+        assert!(
+            backing[DECLARED..].iter().all(|&b| b == 0xEE),
+            "nothing may be written past the declared BufferLength"
         );
     }
 

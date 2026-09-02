@@ -307,6 +307,39 @@ TEST_F(FetchScrollLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
     SQLCloseCursor(stmt_);
 }
 
+// The cross-result-set half of the deferred-resolution contract: one binding,
+// two result sets whose column 1 has a different SQL type in each. The binding
+// must resolve independently per set — SQL_C_SLONG for the int, SQL_C_CHAR for
+// the varchar — which only works because the stored binding keeps the
+// SQL_C_DEFAULT placeholder rather than being rewritten by the first fetch.
+//
+// Deliberately uses the two types both drivers resolve identically (int and
+// narrow varchar), so this runs on the msodbcsql leg too and compares.
+TEST_F(FetchScrollLiveTest, DefaultTargetResolvesPerResultSet) {
+    union {
+        SQLINTEGER n;
+        SQLCHAR text[16];
+    } slot = {};
+    SQLLEN indicator = -99;
+
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_DEFAULT, &slot, sizeof(slot), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ExecDirect("SELECT CAST(4242 AS INT) AS c1; SELECT CAST('hello' AS VARCHAR(16)) AS c1");
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4242, slot.n) << "first set must resolve to SQL_C_SLONG";
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), indicator);
+
+    ASSERT_SQL_OK(SQLMoreResults(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ("hello", reinterpret_cast<const char*>(slot.text))
+        << "second set must resolve the same binding to SQL_C_CHAR";
+    EXPECT_EQ(5, indicator);
+    SQLCloseCursor(stmt_);
+}
+
 // Two columns of different shapes bound at once, to prove the fill loop walks
 // the binding table rather than assuming a single column.
 TEST_F(FetchScrollLiveTest, BindsSeveralColumnsOfDifferentTypes) {

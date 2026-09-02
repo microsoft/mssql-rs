@@ -106,6 +106,23 @@ authoritative parity reference for this crate. Its source lives in the
     Pre-existing for an explicit `SQL_C_SS_TIME2` bind; deferred
     `SQL_C_DEFAULT` resolution makes it reachable without the application naming
     the C type.
+  - A `SQL_C_DEFAULT` binding that resolves to a fixed-width C type wider than
+    the application's declared `BufferLength` is left unresolved and fails the
+    row (`HYC00`) rather than writing. `BufferLength` is ignored for a
+    fixed-width target, which is safe when the application named that type; a
+    `SQL_C_DEFAULT` binding names nothing, so honouring the C type's width would
+    put 16 bytes into a 4-byte slot for a `uniqueidentifier` column, where
+    msodbcsql resolves to `SQL_C_CHAR` and truncates inside `BufferLength`.
+    `BufferLength` 0 is exempt — the documented idiom for a fixed-width target,
+    carrying no width claim. Whether these should instead report `01004` with a
+    truncated value, closer to msodbcsql, is open and untracked.
+  - A `varbinary` / `image` column bound `SQL_C_DEFAULT` resolves to
+    `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY`,
+    then `resolve_default_c_type`), which bound delivery does not implement yet
+    (AB#47239), so it fails per row with `HYC00`. msodbcsql resolves identically
+    and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
+    deferred resolution makes it reachable without the application naming the C
+    type.
   - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
     writes the client code page. msodbcsql uses the client code page -
     `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
