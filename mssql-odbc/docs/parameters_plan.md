@@ -110,7 +110,16 @@ transparent reconnects.
   incremental approach, not a gap. The same-wideness narrow path
   (`SQL_C_CHAR` against a narrow SQL type) still assumes UTF-8 on the wire
   instead of reading the connection's collation (AB#47590); only the
-  wideness-mismatch half of that gap has closed.
+  wideness-mismatch half of that gap has closed. Under a UTF8-flagged
+  database collation, this transcode fix is now *more* correct than the
+  materialized (non-DAE) path: `encode_narrow` checks `collation.utf8()`
+  like `get_encoding_type` does, but the serializer's `VARCHAR | CHAR | TEXT`
+  arm predates that flag and always encodes through the single-byte LCID
+  codepage regardless of it, so the same value now gets correct UTF-8 wire
+  bytes streamed but single-byte-miscoded bytes bound inline - a new
+  instance of the same "two ways to bind disagree" shape, just with the
+  streamed side on the correct end this time (AB#47590; the serializer fix
+  itself is out of scope here).
   Cross-*family* pairings (character/binary against an integer SQL type) are
   still **not** streamable: there is no transcode from arbitrary bytes to an
   integer wire value. Since P5 made those pairings bindable, the refusal

@@ -55,11 +55,17 @@ fn lcid_encoding_or_fallback(collation: SqlCollation) -> &'static encoding_rs::E
 /// the collation is UTF-8-aware, or its single-byte LCID codepage otherwise
 /// (falling back to Windows-1252 for an LCID this crate does not map).
 ///
-/// Mirrors the encoding step [`get_encoding_type`] and the serializer's
-/// `VARCHAR | CHAR | TEXT` arm perform for a materialized value, for a caller
-/// that must produce collation-correct wire bytes directly instead of routing
-/// through that serializer -- e.g. a data-at-execution write, which streams
-/// bytes to the wire before the normal parameter-serialization path runs.
+/// Mirrors the encoding step [`get_encoding_type`] performs for a materialized
+/// value, for a caller that must produce collation-correct wire bytes
+/// directly instead of routing through the parameter serializer -- e.g. a
+/// data-at-execution write, which streams bytes to the wire before the normal
+/// parameter-serialization path runs. Does *not* mirror that serializer's own
+/// `VARCHAR | CHAR | TEXT` arm (`tds_value_serializer.rs`): that arm predates
+/// the UTF-8-collation flag and always encodes through the single-byte LCID
+/// codepage regardless of `collation.utf8()`, so a UTF-8-collation database
+/// gets correct UTF-8 wire bytes from a value streamed through this function
+/// but single-byte-miscoded bytes from the same value bound inline. Tracked
+/// under AB#47590.
 pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
     if collation.utf8() {
         return text.as_bytes().to_vec();

@@ -312,8 +312,8 @@ unsafe fn sql_put_data_safe(
             // an unsafe slice claiming that many bytes are valid just to
             // read its length back out, and never has to check out (and
             // then dispose of) a client it turns out not to need. No client
-            // is parked yet at this point, so `abort_dae_with_diag` tears the
-            // sequence down the same way the `is_null` / `expected_len`
+            // is checked out by this call yet, so `abort_dae_with_diag` tears
+            // the sequence down the same way the `is_null` / `expected_len`
             // checks above do, rather than the "something else is using this
             // sequence" retriable failure `checkout_client` returning `None`
             // represents below.

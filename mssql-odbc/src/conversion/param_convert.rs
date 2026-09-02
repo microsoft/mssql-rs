@@ -315,11 +315,18 @@ pub(crate) fn dae_placeholder_type(
 ///
 /// A wide result is already UTF-16LE, the wire encoding `write_streamed_chunk`
 /// expects verbatim. A narrow result is not: `AppText::transcode` produces
-/// UTF-8, which is this driver's own C-side convention, not a wire encoding --
-/// the materialized path re-encodes narrow output through `db_collation` at
-/// serialization time (`tds_value_serializer.rs`), and a streamed write has to
-/// do the same itself before the bytes reach the wire, or a non-ASCII value
-/// round-trips as mojibake under a non-UTF8 collation.
+/// UTF-8, which is this driver's own C-side convention, not a wire encoding,
+/// so `encode_narrow` re-encodes it through `db_collation` before the bytes
+/// reach the wire, or a non-ASCII value round-trips as mojibake under a
+/// non-UTF8 collation. `encode_narrow` matches `get_encoding_type`'s
+/// `collation.utf8()` check, not the materialized path's serializer arm
+/// (`tds_value_serializer.rs`'s `VARCHAR | CHAR | TEXT`): that arm predates
+/// the UTF-8-collation flag and always encodes through the single-byte LCID
+/// codepage, so under a UTF8 collation the streamed and materialized paths
+/// now disagree on the wire bytes for the same value -- a new instance of
+/// the same "two ways to bind disagree" shape as the narrow/narrow residual
+/// below, just with the streamed side on the correct end this time. Tracked
+/// under AB#47590 alongside this file's other DAE-transcoding gaps.
 pub(crate) fn transcode_dae_bytes(
     c_type: SqlSmallInt,
     sql_type: SqlSmallInt,
