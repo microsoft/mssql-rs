@@ -740,7 +740,18 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTrans
 // the second chunk supplies only the trailing byte -- transcoding each chunk
 // in isolation would decode two invalid/incomplete code points instead of one
 // U+00E9, since neither half is valid UTF-8 on its own.
+//
+// msodbcsql diverges here: this run measured 5 UTF-16 code units back
+// (`wind == 10`) instead of the correct 4, reproducing identically across
+// retries -- i.e. it does not carry a residual across `SQLPutData` calls in
+// this direction, contradicting the source-reading-based characterization on
+// `dae_placeholder_type` and in `parameters_plan.md` (corrected there to
+// reflect what this measured). Whole-value buffering is strictly more
+// correct here, but the parity run compares outcomes, not quality, so this
+// deliberate divergence has to opt out rather than turn the build red.
 TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;

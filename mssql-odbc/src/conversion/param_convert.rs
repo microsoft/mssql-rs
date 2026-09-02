@@ -229,10 +229,20 @@ pub(crate) struct DaeStream {
 ///
 /// Deliberate deviation from msodbcsql: `needs_transcode` buffers the whole
 /// value and transcodes it once (`transcode_dae_bytes`), rather than
-/// transcoding each `SQLPutData` chunk with a carried code-point residual the
-/// way msodbcsql's `ProcessDAEColumnData` does (`sqlccmd.cpp:3864`,
-/// `:3899-3901`; `ConvertLongData`, `sqlccnvt.cpp:938-990`; residual flushed
-/// at `sqlccmd.cpp:5999-6001`). Whole-value buffering costs memory
+/// transcoding each `SQLPutData` chunk incrementally. Source reading
+/// suggested msodbcsql's `ProcessDAEColumnData` carries a code-point residual
+/// across calls (`sqlccmd.cpp:3864`, `:3899-3901`; `ConvertLongData`,
+/// `sqlccnvt.cpp:938-990`; residual flushed at `sqlccmd.cpp:5999-6001`), but
+/// direct measurement contradicts that for this narrow-to-wide direction: the
+/// msodbcsql parity run for a UTF-8 character split across two `SQLPutData`
+/// calls returns 5 UTF-16 code units instead of the correct 4 (see
+/// `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter`),
+/// reproducing identically across retries -- i.e. no residual survives
+/// between calls in this direction, and whole-value buffering is not merely a
+/// documented cost here but measurably more correct. Whether the residual
+/// carry the source suggests actually applies to the wide-to-narrow direction
+/// remains unmeasured: every existing wide-to-narrow test sends its value in
+/// a single `SQLPutData` call. Whole-value buffering costs memory
 /// proportional to the value on a path whose purpose is to avoid exactly
 /// that, and is not a regression -- this pairing previously failed outright
 /// -- but it is real cost, taken because a per-chunk carry is meaningfully
