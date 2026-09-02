@@ -16,7 +16,7 @@ use mssql_tds::connection::tds_client::{
     CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
 };
 use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
-use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
 
 use super::ird::populate_ird;
 use super::sqlstate::*;
@@ -25,7 +25,8 @@ use crate::api::odbc_types::{
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
 };
 use crate::conversion::param_convert::{
-    ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
+    DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
+    dae_length_limit, dae_plan, dae_streamed_declaration, is_data_at_exec_indicator,
 };
 use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
@@ -91,9 +92,23 @@ pub(super) fn park_dae_client(
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
-    dae_params: Vec<DaeParam>,
+    mut dae_params: Vec<DaeParam>,
     op: &str,
 ) -> SqlReturn {
+    // The wire encoding of a narrow target comes from the database collation,
+    // which is only knowable with the connection in hand — `write_streamed_chunk`
+    // writes bytes verbatim, so the re-encoding has to happen before them
+    // (AB#47590).
+    let collation = client.get_collation();
+    for param in &mut dae_params {
+        if !param.plan.is_buffered() {
+            param.transcode = Some(DaeTranscode::new(
+                param.binding.c_type,
+                param.binding.sql_type,
+                collation,
+            ));
+        }
+    }
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         // The client has nowhere to go: the statement that owns it is
         // unreachable and the DBC still records it as busy.
@@ -101,6 +116,39 @@ pub(super) fn park_dae_client(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    SQL_NEED_DATA
+}
+
+/// Parks a sequence whose execute is deferred: at least one parameter buffers,
+/// so no RPC has been opened and the client sits idle on the statement until
+/// the last `SQLParamData` builds the complete parameter list and runs it.
+///
+/// The connection still counts as busy for the duration, exactly as the
+/// streaming sequence does, so an application cannot start another command on it
+/// mid-sequence.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn park_deferred_dae(
+    stmt: &StmtHandle,
+    client: TdsClient,
+    prepared: Option<PreparedPlan>,
+    orphaned: Option<StatementId>,
+    dae_params: Vec<DaeParam>,
+    marker_count: usize,
+    sql: Option<String>,
+    timeout_secs: u32,
+    op: &str,
+) -> SqlReturn {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned while parking deferred DAE state");
+        return SQL_ERROR;
+    };
+    stmt_state.dae = Some(
+        DaeState::new(client, prepared, orphaned, dae_params).deferred(
+            marker_count,
+            sql,
+            timeout_secs,
+        ),
+    );
     SQL_NEED_DATA
 }
 
@@ -582,11 +630,11 @@ pub(super) unsafe fn build_named_params(
         };
 
         if let Some(indicator) = dae_indicator {
-            let dae_stream = match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
-                Ok(t) => t,
+            let plan = match dae_plan(bound_param.c_type, bound_param.sql_type) {
+                Ok(plan) => plan,
                 Err(e) => {
                     error!(
-                        "{op}: parameter {} DAE type not streamable: {}",
+                        "{op}: parameter {} cannot be supplied at execution: {}",
                         i + 1,
                         e.diag().text
                     );
@@ -594,15 +642,62 @@ pub(super) unsafe fn build_named_params(
                     return Err(SQL_ERROR);
                 }
             };
-            let rpc =
-                RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, dae_stream.sql_type);
-            dae_params.push(DaeParam {
-                value_ptr: bound_param.parameter_value_ptr,
-                expected_len: dae_expected_length(indicator),
-                needs_transcode: dae_stream.needs_transcode,
-                c_type: bound_param.c_type,
-                sql_type: bound_param.sql_type,
-            });
+            // A bound that can be measured in buffer bytes is applied as the
+            // chunks arrive, so an overflow is reported by the `SQLPutData`
+            // that carries it rather than at close (msodbcsql parity).
+            let length_limit = match dae_length_limit(
+                bound_param.c_type,
+                bound_param.sql_type,
+                bound_param.column_size,
+            ) {
+                Ok(limit) => limit,
+                Err(e) => {
+                    error!(
+                        "{op}: parameter {} ColumnSize invalid: {}",
+                        i + 1,
+                        e.diag().text
+                    );
+                    post_diag(stmt_state, e.diag());
+                    return Err(SQL_ERROR);
+                }
+            };
+            dae_params.push(DaeParam::new(
+                i,
+                dae_expected_length(indicator),
+                plan,
+                length_limit,
+                bound_param,
+            ));
+            // Nothing to declare for a buffered parameter yet: its bytes are
+            // not in, so its type and length are not known. The slot is filled
+            // to keep parameter positions lined up and is rebuilt by
+            // `rebuild_deferred_params` before anything reaches the wire.
+            let rpc = match plan {
+                DaePlan::Stream(streamed) => {
+                    let param = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, streamed);
+                    // The body is PLP whatever `ColumnSize` says, but the
+                    // variable it lands in is declared from `ParameterType`,
+                    // matching the materialized path and msodbcsql (AB#47590).
+                    match dae_streamed_declaration(bound_param.sql_type, bound_param.column_size) {
+                        Ok(Some(declaration)) => param.with_streamed_declaration(declaration),
+                        Ok(None) => param,
+                        Err(e) => {
+                            error!(
+                                "{op}: parameter {} declaration invalid: {}",
+                                i + 1,
+                                e.diag().text
+                            );
+                            post_diag(stmt_state, e.diag());
+                            return Err(SQL_ERROR);
+                        }
+                    }
+                }
+                DaePlan::Buffer => RpcParameter::data_at_exec(
+                    Some(name),
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarBinaryMax,
+                ),
+            };
             params.push(rpc);
         } else {
             match unsafe { bound_param_to_rpc(name, &bound_param) } {
@@ -626,6 +721,70 @@ pub(super) unsafe fn build_named_params(
     }
 
     Ok(ParamsWithDae { params, dae_params })
+}
+
+/// Rebuilds the whole RPC parameter list once every data-at-execution value has
+/// been collected, for a sequence that deferred its execute.
+///
+/// Non-streamed parameters are re-read from the application's buffers, which
+/// ODBC requires to stay valid until execution completes, and the buffered ones
+/// are converted from their collected bytes by [`buffered_dae_to_rpc`]. Both
+/// therefore go through the same conversion the materialized path uses, so a
+/// value supplied in chunks is declared and bounded exactly like one supplied in
+/// a single buffer (AB#47590).
+///
+/// # Safety
+/// Each bound parameter's value/indicator pointers must still satisfy the
+/// `SQLBindParameter` contract.
+pub(super) unsafe fn rebuild_deferred_params(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    collected: &[(usize, Vec<u8>, bool)],
+    dae_params: &[DaeParam],
+    op: &str,
+) -> Result<Vec<RpcParameter>, SqlReturn> {
+    let mut params = Vec::with_capacity(marker_count);
+    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+
+    for i in 0..marker_count {
+        let name = format!("@P{}", i + 1);
+
+        let built =
+            if let Some((_, bytes, is_null)) = collected.iter().find(|(index, _, _)| *index == i) {
+                let Some(dae) = dae_params.iter().find(|p| p.bound_index == i) else {
+                    error!(
+                        "{op}: collected value for parameter {} has no binding",
+                        i + 1
+                    );
+                    post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+                    return Err(SQL_ERROR);
+                };
+                buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null)
+            } else {
+                let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
+                    error!("{op}: parameter {} has no bound value", i + 1);
+                    post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+                    return Err(SQL_ERROR);
+                };
+                let bound_param = bound_param.with_bind_offset(bind_offset);
+                unsafe { bound_param_to_rpc(name, &bound_param) }
+            };
+
+        match built {
+            Ok(param) => params.push(param),
+            Err(e) => {
+                error!(
+                    "{op}: parameter {} conversion failed: {}",
+                    i + 1,
+                    e.diag().text
+                );
+                post_diag(stmt_state, e.diag());
+                return Err(SQL_ERROR);
+            }
+        }
+    }
+
+    Ok(params)
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -1527,16 +1686,9 @@ mod tests {
 
         let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
-        assert_eq!(
-            dae.dae_params,
-            vec![DaeParam {
-                value_ptr: std::ptr::null_mut(),
-                expected_len: None,
-                needs_transcode: false,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR
-            }]
-        );
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 1);
+        assert_eq!(dae.dae_params[0].expected_len, None);
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
@@ -1562,16 +1714,9 @@ mod tests {
         }));
 
         let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
-        assert_eq!(
-            dae.dae_params,
-            vec![DaeParam {
-                value_ptr: std::ptr::null_mut(),
-                expected_len: Some(7),
-                needs_transcode: false,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR
-            }]
-        );
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 0);
+        assert_eq!(dae.dae_params[0].expected_len, Some(7));
     }
 
     /// Without an indicator pointer there is nothing to carry a

@@ -16,6 +16,7 @@ use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
+use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -648,35 +649,95 @@ impl InertStmtAttrs {
 }
 
 /// One data-at-execution parameter: the token `SQLParamData` returns, how
-/// many bytes the application promised for it, and the C/SQL type pairing
-/// `dae_placeholder_type` resolved at execute time.
+/// many bytes the application promised for it, and the plan `dae_plan`
+/// resolved from the binding at execute time.
 ///
 /// Keeping these fields together means the execution-time token and declared
 /// length cannot drift away from the binding they describe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DaeParam {
+    /// 0-based index into [`StmtState::bound_params`], and equally the
+    /// parameter's position in the RPC list, which is built in the same order.
+    pub(crate) bound_index: usize,
     /// `ParameterValuePtr` with the execution's bind offset already applied.
     pub(crate) value_ptr: SqlPointer,
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
-    /// Set from `dae_placeholder_type`'s report at the same time the streamed
-    /// wire type was decided. `SQLPutData` buffers this parameter's chunks in
-    /// [`DaeProgress::pending_bytes`] instead of writing them to the wire, and
-    /// they are transcoded once, as a whole, when the parameter closes.
-    pub(crate) needs_transcode: bool,
-    /// `BoundParam::c_type` / `BoundParam::sql_type`, snapshotted here at the
-    /// same time as `needs_transcode` rather than re-read from
-    /// `StmtState::bound_params` at close time. `SQLFreeStmt(SQL_RESET_PARAMS)`
-    /// can clear a binding while its data-at-execution sequence is still open,
-    /// and a rebind could change the encoding after the wire placeholder was
-    /// already fixed; the snapshot can neither vanish nor drift underneath the
-    /// sequence it describes. This is the *only* place the sequence reads
-    /// either type from -- no consumer indexes back into `bound_params`, so
-    /// there is one source of truth for the whole sequence, not two that
-    /// could disagree.
-    pub(crate) c_type: SqlSmallInt,
-    pub(crate) sql_type: SqlSmallInt,
+    /// Whether the value streams to the wire or is collected first.
+    pub(crate) plan: DaePlan,
+    /// `ColumnSize` applied to the accumulated chunk total as the chunks
+    /// arrive, so the `22001` lands on the same `SQLPutData` msodbcsql puts it
+    /// on. `None` when the bound is left to the close-time conversion.
+    pub(crate) length_limit: Option<DaeLengthLimit>,
+    /// The binding as of this execution, kept so a buffered value can be
+    /// declared and converted from `ParameterType` when it closes.
+    pub(crate) binding: BoundParam,
+    /// How a streamed chunk is re-encoded on its way to the wire. Filled in
+    /// when the sequence is parked, where the connection's collation is known.
+    pub(crate) transcode: Option<DaeTranscode>,
+}
+
+impl DaeParam {
+    /// Opens a data-at-execution parameter. Named rather than built as a
+    /// literal so a field added later cannot break a construction site written
+    /// in parallel.
+    pub(crate) fn new(
+        bound_index: usize,
+        expected_len: Option<usize>,
+        plan: DaePlan,
+        length_limit: Option<DaeLengthLimit>,
+        binding: BoundParam,
+    ) -> Self {
+        Self {
+            bound_index,
+            value_ptr: binding.parameter_value_ptr,
+            expected_len,
+            plan,
+            length_limit,
+            binding,
+            transcode: None,
+        }
+    }
+
+    /// A streamed parameter with no `ColumnSize` bound, for the tests that only
+    /// exercise the sequencing and declared-length rules.
+    #[cfg(test)]
+    pub(crate) fn unbounded(
+        bound_index: usize,
+        value_ptr: SqlPointer,
+        expected_len: Option<usize>,
+    ) -> Self {
+        use mssql_tds::message::parameters::rpc_parameters::StreamedSqlType;
+        let binding = BoundParam {
+            input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_BINARY,
+            sql_type: crate::api::odbc_types::SQL_VARBINARY,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: value_ptr,
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        };
+        Self::new(
+            bound_index,
+            expected_len,
+            DaePlan::Stream(StreamedSqlType::VarBinaryMax),
+            None,
+            binding,
+        )
+    }
+
+    /// Same, with the binding's C and SQL types set, for the tests that depend
+    /// on the pairing — `SQL_NTS` sizing reads the C type, and the transcode is
+    /// derived from both.
+    #[cfg(test)]
+    pub(crate) fn with_binding_types(mut self, c_type: SqlSmallInt, sql_type: SqlSmallInt) -> Self {
+        self.binding.c_type = c_type;
+        self.binding.sql_type = sql_type;
+        self
+    }
 }
 
 /// How much of the open data-at-execution parameter the application has
@@ -693,11 +754,12 @@ pub(crate) struct DaeProgress {
     /// The parameter was supplied as SQL NULL, so the declared-length check is
     /// skipped, as in msodbcsql.
     pub(crate) is_null: bool,
-    /// Raw `SQLPutData` bytes accumulated so far, in the C type's own
-    /// encoding. Only appended to -- instead of being streamed to the wire
-    /// immediately -- when [`DaeParam::needs_transcode`] is set; empty and
-    /// unused otherwise.
-    pub(crate) pending_bytes: Vec<u8>,
+    /// Chunks collected for a [`DaePlan::Buffer`] parameter, converted when it
+    /// closes. Empty for a streamed one.
+    pub(crate) buffer: Vec<u8>,
+    /// Bytes of a character split across two `SQLPutData` calls, held until the
+    /// chunk that completes it arrives.
+    pub(crate) carry: Vec<u8>,
 }
 
 /// A data-at-execution sequence in progress: everything the statement holds
@@ -730,6 +792,22 @@ pub(crate) struct DaeState {
     pub(crate) cursor: Option<usize>,
     /// Progress on the parameter named by `cursor`.
     pub(crate) progress: DaeProgress,
+    /// Set when at least one parameter is [`DaePlan::Buffer`]. No RPC is open
+    /// for the sequence: the values are collected as their parameters close and
+    /// the execute runs from the last `SQLParamData`, because a buffered
+    /// parameter's declaration is not known until its bytes are all in.
+    pub(crate) deferred: bool,
+    /// Collected values for buffered parameters as `(bound index, bytes,
+    /// is_null)`, in close order.
+    pub(crate) buffered: Vec<(usize, Vec<u8>, bool)>,
+    /// Marker count for the deferred execute's parameter rebuild.
+    pub(crate) marker_count: usize,
+    /// Rewritten SQL for a deferred `SQLExecDirect`, which runs ad-hoc
+    /// `sp_executesql` and has no prepared plan to execute instead.
+    pub(crate) sql: Option<String>,
+    /// Remaining `SQL_ATTR_QUERY_TIMEOUT` budget captured at execute time, so
+    /// the deferred execute is charged the same allowance as an immediate one.
+    pub(crate) timeout_secs: u32,
 }
 
 impl DaeState {
@@ -747,7 +825,43 @@ impl DaeState {
             params,
             cursor: None,
             progress: DaeProgress::default(),
+            deferred: false,
+            buffered: Vec::new(),
+            marker_count: 0,
+            sql: None,
+            timeout_secs: 0,
         }
+    }
+
+    /// Marks the sequence as one whose execute runs when the last parameter
+    /// closes, rather than one already streaming into an open RPC.
+    pub(crate) fn deferred(
+        mut self,
+        marker_count: usize,
+        sql: Option<String>,
+        timeout_secs: u32,
+    ) -> Self {
+        self.deferred = true;
+        self.marker_count = marker_count;
+        self.sql = sql;
+        self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// The parameters, for the deferred execute's rebuild.
+    pub(crate) fn params(&self) -> &[DaeParam] {
+        &self.params
+    }
+
+    /// Takes the prepared plan back out when the deferred execute runs.
+    pub(crate) fn take_prepared(&mut self) -> Option<PreparedPlan> {
+        self.prepared.take()
+    }
+
+    /// Takes the orphaned handle so the deferred execute can piggyback its
+    /// release, exactly as an immediate execute does.
+    pub(crate) fn take_orphaned(&mut self) -> Option<StatementId> {
+        self.orphaned.take()
     }
 
     /// Checks the client out for a network write, so no lock is held across the
@@ -799,6 +913,11 @@ impl DaeState {
             params,
             cursor,
             progress: DaeProgress::default(),
+            deferred: false,
+            buffered: Vec::new(),
+            marker_count: 0,
+            sql: None,
+            timeout_secs: 0,
         }
     }
 
@@ -1164,13 +1283,15 @@ impl StmtState {
     }
 
     /// The C type of the open DAE parameter, which `SQLPutData` needs to size
-    /// an `SQL_NTS` chunk. Reads [`DaeParam::c_type`] -- the snapshot taken at
-    /// execute time -- rather than `bound_params`, so it agrees with the type
-    /// `SQLParamData` transcodes with even if `SQLFreeStmt(SQL_RESET_PARAMS)`
-    /// or a rebind changes or clears the live binding while the sequence is
-    /// open.
+    /// an `SQL_NTS` chunk. Reads the binding snapshot taken at execute time
+    /// rather than `bound_params`, so it agrees with the type the chunks are
+    /// transcoded with even if `SQLFreeStmt(SQL_RESET_PARAMS)` or a rebind
+    /// changes or clears the live binding while the sequence is open.
     pub(crate) fn dae_current_c_type(&self) -> Option<SqlSmallInt> {
-        self.dae.as_ref()?.current_param().map(|param| param.c_type)
+        self.dae
+            .as_ref()?
+            .current_param()
+            .map(|param| param.binding.c_type)
     }
 }
 

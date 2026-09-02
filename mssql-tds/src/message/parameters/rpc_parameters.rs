@@ -105,6 +105,10 @@ pub(crate) struct EncryptedRpcValue {
 /// written before the total value length is known. Callers buffer any other type
 /// and send it materialized.
 ///
+/// This selects the *wire* type only. The `@params` declaration can be narrowed
+/// independently - see [`RpcParameter::with_streamed_declaration`] - so a
+/// `varchar(10)` parameter still streams its body as `varchar(max)`.
+///
 /// TODO: extend to the remaining PLP types (`xml`, `json`, `udt`, `text`, `ntext`,
 /// `image`) for parity with the incremental read path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +122,9 @@ pub enum StreamedSqlType {
 }
 
 impl StreamedSqlType {
-    /// Declaration name for the `sp_executesql` `@params` string. Delegates to
+    /// Default declaration name for the `sp_executesql` `@params` string, used
+    /// when the caller supplied no narrower one via
+    /// [`RpcParameter::with_streamed_declaration`]. Delegates to
     /// [`RpcParameter::get_sql_name_impl`] on the equivalent materialized
     /// [`SqlType`] rather than duplicating the `nvarchar(MAX)` / `varchar(MAX)`
     /// / `varbinary(MAX)` strings, so the two can't drift apart.
@@ -165,6 +171,10 @@ pub struct RpcParameter {
     /// Applied to both the SQL declaration and the wire `TYPE_INFO`.
     type_metadata: Option<RpcTypeMetadata>,
 
+    /// Declaration for a streamed parameter whose `@params` type is narrower
+    /// than its PLP body. See [`RpcParameter::with_streamed_declaration`].
+    streamed_declaration: Option<SqlType>,
+
     /// When present, the parameter is sent encrypted (Always Encrypted): the
     /// ciphertext is serialized as a BIGVARBINARY with the ENCRYPTED status flag
     /// and a trailing CryptoMetaData block, bypassing the plaintext `value`.
@@ -187,6 +197,7 @@ impl RpcParameter {
             options,
             value: RpcValue::Materialized(value),
             type_metadata: None,
+            streamed_declaration: None,
             encrypted: None,
             force_column_encryption: false,
         }
@@ -203,9 +214,27 @@ impl RpcParameter {
             options,
             value: RpcValue::Streamed(sql_type),
             type_metadata: None,
+            streamed_declaration: None,
             encrypted: None,
             force_column_encryption: false,
         }
+    }
+
+    /// Declares a streamed parameter as `declaration` in the `@params` string
+    /// while its value body stays PLP-framed.
+    ///
+    /// The two are independent: PLP framing needs an unknown-length opener, so
+    /// the wire `TYPE_INFO` is always a `max`, but the variable the value is
+    /// assigned to can still be a bounded `varchar(n)`. That is how a streamed
+    /// parameter honours `ColumnSize` without giving up chunking, and it is
+    /// what msodbcsql sends (`odbc/sqlccmd.cpp:4676` passes `cbColDef`
+    /// alongside `VARMAX_INDICATOR`).
+    ///
+    /// Ignored for a materialized parameter, whose declaration comes from its
+    /// own value.
+    pub fn with_streamed_declaration(mut self, declaration: SqlType) -> Self {
+        self.streamed_declaration = Some(declaration);
+        self
     }
 
     /// Returns `true` if this parameter's value is supplied via the
@@ -246,7 +275,10 @@ impl RpcParameter {
     pub(crate) fn sql_declaration(&self) -> TdsResult<String> {
         match &self.value {
             RpcValue::Materialized(value) => Self::get_sql_name(value, self.type_metadata),
-            RpcValue::Streamed(streamed) => streamed.sql_name(),
+            RpcValue::Streamed(streamed) => match &self.streamed_declaration {
+                Some(declaration) => Self::get_sql_name(declaration, self.type_metadata),
+                None => streamed.sql_name(),
+            },
         }
     }
 
