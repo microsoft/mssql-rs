@@ -163,20 +163,26 @@ def test_description_type_size_precision_scale_and_nullability(client_context):
 
 
 @pytest.mark.integration
-def test_description_vector_type_matches_fetched_value(client_context):
+def test_description_vector_type_and_scale_match_fetched_value(client_context):
     async def run():
         conn = await connect(client_context)
         try:
             cursor = conn.cursor()
             await cursor.execute(
-                "SELECT CAST('[1,2,3]' AS vector(3)) AS vector_value",
+                "SELECT "
+                "CAST('[1,2,3]' AS vector(3)) AS float32_vector, "
+                "CAST('[1,2,3]' AS vector(3, float16)) AS float16_vector",
                 use_prepare=False,
             )
 
-            assert cursor.description[0][0:2] == ("vector_value", list)
+            assert cursor.description[0][0:2] == ("float32_vector", list)
+            assert cursor.description[0][5] == 0
+            assert cursor.description[1][0:2] == ("float16_vector", str)
+            assert cursor.description[1][5] == 0
             row = await cursor.fetchone()
             assert isinstance(row[0], list)
             assert row[0] == pytest.approx([1.0, 2.0, 3.0])
+            assert isinstance(row[1], str)
         finally:
             await conn.close()
 

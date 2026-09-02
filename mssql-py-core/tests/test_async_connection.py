@@ -9,7 +9,6 @@ import subprocess
 import sys
 import textwrap
 import warnings
-from decimal import Decimal
 
 import pytest
 import mssql_py_core
@@ -172,7 +171,14 @@ def test_connection_operations_reuse_connect_logger(client_context):
             "column_count=1; elapsed_ms=" in message
             for message in logger.messages
         )
-        assert await cursor.fetchone() == (Decimal("1.00"),)
+        with pytest.raises(
+            mssql_py_core.ProgrammingError, match="No active result set"
+        ):
+            await cursor.fetchone()
+
+        await cursor.execute("SELECT 2 AS recovered_value", use_prepare=False)
+        assert cursor.description[0][:2] == ("recovered_value", int)
+        assert await cursor.fetchone() == (2,)
         await cursor.close()
 
         logger.messages.clear()

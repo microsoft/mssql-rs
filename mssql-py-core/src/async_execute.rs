@@ -384,7 +384,6 @@ pub(crate) fn execute<'py>(
                     ExecuteOutcome::NoRows | ExecuteOutcome::TerminalNoRows => None,
                 };
                 let column_count = metadata.as_ref().map_or(0, Vec::len);
-                future_fetch_state.set(fetch_status);
                 Python::attach(|py| {
                     let mut cursor_ref = cursor.borrow_mut(py);
                     if cursor_ref.input_sizes_generation() == input_sizes_generation {
@@ -403,6 +402,7 @@ pub(crate) fn execute<'py>(
                 })?;
                 let description_materialization_ms = description_started.elapsed().as_millis();
                 future_description_state.replace(description);
+                future_fetch_state.set(fetch_status);
                 tracing::info!(
                     "PyAsyncCursor::execute: query executed successfully; has_result_set={has_result_set}; column_count={column_count}; description_materialization_ms={description_materialization_ms}; has_open_batch={has_open_batch}"
                 );

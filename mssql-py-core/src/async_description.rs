@@ -178,6 +178,7 @@ fn decimal_digits(metadata: &ColumnMetadata) -> u8 {
             8 => 3,
             _ => 0,
         },
+        TdsDataType::Vector => 0,
         _ => metadata.get_scale().unwrap_or(0),
     }
 }
