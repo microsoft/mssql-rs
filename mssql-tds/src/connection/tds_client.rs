@@ -4638,6 +4638,17 @@ impl TdsClient {
         if let Err(error) = self.settle_rpc_terminator(&parser_context).await {
             self.current_metadata = None;
             self.abort_pending_prepare_capture();
+            // A tail token that failed to process before the terminal DONEPROC
+            // leaves the rest of the response unread. The caller has an error to
+            // report and no way back to this batch, so consume it here rather
+            // than leaving the connection claimed by a statement that will never
+            // read it.
+            if self.execution_context.has_open_batch() {
+                if let Err(drain_error) = self.drain_stream_or_retire().await {
+                    warn!(error = ?drain_error, "Drain after an RPC tail failure failed");
+                }
+                self.execution_context.set_has_open_batch(false);
+            }
             return Err(error);
         }
         Ok(!self.execution_context.has_open_batch())
@@ -10027,6 +10038,35 @@ mod tests {
             !client.current_result_ended_with_done_in_proc,
             "a plain batch DONE must not leave the previous RPC's tail gate armed"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_abandons_the_batch_when_a_tail_token_fails() {
+        // The tail parses far enough to park the next result, then reports the
+        // failed RETURNVALUE. Leaving that batch open would strand the ODBC
+        // busy claim on a statement whose cursor is already finished.
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.parked_token.is_none());
     }
 
     #[tokio::test]
