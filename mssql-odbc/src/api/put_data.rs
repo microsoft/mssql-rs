@@ -222,9 +222,13 @@ unsafe fn sql_put_data_safe(
             // there is no safe default: 0 is not "unknown" but a value that
             // scans the buffer for a single terminating byte, so a lost
             // SQL_C_WCHAR binding would silently stream one byte of a wide
-            // string. A binding can vanish under SQLFreeStmt(SQL_RESET_PARAMS);
-            // a driver manager rejects that in the Need Data state, but this
-            // driver is also loaded directly, so refuse rather than guess.
+            // string. `dae_current_c_type()` reads the `DaeParam` snapshot
+            // taken at execute time, so `SQLFreeStmt(SQL_RESET_PARAMS)`
+            // clearing `bound_params` mid-sequence no longer reaches this
+            // guard at all (`nts_uses_the_snapshotted_c_type_with_bound_params_cleared`
+            // asserts that). What remains reachable here is no current
+            // parameter -- the sequence ended or never had one -- so refuse
+            // rather than guess.
             let Some(c_type) = stmt_state.dae_current_c_type() else {
                 error!("SQLPutData: open data-at-execution parameter has no binding");
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
@@ -298,6 +302,33 @@ unsafe fn sql_put_data_safe(
         let client = if byte_count == 0 {
             None
         } else if needs_transcode {
+            // Checked before the checkout below: `SQL_DATA_AT_EXEC` declares
+            // no total, so nothing bounds how large this buffer grows, and
+            // `extend_from_slice`'s infallible allocation would abort the
+            // whole host process on an allocation failure it can't recover
+            // from. `try_reserve` turns that into a diagnostic the
+            // application can act on instead -- checked against `byte_count`
+            // directly, so a reservation this large never has to construct
+            // an unsafe slice claiming that many bytes are valid just to
+            // read its length back out, and never has to check out (and
+            // then dispose of) a client it turns out not to need. No client
+            // is parked yet at this point, so `abort_dae_with_diag` tears the
+            // sequence down the same way the `is_null` / `expected_len`
+            // checks above do, rather than the "something else is using this
+            // sequence" retriable failure `checkout_client` returning `None`
+            // represents below.
+            if stmt_state
+                .dae
+                .as_mut()
+                .is_some_and(|dae| dae.progress.pending_bytes.try_reserve(byte_count).is_err())
+            {
+                drop(stmt_state);
+                error!(
+                    "SQLPutData: failed to reserve {byte_count} bytes for a buffered DAE value (HY001)"
+                );
+                return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_MEMORY_ALLOCATION);
+            }
+
             // The declared C type and SQL type disagree on wideness (see
             // `dae_placeholder_type`), so a chunk transcoded in isolation
             // could split a multi-byte character across two calls. Buffer
@@ -710,6 +741,46 @@ mod tests {
         assert_eq!(dae.progress.bytes_sent, 0);
         assert!(!dae.progress.put_data_called);
         assert!(dae.progress.pending_bytes.is_empty());
+    }
+
+    /// `SQL_DATA_AT_EXEC` declares no total, so nothing bounds how large
+    /// `pending_bytes` can grow for a mismatched-wideness parameter. A
+    /// reservation this call can never satisfy must fail cleanly with
+    /// `HY001` instead of letting `Vec`'s default infallible allocation
+    /// abort the process this driver is loaded into. Checked before any
+    /// client is checked out, so this doesn't need one parked: a byte count
+    /// near `usize::MAX` fails `try_reserve` on any real system without
+    /// actually exhausting its memory, and `data_ptr` is never read at that
+    /// length -- the call returns before the unsafe slice is constructed.
+    #[test]
+    fn oversized_transcoded_chunk_returns_hy001_without_aborting() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![DaeParam {
+                    value_ptr: std::ptr::null_mut(),
+                    expected_len: None,
+                    needs_transcode: true,
+                    c_type: crate::api::odbc_types::SQL_C_WCHAR,
+                    sql_type: SQL_VARCHAR,
+                }],
+                Some(0),
+            ));
+        }
+
+        let mut token = 0u8;
+        let ret =
+            unsafe { sql_put_data(h.stmt, (&mut token as *mut u8).cast(), isize::MAX as SqlLen) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_MEMORY_ALLOCATION.state);
+        assert!(
+            !state.needs_data(),
+            "an unsatisfiable reservation must abandon the sequence, not leave it retriable"
+        );
     }
 
     #[test]
