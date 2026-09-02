@@ -135,7 +135,8 @@ TEST_F(ConnectionBusyLiveTest, PreparedParameterMultiRowReleasesAfterLastRow) {
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(42, value);
-    EXPECT_SQLSTATE(SQL_ERROR, Run(b, "SELECT 2"), "HY000", SQL_HANDLE_STMT, b);
+    EXPECT_EQ(SQL_ERROR, Run(b, "SELECT 2"));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, b, "HY000");
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(42, value);
