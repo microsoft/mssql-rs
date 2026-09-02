@@ -99,21 +99,29 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      available, `cargo check --target <triple>` / `cargo clippy --target <triple>`
      type-checks `#[cfg(windows)]` and `#[cfg(target_os = ...)]` code without a
      matching host, because neither links (`rustup target add
-     aarch64-pc-windows-msvc`; ~30 s warm for `-p mssqlodbc --lib`). This is a
-     convenience, not a requirement — installing a target and building locally isn't
-     something every reviewer wants or needs to do. Either way, confirm the specific
-     CI job for that platform actually ran and passed on the PR's head commit rather
-     than assuming "the matrix owns this" without looking; a local check only adds a
-     faster answer to the same question CI already gates. Neither approach can run a
-     Windows test binary, and a mutation applied to an arm your host does not select
-     proves nothing on its own — that still rests on CI. A local check can also fail
-     in a dependency's build script rather than the reviewed code: targeting a Linux
-     triple pulls `openssl-sys` in through `native-tls`, and its build script fails
-     before rustc ever sees the crate if it can't find a target OpenSSL sysroot —
-     confirmed on `mssql-odbc`, where the Windows-target direction above needs no
-     OpenSSL at all (`native-tls` routes through Schannel on Windows,
-     Security.framework on macOS — only Linux targets hit the sysroot lookup). That is
-     an environment gap, not a type error; read what actually failed before
+     aarch64-pc-windows-msvc`; ~26 s warm for `-p mssql-tds --all-targets`). Use
+     `--all-targets`, not `--lib`: most of this repo's platform-gated code lives
+     inside inline `#[cfg(test)] mod tests` blocks, which `--lib` compiles without the
+     `test` cfg and so skips silently, `--target` notwithstanding — confirmed by
+     mutating a `#[cfg(windows)]` test in `datasource_parser.rs`, which `--lib` missed
+     and `--all-targets` caught. `mssql-tds` is also the crate to reach for here, not
+     `mssql-odbc`: it carries roughly 120 `cfg(windows)`/`cfg(target_os)` sites against
+     `mssql-odbc`'s ~18. This is a convenience, not a requirement — installing a
+     target and building locally isn't something every reviewer wants or needs to do.
+     Either way, confirm the specific CI job for that platform actually ran and passed
+     on the PR's head commit rather than assuming "the matrix owns this" without
+     looking; a local check only adds a faster answer to the same question CI already
+     gates. Neither approach can run a Windows test binary, and a mutation applied to
+     an arm your invocation doesn't select — the wrong target, or `--lib` over
+     `--all-targets` — proves nothing on its own; that still rests on CI. A local
+     check can also fail in a dependency's build script rather than the reviewed
+     code: targeting a non-Windows, non-macOS triple pulls in `openssl-sys` — through
+     `native-tls`'s backend choice and, in `mssql-tds`, through a direct `openssl`
+     dependency for the Always Encrypted primitives — and its build script fails
+     before rustc ever sees the crate if it can't find a target OpenSSL sysroot.
+     Confirmed on `mssql-tds`: the Windows-target direction above needs none at all
+     (`native-tls` routes through Schannel on Windows, Security.framework on macOS).
+     That is an environment gap, not a type error; read what actually failed before
      attributing it to the diff.
 
    ```bash
@@ -393,10 +401,10 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
   response when one comes back, state that none did (a timeout after a bounded wait, a
   hard error) when it doesn't, or say the tool isn't exposed in this session's
   inventory at all when there was nothing to call — a silent hang or a missing tool is
-  an outcome, not an excuse to skip the record. Three of the four caveats closing one
-  review (2026-09-02, AB#47807) — no ADO access, type-checking Windows-gated code
-  without a Windows host, Linux-only mutation scope — did not survive being tested;
-  running a Windows test binary did. Keep two categories apart: *the environment
+  an outcome, not an excuse to skip the record. Three of the four caveats closing a
+  2026-09-02 review of #459 (AB#47509) — no ADO access, type-checking Windows-gated
+  code without a Windows host, Linux-only mutation scope — did not survive being
+  tested; running a Windows test binary did. Keep two categories apart: *the environment
   cannot do this* needs a failed invocation or a confirmed absence, while *the defect
   is inherently untestable* (process teardown, a TOCTOU window) needs only an argument
   and stays valid.
