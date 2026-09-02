@@ -1651,9 +1651,11 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationWhenBytesRemain) {
 }
 
 // The other half of the contract: an empty value has nothing left to deliver, so
-// the same probe is a plain success and the caller correctly stops. Measured
-// identically on msodbcsql 18.6.2.1 (SQL_SUCCESS, indicator 0, no diagnostic).
-TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceeds) {
+// the same probe is a plain success, and because that call delivered the whole
+// value the column is consumed -- a repeat reports SQL_NO_DATA. Measured
+// identically on msodbcsql 18.6.2.1 (SQL_SUCCESS with indicator 0 and no
+// diagnostic, then SQL_NO_DATA).
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceedsAndConsumesColumn) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARBINARY(8)) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
@@ -1661,6 +1663,7 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceeds) {
     SQLLEN ind = -1;
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
     EXPECT_EQ(0, ind);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
 
     SQLCloseCursor(stmt_);
 }

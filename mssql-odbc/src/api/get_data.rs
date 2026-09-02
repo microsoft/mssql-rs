@@ -422,6 +422,16 @@ fn write_captured_column(
         let available = binary_length(value);
         unsafe { write_if_some(strlen_or_ind_ptr, available) };
         if available == 0 {
+            // Nothing was left behind, so this call delivered the whole value
+            // and the column is done: consume it so a repeat reports
+            // SQL_NO_DATA and a last-column read can reach
+            // `finish_get_data`'s completion path. Measured on msodbcsql
+            // 18.6.2.1: a second probe of an empty `varbinary` answers
+            // SQL_NO_DATA, while a second probe of `binary(9)` repeats
+            // SQL_SUCCESS_WITH_INFO / 01004 because bytes are still pending.
+            stmt_state.current_row_last_col = col_index;
+            stmt_state.last_captured = None;
+            stmt_state.partial_text_offset = None;
             return SQL_SUCCESS;
         }
         post_diag(stmt_state, WARN_STRING_TRUNCATION);
@@ -2036,9 +2046,11 @@ mod tests {
     }
 
     /// A value with no bytes has nothing left to deliver, so the probe is not a
-    /// truncation.
+    /// truncation — and it consumed the column, so a repeat reports
+    /// SQL_NO_DATA. msodbcsql 18.6.2.1 answers an empty `varbinary` the same
+    /// way.
     #[test]
-    fn get_data_binary_probe_on_empty_value_succeeds_without_truncation() {
+    fn get_data_binary_probe_on_empty_value_succeeds_and_consumes_the_column() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_captured(&h, ColumnValues::Bytes(Vec::new()));
 
@@ -2047,19 +2059,33 @@ mod tests {
             unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(ind, 0);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let s = stmt.inner.lock().unwrap();
-        assert!(s.diag_records.is_empty());
+        {
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = stmt.inner.lock().unwrap();
+            assert!(s.diag_records.is_empty());
+        }
+
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_NO_DATA);
     }
 
     /// The shape mssql-python's Arrow fetch hits on a `binary(9)` column: the
-    /// probe must not report the bytes as delivered.
+    /// probe must not report the bytes as delivered, and the column stays
+    /// readable so the caller can grow its buffer and come back.
     #[test]
     fn get_data_binary_probe_on_bytes_reports_truncation() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_captured(&h, ColumnValues::Bytes(b"asdfghjkl".to_vec()));
 
         let mut ind: SqlLen = 0;
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 9);
+
+        // Bytes are still pending, so a repeat repeats the answer rather than
+        // reporting the column consumed.
         let ret =
             unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
