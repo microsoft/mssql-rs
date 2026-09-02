@@ -42,7 +42,7 @@ parameters:
   default: true
 
 - name: enableOdbcE2E
-  displayName: Enable ODBC C++ e2e suite (Windows, PR only) with coverage
+  displayName: Enable ODBC C++ e2e suite (Windows/macOS, PR only) with coverage
   type: boolean
   default: false
 
@@ -171,13 +171,14 @@ steps:
       targetPath: "$(Build.SourcesDirectory)/target/cobertura.xml"
       artifactName: "CoberturaCoverageRust_${{ parameters.osType }}"
 
-# ODBC C++ e2e suite (Windows only). The gtest suite loads the Rust ODBC driver
-# DLL through the Windows Driver Manager as separate processes, so its execution
-# was contributing zero coverage. run_e2e.ps1 -Coverage instruments the driver
-# via cargo llvm-cov, lets the gtest processes emit .profraw, and produces a
-# repo-root-relative Cobertura report for mssql-odbc (and statically-linked
-# mssql-tds). The report is unioned into the Merge Coverage stage so lines
-# reachable only via the ODBC surface count toward PR diff coverage.
+# ODBC C++ e2e suite (Windows and macOS). The gtest suite loads the Rust ODBC
+# driver through the platform's Driver Manager as separate processes, so its
+# execution was contributing zero coverage. run_e2e.ps1/run_e2e.sh -Coverage
+# instruments the driver via cargo llvm-cov, lets the gtest processes emit
+# .profraw, and produces a repo-root-relative Cobertura report for mssql-odbc
+# (and statically-linked mssql-tds). The report is unioned into the Merge
+# Coverage stage so lines reachable only via the ODBC surface count toward PR
+# diff coverage.
 - ${{ if and(eq(parameters.osType, 'Windows'), eq(parameters.enableOdbcE2E, true)) }}:
   # Reference driver for the parity comparison below, installed by
   # install-msodbcsql.ps1. Pinned to the msodbcsqlVersion pipeline variable so a
@@ -238,6 +239,43 @@ steps:
     inputs:
       targetPath: "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
       artifactName: "CoberturaCoverageOdbcE2E_Windows"
+
+# ODBC C++ e2e suite (macOS). Same mechanism as the Windows leg above, but via
+# run_e2e.sh (unixODBC) instead of run_e2e.ps1, and with no msodbcsql parity
+# comparison: unlike Windows (winget) and Linux (packages.microsoft.com in a
+# container), there is no scripted macOS installer for the reference driver
+# here yet, so this leg only proves the Rust driver's own e2e suite passes.
+- ${{ if and(eq(parameters.osType, 'MacOS'), eq(parameters.enableOdbcE2E, true)) }}:
+  - script: |
+      export ODBC_TEST_SERVER='localhost'
+      export ODBC_TEST_UID='sa'
+      export ODBC_TEST_PWD="$SQL_PASSWORD"
+      export ODBC_TEST_TRUST_CERT='Yes'
+      ./mssql-odbc/tests/e2e/run_e2e.sh --retries=3 \
+        --coverage="$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
+    displayName: Run ODBC C++ e2e tests (macOS) with coverage
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+      RUST_BACKTRACE: full
+
+  - task: PublishTestResults@2
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e test results (macOS)"
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: $(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml
+      testRunTitle: $(System.PhaseName)-OdbcE2E
+
+  # Best-effort (continueOnError) so a coverage hiccup never fails the build; the
+  # Merge Coverage stage skips it if absent.
+  - task: PublishPipelineArtifact@1
+    condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+    displayName: "Publish ODBC e2e macOS Cobertura coverage artifact"
+    continueOnError: true
+    inputs:
+      targetPath: "$(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml"
+      artifactName: "CoberturaCoverageOdbcE2E_MacOS"
 
 - ${{ if eq(parameters.enableJsBuild, true) }}:
   - bash: |

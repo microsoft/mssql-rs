@@ -82,6 +82,9 @@ steps:
       echo "##vso[task.setvariable variable=CPPFLAGS]-I$(brew --prefix krb5)/include"
       echo "##vso[task.setvariable variable=PKG_CONFIG_PATH]$(brew --prefix krb5)/lib/pkgconfig"
 
+      # unixODBC + cmake for the mssql-odbc C++ e2e suite (tests/e2e/run_e2e.sh)
+      brew install unixodbc cmake
+
       # Install Rustup
       .pipeline/scripts/install-rustup.sh
     displayName: "Install MacOS dependencies"
