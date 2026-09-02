@@ -515,6 +515,17 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   to keep intent clear.
 - Pointer parameters from C must be treated as potentially null, invalid, or
   misaligned — validate before use.
+- **A success code is a promise about the caller's buffer, so never report
+  `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Any
+  out-buffer entry point that could not deliver everything must say so —
+  `SQL_SUCCESS_WITH_INFO` with `01004` for a truncated read — because that is
+  the only signal telling the caller to grow its buffer and come back. The
+  memory safety of this driver ends at the ABI: a caller that believes an
+  undelivered value landed will read out of bounds and take the host process
+  down with it, and no amount of care on our side of the boundary prevents it.
+  AB#47537 is the worked example — a zero-length `SQL_C_BINARY` probe answered
+  `SQL_SUCCESS` with the byte count, and mssql-python copied those bytes out of
+  the empty buffer it had passed.
 
 ## Types and casts
 
