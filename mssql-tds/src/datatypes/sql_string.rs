@@ -64,13 +64,13 @@ pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
     if collation.utf8() {
         return text.as_bytes().to_vec();
     }
-    let (encoded, _, had_errors) = lcid_encoding_or_fallback(collation).encode(text);
+    let (encoded, encoding_used, had_errors) = lcid_encoding_or_fallback(collation).encode(text);
     if had_errors {
         warn!(
             "Encountered encoding errors while converting string to LCID 0x{:04X} ({}) encoding. \
              Some characters may have been replaced.",
             collation.info & 0x000F_FFFF,
-            collation.info & 0x000F_FFFF
+            encoding_used.name()
         );
     }
     encoded.into_owned()

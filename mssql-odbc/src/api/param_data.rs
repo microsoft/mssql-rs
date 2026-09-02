@@ -171,28 +171,11 @@ fn sql_param_data_safe(
             return SQL_ERROR;
         };
 
-        let transcode = stmt_state.dae.as_mut().and_then(|dae| {
-            if dae.progress.is_null || dae.progress.pending_bytes.is_empty() {
-                return None;
-            }
-            let (c_type, sql_type) = {
-                let param = dae.current_param()?;
-                if !param.needs_transcode {
-                    return None;
-                }
-                (param.c_type, param.sql_type)
-            };
-            // Free to take rather than clone: `advance()` resets `progress`
-            // wholesale before the next parameter, and every failure arm
-            // below tears the whole sequence down, so nothing reads
-            // `pending_bytes` again after this.
-            Some((
-                c_type,
-                sql_type,
-                std::mem::take(&mut dae.progress.pending_bytes),
-            ))
-        });
-
+        // Checked out before `pending_bytes` is taken: if this fails (a
+        // concurrent call already holds the client), the sequence stays open
+        // for a retry with the buffered value still intact rather than
+        // silently discarded, mirroring the same ordering `SQLPutData`'s
+        // buffered branch uses for the same reason.
         let client = match stmt_state
             .dae
             .as_mut()
@@ -205,6 +188,30 @@ fn sql_param_data_safe(
                 return SQL_ERROR;
             }
         };
+
+        let transcode = stmt_state.dae.as_mut().and_then(|dae| {
+            if dae.progress.is_null || dae.progress.pending_bytes.is_empty() {
+                return None;
+            }
+            let (c_type, sql_type) = {
+                let param = dae.current_param()?;
+                if !param.needs_transcode {
+                    return None;
+                }
+                (param.c_type, param.sql_type)
+            };
+            // Free to take rather than clone: the client is already checked
+            // out above, so a failed checkout could not have left this call
+            // to take bytes it can no longer deliver. `advance()` resets
+            // `progress` wholesale before the next parameter, and every
+            // failure arm below tears the whole sequence down, so nothing
+            // reads `pending_bytes` again after this.
+            Some((
+                c_type,
+                sql_type,
+                std::mem::take(&mut dae.progress.pending_bytes),
+            ))
+        });
         (client, transcode)
     };
 
@@ -413,6 +420,48 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
         assert!(!state.needs_data());
+    }
+
+    /// A concurrent call on the same statement can hold the client when this
+    /// one tries to close a transcoded parameter (`checkout_client` returns
+    /// `None`, the same condition `DaeState::for_test`'s parked-client-free
+    /// setup exercises here). The client is checked out *before*
+    /// `pending_bytes` is taken, so this failure must not lose the buffered
+    /// value: a retry once the concurrent call finishes has to see the same
+    /// bytes it would have seen if this call had never happened.
+    #[test]
+    fn failed_checkout_leaves_pending_bytes_and_the_sequence_intact() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut dae = DaeState::for_test(
+                vec![DaeParam {
+                    value_ptr: std::ptr::null_mut(),
+                    expected_len: None,
+                    needs_transcode: true,
+                    c_type: SQL_C_CHAR,
+                    sql_type: SQL_VARCHAR,
+                }],
+                Some(0),
+            );
+            dae.progress.put_data_called = true;
+            dae.progress.pending_bytes = b"a\0b\0".to_vec();
+            state.dae = Some(dae);
+        }
+
+        let mut p: SqlPointer = std::ptr::null_mut();
+        let ret = unsafe { sql_param_data(h.stmt, &mut p) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        assert!(state.needs_data(), "sequence must stay open for a retry");
+        assert_eq!(
+            state.dae.as_ref().unwrap().progress.pending_bytes,
+            b"a\0b\0",
+            "the buffered value must survive a failed checkout"
+        );
     }
 
     #[test]
