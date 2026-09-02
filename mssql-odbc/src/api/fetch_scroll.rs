@@ -554,6 +554,12 @@ impl RowWriter for BoundRowWriter<'_> {
 /// resolves to `SQL_C_CHAR` and stays within `BufferLength`. `BufferLength` 0
 /// is exempt: that is the documented idiom for a fixed-width target and carries
 /// no width claim to violate.
+///
+/// The width is `SQL_DESC_OCTET_LENGTH` on the ARD record, which an application
+/// can rewrite with `SQLSetDescField` after binding without touching the type.
+/// Checking it here rather than at bind time is what keeps the two consistent:
+/// the check runs against the same per-fetch snapshot the fill loop uses, so a
+/// slot narrowed after the bind is still caught.
 fn resolve_default_bindings(
     bindings: &mut [ColumnBinding],
     column_sql_types: &[SqlSmallInt],
@@ -1848,8 +1854,9 @@ mod tests {
     use super::*;
     use crate::api::bind_col::sql_bind_col;
     use crate::api::odbc_types::{
-        SQL_C_BINARY, SQL_C_SLONG, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST, SQL_FETCH_LAST,
-        SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE, SQL_GUID, SQL_INTEGER, SQL_WVARCHAR,
+        SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR,
+        SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH_PTR, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST,
+        SQL_FETCH_LAST, SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE, SQL_GUID, SQL_INTEGER, SQL_WVARCHAR,
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
     use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
@@ -2211,6 +2218,80 @@ mod tests {
             stored[0].target_type, SQL_C_DEFAULT,
             "the persistent binding must be resolved again for later result sets"
         );
+    }
+
+    /// The descriptor API is a second door into `resolve_default_bindings`, and
+    /// it reaches the fetch loop by a different route than `SQLBindCol`:
+    /// `set_type` writes `SQL_C_DEFAULT` straight onto the ARD record (it is in
+    /// `is_valid_c_type` and `canonical_c_type` leaves it alone), and
+    /// `ColumnBinding::from_record` keys "bound" off a non-null `SQL_DESC_DATA_PTR`
+    /// rather than the concise type.
+    ///
+    /// Before this, the two doors disagreed: `SQLBindCol` refused `SQL_C_DEFAULT`
+    /// with `HY003` while the descriptor route accepted it and then failed every
+    /// row with `HYC00`. Both now resolve identically, which is the
+    /// bind/descriptor equivalence AB#47437 is built on.
+    #[test]
+    fn a_default_binding_set_through_the_descriptor_api_also_resolves() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let mut values = [0_i32; 2];
+        let mut indicators = [0 as SqlLen; 2];
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.begin_result_set(int_columns(1));
+            state.row_array_size = 2;
+        }
+
+        // Bind column 1 entirely through SQLSetDescField, never SQLBindCol.
+        // The descriptor API exposes SQL_DESC_INDICATOR_PTR and
+        // SQL_DESC_OCTET_LENGTH_PTR separately, where SQLBindCol's single
+        // StrLen_or_Ind argument feeds both; the length is reported through the
+        // latter, so a faithful equivalent has to set both.
+        let ard = h.ard();
+        for (field, value) in [
+            (
+                SQL_DESC_CONCISE_TYPE,
+                SQL_C_DEFAULT as isize as crate::api::odbc_types::SqlPointer,
+            ),
+            (SQL_DESC_DATA_PTR, values.as_mut_ptr().cast()),
+            (SQL_DESC_INDICATOR_PTR, indicators.as_mut_ptr().cast()),
+            (SQL_DESC_OCTET_LENGTH_PTR, indicators.as_mut_ptr().cast()),
+        ] {
+            assert_eq!(
+                unsafe {
+                    crate::api::set_desc_field::sql_set_desc_field_w(
+                        ard,
+                        1,
+                        field as SqlSmallInt,
+                        value,
+                        0,
+                    )
+                },
+                SQL_SUCCESS,
+                "field {field}"
+            );
+        }
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mut client = tds_client_from_int_rows(vec![vec![10], vec![20]]);
+        dbc.runtime
+            .block_on(client.execute("SELECT descriptor default binding".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+
+        assert_eq!(
+            unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) },
+            SQL_SUCCESS
+        );
+        assert_eq!(values, [10, 20]);
+        assert_eq!(indicators, [4, 4]);
     }
 
     /// After `SQLSetStmtAttrW` reassociates the ARD, `SQLFetchScroll` must

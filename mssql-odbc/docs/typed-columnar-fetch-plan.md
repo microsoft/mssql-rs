@@ -162,6 +162,8 @@ Two details worth keeping in mind when extending this:
 
 `SQLBindCol` accepts `SQL_C_DEFAULT` and stores it unresolved, the way msodbcsql does (`sqlcfunc.cpp` `BindOffset` → `Sql2CDefault`): the answer depends on the IRD, which does not exist until a statement executes, and one binding can outlive several result sets. Each `SQLFetchScroll` resolves the placeholder on its own snapshot of the binding table, so the stored binding still says `SQL_C_DEFAULT` for the next result set.
 
+This also closes a bind/descriptor inconsistency. Since AB#47437 the ARD is the fetch's single source of truth, and `SQLBindCol` and an equivalent `SQLSetDescField` sequence are meant to be indistinguishable. `SQL_C_DEFAULT` was the exception: `set_type` accepts it on an application descriptor (it is in `is_valid_c_type`, and `canonical_c_type` leaves it alone), and `ColumnBinding::from_record` keys "bound" off a non-null `SQL_DESC_DATA_PTR` rather than the concise type — so the descriptor route reached the fill loop and failed per row with `HYC00`, while `SQLBindCol` refused the same value outright with `HY003`. Both now resolve identically.
+
 The mapping is `type_rules::resolve_default_c_type`, shared with `SQLBindParameter` so the driver gives one answer for what `SQL_C_DEFAULT` means. It carries two deliberate deviations from msodbcsql, and they apply here too:
 
 | SQL type | This driver | msodbcsql | Why the deviation is kept |
