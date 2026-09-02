@@ -1012,4 +1012,201 @@ mod mock_server_tests {
 
         Ok(())
     }
+
+    /// Regression test for microsoft/mssql-rs#439.
+    ///
+    /// A statement blocked server-side (e.g. behind another session's row
+    /// lock) that eventually fails with a real SQL Server error — 1222, "Lock
+    /// request time out period exceeded" — must surface that error once the
+    /// server actually replies, not hang indefinitely. `execute` is called
+    /// with the same default `ExecuteOptions` (no client-side timeout) that
+    /// mssql-odbc's `SQLExecDirectW` currently uses, so this exercises exactly
+    /// the wait the ODBC driver performs.
+    #[tokio::test]
+    async fn test_delayed_statement_error_does_not_hang() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+        use std::time::{Duration, Instant};
+
+        init_tracing();
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(3);
+        const GENEROUS_BOUND: Duration = Duration::from_secs(30);
+        const SELECT_SQL: &str = "SELECT * FROM ##test_isolation WHERE id = 1";
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+
+        // The server holds the reply until RESPONSE_DELAY has elapsed, then
+        // answers with the same shape a real, lock-timed-out SELECT gets: a
+        // single ERROR token whose DONE ends the batch (no result set).
+        let registry = server.query_registry();
+        {
+            let mut reg = registry.lock().await;
+            reg.register(
+                SELECT_SQL,
+                QueryResponse::error_only(TerminalError::new(
+                    1222,
+                    16,
+                    "Lock request time out period exceeded.",
+                ))
+                .with_delay(RESPONSE_DELAY),
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        let started = Instant::now();
+        let outcome =
+            tokio::time::timeout(GENEROUS_BOUND, client.execute(SELECT_SQL.to_string(), ()))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "execute() hung past the {GENEROUS_BOUND:?} test bound waiting for a \
+                     response delayed by {RESPONSE_DELAY:?} (mssql-rs#439)"
+                    )
+                });
+        let elapsed = started.elapsed();
+
+        match outcome.expect_err("a lock-timed-out statement must surface as an error") {
+            mssql_tds::error::Error::SqlServerError { diagnostics } => {
+                assert_eq!(diagnostics.errors.len(), 1);
+                assert_eq!(diagnostics.errors[0].number, 1222);
+            }
+            other => panic!("expected a SqlServerError(1222), got: {other:?}"),
+        }
+
+        assert!(
+            elapsed >= RESPONSE_DELAY,
+            "response surfaced before the server's artificial delay even elapsed: {elapsed:?}"
+        );
+
+        client.close_connection().await?;
+
+        // Cleanup
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
+
+    /// Companion to `test_delayed_statement_error_does_not_hang`: proves the
+    /// *client's own* `ExecuteOptions::timeout_secs` actually bounds the wait,
+    /// rather than merely tolerating one imposed by the server. A short
+    /// client-side timeout against a much longer server delay must fail
+    /// promptly with a client `TimeoutError`, not wait out the full delay —
+    /// the mock server's delayed response is interruptible by `Attention`
+    /// specifically so this is measurable: the driver's timeout handling
+    /// sends `Attention` and waits for its acknowledgment, which the server
+    /// can only answer promptly if it notices the `Attention` arriving mid-delay.
+    #[tokio::test]
+    async fn test_client_timeout_fires_before_a_longer_server_delay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use mssql_tds::connection::tds_client::ExecuteOptions;
+        use std::time::{Duration, Instant};
+
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+
+        init_tracing();
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const CLIENT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above CLIENT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap between them is exactly
+        // what proves the client timeout (not the server delay) ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+        const SELECT_SQL: &str = "SELECT * FROM ##test_isolation WHERE id = 1";
+
+        let server = MockTdsServer::new("127.0.0.1:0").await?;
+        let server_addr = server.local_addr();
+
+        let registry = server.query_registry();
+        {
+            let mut reg = registry.lock().await;
+            reg.register(
+                SELECT_SQL,
+                QueryResponse::error_only(TerminalError::new(
+                    1222,
+                    16,
+                    "Lock request time out period exceeded.",
+                ))
+                .with_delay(RESPONSE_DELAY),
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_handle =
+            tokio::spawn(async move { server.run_with_shutdown(shutdown_rx).await });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
+        let mut context = ClientContext::default();
+        context.user_name = "sa".to_string();
+        context.password = generate_test_password();
+        context.database = "master".to_string();
+        context.encryption_options = EncryptionOptions {
+            mode: EncryptionSetting::PreferOff,
+            trust_server_certificate: true,
+            host_name_in_cert: None,
+            server_certificate: None,
+        };
+
+        let provider = TdsConnectionProvider {};
+        let mut client = provider.create_client(context, &datasource, None).await?;
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            BOUND,
+            client.execute(
+                SELECT_SQL.to_string(),
+                ExecuteOptions::new().timeout_secs(CLIENT_TIMEOUT_SECS),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "execute() did not return within the {BOUND:?} test bound for a \
+                 {CLIENT_TIMEOUT_SECS}s client timeout — either the timeout was not applied, or \
+                 the driver's Attention-based cancellation is not being acknowledged promptly"
+            )
+        });
+        let elapsed = started.elapsed();
+
+        match outcome.expect_err("a client-side command timeout must surface as an error") {
+            mssql_tds::error::Error::TimeoutError(_) => {}
+            other => panic!("expected a client TimeoutError, got: {other:?}"),
+        }
+
+        assert!(
+            elapsed < RESPONSE_DELAY,
+            "execute() took {elapsed:?}, at or past the full {RESPONSE_DELAY:?} server delay — \
+             the {CLIENT_TIMEOUT_SECS}s client timeout did not bound the wait"
+        );
+
+        // Cleanup
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+
+        Ok(())
+    }
 }

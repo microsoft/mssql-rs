@@ -553,9 +553,12 @@ fn run_catalog(
         Ok(client) => client,
         Err(rc) => return rc,
     };
-    flush_pending_unprepare(dbc, stmt, &mut client, name);
+    // Catalog functions don't share issue #439's blocked-statement scenario and
+    // are out of scope for the SQL_ATTR_QUERY_TIMEOUT wiring below; `0` keeps
+    // their existing unbounded behavior.
+    flush_pending_unprepare(dbc, stmt, &mut client, name, 0);
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, name) {
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, name, 0) {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

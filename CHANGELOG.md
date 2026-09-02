@@ -151,6 +151,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   payload nor terminates a message — but was previously consumed as a
   zero-length packet. Empty end-of-message packets remain legal.
 
+- `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced (AB#46385). Previously
+  it was stored and reported back but silently ignored by `SQLExecute` and
+  `SQLExecDirectW`, so a statement blocked server-side (e.g. behind another
+  session's row lock) had no client-side escape hatch and could wait
+  indefinitely even with a timeout configured. A non-zero value now bounds the
+  wait — including the implicit transaction begin and deferred `sp_unprepare`
+  that can run ahead of the statement itself — and on expiry the driver sends
+  `ATTENTION` and reports `HYT00`, matching msodbcsql. `0` (the ODBC default)
+  remains unlimited. Motivated by issue #439, though that report's own
+  reproduction never sets `SQL_ATTR_QUERY_TIMEOUT` and so is not itself
+  resolved by this change; see the issue for the still-open live-server
+  investigation.
+
 - `mssql-tds`: TCP connect no longer resolves the server hostname with the
   blocking `std::net::ToSocketAddrs`. That call never yields to the async
   runtime, so a slow or unresponsive resolver silently escaped the

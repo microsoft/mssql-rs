@@ -12,12 +12,12 @@
 //! succeeding; `SQL_ATTR_CURSOR_SCROLLABLE` is the same setting seen from the
 //! other side and behaves identically. `SQL_ATTR_QUERY_TIMEOUT` is stored and
 //! clamped to [`MAX_QUERY_TIMEOUT`], matching msodbcsql, which reports `01S02`
-//! rather than rejecting an over-large request; enforcing the stored timeout
-//! against a running statement is tracked separately. `SQL_ATTR_MAX_ROWS` is
-//! stored and genuinely enforced by the fetch path. Other recognized parameter
-//! and cursor controls are stored and round-tripped without effect, because
-//! msodbcsql reports back whatever was written; the handful whose reported value
-//! msodbcsql pins regardless of the
+//! rather than rejecting an over-large request; the stored timeout is enforced
+//! against the running statement by `SQLExecute`/`SQLExecDirectW` (AB#46385).
+//! `SQL_ATTR_MAX_ROWS` is stored and genuinely enforced by the fetch path.
+//! Other recognized parameter and cursor controls are stored and
+//! round-tripped without effect, because msodbcsql reports back whatever was
+//! written; the handful whose reported value msodbcsql pins regardless of the
 //! request (`SQL_ATTR_MAX_LENGTH`, `SQL_ATTR_KEYSET_SIZE`,
 //! `SQL_ATTR_SIMULATE_CURSOR`) substitute and warn with `01S02`.
 //! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger

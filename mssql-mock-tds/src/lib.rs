@@ -27,7 +27,7 @@ pub mod tls_helper;
 
 pub use query_response::{
     ColumnDefinition, ColumnValue, InfoMessage, LeadingError, QueryRegistry, QueryResponse, Row,
-    SqlDataType,
+    SqlDataType, TM_BEGIN_DELAY_KEY, TerminalError,
 };
 pub use server::{ConnectionInfo, ConnectionStore, MockTdsServer, RedirectionConfig};
 pub use tds_tls_wrapper::TdsTlsWrapper;
