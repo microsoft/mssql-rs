@@ -672,15 +672,18 @@ pub fn build_login_ack() -> BytesMut {
     token_data
 }
 
-/// Build a DONE token
-pub fn build_done_token(row_count: u64) -> BytesMut {
+/// Build a DONE token with explicit status flags (MS-TDS `DONE_STATUS`) and
+/// row count. The lower-level primitive behind [`build_done_token`] (which
+/// always passes `DONE_FINAL`) and [`build_attention_ack_packet`] (which needs
+/// `DONE_ATTN` instead).
+fn build_done_token_with_status(status: u16, row_count: u64) -> BytesMut {
     let mut token_data = BytesMut::new();
 
     // DONE token (0xFD)
     token_data.put_u8(TokenType::Done as u8);
 
-    // Status: DONE_FINAL (0x00) - little-endian
-    token_data.put_u16_le(0x0000);
+    // Status - little-endian
+    token_data.put_u16_le(status);
 
     // CurCmd: SELECT (0xC1) - little-endian
     token_data.put_u16_le(0x00C1);
@@ -689,6 +692,19 @@ pub fn build_done_token(row_count: u64) -> BytesMut {
     token_data.put_u64_le(row_count);
 
     token_data
+}
+
+/// Build a DONE token
+pub fn build_done_token(row_count: u64) -> BytesMut {
+    build_done_token_with_status(0x0000, row_count) // DONE_FINAL
+}
+
+/// Build the full packet answering an `Attention` (0x06) request: a DONE
+/// token carrying the DONE_ATTN flag (0x0020), matching real SQL Server's
+/// acknowledgment that it stopped processing the cancelled request.
+pub fn build_attention_ack_packet() -> BytesMut {
+    let response = build_done_token_with_status(0x0020, 0); // DONE_ATTN
+    wrap_in_packet(PacketType::TabularResult, response)
 }
 
 /// Transaction Manager request types (MS-TDS SQLTransactionManagerRequest).
@@ -856,9 +872,54 @@ pub fn build_leading_error_tokens(error: &crate::query_response::LeadingError) -
     buf
 }
 
+/// Build a raw ERROR token (0xAA) followed by a DONE token carrying only the
+/// ERROR flag. Models a statement that fails outright — no MORE flag, no
+/// further result set — e.g. SQL Server error 1222 on a lock-timed-out
+/// `SELECT`. The returned bytes are raw tokens (no packet wrapper).
+pub fn build_terminal_error_tokens(error: &crate::query_response::TerminalError) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    buf.put_u8(TokenType::Error as u8);
+    let length_pos = buf.len();
+    buf.put_u16_le(0); // placeholder for token length
+
+    buf.put_u32_le(error.number);
+    buf.put_u8(1); // state
+    buf.put_u8(error.severity);
+
+    let message_utf16: Vec<u16> = error.message.encode_utf16().collect();
+    buf.put_u16_le(message_utf16.len() as u16);
+    for ch in message_utf16 {
+        buf.put_u16_le(ch);
+    }
+
+    buf.put_u8(0); // server name (empty)
+    buf.put_u8(0); // procedure name (empty)
+    buf.put_u32_le(1); // line number
+
+    let token_length = (buf.len() - length_pos - 2) as u16;
+    let mut length_bytes = &mut buf[length_pos..length_pos + 2];
+    length_bytes.put_u16_le(token_length);
+
+    // DONE with DONE_ERROR (0x02) only: the batch ends here, no MORE.
+    buf.put_u8(TokenType::Done as u8);
+    buf.put_u16_le(0x0002);
+    buf.put_u16_le(0x00C1); // CurCmd: SELECT
+    buf.put_u64_le(0); // row count
+
+    buf
+}
+
 /// Build a query result from a QueryResponse
 pub fn build_query_result(response: &crate::query_response::QueryResponse) -> BytesMut {
     let mut result = BytesMut::new();
+
+    // A terminal error replaces the result set entirely: no ColMetadata, no
+    // rows, no trailing DONE — the error's own DONE ends the batch.
+    if let Some(terminal_error) = &response.terminal_error {
+        result.extend_from_slice(&build_terminal_error_tokens(terminal_error));
+        return wrap_in_packet(PacketType::TabularResult, result);
+    }
 
     // A statement-scoped error preceding the result set: emit the ERROR token
     // and its DONE (MORE) before the ColMetadata so the row set still streams.

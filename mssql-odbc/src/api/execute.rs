@@ -6,14 +6,16 @@
 
 use tracing::{debug, error};
 
+use std::time::Instant;
+
 use mssql_tds::connection::tds_client::{
     ExecuteOptions, StatementId, StatementResult, StreamedParamStatus,
 };
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, fail_with_tds, finish_execute,
-    park_dae_client,
+    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
+    finish_execute, park_dae_client, query_timeout_expired_error,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -59,6 +61,9 @@ struct Execution {
     /// A prepared statement's still-live handle, superseded by a prior rebind /
     /// re-prepare, dropped by piggyback on this execute.
     orphaned: Option<StatementId>,
+    /// `SQL_ATTR_QUERY_TIMEOUT` in effect for this statement, in seconds; `0`
+    /// means no timeout.
+    query_timeout: u32,
 }
 
 /// Values gathered when at least one bound parameter carries a data-at-execution
@@ -71,6 +76,9 @@ struct DaeExecution {
     dae_params: Vec<DaeParam>,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
+    /// `SQL_ATTR_QUERY_TIMEOUT` in effect for this statement, in seconds; `0`
+    /// means no timeout.
+    query_timeout: u32,
 }
 
 enum ExecutionStaging {
@@ -91,6 +99,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             named_params,
             mut prepared,
             mut orphaned,
+            query_timeout,
         }) => {
             let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
                 Ok(client) => client,
@@ -106,8 +115,11 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     return rc;
                 }
             };
+            let started = Instant::now();
 
-            if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
+            if let Err(e) =
+                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
+            {
                 // Nothing ran, so put the staged statement (and any pending orphan)
                 // back before reporting, exactly as the failed-claim path does.
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -117,19 +129,44 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
+            // `query_timeout` (SQL_ATTR_QUERY_TIMEOUT) bounds every wire operation
+            // this call makes, not just the final execute — matching msodbcsql's
+            // `CheckOptions`, which charges the implicit transaction begin above
+            // against the same budget the statement itself gets. The elapsed cost
+            // of that begin is deducted before `execute_prepared` runs; an
+            // already-exhausted budget fails immediately with HYT00 instead of
+            // sending the execute unbounded.
+            let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
+                Ok(remaining) => remaining,
+                Err(()) => {
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    return fail_with_tds(
+                        dbc,
+                        stmt,
+                        statement_handle,
+                        client,
+                        &query_timeout_expired_error(),
+                    );
+                }
+            };
+
             // `execute_prepared` owns the whole recovery sequence: reconnect once up
             // front (mirrors msodbcsql `GetBatchCtxOrRecover`), charge it against the
             // command timeout, then reuse the cached handle or transparently re-prepare
             // when it belongs to a superseded session (msodbcsql `FIsReprepareRequired`).
             // A still-live orphaned handle is released by piggyback on the re-prepare.
             //
-            // Command timeout (SQL_ATTR_QUERY_TIMEOUT) isn't wired up yet; the default
-            // `ExecuteOptions` means no per-command limit.
+            // `query_timeout` (already deducted above) bounds the whole call,
+            // including any reconnect charged above; `0` means unlimited, matching
+            // the ODBC default.
             let exec_result = dbc.runtime.block_on(client.execute_prepared(
                 &mut prepared.stmt,
                 named_params,
                 &mut orphaned,
-                ExecuteOptions::default(),
+                ExecuteOptions::new().timeout_secs(query_timeout),
             ));
 
             // Write the statement back along with any orphan that was not consumed
@@ -169,6 +206,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             dae_params,
             mut prepared,
             mut orphaned,
+            query_timeout,
         }) => {
             let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
                 Ok(client) => client,
@@ -182,14 +220,37 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     return rc;
                 }
             };
+            let started = Instant::now();
 
-            if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecute") {
+            if let Err(e) =
+                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
+            {
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.prepared = Some(prepared);
                     stmt_state.pending_unprepare = orphaned;
                 }
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
+
+            // See the non-streaming arm above: the implicit transaction begin is
+            // charged against the same `SQL_ATTR_QUERY_TIMEOUT` budget as the
+            // streamed execute that follows.
+            let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
+                Ok(remaining) => remaining,
+                Err(()) => {
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    return fail_with_tds(
+                        dbc,
+                        stmt,
+                        statement_handle,
+                        client,
+                        &query_timeout_expired_error(),
+                    );
+                }
+            };
 
             // Data-at-execution keeps the prepared path: `begin_execute_prepared`
             // streams the values into the same `sp_execute` / `sp_prepexec` RPC a
@@ -203,7 +264,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 &mut prepared.stmt,
                 params,
                 &mut orphaned,
-                ExecuteOptions::default(),
+                ExecuteOptions::new().timeout_secs(query_timeout),
             ));
 
             match begin_result {
@@ -303,6 +364,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         .take()
         .expect("prepared checked non-None above");
     let orphaned = stmt_state.pending_unprepare.take();
+    let query_timeout = stmt_state.query_timeout;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.column_metadata.clear();
     stmt_state.reset_row_stream();
@@ -315,6 +377,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             named_params: params,
             prepared,
             orphaned,
+            query_timeout,
         }))
     } else {
         Ok(ExecutionStaging::NeedData(DaeExecution {
@@ -322,6 +385,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             dae_params,
             prepared,
             orphaned,
+            query_timeout,
         }))
     }
 }
@@ -502,6 +566,107 @@ mod tests {
         assert_eq!(exec_orphaned, None);
         assert_eq!(exec_prepared_sql, "SELECT 1");
         assert!(stmt.inner.lock().unwrap().prepared.is_none());
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` (`StmtState::query_timeout`) must be captured
+    /// during staging so the execute call can bound the wait for a response —
+    /// see mssql-rs#439: a statement blocked server-side has no client-side
+    /// escape hatch when the timeout is silently dropped on the floor.
+    #[test]
+    fn stage_execution_captures_configured_query_timeout() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = 42;
+
+        let staging = stage_execution(stmt).expect("staging should succeed");
+        let query_timeout = match staging {
+            ExecutionStaging::Ready(e) => e.query_timeout,
+            ExecutionStaging::NeedData(e) => e.query_timeout,
+        };
+        assert_eq!(query_timeout, 42);
+    }
+
+    /// The ODBC default (`0`, "no timeout") must still stage as `0`, which
+    /// `ExecuteOptions::timeout_secs` treats as unlimited — the common case
+    /// must stay behaviorally unchanged by wiring the timeout through.
+    #[test]
+    fn stage_execution_default_query_timeout_is_zero() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT 1");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let staging = stage_execution(stmt).expect("staging should succeed");
+        let query_timeout = match staging {
+            ExecutionStaging::Ready(e) => e.query_timeout,
+            ExecutionStaging::NeedData(e) => e.query_timeout,
+        };
+        assert_eq!(query_timeout, 0);
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,
+    /// not just reach `ExecuteOptions` — see mssql-rs#439, where the timeout
+    /// was silently dropped on the floor instead of bounding a statement
+    /// blocked server-side (e.g. behind another session's row lock).
+    ///
+    /// Drives the real `SQLExecute` code path (`stage_execution`,
+    /// `begin_transaction_if_manual`, the elapsed-time deduction, and
+    /// `execute_prepared`'s `sp_prepexec` RPC) against a real `TdsClient`
+    /// connected to a mock TDS server that holds its response for
+    /// `RESPONSE_DELAY` — far longer than the statement's configured timeout.
+    /// Reverting the timeout wiring back to `ExecuteOptions::default()` would
+    /// make this test take the full `RESPONSE_DELAY` and return
+    /// `SQL_SUCCESS`/`1222` instead of the prompt `HYT00` asserted here, so it
+    /// fails if the plumbing regresses.
+    #[test]
+    fn execute_query_timeout_bounds_a_longer_server_delay() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+        // All-uppercase: `get_by_contained_utf16_text` compares against the
+        // registry's case-insensitive (upper-cased) key.
+        const SELECT_SQL: &str = "SELECT * FROM T WHERE ID = 1";
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let _mock_server = crate::test_support::connect_mock_server(
+            dbc,
+            SELECT_SQL,
+            QueryResponse::error_only(TerminalError::new(
+                1222,
+                16,
+                "Lock request time out period exceeded.",
+            ))
+            .with_delay(RESPONSE_DELAY),
+        );
+
+        set_prepared(h.stmt, SELECT_SQL);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = unsafe { sql_execute(h.stmt) };
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLExecute took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT must \
+             bound the wait well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
     }
 
     #[test]

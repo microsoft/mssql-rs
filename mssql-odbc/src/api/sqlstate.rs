@@ -59,6 +59,10 @@ pub(crate) const SQLSTATE_HY110: [u8; 5] = *b"HY110";
 // msodbcsql spells this IDS_S1_113; its `S1` prefix is the ODBC 2.x form of
 // `HY` (IDS_S1_C00 is HYC00), so the 3.x state is HY113.
 pub(crate) const SQLSTATE_HY113: [u8; 5] = *b"HY113";
+/// Timeout expired — `SQL_ATTR_QUERY_TIMEOUT` (or `SQL_ATTR_CONNECTION_TIMEOUT`)
+/// elapsed before the driver got a response. Distinct from `HY000` so an
+/// application can tell "my deadline passed" from "something else broke".
+pub(crate) const SQLSTATE_HYT00: [u8; 5] = *b"HYT00";
 
 // Driver-raised diagnostics: a fixed SQLSTATE paired with its canonical
 // message text. Bundling the two means a call site posts one value and can't
@@ -601,8 +605,14 @@ pub(crate) fn post_tds_error(state: &mut impl HasDiagnostics, err: &TdsError, de
     // statement that happened to carry the bit: `TdsClient` has already marked
     // the connection dead, so every call site must report it as a communication
     // failure regardless of the SQLSTATE its own context would suggest.
+    //
+    // A client-side deadline (`SQL_ATTR_QUERY_TIMEOUT` / `SQL_ATTR_CONNECTION_TIMEOUT`)
+    // elapsing is likewise independent of the caller's context: ODBC reserves
+    // `HYT00` specifically so an application can distinguish "my deadline
+    // passed" from a generic failure, matching msodbcsql.
     let sqlstate = match err {
         TdsError::ConnectionResetNotAcknowledged => SQLSTATE_08S01,
+        TdsError::TimeoutError(_) => SQLSTATE_HYT00,
         _ => default,
     };
     post_sql_error(state, sqlstate, 0, err.to_string());
@@ -852,6 +862,21 @@ mod tests {
         post_tds_error(&mut s, &err, SQLSTATE_HY000);
         assert_eq!(s.records.len(), 1);
         assert_eq!(s.records[0].sql_state, SQLSTATE_HY000);
+        assert_eq!(s.records[0].native_error, 0);
+    }
+
+    /// A client-side deadline elapsing (`SQL_ATTR_QUERY_TIMEOUT` /
+    /// `SQL_ATTR_CONNECTION_TIMEOUT`) must report `HYT00` regardless of the
+    /// caller's `default`, matching msodbcsql — see mssql-rs#439.
+    #[test]
+    fn post_tds_error_timeout_maps_to_hyt00_regardless_of_default() {
+        use mssql_tds::error::TimeoutErrorType;
+
+        let mut s = FakeState::default();
+        let err = TdsError::TimeoutError(TimeoutErrorType::String("deadline exceeded".into()));
+        post_tds_error(&mut s, &err, SQLSTATE_HY000);
+        assert_eq!(s.records.len(), 1);
+        assert_eq!(s.records[0].sql_state, SQLSTATE_HYT00);
         assert_eq!(s.records[0].native_error, 0);
     }
 
