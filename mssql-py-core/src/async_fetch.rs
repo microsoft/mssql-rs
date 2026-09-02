@@ -650,7 +650,10 @@ mod tests {
 
     use mssql_tds::error::Error;
 
-    use super::{FetchGuard, map_fetch_error, map_nextset_error};
+    use super::{
+        FetchGuard, MaterializationGuard, map_fetch_error, map_materialization_join_error,
+        map_nextset_error,
+    };
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
 
     fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64) {
@@ -714,5 +717,29 @@ mod tests {
         assert!(error.to_string().contains(
             "PyAsyncCursor.nextset failed while advancing results: Protocol Error: invalid result token"
         ));
+    }
+
+    #[test]
+    fn dropping_interrupted_materialization_guard_is_safe() {
+        drop(MaterializationGuard::new("fetchall", None));
+    }
+
+    #[tokio::test]
+    async fn maps_materialization_task_panic_to_python_runtime_error() {
+        let join_error = tokio::task::spawn_blocking(|| panic!("materialization failed"))
+            .await
+            .unwrap_err();
+
+        let error = map_materialization_join_error(join_error);
+
+        pyo3::Python::attach(|py| {
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+        });
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to materialize fetched rows: task")
+        );
+        assert!(error.to_string().contains("materialization failed"));
     }
 }

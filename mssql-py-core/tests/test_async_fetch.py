@@ -25,6 +25,19 @@ class RecordingLogger:
         self.events.append((level, message, module_name))
 
 
+class BlockingDecimalFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, entered, release):
+        self.entered = entered
+        self.release = release
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != "decimal":
+            return None
+        self.entered.set()
+        self.release.wait()
+        return importlib.machinery.PathFinder.find_spec(fullname, path, target)
+
+
 async def connect(client_context, python_logger=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
@@ -902,18 +915,6 @@ def test_nextset_logs_result_transitions(client_context):
 def test_nextset_cancellation_during_description_materialization_does_not_publish_rows(
     client_context,
 ):
-    class BlockingDecimalFinder(importlib.abc.MetaPathFinder):
-        def __init__(self, entered, release):
-            self.entered = entered
-            self.release = release
-
-        def find_spec(self, fullname, path, target=None):
-            if fullname != "decimal":
-                return None
-            self.entered.set()
-            self.release.wait()
-            return importlib.machinery.PathFinder.find_spec(fullname, path, target)
-
     async def run():
         conn = await connect(client_context)
         entered = threading.Event()
@@ -965,6 +966,67 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
                 sys.meta_path.remove(finder)
             await asyncio.to_thread(__import__, "decimal")
             sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusable(
+    client_context,
+):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        entered = threading.Event()
+        release = threading.Event()
+        finder = BlockingDecimalFinder(entered, release)
+        decimal_module = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT CAST(1 AS decimal(10, 2)) AS value", use_prepare=False
+            )
+            decimal_module = sys.modules.pop("decimal")
+            sys.meta_path.insert(0, finder)
+            logger.events.clear()
+
+            task = asyncio.ensure_future(cursor.fetchall())
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Row materialization did not start")
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            for _ in range(100):
+                if any(
+                    level == 30
+                    and message
+                    == "PyAsyncCursor::fetchall: interrupted during row materialization; connection remains usable"
+                    and module == "async_fetch.rs"
+                    for level, message, module in logger.events
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"Missing materialization warning: {logger.events}")
+
+            release.set()
+            await asyncio.to_thread(__import__, "decimal")
+            probe = conn.cursor()
+            await probe.execute("SELECT 2", use_prepare=False)
+            assert await probe.fetchone() == (2,)
+        finally:
+            release.set()
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            await asyncio.to_thread(__import__, "decimal")
+            if decimal_module is not None:
+                sys.modules["decimal"] = decimal_module
             await conn.close()
 
     asyncio.run(run())

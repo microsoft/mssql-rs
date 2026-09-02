@@ -78,7 +78,28 @@ def test_description_type_size_precision_scale_and_nullability(client_context):
             cursor = conn.cursor()
             await cursor.execute(
                 """
+                CREATE TABLE #fixed_metadata (
+                    fixed_tinyint_value tinyint NOT NULL,
+                    fixed_smallint_value smallint NOT NULL,
+                    fixed_bigint_value bigint NOT NULL,
+                    fixed_real_value real NOT NULL,
+                    fixed_float_value float NOT NULL,
+                    fixed_datetime_value datetime NOT NULL,
+                    fixed_smalldatetime_value smalldatetime NOT NULL
+                )
+                """,
+                use_prepare=False,
+            )
+            await cursor.execute(
+                """
                 SELECT
+                    fixed_tinyint_value,
+                    fixed_smallint_value,
+                    fixed_bigint_value,
+                    fixed_real_value,
+                    fixed_float_value,
+                    fixed_datetime_value,
+                    fixed_smalldatetime_value,
                     CAST(NULL AS bit) AS bit_value,
                     CAST(NULL AS tinyint) AS tinyint_value,
                     CAST(NULL AS smallint) AS smallint_value,
@@ -101,6 +122,7 @@ def test_description_type_size_precision_scale_and_nullability(client_context):
                     CAST(NULL AS datetimeoffset(6)) AS offset_value,
                     CAST(NULL AS uniqueidentifier) AS guid_value,
                     CAST(NULL AS xml) AS xml_value
+                FROM #fixed_metadata
                 """,
                 use_prepare=False,
             )
@@ -108,6 +130,13 @@ def test_description_type_size_precision_scale_and_nullability(client_context):
             description = cursor.description
             assert description is not None
             assert [column[1] for column in description] == [
+                int,
+                int,
+                int,
+                float,
+                float,
+                datetime.datetime,
+                datetime.datetime,
                 bool,
                 int,
                 int,
@@ -133,6 +162,13 @@ def test_description_type_size_precision_scale_and_nullability(client_context):
             ]
             assert all(inspect.isclass(column[1]) for column in description)
             assert [column[3:] for column in description] == [
+                (3, 3, 0, False),
+                (5, 5, 0, False),
+                (19, 19, 0, False),
+                (7, 7, 0, False),
+                (15, 15, 0, False),
+                (23, 23, 3, False),
+                (16, 16, 0, False),
                 (1, 1, 0, True),
                 (3, 3, 0, True),
                 (5, 5, 0, True),
@@ -166,8 +202,17 @@ def test_description_type_size_precision_scale_and_nullability(client_context):
 def test_description_vector_type_and_scale_match_fetched_value(client_context):
     async def run():
         conn = await connect(client_context)
+        database = f"pycore_vector_{uuid.uuid4().hex}"
+        cursor = conn.cursor()
+        database_created = False
         try:
-            cursor = conn.cursor()
+            await cursor.execute(f"CREATE DATABASE [{database}]", use_prepare=False)
+            database_created = True
+            await cursor.execute(f"USE [{database}]", use_prepare=False)
+            await cursor.execute(
+                "ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON",
+                use_prepare=False,
+            )
             await cursor.execute(
                 "SELECT "
                 "CAST('[1,2,3]' AS vector(3)) AS float32_vector, "
@@ -184,6 +229,11 @@ def test_description_vector_type_and_scale_match_fetched_value(client_context):
             assert row[0] == pytest.approx([1.0, 2.0, 3.0])
             assert isinstance(row[1], str)
         finally:
+            if database_created:
+                await cursor.execute("USE [master]", use_prepare=False)
+                await cursor.execute(
+                    f"DROP DATABASE [{database}]", use_prepare=False
+                )
             await conn.close()
 
     asyncio.run(run())
