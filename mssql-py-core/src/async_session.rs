@@ -290,7 +290,7 @@ impl AsyncConnectionState {
     pub(crate) fn finish_fetch(
         &self,
         operation_id: OperationId,
-        has_row: bool,
+        result_set_exhausted: bool,
         has_open_batch: bool,
     ) {
         let mut state = self.lock();
@@ -301,7 +301,7 @@ impl AsyncConnectionState {
             return;
         }
 
-        if has_row || has_open_batch {
+        if !result_set_exhausted || has_open_batch {
             active.phase = OperationPhase::Fetching;
         } else {
             state.active_operation = None;
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(state.claim_fetch(2).unwrap_err(), ClaimError::Busy);
         assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
 
-        state.finish_fetch(fetch.operation_id, true, true);
+        state.finish_fetch(fetch.operation_id, false, true);
         assert_eq!(
             state.lock().active_operation.as_ref().unwrap().phase,
             OperationPhase::Fetching
@@ -465,11 +465,11 @@ mod tests {
         state.finish_execute(execute.operation_id, true);
 
         let current_result_end = state.claim_fetch(1).unwrap();
-        state.finish_fetch(current_result_end.operation_id, false, true);
+        state.finish_fetch(current_result_end.operation_id, true, true);
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
 
         let batch_end = state.claim_fetch(1).unwrap();
-        state.finish_fetch(batch_end.operation_id, false, false);
+        state.finish_fetch(batch_end.operation_id, true, false);
         assert!(state.claim_execute(2).is_ok());
     }
 
