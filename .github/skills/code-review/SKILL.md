@@ -22,8 +22,8 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    is worth it when you can: it catches a PR that drifts from what its work item
    asked, or one still open against a closed item. Attempt the lookup before treating
    it as out of reach — on an already-authenticated host, the Azure DevOps MCP server
-   answers `wit_work_item` without an interactive prompt. See step 6 for what to do
-   when a call actually fails, and for unattended runs.
+   answers `wit_work_item` without an interactive prompt (verified 2026-09-02). See
+   step 6 for what to do when a call actually fails, and for unattended runs.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -385,11 +385,11 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
   "I could not check X" only after invoking the thing and recording what happened —
   quote the response when one comes back, or state that none did (a timeout after a
   bounded wait, a hard error) when it doesn't; a silent hang is itself an outcome, not
-  an excuse to skip the record. Three of the four caveats closing one recent review —
-  no ADO access, no Windows host, Linux-only mutation scope — did not survive being
-  tested. Keep two categories apart: *the environment cannot do this* needs a failed
-  invocation, while *the defect is inherently untestable* (process teardown, a TOCTOU
-  window) needs only an argument and stays valid.
+  an excuse to skip the record. Three of the four caveats closing one review
+  (2026-09-02, AB#47807) — no ADO access, no Windows host, Linux-only mutation scope —
+  did not survive being tested. Keep two categories apart: *the environment cannot do
+  this* needs a failed invocation, while *the defect is inherently untestable* (process
+  teardown, a TOCTOU window) needs only an argument and stays valid.
 - If a change is correct, don't invent problems. An empty severity group means "none
   found" — say so briefly.
 - Reviewing is not merging. The PR author owns the merge — never merge someone
