@@ -4655,4 +4655,44 @@ mod tests {
         assert!(dbc.inner.lock().unwrap().client.is_some());
         assert!(!stmt_handle.inner.lock().unwrap().result_set_exhausted);
     }
+
+    #[test]
+    fn deferred_plp_prefetch_error_surfaces_on_next_get_data_call() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        // Recreate the state left after one call returns its current chunk while
+        // the read-ahead for the following chunk fails.
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.set_prefetch_error(mssql_tds::error::Error::Io(std::io::Error::other(
+            "deferred PLP prefetch failure",
+        )));
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.column_metadata = int_columns(1);
+            state.row_positioned = true;
+            state.active_plp = Some(stream);
+        }
+        let mut output = [0_u8; 8];
+        let mut indicator = 0;
+
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_CHAR,
+                output.as_mut_ptr().cast(),
+                SqlLen::try_from(output.len()).unwrap(),
+                &mut indicator,
+            )
+        };
+        assert_eq!(rc, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert!(!state.has_state(STMT_STATE_CURSOR_OPEN));
+        let diagnostic = state.diag_records.last().unwrap();
+        assert!(
+            diagnostic.message.contains("deferred PLP prefetch failure"),
+            "{diagnostic:?}"
+        );
+    }
 }

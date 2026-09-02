@@ -1112,6 +1112,12 @@ impl NetworkTransport {
         self.tds_read_buffer.pending_bytes_offset = base_offset;
     }
 
+    /// Non-blocking probe for a complete TDS packet.
+    ///
+    /// A no-op waker makes `Poll::Pending` terminal for this probe, so callers
+    /// must treat `Ok(None)` as "not ready" and ultimately fall back to
+    /// `get_new_tds_packet`, which registers a real waker. The `&mut self`
+    /// receiver prevents this poll from replacing a parked async reader's waker.
     fn try_get_new_tds_packet(&mut self) -> TdsResult<Option<usize>> {
         let base_offset = self.tds_read_buffer.buffer_length;
         let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
