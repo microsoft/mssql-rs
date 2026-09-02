@@ -78,9 +78,10 @@ authoritative parity reference for this crate. Its source lives in the
     Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
   - `SQL_C_DEFAULT` resolves the wide character SQL types to `SQL_C_WCHAR`, and
     `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
-    Applies to both directions: `SQLBindParameter` resolves at bind time, and
-    `SQLFetchScroll` resolves a bound column per fetch from the IRD, through the
-    same `type_rules::resolve_default_c_type`.
+    Applies to every direction: `SQLBindParameter` resolves at bind time,
+    `SQLFetchScroll` resolves a bound column per fetch from the IRD, and
+    `SQLGetData` resolves per call from the same column metadata, all through
+    the same `type_rules::resolve_default_c_type`.
     msodbcsql's `Sql2CDefault` reads `rgbTRANSTYPE380`
     (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which resolves both to `SQL_C_CHAR`
     — an ANSI-transfer default this driver has no equivalent for, since its
@@ -114,7 +115,12 @@ authoritative parity reference for this crate. Its source lives in the
     put 16 bytes into a 4-byte slot for a `uniqueidentifier` column, where
     msodbcsql resolves to `SQL_C_CHAR` and truncates inside `BufferLength`.
     `BufferLength` 0 is exempt — the documented idiom for a fixed-width target,
-    carrying no width claim. Whether these should instead report `01004` with a
+    carrying no width claim. `SQLGetData` refuses the same shape and does
+    **not** carry the zero exemption, because there 0 is *also* how an
+    application asks for a length without wanting a value written (the
+    `SQL_C_BINARY` probe), so honouring the C type's width would put up to 20
+    bytes into a buffer the caller declared as holding none. Whether these
+    should instead report `01004` with a
     truncated value, closer to msodbcsql, is open and untracked.
   - A `varbinary` / `image` column bound `SQL_C_DEFAULT` resolves to
     `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY`,
@@ -122,7 +128,8 @@ authoritative parity reference for this crate. Its source lives in the
     (AB#47239), so it fails per row with `HYC00`. msodbcsql resolves identically
     and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
     deferred resolution makes it reachable without the application naming the C
-    type.
+    type. `SQLGetData` answers the same way through the resolved target — it
+    serves `SQL_C_BINARY` only as the zero-length length probe (AB#47815).
   - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
     writes the client code page. msodbcsql uses the client code page -
     `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
