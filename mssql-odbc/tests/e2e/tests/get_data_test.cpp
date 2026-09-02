@@ -1877,6 +1877,15 @@ TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnIsStillUnimplemented) {
 // the streaming path too and stays stable across the continuation calls that
 // re-enter with the same column. A VARCHAR(MAX) resolves to SQL_C_CHAR in both
 // drivers, so this runs on the reference leg and compares.
+//
+// The size is for chunk count, not to force streaming: unlike a bound fetch —
+// where try_read_buffered_column materializes whatever the transport already
+// holds, so a small max column never streams — a paused row read pauses on
+// ColumnMetadata::is_plp() alone (token_stream.rs, `stop_here && meta.is_plp()`),
+// which is a property of the declared type. Every VARCHAR(MAX) therefore takes
+// this path at any size, which PlpColumnUnsupportedCTypeReturnsHyc00 above
+// demonstrates on a three-byte value: it answers HYC00 from the stream's target
+// gate rather than converting the text the way a captured value would.
 TEST_F(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks) {
     const size_t kTotal = 9000;
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000)"),
@@ -1903,9 +1912,11 @@ TEST_F(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks) {
 }
 
 // The wide half of the same streaming path: an NVARCHAR(MAX) resolves to
-// SQL_C_WCHAR and is delivered as UTF-16 across chunks. That resolution is the
-// registered deviation — msodbcsql resolves the wide types to its ANSI
-// SQL_C_CHAR — so this does not run on the reference leg.
+// SQL_C_WCHAR and is delivered as UTF-16 across chunks, which also exercises
+// the per-stream decoder that widening builds once at stream start. That
+// resolution is the registered deviation — msodbcsql resolves the wide types to
+// its ANSI SQL_C_CHAR — so this does not run on the reference leg. See the
+// preceding test for why any max column reaches the streaming path here.
 TEST_F(GetDataLiveTest, DefaultTargetStreamsAnNvarcharMaxAsWideChunks) {
     SKIP_IF_COMPARING_MSODBCSQL();
     const size_t kTotal = 9000;
