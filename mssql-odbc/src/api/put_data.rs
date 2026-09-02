@@ -230,7 +230,7 @@ unsafe fn sql_put_data_safe(
             // parameter -- the sequence ended or never had one -- so refuse
             // rather than guess.
             let Some(c_type) = stmt_state.dae_current_c_type() else {
-                error!("SQLPutData: open data-at-execution parameter has no binding");
+                error!("SQLPutData: open data-at-execution parameter has no snapshotted C type");
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                 return SQL_ERROR;
             };
