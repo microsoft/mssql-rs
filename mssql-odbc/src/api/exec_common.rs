@@ -227,15 +227,21 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// delivered, so posting now would never reach the caller. The next call
 /// that would otherwise short-circuit past the wire believing there is
 /// nothing left (`SQLFetch`'s `result_set_exhausted` fast path,
-/// `SQLMoreResults`) drains and reports it instead.
+/// `SQLMoreResults`) drains and reports it instead. A failure that does
+/// *not* end the batch (a raw transport error) is left unposted entirely:
+/// `release` is false in that case, so nothing about this statement's state
+/// changes, and the caller's very next real operation on this connection
+/// takes the normal, non-fast-path route and organically rediscovers and
+/// reports the same failure through its own existing error handling —
+/// posting it here too would attach a diagnostic to this call's own
+/// still-successful return.
 ///
 /// If an RPC row set ends on `DONEINPROC` with MORE, the TDS layer consumes
 /// only trailing RPC control tokens and parks the first non-tail token for
-/// `SQLMoreResults`. A failure while consuming that completion tail abandons
-/// the batch: timeout/cancellation has already drained through ATTENTION, and
-/// other failures retire the connection. The error is deferred to the next
-/// statement operation because this call has already committed to returning
-/// the row successfully.
+/// `SQLMoreResults`. A failure while consuming that completion tail always
+/// ends the batch — [`TdsClient::complete_current_result`] abandons whatever
+/// is left rather than stranding it — so it takes the deferred-error route
+/// above, never the unposted one.
 ///
 /// `row_delivered` tells this call whether it actually delivered data —
 /// `true` for `SQLGetData` (a column was just captured) and for a
@@ -297,7 +303,6 @@ pub(super) fn release_busy_if_row_exhausted(
         Some(Ok(done)) => *done,
         _ => !client.has_open_batch(),
     };
-    let completion_failed = matches!(&completion_result, Some(Err(_)));
     let release = result_set_exhausted && batch_done;
 
     let mut read_error = peek_result.err();
@@ -328,7 +333,7 @@ pub(super) fn release_busy_if_row_exhausted(
         }
         if let Some(e) = read_error {
             error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
-            if batch_done || completion_failed {
+            if batch_done {
                 stmt_state.pending_fetch_error = Some(e);
             }
         }
