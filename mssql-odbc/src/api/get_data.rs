@@ -44,8 +44,10 @@ use mssql_tds::query::metadata::PlpEncoding;
 /// # Safety
 /// `statement_handle` must be null or point to a live `StmtHandle`.
 /// `target_value_ptr`, when non-null, must be writable for `buffer_length`
-/// bytes, including when `target_type` is `SQL_C_WCHAR`. `strlen_or_ind_ptr`,
-/// when non-null, must be writable for one `SqlLen`.
+/// bytes for variable-width targets, including `SQL_C_WCHAR`, where the length
+/// is still measured in bytes. For a fixed-width target it must be writable for
+/// the full size of `target_type`, even when `buffer_length` is zero or smaller.
+/// `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
 pub(crate) unsafe fn sql_get_data(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,
@@ -79,8 +81,10 @@ pub(crate) unsafe fn sql_get_data(
 /// # Safety
 /// `statement_handle` must be null or point to a live `StmtHandle`.
 /// `target_value_ptr`, when non-null, must be writable for `buffer_length`
-/// bytes, including when `target_type` is `SQL_C_WCHAR`. `strlen_or_ind_ptr`,
-/// when non-null, must be writable for one `SqlLen`.
+/// bytes for variable-width targets, including `SQL_C_WCHAR`, where the length
+/// is still measured in bytes. For a fixed-width target it must be writable for
+/// the full size of `target_type`, even when `buffer_length` is zero or smaller.
+/// `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
 unsafe fn sql_get_data_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,

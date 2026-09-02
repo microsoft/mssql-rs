@@ -776,7 +776,10 @@ pub unsafe extern "C" fn SQLColAttributeW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - `target_value_ptr`, when non-null, must be writable for `buffer_length` bytes.
+/// - `target_value_ptr`, when non-null, must be writable for `buffer_length`
+///   bytes for variable-width targets. For a fixed-width target it must be
+///   writable for the full size of `target_type`, even when `buffer_length` is
+///   zero or smaller.
 /// - `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetData(
