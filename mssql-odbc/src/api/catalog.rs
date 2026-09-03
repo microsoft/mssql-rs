@@ -541,7 +541,7 @@ fn run_catalog(
         // SQLGetTypeInfo/SQLExecDirect: a later failure cannot expose stale
         // SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
-        stmt_state.column_metadata.clear();
+        stmt_state.clear_result_metadata();
         stmt_state.reset_row_stream();
         stmt_state.orphan_prepared_handle();
         stmt_state.prepared = None;
@@ -641,6 +641,7 @@ fn apply_catalog_metadata(
             col.flags &= !COLMETA_NULLABLE_FLAG;
         }
     }
+    stmt_state.refresh_metadata_caches();
     Ok(())
 }
 

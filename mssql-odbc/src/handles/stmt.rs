@@ -55,6 +55,27 @@ pub(crate) struct ActivePlpStream {
     /// having consumed nothing). Holding the surplus here lets a caller ask for
     /// one character at a time without stalling the stream.
     pub(crate) pending_units: Vec<u16>,
+    /// Wire bytes read ahead while the first async read for this value was
+    /// already in flight. Later SQLGetData calls consume these without entering
+    /// the runtime again.
+    prefetched_wire: Vec<u8>,
+    prefetched_offset: usize,
+    prefetched_total_read_before: usize,
+    prefetched_known_total: Option<u64>,
+    prefetched_reached_end: bool,
+    prefetch_error: Option<Box<TdsError>>,
+}
+
+/// Materialized values from a single-row fetch that remain available to
+/// subsequent `SQLGetData` calls.
+#[derive(Debug)]
+pub(crate) struct BufferedGetDataRow {
+    pub(crate) values: Vec<Option<ColumnValues>>,
+    pub(crate) variant_bases: Vec<Option<TdsDataType>>,
+    /// Number of leading value slots already discarded or delivered.
+    pub(crate) consumed: usize,
+    /// The TDS cursor still owns deferred columns after the captured prefix.
+    pub(crate) wire_deferred: bool,
 }
 
 impl ActivePlpStream {
@@ -73,7 +94,87 @@ impl ActivePlpStream {
             pending_high_surrogate: None,
             narrow_to_wide,
             pending_units: Vec::new(),
+            prefetched_wire: Vec::new(),
+            prefetched_offset: 0,
+            prefetched_total_read_before: 0,
+            prefetched_known_total: None,
+            prefetched_reached_end: false,
+            prefetch_error: None,
         }
+    }
+
+    /// Stores a PLP read-ahead result for delivery by later application calls.
+    ///
+    /// Only the first `read` bytes of `bytes` are retained.
+    pub(crate) fn set_prefetched_wire(
+        &mut self,
+        mut bytes: Vec<u8>,
+        read: usize,
+        total_read_before: usize,
+        known_total: Option<u64>,
+        reached_end: bool,
+    ) {
+        bytes.truncate(read);
+        self.prefetched_wire = bytes;
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = total_read_before;
+        self.prefetched_known_total = known_total;
+        self.prefetched_reached_end = reached_end;
+    }
+
+    /// Copies the next prefetched PLP bytes into `out`.
+    ///
+    /// Returns `(bytes_read, reached_end, known_total, total_read)`, where
+    /// `total_read` includes all wire payload consumed through this copy.
+    pub(crate) fn read_prefetched_wire(
+        &mut self,
+        out: &mut [u8],
+    ) -> Option<(usize, bool, Option<u64>, usize)> {
+        let remaining = self
+            .prefetched_wire
+            .len()
+            .saturating_sub(self.prefetched_offset);
+        if remaining == 0 {
+            return None;
+        }
+
+        let read = remaining.min(out.len());
+        let end = self.prefetched_offset.saturating_add(read);
+        let source = self.prefetched_wire.get(self.prefetched_offset..end)?;
+        let target = out.get_mut(..read)?;
+        target.copy_from_slice(source);
+        self.prefetched_offset = end;
+
+        let reached_end =
+            self.prefetched_reached_end && self.prefetched_offset == self.prefetched_wire.len();
+        Some((
+            read,
+            reached_end,
+            self.prefetched_known_total,
+            self.prefetched_total_read_before
+                .saturating_add(self.prefetched_offset),
+        ))
+    }
+
+    /// Clears the prefetch bookkeeping and returns its allocation for reuse.
+    pub(crate) fn take_prefetch_buffer(&mut self) -> Vec<u8> {
+        self.prefetched_offset = 0;
+        self.prefetched_total_read_before = 0;
+        self.prefetched_known_total = None;
+        self.prefetched_reached_end = false;
+        let mut buffer = std::mem::take(&mut self.prefetched_wire);
+        buffer.clear();
+        buffer
+    }
+
+    /// Defers a read-ahead failure until the application's next PLP read.
+    pub(crate) fn set_prefetch_error(&mut self, error: TdsError) {
+        self.prefetch_error = Some(Box::new(error));
+    }
+
+    /// Takes the deferred read-ahead failure for one-time delivery.
+    pub(crate) fn take_prefetch_error(&mut self) -> Option<TdsError> {
+        self.prefetch_error.take().map(|error| *error)
     }
 }
 
@@ -87,6 +188,14 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("pending_high_surrogate", &self.pending_high_surrogate)
             .field("narrow_to_wide", &self.narrow_to_wide.is_some())
             .field("pending_units", &self.pending_units.len())
+            .field(
+                "prefetched_wire_remaining",
+                &self
+                    .prefetched_wire
+                    .len()
+                    .saturating_sub(self.prefetched_offset),
+            )
+            .field("prefetch_error", &self.prefetch_error.is_some())
             .finish()
     }
 }
@@ -223,6 +332,11 @@ pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
+    /// UTF-16 column names built once when result metadata changes.
+    pub(crate) column_names_utf16: Vec<Vec<u16>>,
+    /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
+    /// fresh carry buffer.
+    pub(crate) plp_prefetch_scratch: Vec<u8>,
     /// Set once a fetch has confirmed — possibly by peeking one token past
     /// the row it just delivered — that no further rows exist for the
     /// current cursor. Distinct from `STMT_STATE_CURSOR_OPEN`, which stays
@@ -309,6 +423,10 @@ pub(crate) struct StmtState {
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
     pub(crate) last_captured: Option<(usize, ColumnValues)>,
+    /// Complete non-PLP row captured by SQLFetch for subsequent SQLGetData calls.
+    pub(crate) buffered_get_data_row: Option<BufferedGetDataRow>,
+    /// Emptied row storage retained across fetches to avoid per-row allocations.
+    pub(crate) spare_get_data_row: Option<BufferedGetDataRow>,
     /// Base type of `last_captured` when that column is `sql_variant`, with its
     /// 1-based column index. Set per value, since a variant column can hold a
     /// different type in every row.
@@ -329,6 +447,8 @@ pub(crate) struct StmtState {
     /// the column is being read as (bytes for `SQL_C_CHAR`, UTF-16 code units
     /// for `SQL_C_WCHAR`); a single column's chunk loop uses one target type.
     pub(crate) partial_text_offset: Option<(usize, usize)>,
+    /// Direct string path already validated for `(1-based column, C target type)`.
+    pub(crate) direct_text_target: Option<(usize, SqlSmallInt)>,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -898,8 +1018,25 @@ impl StmtState {
     /// command ordinal restarts rather than climbing across executions.
     pub(crate) fn begin_result_set(&mut self, metadata: Vec<ColumnMetadata>) {
         self.column_metadata = metadata;
+        self.refresh_metadata_caches();
         self.rows_returned = 0;
         self.current_command += 1;
+    }
+
+    /// Rebuilds result-set data derived from `column_metadata`.
+    pub(crate) fn refresh_metadata_caches(&mut self) {
+        self.column_names_utf16.clear();
+        self.column_names_utf16.extend(
+            self.column_metadata
+                .iter()
+                .map(|column| column.column_name.encode_utf16().collect()),
+        );
+    }
+
+    /// Clears result metadata and every cache derived from it.
+    pub(crate) fn clear_result_metadata(&mut self) {
+        self.column_metadata.clear();
+        self.column_names_utf16.clear();
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -926,11 +1063,13 @@ impl StmtState {
     pub(crate) fn reset_row_stream(&mut self) {
         self.row_positioned = false;
         self.last_captured = None;
+        self.buffered_get_data_row = None;
         self.last_variant_base = None;
         self.row_exhausted = false;
         self.active_plp = None;
         self.current_row_last_col = 0;
         self.partial_text_offset = None;
+        self.direct_text_target = None;
     }
 
     /// Positions the row stream on a freshly fetched row: clears all per-row
@@ -1063,6 +1202,8 @@ impl StmtHandle {
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
+                column_names_utf16: Vec::new(),
+                plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
                 pending_fetch_error: None,
@@ -1073,11 +1214,14 @@ impl StmtHandle {
                 pending_unprepare: None,
                 row_positioned: false,
                 last_captured: None,
+                buffered_get_data_row: None,
+                spare_get_data_row: None,
                 last_variant_base: None,
                 row_exhausted: false,
                 active_plp: None,
                 current_row_last_col: 0,
                 partial_text_offset: None,
+                direct_text_target: None,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,
@@ -1139,6 +1283,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
     use crate::handles::desc::{DescHeader, DescKind};
+    use mssql_tds::test_client_support::int_columns;
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {
@@ -1161,6 +1306,12 @@ mod tests {
             header: DescHeader::default(),
             records: Vec::new(),
         };
+        f(&mut state);
+    }
+
+    fn with_state(f: impl FnOnce(&mut StmtState)) {
+        let handle = StmtHandle::new(std::ptr::null_mut(), 0);
+        let mut state = handle.inner.lock().unwrap();
         f(&mut state);
     }
 
@@ -1260,5 +1411,96 @@ mod tests {
         });
         let handle = StmtHandle::new(std::ptr::null_mut(), 0);
         assert!(handle.inner.lock().unwrap().row_bind_offset_ptr.is_null());
+    }
+
+    #[test]
+    fn beginning_a_row_discards_the_previous_buffered_get_data_row() {
+        with_state(|s| {
+            s.buffered_get_data_row = Some(BufferedGetDataRow {
+                values: vec![Some(ColumnValues::Int(1))],
+                variant_bases: vec![Some(TdsDataType::Int4)],
+                consumed: 0,
+                wire_deferred: false,
+            });
+
+            s.begin_row();
+
+            assert!(s.row_positioned);
+            assert!(s.buffered_get_data_row.is_none());
+        });
+    }
+
+    #[test]
+    fn beginning_result_set_caches_utf16_column_names() {
+        with_state(|s| {
+            let mut metadata = int_columns(2);
+            metadata[0].column_name = "alpha".to_string();
+            metadata[1].column_name = "beta\u{1f642}".to_string();
+
+            s.begin_result_set(metadata);
+
+            assert_eq!(
+                s.column_names_utf16,
+                vec![
+                    "alpha".encode_utf16().collect::<Vec<_>>(),
+                    "beta\u{1f642}".encode_utf16().collect::<Vec<_>>(),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn clearing_result_metadata_clears_cached_column_names() {
+        with_state(|s| {
+            let mut metadata = int_columns(1);
+            metadata[0].column_name = "value".to_string();
+            s.begin_result_set(metadata);
+
+            s.clear_result_metadata();
+
+            assert!(s.column_metadata.is_empty());
+            assert!(s.column_names_utf16.is_empty());
+        });
+    }
+
+    #[test]
+    fn prefetched_plp_wire_spans_application_calls() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.set_prefetched_wire(vec![1, 2, 3, 4, 5, 6], 6, 8, Some(14), true);
+
+        let mut first = [0; 2];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut first),
+            Some((2, false, Some(14), 10))
+        );
+        assert_eq!(first, [1, 2]);
+
+        let mut second = [0; 8];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut second),
+            Some((4, true, Some(14), 14))
+        );
+        assert_eq!(&second[..4], &[3, 4, 5, 6]);
+        assert_eq!(stream.read_prefetched_wire(&mut second), None);
+    }
+
+    #[test]
+    fn prefetched_plp_wire_preserves_unknown_length_and_incomplete_tail() {
+        let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.set_prefetched_wire(vec![7, 8, 9], 2, 5, None, false);
+
+        let mut probe = [];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut probe),
+            Some((0, false, None, 5))
+        );
+
+        let mut output = [0; 4];
+        assert_eq!(
+            stream.read_prefetched_wire(&mut output),
+            Some((2, false, None, 7))
+        );
+        assert_eq!(&output[..2], &[7, 8]);
+        assert_eq!(stream.read_prefetched_wire(&mut output), None);
     }
 }
