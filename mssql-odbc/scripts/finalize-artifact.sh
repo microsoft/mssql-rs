@@ -10,7 +10,7 @@ case "$PROFILE" in
     *) echo "Usage: $0 [debug|release] [target-triple]" >&2; exit 2 ;;
 esac
 # Optional cross-compile target triple (e.g. x86_64-apple-darwin), for building
-# a single macOS architecture slice on an Apple Silicon host. Empty = native
+# a single macOS architecture slice via `cargo build --target`. Empty = native
 # build, artifact lives directly under $TARGET_DIR/$PROFILE (existing behavior).
 TARGET_TRIPLE="${2:-}"
 

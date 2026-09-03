@@ -43,7 +43,10 @@ steps:
       # same relative layout (build/<driver file>) across every platform.
       $dropDir = "$(Build.SourcesDirectory)\odbc-drop\build"
       New-Item -ItemType Directory -Force -Path $dropDir | Out-Null
-      Copy-Item "$(CARGO_TARGET_DIR)\release\mssqlodbc.dll" $dropDir
+      # Resolve the cargo cdylib via the finalize script (validates existence
+      # with a clear error) rather than assuming a fixed CARGO_TARGET_DIR layout.
+      $driver = & "$(Build.SourcesDirectory)/mssql-odbc/scripts/finalize-artifact.ps1" -BuildProfile release
+      Copy-Item $driver $dropDir
     displayName: 'Stage driver into drop (${{ parameters.architecture }})'
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 

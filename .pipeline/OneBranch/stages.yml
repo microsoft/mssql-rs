@@ -99,10 +99,11 @@ stages:
           signDriver: ${{ parameters.isOfficial }}
       - task: CopyFiles@2
         displayName: 'Collect ODBC native driver (Windows x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
         inputs:
           sourceFolder: '$(Build.SourcesDirectory)\odbc-drop'
           targetFolder: '$(ob_outputDirectory)\odbc_windows_x64'
-          contents: '**'
+          contents: 'build/mssqlodbc.dll'
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Windows x64 Artifacts'
       inputs:
@@ -168,10 +169,11 @@ stages:
             signDriver: ${{ parameters.isOfficial }}
         - task: CopyFiles@2
           displayName: 'Collect ODBC native driver (Windows ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
           inputs:
             sourceFolder: '$(Build.SourcesDirectory)\odbc-drop'
             targetFolder: '$(ob_outputDirectory)\odbc_windows_arm64'
-            contents: '**'
+            contents: 'build/mssqlodbc.dll'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Windows ARM64 Artifacts'
         inputs:
@@ -226,6 +228,7 @@ stages:
           publishArtifacts: false
       - task: CopyFiles@2
         displayName: 'Collect ODBC glibc driver (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
         inputs:
           sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
           targetFolder: '$(ob_outputDirectory)/odbc_glibc_x64'
@@ -237,6 +240,7 @@ stages:
           publishArtifacts: false
       - task: CopyFiles@2
         displayName: 'Collect ODBC musl driver (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
         inputs:
           sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
           targetFolder: '$(ob_outputDirectory)/odbc_musl_x64'
@@ -296,6 +300,7 @@ stages:
             publishArtifacts: false
         - task: CopyFiles@2
           displayName: 'Collect ODBC glibc driver (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
           inputs:
             sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
             targetFolder: '$(ob_outputDirectory)/odbc_glibc_arm64'
@@ -307,6 +312,7 @@ stages:
             publishArtifacts: false
         - task: CopyFiles@2
           displayName: 'Collect ODBC musl driver (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
           inputs:
             sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
             targetFolder: '$(ob_outputDirectory)/odbc_musl_arm64'
@@ -357,10 +363,11 @@ stages:
             publishArtifacts: false
         - task: CopyFiles@2
           displayName: 'Collect ODBC native driver (macOS x64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
           inputs:
             sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
             targetFolder: '$(ob_outputDirectory)/odbc_macos_x64'
-            contents: '**'
+            contents: 'build/mssqlodbc.dylib'
         - template: /.pipeline/templates/build-odbc-macos-template.yml
           parameters:
             architecture: ARM64
@@ -368,10 +375,11 @@ stages:
             publishArtifacts: false
         - task: CopyFiles@2
           displayName: 'Collect ODBC native driver (macOS ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
           inputs:
             sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
             targetFolder: '$(ob_outputDirectory)/odbc_macos_arm64'
-            contents: '**'
+            contents: 'build/mssqlodbc.dylib'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish macOS Artifacts'
         inputs:
@@ -485,7 +493,7 @@ stages:
 
           # Extract version from mssql-py-core/Cargo.toml
           $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
-          if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+          if ($cargoToml -match '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
             $version = $Matches[1]
           } else {
             Write-Error "Could not extract version from Cargo.toml"

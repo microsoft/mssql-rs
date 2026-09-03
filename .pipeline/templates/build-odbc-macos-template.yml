@@ -1,15 +1,12 @@
 # filepath: .pipeline/templates/build-odbc-macos-template.yml
 #
-# Cross-compile ONE mssql-odbc driver architecture slice (mssqlodbc.dylib) on
-# the shared macOS-14 (Apple Silicon) agent and publish it as a pipeline
-# artifact for the native NuGet package Publish stage.
+# Cross-compile ONE mssql-odbc driver architecture slice (mssqlodbc.dylib) via
+# `cargo build --target` and publish it as a pipeline artifact for the Publish
+# stage to inject into the macOS wheels.
 #
-# Unlike Windows/Linux, macOS has no separate per-architecture pool, so both
-# slices are built here via `cargo build --target`, one job invocation per
-# architecture. mssql-python expects two SEPARATE per-arch binaries (see its
-# sync-mssql-odbc-native-libs.py / setup_rust_odbc.py, mirroring how the
-# msodbcsql C++ driver ships libs/macos/arm64 + libs/macos/x86_64), not a
-# lipo-fused universal binary, so this deliberately does not lipo.
+# Both arch slices are built here (one job invocation per architecture) as two
+# SEPARATE per-arch binaries, not a lipo-fused universal binary, matching the
+# libs/macos/{arm64,x86_64} layout mssql-python's resolver reads for this driver.
 #
 # Driver only - no C++ gtest e2e binaries, matching build-odbc-windows-template.yml.
 #
@@ -49,6 +46,8 @@ steps:
 
   - script: |
       set -e
+      # Clean the shared drop so the ARM64 pass can't inherit x64 leftovers.
+      rm -rf "$(Build.SourcesDirectory)/odbc-drop"
       DROP_DIR="$(Build.SourcesDirectory)/odbc-drop/build"
       mkdir -p "$DROP_DIR"
       DRIVER_PATH="$(bash mssql-odbc/scripts/finalize-artifact.sh release "$(odbcTargetTriple)")"
