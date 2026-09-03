@@ -1742,22 +1742,23 @@ mod tests {
     /// A streamed parameter is only declared at a narrowed length when the
     /// bound that length implies is one `SQLPutData` can actually enforce.
     ///
-    /// The two decisions are made independently, and for a wideness-mismatched
-    /// pairing they disagree: `dae_length_limit` cannot measure a wide buffer
-    /// against a narrow declaration, while `dae_streamed_declaration` would
-    /// happily narrow it. Narrowing there would have the client declare
-    /// `varchar(10)` and then stream past it -- a bound promised to the server
-    /// and kept by nobody, since a streamed value never reaches the close-time
-    /// conversion that bounds a buffered one.
+    /// The two decisions are made independently, so nothing but this guard stops
+    /// them disagreeing. Where they would, the cost is real: a streamed value
+    /// never reaches the close-time conversion that bounds a buffered one, so a
+    /// narrowed declaration with no bound behind it has the client promise the
+    /// server a length and then stream past it.
     #[test]
     fn build_named_params_only_narrows_a_declaration_it_can_enforce() {
         for (c_type, sql_type, expect_narrowed) in [
             // Same unit on both sides: measurable, so narrowing is honoured.
             (SQL_C_CHAR, SQL_VARCHAR, true),
-            // Wide buffer, narrow declaration: not measurable, so `max` stands.
-            (crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR, false),
-            // And the mirror image.
-            (SQL_C_CHAR, crate::api::odbc_types::SQL_WVARCHAR, false),
+            // A wideness mismatch is measurable too - the unit is the
+            // declaration's and the count is of the source.
+            (crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR, true),
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_WVARCHAR, true),
+            // Cross-family is not: a binary byte is not a character, so the
+            // declaration stays `max` rather than claiming a bound.
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_VARBINARY, false),
         ] {
             let h = TestHandles::with_env_dbc_stmt();
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };

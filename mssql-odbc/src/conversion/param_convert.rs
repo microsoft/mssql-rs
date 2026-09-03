@@ -326,30 +326,26 @@ pub(crate) fn dae_length_limit(
         other => return Err(ParamBuildError::UnsupportedCType(other)),
     };
 
-    // Only a pairing whose buffer unit *is* the declaration's unit can be
-    // measured here: a narrow buffer against a wide declaration (or the
-    // reverse) counts different things on each side.
+    // A pairing can be measured here when the declaration's unit and the
+    // buffer's unit are the same thing. Within the character family they always
+    // are, whatever the wideness: `convert_character_sql` derives its limit from
+    // `sql_type` and `ColumnSize` alone and hands it to `trim_blank_overflow`,
+    // which measures the *source* in UTF-16 units -- the C type never enters
+    // into the unit. So `varchar(n)` and `nvarchar(n)` both bound n UTF-16 units
+    // of whatever buffer was bound, and a wideness mismatch is measurable on
+    // exactly the same terms as a matched pair.
     //
-    // What happens to an unmeasurable bound depends on how the value travels.
-    // A *buffered* parameter is converted whole at close, so `ColumnSize` is
-    // still applied there by `convert_character_sql`, which measures both sides
-    // in UTF-16 units. A *streamed* one never reaches that conversion, so
-    // returning `None` here leaves it genuinely unbounded -- which is why
-    // `build_named_params` declines to narrow its declaration in that case
-    // rather than promising a bound nothing enforces.
+    // Cross-*family* is the case that genuinely does not correspond: a binary
+    // byte is not a character, so its bound is left to the close-time
+    // conversion.
     //
-    // msodbcsql does bound this pairing: `ValidatePutDataLength`'s `SQL_C_WCHAR`
-    // arm (`odbc/sqlccmd.cpp:10931`) converts the chunk to the server code page
-    // precisely so it can measure the narrow length, and only `fIsVarMax`
-    // disables the check. Matching that needs the encoded length at this layer;
-    // tracked under AB#47590.
+    // The unit is an approximation of collation bytes on both paths -- msodbcsql
+    // converts to the server code page to measure exactly
+    // (`ValidatePutDataLength`, `odbc/sqlccmd.cpp:10931`), and closing that gap
+    // is AB#47584. Agreeing with the materialized path is what matters here.
     let same_unit = match c_type {
         SQL_C_BINARY => sql_family(sql_type) == Some(SqlFamily::Binary),
-        SQL_C_WCHAR => is_wide_character_sql_type(sql_type),
-        SQL_C_CHAR => {
-            sql_family(sql_type) == Some(SqlFamily::Character)
-                && !is_wide_character_sql_type(sql_type)
-        }
+        SQL_C_CHAR | SQL_C_WCHAR => sql_family(sql_type) == Some(SqlFamily::Character),
         _ => false,
     };
     if !same_unit {
@@ -1875,25 +1871,54 @@ mod tests {
         );
     }
 
-    /// A wideness-mismatched pairing cannot be measured in the buffer's own
-    /// unit, so no bound is produced. Pinned because the streamed path has no
-    /// close-time conversion to fall back on: `build_named_params` reads this
-    /// `None` as the signal to leave the declaration at `max` rather than
-    /// narrowing it to a length nothing would enforce.
+    /// A wideness mismatch inside the character family *is* measurable, because
+    /// the unit is the declaration's and the count is of the source: both
+    /// `varchar(n)` and `nvarchar(n)` bound n UTF-16 units, exactly as
+    /// `convert_character_sql` bounds them on the materialized path. Only the
+    /// buffer's own width changes how those units are counted.
     #[test]
-    fn dae_length_limit_is_absent_for_a_wideness_mismatch() {
+    fn dae_length_limit_measures_a_wideness_mismatch() {
+        // UTF-8 source against a wide declaration: counted in UTF-16 units.
+        for sql_type in [SQL_WVARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR] {
+            assert_eq!(
+                dae_length_limit(SQL_C_CHAR, sql_type, 10).unwrap(),
+                Some(DaeLengthLimit {
+                    bound: DaeBound::Utf16Units(10),
+                    pad_unit: b" ",
+                }),
+                "SQL_C_CHAR -> {sql_type} bounds 10 UTF-16 units of UTF-8"
+            );
+        }
+
+        // UTF-16 source against a narrow declaration: a unit is a fixed two
+        // bytes, so the byte bound is exact.
+        for sql_type in [SQL_VARCHAR, SQL_CHAR, SQL_LONGVARCHAR] {
+            assert_eq!(
+                dae_length_limit(SQL_C_WCHAR, sql_type, 10).unwrap(),
+                Some(DaeLengthLimit {
+                    bound: DaeBound::Bytes(20),
+                    pad_unit: &[b' ', 0],
+                }),
+                "SQL_C_WCHAR -> {sql_type} bounds 10 units as 20 buffer bytes"
+            );
+        }
+    }
+
+    /// Cross-*family* is the pairing that genuinely cannot be measured here: a
+    /// binary byte is not a character, so the two sides count different things
+    /// and the bound is left to the close-time conversion.
+    #[test]
+    fn dae_length_limit_is_absent_across_families() {
         for (c_type, sql_type) in [
-            (SQL_C_WCHAR, SQL_VARCHAR),
-            (SQL_C_WCHAR, SQL_CHAR),
-            (SQL_C_WCHAR, SQL_LONGVARCHAR),
-            (SQL_C_CHAR, SQL_WVARCHAR),
-            (SQL_C_CHAR, SQL_WCHAR),
-            (SQL_C_CHAR, SQL_WLONGVARCHAR),
+            (SQL_C_BINARY, SQL_VARCHAR),
+            (SQL_C_BINARY, SQL_WVARCHAR),
+            (SQL_C_CHAR, SQL_VARBINARY),
+            (SQL_C_WCHAR, SQL_VARBINARY),
         ] {
             assert_eq!(
                 dae_length_limit(c_type, sql_type, 10).unwrap(),
                 None,
-                "{c_type} -> {sql_type} counts different units on each side"
+                "{c_type} -> {sql_type} counts different things on each side"
             );
         }
     }

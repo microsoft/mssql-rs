@@ -1005,6 +1005,55 @@ TEST_F(CharConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
 }
 
+// A wideness-mismatched pairing is bounded on the same terms as a matched one.
+// ColumnSize names the declaration's unit and the count is of the source, so
+// nvarchar(2) bounds two UTF-16 units of the bound buffer whichever width that
+// buffer has. Both directions are covered: without the bound the client would
+// declare a length and then stream past it, since a streamed value never
+// reaches the close-time conversion that bounds a materialized one.
+TEST_F(CharConversionLiveTest, DataAtExecutionBoundsAWidenessMismatch) {
+    // Narrow buffer against a wide declaration.
+    {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+        SQLCHAR token = 0;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_WVARCHAR, 2, 0,
+                                       &token, 0, &streamed_ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+        SQLPOINTER value_ptr = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+        SQLCHAR chunk[] = {'a', 'b', 'c', 'd'};
+        EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, chunk, sizeof(chunk)));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+    }
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    // Wide buffer against a narrow declaration.
+    {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+        SQLCHAR token = 0;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 2, 0,
+                                       &token, 0, &streamed_ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+        SQLPOINTER value_ptr = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+        // Four UTF-16 units against nvarchar-equivalent room for two.
+        SQLWCHAR wide[] = {'a', 'b', 'c', 'd'};
+        EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, wide, sizeof(wide)));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+    }
+}
+
 // The other half of the rule for the character family: an overflow of blanks is
 // dropped rather than reported, so the value lands trimmed to ColumnSize. The
 // pad byte differs from the binary path -- a blank, not a zero.
