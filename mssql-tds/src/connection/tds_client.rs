@@ -36,7 +36,9 @@ use crate::{
         ColumnPolicy, ParserContext, PlpPauseState, RowHeader, RowPauseState, RowReadResult,
     },
     message::{batch::SqlBatch, messages::Request},
-    token::tokens::{ColMetadataToken, CurrentCommand, DoneStatus, EnvChangeTokenSubType, Tokens},
+    token::tokens::{
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, EnvChangeTokenSubType, Tokens,
+    },
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -425,6 +427,10 @@ pub struct TdsClient {
     /// cursor RPC response and interpreted as a [`CursorStatus`](crate::cursor::CursorStatus).
     pub(in crate::connection) last_return_status: ReturnStatus,
     pub(in crate::connection) current_result_set_has_been_read_till_end: bool,
+    /// Whether the DONE that exhausted the current row set was `DONEINPROC`.
+    /// Only that token makes MORE ambiguous between another application result
+    /// and the RPC's protocol-only completion tail.
+    current_result_ended_with_done_in_proc: bool,
 
     /// Column Encryption setting for the command currently executing. Set by
     /// each execute entry point; consulted by the parameter-encryption and
@@ -551,6 +557,7 @@ impl TdsClient {
             output_param_ceks: HashMap::new(),
             last_return_status: ReturnStatus::NotReceived,
             current_result_set_has_been_read_till_end: false,
+            current_result_ended_with_done_in_proc: false,
             current_command_ce_setting:
                 crate::connection::client_context::ExecutionColumnEncryptionSetting::default(),
             pending_capture: None,
@@ -761,6 +768,7 @@ impl TdsClient {
         // metadata.
         self.clear_session_bound_caches();
         self.current_result_set_has_been_read_till_end = false;
+        self.current_result_ended_with_done_in_proc = false;
         self.active_row_read_state = ActiveRowReadState::Idle;
         self.row_already_positioned = false;
         self.parked_token = None;
@@ -1206,22 +1214,38 @@ impl TdsClient {
             return Ok(elapsed);
         }
 
-        // Only attempt recovery when session recovery was negotiated and
-        // the server supports retry (connect_retry_count > 0).
-        if !self.recovery_context.session_recovery_negotiated {
-            return Ok(Duration::ZERO);
-        }
         let connect_retry_count = self
             .recovery_context
             .client_context
             .as_ref()
             .map_or(0, |ctx| ctx.connect_retry_count);
+
+        // A cached dead verdict is authoritative. Without this gate, callers
+        // with recovery disabled (including intentionally closed clients and
+        // clients retired after protocol desynchronization) would fall through
+        // and write another request to the unusable transport.
+        let known_dead = self.transport.connection_known_dead();
+        if known_dead
+            && (!self.recovery_context.session_recovery_negotiated || connect_retry_count == 0)
+        {
+            return Err(crate::error::Error::ConnectionClosed(
+                "Connection is dead and session recovery is unavailable".to_string(),
+            ));
+        }
+
+        // Only attempt recovery when session recovery was negotiated and
+        // the server supports retry (connect_retry_count > 0).
+        if !self.recovery_context.session_recovery_negotiated {
+            return Ok(Duration::ZERO);
+        }
         if connect_retry_count == 0 {
             return Ok(Duration::ZERO);
         }
 
-        // Non-blocking poll — returns immediately.
-        if !self.transport.is_connection_dead() {
+        // Non-blocking poll — returns immediately. Skipped once the verdict is
+        // already in: a session retired by a fatal ERROR token or a failed drain
+        // stays unusable however healthy its socket still looks.
+        if !known_dead && !self.transport.is_connection_dead() {
             return Ok(Duration::ZERO);
         }
 
@@ -4136,6 +4160,7 @@ impl TdsClient {
                 Tokens::ColMetadata(md) => {
                     info!(?md);
                     self.current_result_set_has_been_read_till_end = false;
+                    self.current_result_ended_with_done_in_proc = false;
                     // Positioning on a row-returning result: its count is
                     // unavailable on a forward-only cursor. Clear any count
                     // captured from a preceding DONE-only (DML) result in the
@@ -4162,6 +4187,7 @@ impl TdsClient {
                     // Use saturating_add to prevent integer overflow from malicious/corrupted TDS responses
                     *count = count.saturating_add(done.row_count);
                     self.current_result_set_has_been_read_till_end = true;
+                    self.current_result_ended_with_done_in_proc = is_done_in_proc;
 
                     let is_last = !done.has_more();
 
@@ -4220,6 +4246,7 @@ impl TdsClient {
                             // trailing DONEPROC; find out before the caller
                             // treats it as another result.
                             self.settle_rpc_terminator(&parser_context).await?;
+                            self.current_result_ended_with_done_in_proc = false;
                         }
                         return Ok(ResultBoundaryKind::NoRows {
                             rows_affected: if has_update_count {
@@ -4359,6 +4386,7 @@ impl TdsClient {
                 self.current_metadata = Some(md);
                 self.execution_context.set_has_open_batch(true);
                 self.current_result_set_has_been_read_till_end = false;
+                self.current_result_ended_with_done_in_proc = false;
                 StatementResult::Rows
             }
             ResultBoundaryKind::NoRows { rows_affected } => {
@@ -4376,10 +4404,14 @@ impl TdsClient {
         }
     }
 
-    /// Returns `true` while the current batch still has unconsumed results on
-    /// the wire (a positioned result set, or further statements to navigate to).
+    /// Returns `true` while the current batch still has unconsumed results (a
+    /// positioned result set, or further statements to navigate to).
     /// Used by the ODBC layer to decide whether the connection stays busy after
     /// positioning on a no-row statement result.
+    ///
+    /// A token parked by the RPC-terminator look-ahead is covered without being
+    /// inspected here: parking means the terminal DONEPROC was not reached, so
+    /// the flag this reads is still set.
     pub fn has_open_batch(&self) -> bool {
         self.execution_context.has_open_batch()
     }
@@ -4421,6 +4453,9 @@ impl TdsClient {
     /// look-ahead never consumes a result the caller has yet to navigate to.
     /// The response-tail control tokens that precede `DONEPROC` are absorbed
     /// exactly as the main loop absorbs them.
+    ///
+    /// Every error exit ends the batch, so no caller can propagate a tail
+    /// failure over a batch nothing will finish reading.
     ///
     /// Unlike msodbcsql's short, non-failing single-byte peek, this consumes the
     /// trailer under the request's remaining timeout. An expiry therefore fails
@@ -4483,20 +4518,48 @@ impl TdsClient {
                 }
                 other => {
                     self.parked_token = Some(Box::new(other));
-                    return processing_error.map_or(Ok(()), Err);
+                    return match processing_error {
+                        None => Ok(()),
+                        Some(error) => Err(self.abandon_after_tail_failure(error).await),
+                    };
                 }
             }
         }
+    }
+
+    /// Ends the batch after a tail token failed to process, keeping the rule
+    /// "a tail failure always ends the batch" with the loop that breaks it.
+    ///
+    /// The look-ahead parked whatever it could not process, so the rest of the
+    /// response is unread and nothing will come back for it. Leaving the batch
+    /// open masks the returned error behind `ALREADY_EXECUTING_ERROR` on every
+    /// later command for the whole connection.
+    async fn abandon_after_tail_failure(
+        &mut self,
+        error: crate::error::Error,
+    ) -> crate::error::Error {
+        if self.execution_context.has_open_batch() {
+            if let Err(drain_error) = self.drain_stream_or_retire().await {
+                warn!(error = ?drain_error, "Drain after an RPC tail failure failed");
+            }
+            self.execution_context.set_has_open_batch(false);
+        }
+        error
     }
 
     fn fail_rpc_terminator_look_ahead(&mut self, error: &crate::error::Error) {
         self.execution_context.set_has_open_batch(false);
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
-        if !matches!(
+        let attention_error = matches!(
             error,
             crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
-        ) {
+        );
+        if attention_error && self.transport.connection_known_dead() {
+            // ATTENTION did not restore a message boundary. Reconnecting would
+            // hide failed cancellation cleanup, so do not recover this session.
+            self.recovery_context.session_recovery_negotiated = false;
+        } else if !attention_error {
             self.retire_after_failed_drain(error);
         }
     }
@@ -4532,7 +4595,7 @@ impl TdsClient {
     /// skip straight to the next row-returning result set.
     #[instrument(skip(self), level = "info")]
     pub async fn advance(&mut self) -> TdsResult<StatementResult> {
-        if !self.execution_context.has_open_batch() {
+        if !self.has_open_batch() {
             return Ok(StatementResult::End);
         }
         if self.maybe_has_unread_rows()
@@ -4545,7 +4608,7 @@ impl TdsClient {
         // DONE token (has_more=false), which closes the batch. If so there is
         // nothing left on the wire to advance to; reading again would block
         // forever waiting for a token that never arrives.
-        if !self.execution_context.has_open_batch() {
+        if !self.has_open_batch() {
             return Ok(StatementResult::End);
         }
         match self.position_on_first_result().await {
@@ -4571,6 +4634,42 @@ impl TdsClient {
                 StatementResult::End => return Ok(false),
             }
         }
+    }
+
+    /// Settles the protocol-only tail after an exhausted RPC row set.
+    ///
+    /// SQL Server RPC responses can end a row set with `DONE_MORE`, then emit
+    /// RETURNVALUE/RETURNSTATUS tokens and a terminal DONEPROC. For a
+    /// `DONEINPROC`, [`settle_rpc_terminator`](Self::settle_rpc_terminator)
+    /// consumes only that control-token tail and parks the first non-tail token
+    /// for [`advance`](Self::advance). Plain batch DONE tokens are never probed.
+    ///
+    /// The `DONEINPROC` gate is msodbcsql's: `OnDone` probes the tail only for
+    /// `RS_SELECTION && DONEINPROC && DONE_MORE` (`sqlctokn.cpp:2208-2240`).
+    /// Widening it to every DONE would make an ordinary multi-statement batch
+    /// block here on the next statement's result.
+    ///
+    /// Returns `true` only when the batch is fully exhausted.
+    pub async fn complete_current_result(&mut self) -> TdsResult<bool> {
+        if !self.current_result_set_has_been_read_till_end {
+            return Ok(false);
+        }
+        if !self.execution_context.has_open_batch() {
+            return Ok(true);
+        }
+        if !self.current_result_ended_with_done_in_proc {
+            return Ok(false);
+        }
+
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
+        if let Err(error) = self.settle_rpc_terminator(&parser_context).await {
+            self.current_metadata = None;
+            self.abort_pending_prepare_capture();
+            return Err(error);
+        }
+        Ok(!self.execution_context.has_open_batch())
     }
 
     /// This functions returns to the next row in the result set.
@@ -6509,26 +6608,8 @@ impl TdsClient {
 
     async fn handle_row_read_token(&mut self, token: Tokens) -> TdsResult<Option<bool>> {
         match token {
-            Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                info!("done while get_next_row: {:?}", done);
-
-                if done.has_error() {
-                    return Err(crate::error::Error::ProtocolError(
-                        "Server reported error in DONE token without preceding ERROR token"
-                            .to_string(),
-                    ));
-                }
-
-                let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                *count = count.saturating_add(done.row_count);
-
-                self.current_result_set_has_been_read_till_end = true;
-                if !done.has_more() {
-                    info!("No more rows for current command: {:?}", done.cur_cmd);
-                    self.execution_context.set_has_open_batch(false);
-                }
-                Ok(Some(false))
-            }
+            Tokens::DoneInProc(done) => self.handle_row_done(done, true),
+            Tokens::DoneProc(done) | Tokens::Done(done) => self.handle_row_done(done, false),
             Tokens::Order(order_token) => {
                 info!(?order_token);
                 Ok(None)
@@ -6591,6 +6672,30 @@ impl TdsClient {
                 "Unexpected token while finding the next row: {token:?}"
             ))),
         }
+    }
+
+    fn handle_row_done(
+        &mut self,
+        done: DoneToken,
+        ended_with_done_in_proc: bool,
+    ) -> TdsResult<Option<bool>> {
+        info!("done while get_next_row: {:?}", done);
+
+        if done.has_error() {
+            return Err(crate::error::Error::ProtocolError(
+                "Server reported error in DONE token without preceding ERROR token".to_string(),
+            ));
+        }
+
+        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+        *count = count.saturating_add(done.row_count);
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_result_ended_with_done_in_proc = ended_with_done_in_proc;
+        if !done.has_more() {
+            info!("No more rows for current command: {:?}", done.cur_cmd);
+            self.execution_context.set_has_open_batch(false);
+        }
+        Ok(Some(false))
     }
 
     /// Returns a clone of all [`ReturnValue`]s collected during the current
@@ -6706,7 +6811,7 @@ impl TdsClient {
     /// cover.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
-        if !self.execution_context.has_open_batch() {
+        if !self.has_open_batch() {
             return Ok(());
         }
         // call next row to consume any remaining tokens
@@ -6729,12 +6834,14 @@ impl TdsClient {
         // The sp_prepexec @handle, if any, was captured during the drain above
         // (see push_return_value) and survives this clear.
         self.current_metadata = None;
+        self.current_result_ended_with_done_in_proc = false;
         self.return_values.clear();
         self.abort_pending_prepare_capture();
         self.remaining_request_timeout = None;
         self.cancel_handle = None;
         self.active_row_read_state = ActiveRowReadState::Idle;
         self.row_already_positioned = false;
+        self.parked_token = None;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
 
@@ -6768,6 +6875,7 @@ impl TdsClient {
         // An intentional close is not a recoverable disconnect: disable recovery
         // so a later call on a lingering handle cannot silently resurrect it.
         self.recovery_context.session_recovery_negotiated = false;
+        self.transport.mark_known_dead();
         self.transport.close_transport().await?;
         Ok(())
     }
@@ -7374,7 +7482,8 @@ mod tests {
         create_network_transport_with_live_peer,
     };
     use crate::token::tokens::{
-        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, TokenType, Tokens,
+        ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, ReturnStatusToken,
+        TokenType, Tokens,
     };
     use async_trait::async_trait;
     use std::collections::VecDeque;
@@ -8152,6 +8261,22 @@ mod tests {
         Tokens::Done(DoneToken {
             status: DoneStatus::MORE,
             cur_cmd: CurrentCommand::Insert,
+            row_count: 0,
+        })
+    }
+
+    fn done_in_proc_more() -> Tokens {
+        Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::MORE,
+            cur_cmd: CurrentCommand::Select,
+            row_count: 0,
+        })
+    }
+
+    fn done_proc_no_more() -> Tokens {
+        Tokens::DoneProc(DoneToken {
+            status: DoneStatus::FINAL,
+            cur_cmd: CurrentCommand::Select,
             row_count: 0,
         })
     }
@@ -9864,6 +9989,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_current_result_drains_rpc_tail_and_captures_prepared_handle() {
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            Tokens::ReturnValue(ae_return_value_token("@handle", ColumnValues::Int(9), None)),
+            Tokens::ReturnStatus(ReturnStatusToken { value: 0 }),
+            done_proc_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+        client.pending_capture = Some(sid(1));
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(client.has_open_batch(), "DONE_MORE keeps the RPC open");
+        assert!(client.complete_current_result().await.unwrap());
+
+        assert!(!client.has_open_batch());
+        assert_eq!(client.prepared_handles.get(&sid(1)).copied(), Some(9));
+        assert!(matches!(
+            client.last_return_status,
+            ReturnStatus::Received(0)
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_retires_a_truncated_rpc_tail() {
+        let transport = TestTransport::with_tokens(vec![done_in_proc_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.is_connection_dead());
+        assert!(client.current_result_set_has_been_read_till_end);
+    }
+
+    #[tokio::test]
+    async fn advancing_to_a_no_row_result_clears_the_rpc_tail_gate() {
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            done_count(CurrentCommand::Update, 3, true),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.current_result_ended_with_done_in_proc);
+
+        assert!(matches!(
+            client.advance().await,
+            Ok(StatementResult::NoRows {
+                rows_affected: Some(3)
+            })
+        ));
+        assert!(
+            !client.current_result_ended_with_done_in_proc,
+            "a plain batch DONE must not leave the previous RPC's tail gate armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_abandons_the_batch_when_a_tail_token_fails() {
+        // The tail parses far enough to park the next result, then reports the
+        // failed RETURNVALUE. Leaving that batch open would strand the ODBC
+        // busy claim on a statement whose cursor is already finished.
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.parked_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn advance_abandons_the_batch_when_a_tail_token_fails() {
+        // The other `settle_rpc_terminator` call site. Propagating the failure
+        // with the batch still open would mask it behind ALREADY_EXECUTING_ERROR
+        // on every later command for the whole connection.
+        let transport = TestTransport::with_tokens(vec![
+            info_token(0, 0, "print"),
+            done_in_proc_more(),
+            Tokens::ReturnValue(ae_return_value_token(
+                "@out",
+                ColumnValues::Bytes(vec![1, 2, 3]),
+                Some(ae_crypto_metadata()),
+            )),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        client.current_result_set_has_been_read_till_end = true;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(matches!(
+            client.advance().await,
+            Err(crate::error::Error::ColumnEncryptionError(_))
+        ));
+        assert!(!client.command_is_busy());
+        assert!(client.parked_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_parks_a_following_rowset() {
+        let transport = TestTransport::with_tokens(vec![
+            done_in_proc_more(),
+            empty_col_metadata(),
+            done_no_more(),
+        ]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(client.has_open_batch());
+
+        assert!(matches!(client.advance().await, Ok(StatementResult::Rows)));
+        assert!(!client.current_result_set_has_been_read_till_end);
+
+        client.close_query().await.unwrap();
+        assert!(client.parked_token.is_none());
+        assert!(!client.has_open_batch());
+    }
+
+    #[tokio::test]
     async fn peek_past_current_row_already_exhausted_touches_nothing() {
         // Calling the peek when `next_row_cursor` would already short-circuit
         // (end of set previously observed) must stay free: the ODBC layer
@@ -9962,6 +10240,72 @@ mod tests {
         // Only one leading '@' is stripped.
         assert_eq!(TdsClient::normalize_param_name("@@version"), "@VERSION");
         assert_eq!(TdsClient::normalize_param_name(""), "");
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_does_not_probe_a_plain_batch() {
+        let transport = TestTransport::with_tokens(vec![done_more(), empty_col_metadata()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.parked_token.is_none());
+        assert!(matches!(client.advance().await, Ok(StatementResult::Rows)));
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_requires_an_exhausted_rowset() {
+        let mut client = create_test_client_with_tokens(vec![done_in_proc_more()]);
+        client.execution_context.set_has_open_batch(true);
+
+        assert!(!client.complete_current_result().await.unwrap());
+        assert!(client.execution_context.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_disarms_recovery_when_attention_cleanup_fails() {
+        let transport = TestTransport::with_tokens(vec![done_in_proc_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+        client.transport.mark_known_dead();
+
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(!client.recovery_context.session_recovery_negotiated);
+        assert!(!client.has_open_batch());
+    }
+
+    #[tokio::test]
+    async fn complete_current_result_preserves_recovery_when_cancel_leaves_transport_alive() {
+        let transport = TestTransport::with_tokens(vec![done_in_proc_more()]);
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(stale_metadata());
+        client.execution_context.set_has_open_batch(true);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        assert!(!client.peek_past_current_row().await.unwrap());
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        assert!(matches!(
+            client.complete_current_result().await,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(!client.is_connection_dead());
+        assert!(!client.has_open_batch());
     }
 
     #[tokio::test]
@@ -10469,16 +10813,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_and_reconnect_is_noop_after_close_connection() {
+    async fn check_and_reconnect_rejects_after_close_connection() {
         let mut client = create_test_client();
         client.recovery_context.session_recovery_negotiated = true;
 
         client.close_connection().await.unwrap();
         assert!(!client.recovery_context.session_recovery_negotiated);
 
-        // A dead transport must not be resurrected once the caller closed it.
-        let elapsed = client.check_and_reconnect(Some(5), None).await.unwrap();
-        assert_eq!(elapsed, Duration::ZERO);
+        // A dead transport must neither be resurrected nor reused once the
+        // caller closed it.
+        assert!(matches!(
+            client.check_and_reconnect(Some(5), None).await,
+            Err(crate::error::Error::ConnectionClosed(_))
+        ));
     }
 
     #[tokio::test]
@@ -10526,6 +10873,26 @@ mod tests {
         assert!(
             err.to_string().contains("Session recovery failed"),
             "Expected reconnect attempt resulting in SessionRecoveryFailed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_and_reconnect_recovers_a_retired_session_on_a_live_socket() {
+        // A fatal ERROR token or a failed drain retires the session while the
+        // socket still polls healthy. Trusting that poll would send the next
+        // command over a connection the client already reports as dead.
+        let mut client = create_test_client();
+        client.recovery_context.session_recovery_negotiated = true;
+        client.transport.mark_known_dead();
+        assert!(
+            !client.transport.is_connection_dead(),
+            "socket is still open"
+        );
+
+        let err = client.check_and_reconnect(Some(1), None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Session recovery failed"),
+            "Expected a reconnect attempt, got: {err}"
         );
     }
 
