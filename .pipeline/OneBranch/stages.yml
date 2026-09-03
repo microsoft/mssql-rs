@@ -8,11 +8,11 @@
 #                                                                               #
 # When buildOdbcNative is true, the Windows/Linux x64+ARM64 and macOS jobs      #
 # also build the mssql-odbc native driver (glibc + musl on Linux; 2_34 only,    #
-# no glibc-2.28 on this NuGet path). The Publish job injects each platform's    #
-# driver into the mssql-py-core wheels under mssql_py_core/libs/... so a single #
-# wheel carries both the PyO3 TDS core and the Rust ODBC driver. The macOS job  #
-# builds both arch slices as SEPARATE binaries (no lipo fusion), matching       #
-# mssql-python's libs/macos/{arm64,x86_64} layout for this driver.              #
+# no glibc-2.28 on this NuGet path) and inject it into their own wheels under   #
+# mssql_py_core/libs/... (where Python is already available for the build), so  #
+# a single wheel carries both the PyO3 TDS core and the Rust ODBC driver. The   #
+# macOS job builds both arch slices as SEPARATE binaries (no lipo fusion),      #
+# matching mssql-python's libs/macos/{arm64,x86_64} layout for this driver.     #
 #                                                                               #
 # Build jobs use custom 1ES pools (Rust, Docker, Python pre-installed).        #
 # Publish job uses managed OneBranch pool with ob_nugetPublishing_enabled.     #
@@ -97,13 +97,14 @@ stages:
           artifactName: 'Odbc_Windows_x64'
           publishArtifacts: false
           signDriver: ${{ parameters.isOfficial }}
-      - task: CopyFiles@2
-        displayName: 'Collect ODBC native driver (Windows x64)'
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          $drivers = "$(Build.SourcesDirectory)\drivers\windows\x64"
+          New-Item -ItemType Directory -Force -Path $drivers | Out-Null
+          Copy-Item "$(Build.SourcesDirectory)\odbc-drop\build\mssqlodbc.dll" "$drivers\mssqlodbc.dll"
+          python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
+        displayName: 'Inject ODBC driver into wheels (Windows x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-        inputs:
-          sourceFolder: '$(Build.SourcesDirectory)\odbc-drop'
-          targetFolder: '$(ob_outputDirectory)\odbc_windows_x64'
-          contents: 'build/mssqlodbc.dll'
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Windows x64 Artifacts'
       inputs:
@@ -167,13 +168,14 @@ stages:
             artifactName: 'Odbc_Windows_ARM64'
             publishArtifacts: false
             signDriver: ${{ parameters.isOfficial }}
-        - task: CopyFiles@2
-          displayName: 'Collect ODBC native driver (Windows ARM64)'
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $drivers = "$(Build.SourcesDirectory)\drivers\windows\arm64"
+            New-Item -ItemType Directory -Force -Path $drivers | Out-Null
+            Copy-Item "$(Build.SourcesDirectory)\odbc-drop\build\mssqlodbc.dll" "$drivers\mssqlodbc.dll"
+            python "$(Build.SourcesDirectory)\scripts\inject-odbc-into-wheels.py" --wheels-dir "$(ob_outputDirectory)\wheels" --drivers-dir "$(Build.SourcesDirectory)\drivers"
+          displayName: 'Inject ODBC driver into wheels (Windows ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-          inputs:
-            sourceFolder: '$(Build.SourcesDirectory)\odbc-drop'
-            targetFolder: '$(ob_outputDirectory)\odbc_windows_arm64'
-            contents: 'build/mssqlodbc.dll'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Windows ARM64 Artifacts'
         inputs:
@@ -226,25 +228,32 @@ stages:
           architecture: x64
           artifactName: 'Odbc_Linux_x64_glibc'
           publishArtifacts: false
-      - task: CopyFiles@2
-        displayName: 'Collect ODBC glibc driver (Linux x64)'
+      - script: |
+          set -e
+          mkdir -p "$(Build.SourcesDirectory)/drivers/linux/glibc/x86_64/lib"
+          cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/glibc/x86_64/lib/mssqlodbc.so"
+        displayName: 'Stage glibc driver (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-        inputs:
-          sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
-          targetFolder: '$(ob_outputDirectory)/odbc_glibc_x64'
-          contents: 'build/mssqlodbc.so'
       - template: /.pipeline/templates/build-odbc-alpine-template.yml
         parameters:
           architecture: x64
           artifactName: 'Odbc_Linux_x64_musl'
           publishArtifacts: false
-      - task: CopyFiles@2
-        displayName: 'Collect ODBC musl driver (Linux x64)'
+      - script: |
+          set -e
+          mkdir -p "$(Build.SourcesDirectory)/drivers/linux/musl/x86_64/lib"
+          cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/musl/x86_64/lib/mssqlodbc.so"
+        displayName: 'Stage musl driver (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-        inputs:
-          sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
-          targetFolder: '$(ob_outputDirectory)/odbc_musl_x64'
-          contents: 'build/mssqlodbc.so'
+      - script: |
+          set -e
+          command -v python3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y python3; }
+          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+          python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+            --wheels-dir "$(ob_outputDirectory)/wheels" \
+            --drivers-dir "$(Build.SourcesDirectory)/drivers"
+        displayName: 'Inject ODBC driver into wheels (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Linux x64 Artifacts'
       inputs:
@@ -298,25 +307,26 @@ stages:
             architecture: ARM64
             artifactName: 'Odbc_Linux_ARM64_glibc'
             publishArtifacts: false
-        - task: CopyFiles@2
-          displayName: 'Collect ODBC glibc driver (Linux ARM64)'
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/linux/glibc/arm64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/glibc/arm64/lib/mssqlodbc.so"
+          displayName: 'Stage glibc driver (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-          inputs:
-            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
-            targetFolder: '$(ob_outputDirectory)/odbc_glibc_arm64'
-            contents: 'build/mssqlodbc.so'
         - template: /.pipeline/templates/build-odbc-alpine-template.yml
           parameters:
             architecture: ARM64
             artifactName: 'Odbc_Linux_ARM64_musl'
             publishArtifacts: false
-        - task: CopyFiles@2
-          displayName: 'Collect ODBC musl driver (Linux ARM64)'
+        - script: |
+            set -e
+            command -v python3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y python3; }
+            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+            python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+              --wheels-dir "$(ob_outputDirectory)/wheels" \
+              --drivers-dir "$(Build.SourcesDirectory)/drivers"
+          displayName: 'Inject ODBC driver into wheels (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-          inputs:
-            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
-            targetFolder: '$(ob_outputDirectory)/odbc_musl_arm64'
-            contents: 'build/mssqlodbc.so'
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Linux ARM64 Artifacts'
         inputs:
@@ -361,25 +371,30 @@ stages:
             architecture: x64
             artifactName: 'Odbc_MacOS_x64'
             publishArtifacts: false
-        - task: CopyFiles@2
-          displayName: 'Collect ODBC native driver (macOS x64)'
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/macos/x86_64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.dylib" "$(Build.SourcesDirectory)/drivers/macos/x86_64/lib/mssqlodbc.dylib"
+          displayName: 'Stage macOS x64 driver'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-          inputs:
-            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
-            targetFolder: '$(ob_outputDirectory)/odbc_macos_x64'
-            contents: 'build/mssqlodbc.dylib'
         - template: /.pipeline/templates/build-odbc-macos-template.yml
           parameters:
             architecture: ARM64
             artifactName: 'Odbc_MacOS_ARM64'
             publishArtifacts: false
-        - task: CopyFiles@2
-          displayName: 'Collect ODBC native driver (macOS ARM64)'
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/macos/arm64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.dylib" "$(Build.SourcesDirectory)/drivers/macos/arm64/lib/mssqlodbc.dylib"
+          displayName: 'Stage macOS ARM64 driver'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-          inputs:
-            sourceFolder: '$(Build.SourcesDirectory)/odbc-drop'
-            targetFolder: '$(ob_outputDirectory)/odbc_macos_arm64'
-            contents: 'build/mssqlodbc.dylib'
+        - script: |
+            set -e
+            python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
+              --wheels-dir "$(ob_outputDirectory)/wheels" \
+              --drivers-dir "$(Build.SourcesDirectory)/drivers"
+          displayName: 'Inject ODBC driver into macOS wheels'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
       - task: PublishPipelineArtifact@1
         displayName: 'Publish macOS Artifacts'
         inputs:
@@ -427,66 +442,6 @@ stages:
             Write-Host "WARNING: No wheels found!"
           }
         displayName: 'List collected wheels'
-
-      # Inject the mssql-odbc native driver into each mssql-py-core wheel so a
-      # single wheel carries both the PyO3 TDS core and the Rust ODBC driver.
-      # Driver files land under mssql_py_core/libs/... in the exact layout
-      # mssql-python's native resolver reads for the mssql-odbc provider.
-      - ${{ if eq(parameters.buildOdbcNative, true) }}:
-        - task: UsePythonVersion@0
-          displayName: 'Use Python for wheel injection'
-          inputs:
-            versionSpec: '3.12'
-            addToPath: true
-
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-
-            # Template expansion produces bare True/False which aren't valid
-            # PowerShell; string comparison converts to a proper boolean.
-            $buildAllTargets = "${{ parameters.buildAllTargets }}" -eq "True"
-
-            # Stage each collected mssqlodbc binary into a tree mirroring the
-            # libs/ subtree inject-odbc-into-wheels.py expects. Sources use the
-            # Build jobs' CopyFiles targetFolder names (odbc_<track>_<arch>/
-            # build/<file>); destinations are the runtime libs/-relative layout
-            # the mssql-python resolver reads (arch token x86_64/arm64 on Linux
-            # and macOS, x64/arm64 on Windows).
-            $driversRoot = "$(Build.StagingDirectory)/drivers"
-
-            $map = [ordered]@{
-              'drop_Build_Windows_x64_windows_x64/odbc_windows_x64/build/mssqlodbc.dll' = 'windows/x64/mssqlodbc.dll'
-              'drop_Build_Linux_x64_linux_x64/odbc_glibc_x64/build/mssqlodbc.so'        = 'linux/glibc/x86_64/lib/mssqlodbc.so'
-              'drop_Build_Linux_x64_linux_x64/odbc_musl_x64/build/mssqlodbc.so'         = 'linux/musl/x86_64/lib/mssqlodbc.so'
-            }
-
-            if ($buildAllTargets) {
-              $map['drop_Build_Windows_ARM64_windows_arm64/odbc_windows_arm64/build/mssqlodbc.dll'] = 'windows/arm64/mssqlodbc.dll'
-              $map['drop_Build_Linux_ARM64_linux_arm64/odbc_glibc_arm64/build/mssqlodbc.so']        = 'linux/glibc/arm64/lib/mssqlodbc.so'
-              $map['drop_Build_Linux_ARM64_linux_arm64/odbc_musl_arm64/build/mssqlodbc.so']         = 'linux/musl/arm64/lib/mssqlodbc.so'
-              $map['drop_Build_MacOS_universal2_macos_universal2/odbc_macos_x64/build/mssqlodbc.dylib']   = 'macos/x86_64/lib/mssqlodbc.dylib'
-              $map['drop_Build_MacOS_universal2_macos_universal2/odbc_macos_arm64/build/mssqlodbc.dylib'] = 'macos/arm64/lib/mssqlodbc.dylib'
-            }
-
-            foreach ($src in $map.Keys) {
-              $sourcePath = "$(Pipeline.Workspace)/$src"
-              if (-not (Test-Path $sourcePath)) {
-                Write-Error "Missing ODBC driver binary: $sourcePath"
-                exit 1
-              }
-              $destPath = Join-Path $driversRoot $map[$src]
-              New-Item -ItemType Directory -Force -Path (Split-Path $destPath) | Out-Null
-              Copy-Item $sourcePath $destPath
-              Write-Host "Staged $src -> $($map[$src])"
-            }
-          displayName: 'Stage ODBC driver binaries'
-
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-            python "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" `
-              --wheels-dir "$(Build.StagingDirectory)/wheels" `
-              --drivers-dir "$(Build.StagingDirectory)/drivers"
-          displayName: 'Inject ODBC driver into wheels'
 
       - pwsh: |
           $ErrorActionPreference = 'Stop'
