@@ -1933,10 +1933,14 @@ TEST_F(GetDataLiveTest, DefaultTargetOnABinaryMaxColumnRefusesEvenTheProbe) {
 // where try_read_buffered_column materializes whatever the transport already
 // holds, so a small max column never streams — a paused row read pauses on
 // ColumnMetadata::is_plp() alone (token_stream.rs, `stop_here && meta.is_plp()`),
-// which is a property of the declared type. Every VARCHAR(MAX) therefore takes
-// this path at any size, which PlpColumnUnsupportedCTypeReturnsHyc00 above
-// demonstrates on a three-byte value: it answers HYC00 from the stream's target
-// gate rather than converting the text the way a captured value would.
+// which is a property of the declared type. The buffered fast path this cursor
+// does consult bails out first and unconditionally on the same predicate
+// (decoder.rs `try_decode_buffered`: `if metadata.is_plp() ... return Ok(None)`),
+// so no amount of buffering — and no connection-string packet size — can divert
+// a max column away from the streaming path. Every VARCHAR(MAX) therefore takes
+// it at any size, which PlpColumnUnsupportedCTypeReturnsHyc00 above demonstrates
+// on a three-byte value: it answers HYC00 from the stream's target gate rather
+// than converting the text the way a captured value would.
 TEST_F(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks) {
     const size_t kTotal = 9000;
     ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000)"),
