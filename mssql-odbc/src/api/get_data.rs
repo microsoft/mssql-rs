@@ -900,8 +900,8 @@ fn finish_get_data(
 /// types resolve to `SQL_C_WCHAR`, `SQL_GUID` to `SQL_C_GUID`) therefore reach
 /// `SQLGetData` too.
 ///
-/// The placeholder is kept in two cases, both of which the caller's own target
-/// gate then reports as `HYC00` rather than this driver guessing:
+/// The placeholder is kept in two cases, which the caller's own target gate
+/// then reports as `HYC00` rather than this driver guessing:
 ///
 /// - The column's SQL type has no default (`SQL_UNKNOWN_TYPE` from
 ///   [`odbc_sql_type`] for a TDS type this driver does not map).
@@ -912,6 +912,14 @@ fn finish_get_data(
 ///   so honouring the C type's width would put the 16 bytes a
 ///   `uniqueidentifier` column resolves to into a 4-byte buffer — where
 ///   msodbcsql resolves to `SQL_C_CHAR` and stays inside `BufferLength`.
+///
+/// **A NULL is the exception, in both cases.** [`write_captured_column`]
+/// answers NULL from the indicator before it computes `deliverable_target`, so
+/// an unresolved placeholder over a NULL column reports `SQL_NULL_DATA` and
+/// `SQL_SUCCESS` rather than `HYC00`. That is the correct answer and matches
+/// msodbcsql: nothing is written, so a target this driver cannot deliver — and
+/// a buffer too narrow to hold it — are both moot. The refusals above exist to
+/// prevent a *write*, and there is no write to prevent.
 ///
 /// `BufferLength` 0 is **not** exempt here, unlike in `SQLFetchScroll`'s
 /// resolver. On a binding, 0 is the documented idiom for a fixed-width target
@@ -4502,9 +4510,46 @@ mod tests {
         assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
     }
 
-    /// The zero-length `SQL_C_BINARY` probe still works through the resolved
-    /// target: a `varbinary` column resolves to an application-sized C type, so
-    /// the width check above has nothing to refuse.
+    /// A NULL escapes both refusals above, because `write_captured_column`
+    /// answers NULL from the indicator before it computes `deliverable_target`.
+    /// The narrow-buffer guard exists to stop a *write*, and a NULL writes
+    /// nothing, so reporting `SQL_NULL_DATA` is correct rather than a hole —
+    /// msodbcsql answers the same way. Uses the shape the guard would otherwise
+    /// refuse (a `uniqueidentifier` resolving to the 16-byte `SQL_C_GUID`,
+    /// declared as 4 bytes) so a regression that moved the NULL branch below
+    /// the gate turns this red.
+    #[test]
+    fn get_data_default_over_a_null_reports_null_even_when_unresolvable() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured_column(&h, column_of(TdsDataType::Guid), ColumnValues::Null);
+
+        let mut out = [0xEEu8; 16];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                out.as_mut_ptr() as SqlPointer,
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+        assert_eq!(
+            out, [0xEEu8; 16],
+            "a NULL leaves a fixed-width buffer untouched"
+        );
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert!(
+            s.diag_records.is_empty(),
+            "a NULL must not raise a diagnostic: {:?}",
+            s.diag_records
+        );
+    }
+
     #[test]
     fn get_data_default_on_a_binary_column_answers_the_length_probe() {
         let h = TestHandles::with_env_dbc_stmt();

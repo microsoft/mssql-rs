@@ -134,6 +134,27 @@ authoritative parity reference for this crate. Its source lives in the
     `varbinary(max)` / `image` refuses even that, because
     `stream_active_plp_chunk` admits only the two character targets before it
     looks at `BufferLength` (AB#47815).
+  - **`SQL_ARD_TYPE` is not implemented and is reported as `HY003`, which
+    inverts that SQLSTATE's meaning.** `SQL_ARD_TYPE` (-99) is the second
+    placeholder `TargetType` the ODBC spec defines for `SQLGetData` — "use the
+    type already on the ARD record" — and it appears nowhere in this crate, so
+    it falls through `is_valid_c_type` to `ERR_INVALID_C_DATA_TYPE`. Measured:
+    `SQL_ERROR` / `HY003`. The spec defines `HY003` as *TargetType* not being a
+    valid type, `SQL_C_DEFAULT`, **or `SQL_ARD_TYPE`** — so returning it *for*
+    `SQL_ARD_TYPE` says the application passed a bad buffer type when it passed
+    a documented one. This is a driver-level answer, not a Driver Manager one:
+    msodbcsql resolves it itself in `GetColData`
+    (`Sql/Ntdbms/sqlncli/odbc/sqlcdata.cpp:209`), reading `fCType` off the
+    column's ARD binding — the same function whose `Sql2CDefault` call
+    AB#47815 mirrors for `SQL_C_DEFAULT` — and reports `07009` when the column
+    is unbound. Pre-existing and untouched by AB#47815, which covers only
+    `SQL_C_DEFAULT`; registered here because it is the same argument of the
+    same function, and because `HY003` reads as application error rather than
+    an unimplemented feature, so nothing surfaces it as a gap. Implementing it
+    needs ARD-record lookup plus the unbound-column `07009` case, and
+    `SQL_C_NUMERIC` precision/scale from the same binding, so it wants its own
+    work item rather than a re-spelled error. Raised by Shiwani in review of
+    [PR #481](https://github.com/microsoft/mssql-rs/pull/481); not yet tracked.
   - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
     writes the client code page. msodbcsql uses the client code page -
     `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
