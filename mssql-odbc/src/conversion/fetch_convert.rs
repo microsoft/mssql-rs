@@ -2314,8 +2314,8 @@ mod tests {
     fn datetime_legacy_fraction_rounds_to_milliseconds() {
         use mssql_tds::datatypes::column_values::SqlDateTime;
 
-        for (ticks, expected_fraction) in [(37, 123_000_000), (38, 127_000_000), (299, 997_000_000)]
-        {
+        for ticks in 0u32..300 {
+            let expected_fraction = ((ticks * 20 + 3) / 6) * 1_000_000;
             let mut out = SqlTimestampStruct::default();
             let mut ind: SqlLen = 0;
             unsafe {
