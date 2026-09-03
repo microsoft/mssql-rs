@@ -643,6 +643,19 @@ protected:
                                 static_cast<SQLLEN>(narrow_.size()), &indicator_);
     }
 
+    SQLRETURN BindWide(SQLSMALLINT sql_type, const std::string& text, SQLULEN column_size = 0,
+                       SQLSMALLINT decimal_digits = 0) {
+        wvals_.clear();
+        wvals_.reserve(text.size() + 1);
+        for (unsigned char ch : text) {
+            wvals_.push_back(ch);
+        }
+        wvals_.push_back(0);
+        indicator_ = static_cast<SQLLEN>(text.size() * sizeof(SQLWCHAR));
+        return SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, sql_type, column_size,
+                                decimal_digits, wvals_.data(), indicator_, &indicator_);
+    }
+
     std::string GetColumnChar(SQLUSMALLINT col = 1) {
         SQLCHAR buf[512] = {0};
         SQLLEN ind = 0;
@@ -672,6 +685,7 @@ protected:
 
     alignas(8) SQLCHAR storage_[64] = {0};
     std::vector<SQLCHAR> narrow_;
+    std::vector<SQLWCHAR> wvals_;
     SQLLEN indicator_ = 0;
 };
 
@@ -1234,6 +1248,24 @@ TEST_F(ScalarConversionLiveTest, VariantWithNoColumnSizeIsNotAMaxType) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_VARIANT, "hello"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("hello", ExecuteAndReadBack());
+}
+
+// SQL_C_WCHAR -> SQL_SS_VARIANT is the only variant pairing the matrix admits
+// (AB#47800), and it must never declare a max inner type: sql_variant cannot
+// hold one, so the server answers error 529 at execute rather than a state the
+// application can act on.
+//
+// ColumnSize 0 means "unstated" here, and anything past the wide ceiling is
+// clamped to it. Measured on retail 18.6.2.1: every ColumnSize from 0 to 8000
+// executes, so msodbcsql never lands on a max inner type either.
+TEST_F(ScalarConversionLiveTest, AWideVariantIsNeverAMaxType) {
+    for (SQLULEN size : {SQLULEN{0}, SQLULEN{3000}, SQLULEN{5000}, SQLULEN{8000}}) {
+        ASSERT_SQL_OK(Prepare(kBaseTypeQuery), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindWide(SQL_SS_VARIANT, "hi", size), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("nvarchar", ExecuteAndReadBack()) << "ColumnSize " << size;
+        SQLCloseCursor(stmt_);
+        ResetParams();
+    }
 }
 
 // A defaulted binding of every scalar row must produce a typed NULL from

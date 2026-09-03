@@ -225,12 +225,12 @@ pub(crate) unsafe fn bound_param_to_value(
         }
         (AppValue::NarrowText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
             SQL_VARCHAR,
-            variant_column_size(param.column_size),
+            variant_column_size(param.column_size, SQL_PREC_BIGCHARBINARY),
             AppText::Utf8(bytes),
         )?),
         (AppValue::WideText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
             SQL_WVARCHAR,
-            variant_column_size(param.column_size),
+            variant_column_size(param.column_size, SQL_PREC_NCHAR),
             AppText::Utf16(bytes),
         )?),
         _ => return Err(ParamBuildError::ConversionNotImplemented),
@@ -828,10 +828,17 @@ fn variant_of(inner: SqlType) -> SqlType {
 
 /// `sql_variant` cannot hold a `max` type (server error 529), so a `ColumnSize`
 /// of 0 - which means `max` everywhere else - is instead read as "unstated" and
-/// declared at the non-`max` ceiling.
-fn variant_column_size(column_size: usize) -> usize {
-    if column_size == 0 {
-        SQL_PREC_BIGCHARBINARY
+/// declared at `max_length`, the target's own non-`max` ceiling. A `ColumnSize`
+/// past that ceiling is clamped rather than passed through, because
+/// [`variable_length`] answers `None` above its bound and `None` is the `max`
+/// spelling.
+///
+/// Measured on retail 18.6.2.1: a wide variant binding executes under every
+/// `ColumnSize` from 0 to 8000, so msodbcsql never lands on a `max` inner type
+/// here either.
+fn variant_column_size(column_size: usize, max_length: usize) -> usize {
+    if column_size == 0 || column_size > max_length {
+        max_length
     } else {
         column_size
     }
@@ -2146,32 +2153,39 @@ mod tests {
 
     /// `sql_variant` wraps the inner declaration rather than declaring itself,
     /// and cannot hold a `max` type - server error 529 - so a `ColumnSize` of 0
-    /// is read as "unstated" and declared at the non-`max` ceiling instead of
-    /// meaning `max` the way it does everywhere else.
+    /// is read as "unstated" and a `ColumnSize` past the target's ceiling is
+    /// clamped, rather than either falling through to `max`.
+    ///
+    /// Bound `SQL_C_WCHAR` because that is the only pairing the matrix admits
+    /// (AB#47800); the ceiling is the wide one, so a narrow binding here would
+    /// assert 8000 on a path no application can reach.
     #[test]
     fn a_variant_wraps_a_bounded_inner_declaration() {
-        let mut bytes = b"hi".to_vec();
-        let mut ind: SqlLen = 2;
-        let mut p = param(SQL_C_CHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
-        p.sql_type = SQL_SS_VARIANT;
-        p.column_size = 8;
-        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
-        match value {
-            SqlType::Variant(inner) => assert!(matches!(*inner, SqlType::Varchar(Some(_), 8))),
-            other => panic!("expected Variant, got {other:?}"),
-        }
+        let wide =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
 
-        // ColumnSize 0 must not become varchar(max).
-        let mut ind: SqlLen = 2;
-        let mut p = param(SQL_C_CHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
-        p.sql_type = SQL_SS_VARIANT;
-        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
-        match value {
-            SqlType::Variant(inner) => assert!(matches!(
-                *inner,
-                SqlType::Varchar(Some(_), n) if n as usize == SQL_PREC_BIGCHARBINARY
-            )),
-            other => panic!("expected Variant, got {other:?}"),
+        let cases: &[(usize, u16)] = &[
+            (8, 8),
+            // Unstated: the wide ceiling, not `max`.
+            (0, SQL_PREC_NCHAR as u16),
+            // Past the wide ceiling but inside the narrow one: clamped, not `max`.
+            (5000, SQL_PREC_NCHAR as u16),
+        ];
+
+        for &(column_size, expected) in cases {
+            let mut bytes = wide("hi");
+            let mut ind: SqlLen = 4;
+            let mut p = param(SQL_C_WCHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+            p.sql_type = SQL_SS_VARIANT;
+            p.column_size = column_size;
+            let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+            match value {
+                SqlType::Variant(inner) => assert!(
+                    matches!(*inner, SqlType::NVarchar(Some(_), n) if n == expected),
+                    "column_size {column_size}: got {inner:?}"
+                ),
+                other => panic!("column_size {column_size}: expected Variant, got {other:?}"),
+            }
         }
     }
 

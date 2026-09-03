@@ -680,9 +680,14 @@ Two behaviours are ours to justify rather than copy:
 
 - **`sql_variant` reads `ColumnSize` 0 as unstated, not as `max`.** A
   `sql_variant` cannot hold a `max` type at all (server error 529), so the
-  spelling that means `max` everywhere else declares at the non-`max` ceiling.
-  Unverified end to end: a **narrow** payload cannot reach the wire at all yet,
-  because `mssql-tds` hard-codes the variant's inner context to `NVARCHAR` and
+  spelling that means `max` everywhere else declares at the target's own
+  non-`max` ceiling, and a `ColumnSize` past that ceiling is clamped to it
+  rather than falling through to `max`. Measured on retail 18.6.2.1: a wide
+  variant binding executes under every `ColumnSize` from 0 to 8000, so
+  msodbcsql never lands on a `max` inner type either.
+  `AWideVariantIsNeverAMaxType` runs on both legs.
+  A **narrow** payload cannot reach the wire at all yet, because `mssql-tds`
+  hard-codes the variant's inner context to `NVARCHAR` and
   sizes it as UTF-16, so five UTF-8 bytes are rejected as exceeding a schema
   size of two. The matrix therefore admits `SQL_SS_VARIANT` only from
   `SQL_C_WCHAR`, which leaves the defaulted path short of msodbcsql:
