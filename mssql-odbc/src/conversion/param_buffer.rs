@@ -92,6 +92,10 @@ pub(crate) enum Indicator {
 /// `param.strlen_or_ind_ptr` and `param.octet_length_ptr`, if non-null, must
 /// each point to one valid `SqlLen`.
 pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, ParamBuildError> {
+    // `SQLBindParameter` aims `SQL_DESC_INDICATOR_PTR` and
+    // `SQL_DESC_OCTET_LENGTH_PTR` at one address, so reading NULL from the
+    // first and the length from the second agrees unless a separate
+    // `SQLSetDescField` splits them - unmeasured against msodbcsql.
     if !param.strlen_or_ind_ptr.is_null() {
         let ind = unsafe { param.strlen_or_ind_ptr.read_unaligned() };
         if ind == SQL_NULL_DATA {
@@ -151,14 +155,8 @@ pub(crate) unsafe fn read_param_value(
     param: &BoundParam,
     len_spec: SqlLen,
 ) -> Result<AppValue, ParamBuildError> {
-    // ODBC permits a null `ParameterValuePtr` only for `SQL_NULL_DATA` or
-    // data-at-exec, and `read_indicator` has already returned on both.
-    //
-    // `sqlcfunc.cpp:2549` reads as though msodbcsql treats any null buffer as
-    // NULL, but ADO build 172202 shows retail 18.6.2.1 answering `HY090`
-    // ("Invalid string or buffer length") at execute for exactly this binding,
-    // so that reading is incomplete. Rejecting is the safer half: an
-    // application that meant NULL can say `SQL_NULL_DATA`.
+    // Unreachable: `read_indicator` answers every null-buffer shape itself,
+    // with `Null` or `InvalidBufferLength`. Kept as an FFI-boundary guard.
     if param.parameter_value_ptr.is_null() {
         return Err(ParamBuildError::NullValuePointer);
     }

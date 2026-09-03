@@ -684,7 +684,12 @@ Two behaviours are ours to justify rather than copy:
   Unverified end to end: a **narrow** payload cannot reach the wire at all yet,
   because `mssql-tds` hard-codes the variant's inner context to `NVARCHAR` and
   sizes it as UTF-16, so five UTF-8 bytes are rejected as exceeding a schema
-  size of two. `VariantParamWrapsItsInnerType` and
+  size of two. The matrix therefore admits `SQL_SS_VARIANT` only from
+  `SQL_C_WCHAR`, which leaves the defaulted path short of msodbcsql:
+  `SQL_C_DEFAULT` resolves `SQL_SS_VARIANT` to `SQL_C_CHAR`, so an ordinary
+  defaulted variant binding is `HYC00` at bind rather than executing. Chosen
+  over admitting a pairing that cannot execute, and lifted when AB#47800 lands.
+  `VariantParamWrapsItsInnerType` and
   `VariantWithNoColumnSizeIsNotAMaxType` are skipped against AB#47800; both
   pass on msodbcsql.
 - **`SQL_C_GUID` resolves from `SQL_GUID`**, per the ODBC 3.x default-C-type
