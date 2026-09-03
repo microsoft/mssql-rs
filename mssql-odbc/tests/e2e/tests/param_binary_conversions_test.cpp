@@ -329,26 +329,92 @@ TEST_F(BinaryConversionLiveTest, TwoBinaryParamsKeepSeparateDeclarations) {
     EXPECT_EQ("1122|33445566", ExecuteAndReadBack());
 }
 
-// Divergence: ColumnSize does not bound a data-at-execution value here, and it
-// does in msodbcsql. dae_placeholder_type declares varbinary(max) from the C
-// type alone, so a streamed value is never length-checked; msodbcsql applies the
-// same cbMaxPrec bound and CheckTrailingZeros rule to each SQLPutData chunk,
-// accumulating cbDataSentToServer across calls (sqlccmd.cpp:11192-11218), and
-// answers 22001 for the binding below. Measured on retail 18.6.2.1.
+// ColumnSize bounds a data-at-execution value exactly as it bounds a
+// materialized one, and the parameter is declared varbinary(2) to match: the
+// value body is still PLP framing opened before the length is known, but the
+// variable it is assigned to carries the declared length.
 //
-// Not narrowed to binary: the character DAE path has the same gap, and closing
-// either needs ColumnSize threaded into the placeholder type plus a running
-// total in SQLPutData. Tracked as AB#47590; skipped here rather than left
-// asserting the wrong direction.
-TEST_F(BinaryConversionLiveTest, DataAtExecutionIgnoresColumnSize) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-
+// Runs on both legs: msodbcsql applies the same cbMaxPrec bound and
+// CheckTrailingZeros rule to each SQLPutData call, accumulating
+// cbDataSentToServer across them (sqlccmd.cpp:11192-11218).
+TEST_F(BinaryConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
     SQLCHAR token = 0;
-    // ColumnSize 2 against a 4-byte streamed value: no 22001.
+    // ColumnSize 2 against a 4-byte streamed value whose overflow carries data.
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 2,
+                                   0, &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    const SQLCHAR chunk[] = {0xAA, 0xBB, 0xCC, 0xDD};
+    EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, const_cast<SQLCHAR*>(chunk), sizeof(chunk)));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+}
+
+// The other half of the rule: an overflow made only of the pad byte is dropped
+// rather than reported, so the value still lands trimmed to ColumnSize. This is
+// the streamed counterpart of BinaryColumnSizeTrimsZeroOverflow.
+TEST_F(BinaryConversionLiveTest, DataAtExecutionTrimsZeroOverflowToColumnSize) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 2,
+                                   0, &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    const SQLCHAR chunk[] = {0xAA, 0xBB, 0x00, 0x00};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(chunk), sizeof(chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("AABB", GetColumnChar());
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The bound is against the accumulated value, not each chunk. Both chunks below
+// fit ColumnSize on their own; only their total exceeds it, which is the case a
+// per-chunk check would pass.
+TEST_F(BinaryConversionLiveTest, DataAtExecutionColumnSizeSpansChunks) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 4,
+                                   0, &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    const SQLCHAR first[] = {0x11, 0x22, 0x33};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(first), sizeof(first)),
+                  SQL_HANDLE_STMT, stmt_);
+    // 3 + 3 = 6 against varbinary(4), and the overflow is not padding.
+    const SQLCHAR second[] = {0x44, 0x55, 0x66};
+    EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, const_cast<SQLCHAR*>(second), sizeof(second)));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+}
+
+// A max declaration has no length to enforce, so a streamed value of any size
+// still goes out whole. ColumnSize 0 is how SQLDescribeParam reports one.
+TEST_F(BinaryConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 0,
                                    0, &token, 0, &streamed_ind),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -363,5 +429,38 @@ TEST_F(BinaryConversionLiveTest, DataAtExecutionIgnoresColumnSize) {
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("AABBCCDD", GetColumnChar());
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// `binary(n)` is not one of the PLP-framable types, so its value cannot be
+// streamed as chunks: it is collected across the SQLPutData calls and converted
+// whole when SQLParamData closes the parameter, the branch msodbcsql serves
+// with WriteToExtBuffer (sqlccmd.cpp:4913). The zero padding to the declared
+// width is what proves it went out as `binary(4)` rather than a `max`.
+TEST_F(BinaryConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredBinary) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 2)"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_BINARY, 4, 0,
+                                   &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    // Two chunks: the value only exists once both have been collected.
+    const SQLCHAR first[] = {0x11};
+    const SQLCHAR second[] = {0x22};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(first), sizeof(first)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(second), sizeof(second)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // `binary(4)` zero-pads the two supplied bytes out to its declared width.
+    EXPECT_EQ("11220000", GetColumnChar());
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }

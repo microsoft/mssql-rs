@@ -977,3 +977,193 @@ TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectio
 
     ExpectSameSessionStillUsable(spid);
 }
+
+// ColumnSize bounds a streamed character value exactly as it bounds a
+// materialized one, and the bound is against the accumulated total rather than
+// each chunk (AB#47590). The parameter is declared varchar(2) to match: the
+// value body is still PLP framing opened before the length is known, but the
+// variable it is assigned to carries the declared length.
+//
+// Runs on both legs: msodbcsql applies the same cchMaxPrec bound and
+// CheckTrailingChars rule to each call, accumulating cbDataSentToServer across
+// them (sqlccmd.cpp:11085-11108).
+TEST_F(CharConversionLiveTest, DataAtExecutionOverflowingColumnSizeIsRejected) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 2, 0,
+                                   &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    SQLCHAR chunk[] = {'a', 'b', 'c', 'd'};
+    EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, chunk, sizeof(chunk)));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+}
+
+// A wideness-mismatched pairing is bounded on the same terms as a matched one.
+// ColumnSize names the declaration's unit and the count is of the source, so
+// nvarchar(2) bounds two UTF-16 units of the bound buffer whichever width that
+// buffer has. Both directions are covered: without the bound the client would
+// declare a length and then stream past it, since a streamed value never
+// reaches the close-time conversion that bounds a materialized one.
+TEST_F(CharConversionLiveTest, DataAtExecutionBoundsAWidenessMismatch) {
+    // Narrow buffer against a wide declaration.
+    {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+        SQLCHAR token = 0;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_WVARCHAR, 2, 0,
+                                       &token, 0, &streamed_ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+        SQLPOINTER value_ptr = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+        SQLCHAR chunk[] = {'a', 'b', 'c', 'd'};
+        EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, chunk, sizeof(chunk)));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+    }
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    // Wide buffer against a narrow declaration.
+    {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+        SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+        SQLCHAR token = 0;
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_VARCHAR, 2, 0,
+                                       &token, 0, &streamed_ind),
+                      SQL_HANDLE_STMT, stmt_);
+
+        ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+        SQLPOINTER value_ptr = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+        // Four UTF-16 units against nvarchar-equivalent room for two.
+        SQLWCHAR wide[] = {'a', 'b', 'c', 'd'};
+        EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, wide, sizeof(wide)));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+    }
+}
+
+// The other half of the rule for the character family: an overflow of blanks is
+// dropped rather than reported, so the value lands trimmed to ColumnSize. The
+// pad byte differs from the binary path -- a blank, not a zero.
+TEST_F(CharConversionLiveTest, DataAtExecutionTrimsBlankOverflowToColumnSize) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 3, 0,
+                                   &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    SQLCHAR chunk[] = {'a', 'b', 'c', ' ', ' '};
+    ASSERT_SQL_OK(SQLPutData(stmt_, chunk, sizeof(chunk)), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("abc", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A wide streamed parameter is measured in characters, so its byte budget is
+// twice ColumnSize. Two chunks of one character each fit nvarchar(2); a third
+// does not, and the overflow is not a blank.
+TEST_F(CharConversionLiveTest, DataAtExecutionWideColumnSizeCountsCharacters) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, 2, 0,
+                                   &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    SQLWCHAR first[] = {'a'};
+    ASSERT_SQL_OK(SQLPutData(stmt_, first, sizeof(first)), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR second[] = {'b'};
+    ASSERT_SQL_OK(SQLPutData(stmt_, second, sizeof(second)), SQL_HANDLE_STMT, stmt_);
+    // Two characters already sent against nvarchar(2): a third overflows.
+    SQLWCHAR third[] = {'c'};
+    EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, third, sizeof(third)));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+}
+
+// A max declaration has no length to enforce, so a streamed value of any size
+// still goes out whole. ColumnSize 0 is how SQLDescribeParam reports one.
+TEST_F(CharConversionLiveTest, DataAtExecutionMaxDeclarationIsUnbounded) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 0, 0,
+                                   &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    SQLCHAR chunk[] = {'a', 'b', 'c', 'd'};
+    ASSERT_SQL_OK(SQLPutData(stmt_, chunk, sizeof(chunk)), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("abcd", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// `char(n)` is not one of the PLP-framable types, so its value cannot be
+// streamed as chunks: it is collected across the SQLPutData calls and converted
+// whole when SQLParamData closes the parameter, which is the branch msodbcsql
+// serves with WriteToExtBuffer (sqlccmd.cpp:4913). The declaration and the
+// blank padding are what prove it went out as `char(8)` rather than a `max`.
+TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredChar) {
+    ASSERT_SQL_OK(Prepare("SELECT CAST(SQL_VARIANT_PROPERTY(CAST(? AS SQL_VARIANT),"
+                          " 'BaseType') AS VARCHAR(32)) + '/' + CAST(LEN(?) AS VARCHAR(8))"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    std::vector<SQLCHAR> echo = {'a', 'b', 'c'};
+    SQLLEN echo_ind = static_cast<SQLLEN>(echo.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_CHAR, 8, 0,
+                                   &token, 0, &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_CHAR, 8,
+                                   0, echo.data(), echo_ind, &echo_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    // Two chunks: the value only exists once both have been collected.
+    SQLCHAR first[] = {'a'};
+    SQLCHAR second[] = {'b', 'c'};
+    ASSERT_SQL_OK(SQLPutData(stmt_, first, sizeof(first)), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, second, sizeof(second)), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // `char(8)` blank-pads, so LEN() of the materialized sibling is 3 while the
+    // streamed one is declared the same fixed-width type.
+    EXPECT_EQ("char/3", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
