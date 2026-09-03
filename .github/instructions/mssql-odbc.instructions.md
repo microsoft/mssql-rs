@@ -116,13 +116,15 @@ authoritative parity reference for this crate. Its source lives in the
     `BufferLength` 0 is exempt — the documented idiom for a fixed-width target,
     carrying no width claim. Whether these should instead report `01004` with a
     truncated value, closer to msodbcsql, is open and untracked.
-  - A `varbinary` / `image` column bound `SQL_C_DEFAULT` resolves to
-    `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY`,
-    then `resolve_default_c_type`), which bound delivery does not implement yet
-    (AB#47239), so it fails per row with `HYC00`. msodbcsql resolves identically
-    and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
-    deferred resolution makes it reachable without the application naming the C
-    type.
+  - A `varbinary` / `image` / CLR UDT column bound `SQL_C_DEFAULT` resolves to
+    `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY` /
+    `SQL_SS_UDT`, then `resolve_default_c_type`), which bound delivery does not
+    implement yet (AB#47239), so it fails per row with `HYC00`. For `varbinary`
+    and `image`, deferred resolution exposes the pre-existing explicit
+    `SQL_C_BINARY` gap without the application naming the C type. A UDT's former
+    `SQL_C_CHAR` default was already unsupported, so the new mapping does not
+    regress observable fetch behavior. msodbcsql resolves all three to
+    `SQL_C_BINARY` and delivers the bytes.
   - A zero-length `SQL_C_BINARY` `SQLGetData` on a column whose **source SQL
     type is fixed-length** (`int`, `datetime2`, ...) reports `01004` /
     `SQL_SUCCESS_WITH_INFO`, where msodbcsql reports `22003` / `SQL_ERROR`. The
