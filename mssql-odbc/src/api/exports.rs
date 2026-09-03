@@ -626,6 +626,9 @@ pub unsafe extern "C" fn SQLPutData(
 ///   even when `BufferLength` is zero or smaller. Its indicator and
 ///   octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
 ///   `SqlLen` values.
+/// - When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer
+///   extents begin at the base plus the pointed-to byte offset, so each
+///   allocation must also cover that leading displacement.
 /// - Non-null rowset pointer attributes must satisfy their declared extents:
 ///   one `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
 ///   `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
@@ -649,7 +652,10 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
 /// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `buffer_length` bytes for a character
 /// or binary target, or of the full C type size for a fixed-width target, even
 /// when `buffer_length` is zero or smaller. `strlen_or_ind_ptr`, when non-null,
-/// must be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// must be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values. When
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents begin
+/// at the base plus the pointed-to byte offset, so each allocation must also
+/// cover that leading displacement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLBindCol(
     statement_handle: SqlHandle,
@@ -684,6 +690,9 @@ pub unsafe extern "C" fn SQLBindCol(
 /// or binary target, or of the full C type size for a fixed-width target, even
 /// when `BufferLength` is zero or smaller. Its indicator and octet-length
 /// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
 /// Non-null rowset pointer attributes must satisfy their declared extents: one
 /// `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
 /// `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`

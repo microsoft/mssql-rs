@@ -35,7 +35,10 @@ use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 /// elements of `buffer_length` bytes for a character or binary target, or of
 /// the full C type size for a fixed-width target, even when `buffer_length` is
 /// zero or smaller. `strlen_or_ind_ptr`, when non-null, must be writable for
-/// `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values. When
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents begin
+/// at the base plus the pointed-to byte offset, so each allocation must also
+/// cover that leading displacement.
 pub(crate) unsafe fn sql_bind_col(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,
@@ -68,7 +71,9 @@ pub(crate) unsafe fn sql_bind_col(
 /// or binary target, or of the full C type size for a fixed-width target, even
 /// when `buffer_length` is zero or smaller. `strlen_or_ind_ptr`, when non-null,
 /// must remain valid and be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen`
-/// values.
+/// values. When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer
+/// extents begin at the base plus the pointed-to byte offset, so each allocation
+/// must also cover that leading displacement.
 unsafe fn sql_bind_col_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,

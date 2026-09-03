@@ -82,6 +82,9 @@ struct PlpColumnInfo {
 /// or binary target, or of the full C type size for a fixed-width target, even
 /// when `BufferLength` is zero or smaller. Its indicator and octet-length
 /// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
 /// `SQL_ATTR_ROWS_FETCHED_PTR` must be writable for one `SqlULen`,
 /// `SQL_ATTR_ROW_STATUS_PTR` for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlUSmallInt`
 /// values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable for one
@@ -107,6 +110,9 @@ pub(crate) unsafe fn sql_fetch_scroll(
 /// or binary target, or of the full C type size for a fixed-width target, even
 /// when `BufferLength` is zero or smaller. Its indicator and octet-length
 /// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
 /// `SQL_ATTR_ROWS_FETCHED_PTR` must be writable for one `SqlULen`,
 /// `SQL_ATTR_ROW_STATUS_PTR` for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlUSmallInt`
 /// values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable for one
