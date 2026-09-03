@@ -37,6 +37,7 @@ pub(crate) enum NumericSource {
         negative: bool,
         int_part: i128,
         fraction_dropped: bool,
+        fractional_precision: u32,
     },
     Float(f64),
 }
@@ -269,6 +270,8 @@ fn parse_wide_decimal(text: &str) -> Option<NumericSource> {
         negative,
         int_part: if negative { -int_part } else { int_part },
         fraction_dropped: frac_digits.bytes().any(|b| b != b'0'),
+        fractional_precision: u32::try_from(frac_digits.trim_end_matches('0').len())
+            .unwrap_or(u32::MAX),
     })
 }
 

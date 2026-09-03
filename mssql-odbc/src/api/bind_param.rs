@@ -833,16 +833,15 @@ mod tests {
         assert_eq!(bound.sql_type, SQL_GUID);
     }
 
-    /// ODBC gives some non-character SQL types a character default C type -
-    /// `SQL_DECIMAL`, `SQL_NUMERIC`, `SQL_SS_VARIANT` resolve to `SQL_C_CHAR`
-    /// and `SQL_SS_XML` to `SQL_C_WCHAR`. Each must bind and store the resolved
-    /// type, since a defaulted binding is the common way to use them.
+    /// ODBC gives some non-character SQL types a character default C type. The
+    /// bind result must agree with the implemented conversion row after that
+    /// default is resolved.
     ///
     /// The set is derived from `resolve_default_c_type` rather than listed, so a
     /// type that starts defaulting to a character C type is covered here without
     /// anyone remembering to add it.
     #[test]
-    fn default_bind_accepts_sql_types_whose_default_c_type_is_character() {
+    fn default_bind_matches_character_conversion_rows() {
         use crate::api::type_rules::classify_parameter_sql_type;
         use crate::handles::OdbcVersion;
 
@@ -890,9 +889,16 @@ mod tests {
                     &mut ind,
                 )
             };
-            assert_eq!(ret, SQL_SUCCESS, "sql_type {sql_type}");
-            let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
-            assert_eq!(bound.c_type, default_c, "sql_type {sql_type}");
+            if is_supported_conversion(default_c, sql_type) {
+                assert_eq!(ret, SQL_SUCCESS, "sql_type {sql_type}");
+                let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
+                assert_eq!(bound.c_type, default_c, "sql_type {sql_type}");
+            } else {
+                assert_eq!(ret, SQL_ERROR, "sql_type {sql_type}");
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+            }
         }
         assert!(checked > 0, "no SQL type defaults to a character C type");
     }

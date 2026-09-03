@@ -46,9 +46,9 @@ const INTEGER_SQL_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INT
 
 const DECIMAL_SQL_TARGETS: &[SqlSmallInt] = &[SQL_DECIMAL, SQL_NUMERIC];
 
-/// `xml` and `sql_variant` take a character payload but declare their own wire
-/// type, so they are listed apart from `CHARACTER_SQL_TARGETS`.
-const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML, SQL_SS_VARIANT];
+/// `xml` takes a character payload but declares its own wire type, so it is
+/// listed apart from `CHARACTER_SQL_TARGETS`.
+const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML];
 
 /// Whether the driver can convert a `c_type` application buffer into `sql_type`
 /// for an input parameter.
@@ -63,11 +63,19 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
         "SQL_C_DEFAULT must be resolved before consulting the conversion matrix"
     );
     let targets: &[&[SqlSmallInt]] = match c_type {
-        SQL_C_CHAR | SQL_C_WCHAR => &[
+        SQL_C_CHAR => &[
             CHARACTER_SQL_TARGETS,
             INTEGER_SQL_TARGETS,
             DECIMAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
+        ],
+        // A narrow `sql_variant` payload cannot be serialized until AB#47800.
+        SQL_C_WCHAR => &[
+            CHARACTER_SQL_TARGETS,
+            INTEGER_SQL_TARGETS,
+            DECIMAL_SQL_TARGETS,
+            CHARACTER_PAYLOAD_SQL_TARGETS,
+            &[SQL_SS_VARIANT],
         ],
         SQL_C_BINARY => &[BINARY_SQL_TARGETS],
         SQL_C_BIT => &[&[SQL_BIT]],
@@ -245,20 +253,20 @@ mod tests {
         }
     }
 
-    /// `SQL_C_DEFAULT` resolves `SQL_DECIMAL`, `SQL_NUMERIC` and
-    /// `SQL_SS_VARIANT` to a character C type and `SQL_SS_XML` to `SQL_C_WCHAR`,
-    /// so these off-diagonal pairings are what make a defaulted binding of those
-    /// types work at all.
+    /// Character C types reach the non-character payloads that can be serialized.
+    /// The narrow `sql_variant` path remains deferred under AB#47800.
     #[test]
     fn a_character_c_type_reaches_the_types_that_default_to_one() {
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
-            for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML, SQL_SS_VARIANT] {
+            for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML] {
                 assert!(
                     is_supported_conversion(c_type, sql_type),
                     "{c_type} -> {sql_type} should be supported"
                 );
             }
         }
+        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_SS_VARIANT));
+        assert!(is_supported_conversion(SQL_C_WCHAR, SQL_SS_VARIANT));
     }
 
     /// The off-diagonal rows are one-way: a character buffer parses a decimal

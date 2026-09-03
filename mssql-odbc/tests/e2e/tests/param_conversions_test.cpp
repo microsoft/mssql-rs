@@ -1046,6 +1046,13 @@ TEST_F(ScalarConversionLiveTest, ADroppedFractionIsAlways22008) {
     ASSERT_SQL_OK(BindFixed(SQL_C_SS_TIME2, SQL_SS_TIME2, t2, 0, 3), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22008");
+    ResetParams();
+
+    t2.fraction = 123000001;
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindFixed(SQL_C_SS_TIME2, SQL_SS_TIME2, t2, 0, 7), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22008");
 }
 
 // Dropping a whole time component onto a date is the same 22008.

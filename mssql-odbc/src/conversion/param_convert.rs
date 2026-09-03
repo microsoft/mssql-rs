@@ -849,11 +849,22 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
     let (mantissa, source_scale) = match parsed {
         NumericSource::Int(v) => (v, 0u32),
         NumericSource::Scaled { mantissa, scale } => (mantissa, scale),
-        // An exponent literal or a >38-digit mantissa has no exact form to
-        // rescale. Both reach the wire through the f64 approximation, which is
-        // what msodbcsql does for the exponent case too (`sqlccnvt.cpp:5118`).
-        other => {
-            let value = DecimalParts::from_f64(other.as_f64(), precision, scale)
+        NumericSource::WideDecimal {
+            approx,
+            fractional_precision,
+            ..
+        } => {
+            if fractional_precision > u32::from(scale) {
+                return Err(ParamBuildError::StringTruncation);
+            }
+            let value = DecimalParts::from_f64(approx, precision, scale)
+                .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+            return Ok((decimal_of(param.sql_type, value), Some(metadata)));
+        }
+        // Exponent literals have no exact form to rescale and reach the wire
+        // through the f64 approximation (`sqlccnvt.cpp:5118`).
+        NumericSource::Float(approx) => {
+            let value = DecimalParts::from_f64(approx, precision, scale)
                 .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
             return Ok((decimal_of(param.sql_type, value), Some(metadata)));
         }
@@ -931,6 +942,9 @@ fn convert_datetime_sql(
         }
         if p.hour > 23 || p.minute > 59 || p.second > 59 || p.fraction_ns > 999_999_999 {
             return Err(invalid);
+        }
+        if !p.fraction_ns.is_multiple_of(100) {
+            return Err(truncated);
         }
         Ok(u64::from(p.hour) * 36_000_000_000
             + u64::from(p.minute) * 600_000_000
@@ -1511,6 +1525,13 @@ mod tests {
         // truncation at all - it is exactly zero.
         let zeros = format!("0.{}", "0".repeat(45));
         assert!(convert_decimal(SQL_DECIMAL, 38, 0, &zeros).is_ok());
+
+        let rounded_away = format!("1.{}1", "0".repeat(39));
+        let err = convert_decimal(SQL_DECIMAL, 38, 0, &rounded_away).unwrap_err();
+        assert_eq!(err.diag().state, *b"22001", "wide decimal fraction");
+
+        let trailing_zeros = format!("0.1{}", "0".repeat(39));
+        assert!(convert_decimal(SQL_DECIMAL, 38, 1, &trailing_zeros).is_ok());
     }
 
     /// `ColumnSize` 0 on a decimal is `HY104`, and that matches msodbcsql for
@@ -1830,6 +1851,13 @@ mod tests {
         };
         let err = convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 3, lossy).unwrap_err();
         assert_eq!(err, ParamBuildError::DateTimeFieldOverflow);
+        assert_eq!(err.diag().state, *b"22008");
+
+        let sub_tick = crate::api::odbc_types::SqlSsTime2Struct {
+            fraction: 123_000_001,
+            ..ok
+        };
+        let err = convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 7, sub_tick).unwrap_err();
         assert_eq!(err.diag().state, *b"22008");
 
         let ts = timestamp_struct(2024, 6, 15, 1, 2, 3, 123_400_000);
