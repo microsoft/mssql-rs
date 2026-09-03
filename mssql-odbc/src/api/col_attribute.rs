@@ -523,8 +523,20 @@ fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
         // money all answer SQL_C_NUMERIC. Money belongs here because it is
         // reported as SQL_DECIMAL in the column form too.
         //
-        // This is the type of the *value*, not a promise that SQL_NUMERIC_STRUCT
-        // is an available SQLGetData target - it is not yet (AB#47816).
+        // Known cost, stated plainly: this answer is not yet serviceable. A
+        // caller that follows the ODBC data-type-mapping workflow and binds the
+        // returned C type gets HYC00 from SQLGetData / SQLBindCol until AB#47816
+        // lands, where msodbcsql succeeds. That mismatch is new here - the
+        // previous answer, SQL_C_CHAR, was always deliverable.
+        //
+        // Shipped in this order deliberately. The alternative was to keep
+        // answering SQL_C_CHAR, which is not a safe holding position: it is the
+        // wrong answer, and it fails silently. mssql-python routes on this value
+        // alone and handed back `str` where the value is a decimal (AB#47702),
+        // with nothing to indicate the type was wrong. A defined
+        // "optional feature not implemented" is a better failure than data of
+        // the wrong shape, and it only reaches a caller that asks for the struct
+        // this driver has never offered on any path.
         TdsDataType::Decimal
         | TdsDataType::DecimalN
         | TdsDataType::Numeric
