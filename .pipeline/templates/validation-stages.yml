@@ -416,6 +416,7 @@ stages:
           buildType: ${{ parameters.buildType }}
           testFilter: -E 'not (test(connectivity))'
           enableClippy: false
+          enableOdbcE2E: true
       - script: |
           set +e
           echo "=== Colima status ==="
@@ -998,11 +999,11 @@ stages:
 
 # Merge the mssql-tds Rust coverage from every OS that runs the tests
 # (Build_Windows, Build_Linux, Test_MacOS), the ODBC C++ e2e coverage
-# (Build_Linux x64 and Build_Windows), and the mssql-py-core coverage from the
-# Python tests (Build_Linux) into one Cobertura report. ADO does not merge
-# coverage across stages/jobs, so it is combined here and published as
-# CoberturaCoverage (the artifact the GitHub diff-cover workflow consumes) and
-# to the ADO coverage tab.
+# (Build_Linux x64, Build_Windows, and Test_MacOS), and the mssql-py-core
+# coverage from the Python tests (Build_Linux) into one Cobertura report. ADO
+# does not merge coverage across stages/jobs, so it is combined here and
+# published as CoberturaCoverage (the artifact the GitHub diff-cover workflow
+# consumes) and to the ADO coverage tab.
 - stage: Coverage
   displayName: Merge Coverage
   dependsOn:
@@ -1046,6 +1047,13 @@ stages:
           artifactName: 'CoberturaCoverageOdbcE2E_Windows'
           targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-windows'
       - task: DownloadPipelineArtifact@2
+        displayName: Download ODBC e2e macOS coverage
+        continueOnError: true
+        inputs:
+          buildType: 'current'
+          artifactName: 'CoberturaCoverageOdbcE2E_MacOS'
+          targetPath: '$(Pipeline.Workspace)/cov-odbc-e2e-macos'
+      - task: DownloadPipelineArtifact@2
         displayName: Download Rust (mssql-tds) macOS coverage
         continueOnError: true
         inputs:
@@ -1080,7 +1088,8 @@ stages:
             "$(Pipeline.Workspace)/cov-rust-linux/cobertura.xml" \
             "$(Pipeline.Workspace)/cov-rust-macos/cobertura.xml" \
             "$(Pipeline.Workspace)/cov-odbc-e2e-linux/cobertura-odbc-e2e.xml" \
-            "$(Pipeline.Workspace)/cov-odbc-e2e-windows/cobertura-odbc-e2e.xml"; do
+            "$(Pipeline.Workspace)/cov-odbc-e2e-windows/cobertura-odbc-e2e.xml" \
+            "$(Pipeline.Workspace)/cov-odbc-e2e-macos/cobertura-odbc-e2e.xml"; do
             [ -f "$report" ] && inputs+=("$report")
           done
           # mssql-py-core coverage is measured from within its own crate
