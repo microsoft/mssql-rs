@@ -258,6 +258,7 @@ impl PyAsyncCursor {
             self.input_sizes.clone(),
             self.input_sizes_generation,
             self.cleanup_required.clone(),
+            self.closed.clone(),
             self.fetch_state.clone(),
             self.description_state.clone(),
             self.rowcount.clone(),

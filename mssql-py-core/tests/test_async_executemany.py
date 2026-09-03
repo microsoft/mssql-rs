@@ -6,6 +6,7 @@
 import asyncio
 import itertools
 import sys
+import threading
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import uuid
@@ -660,6 +661,67 @@ def test_executemany_preflight_cancellation_keeps_session_usable(mock_client_con
     asyncio.run(run())
 
 
+@pytest.mark.integration
+def test_executemany_rejects_cursor_closed_during_preflight(client_context):
+    class BlockingRows:
+        def __init__(self):
+            self.index = 0
+            self.blocked = threading.Event()
+            self.release = threading.Event()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == 256:
+                self.blocked.set()
+                if not self.release.wait(timeout=10):
+                    raise RuntimeError("Timed out waiting to resume parameter preflight")
+            if self.index == 512:
+                raise StopIteration
+            row = (self.index,)
+            self.index += 1
+            return row
+
+    async def run():
+        conn = await connect(client_context)
+        rows = BlockingRows()
+        try:
+            setup = conn.cursor()
+            await setup.execute(
+                "CREATE TABLE #async_executemany_close_race (value int)",
+                use_prepare=False,
+            )
+
+            cursor = conn.cursor()
+            pending = asyncio.ensure_future(
+                cursor.executemany(
+                    "INSERT INTO #async_executemany_close_race VALUES (?)",
+                    rows,
+                    use_prepare=False,
+                )
+            )
+            while not rows.blocked.is_set():
+                await asyncio.sleep(0)
+
+            await cursor.close()
+            rows.release.set()
+            with pytest.raises(RuntimeError, match="Cursor is closed"):
+                await pending
+
+            probe = conn.cursor()
+            await probe.execute(
+                "SELECT COUNT(*) FROM #async_executemany_close_race",
+                use_prepare=False,
+            )
+            assert await probe.fetchone() == (0,)
+        finally:
+            rows.release.set()
+            await conn.close()
+
+    asyncio.run(run())
+
+
 def test_executemany_rejects_mixed_mapping_and_positional_rows(mock_client_context):
     async def run():
         conn = await connect(mock_client_context)
@@ -702,6 +764,28 @@ def test_executemany_inserts_rows_and_aggregates_rowcount(client_context, use_pr
                 use_prepare=False,
             )
             assert await cursor.fetchall() == [(1, "one"), (2, "two"), (3, "three")]
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_yields_at_execution_interval(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #async_executemany_yield (value int)",
+                use_prepare=False,
+            )
+            await cursor.executemany(
+                "INSERT INTO #async_executemany_yield VALUES (?)",
+                [(value,) for value in range(256)],
+                use_prepare=False,
+            )
+            assert cursor.rowcount == 256
         finally:
             await conn.close()
 
@@ -782,6 +866,192 @@ def test_executemany_buffers_row_results_and_preserves_boundaries(client_context
             assert await cursor.fetchall() == [(3,)]
             assert await cursor.nextset() is False
             assert cursor.description is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_buffered_fetch_tracks_partial_and_exhausted_states(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            await cursor.executemany(
+                "SELECT value FROM (VALUES (?), (?), (?)) rows(value) ORDER BY value",
+                [(1, 2, 3)],
+                use_prepare=False,
+            )
+            logger.events.clear()
+
+            assert await cursor.fetchone() == (1,)
+            assert await cursor.fetchall() == [(2,), (3,)]
+            assert await cursor.fetchall() == []
+            assert any(
+                level == 10
+                and "read buffered ExecuteMany rows" in message
+                and module == "async_fetch.rs"
+                for level, message, module in logger.events
+            ), logger.events
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_nextset_can_skip_unread_final_buffered_set(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            await cursor.executemany(
+                "SELECT CAST(? AS int) AS value",
+                [(1,)],
+                use_prepare=False,
+            )
+            assert await cursor.nextset() is False
+            assert cursor.description is None
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_buffered_nextset_description_failure_clears_results(client_context):
+    async def run():
+        conn = await connect(client_context)
+        decimal_module = sys.modules["decimal"]
+        try:
+            cursor = conn.cursor()
+            await cursor.executemany(
+                "SELECT CAST(? AS int) AS value; "
+                "SELECT CAST(? AS decimal(10, 2)) AS value",
+                [(1, 2)],
+                use_prepare=False,
+            )
+            assert await cursor.fetchall() == [(1,)]
+
+            sys.modules["decimal"] = None
+            with pytest.raises(
+                mssql_py_core.InternalError,
+                match="Advanced buffered result set but cursor description materialization failed",
+            ):
+                await cursor.nextset()
+            assert cursor.description is None
+            with pytest.raises(
+                mssql_py_core.ProgrammingError, match="No active result set"
+            ):
+                await cursor.fetchone()
+        finally:
+            sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_buffered_awaitable_creation_failure_restores_fetch_state(
+    client_context,
+):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    conn = None
+
+    async def setup():
+        connection = await connect(client_context)
+        cursor = connection.cursor()
+        await cursor.executemany(
+            "SELECT CAST(? AS int) AS value",
+            [(1,), (2,)],
+            use_prepare=False,
+        )
+        return connection, cursor
+
+    try:
+        conn, cursor = loop.run_until_complete(setup())
+        asyncio.set_event_loop(None)
+        with pytest.raises(RuntimeError, match="running event loop"):
+            cursor.fetchone()
+
+        asyncio.set_event_loop(loop)
+
+        async def fetch_first():
+            return await cursor.fetchone()
+
+        assert loop.run_until_complete(fetch_first()) == (1,)
+
+        asyncio.set_event_loop(None)
+        with pytest.raises(RuntimeError, match="running event loop"):
+            cursor.nextset()
+
+        asyncio.set_event_loop(loop)
+
+        async def advance_and_fetch():
+            assert await cursor.nextset() is True
+            return await cursor.fetchone()
+
+        assert loop.run_until_complete(advance_and_fetch()) == (2,)
+    finally:
+        asyncio.set_event_loop(loop)
+        if conn is not None:
+            async def close_connection():
+                await conn.close()
+
+            loop.run_until_complete(close_connection())
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+@pytest.mark.integration
+def test_executemany_yields_while_buffering_large_result_set(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.executemany(
+                "SELECT TOP (256) CAST(? AS int) AS value FROM sys.all_objects",
+                [(7,)],
+                use_prepare=False,
+            )
+            assert await cursor.fetchall() == [(7,)] * 256
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_collects_secondary_dml_rowcount(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #async_executemany_secondary_count (value int)",
+                use_prepare=False,
+            )
+            await cursor.executemany(
+                "SELECT CAST(? AS int) AS selected; "
+                "INSERT INTO #async_executemany_secondary_count VALUES (?)",
+                [(1, 10), (2, 20)],
+                use_prepare=False,
+            )
+            assert cursor.rowcount == -1
+            assert await cursor.fetchall() == [(1,)]
+            assert await cursor.nextset() is True
+            assert await cursor.fetchall() == [(2,)]
+            assert await cursor.nextset() is False
+
+            await cursor.execute(
+                "SELECT value FROM #async_executemany_secondary_count ORDER BY value",
+                use_prepare=False,
+            )
+            assert await cursor.fetchall() == [(10,), (20,)]
         finally:
             await conn.close()
 

@@ -117,6 +117,7 @@ pub(crate) struct ExecuteResources {
     input_sizes: Option<Vec<ParameterHint>>,
     input_sizes_generation: u64,
     cleanup_required: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
     description_state: Arc<DescriptionState>,
     rowcount: Arc<AtomicI64>,
@@ -136,6 +137,7 @@ impl ExecuteResources {
         input_sizes: Option<Vec<ParameterHint>>,
         input_sizes_generation: u64,
         cleanup_required: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
         fetch_state: Arc<FetchState>,
         description_state: Arc<DescriptionState>,
         rowcount: Arc<AtomicI64>,
@@ -152,6 +154,7 @@ impl ExecuteResources {
             input_sizes,
             input_sizes_generation,
             cleanup_required,
+            closed,
             fetch_state,
             description_state,
             rowcount,
@@ -679,6 +682,7 @@ pub(crate) fn execute<'py>(
         input_sizes,
         input_sizes_generation,
         cleanup_required,
+        closed: _,
         fetch_state,
         description_state,
         rowcount,
@@ -816,6 +820,7 @@ pub(crate) fn executemany<'py>(
         input_sizes,
         input_sizes_generation,
         cleanup_required,
+        closed,
         fetch_state,
         description_state,
         rowcount,
@@ -866,6 +871,9 @@ pub(crate) fn executemany<'py>(
             timeout,
             autocommit,
         };
+        if closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("Cursor is closed"));
+        }
         let claim = session_state
             .claim_execute(cursor_id)
             .map_err(map_claim_error)?;

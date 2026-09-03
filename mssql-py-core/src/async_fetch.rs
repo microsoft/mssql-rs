@@ -565,10 +565,11 @@ fn fetch_buffered<'py>(
         fetch_guard.complete(exhausted, !exhausted || has_next);
         let returned = rows.len();
         let rows = materialize_rows(output, rows).await?;
+        let elapsed_ms = started.elapsed().as_millis();
         tracing::debug!(
             returned,
             exhausted,
-            elapsed_ms = started.elapsed().as_millis(),
+            elapsed_ms,
             "PyAsyncCursor::{operation}: read buffered ExecuteMany rows"
         );
         Ok(rows)
