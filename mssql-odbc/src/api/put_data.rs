@@ -451,8 +451,8 @@ mod tests {
 
     #[test]
     fn nts_byte_count_reads_a_misaligned_wide_buffer() {
-        let mut storage = [0u8; 8];
-        let ptr = unsafe { storage.as_mut_ptr().add(1) };
+        let mut storage = [0u16; 4];
+        let ptr = unsafe { storage.as_mut_ptr().cast::<u8>().add(1) };
         assert_ne!(
             ptr as usize % std::mem::align_of::<u16>(),
             0,
