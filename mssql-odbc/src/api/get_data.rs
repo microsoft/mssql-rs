@@ -234,6 +234,8 @@ fn sql_get_data_safe(
             let length = binary_length(value);
             let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
             stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            // SAFETY: per the SQLGetData contract `strlen_or_ind_ptr` is null or
+            // writable for one `SqlLen`; `write_if_some` null-checks.
             unsafe { write_if_some(strlen_or_ind_ptr, length) };
             return SQL_SUCCESS;
         }
@@ -252,6 +254,11 @@ fn sql_get_data_safe(
                 .get(col_index - 1)
                 .and_then(Option::as_ref)
                 .is_some_and(|value| unsafe {
+                    // SAFETY: forwards the SQLGetData buffer contract —
+                    // `target_value_ptr` is null or writable for `buffer_length`
+                    // bytes and `strlen_or_ind_ptr` null or writable for one
+                    // `SqlLen`. `value` is borrowed from the buffered row, which
+                    // the application buffer cannot alias.
                     try_write_complete_buffered_string(
                         value,
                         target_type,
@@ -275,6 +282,8 @@ fn sql_get_data_safe(
                 .get(col_index - 1)
                 .and_then(Option::as_ref)
                 .is_some_and(|value| unsafe {
+                    // SAFETY: same SQLGetData buffer contract as the string path
+                    // above, with `value` borrowed from the non-aliasing row.
                     try_write_complete_buffered_decimal(
                         value,
                         target_value_ptr,
@@ -295,6 +304,10 @@ fn sql_get_data_safe(
             .get(col_index - 1)
             .and_then(Option::as_ref)
             .is_some_and(|value| unsafe {
+                // SAFETY: the fixed-size arms only write when `target_type`
+                // names a C type the DM sized `target_value_ptr` for, and
+                // `strlen_or_ind_ptr` is null or writable for one `SqlLen`.
+                // `value` is borrowed from the non-aliasing buffered row.
                 try_write_exact_buffered_scalar(
                     value,
                     target_type,
@@ -323,6 +336,10 @@ fn sql_get_data_safe(
                     .get(col_index - 1)
                     .and_then(Option::as_ref)
                     .map(|value| unsafe {
+                        // SAFETY: `is_typed_c_target` restricts `target_type` to
+                        // the fixed-size C types the DM sized `target_value_ptr`
+                        // for; `strlen_or_ind_ptr` is null or writable for one
+                        // `SqlLen`.
                         convert_typed_c(value, target_type, target_value_ptr, strlen_or_ind_ptr)
                     });
             let Some(converted) = converted else {
@@ -458,6 +475,10 @@ unsafe fn try_write_complete_buffered_string(
             && std::str::from_utf8(bytes).is_ok()
             || matches!(value.encoding_type(), EncodingType::LcidBased(_)) && bytes.is_ascii());
     if direct_char && (buffer_length as usize) > bytes.len() {
+        // SAFETY: the caller guarantees `target_value_ptr` is null or writable
+        // for `buffer_length` bytes and `strlen_or_ind_ptr` null or writable for
+        // one `SqlLen`. `buffer_length > bytes.len()` leaves room for the
+        // terminator `copy_with_nul` reserves, and both helpers null-check.
         unsafe {
             write_if_some(
                 strlen_or_ind_ptr,
@@ -476,6 +497,8 @@ unsafe fn try_write_complete_buffered_string(
             .all(|unit| unit[1] == 0 && unit[0].is_ascii());
     let utf16_ascii_len = bytes.len() / 2;
     if utf16_ascii && (buffer_length as usize) > utf16_ascii_len {
+        // SAFETY: same caller contract; `buffer_length > utf16_ascii_len` leaves
+        // room for the narrowed bytes plus the terminator written below.
         unsafe {
             write_if_some(
                 strlen_or_ind_ptr,
@@ -506,6 +529,10 @@ unsafe fn try_write_complete_buffered_string(
         return false;
     }
 
+    // SAFETY: same caller contract; the guard above proved `buffer_length >=
+    // bytes.len() + size_of::<SqlWChar>()`, so the copy and its terminator both
+    // fit. `bytes` belongs to `value`, which the caller guarantees does not
+    // alias the application buffer.
     unsafe {
         write_if_some(
             strlen_or_ind_ptr,
@@ -563,6 +590,10 @@ unsafe fn try_write_complete_buffered_decimal(
     if (buffer_length as usize) <= rendered_len {
         return false;
     }
+    // SAFETY: the caller guarantees `target_value_ptr` is null or writable for
+    // `buffer_length` bytes and `strlen_or_ind_ptr` null or writable for one
+    // `SqlLen`. `buffer_length > rendered_len` leaves room for the rendered
+    // digits plus the terminator.
     unsafe {
         write_if_some(
             strlen_or_ind_ptr,
@@ -600,6 +631,9 @@ unsafe fn try_write_exact_buffered_scalar(
     macro_rules! write_exact {
         ($value:expr) => {{
             let value = $value;
+            // SAFETY: this arm only runs once `target_type` matched the C type of
+            // `value`, which the caller guarantees `target_value_ptr` is sized
+            // for; `strlen_or_ind_ptr` is null or writable for one `SqlLen`.
             unsafe {
                 write_if_some(target_value_ptr.cast(), value);
                 write_if_some(
@@ -723,6 +757,10 @@ fn try_deliver_complete_buffered_unicode_plp(
     };
     let rc = if let Some(chunk) = value {
         if !target_value_ptr.is_null() {
+            // SAFETY: `chunk.read <= out_len <= buffer_length -
+            // size_of::<SqlWChar>()`, so the payload and the terminator that
+            // follows it both fit in the application buffer. `payload` is a
+            // local array and cannot alias it.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     payload.as_ptr(),
@@ -736,9 +774,13 @@ fn try_deliver_complete_buffered_unicode_plp(
                     .write_unaligned(0);
             }
         }
+        // SAFETY: the caller selects this path only with a non-null indicator
+        // pointer, which is writable for one `SqlLen`.
         unsafe { write_if_some(strlen_or_ind_ptr, chunk.read as SqlLen) };
         SQL_SUCCESS
     } else {
+        // SAFETY: as above for the indicator; the caller also guarantees room
+        // for at least one `SqlWChar`, so the empty-string terminator fits.
         unsafe {
             write_if_some(strlen_or_ind_ptr, SQL_NULL_DATA);
             if !target_value_ptr.is_null() {
@@ -955,6 +997,10 @@ fn write_captured_column(
         .map(|(_, o)| o)
         .unwrap_or(0);
     let direct_validated = stmt_state.direct_text_target == Some((col_index, target_type));
+    // SAFETY: `buf_elements` is `buffer_length` converted to the element unit of
+    // `target_type`, so `target_value_ptr` is null or writable for that many
+    // elements; `strlen_or_ind_ptr` is null or writable for one `SqlLen`.
+    // `value` is a captured column that neither pointer aliases.
     if let Some((truncated, consumed, remaining)) = unsafe {
         try_write_direct_captured_string_chunk(
             value,
@@ -1091,6 +1137,8 @@ unsafe fn try_write_direct_captured_string_chunk(
             return None;
         }
         let remaining = bytes.get(offset.min(bytes.len())..)?;
+        // SAFETY: the caller guarantees `strlen_or_ind_ptr` is null or writable
+        // for one `SqlLen`.
         unsafe {
             write_if_some(
                 strlen_or_ind_ptr,
@@ -1098,6 +1146,10 @@ unsafe fn try_write_direct_captured_string_chunk(
             );
         }
         let consumed = buf_elements.saturating_sub(1).min(remaining.len());
+        // SAFETY: for `SQL_C_CHAR` the element unit is the byte, so the caller's
+        // contract makes `target_value_ptr` null or writable for `buf_elements`
+        // bytes — exactly the bound `copy_with_nul` respects, terminator
+        // included. `remaining` borrows `value`, which cannot alias the buffer.
         let truncated =
             unsafe { copy_with_nul(target_value_ptr.cast::<u8>(), buf_elements, remaining) };
         return Some((truncated, consumed, remaining.len()));
@@ -1121,6 +1173,8 @@ unsafe fn try_write_direct_captured_string_chunk(
     let offset = offset.min(total_units);
     let remaining_units = total_units - offset;
     let remaining_bytes = remaining_units.saturating_mul(std::mem::size_of::<SqlWChar>());
+    // SAFETY: the caller guarantees `strlen_or_ind_ptr` is null or writable for
+    // one `SqlLen`.
     unsafe {
         write_if_some(
             strlen_or_ind_ptr,
@@ -1136,12 +1190,17 @@ unsafe fn try_write_direct_captured_string_chunk(
     } else {
         let start = offset.saturating_mul(2);
         for (index, unit) in bytes[start..].chunks_exact(2).take(consumed).enumerate() {
+            // SAFETY: `target` is non-null and, for `SQL_C_WCHAR`, the caller's
+            // contract makes it writable for `buf_elements` `SqlWChar`s;
+            // `index < consumed <= buf_elements - 1`.
             unsafe {
                 target
                     .add(index)
                     .write_unaligned(u16::from_le_bytes([unit[0], unit[1]]));
             }
         }
+        // SAFETY: same contract; `consumed <= buf_elements - 1`, so the
+        // terminator stays within the buffer even when truncating.
         unsafe { target.add(consumed).write_unaligned(0) };
         consumed < remaining_units
     };
@@ -1636,6 +1695,12 @@ fn stream_active_plp_chunk<'a>(
         // call. Initialize it before forming a byte slice because ODBC output
         // buffers may contain uninitialized storage; `max_read` reserves the
         // required terminator bytes.
+        //
+        // SAFETY: `direct_wire_output` required a non-null `target_value_ptr`,
+        // which the DM guarantees is writable for `buffer_length` bytes, and
+        // `max_read <= buffer_length - terminator_bytes`. The zeroing above
+        // initializes every byte the slice exposes, and the slice is the only
+        // live reference to that range for its lifetime.
         unsafe {
             std::ptr::write_bytes(target_value_ptr.cast::<u8>(), 0, max_read);
             std::slice::from_raw_parts_mut(target_value_ptr.cast::<u8>(), max_read)
@@ -1889,6 +1954,11 @@ fn stream_active_plp_chunk<'a>(
         let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
         if buf_elements > 0 && !target_value_ptr.is_null() {
             let copy_bytes = usable.min((buf_elements - 1) * std::mem::size_of::<SqlWChar>());
+            // SAFETY: `target_value_ptr` is non-null and writable for
+            // `buffer_length` bytes, and `copy_bytes <= (buf_elements - 1) *
+            // size_of::<SqlWChar>()`, so the payload and the terminator that
+            // follows it stay in bounds. The copy is skipped for
+            // `direct_wire_output`, where `payload` already aliases this buffer.
             unsafe {
                 if !direct_wire_output {
                     std::ptr::copy_nonoverlapping(
@@ -1904,6 +1974,8 @@ fn stream_active_plp_chunk<'a>(
                     .write_unaligned(0);
             }
         }
+        // SAFETY: per the SQLGetData contract `strlen_or_ind_ptr` is null or
+        // writable for one `SqlLen`.
         unsafe { write_if_some(strlen_or_ind_ptr, usable as SqlLen) };
     } else if transcode_utf16_to_utf8 {
         // NVARCHAR PLP wire bytes are UTF-16LE; transcode to UTF-8 for

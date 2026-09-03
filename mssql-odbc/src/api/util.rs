@@ -96,8 +96,12 @@ pub(crate) unsafe fn copy_utf16_with_nul(dst: *mut SqlWChar, buf_len: usize, src
 
     let copy_len = src_len.min(buf_len - 1);
     for (index, unit) in src.encode_utf16().take(copy_len).enumerate() {
+        // SAFETY: `dst` is non-null and writable for `buf_len` units per the
+        // contract, and `index < copy_len <= buf_len - 1`.
         unsafe { dst.add(index).write_unaligned(unit) };
     }
+    // SAFETY: same contract; `copy_len <= buf_len - 1`, so the terminator lands
+    // within the buffer even when the value was truncated.
     unsafe { dst.add(copy_len).write_unaligned(0) };
     copy_len < src_len
 }

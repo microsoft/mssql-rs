@@ -147,7 +147,11 @@ fn sql_describe_col_w_safe(
     unsafe { write_if_some(name_length_ptr, name_len) };
 
     let truncated = match cached_name {
+        // SAFETY: per the SQLDescribeColW contract `column_name` is null or
+        // writable for `buffer_length` `SqlWChar`s, and `buffer_length` is
+        // nonnegative; both helpers null-check and reserve the terminator.
         Some(name) => unsafe { copy_with_nul(column_name, buffer_length as usize, name) },
+        // SAFETY: as above, writing the same buffer from the uncached name.
         None => unsafe {
             copy_utf16_with_nul(column_name, buffer_length as usize, &meta.column_name)
         },
