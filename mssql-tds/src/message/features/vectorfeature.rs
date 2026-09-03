@@ -161,6 +161,15 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_v2_acknowledged() {
+        let mut feature = VectorFeature::default();
+        feature.set_acknowledged(true);
+        feature.deserialize(&[2u8]).unwrap();
+        assert!(feature.is_acknowledged());
+        assert_eq!(feature.negotiated_version(), 2);
+    }
+
+    #[test]
     fn test_deserialize_invalid_length() {
         let mut feature = VectorFeature::default();
         let data = vec![1u8, 0u8]; // Wrong length (2 bytes instead of 1)

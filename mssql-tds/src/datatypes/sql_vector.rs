@@ -306,4 +306,20 @@ mod tests {
         let vector = SqlVector::try_from_f32(values).unwrap();
         assert_eq!(vector.base_type(), VectorBaseType::Float32);
     }
+
+    #[test]
+    fn test_from_f16_valid() {
+        let vector = SqlVector::try_from_f16(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(vector.base_type(), VectorBaseType::Float16);
+        assert_eq!(vector.dimension_count(), 3);
+        assert_eq!(vector.as_f32(), Some(&[1.0, 2.0, 3.0][..]));
+        assert_eq!(vector.total_size(), VECTOR_HEADER_SIZE + 3 * 2);
+    }
+
+    #[test]
+    fn test_f16_allows_more_dimensions_than_f32() {
+        let values = vec![0.0f32; VectorBaseType::Float16.max_dimensions() as usize];
+        assert!(SqlVector::try_from_f16(values.clone()).is_ok());
+        assert!(SqlVector::try_from_f32(values).is_err());
+    }
 }
