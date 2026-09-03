@@ -138,17 +138,20 @@ transparent reconnects.
   moved from `SQLBindParameter` to execute - the DAE indicator is only read
   while building the parameter list - so an application gets `HYC00` from
   `SQLExecute` after setting up its `SQLParamData` loop rather than at bind.
-  msodbcsql returns `SQL_NEED_DATA` for this pairing at `SQLExecute` rather
-  than refusing there, but it does not actually stream it: `SQLPutData`
-  itself then rejects with `HY019` ("Processing of fixed length targets
-  cannot be spread over multiple calls to SQLPutData",
-  `sqlccmd.cpp:11079-11082`, `:11185-11188`) once the streamed value's
-  integer target is a fixed-length one. So the two drivers agree that this
-  pairing cannot stream a value through, they just detect it one call apart
-  -- msodbcsql at `SQLPutData`, this driver at `SQLExecute` -- which is why
-  the parity run stays skipped rather than comparing error codes that
-  differ by construction.
-  Pinned by `CrossFamilyDataAtExecutionIsRejectedAtExecute` and, for the
+
+  **Superseded.** The pairing is no longer refused at all: the chunks are
+  collected and the complete value goes through the same conversion the
+  materialized path uses, so text supplied in pieces parses to an integer
+  exactly as it does when bound in one buffer. Measured against the
+  reference driver, which accepts the `SQLPutData` and returns the same
+  value, so `CrossFamilyDataAtExecutionConvertsToInteger` runs on the
+  comparison leg rather than opting out.
+
+  An earlier note here claimed the reference driver rejects this pairing
+  once the value is supplied in pieces. It does not: the claim came from
+  reading its source rather than running it, and probing both drivers
+  disproved it.
+  Pinned by `CrossFamilyDataAtExecutionConvertsToInteger` and, for the
   wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
   / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
   `execute_test.cpp`.
