@@ -128,8 +128,12 @@ authoritative parity reference for this crate. Its source lives in the
     (AB#47239), so it fails per row with `HYC00`. msodbcsql resolves identically
     and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
     deferred resolution makes it reachable without the application naming the C
-    type. `SQLGetData` answers the same way through the resolved target — it
-    serves `SQL_C_BINARY` only as the zero-length length probe (AB#47815).
+    type. `SQLGetData` answers the same way through the resolved target, but
+    how much of the `SQL_C_BINARY` contract survives depends on the path: a
+    non-PLP `varbinary(n)` still answers the zero-length length probe, while a
+    `varbinary(max)` / `image` refuses even that, because
+    `stream_active_plp_chunk` admits only the two character targets before it
+    looks at `BufferLength` (AB#47815).
   - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
     writes the client code page. msodbcsql uses the client code page -
     `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`

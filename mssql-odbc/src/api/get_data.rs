@@ -359,12 +359,27 @@ fn finish_get_data(
 /// Refusing costs nothing an application had before: the same call answered
 /// `HYC00` prior to AB#47815.
 ///
-/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which this path
-/// still serves only as the zero-length length probe (AB#47239), so a real read
-/// of one keeps returning `HYC00` through the resolved target. That matches the
-/// posture the bound path took in AB#47481; msodbcsql resolves identically and
-/// delivers the bytes. The probe itself is unaffected by the width check —
-/// `SQL_C_BINARY` is application-sized, so it has no fixed width to test.
+/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which neither
+/// delivery path implements yet (AB#47239), so a real read keeps returning
+/// `HYC00` through the resolved target. That matches the posture the bound path
+/// took in AB#47481; msodbcsql resolves identically and delivers the bytes.
+///
+/// **How much the resolved `SQL_C_BINARY` still answers depends on the path**,
+/// so the two are worth stating separately:
+///
+/// - Non-PLP (`varbinary(n)`, `binary(n)`): the zero-length length probe works.
+///   [`write_captured_column`]'s `binary_probe` reports the byte count and
+///   leaves the value resident; only a read with a real buffer is `HYC00`.
+/// - PLP (`varbinary(max)`, `image`): even the probe is `HYC00`.
+///   [`stream_active_plp_chunk`] admits only `SQL_C_CHAR` / `SQL_C_WCHAR` and
+///   rejects everything else before it looks at `buffer_length`, so there is no
+///   probe branch to reach. A NULL is the exception — it never enters the
+///   streaming path at all.
+///
+/// Both are pre-existing for an explicit `SQL_C_BINARY` read; resolution only
+/// makes them reachable without the application naming the C type. The width
+/// check above never fires for either, since `SQL_C_BINARY` is
+/// application-sized and so has no fixed width to test.
 fn resolve_default_target(
     stmt_state: &StmtState,
     col_index: usize,

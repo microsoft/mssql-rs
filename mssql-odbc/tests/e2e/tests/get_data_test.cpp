@@ -1850,6 +1850,9 @@ TEST_F(GetDataLiveTest, DefaultTargetTooNarrowForItsFixedTargetIsRefused) {
 // bound path took when it started resolving the placeholder; msodbcsql resolves
 // identically and delivers the bytes, so this does not run on the reference
 // leg.
+//
+// Scoped to a non-PLP varbinary(n) deliberately: a VARBINARY(MAX) refuses the
+// probe too, which the next test pins.
 TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnIsStillUnimplemented) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x4142434445464748 AS VARBINARY(8))"),
@@ -1871,6 +1874,54 @@ TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnIsStillUnimplemented) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 
     SQLCloseCursor(stmt_);
+}
+
+// The PLP half of the same story, and the boundary the test above does not
+// cross. A non-NULL VARBINARY(MAX) also resolves to SQL_C_BINARY, but there
+// even the zero-length probe is HYC00: stream_active_plp_chunk admits only
+// SQL_C_CHAR/SQL_C_WCHAR and rejects everything else before it looks at
+// BufferLength, so there is no probe branch to reach. The non-PLP
+// VARBINARY(8) above answers that same probe with a length, so the two spell
+// out where the difference actually lies.
+//
+// Asserted as "the defaulted spelling agrees with the explicit one" rather than
+// against a hardcoded state, because that agreement is what this PR is
+// responsible for; the HYC00 itself is pre-existing and owned by AB#47239,
+// which is expected to turn both into real binary delivery. Each spelling gets
+// its own result set: a PLP column whose stream was begun and then refused
+// cannot be re-read on the same row (the second call reports 07009 from the
+// cursor's forward-only guard, not the target gate), so reusing one row would
+// measure that instead.
+//
+// NULL is deliberately not covered here: it never enters the streaming path
+// (see NullVarbinaryMaxToBinaryTargetReportsNull).
+//
+// msodbcsql delivers the bytes on both, so this does not run on the reference
+// leg.
+TEST_F(GetDataLiveTest, DefaultTargetOnABinaryMaxColumnRefusesEvenTheProbe) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const char* kQuery = "SELECT CAST(0x4142434445464748 AS VARBINARY(MAX))";
+
+    // Resolved from SQL_C_DEFAULT.
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR probeBuf[1] = {};
+    SQLLEN probe = -99;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_DEFAULT, probeBuf, 0, &probe));
+    const std::string defaulted = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+    SQLCloseCursor(stmt_);
+
+    // The same probe with the C type named explicitly.
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLLEN explicitProbe = -99;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_BINARY, probeBuf, 0, &explicitProbe));
+    const std::string named = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+    SQLCloseCursor(stmt_);
+
+    EXPECT_EQ("HYC00", defaulted) << "a MAX binary column refuses even the probe";
+    EXPECT_EQ(named, defaulted)
+        << "resolving SQL_C_DEFAULT must give the same answer as naming SQL_C_BINARY";
 }
 
 // The placeholder is resolved ahead of the captured/PLP dispatch, so it reaches
