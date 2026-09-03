@@ -9,10 +9,10 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP,
-    SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
-    SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT,
+    SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
+    SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
@@ -227,7 +227,8 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
         // mssql-python keys its sql_variant handling off this exact type, so
         // reporting the column as character data hides the variant entirely.
         TdsDataType::SsVariant => SQL_SS_VARIANT,
-        TdsDataType::Vector | TdsDataType::Udt => SQL_VARCHAR,
+        TdsDataType::Udt => SQL_SS_UDT,
+        TdsDataType::Vector => SQL_VARCHAR,
         _ => SQL_UNKNOWN_TYPE,
     }
 }
@@ -316,11 +317,6 @@ pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) 
     }
 }
 
-// Unit tests cover the validation/error paths only. The metadata-driven mapping
-// helpers (`odbc_sql_type`, `column_size`, `decimal_digits`) cannot be exercised
-// here because `mssql_tds::ColumnMetadata::type_info_variant` is `pub(crate)`
-// and there is no public constructor — those branches are covered end-to-end by
-// `tests/e2e/tests/describe_col_test.cpp` against a live SQL Server.
 #[cfg(test)]
 mod tests {
     use std::ptr;
@@ -355,6 +351,17 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { describe(ptr::null_mut(), 1) };
         assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn udt_column_reports_sql_ss_udt() {
+        let mut metadata = int_columns(1);
+        let meta = metadata.first_mut().unwrap();
+        meta.data_type = TdsDataType::Udt;
+        meta.type_info.tds_type = TdsDataType::Udt;
+        meta.type_info.length = usize::from(u16::MAX);
+
+        assert_eq!(odbc_sql_type(meta), SQL_SS_UDT);
     }
 
     #[test]
