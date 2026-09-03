@@ -10,7 +10,7 @@ use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
     SQL_NULLABLE, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
-    SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
     SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
     SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
@@ -238,12 +238,20 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
         // mssql-python keys its sql_variant handling off this exact type, so
         // reporting the column as character data hides the variant entirely.
         TdsDataType::SsVariant => SQL_SS_VARIANT,
-        TdsDataType::Vector | TdsDataType::Udt => SQL_VARCHAR,
+        TdsDataType::Udt => SQL_SS_UDT,
+        // Result delivery does not support SQL_C_SS_VECTOR yet; retaining the
+        // character type keeps SQL_C_DEFAULT fetches on the working text path.
+        TdsDataType::Vector => SQL_VARCHAR,
         _ => SQL_UNKNOWN_TYPE,
     }
 }
 
 pub(crate) fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+    // CLR UDT metadata is PLP even when MAX_BYTE_SIZE is bounded. Only 0xFFFF
+    // carries the unbounded convention used by geography and geometry.
+    if meta.data_type == TdsDataType::Udt && meta.type_info.length != usize::from(u16::MAX) {
+        return meta.type_info.length as u64;
+    }
     // PLP / `*(max)` / xml / json: ColumnSize is "unbounded". Report 0 per ODBC spec
     if meta.is_plp() {
         return 0;
@@ -327,17 +335,13 @@ pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) 
     }
 }
 
-// Precision- and scale-dependent branches in `column_size` and `decimal_digits` cannot
-// be exercised here because `mssql_tds::ColumnMetadata::type_info_variant` is `pub(crate)`
-// and there is no public constructor — those branches are covered end-to-end by
-// `tests/e2e/tests/describe_col_test.cpp` against a live SQL Server.
 #[cfg(test)]
 mod tests {
     use std::ptr;
 
     use super::*;
     use crate::test_support::TestHandles;
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{int_columns, udt_column};
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
@@ -368,6 +372,18 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { describe(ptr::null_mut(), 1) };
         assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn udt_column_reports_sql_ss_udt_metadata() {
+        for (max_byte_size, expected_column_size) in [(u16::MAX, 0), (892, 892)] {
+            let meta = udt_column(max_byte_size);
+
+            assert!(meta.is_plp());
+            assert_eq!(odbc_sql_type(&meta), SQL_SS_UDT);
+            assert_eq!(column_size(&meta), expected_column_size);
+            assert_eq!(decimal_digits(&meta), 0);
+        }
     }
 
     #[test]
