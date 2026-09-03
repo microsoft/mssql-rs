@@ -5,6 +5,7 @@
 
 import asyncio
 import itertools
+import sys
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import uuid
@@ -15,11 +16,19 @@ import pytest
 import mssql_py_core
 
 
-async def connect(client_context, *, autocommit=True):
+class RecordingLogger:
+    def __init__(self):
+        self.events = []
+
+    def py_core_log(self, level, message, module_name, _line):
+        self.events.append((level, message, module_name))
+
+
+async def connect(client_context, python_logger=None, *, autocommit=True):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         return await mssql_py_core.PyAsyncConnection.connect(
-            client_context, autocommit=autocommit
+            client_context, python_logger, autocommit=autocommit
         )
 
 
@@ -513,11 +522,18 @@ def test_executemany_large_batch_mixed_types_parity(client_context):
 
 def test_executemany_preflight_parameter_shape_parity(mock_client_context):
     async def run():
-        conn = await connect(mock_client_context)
+        logger = RecordingLogger()
+        conn = await connect(mock_client_context, logger)
         try:
             cursor = conn.cursor()
             with pytest.raises(TypeError, match="row 1"):
                 await cursor.executemany("SELECT ?, ?", [(1, 2), (3,)])
+            assert any(
+                level == 40
+                and "PyAsyncCursor::executemany: parameter preflight failed" in message
+                and "row 1" in message
+                for level, message, _module in logger.events
+            )
         finally:
             await conn.close()
 
@@ -616,9 +632,11 @@ def test_executemany_preflight_yields_to_event_loop(mock_client_context):
 
 def test_executemany_preflight_cancellation_keeps_session_usable(mock_client_context):
     async def run():
-        conn = await connect(mock_client_context)
+        logger = RecordingLogger()
+        conn = await connect(mock_client_context, logger)
         try:
             cursor = conn.cursor()
+            logger.events.clear()
             task = asyncio.ensure_future(
                 cursor.executemany("SELECT ?", itertools.repeat((1,)))
             )
@@ -628,6 +646,14 @@ def test_executemany_preflight_cancellation_keeps_session_usable(mock_client_con
                 await task
 
             assert await cursor.execute("SET NOCOUNT ON", use_prepare=False) is cursor
+            assert any(
+                level == 30
+                and "PyAsyncCursor::executemany: interrupted during parameter preflight"
+                in message
+                and "connection remains usable" in message
+                and module == "async_execute.rs"
+                for level, message, module in logger.events
+            )
         finally:
             await conn.close()
 
@@ -875,6 +901,125 @@ def test_executemany_error_can_be_rolled_back_in_explicit_transaction(client_con
                 use_prepare=False,
             )
             assert await cursor.fetchone() == (None,)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_logs_completion_and_execution_failure(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            await execute(cursor, "CREATE TABLE #em_trace (id int PRIMARY KEY)")
+            logger.events.clear()
+
+            await cursor.executemany("INSERT INTO #em_trace VALUES (?)", [(1,), (2,)])
+            assert any(
+                level == 20
+                and "PyAsyncCursor::executemany: completed" in message
+                and "batch_count=2" in message
+                and "preflight_ms=" in message
+                and "execution_ms=" in message
+                and "elapsed_ms=" in message
+                for level, message, _module in logger.events
+            )
+
+            logger.events.clear()
+            with pytest.raises(mssql_py_core.DatabaseError):
+                await cursor.executemany("INSERT INTO #em_trace VALUES (?)", [(3,), (1,)])
+            assert any(
+                level == 40
+                and "PyAsyncCursor::executemany: failed" in message
+                and "failed_row_index=1" in message
+                and "error=" in message
+                for level, message, _module in logger.events
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_logs_description_materialization_failure(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        decimal_module = sys.modules["decimal"]
+        try:
+            cursor = conn.cursor()
+            logger.events.clear()
+            sys.modules["decimal"] = None
+            with pytest.raises(
+                mssql_py_core.InternalError,
+                match="cursor description materialization failed",
+            ):
+                await cursor.executemany(
+                    "SELECT CAST(? AS decimal(10, 2)) AS value",
+                    [(1,)],
+                    use_prepare=False,
+                )
+            assert any(
+                level == 40
+                and "PyAsyncCursor::executemany: cursor description materialization failed"
+                in message
+                and "result_set_count=1" in message
+                and "buffered_row_count=1" in message
+                and "description_materialization_ms=" in message
+                for level, message, _module in logger.events
+            )
+        finally:
+            sys.modules["decimal"] = decimal_module
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_executemany_logs_interruption_during_execution(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            logger.events.clear()
+            task = asyncio.ensure_future(
+                cursor.executemany(
+                    "WAITFOR DELAY '00:00:05'; SELECT ?",
+                    [(1,)],
+                    use_prepare=False,
+                )
+            )
+            for _ in range(100):
+                if any(
+                    "PyAsyncCursor::executemany: executing parameter rows" in message
+                    for _level, message, _module in logger.events
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("ExecuteMany did not start wire execution")
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            for _ in range(100):
+                if any(
+                    level == 30
+                    and "PyAsyncCursor::executemany: interrupted" in message
+                    and "phase=execution" in message
+                    and "connection marked broken" in message
+                    and module == "async_execute.rs"
+                    for level, message, module in logger.events
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"Missing execution interruption warning: {logger.events}")
         finally:
             await conn.close()
 

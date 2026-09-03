@@ -28,7 +28,9 @@ use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatu
 use crate::async_parameters::{
     ParameterBindingPlan, ParameterMetadata, bind_parameters, parse_input_sizes,
 };
-use crate::async_session::{AsyncConnectionState, CursorId, ExecuteClaim, SessionOperationGuard};
+use crate::async_session::{
+    AsyncConnectionState, CursorId, ExecuteClaim, OperationId, SessionOperationGuard,
+};
 use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::row_writer::PyRowWriter;
 use crate::types::ParameterHint;
@@ -336,6 +338,88 @@ struct ExecuteManyBindingState {
     parameter_sets: Vec<BoundParameterSet>,
     plan: Option<ParameterBindingPlan>,
     named: Option<bool>,
+}
+
+struct ExecuteManyPreflightGuard {
+    cursor_id: CursorId,
+    dispatch: Option<tracing::Dispatch>,
+    completed: bool,
+}
+
+impl ExecuteManyPreflightGuard {
+    fn new(cursor_id: CursorId, dispatch: Option<tracing::Dispatch>) -> Self {
+        Self {
+            cursor_id,
+            dispatch,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ExecuteManyPreflightGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::warn!(
+                cursor_id = self.cursor_id,
+                "PyAsyncCursor::executemany: interrupted during parameter preflight; cursor_id={}; connection remains usable",
+                self.cursor_id
+            );
+        }
+    }
+}
+
+struct ExecuteManyInterruptionGuard {
+    cursor_id: CursorId,
+    operation_id: OperationId,
+    phase: &'static str,
+    dispatch: Option<tracing::Dispatch>,
+    completed: bool,
+}
+
+impl ExecuteManyInterruptionGuard {
+    fn new(
+        cursor_id: CursorId,
+        operation_id: OperationId,
+        dispatch: Option<tracing::Dispatch>,
+    ) -> Self {
+        Self {
+            cursor_id,
+            operation_id,
+            phase: "execution",
+            dispatch,
+            completed: false,
+        }
+    }
+
+    fn set_phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ExecuteManyInterruptionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::warn!(
+                cursor_id = self.cursor_id,
+                operation_id = self.operation_id,
+                phase = self.phase,
+                "PyAsyncCursor::executemany: interrupted; cursor_id={}; operation_id={}; phase={}; connection marked broken",
+                self.cursor_id,
+                self.operation_id,
+                self.phase
+            );
+        }
+    }
 }
 
 async fn execute_many_on_client(
@@ -738,12 +822,43 @@ pub(crate) fn executemany<'py>(
         buffered_results,
     } = resources;
     let seq_of_parameters = seq_of_parameters.clone().unbind();
+    let trace_dispatch = dispatch.clone();
 
     let future = async move {
-        let (operation, parameter_sets) =
-            bind_parameter_sets(operation, seq_of_parameters, input_sizes).await?;
+        let started = Instant::now();
+        let preflight_started = Instant::now();
+        let mut preflight_guard = ExecuteManyPreflightGuard::new(cursor_id, trace_dispatch.clone());
+        tracing::debug!(
+            cursor_id,
+            "PyAsyncCursor::executemany: parameter preflight started; cursor_id={cursor_id}"
+        );
+        let preflight = bind_parameter_sets(operation, seq_of_parameters, input_sizes).await;
+        let preflight_ms = preflight_started.elapsed().as_millis();
+        let (operation, parameter_sets) = match preflight {
+            Ok(bound) => {
+                preflight_guard.complete();
+                bound
+            }
+            Err(error) => {
+                preflight_guard.complete();
+                tracing::error!(
+                    cursor_id,
+                    preflight_ms,
+                    error = %error,
+                    "PyAsyncCursor::executemany: parameter preflight failed; cursor_id={cursor_id}; preflight_ms={preflight_ms}; error={error}"
+                );
+                return Err(error);
+            }
+        };
         let parameter_count = parameter_sets.first().map_or(0, |set| set.0.len());
         let batch_count = parameter_sets.len();
+        tracing::debug!(
+            cursor_id,
+            batch_count,
+            parameter_count,
+            preflight_ms,
+            "PyAsyncCursor::executemany: parameter preflight completed; cursor_id={cursor_id}; batch_count={batch_count}; parameter_count={parameter_count}; preflight_ms={preflight_ms}"
+        );
         let request = ExecuteManyRequest {
             operation,
             parameter_sets,
@@ -762,14 +877,18 @@ pub(crate) fn executemany<'py>(
             buffered_results.replace(VecDeque::new());
             let mut operation_guard =
                 SessionOperationGuard::new(session_state.clone(), operation_id);
+            let mut interruption_guard =
+                ExecuteManyInterruptionGuard::new(cursor_id, operation_id, trace_dispatch);
             cleanup_required.store(true, Ordering::Release);
             tracing::info!(
                 batch_count,
                 parameter_count,
                 use_prepare,
-                "PyAsyncCursor::executemany: executing parameter rows"
+                preflight_ms,
+                "PyAsyncCursor::executemany: executing parameter rows; batch_count={batch_count}; parameter_count={parameter_count}; use_prepare={use_prepare}; preflight_ms={preflight_ms}"
             );
 
+            let execution_started = Instant::now();
             let (result, info_messages, has_open_batch) = {
                 let mut client = client.lock().await;
                 let result =
@@ -782,25 +901,48 @@ pub(crate) fn executemany<'py>(
                 let has_open_batch = client.has_open_batch();
                 (result, info_messages, has_open_batch)
             };
+            let execution_ms = execution_started.elapsed().as_millis();
 
             match result {
                 Ok((total_rows_affected, results)) => {
                     let produced_rows = !results.is_empty();
+                    let result_set_count = results.len();
+                    let buffered_row_count = results
+                        .iter()
+                        .map(|result| result.rows.len())
+                        .sum::<usize>();
                     let total_rows_affected = if batch_count == 0 {
                         0
                     } else {
                         total_rows_affected
                     };
                     let metadata = results.front().map(|result| result.metadata.clone());
+                    interruption_guard.set_phase("description_materialization");
+                    let description_started = Instant::now();
                     let description = match materialize(metadata).await {
                         Ok(description) => description,
                         Err(error) => {
+                            let description_materialization_ms =
+                                description_started.elapsed().as_millis();
+                            record_result_set_status("error");
+                            tracing::error!(
+                                batch_count,
+                                result_set_count,
+                                buffered_row_count,
+                                preflight_ms,
+                                execution_ms,
+                                description_materialization_ms,
+                                error = %error,
+                                "PyAsyncCursor::executemany: cursor description materialization failed; batch_count={batch_count}; result_set_count={result_set_count}; buffered_row_count={buffered_row_count}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; description_materialization_ms={description_materialization_ms}; error={error}"
+                            );
                             operation_guard.settle(false);
+                            interruption_guard.complete();
                             return Err(InternalError::new_err(format!(
                                 "ExecuteMany completed but cursor description materialization failed: {error}"
                             )));
                         }
                     };
+                    let description_materialization_ms = description_started.elapsed().as_millis();
                     buffered_results.replace(results);
                     description_state.replace(description);
                     fetch_state.set(if produced_rows {
@@ -810,6 +952,7 @@ pub(crate) fn executemany<'py>(
                     });
                     rowcount.store(total_rows_affected, Ordering::Release);
                     operation_guard.finish_execute(produced_rows);
+                    interruption_guard.complete();
                     if batch_count > 0 {
                         consume_input_sizes(&cursor, input_sizes_generation);
                     }
@@ -818,20 +961,37 @@ pub(crate) fn executemany<'py>(
                     } else {
                         "no_rows"
                     });
+                    let elapsed_ms = started.elapsed().as_millis();
                     tracing::info!(
                         batch_count,
                         total_rows_affected,
                         produced_rows,
-                        "PyAsyncCursor::executemany: completed"
+                        result_set_count,
+                        buffered_row_count,
+                        preflight_ms,
+                        execution_ms,
+                        description_materialization_ms,
+                        elapsed_ms,
+                        "PyAsyncCursor::executemany: completed; batch_count={batch_count}; total_rows_affected={total_rows_affected}; produced_rows={produced_rows}; result_set_count={result_set_count}; buffered_row_count={buffered_row_count}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; description_materialization_ms={description_materialization_ms}; elapsed_ms={elapsed_ms}"
                     );
                     Ok(cursor)
                 }
                 Err(error) => {
                     record_result_set_status("error");
-                    operation_guard.settle(error.failure.break_connection || has_open_batch);
+                    let connection_marked_broken = error.failure.break_connection || has_open_batch;
+                    operation_guard.settle(connection_marked_broken);
+                    interruption_guard.complete();
+                    let elapsed_ms = started.elapsed().as_millis();
                     tracing::error!(
                         failed_row_index = error.row_index,
-                        "PyAsyncCursor::executemany: failed"
+                        connection_marked_broken,
+                        preflight_ms,
+                        execution_ms,
+                        elapsed_ms,
+                        error = %error.failure.error,
+                        "PyAsyncCursor::executemany: failed; failed_row_index={}; connection_marked_broken={connection_marked_broken}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; elapsed_ms={elapsed_ms}; error={}",
+                        error.row_index,
+                        error.failure.error
                     );
                     let error = map_tds_error(
                         &format!(
