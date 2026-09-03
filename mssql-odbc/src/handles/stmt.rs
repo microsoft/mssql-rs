@@ -647,20 +647,36 @@ impl InertStmtAttrs {
     }
 }
 
-/// One data-at-execution parameter: which binding it refers to, the token
-/// `SQLParamData` returns, and how many bytes the application promised for it.
+/// One data-at-execution parameter: the token `SQLParamData` returns, how
+/// many bytes the application promised for it, and the C/SQL type pairing
+/// `dae_placeholder_type` resolved at execute time.
 ///
 /// Keeping these fields together means the execution-time token and declared
 /// length cannot drift away from the binding they describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DaeParam {
-    /// 0-based index into [`StmtState::bound_params`].
-    pub(crate) bound_index: usize,
     /// `ParameterValuePtr` with the execution's bind offset already applied.
     pub(crate) value_ptr: SqlPointer,
     /// Total byte count declared by `SQL_LEN_DATA_AT_EXEC(n)`; `None` for
     /// `SQL_DATA_AT_EXEC`, where the application promised no total.
     pub(crate) expected_len: Option<usize>,
+    /// Set from `dae_placeholder_type`'s report at the same time the streamed
+    /// wire type was decided. `SQLPutData` buffers this parameter's chunks in
+    /// [`DaeProgress::pending_bytes`] instead of writing them to the wire, and
+    /// they are transcoded once, as a whole, when the parameter closes.
+    pub(crate) needs_transcode: bool,
+    /// `BoundParam::c_type` / `BoundParam::sql_type`, snapshotted here at the
+    /// same time as `needs_transcode` rather than re-read from
+    /// `StmtState::bound_params` at close time. `SQLFreeStmt(SQL_RESET_PARAMS)`
+    /// can clear a binding while its data-at-execution sequence is still open,
+    /// and a rebind could change the encoding after the wire placeholder was
+    /// already fixed; the snapshot can neither vanish nor drift underneath the
+    /// sequence it describes. This is the *only* place the sequence reads
+    /// either type from -- no consumer indexes back into `bound_params`, so
+    /// there is one source of truth for the whole sequence, not two that
+    /// could disagree.
+    pub(crate) c_type: SqlSmallInt,
+    pub(crate) sql_type: SqlSmallInt,
 }
 
 /// How much of the open data-at-execution parameter the application has
@@ -677,6 +693,11 @@ pub(crate) struct DaeProgress {
     /// The parameter was supplied as SQL NULL, so the declared-length check is
     /// skipped, as in msodbcsql.
     pub(crate) is_null: bool,
+    /// Raw `SQLPutData` bytes accumulated so far, in the C type's own
+    /// encoding. Only appended to -- instead of being streamed to the wire
+    /// immediately -- when [`DaeParam::needs_transcode`] is set; empty and
+    /// unused otherwise.
+    pub(crate) pending_bytes: Vec<u8>,
 }
 
 /// A data-at-execution sequence in progress: everything the statement holds
@@ -1142,15 +1163,14 @@ impl StmtState {
             .map_or(std::ptr::null_mut(), |param| param.value_ptr)
     }
 
-    /// The bound C type of the open DAE parameter, which `SQLPutData` needs to
-    /// size an `SQL_NTS` chunk.
+    /// The C type of the open DAE parameter, which `SQLPutData` needs to size
+    /// an `SQL_NTS` chunk. Reads [`DaeParam::c_type`] -- the snapshot taken at
+    /// execute time -- rather than `bound_params`, so it agrees with the type
+    /// `SQLParamData` transcodes with even if `SQLFreeStmt(SQL_RESET_PARAMS)`
+    /// or a rebind changes or clears the live binding while the sequence is
+    /// open.
     pub(crate) fn dae_current_c_type(&self) -> Option<SqlSmallInt> {
-        self.dae_current_bound_param().map(|param| param.c_type)
-    }
-
-    fn dae_current_bound_param(&self) -> Option<&BoundParam> {
-        let dae_param = self.dae.as_ref()?.current_param()?;
-        self.bound_params.get(dae_param.bound_index)?.as_ref()
+        self.dae.as_ref()?.current_param().map(|param| param.c_type)
     }
 }
 

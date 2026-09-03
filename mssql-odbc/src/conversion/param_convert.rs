@@ -7,20 +7,26 @@
 //! Which C/SQL pairings reach this module is decided at bind time by
 //! [`crate::api::type_rules`] and [`crate::params::conversion_matrix`];
 //! `SQL_C_DEFAULT` has already been resolved to a concrete C type by then.
-//! Data-at-execution is rejected with `HYC00`, `SQL_DEFAULT_PARAM` with
-//! `07S01`, and an invalid negative `StrLen_or_Ind` with `HY090`.
+//! Cross-*family* data-at-execution (character streamed against binary, or
+//! vice versa) is rejected with `HYC00`; a same-family wideness mismatch
+//! (`SQL_C_WCHAR` streamed against a narrow SQL type, or the reverse) is
+//! buffered and transcoded once instead of being rejected -- see
+//! [`dae_placeholder_type`] and [`transcode_dae_bytes`]. `SQL_DEFAULT_PARAM`
+//! is rejected with `07S01`, and an invalid negative `StrLen_or_Ind` with
+//! `HY090`.
 //!
 //! A `SQL_NULL_DATA` parameter is materialised as a typed TDS NULL from
 //! `sql_type` -- see [`typed_null`].
 
 use std::borrow::Cow;
 
-use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{
     RpcParameter, RpcTypeMetadata, StatusFlags, StreamedSqlType,
 };
+use mssql_tds::token::tokens::SqlCollation;
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
@@ -192,42 +198,166 @@ pub(crate) fn is_data_at_exec_indicator(indicator: SqlLen) -> bool {
     indicator == SQL_DATA_AT_EXEC || indicator <= SQL_LEN_DATA_AT_EXEC_OFFSET
 }
 
+/// What a data-at-execution parameter streams as on the wire, and whether the
+/// bytes `SQLPutData` supplies need transcoding before they get there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DaeStream {
+    pub(crate) sql_type: StreamedSqlType,
+    /// `true` when the declared C type's encoding does not match the target
+    /// `ParameterType`'s (e.g. `SQL_C_WCHAR` bound to a narrow SQL type).
+    /// `SQLPutData` cannot transcode a chunk in isolation -- a multi-byte
+    /// character can straddle two calls -- so a caller buffers every chunk
+    /// instead of streaming it to the wire, and transcodes the whole value
+    /// once when the parameter closes, via [`transcode_dae_bytes`].
+    pub(crate) needs_transcode: bool,
+}
+
 /// Builds the streaming placeholder type for a data-at-execution bound
 /// parameter. The actual bytes arrive later via `SQLPutData`.
 ///
-/// The placeholder follows the *C* type, not `ParameterType`, because
-/// `SQLPutData` streams its chunks to the wire untranscoded - a UTF-8 sequence
-/// can straddle two calls, so there is nothing to transcode a chunk against. A
-/// cross-family pairing would therefore declare one encoding and send another,
-/// so it is rejected here rather than silently corrupting the value (AB#47590).
-/// `ColumnSize` is likewise unenforceable: every streamed type is a `max`.
+/// The wire type follows `ParameterType`'s family and wideness -- that is what
+/// the column actually is -- not the C type's. A same-family pairing whose
+/// wideness disagrees with the C type (e.g. `SQL_C_WCHAR` bound to a narrow
+/// SQL type) is accepted with `needs_transcode` set: the caller buffers every
+/// `SQLPutData` chunk instead of writing it to the wire untranscoded, and
+/// transcodes the complete value once the parameter closes. A cross-*family*
+/// pairing (character streamed against a binary SQL type, or the reverse) has
+/// no such recovery -- there is nothing it could mean other than one side
+/// declaring one encoding and sending another -- so it is still rejected here
+/// rather than risking silent corruption (AB#47590). `ColumnSize` is likewise
+/// unenforceable: every streamed type is a `max`.
+///
+/// Deliberate deviation from msodbcsql: `needs_transcode` buffers the whole
+/// value and transcodes it once (`transcode_dae_bytes`), rather than
+/// transcoding each `SQLPutData` chunk incrementally. Source reading
+/// suggested msodbcsql's `ProcessDAEColumnData` carries a code-point residual
+/// across calls (`sqlccmd.cpp:3864`, `:3899-3901`; `ConvertLongData`,
+/// `sqlccnvt.cpp:938-990`; residual flushed at `sqlccmd.cpp:5999-6001`).
+/// A msodbcsql parity run for a UTF-8 character split across two
+/// `SQLPutData` calls measured 5 UTF-16 code units instead of the correct 4
+/// (see `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter`),
+/// reproducing identically across retries -- but this is very likely `AppText`'s
+/// documented divergence from msodbcsql, not a residual-carrying failure:
+/// msodbcsql reads `SQL_C_CHAR` bytes in the client code page rather than
+/// UTF-8, so on the parity leg's Windows default code page the two split
+/// bytes (`0xC3 0xA9`) each decode as their own Windows-1252 character
+/// instead of the one UTF-8 character they encode together -- a mismatch that
+/// would reproduce for a single-chunk value too, not only a split one, so it
+/// says nothing about whether msodbcsql carries a residual across calls.
+/// Not confirmed at the code-point level (the failing assertion aborted
+/// before the actual units were logged), so this is the more likely
+/// explanation, not a settled one; tracked under AB#47565 (client code page
+/// support), separately from this whole-value-buffering deviation. Either
+/// way, whole-value buffering costs memory proportional to the value on a
+/// path whose purpose is to avoid exactly that, and is not a regression --
+/// this pairing previously failed outright -- but it is real cost, taken
+/// because a per-chunk carry is meaningfully more machinery (correctly
+/// splitting a UTF-16 surrogate pair or a multi-byte narrow sequence across
+/// calls) than this driver has today. It also means a mismatched value whose
+/// total size exceeds `u32::MAX` bytes -- `SQL_LEN_DATA_AT_EXEC` declares no
+/// upper bound -- fails late, with a clean `UsageError` from
+/// `write_streamed_chunk`'s own chunk-length check, rather than at the first
+/// oversized `SQLPutData` call.
+/// Tracked under AB#47590 alongside this file's other DAE-transcoding gaps.
+///
+/// Known residual, also AB#47590: a same-family pairing whose wideness
+/// *matches* the C type (`needs_transcode: false`, e.g. `SQL_C_CHAR` bound to
+/// `SQL_VARCHAR`) still streams its chunks to the wire untranscoded. That is
+/// correct for the wide case -- `SQL_C_WCHAR` is already UTF-16LE, the wire
+/// encoding -- but not for the narrow one: this driver's `SQL_C_CHAR` is
+/// UTF-8 by convention, not a wire encoding, so a non-ASCII value streamed
+/// under a non-UTF8 collation round-trips as mojibake, the same defect
+/// `transcode_dae_bytes` fixes for the wideness-mismatched case. Extending
+/// `needs_transcode` to cover it needs the connection's collation at this
+/// function's call site (`build_named_params`, execute time), which it does
+/// not have today.
 pub(crate) fn dae_placeholder_type(
     c_type: SqlSmallInt,
     sql_type: SqlSmallInt,
-) -> Result<StreamedSqlType, ParamBuildError> {
-    let streamed = match c_type {
-        SQL_C_CHAR => StreamedSqlType::VarcharMax,
-        SQL_C_WCHAR => StreamedSqlType::NVarcharMax,
-        SQL_C_BINARY => StreamedSqlType::VarBinaryMax,
+) -> Result<DaeStream, ParamBuildError> {
+    let c_family = match c_type {
+        SQL_C_CHAR | SQL_C_WCHAR => SqlFamily::Character,
+        SQL_C_BINARY => SqlFamily::Binary,
         other => return Err(ParamBuildError::UnsupportedCType(other)),
     };
-    // Derived from `sql_family` rather than a third type list, so the streamable
-    // set cannot drift from the conversion matrix.
-    let same_family = match streamed {
-        StreamedSqlType::VarcharMax => {
-            sql_family(sql_type) == Some(SqlFamily::Character)
-                && !is_wide_character_sql_type(sql_type)
-        }
-        StreamedSqlType::NVarcharMax => {
-            sql_family(sql_type) == Some(SqlFamily::Character)
-                && is_wide_character_sql_type(sql_type)
-        }
-        StreamedSqlType::VarBinaryMax => sql_family(sql_type) == Some(SqlFamily::Binary),
-    };
-    if !same_family {
+    if sql_family(sql_type) != Some(c_family) {
         return Err(ParamBuildError::ConversionNotImplemented);
     }
-    Ok(streamed)
+    let (sql_type, needs_transcode) = match c_family {
+        SqlFamily::Character => {
+            let wide = is_wide_character_sql_type(sql_type);
+            let streamed = if wide {
+                StreamedSqlType::NVarcharMax
+            } else {
+                StreamedSqlType::VarcharMax
+            };
+            (streamed, wide != (c_type == SQL_C_WCHAR))
+        }
+        SqlFamily::Binary => (StreamedSqlType::VarBinaryMax, false),
+        // Unreachable: `c_family` above only ever produces `Character` or
+        // `Binary`. An explicit error rather than `unreachable!()`, since this
+        // runs behind an FFI boundary.
+        SqlFamily::Integer => return Err(ParamBuildError::UnsupportedCType(c_type)),
+    };
+    Ok(DaeStream {
+        sql_type,
+        needs_transcode,
+    })
+}
+
+/// Transcodes a fully-buffered data-at-execution value, once, from the C
+/// type's encoding to the target's -- the counterpart to
+/// [`dae_placeholder_type`] reporting `needs_transcode`. Mirrors the inline
+/// (non-DAE) conversion [`AppText::transcode`] already performs per
+/// `SQLBindParameter` call; applying that same transform to the whole
+/// streamed value at once, rather than to one `SQLPutData` chunk, is what
+/// makes it safe to call -- see `sql_param_data_safe` in `api::param_data`.
+///
+/// A wide result is already UTF-16LE, the wire encoding `write_streamed_chunk`
+/// expects verbatim. A narrow result is not: `AppText::transcode` produces
+/// UTF-8, which is this driver's own C-side convention, not a wire encoding,
+/// so `encode_narrow` re-encodes it through `db_collation` before the bytes
+/// reach the wire, or a non-ASCII value round-trips as mojibake under a
+/// non-UTF8 collation. `encode_narrow` matches `get_encoding_type`'s
+/// `collation.utf8()` check, not the materialized path's serializer arm
+/// (`tds_value_serializer.rs`'s `VARCHAR | CHAR | TEXT`): that arm predates
+/// the UTF-8-collation flag and always encodes through the single-byte LCID
+/// codepage, so under a UTF8 collation the streamed and materialized paths
+/// now disagree on the wire bytes for the same value -- a new instance of
+/// the same "two ways to bind disagree" shape as the narrow/narrow residual
+/// below, just with the streamed side on the correct end this time. Tracked
+/// under AB#47590 alongside this file's other DAE-transcoding gaps.
+///
+/// `SQLPutData`'s `try_reserve` guard against an unbounded `SQL_DATA_AT_EXEC`
+/// value stops here: `decode_utf16le`, `String::from_utf8_lossy`, and
+/// `encode_narrow`'s `encoding_rs::encode` (up to 10 bytes per character for
+/// an NCR substitution the target codepage can't represent -- measured
+/// `&#1114111;` for U+10FFFF, the maximum scalar value) all allocate their
+/// output infallibly, so a value that just fit under that guard can still
+/// abort the process during this transform -- arguably a wider window, since
+/// the guard checks per chunk and this is one allocation for the whole value.
+/// Not fixed here: `AppText`/`decode_utf16le` are shared with the
+/// materialized (non-DAE) path (`convert_character_sql`), so bounding them
+/// would be a broader change than this file's DAE-specific scope. Tracked
+/// under AB#47590.
+pub(crate) fn transcode_dae_bytes(
+    c_type: SqlSmallInt,
+    sql_type: SqlSmallInt,
+    bytes: Vec<u8>,
+    db_collation: SqlCollation,
+) -> Vec<u8> {
+    let source = if c_type == SQL_C_WCHAR {
+        AppText::Utf16(bytes)
+    } else {
+        AppText::Utf8(bytes)
+    };
+    match source.transcode(is_wide_character_sql_type(sql_type)) {
+        AppText::Utf16(bytes) => bytes,
+        AppText::Utf8(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            encode_narrow(&text, db_collation)
+        }
+    }
 }
 
 /// The SQL-side axis of the conversion matrix.
@@ -1066,15 +1196,24 @@ mod tests {
     fn dae_placeholder_type_covers_the_streamable_c_types() {
         assert!(matches!(
             dae_placeholder_type(SQL_C_CHAR, SQL_VARCHAR),
-            Ok(StreamedSqlType::VarcharMax)
+            Ok(DaeStream {
+                sql_type: StreamedSqlType::VarcharMax,
+                needs_transcode: false
+            })
         ));
         assert!(matches!(
             dae_placeholder_type(SQL_C_WCHAR, SQL_WVARCHAR),
-            Ok(StreamedSqlType::NVarcharMax)
+            Ok(DaeStream {
+                sql_type: StreamedSqlType::NVarcharMax,
+                needs_transcode: false
+            })
         ));
         assert!(matches!(
             dae_placeholder_type(SQL_C_BINARY, SQL_VARBINARY),
-            Ok(StreamedSqlType::VarBinaryMax)
+            Ok(DaeStream {
+                sql_type: StreamedSqlType::VarBinaryMax,
+                needs_transcode: false
+            })
         ));
 
         let err = dae_placeholder_type(SQL_C_LONG, SQL_VARCHAR).unwrap_err();
@@ -1082,19 +1221,12 @@ mod tests {
         assert_eq!(err.diag().state, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED.state);
     }
 
-    /// Streaming writes chunks untranscoded, so a pairing the materialized path
-    /// would transcode has to be refused rather than declared in one encoding
-    /// and sent in another (AB#47590). Same-family pairings stay accepted even
-    /// where the declared type is not itself a `max`.
+    /// A genuine cross-*family* pairing (character streamed against binary, or
+    /// the reverse) has to be refused: there is nothing it could mean other
+    /// than one side declaring one encoding and sending another (AB#47590).
     #[test]
     fn cross_family_dae_is_rejected() {
         for (c_type, sql_type) in [
-            (SQL_C_CHAR, SQL_WCHAR),
-            (SQL_C_CHAR, SQL_WVARCHAR),
-            (SQL_C_CHAR, SQL_WLONGVARCHAR),
-            (SQL_C_WCHAR, SQL_CHAR),
-            (SQL_C_WCHAR, SQL_VARCHAR),
-            (SQL_C_WCHAR, SQL_LONGVARCHAR),
             (SQL_C_BINARY, SQL_VARCHAR),
             (SQL_C_CHAR, SQL_VARBINARY),
             // Newly bindable as of the cross conversions, so the refusal moves
@@ -1110,19 +1242,119 @@ mod tests {
             );
             assert_eq!(err.diag().state, *b"HYC00");
         }
+    }
 
-        for (c_type, sql_type) in [
-            (SQL_C_CHAR, SQL_CHAR),
-            (SQL_C_CHAR, SQL_LONGVARCHAR),
-            (SQL_C_WCHAR, SQL_WCHAR),
-            (SQL_C_WCHAR, SQL_WLONGVARCHAR),
-            (SQL_C_BINARY, SQL_BINARY),
-            (SQL_C_BINARY, SQL_LONGVARBINARY),
+    /// Same-family pairings always stream, whether or not the declared type is
+    /// itself a `max`. Matching wideness streams untranscoded; a mismatch is
+    /// still accepted but flagged so the caller buffers and transcodes once
+    /// (`wideness_mismatched_dae_needs_transcode`) rather than corrupting a
+    /// chunk streamed as-is.
+    #[test]
+    fn same_family_dae_always_streams() {
+        for (c_type, sql_type, streamed) in [
+            (SQL_C_CHAR, SQL_CHAR, StreamedSqlType::VarcharMax),
+            (SQL_C_CHAR, SQL_LONGVARCHAR, StreamedSqlType::VarcharMax),
+            (SQL_C_WCHAR, SQL_WCHAR, StreamedSqlType::NVarcharMax),
+            (SQL_C_WCHAR, SQL_WLONGVARCHAR, StreamedSqlType::NVarcharMax),
+            (SQL_C_BINARY, SQL_BINARY, StreamedSqlType::VarBinaryMax),
+            (
+                SQL_C_BINARY,
+                SQL_LONGVARBINARY,
+                StreamedSqlType::VarBinaryMax,
+            ),
         ] {
-            assert!(
-                dae_placeholder_type(c_type, sql_type).is_ok(),
-                "{c_type} -> {sql_type} should stream"
+            assert_eq!(
+                dae_placeholder_type(c_type, sql_type),
+                Ok(DaeStream {
+                    sql_type: streamed,
+                    needs_transcode: false
+                }),
+                "{c_type} -> {sql_type} should stream untranscoded"
             );
+        }
+    }
+
+    /// The pairing this driver used to reject with `HYC00`: a wide C type
+    /// streamed against a narrow SQL type, or the reverse. mssql-python binds
+    /// every character parameter's data-at-execution path as `SQL_C_WCHAR`,
+    /// including narrow (ASCII) values, so this is the ordinary shape for any
+    /// bound string over ~4000 characters (AB#47709's follow-up).
+    #[test]
+    fn wideness_mismatched_dae_needs_transcode() {
+        for (c_type, sql_type, streamed) in [
+            (SQL_C_WCHAR, SQL_VARCHAR, StreamedSqlType::VarcharMax),
+            (SQL_C_WCHAR, SQL_LONGVARCHAR, StreamedSqlType::VarcharMax),
+            (SQL_C_CHAR, SQL_WVARCHAR, StreamedSqlType::NVarcharMax),
+            (SQL_C_CHAR, SQL_WLONGVARCHAR, StreamedSqlType::NVarcharMax),
+        ] {
+            assert_eq!(
+                dae_placeholder_type(c_type, sql_type),
+                Ok(DaeStream {
+                    sql_type: streamed,
+                    needs_transcode: true
+                }),
+                "{c_type} -> {sql_type}"
+            );
+        }
+    }
+
+    /// The wire type follows the *declared* `ParameterType`, not the C type --
+    /// otherwise a narrow column would receive UTF-16LE bytes under a wide
+    /// declaration, or vice versa, regardless of transcoding.
+    #[test]
+    fn transcode_dae_bytes_wide_round_trips() {
+        let wide_bytes: Vec<u8> = "caf\u{e9}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let narrow = transcode_dae_bytes(SQL_C_WCHAR, SQL_VARCHAR, wide_bytes, utf8_collation());
+        assert_eq!(String::from_utf8(narrow).unwrap(), "caf\u{e9}");
+
+        let narrow_bytes = "caf\u{e9}".as_bytes().to_vec();
+        let wide = transcode_dae_bytes(SQL_C_CHAR, SQL_WVARCHAR, narrow_bytes, utf8_collation());
+        let wide_units: Vec<u16> = wide
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&wide_units).unwrap(), "caf\u{e9}");
+    }
+
+    /// The narrow direction has to land on the *connection's* collation, not
+    /// this driver's own UTF-8 C-side convention -- otherwise a non-ASCII
+    /// value silently corrupts under any collation that isn't itself UTF-8.
+    /// Windows-1252 encodes 'é' as the single byte 0xE9; naive UTF-8
+    /// passthrough would instead send 0xC3 0xA9, mojibake to a server
+    /// expecting Windows-1252.
+    #[test]
+    fn transcode_dae_bytes_narrow_uses_the_connection_collation() {
+        let wide_bytes: Vec<u8> = "caf\u{e9}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let narrow = transcode_dae_bytes(
+            SQL_C_WCHAR,
+            SQL_VARCHAR,
+            wide_bytes,
+            windows_1252_collation(),
+        );
+        assert_eq!(narrow, b"caf\xe9");
+    }
+
+    fn utf8_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40, // fUTF8
+            sort_id: 0,
+        }
+    }
+
+    fn windows_1252_collation() -> SqlCollation {
+        SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
         }
     }
 

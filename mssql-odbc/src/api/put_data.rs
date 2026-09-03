@@ -222,11 +222,15 @@ unsafe fn sql_put_data_safe(
             // there is no safe default: 0 is not "unknown" but a value that
             // scans the buffer for a single terminating byte, so a lost
             // SQL_C_WCHAR binding would silently stream one byte of a wide
-            // string. A binding can vanish under SQLFreeStmt(SQL_RESET_PARAMS);
-            // a driver manager rejects that in the Need Data state, but this
-            // driver is also loaded directly, so refuse rather than guess.
+            // string. `dae_current_c_type()` reads the `DaeParam` snapshot
+            // taken at execute time, so `SQLFreeStmt(SQL_RESET_PARAMS)`
+            // clearing `bound_params` mid-sequence no longer reaches this
+            // guard at all (`nts_uses_the_snapshotted_c_type_with_bound_params_cleared`
+            // asserts that). What remains reachable here is no current
+            // parameter -- the sequence ended or never had one -- so refuse
+            // rather than guess.
             let Some(c_type) = stmt_state.dae_current_c_type() else {
-                error!("SQLPutData: open data-at-execution parameter has no binding");
+                error!("SQLPutData: open data-at-execution parameter has no snapshotted C type");
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                 return SQL_ERROR;
             };
@@ -291,7 +295,87 @@ unsafe fn sql_put_data_safe(
             return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_DAE_LENGTH_MISMATCH);
         }
 
+        let needs_transcode = dae
+            .current_param()
+            .is_some_and(|param| param.needs_transcode);
+
         let client = if byte_count == 0 {
+            None
+        } else if needs_transcode {
+            // Checked before the checkout below: `SQL_DATA_AT_EXEC` declares
+            // no total, so nothing bounds how large this buffer grows, and
+            // `extend_from_slice`'s infallible allocation would abort the
+            // whole host process on an allocation failure it can't recover
+            // from. `try_reserve` turns that into a diagnostic the
+            // application can act on instead -- checked against `byte_count`
+            // directly, so a reservation this large never has to construct
+            // an unsafe slice claiming that many bytes are valid just to
+            // read its length back out, and never has to check out (and
+            // then dispose of) a client it turns out not to need. No client
+            // is checked out by this call yet, so `abort_dae_with_diag` tears
+            // the sequence down the same way the `is_null` / `expected_len`
+            // checks above do, rather than the "something else is using this
+            // sequence" retriable failure `checkout_client` returning `None`
+            // represents below. This only bounds accumulation, not the
+            // transform `SQLParamData` runs at close, which still allocates
+            // infallibly -- see `transcode_dae_bytes`'s doc comment.
+            if stmt_state
+                .dae
+                .as_mut()
+                .is_some_and(|dae| dae.progress.pending_bytes.try_reserve(byte_count).is_err())
+            {
+                drop(stmt_state);
+                error!(
+                    "SQLPutData: failed to reserve {byte_count} bytes for a buffered DAE value (HY001)"
+                );
+                return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_MEMORY_ALLOCATION);
+            }
+
+            // The declared C type and SQL type disagree on wideness (see
+            // `dae_placeholder_type`), so a chunk transcoded in isolation
+            // could split a multi-byte character across two calls. Buffer
+            // the raw bytes instead; the whole value is transcoded once,
+            // when the parameter closes (`sql_param_data_safe`).
+            //
+            // Still checked out and immediately returned, exactly like the
+            // streaming branch below: `checkout_client` is this sequence's
+            // only mutual-exclusion signal against a concurrent
+            // `SQLParamData`, which checks the client out for the whole
+            // close and snapshots `pending_bytes` to transcode under the
+            // same lock. Skipping the checkout here would let this call
+            // append after that snapshot and still report success, so the
+            // bytes it appended would be silently discarded rather than
+            // sent.
+            //
+            // Checkout and append share one `dae` borrow rather than
+            // re-fetching `stmt_state.dae.as_mut()` for the append: a
+            // second fetch that came back `None` would silently drop the
+            // checked-out client instead of returning it. Provably
+            // unreachable -- nothing between the two fetches can clear
+            // `dae` -- but sharing the borrow removes the possibility
+            // structurally instead of relying on that argument.
+            let Some(dae) = stmt_state.dae.as_mut() else {
+                error!("SQLPutData: DAE client is unavailable — internal state corruption");
+                post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                return SQL_ERROR;
+            };
+            match dae.checkout_client() {
+                Some(client) => {
+                    // Safety: caller guarantees data_ptr is readable for
+                    // byte_count bytes, and byte_count > 0 here, so
+                    // data_ptr is non-null (the null+nonzero-length
+                    // combination was already rejected above).
+                    let chunk =
+                        unsafe { std::slice::from_raw_parts(data_ptr as *const u8, byte_count) };
+                    dae.progress.pending_bytes.extend_from_slice(chunk);
+                    dae.return_client(client);
+                }
+                None => {
+                    error!("SQLPutData: DAE client is unavailable — internal state corruption");
+                    post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                    return SQL_ERROR;
+                }
+            }
             None
         } else {
             match stmt_state
@@ -317,7 +401,9 @@ unsafe fn sql_put_data_safe(
 
     let Some(mut client) = checked_out else {
         // Zero-length chunk with a non-null pointer supplies an empty value.
-        // NULL/0 is handled above as SQL NULL to match msodbcsql.
+        // NULL/0 is handled above as SQL NULL to match msodbcsql. A buffered
+        // (`needs_transcode`) chunk was appended above with no network write
+        // of its own.
         return SQL_SUCCESS;
     };
 
@@ -374,7 +460,7 @@ unsafe fn sql_put_data_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
@@ -382,9 +468,11 @@ mod tests {
     fn open_dae(expected_len: Option<usize>) -> DaeState {
         DaeState::for_test(
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR,
             }],
             Some(0),
         )
@@ -435,29 +523,32 @@ mod tests {
         assert_eq!(unsafe { nts_byte_count(ptr, 0) }, 1);
     }
 
-    /// A binding can disappear under an open sequence via
-    /// `SQLFreeStmt(SQL_RESET_PARAMS)`, leaving no C type to size `SQL_NTS`
-    /// with. The call is rejected instead of guessing.
-    ///
-    /// This asserts the outcome, not the branch: `for_test` parks no client, so
-    /// a sequence that got past the guard would post the same `HY010` when it
-    /// failed to check one out. The truncation the guard prevents is pinned by
+    /// `SQLFreeStmt(SQL_RESET_PARAMS)` can clear `bound_params` while a
+    /// data-at-execution sequence is still open. Sizing an `SQL_NTS` chunk no
+    /// longer needs that live binding: `dae_current_c_type()` reads
+    /// `DaeParam::c_type`, snapshotted at execute time, so the call reaches
+    /// the same "no client parked" state
+    /// `failed_client_checkout_leaves_progress_untouched` covers, rather than
+    /// being rejected earlier for a binding that no longer exists. The
+    /// truncation a lost snapshot would risk is pinned by
     /// `nts_byte_count_narrows_a_wide_buffer_when_the_c_type_defaults`.
     #[test]
-    fn nts_without_a_binding_returns_hy010() {
+    fn nts_uses_the_snapshotted_c_type_with_bound_params_cleared() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         {
             let mut state = stmt.inner.lock().unwrap();
-            // `open_dae` points at bound index 0, which was never bound.
+            // `open_dae`'s DaeParam snapshots SQL_C_CHAR; bound_params stays
+            // empty, as SQL_RESET_PARAMS would leave it.
             state.dae = Some(open_dae(None));
-            assert!(state.dae_current_c_type().is_none());
+            assert!(state.bound_params.is_empty());
+            assert_eq!(state.dae_current_c_type(), Some(SQL_C_CHAR));
         }
-        let wide: [u16; 3] = [0x0041, 0x0042, 0x0000];
+        let narrow = b"AB\0";
         let ret = unsafe {
             sql_put_data(
                 h.stmt,
-                wide.as_ptr() as *mut std::ffi::c_void,
+                narrow.as_ptr() as *mut std::ffi::c_void,
                 SQL_NTS as SqlLen,
             )
         };
@@ -541,17 +632,6 @@ mod tests {
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.dae = Some(open_dae(Some(declared)));
-                state.bound_params.push(Some(crate::params::BoundParam {
-                    input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
-                    c_type: SQL_C_CHAR,
-                    sql_type: crate::api::odbc_types::SQL_VARCHAR,
-                    column_size: 0,
-                    decimal_digits: 0,
-                    parameter_value_ptr: std::ptr::null_mut(),
-                    buffer_length: 0,
-                    strlen_or_ind_ptr: std::ptr::null_mut(),
-                    octet_length_ptr: std::ptr::null_mut(),
-                }));
             }
 
             let mut bytes = b"abc\0".to_vec();
@@ -578,18 +658,16 @@ mod tests {
             let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
             {
                 let mut state = stmt.inner.lock().unwrap();
-                state.dae = Some(open_dae(Some(declared)));
-                state.bound_params.push(Some(crate::params::BoundParam {
-                    input_output_type: crate::api::odbc_types::SQL_PARAM_INPUT,
-                    c_type: crate::api::odbc_types::SQL_C_WCHAR,
-                    sql_type: crate::api::odbc_types::SQL_WVARCHAR,
-                    column_size: 0,
-                    decimal_digits: 0,
-                    parameter_value_ptr: std::ptr::null_mut(),
-                    buffer_length: 0,
-                    strlen_or_ind_ptr: std::ptr::null_mut(),
-                    octet_length_ptr: std::ptr::null_mut(),
-                }));
+                state.dae = Some(DaeState::for_test(
+                    vec![DaeParam {
+                        value_ptr: std::ptr::null_mut(),
+                        expected_len: Some(declared),
+                        needs_transcode: false,
+                        c_type: crate::api::odbc_types::SQL_C_WCHAR,
+                        sql_type: crate::api::odbc_types::SQL_WVARCHAR,
+                    }],
+                    Some(0),
+                ));
             }
 
             let mut units: Vec<u16> = "hi".encode_utf16().chain(std::iter::once(0)).collect();
@@ -624,6 +702,87 @@ mod tests {
         let dae = state.dae.as_ref().expect("sequence still active");
         assert_eq!(dae.progress.bytes_sent, 0);
         assert!(!dae.progress.put_data_called);
+    }
+
+    /// A parameter whose C type and SQL type disagree on wideness still needs
+    /// the checked-out client as this sequence's only mutual-exclusion signal
+    /// against a concurrent `SQLParamData` -- even though the buffered write
+    /// itself never touches the network. `SQLParamData` checks the client out
+    /// for the whole close and snapshots `pending_bytes` to transcode under
+    /// the same lock; skipping the checkout here would let a buffered chunk
+    /// land after that snapshot and still report success, silently discarding
+    /// the bytes it appended. No client to check out is therefore the same
+    /// "something else is using this sequence" state
+    /// `failed_client_checkout_leaves_progress_untouched` covers for the
+    /// streaming path.
+    #[test]
+    fn transcoded_param_without_a_client_returns_hy010() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![DaeParam {
+                    value_ptr: std::ptr::null_mut(),
+                    expected_len: None,
+                    needs_transcode: true,
+                    c_type: crate::api::odbc_types::SQL_C_WCHAR,
+                    sql_type: SQL_VARCHAR,
+                }],
+                Some(0),
+            ));
+        }
+
+        let mut bytes: Vec<u8> = "ab".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let len = bytes.len() as SqlLen;
+        let ret = unsafe { sql_put_data(h.stmt, bytes.as_mut_ptr().cast(), len) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert_eq!(dae.progress.bytes_sent, 0);
+        assert!(!dae.progress.put_data_called);
+        assert!(dae.progress.pending_bytes.is_empty());
+    }
+
+    /// `SQL_DATA_AT_EXEC` declares no total, so nothing bounds how large
+    /// `pending_bytes` can grow for a mismatched-wideness parameter. A
+    /// reservation this call can never satisfy must fail cleanly with
+    /// `HY001` instead of letting `Vec`'s default infallible allocation
+    /// abort the process this driver is loaded into. Checked before any
+    /// client is checked out, so this doesn't need one parked: a byte count
+    /// near `usize::MAX` fails `try_reserve` on any real system without
+    /// actually exhausting its memory, and `data_ptr` is never read at that
+    /// length -- the call returns before the unsafe slice is constructed.
+    #[test]
+    fn oversized_transcoded_chunk_returns_hy001_without_aborting() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![DaeParam {
+                    value_ptr: std::ptr::null_mut(),
+                    expected_len: None,
+                    needs_transcode: true,
+                    c_type: crate::api::odbc_types::SQL_C_WCHAR,
+                    sql_type: SQL_VARCHAR,
+                }],
+                Some(0),
+            ));
+        }
+
+        let mut token = 0u8;
+        let ret =
+            unsafe { sql_put_data(h.stmt, (&mut token as *mut u8).cast(), isize::MAX as SqlLen) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_MEMORY_ALLOCATION.state);
+        assert!(
+            !state.needs_data(),
+            "an unsatisfiable reservation must abandon the sequence, not leave it retriable"
+        );
     }
 
     #[test]

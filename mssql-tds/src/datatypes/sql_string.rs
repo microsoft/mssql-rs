@@ -51,6 +51,37 @@ fn lcid_encoding_or_fallback(collation: SqlCollation) -> &'static encoding_rs::E
     }
 }
 
+/// Encodes `text` for the wire under `collation`'s narrow encoding: UTF-8 when
+/// the collation is UTF-8-aware, or its single-byte LCID codepage otherwise
+/// (falling back to Windows-1252 for an LCID this crate does not map).
+///
+/// Mirrors the encoding step [`get_encoding_type`] performs for a materialized
+/// value, for a caller that must produce collation-correct wire bytes
+/// directly instead of routing through the parameter serializer -- e.g. a
+/// data-at-execution write, which streams bytes to the wire before the normal
+/// parameter-serialization path runs. Does *not* mirror that serializer's own
+/// `VARCHAR | CHAR | TEXT` arm (`tds_value_serializer.rs`): that arm predates
+/// the UTF-8-collation flag and always encodes through the single-byte LCID
+/// codepage regardless of `collation.utf8()`, so a UTF-8-collation database
+/// gets correct UTF-8 wire bytes from a value streamed through this function
+/// but single-byte-miscoded bytes from the same value bound inline. Tracked
+/// under AB#47590.
+pub fn encode_narrow(text: &str, collation: SqlCollation) -> Vec<u8> {
+    if collation.utf8() {
+        return text.as_bytes().to_vec();
+    }
+    let (encoded, encoding_used, had_errors) = lcid_encoding_or_fallback(collation).encode(text);
+    if had_errors {
+        warn!(
+            "Encountered encoding errors while converting string to LCID 0x{:04X} ({}) encoding. \
+             Some characters may have been replaced.",
+            collation.info & 0x000F_FFFF,
+            encoding_used.name()
+        );
+    }
+    encoded.into_owned()
+}
+
 impl EncodingType {
     /// The encoding these bytes are in, or `None` when the collation is not yet
     /// known ([`EncodingType::DelayedSet`]).
@@ -499,5 +530,55 @@ mod tests {
 
         let utf8_str = SqlString::new(b"test".to_vec(), EncodingType::Utf8);
         assert!(utf8_str.as_utf16_bytes().is_none());
+    }
+
+    #[test]
+    fn encode_narrow_uses_the_lcid_codepage_for_a_non_utf8_collation() {
+        let collation = SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(encode_narrow("Caf\u{e9}", collation), b"Caf\xe9");
+    }
+
+    #[test]
+    fn encode_narrow_passes_through_utf8_for_a_utf8_collation() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40, // fUTF8
+            sort_id: 0,
+        };
+        assert_eq!(
+            encode_narrow("Caf\u{e9}", collation),
+            "Caf\u{e9}".as_bytes()
+        );
+    }
+
+    #[test]
+    fn encode_narrow_falls_back_to_windows_1252_for_an_unmapped_lcid() {
+        let collation = SqlCollation {
+            info: 0x000F_FFFF,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(encode_narrow("Caf\u{e9}", collation), b"Caf\xe9");
+    }
+
+    /// U+65E5 has no Windows-1252 representation. `encoding_rs` substitutes
+    /// an HTML numeric character reference, not `?`, and `encode_narrow`
+    /// warns on this rather than substituting silently.
+    #[test]
+    fn encode_narrow_substitutes_ncr_for_a_character_the_codepage_cannot_represent() {
+        let collation = SqlCollation {
+            info: 0x0409, // US English LCID -> Windows-1252
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+        assert_eq!(encode_narrow("\u{65e5}", collation), b"&#26085;");
     }
 }
