@@ -1714,7 +1714,7 @@ TEST_F(GetDataLiveTest, EmbeddedNulEndsANumericColumn) {
 // A character column holding more digits than an exact i128 mantissa still
 // reaches a float target at full precision. The parser is shared with the
 // parameter direction, which reduces such a literal to an integer part plus a
-// dropped-fraction flag (param_cross_conversions_test.cpp,
+// dropped-fraction flag (param_conversions_test.cpp,
 // WideDecimalLiteralReportsTruncation); routing that reduction to a double would
 // yield about 1.1 here.
 TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
@@ -1729,6 +1729,49 @@ TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_NEAR(out, 1.2345678901234567, 1e-15);
     EXPECT_EQ(static_cast<SQLLEN>(sizeof(double)), ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(GetDataLiveTest, FloatTargetRejectsUnderflowAsWellAsOverflow) {
+    struct Case {
+        const char* literal;
+        const char* what;
+    };
+    for (const Case& c : {Case{"1e-40", "positive underflow"},
+                          Case{"-1e-40", "negative underflow"},
+                          Case{"1e40", "positive overflow"},
+                          Case{"-1e40", "negative overflow"}}) {
+        ASSERT_SQL_OK(ExecDirect(std::string("SELECT CAST(") + c.literal + " AS FLOAT)"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        float out = 9.0f;
+        SQLLEN ind = 0;
+        EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_FLOAT, &out, sizeof(out), &ind))
+            << c.what;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+        EXPECT_EQ(9.0f, out) << c.what << ": a rejected conversion must not write the buffer";
+
+        SQLCloseCursor(stmt_);
+    }
+
+    // Zero is not underflow, and the same value reaches SQL_C_DOUBLE intact -
+    // only the 32-bit target narrows.
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0 AS FLOAT), CAST(1e-40 AS FLOAT)"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    float zero = 9.0f;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_FLOAT, &zero, sizeof(zero), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0.0f, zero);
+
+    double wide = 0.0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_DOUBLE, &wide, sizeof(wide), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_DOUBLE_EQ(1e-40, wide);
 
     SQLCloseCursor(stmt_);
 }

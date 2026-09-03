@@ -134,6 +134,36 @@ pub(crate) fn narrow_i128<T: TryFrom<i128>>(v: i128) -> Result<T, ConvError> {
     T::try_from(v).map_err(|_| ConvError::OutOfRange)
 }
 
+/// Narrows an `f64` to `real`, for either direction.
+///
+/// One function because msodbcsql has one arm: `SQL_C_FLOAT` and `SQL_REAL` are
+/// both `7`, so `case SQL_C_FLOAT` (`sqlccnvt.cpp:5519`) serves a `real`
+/// parameter and a `SQL_C_FLOAT` fetch buffer alike - the same identifier
+/// collision that makes [`parse_numeric_text`] shared. Its rule is symmetric:
+///
+/// ```cpp
+/// if (Temp > FLT_MAX || Temp < -FLT_MAX ||
+///     (Temp > 0.0 && Temp < FLT_MIN) ||
+///     (Temp < 0.0 && Temp > -FLT_MIN))
+///     Error = CVT_PREC;            // IDS_22_003
+/// ```
+///
+/// So a non-zero magnitude *below* `f32::MIN_POSITIVE` is `22003` rather than a
+/// silent flush to zero - the half that is easy to miss.
+///
+/// The comparisons are left to reproduce the C semantics on their own rather
+/// than being guarded by a finiteness check. `Temp` is a `DOUBLE`
+/// (`sqlccnvt.cpp:5327`) and `FLT_MAX` promotes to one, so `+INF > FLT_MAX`
+/// holds and an infinity is `22003`; a NaN compares false four times and
+/// passes. Zero passes on the `Temp > 0.0` / `Temp < 0.0` guards.
+pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
+    let magnitude = v.abs();
+    if magnitude > f64::from(f32::MAX) || (v != 0.0 && magnitude < f64::from(f32::MIN_POSITIVE)) {
+        return Err(ConvError::OutOfRange);
+    }
+    Ok(v as f32)
+}
+
 /// Interprets text as a number, for either direction (fetch & params).
 ///
 /// Both directions must agree on what counts as a number, because msodbcsql
@@ -245,6 +275,46 @@ fn parse_wide_decimal(text: &str) -> Option<NumericSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `real` range check is symmetric, and both directions get the same
+    /// answer because they call this one function. Fetch used to check only the
+    /// overflow half and silently flushed a denormal to zero.
+    #[test]
+    fn the_real_range_check_is_symmetric() {
+        for v in [1e39f64, -1e39, 1e-40, -1e-40] {
+            assert_eq!(
+                narrow_f64_to_f32(v),
+                Err(ConvError::OutOfRange),
+                "value {v}"
+            );
+        }
+
+        // The boundaries themselves are representable, and zero is not
+        // underflow: msodbcsql guards the underflow arms with `Temp > 0.0` /
+        // `Temp < 0.0` (`sqlccnvt.cpp:5520`).
+        for v in [
+            0.0f64,
+            -0.0,
+            f64::from(f32::MAX),
+            f64::from(f32::MIN_POSITIVE),
+            -f64::from(f32::MIN_POSITIVE),
+        ] {
+            assert!(narrow_f64_to_f32(v).is_ok(), "value {v}");
+        }
+    }
+
+    /// An infinity exceeds `FLT_MAX` and is rejected; a NaN compares false
+    /// against every bound and passes. Both fall out of the comparisons rather
+    /// than being special-cased, which is what msodbcsql does.
+    #[test]
+    fn an_infinity_is_out_of_range_but_a_nan_is_not() {
+        assert_eq!(narrow_f64_to_f32(f64::INFINITY), Err(ConvError::OutOfRange));
+        assert_eq!(
+            narrow_f64_to_f32(f64::NEG_INFINITY),
+            Err(ConvError::OutOfRange)
+        );
+        assert!(narrow_f64_to_f32(f64::NAN).unwrap().is_nan());
+    }
 
     #[test]
     fn plain_decimal_literals_parse_exactly() {

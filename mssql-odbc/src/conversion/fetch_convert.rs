@@ -29,8 +29,14 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
+use crate::conversion::datetime::{
+    DAYS_0001_TO_1900, DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY,
+    civil_from_days_since_0001, days_in_month, hms_from_ticks_100ns,
+};
 use crate::conversion::error::{ConvError, ConvOk};
-use crate::conversion::numeric::{NumericSource, narrow_i128, parse_numeric_text};
+use crate::conversion::numeric::{
+    NumericSource, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
+};
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime,
 };
@@ -261,15 +267,10 @@ pub(crate) unsafe fn convert_float_c(
     }
     let v = numeric_source_or_parse(value)?.as_f64();
     let ret = match target_type {
-        // SQL_C_FLOAT is 32-bit. A finite value outside the f32 range must be
-        // reported as an overflow (22003) rather than silently becoming
-        // infinity; a source that is already infinite passes through.
-        SQL_C_FLOAT => {
-            if v.is_finite() && v.abs() > f64::from(f32::MAX) {
-                return Err(ConvError::OutOfRange);
-            }
-            unsafe { write_fixed(target_value_ptr, v as f32, strlen_or_ind_ptr) }
-        }
+        // SQL_C_FLOAT is 32-bit.
+        SQL_C_FLOAT => unsafe {
+            write_fixed(target_value_ptr, narrow_f64_to_f32(v)?, strlen_or_ind_ptr)
+        },
         SQL_C_DOUBLE => unsafe { write_fixed(target_value_ptr, v, strlen_or_ind_ptr) },
         _ => return Err(ConvError::NotHandledHere),
     };
@@ -304,43 +305,6 @@ pub(crate) unsafe fn convert_guid_c(
         data4: *data4,
     };
     Ok(unsafe { write_fixed(target_value_ptr, guid, strlen_or_ind_ptr) })
-}
-
-/// Days from 0001-01-01 (proleptic Gregorian) to 1900-01-01, used to rebase the
-/// `datetime` / `smalldatetime` epoch onto the common day-0 = 0001-01-01 axis.
-const DAYS_0001_TO_1900: i64 = 693_595;
-
-/// A normalized calendar breakdown shared by every date/time column type, so
-/// each target C struct can be filled from a single representation.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct DateTimeParts {
-    /// Proleptic Gregorian year.
-    pub year: i16,
-    /// Calendar month in `1..=12`.
-    pub month: u16,
-    /// Calendar day in `1..=31`.
-    pub day: u16,
-    /// Hour in `0..=23`.
-    pub hour: u16,
-    /// Minute in `0..=59`.
-    pub minute: u16,
-    /// Second in `0..=59`.
-    pub second: u16,
-    /// Fractional seconds in nanoseconds.
-    pub fraction_ns: u32,
-    /// Declared fractional-seconds scale (0-7) of the source column. Character
-    /// rendering pads to exactly this many digits, matching msodbcsql.
-    pub scale: u8,
-    /// Signed timezone hour component.
-    pub tz_hour: i16,
-    /// Signed timezone minute component.
-    pub tz_minute: i16,
-    /// Whether the source carries a date component.
-    pub has_date: bool,
-    /// Whether the source carries a time component.
-    pub has_time: bool,
-    /// Whether the source carries a timezone offset.
-    pub has_tz: bool,
 }
 
 /// Converts a TDS `date` into normalized calendar fields.
@@ -413,45 +377,6 @@ pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateT
     })
 }
 
-/// (year, month, day) from a day count where day 0 = 0001-01-01, using Howard
-/// Hinnant's `civil_from_days` algorithm rebased from its 1970 epoch.
-fn civil_from_days_since_0001(days_since_0001: i64) -> (i16, u16, u16) {
-    // Hinnant's algorithm works in days since 1970-01-01 with a +719468 shift.
-    let z = days_since_0001 - 719_162 + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-    (year as i16, m as u16, d as u16)
-}
-
-/// Number of 100 ns ticks in one day.
-const TICKS_PER_DAY: i64 = 864_000_000_000;
-
-/// Day number of `9999-12-31`, the maximum SQL Server date. Used to reject a
-/// `datetimeoffset` whose offset adjustment would leave the representable range.
-const MAX_DAYS_SINCE_0001: i64 = 3_652_058;
-
-/// (hour, minute, second, fraction_ns) from 100-nanosecond ticks since midnight.
-///
-/// `SqlTime::time_nanoseconds` is a misnomer: the decoder normalizes every
-/// fractional-seconds scale to 100 ns ticks, not nanoseconds.
-fn hms_from_ticks_100ns(ticks: u64) -> (u16, u16, u16, u32) {
-    let secs = ticks / 10_000_000;
-    let fraction_ns = ((ticks % 10_000_000) * 100) as u32;
-    (
-        (secs / 3600) as u16,
-        ((secs % 3600) / 60) as u16,
-        (secs % 60) as u16,
-        fraction_ns,
-    )
-}
-
 /// Extracts a [`DateTimeParts`] from any date/time column value, or `None` for
 /// non-temporal sources.
 pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimeParts> {
@@ -508,23 +433,6 @@ pub(crate) fn is_datetime_c_target(target_type: SqlSmallInt) -> bool {
             | SQL_C_TIMESTAMP
             | SQL_C_SS_TIMESTAMPOFFSET
     )
-}
-
-/// Days in `month` of `year` under the proleptic Gregorian leap rule.
-fn days_in_month(year: i16, month: u16) -> u16 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            let y = i32::from(year);
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
 }
 
 /// Parses `YYYY-MM-DD`.
@@ -1896,6 +1804,48 @@ mod tests {
         assert_eq!(err, ConvError::OutOfRange);
     }
 
+    #[test]
+    fn float_target_underflow_is_out_of_range() {
+        for v in [1.0e-40f64, -1.0e-40] {
+            let mut out: f32 = 9.0;
+            let mut ind: SqlLen = -99;
+            let err = conv_f(
+                &ColumnValues::Float(v),
+                SQL_C_FLOAT,
+                (&mut out as *mut f32).cast(),
+                &mut ind,
+            )
+            .unwrap_err();
+            assert_eq!(err, ConvError::OutOfRange, "value {v}");
+            // A rejected conversion writes neither the buffer nor the indicator.
+            assert_eq!(out, 9.0);
+            assert_eq!(ind, -99);
+        }
+
+        // Zero is not underflow, and `SQL_C_DOUBLE` never narrows so it takes
+        // the same value unchanged.
+        let mut out: f32 = 9.0;
+        let mut ind: SqlLen = 0;
+        conv_f(
+            &ColumnValues::Float(0.0),
+            SQL_C_FLOAT,
+            (&mut out as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(out, 0.0);
+
+        let mut wide: f64 = 0.0;
+        conv_f(
+            &ColumnValues::Float(1.0e-40),
+            SQL_C_DOUBLE,
+            (&mut wide as *mut f64).cast(),
+            &mut ind,
+        )
+        .unwrap();
+        assert_eq!(wide, 1.0e-40);
+    }
+
     // ---- GUID ------------------------------------------------------------
     #[test]
     fn uuid_to_guid_struct() {
@@ -1938,15 +1888,6 @@ mod tests {
     }
 
     // ---- Date / time -----------------------------------------------------
-    #[test]
-    fn civil_anchor_dates() {
-        assert_eq!(civil_from_days_since_0001(0), (1, 1, 1));
-        assert_eq!(civil_from_days_since_0001(693_595), (1900, 1, 1));
-        assert_eq!(civil_from_days_since_0001(730_178), (2000, 2, 29));
-        assert_eq!(civil_from_days_since_0001(738_685), (2023, 6, 15));
-        assert_eq!(civil_from_days_since_0001(3_652_058), (9999, 12, 31));
-    }
-
     #[test]
     fn date_to_date_struct() {
         use mssql_tds::datatypes::column_values::SqlDate;

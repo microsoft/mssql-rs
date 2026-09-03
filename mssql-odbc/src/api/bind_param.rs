@@ -474,8 +474,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_FLOAT, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA,
-        SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
+        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA, SQL_NULL_HANDLE,
+        SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -731,22 +731,23 @@ mod tests {
     }
 
     #[test]
-    fn real_but_unconvertible_c_type_returns_hyc00() {
-        // SQL_C_FLOAT is a legal ODBC C type the driver cannot convert yet, so it
-        // must fail the conversion check rather than the HY003 type check.
+    fn valid_c_type_with_no_matrix_row_returns_hyc00() {
+        // SQL_C_SS_VECTOR is a legal ODBC C type with no row in the conversion
+        // matrix, so it must fail the conversion check rather than the HY003
+        // identifier check - the two are different answers to the application.
         let h = TestHandles::with_env_dbc_stmt();
-        let mut val: f32 = 0.0;
+        let mut val: [u8; 8] = [0; 8];
         let mut ind: SqlLen = 0;
         let ret = unsafe {
             sql_bind_parameter(
                 h.stmt,
                 1,
                 SQL_PARAM_INPUT,
-                SQL_C_FLOAT,
+                crate::api::odbc_types::SQL_C_SS_VECTOR,
                 SQL_INTEGER,
                 0,
                 0,
-                &mut val as *mut f32 as SqlPointer,
+                val.as_mut_ptr() as SqlPointer,
                 0,
                 &mut ind,
             )
@@ -808,7 +809,6 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
 
-    #[ignore = "SQL_GUID has no conversion row yet; re-enable with GUID support - AB#47500"]
     #[test]
     fn default_c_type_guid_is_accepted_and_stored() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -828,22 +828,21 @@ mod tests {
             )
         };
         assert_eq!(ret, SQL_SUCCESS);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        let bound = state.bound_params[0].expect("parameter 1 should be bound");
+        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
         assert_eq!(bound.c_type, crate::api::odbc_types::SQL_C_GUID);
         assert_eq!(bound.sql_type, SQL_GUID);
     }
 
-    /// `resolve_default_c_type` maps some non-character SQL types onto a
-    /// character C type - ODBC says their default application representation is
-    /// a string. Those are the ones a widened `SQL_C_CHAR` / `SQL_C_WCHAR`
-    /// matrix row could start admitting by accident, and a defaulted
-    /// `SQL_DECIMAL` admitted that way would have its buffer read as text and
-    /// sent as `varchar(max)` rather than `decimal(p,s)`. The set is derived
-    /// rather than listed so it cannot drift as types are added.
+    /// ODBC gives some non-character SQL types a character default C type -
+    /// `SQL_DECIMAL`, `SQL_NUMERIC`, `SQL_SS_VARIANT` resolve to `SQL_C_CHAR`
+    /// and `SQL_SS_XML` to `SQL_C_WCHAR`. Each must bind and store the resolved
+    /// type, since a defaulted binding is the common way to use them.
+    ///
+    /// The set is derived from `resolve_default_c_type` rather than listed, so a
+    /// type that starts defaulting to a character C type is covered here without
+    /// anyone remembering to add it.
     #[test]
-    fn default_bind_rejects_sql_types_whose_default_c_type_is_character() {
+    fn default_bind_accepts_sql_types_whose_default_c_type_is_character() {
         use crate::api::type_rules::classify_parameter_sql_type;
         use crate::handles::OdbcVersion;
 
@@ -882,17 +881,18 @@ mod tests {
                     SQL_PARAM_INPUT,
                     SQL_C_DEFAULT,
                     sql_type,
-                    0,
-                    0,
+                    // A real precision and scale: `decimal` rejects 0 as a
+                    // precision, and this path is about the C type, not the size.
+                    18,
+                    2,
                     std::ptr::null_mut(),
                     0,
                     &mut ind,
                 )
             };
-            assert_eq!(ret, SQL_ERROR, "sql_type {sql_type}");
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-            let state = stmt.inner.lock().unwrap();
-            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+            assert_eq!(ret, SQL_SUCCESS, "sql_type {sql_type}");
+            let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
+            assert_eq!(bound.c_type, default_c, "sql_type {sql_type}");
         }
         assert!(checked > 0, "no SQL type defaults to a character C type");
     }
@@ -924,9 +924,9 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_c_type_spelling_passes_the_hy003_gate() {
-        // SQL_C_TIMESTAMP is folded to SQL_C_TYPE_TIMESTAMP before validation, so
-        // it must fail on the missing conversion row, not as an unknown C type.
+    fn deprecated_c_type_spelling_is_stored_canonically() {
+        // SQL_C_TIMESTAMP is folded to SQL_C_TYPE_TIMESTAMP before validation,
+        // so only one spelling per type reaches conversion and storage.
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -943,10 +943,13 @@ mod tests {
                 &mut ind,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        assert_eq!(ret, SQL_SUCCESS);
+        let bound = bound_params(&h)[0].expect("parameter 1 should be bound");
+        assert_eq!(
+            bound.c_type,
+            crate::api::odbc_types::SQL_C_TYPE_TIMESTAMP,
+            "the deprecated spelling must be stored canonically"
+        );
     }
 
     #[test]
