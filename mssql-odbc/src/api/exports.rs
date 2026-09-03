@@ -98,7 +98,11 @@ pub unsafe extern "C" fn SQLGetEnvAttr(
 /// # Safety
 /// - `connection_handle` must be a valid DBC handle.
 /// - `attribute` must be a valid connection attribute identifier.
-/// - `value_ptr` validity depends on the attribute type.
+/// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
+///   native-endian length followed by that many readable UTF-16LE token bytes.
+/// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for
+///   `string_length` bytes of UTF-16, or through a NUL terminator when
+///   `string_length` is `SQL_NTS`.
 /// - `string_length` is used only for string-type attributes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetConnectAttrW(
@@ -129,7 +133,11 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
 /// # Safety
 /// - `connection_handle` must be a valid DBC handle.
 /// - `attribute` must be a valid connection attribute identifier.
-/// - `value_ptr` validity depends on the attribute type.
+/// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
+///   native-endian length followed by that many readable UTF-16LE token bytes.
+/// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for
+///   `string_length` bytes, or through a NUL terminator when `string_length` is
+///   `SQL_NTS`.
 /// - `string_length` is used only for string-type attributes.
 #[cfg(not(windows))]
 #[unsafe(no_mangle)]

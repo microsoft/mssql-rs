@@ -48,7 +48,7 @@ const MAX_LOGIN_TIMEOUT_SECS: u64 = 0xfffe;
 /// # Safety
 /// - `connection_handle` must be a valid `DbcHandle` from `SQLAllocHandle`.
 /// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to an ACCESSTOKEN
-///   struct: a 4-byte little-endian length prefix followed by that many bytes
+///   struct: a 4-byte native-endian length prefix followed by that many bytes
 ///   of the UTF-16-LE-encoded access token.
 /// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must point to `string_length`
 ///   readable bytes of UTF-16, or to a NUL-terminated wide string when
@@ -160,7 +160,7 @@ unsafe fn sql_set_connect_attr_impl(
 /// # Safety
 /// `connection_handle` must be null or point to a live `DbcHandle`. For
 /// `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
-/// little-endian length followed by that many readable token bytes. For
+/// native-endian length followed by that many readable token bytes. For
 /// `SQL_ATTR_CURRENT_CATALOG`, it must be readable for `string_length` bytes of
 /// UTF-16, or through a NUL terminator when `string_length` is `SQL_NTS`.
 unsafe fn sql_set_connect_attr_w_impl(
@@ -508,10 +508,10 @@ mod tests {
     use crate::test_support::TestHandles;
 
     /// Build a `SQL_COPT_SS_ACCESS_TOKEN` struct the way msodbcsql apps do:
-    /// a 4-byte little-endian length followed by UTF-16-LE token bytes.
+    /// a 4-byte native-endian length followed by UTF-16-LE token bytes.
     fn make_token_struct(jwt: &str) -> Vec<u8> {
         let token_bytes: Vec<u8> = jwt.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let mut buf = (token_bytes.len() as u32).to_le_bytes().to_vec();
+        let mut buf = (token_bytes.len() as u32).to_ne_bytes().to_vec();
         buf.extend_from_slice(&token_bytes);
         buf
     }
