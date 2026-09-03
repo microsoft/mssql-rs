@@ -9,19 +9,26 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP,
-    SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
-    SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_NULLABLE, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
+    SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
 };
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_utf16_with_nul, copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
+/// Gets metadata for a result-set column.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_describe_col_w(
     statement_handle: SqlHandle,
@@ -62,6 +69,11 @@ pub(crate) unsafe fn sql_describe_col_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_describe_col_w_impl(
     statement_handle: SqlHandle,
@@ -137,11 +149,25 @@ fn sql_describe_col_w_safe(
 
     let meta = &stmt_state.column_metadata[(column_number - 1) as usize];
 
-    let name_utf16: Vec<u16> = meta.column_name.encode_utf16().collect();
-    let name_len = SqlSmallInt::try_from(name_utf16.len()).unwrap_or(SqlSmallInt::MAX);
+    let cached_name = stmt_state
+        .column_names_utf16
+        .get((column_number - 1) as usize);
+    let name_len = SqlSmallInt::try_from(
+        cached_name.map_or_else(|| meta.column_name.encode_utf16().count(), Vec::len),
+    )
+    .unwrap_or(SqlSmallInt::MAX);
     unsafe { write_if_some(name_length_ptr, name_len) };
 
-    let truncated = unsafe { copy_with_nul(column_name, buffer_length as usize, &name_utf16) };
+    let truncated = match cached_name {
+        // SAFETY: per the SQLDescribeColW contract `column_name` is null or
+        // writable for `buffer_length` `SqlWChar`s, and `buffer_length` is
+        // nonnegative; both helpers null-check and reserve the terminator.
+        Some(name) => unsafe { copy_with_nul(column_name, buffer_length as usize, name) },
+        // SAFETY: as above, writing the same buffer from the uncached name.
+        None => unsafe {
+            copy_utf16_with_nul(column_name, buffer_length as usize, &meta.column_name)
+        },
+    };
 
     unsafe { write_if_some(data_type_ptr, odbc_sql_type(meta)) };
     unsafe { write_if_some(column_size_ptr, column_size(meta)) };
@@ -182,10 +208,9 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
             8 => SQL_DOUBLE,
             _ => SQL_UNKNOWN_TYPE,
         },
-        TdsDataType::Decimal
-        | TdsDataType::DecimalN
-        | TdsDataType::Numeric
-        | TdsDataType::NumericN => SQL_DECIMAL,
+        TdsDataType::DecimalN => SQL_DECIMAL,
+        // msodbcsql's rgbSRV2SQLTYPE maps the legacy fixed SQLDECIMAL token to SQL_NUMERIC.
+        TdsDataType::Decimal | TdsDataType::Numeric | TdsDataType::NumericN => SQL_NUMERIC,
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => SQL_DECIMAL,
         TdsDataType::DateN => SQL_TYPE_DATE,
         // SQL Server's `time` supports up to 7-digit fractional seconds; SQL_TYPE_TIME
@@ -213,12 +238,20 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
         // mssql-python keys its sql_variant handling off this exact type, so
         // reporting the column as character data hides the variant entirely.
         TdsDataType::SsVariant => SQL_SS_VARIANT,
-        TdsDataType::Vector | TdsDataType::Udt => SQL_VARCHAR,
+        TdsDataType::Udt => SQL_SS_UDT,
+        // Result delivery does not support SQL_C_SS_VECTOR yet; retaining the
+        // character type keeps SQL_C_DEFAULT fetches on the working text path.
+        TdsDataType::Vector => SQL_VARCHAR,
         _ => SQL_UNKNOWN_TYPE,
     }
 }
 
 pub(crate) fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+    // CLR UDT metadata is PLP even when MAX_BYTE_SIZE is bounded. Only 0xFFFF
+    // carries the unbounded convention used by geography and geometry.
+    if meta.data_type == TdsDataType::Udt && meta.type_info.length != usize::from(u16::MAX) {
+        return meta.type_info.length as u64;
+    }
     // PLP / `*(max)` / xml / json: ColumnSize is "unbounded". Report 0 per ODBC spec
     if meta.is_plp() {
         return 0;
@@ -302,20 +335,19 @@ pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) 
     }
 }
 
-// Unit tests cover the validation/error paths only. The metadata-driven mapping
-// helpers (`odbc_sql_type`, `column_size`, `decimal_digits`) cannot be exercised
-// here because `mssql_tds::ColumnMetadata::type_info_variant` is `pub(crate)`
-// and there is no public constructor — those branches are covered end-to-end by
-// `tests/e2e/tests/describe_col_test.cpp` against a live SQL Server.
 #[cfg(test)]
 mod tests {
     use std::ptr;
 
     use super::*;
     use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::{int_columns, udt_column};
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
+    ///
+    /// # Safety
+    /// `stmt` must be null or point to a live `StmtHandle`.
     unsafe fn describe(stmt: SqlHandle, column_number: SqlUSmallInt) -> SqlReturn {
         let mut data_type: SqlSmallInt = 0;
         let mut col_size: u64 = 0;
@@ -340,6 +372,40 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { describe(ptr::null_mut(), 1) };
         assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn udt_column_reports_sql_ss_udt_metadata() {
+        for (max_byte_size, expected_column_size) in [(u16::MAX, 0), (892, 892)] {
+            let meta = udt_column(max_byte_size);
+
+            assert!(meta.is_plp());
+            assert_eq!(odbc_sql_type(&meta), SQL_SS_UDT);
+            assert_eq!(column_size(&meta), expected_column_size);
+            assert_eq!(decimal_digits(&meta), 0);
+        }
+    }
+
+    #[test]
+    fn decimal_numeric_and_money_types_match_msodbcsql() {
+        let mut columns = int_columns(1);
+        let meta = &mut columns[0];
+
+        for (tds_type, length, sql_type) in [
+            (TdsDataType::Decimal, 17, SQL_NUMERIC),
+            (TdsDataType::DecimalN, 17, SQL_DECIMAL),
+            (TdsDataType::Numeric, 17, SQL_NUMERIC),
+            (TdsDataType::NumericN, 17, SQL_NUMERIC),
+            (TdsDataType::Money, 8, SQL_DECIMAL),
+            (TdsDataType::Money4, 4, SQL_DECIMAL),
+            (TdsDataType::MoneyN, 8, SQL_DECIMAL),
+        ] {
+            meta.data_type = tds_type;
+            meta.type_info.tds_type = tds_type;
+            meta.type_info.length = length;
+
+            assert_eq!(odbc_sql_type(meta), sql_type, "{tds_type:?}");
+        }
     }
 
     #[test]
@@ -406,5 +472,37 @@ mod tests {
             stmt_state.diag_records[0].sql_state,
             ERR_INVALID_DESCRIPTOR_INDEX.state
         );
+    }
+
+    #[test]
+    fn uncached_column_name_is_encoded_on_demand() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_CONTEXT);
+            state.column_metadata = int_columns(1);
+            assert!(state.column_names_utf16.is_empty());
+        }
+
+        let mut name = [0_u16; 3];
+        let mut name_len = 0;
+        let rc = unsafe {
+            sql_describe_col_w(
+                h.stmt,
+                1,
+                name.as_mut_ptr(),
+                SqlSmallInt::try_from(name.len()).unwrap(),
+                &mut name_len,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(name, [u16::from(b'c'), u16::from(b'1'), 0]);
+        assert_eq!(name_len, 2);
     }
 }

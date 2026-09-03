@@ -35,6 +35,7 @@ pub(crate) const SQLSTATE_25000: [u8; 5] = *b"25000";
 /// is the application's statement that is at fault.
 pub(crate) const SQLSTATE_42000: [u8; 5] = *b"42000";
 pub(crate) const SQLSTATE_HY000: [u8; 5] = *b"HY000";
+pub(crate) const SQLSTATE_HY001: [u8; 5] = *b"HY001";
 pub(crate) const SQLSTATE_HY003: [u8; 5] = *b"HY003";
 pub(crate) const SQLSTATE_HY004: [u8; 5] = *b"HY004";
 pub(crate) const SQLSTATE_HY012: [u8; 5] = *b"HY012";
@@ -102,6 +103,16 @@ pub(crate) const ERR_STATEMENT_UNUSABLE: DiagMsg = DiagMsg {
 pub(crate) const ERR_FUNCTION_SEQUENCE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY010,
     text: "Function sequence error",
+};
+/// A fallible allocation failed. Used where the byte count comes from the
+/// application rather than a bounded internal computation -- e.g. buffering
+/// a data-at-execution value with no declared total (`SQL_DATA_AT_EXEC`) --
+/// so it fails as a diagnostic the caller can act on instead of hitting
+/// `Vec`'s default infallible allocation, which aborts the process this
+/// driver is loaded into.
+pub(crate) const ERR_MEMORY_ALLOCATION: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY001,
+    text: "Memory allocation error",
 };
 pub(crate) const ERR_FETCH_TYPE_OUT_OF_RANGE: DiagMsg = DiagMsg {
     state: SQLSTATE_HY106,

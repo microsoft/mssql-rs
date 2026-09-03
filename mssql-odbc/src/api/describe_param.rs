@@ -34,6 +34,12 @@ const SUGGESTED_SCALE: usize = 6;
 const SUGGESTED_TDS_TYPE_ID: usize = 22;
 const SUGGESTED_TDS_LENGTH: usize = 23;
 
+/// Describes a prepared statement parameter.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Every output
+/// pointer, when non-null, must be writable for one value of its pointed-to
+/// type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_describe_param(
     statement_handle: SqlHandle,
@@ -65,6 +71,10 @@ pub(crate) unsafe fn sql_describe_param(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Every output
+/// pointer, when non-null, must be writable for one value of its pointed-to
+/// type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_describe_param_impl(
     statement_handle: SqlHandle,
@@ -528,10 +538,11 @@ fn describe_tds_type(
         }
         TdsDataType::Image => (SQL_LONGVARBINARY, parameter_length(length, false)?, 0),
         TdsDataType::SsVariant => (SQL_SS_VARIANT, 8000, 0),
-        // Unbounded types report a size of 0, the same "unbounded" convention
-        // `describe_col::column_size` already uses for PLP. A table type has no
-        // meaningful column size at all.
+        // Although `suggested_tds_length` carries CLR MAX_BYTE_SIZE, retail
+        // msodbcsql 18.6.2.1 reports ParameterSize 0 for bounded and unbounded
+        // UDT parameters. Result columns report the bounded size.
         TdsDataType::Udt => (SQL_SS_UDT, 0, 0),
+        // XML is unbounded; a table type has no meaningful column size at all.
         TdsDataType::Xml => (SQL_SS_XML, 0, 0),
         TdsDataType::SqlTable => (SQL_SS_TABLE, 0, 0),
         // Neither of the next two arms fires against a shipping server. On SQL
@@ -963,6 +974,24 @@ mod tests {
 
         for (row, expected) in cases {
             assert_eq!(parse_parameter_row(&row, 1, true).unwrap().1, expected);
+        }
+    }
+
+    #[test]
+    fn udt_parameter_size_matches_msodbcsql() {
+        for length in [892, -1, i32::from(u16::MAX)] {
+            let (_, description) =
+                parse_parameter_row(&row(1, TdsDataType::Udt, length, 0, 0), 1, true).unwrap();
+
+            assert_eq!(
+                description,
+                ParameterDescription {
+                    data_type: SQL_SS_UDT,
+                    parameter_size: 0,
+                    decimal_digits: 0,
+                    nullable: SQL_NULLABLE,
+                }
+            );
         }
     }
 

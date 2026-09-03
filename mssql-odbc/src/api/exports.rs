@@ -98,7 +98,11 @@ pub unsafe extern "C" fn SQLGetEnvAttr(
 /// # Safety
 /// - `connection_handle` must be a valid DBC handle.
 /// - `attribute` must be a valid connection attribute identifier.
-/// - `value_ptr` validity depends on the attribute type.
+/// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
+///   native-endian length followed by that many readable UTF-16LE token bytes.
+/// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for
+///   `string_length` bytes of UTF-16, or through a NUL terminator when
+///   `string_length` is `SQL_NTS`.
 /// - `string_length` is used only for string-type attributes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLSetConnectAttrW(
@@ -129,7 +133,11 @@ pub unsafe extern "C" fn SQLSetConnectAttrW(
 /// # Safety
 /// - `connection_handle` must be a valid DBC handle.
 /// - `attribute` must be a valid connection attribute identifier.
-/// - `value_ptr` validity depends on the attribute type.
+/// - For `SQL_COPT_SS_ACCESS_TOKEN`, `value_ptr` must point to a four-byte
+///   native-endian length followed by that many readable UTF-16LE token bytes.
+/// - For `SQL_ATTR_CURRENT_CATALOG`, `value_ptr` must be readable for
+///   `string_length` bytes, or through a NUL terminator when `string_length` is
+///   `SQL_NTS`.
 /// - `string_length` is used only for string-type attributes.
 #[cfg(not(windows))]
 #[unsafe(no_mangle)]
@@ -445,6 +453,9 @@ pub unsafe extern "C" fn SQLFreeStmt(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `parameter_value_ptr` / `strlen_or_ind_ptr`, if non-null, must remain valid
 ///   and readable until the statement is executed.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, the readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLBindParameter(
@@ -530,6 +541,12 @@ pub unsafe extern "C" fn SQLDescribeParam(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `statement_text`, if non-null, must be readable for `text_length` `SQLWCHAR`s.
 ///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
+/// - Each non-data-at-execution parameter's currently bound value and length
+///   buffers must remain readable according to its C type and declared lengths.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, those readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range. The
+///   offset pointer itself must remain readable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecDirectW(
     statement_handle: SqlHandle,
@@ -558,6 +575,12 @@ pub unsafe extern "C" fn SQLGetTypeInfoW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Each non-data-at-execution parameter's currently bound value and length
+///   buffers must remain readable according to its C type and declared lengths.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, those readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range. The
+///   offset pointer itself must remain readable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecute(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
@@ -594,6 +617,11 @@ pub unsafe extern "C" fn SQLParamData(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `data_ptr`, when `strlen_or_ind` is a positive byte count, must be
 ///   readable for that many bytes.
+/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null and
+///   NUL-terminated within an allocation it owns. The terminator search reads
+///   potentially unaligned `u16` units for `SQL_C_WCHAR` and `u8` units
+///   otherwise, and runs off the end of the allocation if no terminator is
+///   present.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLPutData(
     statement_handle: SqlHandle,
@@ -612,6 +640,19 @@ pub unsafe extern "C" fn SQLPutData(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
+/// - Every active bound-column data buffer must be writable for
+///   `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+///   or binary target, or of the full C type size for a fixed-width target,
+///   even when `BufferLength` is zero or smaller. Its indicator and
+///   octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
+///   `SqlLen` values.
+/// - When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer
+///   extents begin at the base plus the pointed-to byte offset, so each
+///   allocation must also cover that leading displacement.
+/// - Non-null rowset pointer attributes must satisfy their declared extents:
+///   one `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
+///   `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
+///   `SqlUSmallInt` values for `SQL_ATTR_ROW_STATUS_PTR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();
@@ -625,8 +666,16 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
 /// only.
 ///
 /// # Safety
-/// `statement_handle` must be a valid statement handle or null. The buffers must
-/// stay valid until the column is unbound or the statement is freed.
+/// `statement_handle` must be a valid statement handle or null. The buffers
+/// must stay valid until the column is unbound or the statement is freed. At
+/// each fetch, `target_value_ptr` must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `buffer_length` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `buffer_length` is zero or smaller. `strlen_or_ind_ptr`, when non-null,
+/// must be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values. When
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents begin
+/// at the base plus the pointed-to byte offset, so each allocation must also
+/// cover that leading displacement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLBindCol(
     statement_handle: SqlHandle,
@@ -656,6 +705,18 @@ pub unsafe extern "C" fn SQLBindCol(
 ///
 /// # Safety
 /// `statement_handle` must be a valid statement handle or null.
+/// Every active bound-column data buffer must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `BufferLength` is zero or smaller. Its indicator and octet-length
+/// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
+/// Non-null rowset pointer attributes must satisfy their declared extents: one
+/// `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
+/// `SqlUSmallInt` values for `SQL_ATTR_ROW_STATUS_PTR`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLFetchScroll(
     statement_handle: SqlHandle,
@@ -753,7 +814,10 @@ pub unsafe extern "C" fn SQLColAttributeW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - `target_value_ptr`, when non-null, must be writable for `buffer_length` bytes.
+/// - `target_value_ptr`, when non-null, must be writable for `buffer_length`
+///   bytes for variable-width targets. For a fixed-width target it must be
+///   writable for the full size of `target_type`, even when `buffer_length` is
+///   zero or smaller.
 /// - `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLGetData(
@@ -813,7 +877,9 @@ pub unsafe extern "C" fn SQLRowCount(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLTablesW(
@@ -847,7 +913,9 @@ pub unsafe extern "C" fn SQLTablesW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLColumnsW(
@@ -881,7 +949,9 @@ pub unsafe extern "C" fn SQLColumnsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLPrimaryKeysW(
     statement_handle: SqlHandle,
@@ -910,7 +980,9 @@ pub unsafe extern "C" fn SQLPrimaryKeysW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLForeignKeysW(
@@ -952,7 +1024,9 @@ pub unsafe extern "C" fn SQLForeignKeysW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLStatisticsW(
@@ -987,7 +1061,9 @@ pub unsafe extern "C" fn SQLStatisticsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLSpecialColumnsW(
@@ -1023,7 +1099,9 @@ pub unsafe extern "C" fn SQLSpecialColumnsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLProceduresW(
     statement_handle: SqlHandle,

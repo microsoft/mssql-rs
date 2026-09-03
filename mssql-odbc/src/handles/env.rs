@@ -3,6 +3,7 @@
 
 use std::ffi::c_void;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
@@ -35,6 +36,51 @@ impl TryFrom<u32> for OdbcVersion {
     }
 }
 
+/// A Tokio runtime that never joins its worker threads when it goes away.
+///
+/// `SQLFreeHandle(SQL_HANDLE_ENV)` can run long after the OS has already
+/// force-terminated background threads — e.g. a caller that loads this driver
+/// directly instead of through the ODBC Driver Manager may defer the free to a
+/// C++ static destructor that only runs at `DLL_PROCESS_DETACH`, by which point
+/// Windows has already killed every thread but the one tearing the process
+/// down (AB#47509). The default `Runtime` drop unconditionally joins its worker
+/// thread, which panics ("threads should not terminate unexpectedly") if that
+/// thread no longer exists. `shutdown_background` detaches instead of joining.
+///
+/// This lives on the shared value rather than on `EnvHandle` so the guarantee
+/// holds for whichever owner happens to release the last reference. A DBC that
+/// outlives its ENV — which a non-conformant caller can produce, since
+/// `SQLFreeHandle(ENV)` only `debug_assert!`s that the connection list is empty
+/// — would otherwise drop the runtime through the default joining path, which
+/// is exactly the teardown this exists to avoid.
+#[derive(Debug)]
+pub(crate) struct SharedRuntime(ManuallyDrop<Runtime>);
+
+impl SharedRuntime {
+    fn new(runtime: Runtime) -> Self {
+        Self(ManuallyDrop::new(runtime))
+    }
+}
+
+impl std::ops::Deref for SharedRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        &self.0
+    }
+}
+
+impl Drop for SharedRuntime {
+    fn drop(&mut self) {
+        // SAFETY: `drop` runs at most once and nothing reads `self.0` after
+        // this, so taking ownership out of the `ManuallyDrop` is sound. Taking
+        // it by value is what lets us call `shutdown_background`, which
+        // consumes the `Runtime`; the default drop glue would join instead.
+        let runtime = unsafe { ManuallyDrop::take(&mut self.0) };
+        runtime.shutdown_background();
+    }
+}
+
 /// Environment handle
 ///
 /// One ENV is typically allocated per application. It owns connection handles
@@ -48,9 +94,11 @@ impl TryFrom<u32> for OdbcVersion {
 pub(crate) struct EnvHandle {
     pub(crate) object_type: HandleType,
     pub(crate) inner: Mutex<EnvState>,
-    /// Shared Tokio runtime for all connections on this ENV.
-    /// Wrapped in `Arc` so DBCs can hold a reference without lifetime issues.
-    pub(crate) runtime: Arc<Runtime>,
+    /// Shared Tokio runtime for all connections on this ENV, in an `Arc` so
+    /// DBCs can hold a reference without lifetime issues. Shutdown is handled
+    /// by `SharedRuntime`'s own `Drop`, so this handle needs no `Drop` of its
+    /// own and the field is never vacated while the ENV is live.
+    pub(crate) runtime: Arc<SharedRuntime>,
 }
 
 /// Mutable state within an environment handle, protected by `inner`.
@@ -90,7 +138,7 @@ impl EnvHandle {
                 output_nts: true, // SQL_ATTR_OUTPUT_NTS defaults to SQL_TRUE
                 connections: Vec::new(),
             }),
-            runtime: Arc::new(runtime),
+            runtime: Arc::new(SharedRuntime::new(runtime)),
         })
     }
 }
@@ -98,5 +146,71 @@ impl EnvHandle {
 impl HasObjectType for EnvHandle {
     fn object_type_mut(&mut self) -> &mut HandleType {
         &mut self.object_type
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const PARK: Duration = Duration::from_secs(5);
+
+    /// Parks a blocking task on `runtime` and returns once it is confirmed
+    /// running, so a later drop has in-flight blocking work to contend with.
+    fn park_blocking_task(runtime: &SharedRuntime) {
+        let (started_tx, started_rx) = mpsc::channel();
+        runtime.spawn_blocking(move || {
+            let _ = started_tx.send(());
+            thread::sleep(PARK);
+        });
+        started_rx
+            .recv_timeout(PARK)
+            .expect("blocking task should have started");
+    }
+
+    fn assert_released_promptly(what: &str, release: impl FnOnce()) {
+        let start = Instant::now();
+        release();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < PARK / 2,
+            "{what} blocked for {elapsed:?} waiting on the runtime's blocking work; \
+             shutdown must detach via shutdown_background, not join"
+        );
+    }
+
+    /// Guards against reintroducing a blocking join. The default `Runtime` drop
+    /// waits out in-flight blocking work; `shutdown_background` detaches from
+    /// it. An idle runtime joins its idle worker promptly under either one, so
+    /// these park a blocking task to tell the two apart. The
+    /// OS-already-killed-the-thread case that actually panicked (AB#47509)
+    /// needs real process/DLL teardown and isn't reproducible from a unit test.
+    #[test]
+    fn dropping_env_handle_does_not_wait_for_blocking_work() {
+        let env = EnvHandle::new().expect("failed to create EnvHandle for test");
+        park_blocking_task(&env.runtime);
+
+        assert_released_promptly("dropping EnvHandle", || drop(env));
+    }
+
+    /// The ENV is not always the last owner: `SQLFreeHandle(ENV)` only
+    /// `debug_assert!`s that the connection list is empty, so a non-conformant
+    /// caller can free the ENV while a DBC still holds a runtime reference.
+    /// Shutdown must still detach when that straggler releases the last one.
+    #[test]
+    fn dropping_a_dbc_that_outlived_its_env_does_not_wait_for_blocking_work() {
+        let env = EnvHandle::new().expect("failed to create EnvHandle for test");
+        let dbc_runtime = Arc::clone(&env.runtime);
+        park_blocking_task(&env.runtime);
+
+        drop(env);
+
+        assert_released_promptly("dropping the last DBC runtime reference", || {
+            drop(dbc_runtime)
+        });
     }
 }

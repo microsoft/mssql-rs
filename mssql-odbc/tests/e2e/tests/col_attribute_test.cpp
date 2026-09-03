@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // col_attribute_test.cpp  –  E2E tests for SQLColAttributeW.
 //
-// Unit tests can only build `int` column metadata, so the per-type mapping
-// tables (concise type, type name, radix, and the sql_variant underlying type)
-// are only meaningfully exercised here, against a live server.
+// Per-type mapping tables (concise type, type name, radix, and the sql_variant
+// underlying type) are meaningfully exercised here against live server metadata.
 //
 // Verifies:
 //   1.  NullHandle                        - SQL_NULL_HSTMT → SQL_INVALID_HANDLE
@@ -28,10 +27,11 @@
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   23. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
-//   24. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
-//   25. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
-//   26. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
+//   23. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
+//   24. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   25. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   26. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   27. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
 
 #include "odbc_test_fixture.h"
 
@@ -44,6 +44,9 @@
 #endif
 #ifndef SQL_SS_VARIANT
 #define SQL_SS_VARIANT (-150)
+#endif
+#ifndef SQL_SS_UDT
+#define SQL_SS_UDT (-151)
 #endif
 
 class ColAttributeLiveTest : public ODBCTest {
@@ -121,6 +124,38 @@ TEST_F(ColAttributeLiveTest, ConciseTypePerColumnType) {
     EXPECT_EQ(SQL_VARCHAR, NumericAttr(stmt_, 2, SQL_DESC_CONCISE_TYPE));
     EXPECT_EQ(SQL_WVARCHAR, NumericAttr(stmt_, 3, SQL_DESC_CONCISE_TYPE));
     EXPECT_EQ(SQL_DECIMAL, NumericAttr(stmt_, 4, SQL_DESC_CONCISE_TYPE));
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
+    ExecDirect("SELECT CAST(NULL AS geography) AS geography_col, "
+               "CAST(NULL AS geometry) AS geometry_col, "
+               "CAST(NULL AS hierarchyid) AS hierarchyid_col");
+
+    struct UdtColumn {
+        SQLUSMALLINT ordinal;
+        SQLLEN size;
+    };
+    const UdtColumn columns[] = {
+        {1, 0},
+        {2, 0},
+        {3, 892},
+    };
+
+    for (const auto& column : columns) {
+        EXPECT_EQ(SQL_SS_UDT, NumericAttr(stmt_, column.ordinal, SQL_DESC_TYPE))
+            << "column " << column.ordinal;
+        EXPECT_EQ(SQL_SS_UDT, NumericAttr(stmt_, column.ordinal, SQL_DESC_CONCISE_TYPE))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.size, NumericAttr(stmt_, column.ordinal, SQL_DESC_LENGTH))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.size, NumericAttr(stmt_, column.ordinal, SQL_DESC_PRECISION))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.size, NumericAttr(stmt_, column.ordinal, SQL_DESC_OCTET_LENGTH))
+            << "column " << column.ordinal;
+        EXPECT_EQ(0, NumericAttr(stmt_, column.ordinal, SQL_DESC_DISPLAY_SIZE))
+            << "column " << column.ordinal;
+    }
     SQLCloseCursor(stmt_);
 }
 

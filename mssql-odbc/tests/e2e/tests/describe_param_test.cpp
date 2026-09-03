@@ -6,6 +6,10 @@
 #include <array>
 #include <string>
 
+#ifndef SQL_SS_UDT
+#define SQL_SS_UDT (-151)
+#endif
+
 namespace {
 
 struct ParamDescription {
@@ -117,6 +121,28 @@ TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
         {SQL_VARBINARY, 16, 0, SQL_NULLABLE},
         {SQL_DECIMAL, 12, 3, SQL_NULLABLE},
         {SQL_TYPE_TIMESTAMP, 24, 4, SQL_NULLABLE},
+    }};
+
+    for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
+        ParamDescription actual;
+        ASSERT_TRUE(Describe(ordinal, actual)) << "ordinal " << ordinal;
+        const ParamDescription& wanted = expected[ordinal - 1];
+        EXPECT_EQ(wanted.data_type, actual.data_type) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.size, actual.size) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.scale, actual.scale) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.nullable, actual.nullable) << "ordinal " << ordinal;
+    }
+}
+
+TEST_F(DescribeParamLiveTest, DescribesClrUdtMetadata) {
+    ASSERT_SQL_OK(
+        Prepare("SELECT CAST(? AS geography), CAST(? AS geometry), CAST(? AS hierarchyid)"),
+        SQL_HANDLE_STMT, stmt_);
+
+    const std::array<ParamDescription, 3> expected = {{
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
     }};
 
     for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
