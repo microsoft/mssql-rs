@@ -342,13 +342,15 @@ struct StreamedWriteContext {
     timeout_sec: Option<u32>,
 }
 
-/// Cached whole-row eligibility paired with the exact metadata allocation it describes.
+/// Cached row-buffering eligibility paired with the exact metadata allocation it describes.
 #[derive(Debug)]
 struct BufferedRowSupport {
     /// Metadata allocation whose eligibility was evaluated.
     metadata: Arc<ColMetadataToken>,
     /// Whether all columns support buffered whole-row decoding.
-    supported: bool,
+    whole_row: bool,
+    /// Number of inline columns before the first PLP, when a safe prefix exists.
+    prefix_len: Option<usize>,
 }
 
 /// Active TDS connection to a SQL Server instance.
@@ -5371,6 +5373,40 @@ impl TdsClient {
         })
     }
 
+    /// Attempts to consume the next PLP output chunk entirely from buffered bytes.
+    pub fn try_read_active_plp_chunk(&mut self, out: &mut [u8]) -> TdsResult<CursorPoll<PlpChunk>> {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        let start = self.request_timeout_start();
+        let read = match &mut self.active_row_read_state {
+            ActiveRowReadState::PlpPaused(plp_state) => {
+                self.transport.try_read_buffered_plp(plp_state, out)?
+            }
+            _ => {
+                return Err(UsageError(
+                    "try_read_active_plp_chunk called with no active PLP stream".to_string(),
+                ));
+            }
+        };
+        let Some(read) = read else {
+            return Ok(CursorPoll::Pending);
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        Ok(CursorPoll::Ready(PlpChunk {
+            read,
+            reached_end: self.active_plp_reached_end(),
+            known_total: self.active_plp_known_len(),
+            total_read: self.active_plp_total_read(),
+        }))
+    }
+
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     ///
@@ -5607,6 +5643,58 @@ impl TdsClient {
         }
     }
 
+    /// Attempts to position a row and capture its inline prefix from buffered bytes.
+    pub fn try_next_buffered_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<BufferedRowPoll>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found while fetching the next row. Have you called the execute method or was the query supposed to return resultset?".to_string(),
+            ));
+        }
+        if self.current_result_set_has_been_read_till_end {
+            return Ok(BufferedRowPoll::Exhausted);
+        }
+        if !matches!(self.active_row_read_state, ActiveRowReadState::Idle)
+            || self
+                .cancel_handle
+                .as_ref()
+                .is_some_and(|handle| handle.cancel_token.is_cancelled())
+            || self.current_result_bufferable_prefix_len() != Some(prefix_len)
+        {
+            return Ok(BufferedRowPoll::Pending);
+        }
+        let metadata = Arc::clone(
+            self.current_metadata
+                .as_ref()
+                .ok_or_else(|| UsageError("Buffered row metadata was cleared".to_string()))?,
+        );
+        let context = ParserContext::ColumnMetadata(metadata, None);
+        let start = self.request_timeout_start();
+        let Some(mut pause_state) = self.transport.try_receive_row_header(&context)? else {
+            return Ok(BufferedRowPoll::Pending);
+        };
+        let complete = self.transport.try_read_buffered_row_prefix_into(
+            &mut pause_state,
+            prefix_len,
+            writer,
+        )?;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+        Ok(if complete {
+            BufferedRowPoll::Complete
+        } else {
+            BufferedRowPoll::Partial
+        })
+    }
+
     /// Positions the cursor on the next row without decoding any column
     /// (ODBC `SQLFetch`). Returns `Ok(true)` when positioned on a row and
     /// `Ok(false)` when the result set is exhausted.
@@ -5678,20 +5766,26 @@ impl TdsClient {
         }
     }
 
-    /// Peeks ahead to the next row and preserves it for the next cursor advance.
+    /// Attempts to peek ahead to the next row from buffered bytes and preserves
+    /// it for the next cursor advance.
     ///
     /// ODBC execution uses this before its first fetch so an ERROR token sent
     /// after COLMETADATA is reported by SQLExecDirect/SQLExecute. The ODBC busy
     /// gate also uses it after delivering a row to discover whether another
     /// row follows or the wire is now idle.
     ///
-    /// Returns `Ok(true)` if another row is now positioned: it is parked
-    /// exactly as [`next_row_cursor`](Self::next_row_cursor) parks any
-    /// positioned row, so the very next call to it returns this same row
-    /// immediately, without re-reading the wire. Returns `Ok(false)` if the
-    /// result set is now known exhausted — the same thing a later
-    /// `next_row_cursor` call would eventually report, just discovered now
-    /// because the wire happened to already have the answer.
+    /// A row found by [`CursorPoll::Ready`] is parked for the next
+    /// [`next_row_cursor`](Self::next_row_cursor) call. [`CursorPoll::Pending`]
+    /// leaves the peek for [`peek_past_current_row`](Self::peek_past_current_row).
+    pub fn try_peek_past_current_row(&mut self) -> TdsResult<CursorPoll<bool>> {
+        let poll = self.try_next_row_cursor()?;
+        if let CursorPoll::Ready(has_row) = poll {
+            self.row_already_positioned = has_row;
+        }
+        Ok(poll)
+    }
+
+    /// Peeks past the fully consumed row, parking the next row if one exists.
     ///
     /// Call this before the first row is positioned, or after every column of
     /// the current row has been read. Like `next_row_cursor`, it discards any
@@ -5736,6 +5830,71 @@ impl TdsClient {
             return Ok(CursorPoll::Pending);
         }
 
+        let buffered_null = matches!(
+            &self.active_row_read_state,
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        );
+        if buffered_null {
+            let ActiveRowReadState::RowPaused(mut pause_state) =
+                std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+            else {
+                return Err(crate::error::Error::ImplementationError(
+                    "buffered NULL decode lost its row pause state".to_string(),
+                ));
+            };
+            pause_state.next_column_index = target + 1;
+            if pause_state.next_column_index < column_count {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+            }
+            return Ok(CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Null,
+                variant_base: None,
+            }));
+        }
+
+        let buffered_plp = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .columns()
+                    .get(target)
+                    .is_some_and(|metadata| metadata.is_plp()) =>
+            {
+                self.transport.try_begin_buffered_plp(pause_state, target)?
+            }
+            _ => None,
+        };
+        if let Some(stream) = buffered_plp {
+            let ActiveRowReadState::RowPaused(mut pause_state) =
+                std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+            else {
+                return Err(crate::error::Error::ImplementationError(
+                    "buffered PLP decode lost its row pause state".to_string(),
+                ));
+            };
+            pause_state.next_column_index = target + 1;
+            return if let Some(plp_stream) = stream {
+                let collation = plp_stream.collation();
+                self.active_row_read_state =
+                    ActiveRowReadState::PlpPaused(Box::new(PlpPauseState {
+                        row_pause_state: *pause_state,
+                        plp_stream,
+                    }));
+                Ok(CursorPoll::Ready(CursorColumn::PlpStreaming { collation }))
+            } else {
+                if pause_state.next_column_index < column_count {
+                    self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+                }
+                Ok(CursorPoll::Ready(CursorColumn::Value {
+                    value: ColumnValues::Null,
+                    variant_base: None,
+                }))
+            };
+        }
+
         let start = self.request_timeout_start();
         let value = match &self.active_row_read_state {
             ActiveRowReadState::RowPaused(pause_state) => self
@@ -5765,6 +5924,70 @@ impl TdsClient {
             value,
             variant_base,
         }))
+    }
+
+    /// Attempts to consume one complete buffered PLP column without opening a stream.
+    pub fn try_read_row_plp_complete(
+        &mut self,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CursorPoll<Option<PlpChunk>>> {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(CursorPoll::Pending);
+        }
+        let (next_column, column_count) = match &self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => {
+                (pause_state.next_column_index, pause_state.columns().len())
+            }
+            _ => return Ok(CursorPoll::Pending),
+        };
+        if target != next_column || target >= column_count {
+            return Ok(CursorPoll::Pending);
+        }
+        let is_null = matches!(
+            &self.active_row_read_state,
+            ActiveRowReadState::RowPaused(pause_state)
+                if pause_state
+                    .nbc_null_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap[target / 8] & (1 << (target % 8)) != 0)
+        );
+        let result = if is_null {
+            Some(None)
+        } else {
+            match &self.active_row_read_state {
+                ActiveRowReadState::RowPaused(pause_state) => self
+                    .transport
+                    .try_read_complete_buffered_plp_column(pause_state, target, out)?,
+                _ => None,
+            }
+        };
+        let Some(result) = result else {
+            return Ok(CursorPoll::Pending);
+        };
+        let ActiveRowReadState::RowPaused(mut pause_state) =
+            std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle)
+        else {
+            return Err(crate::error::Error::ImplementationError(
+                "complete buffered PLP lost its row pause state".to_string(),
+            ));
+        };
+        pause_state.next_column_index = target + 1;
+        if pause_state.next_column_index < column_count {
+            self.active_row_read_state = ActiveRowReadState::RowPaused(pause_state);
+        }
+        Ok(CursorPoll::Ready(result.map(
+            |(read, known_total, total_read)| PlpChunk {
+                read,
+                reached_end: true,
+                known_total,
+                total_read,
+            },
+        )))
     }
 
     /// Attempts to finish the positioned row through `writer` from bytes already
@@ -5806,6 +6029,40 @@ impl TdsClient {
         Ok(complete)
     }
 
+    /// Attempts to finish an inline row prefix from bytes already buffered.
+    pub fn try_finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<bool>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        if self
+            .cancel_handle
+            .as_ref()
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Ok(false);
+        }
+        let start = self.request_timeout_start();
+        let complete = match &mut self.active_row_read_state {
+            ActiveRowReadState::RowPaused(pause_state) => self
+                .transport
+                .try_read_buffered_row_prefix_into(pause_state, prefix_len, writer)?,
+            ActiveRowReadState::PlpPaused(_) => return Ok(false),
+            ActiveRowReadState::Idle => {
+                return Err(UsageError(
+                    "try_finish_row_prefix_into called without a positioned row".to_string(),
+                ));
+            }
+        };
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        Ok(complete)
+    }
+
     /// Returns whether the current result can be consumed as complete rows
     /// without changing the pull cursor's PLP streaming behavior.
     pub fn current_result_supports_row_into(&self) -> bool {
@@ -5815,9 +6072,17 @@ impl TdsClient {
         if let Some(cached) = self.buffered_row_support.as_ref()
             && Arc::ptr_eq(metadata, &cached.metadata)
         {
-            return cached.supported;
+            return cached.whole_row;
         }
         Self::metadata_supports_buffered_rows(metadata)
+    }
+
+    /// Returns the contiguous non-PLP prefix eligible for fetch-time capture.
+    pub fn current_result_bufferable_prefix_len(&mut self) -> Option<usize> {
+        self.buffered_row_support();
+        self.buffered_row_support
+            .as_ref()
+            .and_then(|support| support.prefix_len)
     }
 
     /// Returns and caches whole-row eligibility for the current metadata allocation.
@@ -5828,15 +6093,30 @@ impl TdsClient {
         if let Some(cached) = self.buffered_row_support.as_ref()
             && Arc::ptr_eq(metadata, &cached.metadata)
         {
-            return cached.supported;
+            return cached.whole_row;
         }
 
-        let supported = Self::metadata_supports_buffered_rows(metadata);
+        let whole_row = Self::metadata_supports_buffered_rows(metadata);
+        let prefix_len = if metadata.cek_table.is_empty()
+            && metadata
+                .columns
+                .iter()
+                .all(|column| column.crypto_metadata.is_none())
+        {
+            metadata
+                .columns
+                .iter()
+                .position(|column| column.is_plp())
+                .filter(|prefix_len| *prefix_len > 0)
+        } else {
+            None
+        };
         self.buffered_row_support = Some(Box::new(BufferedRowSupport {
             metadata: Arc::clone(metadata),
-            supported,
+            whole_row,
+            prefix_len,
         }));
-        supported
+        whole_row
     }
 
     /// Checks whether every column can use the non-streaming, non-encrypted row path.
@@ -5899,6 +6179,71 @@ impl TdsClient {
             }
             Ok(RowReadResult::Token(_)) => Err(crate::error::Error::ProtocolError(
                 "row continuation returned a control token".to_string(),
+            )),
+            Err(error) => {
+                self.abort_pending_prepare_capture();
+                Err(error)
+            }
+        }
+    }
+
+    /// Finishes a partially buffered inline prefix and pauses before its first PLP.
+    pub async fn finish_row_prefix_into<W>(
+        &mut self,
+        prefix_len: usize,
+        writer: &mut W,
+    ) -> TdsResult<()>
+    where
+        W: RowWriter + Send + ?Sized,
+    {
+        let state = std::mem::replace(&mut self.active_row_read_state, ActiveRowReadState::Idle);
+        let pause_state = match state {
+            ActiveRowReadState::RowPaused(pause_state) => pause_state,
+            state => {
+                self.active_row_read_state = state;
+                return Err(UsageError(
+                    "finish_row_prefix_into called without a resumable positioned row".to_string(),
+                ));
+            }
+        };
+        let start = self.request_timeout_start();
+        let result = self
+            .transport
+            .resume_row_into(
+                *pause_state,
+                self.remaining_request_timeout,
+                self.cancel_handle.as_ref(),
+                ColumnPolicy::DecodePrefix(prefix_len),
+                writer,
+            )
+            .await;
+        if let Some(start) = start {
+            self.update_remaining_timeout(start);
+        }
+        match result {
+            Ok(RowReadResult::RowPaused(pause_state))
+                if pause_state.next_column_index == prefix_len =>
+            {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+                Ok(())
+            }
+            Ok(RowReadResult::RowPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "Inline prefix decode paused at the wrong column".to_string(),
+                ))
+            }
+            Ok(RowReadResult::RowWritten) => Err(crate::error::Error::ProtocolError(
+                "Inline prefix decode consumed the complete row".to_string(),
+            )),
+            Ok(RowReadResult::PlpPaused(pause_state)) => {
+                self.active_row_read_state = ActiveRowReadState::PlpPaused(Box::new(pause_state));
+                Err(crate::error::Error::ProtocolError(
+                    "Inline prefix decode consumed the PLP header".to_string(),
+                ))
+            }
+            Ok(RowReadResult::Token(_)) => Err(crate::error::Error::ProtocolError(
+                "Inline prefix continuation returned a control token".to_string(),
             )),
             Err(error) => {
                 self.abort_pending_prepare_capture();
@@ -6087,6 +6432,9 @@ impl TdsClient {
     /// already network-bound, so one allocation there is negligible; an 8 KiB
     /// per-row state machine is not.
     async fn drain_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
+        if plp_state.reached_end() {
+            return Ok(());
+        }
         let mut buffer = vec![0u8; 8192];
         while !plp_state.reached_end() {
             let start = Instant::now();
@@ -7021,7 +7369,10 @@ mod tests {
     use crate::message::parameters::rpc_parameters::StreamedSqlType;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes as client_over_bytes;
     use crate::test_client_support::byte_stream::tds_client_over_raw_bytes_with_column_encryption as client_over_bytes_with_ae;
-    use crate::test_packet_support::{TestPacketBuilder, create_network_transport_with_data};
+    use crate::test_packet_support::{
+        TestPacketBuilder, create_network_transport_with_data,
+        create_network_transport_with_live_peer,
+    };
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, TokenType, Tokens,
     };
@@ -7759,6 +8110,44 @@ mod tests {
         })
     }
 
+    fn mixed_lob_metadata(prefix_columns: usize) -> Arc<ColMetadataToken> {
+        let mut columns = int_column_metadata(prefix_columns).columns.clone();
+        columns.push(crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::partial_len(
+                crate::datatypes::sqldatatypes::TdsDataType::NVarChar,
+                usize::from(u16::MAX),
+                None,
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::NVarChar,
+            column_name: "lob".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        });
+        Arc::new(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap(),
+            columns,
+            cek_table: vec![],
+        })
+    }
+
+    /// Like [`mixed_lob_metadata`], but with `suffix_columns` plain int
+    /// columns after the PLP column instead of the PLP column being last.
+    fn mixed_lob_metadata_with_int_suffix(
+        prefix_columns: usize,
+        suffix_columns: usize,
+    ) -> Arc<ColMetadataToken> {
+        let mut columns = mixed_lob_metadata(prefix_columns).columns.clone();
+        columns.extend(int_column_metadata(suffix_columns).columns.iter().cloned());
+        Arc::new(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap(),
+            columns,
+            cek_table: vec![],
+        })
+    }
+
     fn done_more() -> Tokens {
         Tokens::Done(DoneToken {
             status: DoneStatus::MORE,
@@ -8299,6 +8688,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_peek_parks_the_buffered_row_for_the_next_cursor_call() {
+        let metadata = int_column_metadata(1);
+        let mut transport = TestTransport::new();
+        transport.sync_header_available = true;
+        let mut client = create_test_client_with_transport(transport);
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+
+        assert_eq!(
+            client.try_peek_past_current_row().unwrap(),
+            CursorPoll::Ready(true)
+        );
+        assert!(client.row_already_positioned);
+
+        assert!(client.next_row_cursor().await.unwrap());
+        assert!(!client.row_already_positioned);
+    }
+
+    #[tokio::test]
     async fn sync_cursor_decodes_buffered_sql_variant_with_base_type() {
         let column = crate::query::metadata::ColumnMetadata {
             user_type: 0,
@@ -8363,6 +8771,420 @@ mod tests {
             client.try_next_buffered_row_into(&mut writer).unwrap(),
             BufferedRowPoll::Complete
         );
+        assert_eq!(
+            writer.take_row(),
+            expected
+                .into_iter()
+                .map(ColumnValues::Int)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_leaves_and_consumes_complete_plp() {
+        let metadata = mixed_lob_metadata(2);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(&4_i64.to_le_bytes());
+        payload.extend_from_slice(&4_u32.to_le_bytes());
+        payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        assert_eq!(client.current_result_bufferable_prefix_len(), Some(2));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert_eq!(
+            writer.take_row(),
+            vec![ColumnValues::Int(10), ColumnValues::Int(20)]
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+
+        let mut bytes = [0_u8; 4];
+        let CursorPoll::Ready(Some(chunk)) =
+            client.try_read_row_plp_complete(2, &mut bytes).unwrap()
+        else {
+            panic!("complete buffered PLP should not require async continuation");
+        };
+        assert_eq!(bytes, [b'o', 0, b'k', 0]);
+        assert_eq!(chunk.read, 4);
+        assert!(chunk.reached_end);
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_updates_the_remaining_timeout() {
+        // Needs a trailing PLP column so `prefix_len` (the PLP column's
+        // index) is a valid buffered-prefix boundary; the prefix itself
+        // only touches the leading int column.
+        let metadata = mixed_lob_metadata(1);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&42_i32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(1, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert!(client.remaining_request_timeout.unwrap() < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_propagates_a_column_decode_error() {
+        // An invalid `IntN` length byte makes the underlying buffered decoder
+        // return a `ProtocolError`, which must propagate out of
+        // `try_next_buffered_row_prefix_into` instead of being swallowed. A
+        // trailing PLP column makes column 0's index a valid prefix boundary.
+        let mut columns = vec![crate::query::metadata::ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: crate::datatypes::sqldatatypes::TypeInfo::var_len(
+                crate::datatypes::sqldatatypes::TdsDataType::IntN,
+                4,
+            )
+            .unwrap(),
+            data_type: crate::datatypes::sqldatatypes::TdsDataType::IntN,
+            column_name: "c0".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        }];
+        columns.extend(mixed_lob_metadata(0).columns.iter().cloned());
+        let metadata = Arc::new(ColMetadataToken {
+            column_count: u16::try_from(columns.len()).unwrap(),
+            columns,
+            cek_table: vec![],
+        });
+        let payload = vec![0xff, TokenType::Row as u8, 3];
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
+
+        let error = client
+            .try_next_buffered_row_prefix_into(1, &mut writer)
+            .unwrap_err();
+        assert!(matches!(error, crate::error::Error::ProtocolError(_)));
+    }
+
+    #[tokio::test]
+    async fn buffered_prefix_capture_continues_across_packets() {
+        let metadata = mixed_lob_metadata(2);
+        let second_value = 20_i32.to_le_bytes();
+        let mut first_payload = vec![0xff, TokenType::Row as u8];
+        first_payload.extend_from_slice(&10_i32.to_le_bytes());
+        first_payload.extend_from_slice(&second_value[..2]);
+        let mut first = TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut second =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut stream = first.continuation().append_bytes(&first_payload).build();
+        stream.extend_from_slice(
+            &second
+                .append_bytes(&second_value[2..])
+                .append_bytes(&(-1_i64).to_le_bytes())
+                .build(),
+        );
+        let mut transport = create_network_transport_with_data(&stream);
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Partial
+        );
+        client.finish_row_prefix_into(2, &mut writer).await.unwrap();
+        assert_eq!(
+            writer.take_row(),
+            vec![ColumnValues::Int(10), ColumnValues::Int(20)]
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+    }
+
+    /// Sets up `client` positioned at a buffered `[int, int, PLP]` row with
+    /// `client.try_next_buffered_row_prefix_into(2, writer)` already run, so
+    /// `active_row_read_state` is `RowPaused` right before the PLP column.
+    async fn positioned_before_buffered_plp_column(
+        plp_payload: &[u8],
+    ) -> (TdsClient, crate::datatypes::row_writer::DefaultRowWriter) {
+        let metadata = mixed_lob_metadata(2);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(plp_payload);
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        (client, writer)
+    }
+
+    #[tokio::test]
+    async fn cursor_column_begins_a_buffered_plp_stream_when_length_is_known() {
+        // Known-length header (4) + a complete chunk + terminator, all already
+        // buffered: `try_read_row_column` must open a real `PlpStreaming`
+        // cursor from bytes alone, without waiting on async I/O.
+        let mut plp_payload = Vec::new();
+        plp_payload.extend_from_slice(&4_i64.to_le_bytes());
+        plp_payload.extend_from_slice(&4_u32.to_le_bytes());
+        plp_payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        plp_payload.extend_from_slice(&0_u32.to_le_bytes());
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let result = client.try_read_row_column(2).unwrap();
+        assert!(matches!(
+            result,
+            CursorPoll::Ready(CursorColumn::PlpStreaming { .. })
+        ));
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::PlpPaused(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_column_reports_null_for_a_buffered_plp_sentinel() {
+        // `SQL_PLP_NULL` (all bits set) means the PLP column itself is NULL on
+        // the wire; `try_read_row_column` must report it as a plain NULL value
+        // without ever entering the `PlpPaused` streaming state.
+        let plp_payload = (-1_i64).to_le_bytes();
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let result = client.try_read_row_column(2).unwrap();
+        assert!(matches!(
+            result,
+            CursorPoll::Ready(CursorColumn::Value {
+                value: ColumnValues::Null,
+                variant_base: None,
+            })
+        ));
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_active_plp_chunk_reads_a_buffered_chunk_and_updates_the_timeout() {
+        let mut plp_payload = Vec::new();
+        plp_payload.extend_from_slice(&4_i64.to_le_bytes());
+        plp_payload.extend_from_slice(&4_u32.to_le_bytes());
+        plp_payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        plp_payload.extend_from_slice(&0_u32.to_le_bytes());
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+        assert!(matches!(
+            client.try_read_row_column(2).unwrap(),
+            CursorPoll::Ready(CursorColumn::PlpStreaming { .. })
+        ));
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+
+        let mut out = [0_u8; 4];
+        let CursorPoll::Ready(chunk) = client.try_read_active_plp_chunk(&mut out).unwrap() else {
+            panic!("the whole chunk was already buffered");
+        };
+        assert_eq!(out, [b'o', 0, b'k', 0]);
+        assert_eq!(chunk.read, 4);
+        assert!(chunk.reached_end);
+        assert!(client.remaining_request_timeout.unwrap() < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn try_read_active_plp_chunk_defers_when_the_socket_has_no_more_data_yet() {
+        // The chunk header is only partially buffered and the peer stays
+        // connected without sending more, so `try_read_buffered_plp` must fall
+        // through its "no more data yet" branch and report `Pending` rather
+        // than blocking or erroring.
+        let metadata = mixed_lob_metadata(2);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(&4_i64.to_le_bytes()); // known-length PLP header
+        payload.extend_from_slice(&[0, 0]); // partial chunk-length header only
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_live_peer(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+        assert!(matches!(
+            client.try_read_row_column(2).unwrap(),
+            CursorPoll::Ready(CursorColumn::PlpStreaming { .. })
+        ));
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_active_plp_chunk(&mut out).unwrap(),
+            CursorPoll::Pending
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::PlpPaused(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_row_plp_complete_reports_a_buffered_null_column() {
+        // The PLP header itself carries `SQL_PLP_NULL`, distinct from the
+        // NBCROW null-bitmap null path exercised elsewhere.
+        let plp_payload = (-1_i64).to_le_bytes();
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_row_plp_complete(2, &mut out).unwrap(),
+            CursorPoll::Ready(None)
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_row_plp_complete_is_pending_without_the_full_chunk() {
+        // Only the 8-byte known-length header is buffered; the chunk header
+        // and payload haven't arrived yet, so the client must defer instead
+        // of erroring or fabricating a result.
+        let plp_payload = 4_i64.to_le_bytes();
+        let (mut client, _writer) = positioned_before_buffered_plp_column(&plp_payload).await;
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_row_plp_complete(2, &mut out).unwrap(),
+            CursorPoll::Pending
+        );
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_read_row_plp_complete_leaves_row_paused_when_more_columns_remain() {
+        // With a plain int column after the PLP column, completing the PLP
+        // value from buffered bytes must keep the row parked instead of
+        // dropping to `Idle`.
+        let metadata = mixed_lob_metadata_with_int_suffix(2, 1);
+        let mut payload = vec![0xff, TokenType::Row as u8];
+        payload.extend_from_slice(&10_i32.to_le_bytes());
+        payload.extend_from_slice(&20_i32.to_le_bytes());
+        payload.extend_from_slice(&4_i64.to_le_bytes());
+        payload.extend_from_slice(&4_u32.to_le_bytes());
+        payload.extend_from_slice(&[b'o', 0, b'k', 0]);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&30_i32.to_le_bytes());
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(metadata);
+        client.current_result_set_has_been_read_till_end = false;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(4);
+        assert_eq!(
+            client
+                .try_next_buffered_row_prefix_into(2, &mut writer)
+                .unwrap(),
+            BufferedRowPoll::Complete
+        );
+
+        let mut out = [0_u8; 4];
+        let CursorPoll::Ready(Some(chunk)) = client.try_read_row_plp_complete(2, &mut out).unwrap()
+        else {
+            panic!("complete buffered PLP should not require async continuation");
+        };
+        assert_eq!(out, [b'o', 0, b'k', 0]);
+        assert_eq!(chunk.read, 4);
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 3
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_finish_row_into_completes_a_fully_buffered_row() {
+        let expected = [11_i32, 22_i32];
+        let mut payload = vec![0xff];
+        payload.extend(expected.iter().flat_map(|value| value.to_le_bytes()));
+        let mut packet =
+            TestPacketBuilder::new(crate::message::messages::PacketType::TabularResult);
+        let mut transport =
+            create_network_transport_with_data(&packet.append_bytes(&payload).build());
+        // Force a packet read so the int columns are already buffered before
+        // `try_finish_row_into` runs its synchronous, buffer-only pass.
+        assert_eq!(transport.read_byte().await.unwrap(), 0xff);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(RowPauseState {
+            next_column_index: 0,
+            metadata: int_column_metadata(expected.len()),
+            nbc_null_bitmap: None,
+            decryptor: None,
+        }));
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(expected.len());
+
+        assert!(client.try_finish_row_into(&mut writer).unwrap());
         assert_eq!(
             writer.take_row(),
             expected
@@ -8554,10 +9376,38 @@ mod tests {
     }
 
     #[test]
+    fn try_read_active_plp_chunk_defers_when_cancelled() {
+        let mut client = create_test_client();
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            client.try_read_active_plp_chunk(&mut out).unwrap(),
+            CursorPoll::Pending
+        );
+    }
+
+    #[test]
+    fn try_read_active_plp_chunk_errors_without_an_active_stream() {
+        let mut client = create_test_client();
+        assert!(matches!(
+            client.active_row_read_state,
+            ActiveRowReadState::Idle
+        ));
+
+        let mut out = [0_u8; 4];
+        let error = client.try_read_active_plp_chunk(&mut out).unwrap_err();
+        assert!(matches!(error, UsageError(_)));
+    }
+
+    #[test]
     fn row_writer_finish_is_limited_to_non_plp_results() {
         let mut client = create_test_client();
         assert!(!client.current_result_supports_row_into());
         assert!(!client.buffered_row_support());
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
 
         client.current_metadata = Some(int_column_metadata(1));
         assert!(client.current_result_supports_row_into());
@@ -8585,11 +9435,27 @@ mod tests {
         }));
         assert!(!client.current_result_supports_row_into());
         assert!(!client.buffered_row_support());
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
         let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(1);
         assert_eq!(
             client.try_next_buffered_row_into(&mut writer).unwrap(),
             BufferedRowPoll::Pending
         );
+    }
+
+    #[test]
+    fn prefix_eligibility_requires_inline_columns_and_no_encryption() {
+        let mut client = create_test_client();
+        client.current_metadata = Some(mixed_lob_metadata(2));
+        assert_eq!(client.current_result_bufferable_prefix_len(), Some(2));
+
+        client.current_metadata = Some(mixed_lob_metadata(0));
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
+
+        let mut encrypted = mixed_lob_metadata(2).as_ref().clone();
+        encrypted.columns[0].crypto_metadata = Some(ae_crypto_metadata());
+        client.current_metadata = Some(Arc::new(encrypted));
+        assert_eq!(client.current_result_bufferable_prefix_len(), None);
     }
 
     #[test]
@@ -8710,6 +9576,120 @@ mod tests {
         let mut failed = create_test_client();
         failed.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused()));
         assert!(failed.finish_row_into(&mut writer).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn finish_row_prefix_into_handles_transport_outcomes() {
+        fn paused_at(next_column_index: usize) -> RowPauseState {
+            RowPauseState {
+                next_column_index,
+                metadata: int_column_metadata(2),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            }
+        }
+
+        const PREFIX_LEN: usize = 1;
+        let mut writer = crate::datatypes::row_writer::DefaultRowWriter::new(2);
+
+        // `RowPaused` at the requested prefix boundary succeeds.
+        let mut ok_transport = TestTransport::new();
+        ok_transport
+            .resume_results
+            .push_back(RowReadResult::RowPaused(paused_at(PREFIX_LEN)));
+        let mut ok = create_test_client_with_transport(ok_transport);
+        ok.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        ok.finish_row_prefix_into(PREFIX_LEN, &mut writer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ok.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == PREFIX_LEN
+        ));
+
+        // `RowPaused` at a different column than requested is a protocol error.
+        let mut wrong_column_transport = TestTransport::new();
+        wrong_column_transport
+            .resume_results
+            .push_back(RowReadResult::RowPaused(paused_at(0)));
+        let mut wrong_column = create_test_client_with_transport(wrong_column_transport);
+        wrong_column.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            wrong_column
+                .finish_row_prefix_into(PREFIX_LEN, &mut writer)
+                .await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(matches!(
+            wrong_column.active_row_read_state,
+            ActiveRowReadState::RowPaused(ref state) if state.next_column_index == 0
+        ));
+
+        // Decoding the whole row instead of stopping at the prefix is also an error.
+        let mut whole_row_transport = TestTransport::new();
+        whole_row_transport
+            .resume_results
+            .push_back(RowReadResult::RowWritten);
+        let mut whole_row = create_test_client_with_transport(whole_row_transport);
+        whole_row.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            whole_row
+                .finish_row_prefix_into(PREFIX_LEN, &mut writer)
+                .await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+
+        // Pausing at a PLP header before reaching the requested prefix is an error.
+        let plp_metadata = mixed_lob_metadata(2);
+        let Some((Some(plp_stream), _used)) =
+            crate::datatypes::decoder::PlpColumnStream::try_begin_buffered(
+                &plp_metadata.columns[2],
+                &4_u64.to_le_bytes(),
+            )
+            .unwrap()
+        else {
+            panic!("a known-length PLP header must yield a started stream");
+        };
+        let plp_pause = PlpPauseState {
+            row_pause_state: paused_at(2),
+            plp_stream,
+        };
+        let mut plp_transport = TestTransport::new();
+        plp_transport
+            .resume_results
+            .push_back(RowReadResult::PlpPaused(plp_pause));
+        let mut plp = create_test_client_with_transport(plp_transport);
+        plp.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            plp.finish_row_prefix_into(PREFIX_LEN, &mut writer).await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+        assert!(matches!(
+            plp.active_row_read_state,
+            ActiveRowReadState::PlpPaused(_)
+        ));
+
+        // A control token in place of a row is a protocol error.
+        let mut token_transport = TestTransport::new();
+        token_transport
+            .resume_results
+            .push_back(RowReadResult::Token(done_no_more()));
+        let mut token = create_test_client_with_transport(token_transport);
+        token.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(matches!(
+            token.finish_row_prefix_into(PREFIX_LEN, &mut writer).await,
+            Err(crate::error::Error::ProtocolError(_))
+        ));
+
+        // A transport failure propagates and aborts any pending prepare capture.
+        let mut failed = create_test_client();
+        failed.active_row_read_state = ActiveRowReadState::RowPaused(Box::new(paused_at(0)));
+        assert!(
+            failed
+                .finish_row_prefix_into(PREFIX_LEN, &mut writer)
+                .await
+                .is_err()
+        );
     }
 
     // ── PLP streaming lifecycle contract tests ──
