@@ -414,14 +414,22 @@ fn open_deferred_rpc(
             Err(rc) => {
                 // Nothing was sent, so the statement goes back to being merely
                 // prepared rather than needing a cancel.
-                let client = stmt_state.take_dae();
+                //
+                // The client checked out above is returned directly rather than
+                // through `take_dae`: a checked-out client is no longer on the
+                // sequence, so `take_dae` reports `None` for it and disposing of
+                // it is this function's obligation (see `checkout_client`).
+                // `take_dae` still runs, for the sequence teardown it performs.
+                let parked = stmt_state.take_dae();
+                debug_assert!(
+                    parked.is_none(),
+                    "the client was checked out above, so the sequence cannot hold one"
+                );
                 stmt_state.prepared = prepared;
                 stmt_state.pending_unprepare = orphaned;
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
                 drop(stmt_state);
-                if let Some(client) = client {
-                    return_client_idle(dbc, statement_handle, client);
-                }
+                return_client_idle(dbc, statement_handle, client);
                 return Some(rc);
             }
         };
@@ -456,15 +464,22 @@ fn open_deferred_rpc(
         Ok(StreamedParamStatus::NeedData { .. }) => {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLParamData: stmt mutex poisoned parking the opened RPC");
+                abandon_open_rpc(dbc, statement_handle, client);
                 return Some(SQL_ERROR);
             };
             stmt_state.prepared = prepared;
             stmt_state.pending_unprepare = orphaned;
-            let Some(dae) = stmt_state.dae.as_mut() else {
+            // Taken rather than borrowed: the failure arm has to release the
+            // guard before it can dispose of `client`, which a borrow held
+            // across a `let ... else` would forbid. Put back below on success.
+            let Some(mut dae) = stmt_state.dae.take() else {
                 error!("SQLParamData: DAE sequence vanished with its RPC open");
+                drop(stmt_state);
+                abandon_open_rpc(dbc, statement_handle, client);
                 return Some(SQL_ERROR);
             };
             dae.begin_streaming_phase(client, collation);
+            stmt_state.dae = Some(dae);
             None
         }
         Ok(StreamedParamStatus::Complete(_)) => {
@@ -492,6 +507,28 @@ fn open_deferred_rpc(
             Some(fail_with_tds(dbc, stmt, statement_handle, client, &e))
         }
     }
+}
+
+/// Disposes of a client whose RPC is open but which has nowhere left to be
+/// parked, so the connection is usable again rather than wedged.
+///
+/// The transport is mid-write once the RPC is open, so the parked request has to
+/// be discarded before the client can serve another command — the same disposal
+/// [`unwind_dae`](super::exec_common::unwind_dae) performs, without the
+/// statement half, which neither caller can do: one has a poisoned mutex and the
+/// other has already lost the sequence that teardown would read.
+///
+/// Reached only through internal-state corruption. It exists because dropping
+/// the client instead would leave the DBC holding `active_stmt` with no client
+/// to give, which fails every later operation on that connection rather than
+/// just this one.
+fn abandon_open_rpc(
+    dbc: &crate::handles::DbcHandle,
+    statement_handle: SqlHandle,
+    mut client: mssql_tds::connection::tds_client::TdsClient,
+) {
+    dbc.runtime.block_on(client.cancel_streamed_write());
+    return_client_idle(dbc, statement_handle, client);
 }
 
 /// Runs the execute a data-at-execution sequence deferred, now that every value
@@ -747,5 +784,96 @@ mod tests {
             ERR_DAE_LENGTH_MISMATCH.state
         );
         assert!(!state.needs_data());
+    }
+
+    /// A collected value that cannot be converted fails the whole sequence, and
+    /// the client `open_deferred_rpc` checked out has to reach the connection on
+    /// the way out.
+    ///
+    /// Dropping it instead leaves the DBC holding `active_stmt` with `client ==
+    /// None`, which fails every later operation on that *connection* rather than
+    /// just this statement — the failure is one statement's, so the blast radius
+    /// must be too. `take_dae` cannot supply it: a checked-out client is no
+    /// longer on the sequence, so `take_dae` answers `None` for it.
+    ///
+    /// The sequence has to be **mixed** to reach that branch at all:
+    /// `open_deferred_rpc` only runs once every remaining parameter streams
+    /// (`buffered_phase_complete`), so a lone buffered parameter closes through
+    /// `run_deferred_execute` instead and never checks a client out here.
+    /// The conversion is failed with a `varchar(1)` declaration against two
+    /// non-blank bytes, which `buffered_dae_to_rpc` rejects as `22001`.
+    #[test]
+    fn a_failed_deferred_rebuild_returns_the_client_to_the_connection() {
+        use crate::api::odbc_types::SQL_VARCHAR;
+        use crate::conversion::param_convert::DaePlan;
+        use mssql_tds::message::parameters::rpc_parameters::{
+            RpcParameter, StatusFlags, StreamedSqlType,
+        };
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+
+        let mut token = 0u8;
+        let token_ptr: SqlPointer = (&raw mut token).cast();
+
+        {
+            // Busy on this statement with no client of its own: the sequence
+            // holds it, exactly as a parked DAE sequence leaves the connection.
+            let mut dbc_state = dbc.inner.lock().unwrap();
+            dbc_state.active_stmt = Some(h.stmt);
+            dbc_state.client = None;
+        }
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            // Parameter 0 buffers: one character declared, two supplied,
+            // neither a blank, so the conversion answers 22001.
+            let mut buffered =
+                DaeParam::unbounded(0, token_ptr, None).with_binding_types(SQL_C_CHAR, SQL_VARCHAR);
+            buffered.binding.column_size = 1;
+            buffered.plan = DaePlan::Buffer;
+            // Parameter 1 streams, which is what makes the buffered phase
+            // "complete" once parameter 0 closes and sends this through
+            // `open_deferred_rpc`.
+            let streamed = DaeParam::unbounded(1, token_ptr, None);
+
+            let mut dae = DaeState::for_test_with_client(
+                vec![buffered, streamed],
+                Some(0),
+                tds_client_from_tokens(vec![]),
+            );
+            dae.deferred = true;
+            dae.prebuilt = vec![
+                RpcParameter::data_at_exec(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarcharMax,
+                ),
+                RpcParameter::data_at_exec(
+                    Some("@P2".to_string()),
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarBinaryMax,
+                ),
+            ];
+            dae.sql = Some("SELECT ?, ?".to_string());
+            dae.progress.put_data_called = true;
+            dae.progress.buffer = b"ab".to_vec();
+            state.dae = Some(dae);
+        }
+
+        let mut p: SqlPointer = std::ptr::null_mut();
+        let ret = unsafe { sql_param_data(h.stmt, &mut p) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let dbc_state = dbc.inner.lock().unwrap();
+        assert!(
+            dbc_state.client.is_some(),
+            "the checked-out client must be returned, not dropped"
+        );
+        assert_eq!(
+            dbc_state.active_stmt, None,
+            "the busy claim must be released with it"
+        );
     }
 }

@@ -988,6 +988,19 @@ impl DaeState {
     pub(crate) fn set_call_in_flight(&mut self, in_flight: bool) {
         self.call_in_flight = in_flight;
     }
+
+    /// Same as [`Self::for_test`], with a parked client, for the tests that
+    /// exercise a path which checks one out and must dispose of it.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_client(
+        params: Vec<DaeParam>,
+        cursor: Option<usize>,
+        client: TdsClient,
+    ) -> Self {
+        let mut state = Self::for_test(params, cursor);
+        state.client = Some(client);
+        state
+    }
 }
 
 /// How msodbcsql validates a vendor statement attribute's value.

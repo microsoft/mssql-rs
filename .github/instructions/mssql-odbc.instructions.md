@@ -123,6 +123,31 @@ authoritative parity reference for this crate. Its source lives in the
     and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
     deferred resolution makes it reachable without the application naming the C
     type.
+  - **`SQLParamData` offers a mixed data-at-execution sequence buffered-first,
+    not in bind order.** A parameter whose `ParameterType` has no PLP form
+    (`char(n)`, `int`, …) has to be collected whole before its declaration is
+    known, and the RPC cannot open until every such value is in hand — so
+    visiting them first is what lets the PLP-capable parameters stream instead
+    of also being held in memory (`DaeState::deferred`). msodbcsql offers them
+    in bind order, because `Sql2Srv` gives it a declaration without seeing the
+    value. ODBC specifies no order: `SQLParamData` returns "the next parameter
+    for which data is needed" and the application identifies it by the returned
+    `ParameterValuePtr` token, not by position — so an application that compares
+    tokens is unaffected, while one that *counts* calls and assumes bind order
+    supplies the wrong value with no diagnostic. Only sequences that mix the two
+    plans are reordered; an all-streamed or all-buffered sequence keeps bind
+    order (`sort_by_key` is stable). Anchored by
+    `MixedDataAtExecutionStreamsThePlpParameter` (AB#47590).
+  - **A fixed-width target may be supplied across several `SQLPutData` calls.**
+    msodbcsql refuses the second call with `HY019` — `ValidatePutDataLength`'s
+    `default:` arm ("Processing of fixed length targets cannot be spread over
+    multiple calls to SQLPutData", `odbc/sqlccmd.cpp`), with the first call
+    exempted at its call site. This driver collects the chunks and converts the
+    concatenation, which is the permissive direction: the value it produces is
+    the one a single buffer would have produced, so nothing an application does
+    today breaks. Already observable in
+    `CrossFamilyDataAtExecutionConvertsToInteger`, which records msodbcsql
+    answering `HY019` where this driver converts.
   - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
     writes the client code page. msodbcsql uses the client code page -
     `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
