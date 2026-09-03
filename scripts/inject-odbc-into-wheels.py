@@ -63,18 +63,21 @@ def drivers_for_platform_tag(platform_tag: str) -> list[str]:
     if "win_arm64" in tag:
         return [_WIN_ARM64]
 
-    if "manylinux" in tag:
-        if "x86_64" in tag:
-            return [_GLIBC_X64]
-        if "aarch64" in tag:
-            return [_GLIBC_ARM64]
+    # musllinux must be checked before the generic linux branch (it contains
+    # "linux"). glibc wheels carry the bare linux_<arch> tag (auditwheel=skip
+    # means maturin does not retag them manylinux); manylinux_* maps here too.
     if "musllinux" in tag:
         if "x86_64" in tag:
             return [_MUSL_X64]
         if "aarch64" in tag:
             return [_MUSL_ARM64]
+    elif "linux" in tag:
+        if "x86_64" in tag:
+            return [_GLIBC_X64]
+        if "aarch64" in tag:
+            return [_GLIBC_ARM64]
 
-    # Re-tagged macOS wheels are universal2 -> ship both arch slices.
+    # macOS wheels are universal2 -> ship both arch slices.
     if "macosx" in tag and "universal2" in tag:
         return [_MACOS_X64, _MACOS_ARM64]
 
