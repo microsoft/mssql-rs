@@ -143,7 +143,9 @@ TEST_F(DescribeColLiveTest, InvalidColumnOrdinal) {
 }
 
 TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
-    ExecDirect("SELECT CAST(3.14 AS DECIMAL(10,2)) AS d, CAST(6.28 AS NUMERIC(12,3)) AS n");
+    ExecDirect(
+        "SELECT CAST(3.14 AS DECIMAL(10,2)) AS d, CAST(6.28 AS NUMERIC(12,3)) AS n, 1.5 AS "
+        "literal");
 
     SQLSMALLINT dataType = 0;
     SQLULEN colSize = 0;
@@ -163,6 +165,13 @@ TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
     EXPECT_EQ(SQL_NUMERIC, dataType);
     EXPECT_EQ(12u, colSize);
     EXPECT_EQ(3, decDigits);
+
+    rc = SQLDescribeCol(
+        stmt_, 3, nullptr, 0, nullptr, &dataType, &colSize, &decDigits, &nullable);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NUMERIC, dataType);
+    EXPECT_EQ(2u, colSize);
+    EXPECT_EQ(1, decDigits);
 
     SQLCloseCursor(stmt_);
 }

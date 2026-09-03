@@ -315,9 +315,8 @@ pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) 
     }
 }
 
-// Unit tests cover the validation/error paths only. The metadata-driven mapping
-// helpers (`odbc_sql_type`, `column_size`, `decimal_digits`) cannot be exercised
-// here because `mssql_tds::ColumnMetadata::type_info_variant` is `pub(crate)`
+// Precision- and scale-dependent branches in `column_size` and `decimal_digits` cannot
+// be exercised here because `mssql_tds::ColumnMetadata::type_info_variant` is `pub(crate)`
 // and there is no public constructor — those branches are covered end-to-end by
 // `tests/e2e/tests/describe_col_test.cpp` against a live SQL Server.
 #[cfg(test)]
@@ -354,6 +353,28 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { describe(ptr::null_mut(), 1) };
         assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn decimal_numeric_and_money_types_match_msodbcsql() {
+        let mut columns = int_columns(1);
+        let meta = &mut columns[0];
+
+        for (tds_type, length, sql_type) in [
+            (TdsDataType::Decimal, 17, SQL_NUMERIC),
+            (TdsDataType::DecimalN, 17, SQL_DECIMAL),
+            (TdsDataType::Numeric, 17, SQL_NUMERIC),
+            (TdsDataType::NumericN, 17, SQL_NUMERIC),
+            (TdsDataType::Money, 8, SQL_DECIMAL),
+            (TdsDataType::Money4, 4, SQL_DECIMAL),
+            (TdsDataType::MoneyN, 8, SQL_DECIMAL),
+        ] {
+            meta.data_type = tds_type;
+            meta.type_info.tds_type = tds_type;
+            meta.type_info.length = length;
+
+            assert_eq!(odbc_sql_type(meta), sql_type, "{tds_type:?}");
+        }
     }
 
     #[test]
