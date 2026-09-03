@@ -408,6 +408,8 @@ fn display_size(meta: &ColumnMetadata) -> SqlLen {
 /// representation, which for the temporal types is the C struct the driver
 /// hands back, not the TDS payload width.
 pub(super) fn octet_length(meta: &ColumnMetadata) -> SqlLen {
+    // A bounded UDT is still PLP; use its byte limit for binary transfer while
+    // display_size remains zero because the opaque value has no text rendering.
     if meta.data_type == TdsDataType::Udt {
         return desc_length(meta);
     }

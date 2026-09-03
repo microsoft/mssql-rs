@@ -538,9 +538,9 @@ fn describe_tds_type(
         }
         TdsDataType::Image => (SQL_LONGVARBINARY, parameter_length(length, false)?, 0),
         TdsDataType::SsVariant => (SQL_SS_VARIANT, 8000, 0),
-        // Unbounded types report a size of 0, the same "unbounded" convention
-        // `describe_col::column_size` already uses for PLP. A table type has no
-        // meaningful column size at all.
+        // Parameter discovery does not include the CLR MAX_BYTE_SIZE carried by
+        // COLMETADATA, so UDT size remains 0. XML is unbounded; a table type has
+        // no meaningful column size at all.
         TdsDataType::Udt => (SQL_SS_UDT, 0, 0),
         TdsDataType::Xml => (SQL_SS_XML, 0, 0),
         TdsDataType::SqlTable => (SQL_SS_TABLE, 0, 0),
