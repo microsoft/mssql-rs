@@ -9,10 +9,10 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT,
-    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP,
-    SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
-    SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_NULLABLE, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
+    SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
@@ -208,10 +208,9 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
             8 => SQL_DOUBLE,
             _ => SQL_UNKNOWN_TYPE,
         },
-        TdsDataType::Decimal
-        | TdsDataType::DecimalN
-        | TdsDataType::Numeric
-        | TdsDataType::NumericN => SQL_DECIMAL,
+        TdsDataType::DecimalN => SQL_DECIMAL,
+        // msodbcsql's rgbSRV2SQLTYPE maps the legacy fixed SQLDECIMAL token to SQL_NUMERIC.
+        TdsDataType::Decimal | TdsDataType::Numeric | TdsDataType::NumericN => SQL_NUMERIC,
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => SQL_DECIMAL,
         TdsDataType::DateN => SQL_TYPE_DATE,
         // SQL Server's `time` supports up to 7-digit fractional seconds; SQL_TYPE_TIME
@@ -328,9 +327,8 @@ pub(crate) fn decimal_digits(meta: &mssql_tds::query::metadata::ColumnMetadata) 
     }
 }
 
-// Unit tests cover the validation/error paths only. The metadata-driven mapping
-// helpers (`odbc_sql_type`, `column_size`, `decimal_digits`) cannot be exercised
-// here because `mssql_tds::ColumnMetadata::type_info_variant` is `pub(crate)`
+// Precision- and scale-dependent branches in `column_size` and `decimal_digits` cannot
+// be exercised here because `mssql_tds::ColumnMetadata::type_info_variant` is `pub(crate)`
 // and there is no public constructor — those branches are covered end-to-end by
 // `tests/e2e/tests/describe_col_test.cpp` against a live SQL Server.
 #[cfg(test)]
@@ -370,6 +368,28 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let rc = unsafe { describe(ptr::null_mut(), 1) };
         assert_eq!(rc, SQL_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn decimal_numeric_and_money_types_match_msodbcsql() {
+        let mut columns = int_columns(1);
+        let meta = &mut columns[0];
+
+        for (tds_type, length, sql_type) in [
+            (TdsDataType::Decimal, 17, SQL_NUMERIC),
+            (TdsDataType::DecimalN, 17, SQL_DECIMAL),
+            (TdsDataType::Numeric, 17, SQL_NUMERIC),
+            (TdsDataType::NumericN, 17, SQL_NUMERIC),
+            (TdsDataType::Money, 8, SQL_DECIMAL),
+            (TdsDataType::Money4, 4, SQL_DECIMAL),
+            (TdsDataType::MoneyN, 8, SQL_DECIMAL),
+        ] {
+            meta.data_type = tds_type;
+            meta.type_info.tds_type = tds_type;
+            meta.type_info.length = length;
+
+            assert_eq!(odbc_sql_type(meta), sql_type, "{tds_type:?}");
+        }
     }
 
     #[test]
