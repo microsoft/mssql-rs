@@ -620,8 +620,10 @@ pub unsafe extern "C" fn SQLPutData(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Every active bound-column data buffer must be writable for the configured
-///   rowset according to its C type and `BufferLength`; its indicator and
+/// - Every active bound-column data buffer must be writable for
+///   `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+///   or binary target, or of the full C type size for a fixed-width target,
+///   even when `BufferLength` is zero or smaller. Its indicator and
 ///   octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
 ///   `SqlLen` values.
 /// - Non-null rowset pointer attributes must satisfy their declared extents:
@@ -641,8 +643,13 @@ pub unsafe extern "C" fn SQLFetch(statement_handle: SqlHandle) -> SqlReturn {
 /// only.
 ///
 /// # Safety
-/// `statement_handle` must be a valid statement handle or null. The buffers must
-/// stay valid until the column is unbound or the statement is freed.
+/// `statement_handle` must be a valid statement handle or null. The buffers
+/// must stay valid until the column is unbound or the statement is freed. At
+/// each fetch, `target_value_ptr` must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `buffer_length` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `buffer_length` is zero or smaller. `strlen_or_ind_ptr`, when non-null,
+/// must be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLBindCol(
     statement_handle: SqlHandle,
@@ -672,11 +679,13 @@ pub unsafe extern "C" fn SQLBindCol(
 ///
 /// # Safety
 /// `statement_handle` must be a valid statement handle or null.
-/// Every active bound-column data buffer must be writable for the configured
-/// rowset according to its C type and `BufferLength`; its indicator and
-/// octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
-/// `SqlLen` values. Non-null rowset pointer attributes must satisfy their
-/// declared extents: one `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
+/// Every active bound-column data buffer must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `BufferLength` is zero or smaller. Its indicator and octet-length
+/// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// Non-null rowset pointer attributes must satisfy their declared extents: one
+/// `SqlULen` for `SQL_ATTR_ROWS_FETCHED_PTR` and
 /// `SQL_ATTR_ROW_BIND_OFFSET_PTR`, and `SQL_ATTR_ROW_ARRAY_SIZE`
 /// `SqlUSmallInt` values for `SQL_ATTR_ROW_STATUS_PTR`.
 #[unsafe(no_mangle)]

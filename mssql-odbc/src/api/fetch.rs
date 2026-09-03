@@ -22,13 +22,15 @@ use crate::api::odbc_types::{SQL_FETCH_NEXT, SqlHandle, SqlReturn};
 ///
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
-/// Every active bound-column data buffer must be writable for the configured
-/// rowset according to its C type and `BufferLength`; its indicator and
-/// octet-length arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
-/// `SqlLen` values. `SQL_ATTR_ROWS_FETCHED_PTR` must be writable for one
-/// `SqlULen`, `SQL_ATTR_ROW_STATUS_PTR` for `SQL_ATTR_ROW_ARRAY_SIZE`
-/// `SqlUSmallInt` values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable
-/// for one `SqlULen`, whenever those attributes are non-null.
+/// Every active bound-column data buffer must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `BufferLength` is zero or smaller. Its indicator and octet-length
+/// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// `SQL_ATTR_ROWS_FETCHED_PTR` must be writable for one `SqlULen`,
+/// `SQL_ATTR_ROW_STATUS_PTR` for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlUSmallInt`
+/// values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable for one
+/// `SqlULen`, whenever those attributes are non-null.
 pub(crate) unsafe fn sql_fetch(statement_handle: SqlHandle) -> SqlReturn {
     debug!(?statement_handle, "SQLFetch called");
     crate::ffi_entry!("SQLFetch", unsafe {
