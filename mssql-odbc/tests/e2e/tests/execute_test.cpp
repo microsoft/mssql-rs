@@ -850,7 +850,18 @@ TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTrans
 // non-UTF8 collation. Every streamed chunk now goes through the connection's
 // collation on its way out, so this pairing encodes like the materialized path
 // (AB#47590's narrow-to-narrow half).
+//
+// Skipped in the parity run because the two drivers disagree by construction,
+// not by defect: msodbcsql reads `SQL_C_CHAR` as the client's ANSI codepage and
+// passes those bytes through, so it round-trips these five UTF-8 bytes as five
+// characters ("caf" + U+00C3 + U+00A9), while this driver decodes them as one
+// character ("caf" + U+00E9). The divergence is the driver-wide `SQL_C_CHAR`
+// convention, which the materialized path already follows; it is not specific
+// to the streamed path this test covers. Only visible under a non-UTF8
+// collation -- under a UTF8 one, transcode and passthrough are byte-identical.
 TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
