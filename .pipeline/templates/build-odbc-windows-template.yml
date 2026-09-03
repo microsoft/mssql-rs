@@ -21,6 +21,14 @@ parameters:
   - name: publishArtifacts
     type: boolean
     default: true
+  # Authenticode-sign the driver with ESRP (CP-230012) before it is collected.
+  # Enable for official builds; the caller must load the ESRP variable group.
+  - name: signDriver
+    type: boolean
+    default: false
+  - name: esrpConnectedServiceName
+    type: string
+    default: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
 
 steps:
   - pwsh: |
@@ -38,6 +46,76 @@ steps:
       Copy-Item "$(CARGO_TARGET_DIR)\release\mssqlodbc.dll" $dropDir
     displayName: 'Stage driver into drop (${{ parameters.architecture }})'
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+  # Sign the raw driver at its source so it flows already-signed into whichever
+  # pipeline injects it into the wheels (NonOfficial Publish / Official Release).
+  - ${{ if eq(parameters.signDriver, true) }}:
+    - task: EsrpMalwareScanning@6
+      displayName: 'ESRP Malware Scanning driver (${{ parameters.architecture }})'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        ConnectedServiceName: '${{ parameters.esrpConnectedServiceName }}'
+        AppRegistrationClientId: '$(appRegistrationClientId)'
+        AppRegistrationTenantId: '$(appRegistrationTenantId)'
+        EsrpClientId: '$(EsrpClientId)'
+        FolderPath: '$(Build.SourcesDirectory)\odbc-drop\build'
+        Pattern: 'mssqlodbc.dll'
+        UseMinimatch: true
+        UseMSIAuthentication: true
+        CleanupTempStorage: true
+        VerboseLogin: true
+
+    - task: EsrpCodeSigning@6
+      displayName: 'ESRP CodeSigning driver (${{ parameters.architecture }})'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        ConnectedServiceName: '${{ parameters.esrpConnectedServiceName }}'
+        UseMSIAuthentication: true
+        AppRegistrationClientId: '$(appRegistrationClientId)'
+        AppRegistrationTenantId: '$(appRegistrationTenantId)'
+        EsrpClientId: '$(EsrpClientId)'
+        AuthAKVName: '$(AuthAKVName)'
+        AuthSignCertName: '$(AuthSignCertName)'
+        FolderPath: '$(Build.SourcesDirectory)\odbc-drop\build'
+        Pattern: 'mssqlodbc.dll'
+        UseMinimatch: true
+        signConfigType: inlineSignParams
+        inlineOperation: |
+          [
+            {
+              "KeyCode": "CP-230012",
+              "OperationCode": "SigntoolSign",
+              "ToolName": "sign",
+              "ToolVersion": "1.0",
+              "Parameters": {
+                "OpusName": "Microsoft",
+                "OpusInfo": "https://www.microsoft.com",
+                "FileDigest": "/fd SHA256",
+                "PageHash": "/NPH",
+                "TimeStamp": "/tr \"http://rfc3161.gtm.corp.microsoft.com/TSS/HttpTspServer\" /td sha256"
+              }
+            },
+            {
+              "KeyCode": "CP-230012",
+              "OperationCode": "SigntoolVerify",
+              "ToolName": "sign",
+              "ToolVersion": "1.0",
+              "Parameters": {}
+            }
+          ]
+        VerboseLogin: true
+
+    - pwsh: |
+        $ErrorActionPreference = 'Stop'
+        $driver = "$(Build.SourcesDirectory)\odbc-drop\build\mssqlodbc.dll"
+        $sig = Get-AuthenticodeSignature $driver
+        Write-Host "mssqlodbc.dll: $($sig.Status)"
+        if ($sig.Status -ne 'Valid') {
+          Write-Error "Driver signature invalid or missing: $($sig.Status)"
+          exit 1
+        }
+      displayName: 'Verify signed driver (${{ parameters.architecture }})'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 
   - ${{ if eq(parameters.publishArtifacts, true) }}:
     - task: PublishPipelineArtifact@1
