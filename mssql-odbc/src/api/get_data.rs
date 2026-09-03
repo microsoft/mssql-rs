@@ -52,6 +52,14 @@ const MAX_PLP_PREFETCH_BYTES: usize = 64 * 1024;
 /// - Supports `SQL_C_CHAR` and `SQL_C_WCHAR` for text retrieval.
 /// - Supports incremental row resume and chunked PLP retrieval via
 ///   `read_active_plp_chunk`.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `target_value_ptr`, when non-null, must be writable for `buffer_length`
+/// bytes for variable-width targets, including `SQL_C_WCHAR`, where the length
+/// is still measured in bytes. For a fixed-width target it must be writable for
+/// the full size of `target_type`, even when `buffer_length` is zero or smaller.
+/// `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
 pub(crate) unsafe fn sql_get_data(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,
@@ -82,6 +90,13 @@ pub(crate) unsafe fn sql_get_data(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `target_value_ptr`, when non-null, must be writable for `buffer_length`
+/// bytes for variable-width targets, including `SQL_C_WCHAR`, where the length
+/// is still measured in bytes. For a fixed-width target it must be writable for
+/// the full size of `target_type`, even when `buffer_length` is zero or smaller.
+/// `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
 unsafe fn sql_get_data_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,

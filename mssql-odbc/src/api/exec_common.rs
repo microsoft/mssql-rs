@@ -539,7 +539,10 @@ pub(super) fn snapshot_bound_params(
 ///
 /// # Safety
 /// Each bound parameter's value/indicator pointers must still satisfy the
-/// `SQLBindParameter` contract; the buffers are read here.
+/// `SQLBindParameter` contract; the buffers are read here. When
+/// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, their readable extents begin at
+/// each bound base plus the pointed-to signed byte offset, which may be
+/// negative, so every allocation must cover that displaced range.
 pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,

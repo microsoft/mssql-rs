@@ -47,6 +47,8 @@ pub(crate) unsafe fn sql_free_stmt_close(statement_handle: SqlHandle) -> SqlRetu
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLCloseCursor: statement_handle is null");
@@ -114,6 +116,8 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     }
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLFreeStmt(SQL_CLOSE): statement_handle is null");

@@ -22,6 +22,13 @@ use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
+/// Gets metadata for a result-set column.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_describe_col_w(
     statement_handle: SqlHandle,
@@ -62,6 +69,11 @@ pub(crate) unsafe fn sql_describe_col_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_describe_col_w_impl(
     statement_handle: SqlHandle,
@@ -331,6 +343,9 @@ mod tests {
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
+    ///
+    /// # Safety
+    /// `stmt` must be null or point to a live `StmtHandle`.
     unsafe fn describe(stmt: SqlHandle, column_number: SqlUSmallInt) -> SqlReturn {
         let mut data_type: SqlSmallInt = 0;
         let mut col_size: u64 = 0;

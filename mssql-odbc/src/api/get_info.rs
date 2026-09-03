@@ -55,6 +55,12 @@ pub(crate) unsafe fn sql_get_info_w(
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
+/// `info_value_ptr`, when non-null, must be writable for `buffer_length` bytes
+/// for string information or for one value of the requested numeric information
+/// type. `string_length_ptr`, when non-null, must be writable for one
+/// `SqlSmallInt`.
 unsafe fn sql_get_info_w_impl(
     connection_handle: SqlHandle,
     info_type: SqlUSmallInt,

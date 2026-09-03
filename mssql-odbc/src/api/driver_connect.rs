@@ -78,6 +78,13 @@ pub(crate) unsafe fn sql_driver_connect_w(
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
+/// `in_connection_string`, when non-null, must be readable for
+/// `string_length_1` UTF-16 code units, or through a NUL terminator when the
+/// length is `SQL_NTS`. `out_connection_string`, when non-null, must be writable
+/// for `buffer_length` UTF-16 code units, and `string_length_2_ptr`, when
+/// non-null, must be writable for one `SqlSmallInt`.
 unsafe fn sql_driver_connect_w_impl(
     connection_handle: SqlHandle,
     in_connection_string: *const SqlWChar,
@@ -636,6 +643,9 @@ mod tests {
     /// driver's own `SQLGetDiagRecW` entry point. Tests use this to verify
     /// the diagnostic surface that real ODBC apps see, not just the internal
     /// `diag_records` vec.
+    ///
+    /// # Safety
+    /// `dbc` must point to a live `DbcHandle`.
     unsafe fn diag_sqlstate(dbc: SqlHandle, rec_number: SqlSmallInt) -> String {
         let mut state_buf = [0u16; 6];
         let mut msg_buf = [0u16; 256];

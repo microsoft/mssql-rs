@@ -60,6 +60,9 @@ pub(crate) unsafe fn sql_param_data(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `value_ptr_ptr`, when non-null, must be writable for one `SqlPointer`.
 unsafe fn sql_param_data_impl(
     statement_handle: SqlHandle,
     value_ptr_ptr: *mut SqlPointer,
