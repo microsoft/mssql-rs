@@ -757,12 +757,14 @@ pub(crate) struct DaeProgress {
     /// `SQL_LEN_DATA_AT_EXEC(n)` promise is checked against, so it has to count
     /// what the application handed over rather than what survived.
     pub(crate) bytes_sent: usize,
-    /// Bytes kept after `ColumnSize` trimming -- msodbcsql's
+    /// Units kept after `ColumnSize` trimming -- msodbcsql's
     /// `cbDataSentToServer`. Padding trimmed away does not consume the
     /// declaration's budget, so this trails `bytes_sent` whenever a chunk was
     /// trimmed, and the two must not be conflated: the declared-length check
-    /// reads the first, the `ColumnSize` bound the second.
-    pub(crate) retained_bytes: usize,
+    /// reads the first, the `ColumnSize` bound the second. Counted in the
+    /// bound's own unit, which is UTF-16 code units for a `SQL_C_CHAR` buffer
+    /// and bytes otherwise.
+    pub(crate) retained_units: usize,
     /// Set by the first `SQLPutData` for this parameter, including zero-length
     /// and NULL writes. Closing a parameter without one is a sequence error in
     /// msodbcsql.

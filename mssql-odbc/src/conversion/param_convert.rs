@@ -199,18 +199,49 @@ pub(crate) fn is_data_at_exec_indicator(indicator: SqlLen) -> bool {
     indicator == SQL_DATA_AT_EXEC || indicator <= SQL_LEN_DATA_AT_EXEC_OFFSET
 }
 
+/// UTF-16 code units contributed by a single UTF-8 byte.
+///
+/// Classified from the byte alone, which is what lets the bound below survive a
+/// character split across two `SQLPutData` calls without carrying state: a
+/// continuation byte belongs to a character already counted at its lead, and a
+/// four-byte lead is exactly the one that decodes to a surrogate pair. A
+/// sequence broken across chunks therefore has its lead counted in the first and
+/// its continuations counted as nothing in the second, for the same total.
+fn utf16_units_of_utf8_byte(byte: u8) -> usize {
+    if byte & 0b1100_0000 == 0b1000_0000 {
+        0
+    } else if byte & 0b1111_1000 == 0b1111_0000 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The unit a declaration's `ColumnSize` is counted in, and how much of it fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaeBound {
+    /// Application-buffer bytes. Binary counts them directly, and a
+    /// `SQL_C_WCHAR` character is a fixed two of them, so both are exact.
+    Bytes(usize),
+    /// UTF-16 code units of a UTF-8 buffer. `SQL_C_CHAR` bytes are not
+    /// characters, and the materialized path measures every character input in
+    /// UTF-16 units (`trim_blank_overflow`), so counting bytes here would reject
+    /// a value -- one non-ASCII character against `varchar(1)` -- that the same
+    /// binding materialized accepts. The unit is an approximation of collation
+    /// bytes on both paths; making it exact is AB#47584.
+    Utf16Units(usize),
+}
+
 /// How much a buffered parameter may accept, and what its overflow is allowed
 /// to be made of.
 ///
-/// Held in application-buffer bytes so `SQLPutData` can compare it against a raw
-/// chunk length. Only produced for a same-family pairing, where the C type fixes
-/// the unit width unambiguously; a cross-family value's units do not correspond
-/// (a UTF-8 byte is not a character), so its bound is left to the close-time
-/// converter instead.
+/// Only produced for a same-family pairing, where the C type fixes the unit
+/// unambiguously; a cross-family value's units do not correspond, so its bound
+/// is left to the close-time converter instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DaeLengthLimit {
-    /// Maximum total the parameter may accept, in application-buffer bytes.
-    max_bytes: usize,
+    /// Maximum total the parameter may accept, in the unit named by the bound.
+    bound: DaeBound,
     /// One unit of padding whose overflow is dropped rather than reported:
     /// `0x00` for binary, a blank for character, in the buffer's own encoding.
     pad_unit: &'static [u8],
@@ -218,7 +249,10 @@ pub(crate) struct DaeLengthLimit {
 
 impl DaeLengthLimit {
     /// Applies the limit to one chunk given the total already accepted,
-    /// returning the prefix that may be kept.
+    /// returning the prefix that may be kept and the units it consumed.
+    ///
+    /// `already` and the returned count are both in the bound's own unit, so a
+    /// caller accumulates the return value rather than the kept byte length.
     ///
     /// Mirrors every same-family arm of msodbcsql's `SQLPutData`
     /// (`sqlccmd.cpp:10985-11218`): the bound is compared against the
@@ -229,13 +263,39 @@ impl DaeLengthLimit {
     pub(crate) fn fit<'a>(
         &self,
         chunk: &'a [u8],
-        already_sent: usize,
-    ) -> Result<&'a [u8], ParamBuildError> {
-        let keep = self.max_bytes.saturating_sub(already_sent);
-        if chunk.len() <= keep {
-            return Ok(chunk);
-        }
-        let overflow = &chunk[keep..];
+        already: usize,
+    ) -> Result<(&'a [u8], usize), ParamBuildError> {
+        let (split, consumed) = match self.bound {
+            DaeBound::Bytes(max) => {
+                let keep = max.saturating_sub(already);
+                if chunk.len() <= keep {
+                    return Ok((chunk, chunk.len()));
+                }
+                (keep, keep)
+            }
+            DaeBound::Utf16Units(max) => {
+                let keep = max.saturating_sub(already);
+                let mut units = 0;
+                let mut split = chunk.len();
+                for (i, &byte) in chunk.iter().enumerate() {
+                    let cost = utf16_units_of_utf8_byte(byte);
+                    // A continuation byte costs nothing, so it always stays with
+                    // the lead that paid for it rather than starting an overflow
+                    // of its own.
+                    if units + cost > keep {
+                        split = i;
+                        break;
+                    }
+                    units += cost;
+                }
+                if split == chunk.len() {
+                    return Ok((chunk, units));
+                }
+                (split, units)
+            }
+        };
+
+        let overflow = &chunk[split..];
         // A partial trailing unit cannot be padding, so it is left to fail the
         // comparison below rather than being rounded away.
         if !overflow
@@ -244,7 +304,7 @@ impl DaeLengthLimit {
         {
             return Err(ParamBuildError::StringTruncation);
         }
-        Ok(&chunk[..keep])
+        Ok((&chunk[..split], consumed))
     }
 }
 
@@ -309,7 +369,14 @@ pub(crate) fn dae_length_limit(
     };
 
     Ok(units.map(|units| DaeLengthLimit {
-        max_bytes: units.saturating_mul(unit_bytes),
+        // `SQL_C_CHAR` is the one buffer whose bytes are not its units: it holds
+        // UTF-8, so the declaration's character count is measured in UTF-16
+        // units to agree with the materialized path. The other two have a fixed
+        // byte width per unit and stay exact.
+        bound: match c_type {
+            SQL_C_CHAR => DaeBound::Utf16Units(units),
+            _ => DaeBound::Bytes(units.saturating_mul(unit_bytes)),
+        },
         pad_unit,
     }))
 }
@@ -1603,20 +1670,22 @@ mod tests {
         let limit = dae_length_limit(SQL_C_BINARY, SQL_VARBINARY, 2)
             .unwrap()
             .expect("a bounded varbinary is limited");
-        assert_eq!(limit.max_bytes, 2);
+        assert_eq!(limit.bound, DaeBound::Bytes(2));
         assert_eq!(limit.pad_unit, [0u8]);
 
+        // A narrow character buffer is measured in the UTF-16 units the
+        // materialized path uses, not in its UTF-8 bytes.
         let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 4)
             .unwrap()
             .expect("a bounded varchar is limited");
-        assert_eq!(limit.max_bytes, 4);
+        assert_eq!(limit.bound, DaeBound::Utf16Units(4));
         assert_eq!(limit.pad_unit, *b" ");
 
         // Four characters of nvarchar are eight bytes of SQL_C_WCHAR buffer.
         let limit = dae_length_limit(SQL_C_WCHAR, SQL_WVARCHAR, 4)
             .unwrap()
             .expect("a bounded nvarchar is limited");
-        assert_eq!(limit.max_bytes, 8);
+        assert_eq!(limit.bound, DaeBound::Bytes(8));
         assert_eq!(limit.pad_unit, [b' ', 0]);
     }
 
@@ -1649,12 +1718,12 @@ mod tests {
         let limit = dae_length_limit(SQL_C_BINARY, SQL_LONGVARBINARY, 3)
             .unwrap()
             .expect("image is bounded by ColumnSize");
-        assert_eq!(limit.max_bytes, 3);
+        assert_eq!(limit.bound, DaeBound::Bytes(3));
 
         let limit = dae_length_limit(SQL_C_CHAR, SQL_LONGVARCHAR, 3)
             .unwrap()
             .expect("text is bounded by ColumnSize");
-        assert_eq!(limit.max_bytes, 3);
+        assert_eq!(limit.bound, DaeBound::Utf16Units(3));
     }
 
     /// A zero `ColumnSize` is the `max` spelling for the variable-width types
@@ -1682,7 +1751,7 @@ mod tests {
             .unwrap();
 
         // Each chunk is under the limit on its own; together they exceed it.
-        assert_eq!(limit.fit(&[1, 2, 3], 0).unwrap(), &[1, 2, 3]);
+        assert_eq!(limit.fit(&[1, 2, 3], 0).unwrap(), (&[1, 2, 3][..], 3));
         assert_eq!(
             limit.fit(&[4, 5, 6], 3).unwrap_err(),
             ParamBuildError::StringTruncation
@@ -1698,7 +1767,7 @@ mod tests {
         let binary = dae_length_limit(SQL_C_BINARY, SQL_VARBINARY, 2)
             .unwrap()
             .unwrap();
-        assert_eq!(binary.fit(&[1, 2, 0, 0], 0).unwrap(), &[1, 2]);
+        assert_eq!(binary.fit(&[1, 2, 0, 0], 0).unwrap(), (&[1, 2][..], 2));
         assert_eq!(
             binary.fit(&[1, 2, 0, 3], 0).unwrap_err(),
             ParamBuildError::StringTruncation
@@ -1707,7 +1776,7 @@ mod tests {
         let narrow = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 2)
             .unwrap()
             .unwrap();
-        assert_eq!(narrow.fit(b"ab  ", 0).unwrap(), b"ab");
+        assert_eq!(narrow.fit(b"ab  ", 0).unwrap(), (&b"ab"[..], 2));
         assert_eq!(
             narrow.fit(b"abcd", 0).unwrap_err(),
             ParamBuildError::StringTruncation
@@ -1717,11 +1786,54 @@ mod tests {
         let wide = dae_length_limit(SQL_C_WCHAR, SQL_WVARCHAR, 1)
             .unwrap()
             .unwrap();
-        assert_eq!(wide.fit(&[b'a', 0, b' ', 0], 0).unwrap(), &[b'a', 0]);
+        assert_eq!(
+            wide.fit(&[b'a', 0, b' ', 0], 0).unwrap(),
+            (&[b'a', 0][..], 2)
+        );
         assert_eq!(
             wide.fit(&[b'a', 0, b'b', 0], 0).unwrap_err(),
             ParamBuildError::StringTruncation
         );
+    }
+
+    /// A `SQL_C_CHAR` buffer holds UTF-8, so its bytes are not its units. The
+    /// materialized path measures every character input in UTF-16 units
+    /// (`trim_blank_overflow`), and counting bytes here instead would reject a
+    /// value the same binding materialized accepts -- one non-ASCII character
+    /// against `varchar(1)` is two bytes but one unit.
+    #[test]
+    fn dae_limit_fit_measures_a_narrow_buffer_in_utf16_units() {
+        let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+            .unwrap()
+            .unwrap();
+        // U+00E9, two UTF-8 bytes, one UTF-16 unit: it fits `varchar(1)`.
+        assert_eq!(limit.fit("é".as_bytes(), 0).unwrap(), ("é".as_bytes(), 1));
+
+        let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 4)
+            .unwrap()
+            .unwrap();
+        // Four characters, six bytes: a byte count would have rejected these.
+        assert_eq!(limit.fit("café".as_bytes(), 0).unwrap().1, 4);
+        // U+1D11E is four UTF-8 bytes and a surrogate pair, so it costs two of
+        // the four units, exactly as the materialized path counts it.
+        assert_eq!(limit.fit("𝄞ab".as_bytes(), 0).unwrap().1, 4);
+    }
+
+    /// The unit count is taken from each byte on its own, so a character split
+    /// across two `SQLPutData` calls is counted once, at its lead, without the
+    /// limit carrying any decode state between chunks.
+    #[test]
+    fn dae_limit_fit_counts_a_split_character_once() {
+        let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 2)
+            .unwrap()
+            .unwrap();
+        // "é" arrives as its lead byte and then its continuation byte.
+        let (_, first) = limit.fit(&[0xC3], 0).unwrap();
+        assert_eq!(first, 1, "the lead pays for the character");
+        let (_, second) = limit.fit(&[0xA9], first).unwrap();
+        assert_eq!(second, 0, "the continuation is already paid for");
+        // One unit consumed in total, so a second character still fits.
+        assert_eq!(limit.fit(b"z", first + second).unwrap().1, 1);
     }
 
     /// Once the budget is spent every later chunk must be padding, and the
@@ -1732,7 +1844,7 @@ mod tests {
         let limit = dae_length_limit(SQL_C_BINARY, SQL_VARBINARY, 2)
             .unwrap()
             .unwrap();
-        assert!(limit.fit(&[0, 0], 2).unwrap().is_empty());
+        assert!(limit.fit(&[0, 0], 2).unwrap().0.is_empty());
         assert_eq!(
             limit.fit(&[0, 1], 2).unwrap_err(),
             ParamBuildError::StringTruncation

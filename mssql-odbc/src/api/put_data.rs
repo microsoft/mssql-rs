@@ -372,23 +372,29 @@ unsafe fn sql_put_data_safe(
         // trimmed padding must not consume the declaration's budget. The two
         // totals are tracked separately because the declared-length promise
         // above counts what the application supplied.
-        let retained_before = dae.progress.retained_bytes;
+        //
+        // Counted in the bound's own unit, which is not always bytes -- a
+        // `SQL_C_CHAR` buffer is measured in the UTF-16 units the materialized
+        // path uses -- so the running total accumulates what `fit` reports
+        // rather than the length of what it kept.
+        let retained_before = dae.progress.retained_units;
         // Borrowed, not copied: `fit` returns a prefix of `chunk`, and the
         // buffered branch copies it straight into the capacity reserved above,
         // so a chunk is never materialized into a second heap buffer that the
         // `try_reserve` guard does not cover and that would double peak usage.
-        let fitted: &[u8] = match dae.current_param().and_then(|param| param.length_limit) {
-            Some(limit) if !chunk.is_empty() => match limit.fit(chunk, retained_before) {
-                Ok(fitted) => fitted,
-                Err(e) => {
-                    drop(stmt_state);
-                    error!("SQLPutData: value exceeds ColumnSize (22001)");
-                    return abort_dae_with_diag(dbc, stmt, statement_handle, e.diag());
-                }
-            },
-            _ => chunk,
-        };
-        let retained_total = retained_before.saturating_add(fitted.len());
+        let (fitted, consumed): (&[u8], usize) =
+            match dae.current_param().and_then(|param| param.length_limit) {
+                Some(limit) if !chunk.is_empty() => match limit.fit(chunk, retained_before) {
+                    Ok(fitted) => fitted,
+                    Err(e) => {
+                        drop(stmt_state);
+                        error!("SQLPutData: value exceeds ColumnSize (22001)");
+                        return abort_dae_with_diag(dbc, stmt, statement_handle, e.diag());
+                    }
+                },
+                _ => (chunk, chunk.len()),
+            };
+        let retained_total = retained_before.saturating_add(consumed);
 
         // A buffered parameter never touches the wire here: it accumulates and
         // is converted whole when `SQLParamData` closes it. In a deferred
@@ -398,7 +404,7 @@ unsafe fn sql_put_data_safe(
             if let Some(dae) = stmt_state.dae.as_mut() {
                 dae.progress.buffer.extend_from_slice(fitted);
                 dae.progress.bytes_sent = app_total;
-                dae.progress.retained_bytes = retained_total;
+                dae.progress.retained_units = retained_total;
                 dae.progress.put_data_called = true;
             }
             return SQL_SUCCESS;
@@ -443,7 +449,7 @@ unsafe fn sql_put_data_safe(
 
         if let Some(dae) = stmt_state.dae.as_mut() {
             dae.progress.bytes_sent = app_total;
-            dae.progress.retained_bytes = retained_total;
+            dae.progress.retained_units = retained_total;
             dae.progress.put_data_called = true;
         }
         client.map(|client| (client, outgoing))
@@ -807,7 +813,7 @@ mod tests {
             "the declared-length promise counts what the application supplied"
         );
         assert_eq!(
-            dae.progress.retained_bytes, 2,
+            dae.progress.retained_units, 2,
             "the ColumnSize budget counts only what survived trimming"
         );
         assert_eq!(dae.progress.buffer, b"ab", "the blanks were trimmed away");
