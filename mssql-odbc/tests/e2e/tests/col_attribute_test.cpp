@@ -27,7 +27,7 @@
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   23. ClrUdtTypeFields                   - verbose and concise types are SQL_SS_UDT
+//   23. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
 
 #include "odbc_test_fixture.h"
 
@@ -123,13 +123,34 @@ TEST_F(ColAttributeLiveTest, ConciseTypePerColumnType) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(ColAttributeLiveTest, ClrUdtTypeFields) {
+TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
     ExecDirect("SELECT CAST(NULL AS geography) AS geography_col, "
                "CAST(NULL AS geometry) AS geometry_col, "
                "CAST(NULL AS hierarchyid) AS hierarchyid_col");
-    for (SQLUSMALLINT col : {1, 2, 3}) {
-        EXPECT_EQ(SQL_SS_UDT, NumericAttr(stmt_, col, SQL_DESC_TYPE)) << "column " << col;
-        EXPECT_EQ(SQL_SS_UDT, NumericAttr(stmt_, col, SQL_DESC_CONCISE_TYPE)) << "column " << col;
+
+    struct UdtColumn {
+        SQLUSMALLINT ordinal;
+        SQLLEN size;
+    };
+    const UdtColumn columns[] = {
+        {1, 0},
+        {2, 0},
+        {3, 892},
+    };
+
+    for (const auto& column : columns) {
+        EXPECT_EQ(SQL_SS_UDT, NumericAttr(stmt_, column.ordinal, SQL_DESC_TYPE))
+            << "column " << column.ordinal;
+        EXPECT_EQ(SQL_SS_UDT, NumericAttr(stmt_, column.ordinal, SQL_DESC_CONCISE_TYPE))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.size, NumericAttr(stmt_, column.ordinal, SQL_DESC_LENGTH))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.size, NumericAttr(stmt_, column.ordinal, SQL_DESC_PRECISION))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.size, NumericAttr(stmt_, column.ordinal, SQL_DESC_OCTET_LENGTH))
+            << "column " << column.ordinal;
+        EXPECT_EQ(0, NumericAttr(stmt_, column.ordinal, SQL_DESC_DISPLAY_SIZE))
+            << "column " << column.ordinal;
     }
     SQLCloseCursor(stmt_);
 }
