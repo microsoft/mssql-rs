@@ -1733,6 +1733,10 @@ TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
     SQLCloseCursor(stmt_);
 }
 
+// The underflow half of the `real` range check, on the fetch direction. Runs
+// unskipped on the msodbcsql parity leg, so retail is what pins the answer: a
+// `float` column at 1e-40 read into a `SQL_C_FLOAT` buffer is 22003 there too,
+// not a silent subnormal write.
 TEST_F(GetDataLiveTest, FloatTargetRejectsUnderflowAsWellAsOverflow) {
     struct Case {
         const char* literal;

@@ -1588,6 +1588,32 @@ mod tests {
         assert!(convert_decimal(SQL_DECIMAL, 38, 1, &trailing_zeros).is_ok());
     }
 
+    /// Trailing fraction zeros must not push a literal onto the `f64` path.
+    /// They carry no value, but they do count against the exact mantissa, so
+    /// `"1" x 38 + ".00"` used to parse as a 40-digit wide decimal and reach
+    /// the wire as the nearest double - a different number, reported as
+    /// `SQL_SUCCESS`. Asserted by value rather than by `is_ok`, which is what
+    /// let the rounding through in the first place.
+    #[test]
+    fn a_wide_literal_with_trailing_fraction_zeros_is_exact() {
+        for digits in [
+            "1".repeat(38),
+            "12345678901234567890123456789012345678".into(),
+        ] {
+            let (value, _) = convert_decimal(SQL_DECIMAL, 38, 0, &format!("{digits}.00")).unwrap();
+            let SqlType::Decimal(Some(parts)) = value else {
+                panic!("expected a decimal for {digits}");
+            };
+            assert_eq!(
+                parts.magnitude(),
+                digits.parse::<u128>().unwrap(),
+                "{digits}"
+            );
+            assert_eq!(parts.scale, 0);
+            assert!(parts.is_positive);
+        }
+    }
+
     /// `ColumnSize` 0 on a decimal is `HY104`, and that matches msodbcsql for
     /// the applications this driver serves. `CheckSqlPrec`
     /// (`sqlcdesc.cpp:11471`) treats 0 as `SQL_PREC_UNLIMITED` and returns

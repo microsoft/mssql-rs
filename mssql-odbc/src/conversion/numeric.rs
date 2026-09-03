@@ -122,10 +122,22 @@ fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
     {
         return None;
     }
-    let mantissa: i128 = format!("{int_digits}{frac_digits}").parse().ok()?;
+    // Trailing fraction zeros carry no value but do consume mantissa digits, so
+    // dropping them keeps literals exact that would otherwise overflow an `i128`
+    // and fall through to `parse_wide_decimal` - where the value reaches the wire
+    // as an `f64` and loses digits with no diagnostic. `"1.50"` and `"1.5"` are
+    // the same number, so nothing that parses today answers differently.
+    let frac_digits = frac_digits.trim_end_matches('0');
+    let digits = format!("{int_digits}{frac_digits}");
+    // `".000"` trims to no digits at all, but it is still the number zero.
+    let mantissa: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     Some(NumericSource::Scaled {
         mantissa: if negative { -mantissa } else { mantissa },
-        scale: frac_digits.len() as u32,
+        scale: u32::try_from(frac_digits.len()).unwrap_or(u32::MAX),
     })
 }
 
@@ -157,6 +169,11 @@ pub(crate) fn narrow_i128<T: TryFrom<i128>>(v: i128) -> Result<T, ConvError> {
 /// rejecting them, so `SQL_C_FLOAT` params take [`convert_real_sql`] and `real`
 /// columns are copied. Widening such a source to `f64` and arriving here would
 /// turn an exactly representable value into `22003`.
+///
+/// The fetch direction is pinned against retail by
+/// `FloatTargetRejectsUnderflowAsWellAsOverflow` (`get_data_test.cpp`), which
+/// runs unskipped on the msodbcsql parity leg: a `float` column below
+/// `FLT_MIN` read into a `SQL_C_FLOAT` buffer is `22003` there as well.
 ///
 /// The comparisons are left to reproduce the C semantics on their own rather
 /// than being guarded by a finiteness check. `Temp` is a `DOUBLE`
@@ -289,7 +306,9 @@ mod tests {
 
     /// The `real` range check is symmetric, and both directions get the same
     /// answer because they call this one function. Fetch used to check only the
-    /// overflow half and silently flushed a denormal to zero.
+    /// overflow half, so a magnitude below `FLT_MIN` was written through `v as
+    /// f32`: exact for a subnormal, and flushed to zero only below roughly
+    /// `1.4e-45`. Either way it was silent where msodbcsql answers `22003`.
     #[test]
     fn the_real_range_check_is_symmetric() {
         for v in [1e39f64, -1e39, 1e-40, -1e-40] {
@@ -357,6 +376,36 @@ mod tests {
             Some(NumericSource::Scaled {
                 mantissa: -1,
                 scale: 2
+            })
+        );
+    }
+
+    /// Trailing fraction zeros are dropped so they cannot consume mantissa
+    /// digits and push an otherwise exact literal onto the wide-decimal path,
+    /// where only the `f64` approximation survives. `".000"` trims to nothing
+    /// at all and is still zero.
+    #[test]
+    fn trailing_fraction_zeros_do_not_cost_mantissa_digits() {
+        assert_eq!(
+            parse_decimal_literal("1.50"),
+            Some(NumericSource::Scaled {
+                mantissa: 15,
+                scale: 1
+            })
+        );
+        let wide = format!("{}.00", "1".repeat(38));
+        assert_eq!(
+            parse_decimal_literal(&wide),
+            Some(NumericSource::Scaled {
+                mantissa: "1".repeat(38).parse().unwrap(),
+                scale: 0
+            })
+        );
+        assert_eq!(
+            parse_decimal_literal(".000"),
+            Some(NumericSource::Scaled {
+                mantissa: 0,
+                scale: 0
             })
         );
     }
