@@ -581,6 +581,26 @@ function Initialize-CMake {
     }
 }
 
+# CMake build trees are not portable across Windows and WSL: each environment
+# records a different absolute source path in CMakeCache.txt. Remove a tree
+# configured from another path before asking Windows CMake to reuse it.
+function Remove-IncompatibleCMakeBuildTree([string]$BuildDir) {
+    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path $cachePath)) { return }
+
+    $sourceEntry = Get-Content -Path $cachePath |
+        Where-Object { $_ -match '^CMAKE_HOME_DIRECTORY:INTERNAL=' } |
+        Select-Object -First 1
+    if (-not $sourceEntry) { return }
+
+    $cachedSource = ($sourceEntry -replace '^CMAKE_HOME_DIRECTORY:INTERNAL=', '').Replace('\', '/').TrimEnd('/')
+    $windowsSource = $ScriptDir.Replace('\', '/').TrimEnd('/')
+    if (-not [string]::Equals($cachedSource, $windowsSource, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "Removing incompatible CMake build tree (cached source: $cachedSource)"
+        Remove-Item -Path $BuildDir -Recurse -Force
+    }
+}
+
 try {
     if ($Retries -gt 0) {
         Write-Host "Retries enabled: each failing test reruns up to $Retries time(s)."
@@ -649,6 +669,7 @@ try {
     Write-Host ""
     Write-Host "=== Configuring e2e tests (CMake) ==="
     Initialize-CMake
+    Remove-IncompatibleCMakeBuildTree (Join-Path $ScriptDir "build")
     Push-Location $ScriptDir
     try {
         try {

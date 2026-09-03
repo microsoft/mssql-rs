@@ -39,7 +39,9 @@ use crate::handles::{DescHandle, HandleType, handle_from_raw};
 /// Implementation of [`SQLSetDescRec`](super::exports::SQLSetDescRec).
 ///
 /// # Safety
-/// See the exported function's doc for caller requirements.
+/// `descriptor_handle` must be null or point to a live, non-IRD `DescHandle`.
+/// `data_ptr`, `string_length_ptr`, and `indicator_ptr`, when non-null, are
+/// stored and must remain valid while the descriptor record is bound.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_set_desc_rec(
     descriptor_handle: SqlHandle,
@@ -82,6 +84,10 @@ pub(crate) unsafe fn sql_set_desc_rec(
     })
 }
 
+/// # Safety
+/// `descriptor_handle` must be null or point to a live, non-IRD `DescHandle`.
+/// `data_ptr`, `string_length_ptr`, and `indicator_ptr`, when non-null, are
+/// stored and must remain valid while the descriptor record is bound.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_set_desc_rec_impl(
     descriptor_handle: SqlHandle,

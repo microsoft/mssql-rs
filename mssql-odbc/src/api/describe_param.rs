@@ -34,6 +34,12 @@ const SUGGESTED_SCALE: usize = 6;
 const SUGGESTED_TDS_TYPE_ID: usize = 22;
 const SUGGESTED_TDS_LENGTH: usize = 23;
 
+/// Describes a prepared statement parameter.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Every output
+/// pointer, when non-null, must be writable for one value of its pointed-to
+/// type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_describe_param(
     statement_handle: SqlHandle,
@@ -65,6 +71,10 @@ pub(crate) unsafe fn sql_describe_param(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Every output
+/// pointer, when non-null, must be writable for one value of its pointed-to
+/// type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_describe_param_impl(
     statement_handle: SqlHandle,

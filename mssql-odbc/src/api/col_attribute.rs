@@ -35,6 +35,13 @@ use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
+/// Gets a descriptor field for a result-set column.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `character_attribute_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes. `string_length_ptr` and `numeric_attribute_ptr`, when
+/// non-null, must each be writable for one value of their pointed-to type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_col_attribute_w(
     statement_handle: SqlHandle,
@@ -69,6 +76,11 @@ pub(crate) unsafe fn sql_col_attribute_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `character_attribute_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes. `string_length_ptr` and `numeric_attribute_ptr`, when
+/// non-null, must each be writable for one value of their pointed-to type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_col_attribute_w_impl(
     statement_handle: SqlHandle,

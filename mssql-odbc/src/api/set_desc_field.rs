@@ -54,7 +54,10 @@ use crate::handles::{DescHandle, HandleType, handle_from_raw};
 /// Implementation of [`SQLSetDescFieldW`](super::exports::SQLSetDescFieldW).
 ///
 /// # Safety
-/// See the exported function's doc for caller requirements.
+/// `descriptor_handle` must be null or point to a live `DescHandle`. For a
+/// character field, `value_ptr` must be readable for `buffer_length` bytes or
+/// through a NUL terminator when `buffer_length` is `SQL_NTS`. For a pointer
+/// field, its value is stored and must remain valid while it is bound.
 pub(crate) unsafe fn sql_set_desc_field_w(
     descriptor_handle: SqlHandle,
     record_number: SqlSmallInt,
@@ -81,6 +84,11 @@ pub(crate) unsafe fn sql_set_desc_field_w(
     })
 }
 
+/// # Safety
+/// `descriptor_handle` must be null or point to a live `DescHandle`. For a
+/// character field, `value_ptr` must be readable for `buffer_length` bytes or
+/// through a NUL terminator when `buffer_length` is `SQL_NTS`. For a pointer
+/// field, its value is stored and must remain valid while it is bound.
 unsafe fn sql_set_desc_field_w_impl(
     descriptor_handle: SqlHandle,
     record_number: SqlSmallInt,

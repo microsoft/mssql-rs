@@ -9,8 +9,8 @@ use tracing::{debug, error};
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_CHAR, SQL_DECIMAL, SQL_DOUBLE, SQL_ERROR, SQL_GUID,
     SQL_INTEGER, SQL_INVALID_HANDLE, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NO_NULLS,
-    SQL_NULLABLE, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT,
-    SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
+    SQL_NULLABLE, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET,
+    SQL_SS_UDT, SQL_SS_VARIANT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_TINYINT, SQL_TYPE_DATE,
     SQL_TYPE_TIMESTAMP, SQL_UNKNOWN_TYPE, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
     SQL_WVARCHAR, SqlHandle, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
@@ -22,6 +22,13 @@ use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
+/// Gets metadata for a result-set column.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_describe_col_w(
     statement_handle: SqlHandle,
@@ -62,6 +69,11 @@ pub(crate) unsafe fn sql_describe_col_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_describe_col_w_impl(
     statement_handle: SqlHandle,
@@ -196,10 +208,9 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
             8 => SQL_DOUBLE,
             _ => SQL_UNKNOWN_TYPE,
         },
-        TdsDataType::Decimal
-        | TdsDataType::DecimalN
-        | TdsDataType::Numeric
-        | TdsDataType::NumericN => SQL_DECIMAL,
+        TdsDataType::DecimalN => SQL_DECIMAL,
+        // msodbcsql's rgbSRV2SQLTYPE maps the legacy fixed SQLDECIMAL token to SQL_NUMERIC.
+        TdsDataType::Decimal | TdsDataType::Numeric | TdsDataType::NumericN => SQL_NUMERIC,
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => SQL_DECIMAL,
         TdsDataType::DateN => SQL_TYPE_DATE,
         // SQL Server's `time` supports up to 7-digit fractional seconds; SQL_TYPE_TIME
@@ -334,6 +345,9 @@ mod tests {
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
+    ///
+    /// # Safety
+    /// `stmt` must be null or point to a live `StmtHandle`.
     unsafe fn describe(stmt: SqlHandle, column_number: SqlUSmallInt) -> SqlReturn {
         let mut data_type: SqlSmallInt = 0;
         let mut col_size: u64 = 0;
@@ -369,6 +383,28 @@ mod tests {
             assert_eq!(odbc_sql_type(&meta), SQL_SS_UDT);
             assert_eq!(column_size(&meta), expected_column_size);
             assert_eq!(decimal_digits(&meta), 0);
+        }
+    }
+
+    #[test]
+    fn decimal_numeric_and_money_types_match_msodbcsql() {
+        let mut columns = int_columns(1);
+        let meta = &mut columns[0];
+
+        for (tds_type, length, sql_type) in [
+            (TdsDataType::Decimal, 17, SQL_NUMERIC),
+            (TdsDataType::DecimalN, 17, SQL_DECIMAL),
+            (TdsDataType::Numeric, 17, SQL_NUMERIC),
+            (TdsDataType::NumericN, 17, SQL_NUMERIC),
+            (TdsDataType::Money, 8, SQL_DECIMAL),
+            (TdsDataType::Money4, 4, SQL_DECIMAL),
+            (TdsDataType::MoneyN, 8, SQL_DECIMAL),
+        ] {
+            meta.data_type = tds_type;
+            meta.type_info.tds_type = tds_type;
+            meta.type_info.length = length;
+
+            assert_eq!(odbc_sql_type(meta), sql_type, "{tds_type:?}");
         }
     }
 
