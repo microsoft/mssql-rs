@@ -638,6 +638,20 @@ impl TypeInfo {
             type_info_variant: TypeInfoVariant::PartialLen(t, Some(length), collation, None, None),
         })
     }
+
+    /// CLR UDT identity parsed from a result-set `COLMETADATA` token.
+    pub fn udt_info(&self) -> Option<&UdtInfoInColMetadata> {
+        match &self.type_info_variant {
+            TypeInfoVariant::PartialLen(
+                PartialLengthType::Udt,
+                _,
+                _,
+                _,
+                Some(UdtInfo::InColMetadata(info)),
+            ) => Some(info),
+            _ => None,
+        }
+    }
 }
 
 type Precision = u8;
@@ -673,13 +687,55 @@ pub(crate) struct XmlInfo {
 
 /// UDT metadata received in COLMETADATA tokens.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields parsed from TDS wire protocol for completeness
-pub(crate) struct UdtInfoInColMetadata {
+pub struct UdtInfoInColMetadata {
     max_byte_size: u16,
     db_name: String,
     schema_name: String,
     type_name: String,
     assembly_qualified_name: UdtMetadata,
+}
+
+impl UdtInfoInColMetadata {
+    pub(crate) fn new(
+        max_byte_size: u16,
+        db_name: String,
+        schema_name: String,
+        type_name: String,
+        assembly_qualified_name: String,
+    ) -> Self {
+        Self {
+            max_byte_size,
+            db_name,
+            schema_name,
+            type_name,
+            assembly_qualified_name,
+        }
+    }
+
+    /// Maximum serialized size advertised by SQL Server.
+    pub fn max_byte_size(&self) -> u16 {
+        self.max_byte_size
+    }
+
+    /// Database containing the UDT definition.
+    pub fn db_name(&self) -> &str {
+        &self.db_name
+    }
+
+    /// Schema containing the UDT definition.
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    /// SQL Server UDT name.
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// CLR assembly-qualified type name.
+    pub fn assembly_qualified_name(&self) -> &str {
+        &self.assembly_qualified_name
+    }
 }
 
 type UdtMetadata = String;
@@ -945,13 +1001,13 @@ where
                         Some(len),
                         None,
                         None,
-                        Some(UdtInfo::InColMetadata(UdtInfoInColMetadata {
-                            max_byte_size: len as u16,
+                        Some(UdtInfo::InColMetadata(UdtInfoInColMetadata::new(
+                            len as u16,
                             db_name,
                             schema_name,
                             type_name,
                             assembly_qualified_name,
-                        })),
+                        ))),
                     ),
                 }
             }
@@ -1713,6 +1769,38 @@ mod tests {
                 None
             )
         ));
+    }
+
+    #[test]
+    fn test_type_info_udt_info() {
+        let ti = TypeInfo {
+            tds_type: TdsDataType::Udt,
+            length: 892,
+            type_info_variant: TypeInfoVariant::PartialLen(
+                PartialLengthType::Udt,
+                Some(892),
+                None,
+                None,
+                Some(UdtInfo::InColMetadata(UdtInfoInColMetadata::new(
+                    892,
+                    "tempdb".to_string(),
+                    "sys".to_string(),
+                    "hierarchyid".to_string(),
+                    "Microsoft.SqlServer.Types.SqlHierarchyId, Microsoft.SqlServer.Types"
+                        .to_string(),
+                ))),
+            ),
+        };
+
+        let info = ti.udt_info().unwrap();
+        assert_eq!(info.max_byte_size(), 892);
+        assert_eq!(info.db_name(), "tempdb");
+        assert_eq!(info.schema_name(), "sys");
+        assert_eq!(info.type_name(), "hierarchyid");
+        assert_eq!(
+            info.assembly_qualified_name(),
+            "Microsoft.SqlServer.Types.SqlHierarchyId, Microsoft.SqlServer.Types"
+        );
     }
 
     #[test]
