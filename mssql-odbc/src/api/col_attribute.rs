@@ -533,11 +533,20 @@ fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
         | TdsDataType::Money4
         | TdsDataType::MoneyN => SQL_C_NUMERIC,
         TdsDataType::DateN => SQL_C_TYPE_DATE,
+        // Not gated on the declared ODBC version, where
+        // `type_rules::resolve_default_c_type` gates the same two types
+        // (`SQL_SS_TIME2 if is_3_80`, else `SQL_C_BINARY`). Under
+        // `SQL_OV_ODBC3` the same value is therefore described one way as a
+        // variant and another as a column resolved from `SQL_C_DEFAULT`.
+        // Deliverable either way - `is_valid_c_type` accepts both
+        // unconditionally - but inconsistent, and unfixable here until this
+        // module can reach the environment's `OdbcVersion`. Tracked in AB#47830.
         TdsDataType::TimeN => SQL_C_SS_TIME2,
         TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
             SQL_C_TYPE_TIMESTAMP
         }
         TdsDataType::DateTime2N => SQL_C_TYPE_TIMESTAMP,
+        // Same version-gating gap as `TimeN` above (AB#47830).
         TdsDataType::DateTimeOffsetN => SQL_C_SS_TIMESTAMPOFFSET,
         TdsDataType::Char
         | TdsDataType::BigChar
