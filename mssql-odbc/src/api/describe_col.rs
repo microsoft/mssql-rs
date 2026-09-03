@@ -196,8 +196,9 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
             8 => SQL_DOUBLE,
             _ => SQL_UNKNOWN_TYPE,
         },
-        TdsDataType::Decimal | TdsDataType::DecimalN => SQL_DECIMAL,
-        TdsDataType::Numeric | TdsDataType::NumericN => SQL_NUMERIC,
+        TdsDataType::DecimalN => SQL_DECIMAL,
+        // msodbcsql's rgbSRV2SQLTYPE maps the legacy fixed SQLDECIMAL token to SQL_NUMERIC.
+        TdsDataType::Decimal | TdsDataType::Numeric | TdsDataType::NumericN => SQL_NUMERIC,
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => SQL_DECIMAL,
         TdsDataType::DateN => SQL_TYPE_DATE,
         // SQL Server's `time` supports up to 7-digit fractional seconds; SQL_TYPE_TIME
