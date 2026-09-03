@@ -536,9 +536,16 @@ fn bind_parameter_chunk(
         let plan = state
             .plan
             .get_or_insert(ParameterBindingPlan::new(&state.operation, row_is_named)?);
-        state
-            .parameter_sets
-            .push(plan.bind_row(&row, state.hints.as_deref())?);
+        let parameter_set = plan
+            .bind_row(&row, state.hints.as_deref())
+            .map_err(|error| {
+                if error.is_instance_of::<PyTypeError>(py) {
+                    PyTypeError::new_err(format!("executemany parameter row {row_index}: {error}"))
+                } else {
+                    error
+                }
+            })?;
+        state.parameter_sets.push(parameter_set);
     }
     Ok((state, false))
 }

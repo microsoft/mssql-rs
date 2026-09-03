@@ -701,18 +701,11 @@ fn py_datetime_to_sql_type(
     py_obj: &Bound<'_, PyAny>,
     hinted_scale: Option<u8>,
 ) -> TdsResult<SqlType> {
-    let ordinal = py_obj
-        .call_method0("toordinal")
-        .and_then(|value| value.extract::<u32>())
-        .map_err(|error| Error::UsageError(format!("Failed to get datetime ordinal: {error}")))?;
-    let days = ordinal.checked_sub(1).ok_or_else(|| {
-        Error::UsageError("Date ordinal is 0, expected a value greater than 0".to_string())
-    })?;
-
     let tzinfo = py_obj
         .getattr("tzinfo")
         .map_err(|error| Error::UsageError(format!("Failed to get datetime tzinfo: {error}")))?;
     if tzinfo.is_none() {
+        let days = datetime_days(py_obj)?;
         return Ok(SqlType::DateTime2(Some(SqlDateTime2 {
             days,
             time: py_time(py_obj, hinted_scale.unwrap_or(6))?,
@@ -734,14 +727,31 @@ fn py_datetime_to_sql_type(
             Error::UsageError(format!("Failed to get timezone offset seconds: {error}"))
         })?;
     let offset_minutes = datetimeoffset_minutes(offset_seconds)?;
+    let datetime = PyModule::import(py_obj.py(), "datetime")
+        .and_then(|module| module.getattr("timezone"))
+        .and_then(|timezone| timezone.getattr("utc"))
+        .and_then(|utc| py_obj.call_method1("astimezone", (utc,)))
+        .map_err(|error| {
+            Error::UsageError(format!("Failed to normalize datetime to UTC: {error}"))
+        })?;
 
     Ok(SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
         datetime2: SqlDateTime2 {
-            days,
-            time: py_time(py_obj, hinted_scale.unwrap_or(7))?,
+            days: datetime_days(&datetime)?,
+            time: py_time(&datetime, hinted_scale.unwrap_or(7))?,
         },
         offset: offset_minutes,
     })))
+}
+
+fn datetime_days(py_obj: &Bound<'_, PyAny>) -> TdsResult<u32> {
+    let ordinal = py_obj
+        .call_method0("toordinal")
+        .and_then(|value| value.extract::<u32>())
+        .map_err(|error| Error::UsageError(format!("Failed to get datetime ordinal: {error}")))?;
+    ordinal.checked_sub(1).ok_or_else(|| {
+        Error::UsageError("Date ordinal is 0, expected a value greater than 0".to_string())
+    })
 }
 
 fn datetimeoffset_minutes(offset_seconds: f64) -> TdsResult<i16> {
@@ -1919,6 +1929,50 @@ mod tests {
                 error,
                 Error::UsageError(message)
                     if message == "DATETIMEOFFSET requires a timezone-aware datetime"
+            ));
+        });
+    }
+
+    #[test]
+    fn datetimeoffset_normalizes_datetime_to_utc_and_preserves_offset() {
+        Python::attach(|py| {
+            let datetime = PyModule::import(py, "datetime").unwrap();
+            let timezone = datetime.getattr("timezone").unwrap();
+            let timedelta = datetime
+                .getattr("timedelta")
+                .unwrap()
+                .call1((0, 14 * 60 * 60))
+                .unwrap();
+            let offset = timezone.call1((timedelta,)).unwrap();
+            let value = datetime
+                .getattr("datetime")
+                .unwrap()
+                .call1((2023, 10, 30, 0, 0, 0, 0, offset))
+                .unwrap();
+            let expected_days = datetime
+                .getattr("date")
+                .unwrap()
+                .call1((2023, 10, 29))
+                .unwrap()
+                .call_method0("toordinal")
+                .unwrap()
+                .extract::<u32>()
+                .unwrap()
+                - 1;
+
+            let result = py_datetime_to_sql_type(&value, None).unwrap();
+            assert!(matches!(
+                result,
+                SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days,
+                        time: SqlTime {
+                            time_nanoseconds: 360_000_000_000,
+                            scale: 7,
+                        },
+                    },
+                    offset: 840,
+                })) if days == expected_days
             ));
         });
     }
