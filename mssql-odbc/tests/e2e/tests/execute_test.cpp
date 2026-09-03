@@ -696,14 +696,64 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDuringNeedDataReturnsHY010) {
     EXPECT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// Streaming writes SQLPutData chunks to the wire untranscoded - a UTF-8
-// sequence can straddle two calls - so the streamed type must be the one the C
-// buffer already holds. A cross-family binding is therefore refused at execute
-// rather than declared nvarchar and sent as UTF-8. The materialized path does
-// transcode it, so the two paths deliberately differ until AB#47590 lands.
+// Streaming used to require the C type and SQL type to agree on wideness --
+// SQL_C_CHAR only against a narrow SQL type, SQL_C_WCHAR only against a wide
+// one -- because SQLPutData writes chunks to the wire untranscoded, and a
+// chunk transcoded in isolation could split a multi-byte character across two
+// calls. That pairing is now buffered instead of streamed chunk-by-chunk, and
+// the whole value is transcoded once the parameter closes, matching what the
+// materialized path already does (AB#47590).
 //
-// msodbcsql supports the pairing, hence the skip.
-TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
+// msodbcsql has always supported this pairing, so the parity run is no longer
+// skipped here.
+TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_WVARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    const char first_chunk[] = "strea";
+    const char second_chunk[] = "med";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first_chunk), 5),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second_chunk), 3),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("streamed", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The whole reason this pairing buffers rather than transcodes chunk-by-chunk:
+// a multi-byte UTF-8 sequence can straddle two SQLPutData calls. Splits "caf"
+// + U+00E9 (UTF-8 0xC3 0xA9) so the first chunk ends with the lead byte and
+// the second chunk supplies only the trailing byte -- transcoding each chunk
+// in isolation would decode two invalid/incomplete code points instead of one
+// U+00E9, since neither half is valid UTF-8 on its own.
+//
+// msodbcsql diverges here: this run measured 5 UTF-16 code units back
+// (`wind == 10`) instead of the correct 4, reproducing identically across
+// retries. Very likely cause: msodbcsql reads SQL_C_CHAR bytes in the client
+// code page rather than UTF-8 (AB#47565, see the AppText doc comment in
+// param_convert.rs), and on the parity leg's Windows default code page the
+// split bytes (0xC3, 0xA9) each decode as their own Windows-1252 character --
+// a mismatch that would reproduce for a single-chunk value too, so it is not
+// evidence about residual-carrying across SQLPutData calls one way or the
+// other; not confirmed at the code-point level, since the failing assertion
+// aborted before the actual units were logged. Either way the parity run
+// compares outcomes, not cause, so this divergence has to opt out rather
+// than turn the build red.
+TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
@@ -712,6 +762,166 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
     SQLCHAR token = 0;
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
                                    SQL_WVARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    const SQLCHAR first_chunk[] = {'c', 'a', 'f', 0xC3};
+    const SQLCHAR second_chunk[] = {0xA9};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(first_chunk),
+                             sizeof(first_chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(second_chunk),
+                             sizeof(second_chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR buf[16] = {0};
+    SQLLEN wind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &wind),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLWCHAR expected[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_EQ(sizeof(expected), static_cast<size_t>(wind));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(SQLWCHAR); ++i) {
+        EXPECT_EQ(expected[i], buf[i]) << "code unit " << i;
+    }
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// The pairing this fix actually targets: mssql-python always declares
+// SQL_C_WCHAR for a streamed character parameter, including ASCII values it
+// also declares as the *narrow* SQL_VARCHAR (a documented convention in its
+// own source -- "a long-standing alias in the Python layer"). A non-ASCII
+// value here exercises both the wideness-mismatch transcode and the
+// collation-correct narrow encoding in one test: the narrow-to-wide
+// direction above produces wide UTF-16LE output, which never touches
+// collation encoding at all, so it cannot cover that half of the fix.
+TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLWCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_WCHAR,
+                                   SQL_VARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    // "caf" + LATIN SMALL LETTER E WITH ACUTE (U+00E9), as UTF-16LE code units.
+    const SQLWCHAR chunk[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLWCHAR*>(chunk), sizeof(chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // Read back via SQL_C_WCHAR rather than GetColumnChar: narrow-PLP delivery
+    // to SQL_C_CHAR is a verbatim wire-byte copy today regardless of collation
+    // (AB#47566, a separate, pre-existing gap on the *fetch* side -- see
+    // get_data.rs's `copy_verbatim` arm for `PlpEncoding::SingleByteText`), so
+    // under the server's default non-UTF8 collation it returns the raw
+    // single-byte codepage byte instead of UTF-8, which this test would
+    // wrongly read as a failure of the *write*-side fix under test.
+    // SQL_C_WCHAR widening already decodes through the collation correctly.
+    SQLWCHAR buf[16] = {0};
+    SQLLEN wind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &wind),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLWCHAR expected[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_EQ(sizeof(expected), static_cast<size_t>(wind));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(SQLWCHAR); ++i) {
+        EXPECT_EQ(expected[i], buf[i]) << "code unit " << i;
+    }
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// Same-wideness narrow pairing (needs_transcode: false): SQLPutData streams
+// SQL_C_CHAR bytes to the wire untranscoded, on the assumption they are
+// already the wire encoding. They are not -- this driver's SQL_C_CHAR is
+// UTF-8 by convention, not a wire encoding -- so a non-ASCII value round-trips
+// as mojibake under a non-UTF8 collation (AB#47590's narrow-to-narrow half,
+// left open by this PR: only the wideness-mismatch half above closes here).
+// Written as the passing assertions AB#47590 would need to satisfy, with an
+// unconditional skip at the top: pins the gap's location for whoever picks
+// that up, and removing the skip is the whole activation step once fixed,
+// rather than writing this test from scratch then.
+TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionStillMisencodesNonAscii) {
+    GTEST_SKIP() << "known gap, not fixed by this PR: same-wideness narrow "
+                    "DAE streams SQL_C_CHAR bytes as UTF-8 regardless of the "
+                    "connection's actual collation (AB#47590)";
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    // "caf" + LATIN SMALL LETTER E WITH ACUTE (U+00E9), as UTF-8 bytes.
+    const SQLCHAR chunk[] = {'c', 'a', 'f', 0xC3, 0xA9};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(chunk), sizeof(chunk)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    // Read back via SQL_C_WCHAR, which decodes through the connection's
+    // collation correctly (see the sibling test above): the same probe that
+    // would prove the fix once `needs_transcode` covers this pairing too.
+    SQLWCHAR buf[16] = {0};
+    SQLLEN wind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &wind),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLWCHAR expected[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_EQ(sizeof(expected), static_cast<size_t>(wind));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(SQLWCHAR); ++i) {
+        EXPECT_EQ(expected[i], buf[i]) << "code unit " << i;
+    }
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+// A genuine cross-*family* pairing -- character streamed against an integer
+// SQL type -- has no transcode to fall back on: there is nothing it could
+// mean other than one side declaring one encoding and sending another, so it
+// is still refused at execute rather than risking corruption.
+//
+// SQL_C_CHAR -> SQL_INTEGER is reachable here (rather than failing at bind,
+// like SQL_C_CHAR -> a binary type still does) specifically because the
+// integer/character cross-conversions feature made it a valid *materialized*
+// binding; DAE has no equivalent, so the refusal for this one pairing moves
+// from bind time to here.
+//
+// msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute (see
+// param_cross_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute),
+// but does not actually stream it: SQLPutData itself then rejects with
+// HY019 ("Processing of fixed length targets cannot be spread over multiple
+// calls to SQLPutData"). Both drivers agree the pairing cannot stream
+// through -- they just detect it one call apart, this driver at SQLExecute
+// -- so the parity run stays skipped rather than comparing error codes that
+// differ by construction.
+TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_INTEGER, 0, 0, &token, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));

@@ -36,6 +36,7 @@ use super::util::write_if_some;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA, SqlHandle, SqlPointer, SqlReturn,
 };
+use crate::conversion::param_convert::transcode_dae_bytes;
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_STARTED;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
@@ -59,6 +60,9 @@ pub(crate) unsafe fn sql_param_data(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `value_ptr_ptr`, when non-null, must be writable for one `SqlPointer`.
 unsafe fn sql_param_data_impl(
     statement_handle: SqlHandle,
     value_ptr_ptr: *mut SqlPointer,
@@ -155,13 +159,27 @@ fn sql_param_data_safe(
     }
 
     // ── Subsequent calls: close current parameter and advance ───────────────
-    // Take the TDS client out of stmt_state while we do I/O.
-    let mut client = {
+    // Snapshot what's needed to transcode the parameter being closed -- when
+    // its C type and SQL type disagreed on wideness, `SQLPutData` buffered its
+    // bytes instead of streaming them (see `dae_placeholder_type`) -- and take
+    // the TDS client out of stmt_state while we do I/O. `c_type`/`sql_type`
+    // come from the `DaeParam` snapshot taken at execution time, not a fresh
+    // `bound_params` lookup: `SQLFreeStmt(SQL_RESET_PARAMS)` can clear that
+    // binding while this sequence is still open, and a rebind could change the
+    // encoding after the wire placeholder was already fixed, so re-reading it
+    // here could silently commit an empty value instead of the buffered one.
+    let (mut client, transcode) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLParamData: stmt mutex poisoned taking dae_client");
             return SQL_ERROR;
         };
-        match stmt_state
+
+        // Checked out before `pending_bytes` is taken: if this fails (a
+        // concurrent call already holds the client), the sequence stays open
+        // for a retry with the buffered value still intact rather than
+        // silently discarded, mirroring the same ordering `SQLPutData`'s
+        // buffered branch uses for the same reason.
+        let client = match stmt_state
             .dae
             .as_mut()
             .and_then(|dae| dae.checkout_client())
@@ -172,8 +190,55 @@ fn sql_param_data_safe(
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                 return SQL_ERROR;
             }
-        }
+        };
+
+        let transcode = stmt_state.dae.as_mut().and_then(|dae| {
+            if dae.progress.is_null || dae.progress.pending_bytes.is_empty() {
+                return None;
+            }
+            let (c_type, sql_type) = {
+                let param = dae.current_param()?;
+                if !param.needs_transcode {
+                    return None;
+                }
+                (param.c_type, param.sql_type)
+            };
+            // Free to take rather than clone: the client is already checked
+            // out above, so a failed checkout could not have left this call
+            // to take bytes it can no longer deliver. `advance()` resets
+            // `progress` wholesale before the next parameter, and every
+            // failure arm below tears the whole sequence down, so nothing
+            // reads `pending_bytes` again after this.
+            Some((
+                c_type,
+                sql_type,
+                std::mem::take(&mut dae.progress.pending_bytes),
+            ))
+        });
+        (client, transcode)
     };
+
+    // The buffered value is written as a single chunk, once, before the
+    // stream is told the parameter is complete. Nothing about this differs
+    // from an application that called `SQLPutData` once with the whole value
+    // -- the wire never sees the untranscoded bytes.
+    if let Some((c_type, sql_type, pending_bytes)) = transcode {
+        let db_collation = client.get_collation();
+        let wire_bytes = transcode_dae_bytes(c_type, sql_type, pending_bytes, db_collation);
+        if let Err(e) = dbc
+            .runtime
+            .block_on(client.write_streamed_chunk(&wire_bytes))
+        {
+            error!(%e, "SQLParamData: writing transcoded DAE value failed");
+            dbc.runtime.block_on(client.cancel_streamed_write());
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                let parked = stmt_state.take_dae();
+                debug_assert!(parked.is_none(), "the client was checked out above");
+                stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+            }
+            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+        }
+    }
 
     let end_result = dbc.runtime.block_on(client.end_streamed_param());
 
@@ -281,16 +346,18 @@ fn sql_param_data_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_NULL_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState};
     use crate::test_support::TestHandles;
 
     fn open_dae(expected_len: Option<usize>) -> DaeState {
         DaeState::for_test(
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len,
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR,
             }],
             Some(0),
         )
@@ -324,9 +391,11 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.dae = Some(DaeState::for_test(
                 vec![DaeParam {
-                    bound_index: 0,
                     value_ptr: token_ptr,
                     expected_len: None,
+                    needs_transcode: false,
+                    c_type: SQL_C_CHAR,
+                    sql_type: SQL_VARCHAR,
                 }],
                 None,
             ));
@@ -354,6 +423,48 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
         assert!(!state.needs_data());
+    }
+
+    /// A concurrent call on the same statement can hold the client when this
+    /// one tries to close a transcoded parameter (`checkout_client` returns
+    /// `None`, the same condition `DaeState::for_test`'s parked-client-free
+    /// setup exercises here). The client is checked out *before*
+    /// `pending_bytes` is taken, so this failure must not lose the buffered
+    /// value: a retry once the concurrent call finishes has to see the same
+    /// bytes it would have seen if this call had never happened.
+    #[test]
+    fn failed_checkout_leaves_pending_bytes_and_the_sequence_intact() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut dae = DaeState::for_test(
+                vec![DaeParam {
+                    value_ptr: std::ptr::null_mut(),
+                    expected_len: None,
+                    needs_transcode: true,
+                    c_type: SQL_C_CHAR,
+                    sql_type: SQL_VARCHAR,
+                }],
+                Some(0),
+            );
+            dae.progress.put_data_called = true;
+            dae.progress.pending_bytes = b"a\0b\0".to_vec();
+            state.dae = Some(dae);
+        }
+
+        let mut p: SqlPointer = std::ptr::null_mut();
+        let ret = unsafe { sql_param_data(h.stmt, &mut p) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        assert!(state.needs_data(), "sequence must stay open for a retry");
+        assert_eq!(
+            state.dae.as_ref().unwrap().progress.pending_bytes,
+            b"a\0b\0",
+            "the buffered value must survive a failed checkout"
+        );
     }
 
     #[test]

@@ -250,6 +250,18 @@ impl RowWriter for BufferedGetDataRow {
 ///
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
+/// Every active bound-column data buffer must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `BufferLength` is zero or smaller. Its indicator and octet-length
+/// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
+/// `SQL_ATTR_ROWS_FETCHED_PTR` must be writable for one `SqlULen`,
+/// `SQL_ATTR_ROW_STATUS_PTR` for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlUSmallInt`
+/// values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable for one
+/// `SqlULen`, whenever those attributes are non-null.
 pub(crate) unsafe fn sql_fetch_scroll(
     statement_handle: SqlHandle,
     fetch_orientation: SqlSmallInt,
@@ -264,6 +276,20 @@ pub(crate) unsafe fn sql_fetch_scroll(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// Every active bound-column data buffer must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `BufferLength` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `BufferLength` is zero or smaller. Its indicator and octet-length
+/// arrays must each be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values.
+/// When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents
+/// begin at the base plus the pointed-to byte offset, so each allocation must
+/// also cover that leading displacement.
+/// `SQL_ATTR_ROWS_FETCHED_PTR` must be writable for one `SqlULen`,
+/// `SQL_ATTR_ROW_STATUS_PTR` for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlUSmallInt`
+/// values, and `SQL_ATTR_ROW_BIND_OFFSET_PTR` must be readable for one
+/// `SqlULen`, whenever those attributes are non-null.
 pub(crate) unsafe fn sql_fetch_scroll_impl(
     statement_handle: SqlHandle,
     fetch_orientation: SqlSmallInt,
@@ -711,11 +737,12 @@ impl RowWriter for BoundRowWriter<'_> {
 /// loop skips it, matching msodbcsql.
 ///
 /// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which bound
-/// delivery does not implement yet (AB#47239), so it fails per row with
-/// `HYC00`. That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred
-/// resolution makes it reachable without the application naming the C type, and
-/// it covers more common column types than the `time` / `datetimeoffset` stride
-/// case. msodbcsql resolves identically and delivers the bytes.
+/// delivery does not implement yet (AB#47239), so it fails per row with `HYC00`.
+/// That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred resolution
+/// makes it reachable without the application naming the C type. A CLR UDT now
+/// resolves to `SQL_C_BINARY` too, but its former `SQL_C_CHAR` default was
+/// already unsupported, so the mapping change introduces no fetch regression.
+/// msodbcsql resolves all three identically and delivers the bytes.
 ///
 /// A resolved fixed-width target is left unresolved as well when the
 /// application declared a `BufferLength` too small to hold it. `BufferLength`
@@ -1630,6 +1657,10 @@ fn trim_partial_utf8(bytes: &mut Vec<u8>) {
 /// the two pointers alias (the common `SQLBindCol` case, and when there is no
 /// indicator at all): the length write below lands on the same location
 /// there, so nothing stale can survive either way.
+///
+/// # Safety
+/// `indicator` must be null, equal to `octet_length`, or writable for one
+/// `SqlLen`.
 unsafe fn clear_stale_null_indicator(indicator: *mut SqlLen, octet_length: *mut SqlLen) {
     if !indicator.is_null() && indicator != octet_length {
         unsafe { write_if_some(indicator, 0) };

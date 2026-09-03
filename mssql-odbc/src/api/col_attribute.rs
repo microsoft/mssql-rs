@@ -35,6 +35,13 @@ use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
+/// Gets a descriptor field for a result-set column.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `character_attribute_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes. `string_length_ptr` and `numeric_attribute_ptr`, when
+/// non-null, must each be writable for one value of their pointed-to type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_col_attribute_w(
     statement_handle: SqlHandle,
@@ -69,6 +76,11 @@ pub(crate) unsafe fn sql_col_attribute_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `character_attribute_ptr`, when non-null, must be writable for
+/// `buffer_length` bytes. `string_length_ptr` and `numeric_attribute_ptr`, when
+/// non-null, must each be writable for one value of their pointed-to type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_col_attribute_w_impl(
     statement_handle: SqlHandle,
@@ -323,7 +335,7 @@ fn binary_precision(meta: &ColumnMetadata) -> Option<SqlSmallInt> {
 /// digits) for a column size of 10, a GUID needs 36, and binary renders as two
 /// hex characters per byte.
 fn display_size(meta: &ColumnMetadata) -> SqlLen {
-    // `*(max)`, xml and json are unbounded; ODBC reports zero.
+    // `*(max)`, xml, json, and opaque UDTs have no fixed character display size.
     if meta.is_plp() {
         return 0;
     }
@@ -396,6 +408,11 @@ fn display_size(meta: &ColumnMetadata) -> SqlLen {
 /// representation, which for the temporal types is the C struct the driver
 /// hands back, not the TDS payload width.
 pub(super) fn octet_length(meta: &ColumnMetadata) -> SqlLen {
+    // A bounded UDT is still PLP; use its byte limit for binary transfer while
+    // display_size remains zero because the opaque value has no text rendering.
+    if meta.data_type == TdsDataType::Udt {
+        return desc_length(meta);
+    }
     if meta.is_plp() {
         return 0;
     }
@@ -620,8 +637,7 @@ fn type_name(meta: &ColumnMetadata) -> &'static str {
     }
 }
 
-// Only `int` column metadata can be built outside the decoder (`int_columns`),
-// so the per-type mapping tables are covered end-to-end by
+// Most per-type mapping tables are covered end-to-end by
 // `tests/e2e/tests/col_attribute_test.cpp` against a live SQL Server.
 #[cfg(test)]
 mod tests {
@@ -634,7 +650,7 @@ mod tests {
     use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_FIELD;
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sqldatatypes::TypeInfo;
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{int_columns, udt_column};
 
     /// A statement positioned on a result set of `n` nullable `int` columns.
     fn stmt_with_int_columns(h: &TestHandles, n: usize) {
@@ -1375,6 +1391,18 @@ mod tests {
                 .expect("varchar(max) is a PLP type");
         }
         assert_eq!(numeric(&h, 1, SQL_DESC_OCTET_LENGTH), 0);
+    }
+
+    #[test]
+    fn udt_size_attributes_match_bounded_and_unbounded_metadata() {
+        for (max_byte_size, expected_size) in [(u16::MAX, 0), (892, 892)] {
+            let meta = udt_column(max_byte_size);
+
+            assert_eq!(desc_length(&meta), expected_size);
+            assert_eq!(SqlLen::from(precision(&meta)), expected_size);
+            assert_eq!(octet_length(&meta), expected_size);
+            assert_eq!(display_size(&meta), 0);
+        }
     }
 
     /// A `decimal` carries its own precision on the wire, which takes

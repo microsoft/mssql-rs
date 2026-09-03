@@ -34,6 +34,8 @@ pub(crate) unsafe fn sql_cancel(statement_handle: SqlHandle) -> SqlReturn {
     crate::ffi_entry!("SQLCancel", unsafe { sql_cancel_impl(statement_handle) })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLCancel: statement_handle is null");
@@ -85,16 +87,18 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::SQL_INVALID_HANDLE;
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_INVALID_HANDLE, SQL_VARCHAR};
     use crate::handles::stmt::{DaeParam, DaeState, STMT_STATE_EXEC_STARTED};
     use crate::test_support::TestHandles;
 
     fn dae_with_one_param(cursor: Option<usize>) -> DaeState {
         DaeState::for_test(
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
                 expected_len: None,
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR,
             }],
             cursor,
         )

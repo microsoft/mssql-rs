@@ -236,6 +236,13 @@ pub(super) fn return_client_busy(dbc: &DbcHandle, client: TdsClient) {
 /// posting it here too would attach a diagnostic to this call's own
 /// still-successful return.
 ///
+/// If an RPC row set ends on `DONEINPROC` with MORE, the TDS layer consumes
+/// only trailing RPC control tokens and parks the first non-tail token for
+/// `SQLMoreResults`. A failure while consuming that completion tail always
+/// ends the batch — [`TdsClient::complete_current_result`] abandons whatever
+/// is left rather than stranding it — so it takes the deferred-error route
+/// above, never the unposted one.
+///
 /// `row_delivered` tells this call whether it actually delivered data —
 /// `true` for `SQLGetData` (a column was just captured) and for a
 /// `SQLFetch`/`SQLFetchScroll` whose rowset held at least one row, `false`
@@ -269,7 +276,6 @@ pub(super) fn release_busy_if_row_exhausted(
         Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
         Err(error) => Err(error),
     };
-    let batch_done = !client.has_open_batch();
 
     // `Ok(true)`: another row, already parked for the next fetch — never
     // exhausted. `Ok(false)`: the current result set's own DONE token was
@@ -280,9 +286,29 @@ pub(super) fn release_busy_if_row_exhausted(
     // the wire itself has given up on the whole batch (see doc comment).
     let result_set_exhausted = match &peek_result {
         Ok(has_more) => !has_more,
-        Err(_) => batch_done,
+        Err(_) => !client.has_open_batch(),
+    };
+
+    // A row-returning RPC can end its visible row set with DONEINPROC MORE because
+    // RETURNVALUE, RETURNSTATUS, and a terminal DONE still follow. Consume
+    // those protocol-only tokens now. The first non-tail token is parked inside
+    // TdsClient, so SQLMoreResults still observes it in order. Plain batch DONE
+    // tokens return immediately without probing the next result.
+    let completion_result = if result_set_exhausted && peek_result.is_ok() {
+        Some(dbc.runtime.block_on(client.complete_current_result()))
+    } else {
+        None
+    };
+    let batch_done = match &completion_result {
+        Some(Ok(done)) => *done,
+        _ => !client.has_open_batch(),
     };
     let release = result_set_exhausted && batch_done;
+
+    let mut read_error = peek_result.err();
+    if let Some(Err(error)) = completion_result {
+        read_error = Some(error);
+    }
 
     let drained_info = if release {
         client.take_info_messages()
@@ -305,8 +331,8 @@ pub(super) fn release_busy_if_row_exhausted(
         } else {
             stmt_state.pending_fetch_info = drained_info;
         }
-        if let Err(e) = peek_result {
-            error!(%e, "release_busy_if_row_exhausted: peek past current row failed");
+        if let Some(e) = read_error {
+            error!(%e, "release_busy_if_row_exhausted: finishing current result failed");
             if batch_done {
                 stmt_state.pending_fetch_error = Some(e);
             }
@@ -539,7 +565,10 @@ pub(super) fn snapshot_bound_params(
 ///
 /// # Safety
 /// Each bound parameter's value/indicator pointers must still satisfy the
-/// `SQLBindParameter` contract; the buffers are read here.
+/// `SQLBindParameter` contract; the buffers are read here. When
+/// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, their readable extents begin at
+/// each bound base plus the pointed-to signed byte offset, which may be
+/// negative, so every allocation must cover that displaced range.
 pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
@@ -582,24 +611,26 @@ pub(super) unsafe fn build_named_params(
         };
 
         if let Some(indicator) = dae_indicator {
-            let placeholder_type =
-                match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(
-                            "{op}: parameter {} DAE type not streamable: {}",
-                            i + 1,
-                            e.diag().text
-                        );
-                        post_diag(stmt_state, e.diag());
-                        return Err(SQL_ERROR);
-                    }
-                };
-            let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
+            let dae_stream = match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(
+                        "{op}: parameter {} DAE type not streamable: {}",
+                        i + 1,
+                        e.diag().text
+                    );
+                    post_diag(stmt_state, e.diag());
+                    return Err(SQL_ERROR);
+                }
+            };
+            let rpc =
+                RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, dae_stream.sql_type);
             dae_params.push(DaeParam {
-                bound_index: i,
                 value_ptr: bound_param.parameter_value_ptr,
                 expected_len: dae_expected_length(indicator),
+                needs_transcode: dae_stream.needs_transcode,
+                c_type: bound_param.c_type,
+                sql_type: bound_param.sql_type,
             });
             params.push(rpc);
         } else {
@@ -801,8 +832,8 @@ mod tests {
     use crate::params::BoundParam;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::{
-        ScriptedToken, col_metadata, col_metadata_empty, done_more, done_no_more, int_columns,
-        sql_error, tds_client_from_tokens,
+        ScriptedToken, col_metadata, col_metadata_empty, done_in_proc_more, done_more,
+        done_no_more, done_proc_no_more, int_columns, sql_error, tds_client_from_tokens,
     };
     use std::ffi::c_void;
 
@@ -1059,6 +1090,54 @@ mod tests {
              SQLMoreResults must also be able to fast-path without touching \
              the connection"
         );
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_drains_a_protocol_only_rpc_tail() {
+        // A SELECT inside sp_executesql/sp_prepexec ends with DONE_MORE even
+        // when no application-visible result follows. The RPC's terminal DONE
+        // must be consumed before another statement can safely use the wire.
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(
+            &h,
+            vec![
+                col_metadata_empty(),
+                done_in_proc_more(),
+                done_proc_no_more(),
+            ],
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.result_set_exhausted);
+        assert!(ss.batch_exhausted);
+    }
+
+    #[test]
+    fn release_busy_if_row_exhausted_defers_a_truncated_rpc_tail() {
+        let h = TestHandles::with_env_dbc_stmt();
+        position_and_inject(&h, vec![col_metadata_empty(), done_in_proc_more()]);
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let client = dbc.inner.lock().unwrap().client.take().unwrap();
+
+        release_busy_if_row_exhausted(dbc, stmt, h.stmt, client, true);
+
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        let ss = stmt.inner.lock().unwrap();
+        assert!(ss.result_set_exhausted);
+        assert!(ss.batch_exhausted);
+        assert!(matches!(
+            ss.pending_fetch_error,
+            Some(TdsError::ConnectionClosed(_))
+        ));
     }
 
     /// The reviewer-flagged AB#47508 regression: `SELECT 1; SELECT 2;` as one
@@ -1528,9 +1607,11 @@ mod tests {
         assert_eq!(
             dae.dae_params,
             vec![DaeParam {
-                bound_index: 1,
                 value_ptr: std::ptr::null_mut(),
-                expected_len: None
+                expected_len: None,
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR
             }]
         );
     }
@@ -1561,9 +1642,11 @@ mod tests {
         assert_eq!(
             dae.dae_params,
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
-                expected_len: Some(7)
+                expected_len: Some(7),
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR
             }]
         );
     }

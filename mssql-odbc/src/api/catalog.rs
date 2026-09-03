@@ -652,7 +652,9 @@ fn apply_catalog_metadata(
 /// Implements `SQLTablesW`.
 ///
 /// # Safety
-/// Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// Each name pointer must be null, reference its paired length in readable
+/// UTF-16 units, or be readable through a NUL terminator when that length is
+/// `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_tables_w(
     statement_handle: SqlHandle,
@@ -692,6 +694,10 @@ pub(crate) unsafe fn sql_tables_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Each
+/// non-null name pointer must be readable for its paired length in UTF-16 code
+/// units, or through a NUL terminator when that length is `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_tables_w_impl(
     statement_handle: SqlHandle,
@@ -795,7 +801,9 @@ fn sql_tables_w_safe(
 /// Implements `SQLColumnsW`.
 ///
 /// # Safety
-/// Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// Each name pointer must be null, reference its paired length in readable
+/// UTF-16 units, or be readable through a NUL terminator when that length is
+/// `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_columns_w(
     statement_handle: SqlHandle,
@@ -835,6 +843,10 @@ pub(crate) unsafe fn sql_columns_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Each
+/// non-null name pointer must be readable for its paired length in UTF-16 code
+/// units, or through a NUL terminator when that length is `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_columns_w_impl(
     statement_handle: SqlHandle,
@@ -946,7 +958,9 @@ fn sql_columns_w_safe(
 /// Implements `SQLPrimaryKeysW`.
 ///
 /// # Safety
-/// Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// Each name pointer must be null, reference its paired length in readable
+/// UTF-16 units, or be readable through a NUL terminator when that length is
+/// `SQL_NTS`.
 pub(crate) unsafe fn sql_primary_keys_w(
     statement_handle: SqlHandle,
     catalog_name: *const SqlWChar,
@@ -979,6 +993,10 @@ pub(crate) unsafe fn sql_primary_keys_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Each
+/// non-null name pointer must be readable for its paired length in UTF-16 code
+/// units, or through a NUL terminator when that length is `SQL_NTS`.
 unsafe fn sql_primary_keys_w_impl(
     statement_handle: SqlHandle,
     catalog_name: *const SqlWChar,
@@ -1062,7 +1080,9 @@ fn sql_primary_keys_w_safe(
 /// Implements `SQLForeignKeysW`.
 ///
 /// # Safety
-/// Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// Each name pointer must be null, reference its paired length in readable
+/// UTF-16 units, or be readable through a NUL terminator when that length is
+/// `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_foreign_keys_w(
     statement_handle: SqlHandle,
@@ -1114,6 +1134,10 @@ pub(crate) unsafe fn sql_foreign_keys_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Each
+/// non-null name pointer must be readable for its paired length in UTF-16 code
+/// units, or through a NUL terminator when that length is `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_foreign_keys_w_impl(
     statement_handle: SqlHandle,
@@ -1268,7 +1292,9 @@ fn sql_foreign_keys_w_safe(
 /// Implements `SQLStatisticsW`.
 ///
 /// # Safety
-/// Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// Each name pointer must be null, reference its paired length in readable
+/// UTF-16 units, or be readable through a NUL terminator when that length is
+/// `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_statistics_w(
     statement_handle: SqlHandle,
@@ -1308,6 +1334,10 @@ pub(crate) unsafe fn sql_statistics_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Each
+/// non-null name pointer must be readable for its paired length in UTF-16 code
+/// units, or through a NUL terminator when that length is `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_statistics_w_impl(
     statement_handle: SqlHandle,
@@ -1429,7 +1459,9 @@ fn sql_statistics_w_safe(
 /// Implements `SQLSpecialColumnsW`.
 ///
 /// # Safety
-/// Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// Each name pointer must be null, reference its paired length in readable
+/// UTF-16 units, or be readable through a NUL terminator when that length is
+/// `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_special_columns_w(
     statement_handle: SqlHandle,
@@ -1472,6 +1504,10 @@ pub(crate) unsafe fn sql_special_columns_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Each
+/// non-null name pointer must be readable for its paired length in UTF-16 code
+/// units, or through a NUL terminator when that length is `SQL_NTS`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_special_columns_w_impl(
     statement_handle: SqlHandle,
@@ -1623,7 +1659,9 @@ fn sql_special_columns_w_safe(
 /// Implements `SQLProceduresW`.
 ///
 /// # Safety
-/// Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// Each name pointer must be null, reference its paired length in readable
+/// UTF-16 units, or be readable through a NUL terminator when that length is
+/// `SQL_NTS`.
 pub(crate) unsafe fn sql_procedures_w(
     statement_handle: SqlHandle,
     catalog_name: *const SqlWChar,
@@ -1656,6 +1694,10 @@ pub(crate) unsafe fn sql_procedures_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Each
+/// non-null name pointer must be readable for its paired length in UTF-16 code
+/// units, or through a NUL terminator when that length is `SQL_NTS`.
 unsafe fn sql_procedures_w_impl(
     statement_handle: SqlHandle,
     catalog_name: *const SqlWChar,

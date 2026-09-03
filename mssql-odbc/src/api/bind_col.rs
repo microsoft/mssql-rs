@@ -30,7 +30,15 @@ use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
 ///
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null. The buffers must
-/// stay valid until the column is unbound or the statement is freed.
+/// stay valid until the column is unbound or the statement is freed. At each
+/// fetch, `target_value_ptr` must be writable for `SQL_ATTR_ROW_ARRAY_SIZE`
+/// elements of `buffer_length` bytes for a character or binary target, or of
+/// the full C type size for a fixed-width target, even when `buffer_length` is
+/// zero or smaller. `strlen_or_ind_ptr`, when non-null, must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen` values. When
+/// `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer extents begin
+/// at the base plus the pointed-to byte offset, so each allocation must also
+/// cover that leading displacement.
 pub(crate) unsafe fn sql_bind_col(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,
@@ -55,6 +63,17 @@ pub(crate) unsafe fn sql_bind_col(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. When
+/// non-null, `target_value_ptr` must remain valid until the column is unbound or
+/// the statement is freed. At each fetch, it must be writable for
+/// `SQL_ATTR_ROW_ARRAY_SIZE` elements of `buffer_length` bytes for a character
+/// or binary target, or of the full C type size for a fixed-width target, even
+/// when `buffer_length` is zero or smaller. `strlen_or_ind_ptr`, when non-null,
+/// must remain valid and be writable for `SQL_ATTR_ROW_ARRAY_SIZE` `SqlLen`
+/// values. When `SQL_ATTR_ROW_BIND_OFFSET_PTR` is non-null, these bound-buffer
+/// extents begin at the base plus the pointed-to byte offset, so each allocation
+/// must also cover that leading displacement.
 unsafe fn sql_bind_col_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,

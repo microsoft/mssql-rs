@@ -37,8 +37,10 @@ const DEFAULT_LOGIN_TIMEOUT_SECS: u32 = DEFAULT_CONNECT_TIMEOUT_SECS;
 ///
 /// # Safety
 /// - `connection_handle` must be a valid `DbcHandle` from `SQLAllocHandle`.
-/// - For `SQL_ATTR_LOGIN_TIMEOUT`, `value_ptr` must point to a writable
-///   `SQLUINTEGER`.
+/// - `value_ptr`, when non-null, must be writable for `buffer_length` bytes for
+///   `SQL_ATTR_CURRENT_CATALOG`, or for one value of the requested fixed-width
+///   attribute type otherwise.
+/// - `string_length_ptr`, when non-null, must be writable for one `SqlInteger`.
 pub(crate) unsafe fn sql_get_connect_attr_w(
     connection_handle: SqlHandle,
     attribute: SqlInteger,
@@ -66,6 +68,12 @@ pub(crate) unsafe fn sql_get_connect_attr_w(
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
+/// `value_ptr`, when non-null, must be writable for `buffer_length` bytes for
+/// `SQL_ATTR_CURRENT_CATALOG`, or for one value of the requested fixed-width
+/// attribute type otherwise. `string_length_ptr`, when non-null, must be
+/// writable for one `SqlInteger`.
 unsafe fn sql_get_connect_attr_w_impl(
     connection_handle: SqlHandle,
     attribute: SqlInteger,

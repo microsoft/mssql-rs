@@ -70,6 +70,8 @@ pub(crate) unsafe fn sql_get_type_info_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_get_type_info_w_impl(
     statement_handle: SqlHandle,
     data_type: SqlSmallInt,
