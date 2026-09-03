@@ -860,6 +860,91 @@ def test_executemany_applies_setinputsizes_and_consumes_hints(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_executemany_binds_json(client_context, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([mssql_py_core.SQL_JSON, 4])
+            await cursor.executemany(
+                "IF JSON_VALUE(?, '$.answer') <> ? THROW 50000, 'Invalid JSON', 1",
+                [({"answer": 42}, 42), ({"answer": -7}, -7)],
+                use_prepare=use_prepare,
+            )
+            assert cursor.rowcount == -1
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_executemany_binds_vector(client_context, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes(
+                [(mssql_py_core.SQL_VECTOR, 3, 0), (mssql_py_core.SQL_VECTOR, 3, 0)]
+            )
+            await cursor.executemany(
+                "IF VECTOR_DISTANCE('euclidean', ?, ?) <> 0 "
+                "THROW 50000, 'Invalid VECTOR', 1",
+                [
+                    ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]),
+                    ([-4.5, 0.0, 9.25], [-4.5, 0.0, 9.25]),
+                ],
+                use_prepare=use_prepare,
+            )
+            assert cursor.rowcount == -1
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_executemany_binds_table_valued_parameters(client_context, use_prepare):
+    async def run():
+        conn = await connect(client_context)
+        type_name = f"PyAsyncExecuteManyTvp_{uuid.uuid4().hex}"
+        qualified_type_name = f"dbo.{type_name}"
+        cursor = conn.cursor()
+        try:
+            await cursor.execute(
+                f"CREATE TYPE dbo.[{type_name}] AS TABLE (id INT, value NVARCHAR(50))"
+            )
+            populated = mssql_py_core.TableValuedParameter(
+                qualified_type_name,
+                [(4, 0, 0), (-9, 50, 0)],
+                [(1, "first"), (2, "second")],
+            )
+            empty = mssql_py_core.TableValuedParameter(
+                qualified_type_name,
+                [(4, 0, 0), (-9, 50, 0)],
+                [],
+            )
+            null = mssql_py_core.TableValuedParameter(qualified_type_name)
+            await cursor.executemany(
+                "IF (SELECT COUNT(*) FROM ?) <> ? "
+                "THROW 50000, 'Unexpected TVP row count', 1",
+                [(populated, 2), (empty, 0), (null, 0)],
+                use_prepare=use_prepare,
+            )
+            assert cursor.rowcount == -1
+        finally:
+            try:
+                await cursor.execute(f"DROP TYPE IF EXISTS dbo.[{type_name}]")
+            finally:
+                await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_executemany_supports_heterogeneous_inferred_signatures(client_context):
     async def run():
         conn = await connect(client_context)
@@ -1007,6 +1092,22 @@ def test_executemany_logs_interruption_during_execution(client_context):
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+            probe = conn.cursor()
+            for _ in range(100):
+                try:
+                    await probe.execute("SELECT 1", use_prepare=False)
+                except RuntimeError as error:
+                    if "busy" in str(error).lower():
+                        await asyncio.sleep(0.01)
+                        continue
+                    assert "broken" in str(error).lower()
+                    break
+                else:
+                    pytest.fail("Cancelled executemany left the connection reusable")
+            else:
+                pytest.fail("Cancelled executemany left the connection permanently busy")
+
             for _ in range(100):
                 if any(
                     level == 30
@@ -1024,19 +1125,3 @@ def test_executemany_logs_interruption_during_execution(client_context):
             await conn.close()
 
     asyncio.run(run())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

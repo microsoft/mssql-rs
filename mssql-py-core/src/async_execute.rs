@@ -247,12 +247,12 @@ async fn execute_on_client(
         ..Default::default()
     };
     if !autocommit && !client.has_active_transaction() {
-        // TODO(mssql-tds): Add an options-aware begin_transaction API that applies
-        // reconnect timeout accounting and cancellation, and records whether the
-        // transaction-manager request reached the wire. Until then, any BEGIN
-        // failure must conservatively poison the session.
         client
-            .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+            .begin_transaction_with_options(
+                TransactionIsolationLevel::ReadCommitted,
+                None,
+                options.clone(),
+            )
             .await
             .map_err(ExecuteFailure::broken)?;
     }
