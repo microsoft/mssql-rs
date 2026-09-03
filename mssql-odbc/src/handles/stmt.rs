@@ -738,15 +738,31 @@ impl DaeParam {
         self.binding.sql_type = sql_type;
         self
     }
+
+    /// Same, with a `ColumnSize` bound attached, for the tests that exercise
+    /// trimming against the declared-length promise.
+    #[cfg(test)]
+    pub(crate) fn with_length_limit(mut self, limit: DaeLengthLimit) -> Self {
+        self.length_limit = Some(limit);
+        self
+    }
 }
 
 /// How much of the open data-at-execution parameter the application has
 /// supplied. Reset as a unit whenever the cursor advances.
 #[derive(Debug, Default)]
 pub(crate) struct DaeProgress {
-    /// Bytes supplied by `SQLPutData`, counted before any server-side
-    /// conversion to match msodbcsql's `cbDataAppGiven`.
+    /// Bytes supplied by `SQLPutData`, counted before any trimming or
+    /// conversion to match msodbcsql's `cbDataAppGiven`. This is the total the
+    /// `SQL_LEN_DATA_AT_EXEC(n)` promise is checked against, so it has to count
+    /// what the application handed over rather than what survived.
     pub(crate) bytes_sent: usize,
+    /// Bytes kept after `ColumnSize` trimming -- msodbcsql's
+    /// `cbDataSentToServer`. Padding trimmed away does not consume the
+    /// declaration's budget, so this trails `bytes_sent` whenever a chunk was
+    /// trimmed, and the two must not be conflated: the declared-length check
+    /// reads the first, the `ColumnSize` bound the second.
+    pub(crate) retained_bytes: usize,
     /// Set by the first `SQLPutData` for this parameter, including zero-length
     /// and NULL writes. Closing a parameter without one is a sequence error in
     /// msodbcsql.

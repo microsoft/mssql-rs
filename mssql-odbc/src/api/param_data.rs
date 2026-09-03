@@ -31,7 +31,8 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::{ExecuteOptions, StatementResult, StreamedParamStatus};
 
 use super::exec_common::{
-    abort_dae_with_diag, fail_with_tds, finish_execute, rebuild_deferred_params, return_client_idle,
+    abort_dae_with_diag, clear_exec_started, fail_with_tds, finish_execute,
+    rebuild_deferred_params, return_client_idle,
 };
 use super::sqlstate::*;
 use super::util::write_if_some;
@@ -413,13 +414,19 @@ fn run_deferred_execute(
         };
 
         let client = stmt_state.take_dae();
-        stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+        // `EXEC_STARTED` deliberately stays set across the execute below, exactly
+        // as the immediate path holds it for its whole round trip and lets
+        // `finish_execute` / `fail_with_tds` clear it. Clearing it here would
+        // open a window in which a concurrent `SQLPrepareW` passes its
+        // active-execute guard and installs a plan that the `prepared` restore
+        // after the execute would then silently overwrite.
         (client, params, prepared, orphaned, sql, timeout_secs)
     };
 
     let (client, params, mut prepared, mut orphaned, sql, timeout_secs) = taken;
     let Some(mut client) = client else {
         error!("SQLParamData: deferred sequence has no client to execute on");
+        clear_exec_started(stmt);
         return SQL_ERROR;
     };
 
@@ -438,6 +445,7 @@ fn run_deferred_execute(
             (None, None) => {
                 error!("SQLParamData: deferred sequence has neither a plan nor SQL text");
                 return_client_idle(dbc, statement_handle, client);
+                clear_exec_started(stmt);
                 return SQL_ERROR;
             }
         };

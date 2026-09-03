@@ -10,6 +10,8 @@
 //! parameter as SQL `NULL` (no chunks); any other valid value is a byte count
 //! for `data_ptr`.
 
+use std::borrow::Cow;
+
 use tracing::{debug, error};
 
 use super::exec_common::{abort_dae_with_diag, fail_with_tds, return_client_idle};
@@ -303,9 +305,9 @@ unsafe fn sql_put_data_safe(
                 ERR_ATTEMPT_TO_CONCATENATE_NULL,
             );
         }
-        let new_total = dae.progress.bytes_sent.saturating_add(byte_count);
+        let app_total = dae.progress.bytes_sent.saturating_add(byte_count);
         if let Some(expected) = dae.current_param().and_then(|param| param.expected_len)
-            && new_total > expected
+            && app_total > expected
         {
             drop(stmt_state);
             error!("SQLPutData: DAE data exceeds SQL_LEN_DATA_AT_EXEC length");
@@ -365,21 +367,28 @@ unsafe fn sql_put_data_safe(
         // buffer - exactly where msodbcsql applies `ValidatePutDataLength`
         // (`odbc/sqlccmd.cpp:4571`), so the `22001` lands on the `SQLPutData`
         // that overflows rather than at close (AB#47590).
-        let sent_before = dae.progress.bytes_sent;
-        let fitted: Vec<u8> = match dae.current_param().and_then(|param| param.length_limit) {
-            Some(limit) if !chunk.is_empty() => match limit.fit(chunk, sent_before) {
-                Ok(fitted) => fitted.to_vec(),
+        //
+        // Measured against the *retained* running total, not the application's:
+        // trimmed padding must not consume the declaration's budget. The two
+        // totals are tracked separately because the declared-length promise
+        // above counts what the application supplied.
+        let retained_before = dae.progress.retained_bytes;
+        // Borrowed, not copied: `fit` returns a prefix of `chunk`, and the
+        // buffered branch copies it straight into the capacity reserved above,
+        // so a chunk is never materialized into a second heap buffer that the
+        // `try_reserve` guard does not cover and that would double peak usage.
+        let fitted: &[u8] = match dae.current_param().and_then(|param| param.length_limit) {
+            Some(limit) if !chunk.is_empty() => match limit.fit(chunk, retained_before) {
+                Ok(fitted) => fitted,
                 Err(e) => {
                     drop(stmt_state);
                     error!("SQLPutData: value exceeds ColumnSize (22001)");
                     return abort_dae_with_diag(dbc, stmt, statement_handle, e.diag());
                 }
             },
-            _ => chunk.to_vec(),
+            _ => chunk,
         };
-        // The total advances by the retained count, so padding trimmed away
-        // does not consume the declaration's budget.
-        let new_total = sent_before.saturating_add(fitted.len());
+        let retained_total = retained_before.saturating_add(fitted.len());
 
         // A buffered parameter never touches the wire here: it accumulates and
         // is converted whole when `SQLParamData` closes it. In a deferred
@@ -387,30 +396,32 @@ unsafe fn sql_put_data_safe(
         // accumulates, whatever its own plan says.
         if will_buffer {
             if let Some(dae) = stmt_state.dae.as_mut() {
-                dae.progress.buffer.extend_from_slice(&fitted);
-                dae.progress.bytes_sent = new_total;
+                dae.progress.buffer.extend_from_slice(fitted);
+                dae.progress.bytes_sent = app_total;
+                dae.progress.retained_bytes = retained_total;
                 dae.progress.put_data_called = true;
             }
             return SQL_SUCCESS;
         }
 
         // A transcoded stream converts on the way out, holding back a character
-        // that this chunk ended part-way through.
+        // that this chunk ended part-way through. An untranscoded one is already
+        // the wire's bytes, so it is forwarded borrowed.
         let transcode = dae.current_param().and_then(|param| param.transcode);
-        let outgoing: Vec<u8> = match transcode {
+        let outgoing: Cow<'_, [u8]> = match transcode {
             Some(transcode) => match stmt_state.dae.as_mut() {
                 Some(dae) => {
                     let mut carry = std::mem::take(&mut dae.progress.carry);
-                    let out = transcode.push(&mut carry, &fitted);
+                    let out = transcode.push(&mut carry, fitted);
                     dae.progress.carry = carry;
-                    out
+                    Cow::Owned(out)
                 }
                 None => {
                     error!("SQLPutData: DAE sequence ended between locks");
                     return SQL_ERROR;
                 }
             },
-            None => fitted,
+            None => Cow::Borrowed(fitted),
         };
 
         let client = if outgoing.is_empty() {
@@ -431,7 +442,8 @@ unsafe fn sql_put_data_safe(
         };
 
         if let Some(dae) = stmt_state.dae.as_mut() {
-            dae.progress.bytes_sent = new_total;
+            dae.progress.bytes_sent = app_total;
+            dae.progress.retained_bytes = retained_total;
             dae.progress.put_data_called = true;
         }
         client.map(|client| (client, outgoing))
@@ -747,6 +759,60 @@ mod tests {
     /// this sequence" state `failed_client_checkout_leaves_progress_untouched`
     /// covers for the untranscoded path, and a rejected call must leave the
     /// parameter's counters and carry where they were.
+    /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` *application* bytes, while
+    /// `ColumnSize` bounds what survives trimming. Conflating the two makes a
+    /// value that satisfies both fail at close: `"ab  "` is four bytes the
+    /// application really did supply, and two after the overflowing blanks are
+    /// trimmed to `varchar(2)`, so a single counter would report `2 != 4` and
+    /// reject a correct sequence. The totals are tracked separately.
+    #[test]
+    fn trimmed_padding_does_not_break_the_declared_length_promise() {
+        let limit = crate::conversion::param_convert::dae_length_limit(
+            crate::api::odbc_types::SQL_C_CHAR,
+            SQL_VARCHAR,
+            2,
+        )
+        .expect("varchar(2) is a bounded declaration")
+        .expect("and therefore has a limit");
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.dae = Some(DaeState::for_test(
+                vec![
+                    DaeParam::unbounded(0, std::ptr::null_mut(), Some(4))
+                        .with_binding_types(crate::api::odbc_types::SQL_C_CHAR, SQL_VARCHAR)
+                        .with_length_limit(limit),
+                ],
+                Some(0),
+            ));
+        }
+        // Buffered rather than streamed, so the chunk lands in the accumulator
+        // without needing a parked client.
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let dae = state.dae.as_mut().unwrap();
+            dae.deferred = true;
+        }
+
+        let mut chunk = *b"ab  ";
+        let ret = unsafe { sql_put_data(h.stmt, chunk.as_mut_ptr().cast(), 4) };
+        assert_eq!(ret, SQL_SUCCESS, "four supplied bytes satisfy the promise");
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert_eq!(
+            dae.progress.bytes_sent, 4,
+            "the declared-length promise counts what the application supplied"
+        );
+        assert_eq!(
+            dae.progress.retained_bytes, 2,
+            "the ColumnSize budget counts only what survived trimming"
+        );
+        assert_eq!(dae.progress.buffer, b"ab", "the blanks were trimmed away");
+    }
+
     #[test]
     fn transcoded_param_without_a_client_returns_hy010() {
         let h = TestHandles::with_env_dbc_stmt();
