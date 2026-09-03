@@ -90,6 +90,9 @@ pub(crate) enum ParamBuildError {
     InvalidLength(SqlLen),
     /// The parameter carries a value but `ParameterValuePtr` is null.
     NullValuePointer,
+    /// A null `ParameterValuePtr` paired with a length that is not zero, or
+    /// with a fixed-width C type. msodbcsql answers `HY090` here.
+    InvalidBufferLength,
     /// Character data longer than the declared length, in more than trailing
     /// blanks.
     StringTruncation,
@@ -119,6 +122,7 @@ impl ParamBuildError {
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
+            Self::InvalidBufferLength => crate::api::sqlstate::ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::StringTruncation => ERR_PARAM_STRING_TRUNCATION,
             Self::InvalidDateTime => ERR_INVALID_DATETIME_FORMAT,
             Self::DateTimeFieldOverflow => ERR_DATETIME_FIELD_OVERFLOW,

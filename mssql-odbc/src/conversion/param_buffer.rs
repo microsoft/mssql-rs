@@ -122,6 +122,20 @@ pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, Par
         }
     }
 
+    // A null value buffer with a zero length is the SQLPutData NULL/0
+    // convention (`sqlccmd.cpp:4497`) and reaches the wire as NULL - but only
+    // for a variable-length C type, which is the only kind that carries a
+    // length. Measured on retail 18.6.2.1: `SQL_C_CHAR`/`WCHAR`/`BINARY` with
+    // an indicator of 0 execute successfully, while the same C types with a
+    // non-zero length or `SQL_NTS`, and every fixed-width C type whatever the
+    // indicator, answer `HY090`.
+    if param.parameter_value_ptr.is_null() {
+        if indicator_is_a_length(param.c_type) && indicator == Some(0) {
+            return Ok(Indicator::Null);
+        }
+        return Err(ParamBuildError::InvalidBufferLength);
+    }
+
     // For the character C types a null octet-length pointer means "null-terminated".
     Ok(Indicator::Length(indicator.unwrap_or(SQL_NTS as SqlLen)))
 }
@@ -814,25 +828,31 @@ mod tests {
         );
     }
 
-    /// Both pointers null is the case msodbcsql rejects too, though with a
-    /// different state: retail 18.6.2.1 answers `HY090` at execute where this
-    /// driver answers `HY009` at bind.
+    /// The null-buffer rule, measured on retail 18.6.2.1 across every shape:
+    /// a variable-length C type with a zero length is NULL, everything else is
+    /// `HY090`.
     #[test]
-    fn non_null_parameter_without_a_value_buffer_is_rejected() {
-        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_SLONG] {
-            let p = param(c_type, std::ptr::null_mut(), std::ptr::null_mut());
-            assert_eq!(
-                read(&p).unwrap_err(),
-                ParamBuildError::NullValuePointer,
-                "c_type {c_type}"
-            );
+    fn a_null_value_buffer_follows_the_zero_length_rule() {
+        // Variable-length C types with a zero length: SQL NULL.
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {
+            let mut zero: SqlLen = 0;
+            let p = param(c_type, std::ptr::null_mut(), &mut zero);
+            assert_eq!(read(&p).unwrap(), None, "c_type {c_type}");
         }
-        // An explicit length does not make the missing buffer readable either.
-        let mut ind: SqlLen = 4;
-        let p = param(SQL_C_SLONG, std::ptr::null_mut(), &mut ind);
-        let err = read(&p).unwrap_err();
-        assert_eq!(err, ParamBuildError::NullValuePointer);
-        assert_eq!(err.diag().state, *b"HY009");
+
+        // Same C type, non-zero length: HY090.
+        let mut four: SqlLen = 4;
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut four);
+        assert_eq!(read(&p).unwrap_err().diag().state, *b"HY090");
+
+        // A fixed-width C type never carries a length, so even zero is HY090.
+        let mut zero: SqlLen = 0;
+        let p = param(SQL_C_SLONG, std::ptr::null_mut(), &mut zero);
+        assert_eq!(read(&p).unwrap_err().diag().state, *b"HY090");
+
+        // No indicator at all means SQL_NTS, not zero.
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(read(&p).unwrap_err().diag().state, *b"HY090");
     }
 
     /// Pins the helpers' own length handling. The null-pointer and negative-length

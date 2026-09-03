@@ -369,10 +369,11 @@ Rules it fixes:
 - `StrLen_or_Ind` is a length only for the variable-length C types (msodbcsql's
   `IsFixedCType`); a fixed-width type takes its size from the C type.
 - A null indicator pointer means `SQL_NTS`, not NULL.
-- A non-NULL parameter with a null `ParameterValuePtr` is `HY009`. Both drivers
-  reject it: retail 18.6.2.1 answers `HY090` at execute (ADO build 172202).
-  `sqlcfunc.cpp:2549` reads as though a null buffer is taken as NULL; matching
-  that reading failed CI on this input, so it is incomplete. Deviation 7.
+- A null `ParameterValuePtr` is SQL NULL only for a variable-length C type
+  carrying a zero length - the `SQLPutData` NULL/0 convention of
+  `sqlccmd.cpp:4497`. Every other shape is `HY090`. Measured on retail
+  18.6.2.1: `SQL_C_CHAR` / `WCHAR` / `BINARY` with an indicator of 0 execute,
+  while a non-zero length, `SQL_NTS`, or any fixed-width C type is rejected.
 - `AppValue::Integer` is `i128`, so `SQL_C_UBIGINT` above `i64::MAX` reaches the
   narrowing check intact rather than as a negative.
 

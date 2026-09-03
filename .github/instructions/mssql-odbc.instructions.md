@@ -189,17 +189,7 @@ does not grow every time a new msodbcsql build is measured.
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
    outstanding 18.6.2.1 measurements land - keep the running record there
    rather than growing this file per build.
-7. **A non-NULL parameter with a null `ParameterValuePtr` is `HY009`.**
-   Both drivers reject it, with different states: retail 18.6.2.1 answers
-   `HY090` ("Invalid string or buffer length") at `SQLExecute`, measured on ADO
-   build 172202 on both Build Linux and Build Windows. `read_param_value`
-   rejects the null buffer at bind instead, because the indicator already said
-   the parameter is not NULL and so a value is owed.
-   `sqlcfunc.cpp:2549` reads as though any null buffer is simply taken as NULL -
-   an attempt to match that reading failed CI on exactly this input, so the
-   reading is incomplete and must not be re-derived from source.
-   `NullDataPointerWithZeroLengthIsHy009` carries `SKIP_IF_COMPARING_MSODBCSQL()`.
-8. **A bound `max`/LOB text column converted to a typed C target is refused
+7. **A bound `max`/LOB text column converted to a typed C target is refused
    above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
    cap what a typed conversion may materialize - a `varchar(max)` carries up to
    2 GB and the converter needs one contiguous literal. This driver's cap is
@@ -228,7 +218,7 @@ does not grow every time a new msodbcsql build is measured.
    contrived input. CI compares against 18.6.2.1; this measurement is
    18.06.0001, so re-measure there before relying on the exact prefix length.
    Tracked in AB#47767.
-9. **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
+8. **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
    character.** A buffer with no room for the final surrogate pair ends before
    it; msodbcsql leaves the lone high surrogate in the last payload slot on this
    narrow-source widening path, though its wide-source path is surrogate-safe
@@ -238,7 +228,7 @@ does not grow every time a new msodbcsql build is measured.
    type but not the other would be worse than the divergence.
    `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
-10. A bound `time` / `datetimeoffset` column strides by
+9. A bound `time` / `datetimeoffset` column strides by
     `sizeof(SQL_SS_TIME2_STRUCT)` (12) and
     `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by `BufferLength`.
     Both drivers resolve these to the same C types under ODBC 3.8
@@ -253,7 +243,7 @@ does not grow every time a new msodbcsql build is measured.
     Pre-existing for an explicit `SQL_C_SS_TIME2` bind; deferred
     `SQL_C_DEFAULT` resolution makes it reachable without the application naming
     the C type.
-11. A `SQL_C_DEFAULT` binding that resolves to a fixed-width C type wider than
+10. A `SQL_C_DEFAULT` binding that resolves to a fixed-width C type wider than
     the application's declared `BufferLength` is left unresolved and fails the
     row (`HYC00`) rather than writing. `BufferLength` is ignored for a
     fixed-width target, which is safe when the application named that type; a
@@ -263,7 +253,7 @@ does not grow every time a new msodbcsql build is measured.
     `BufferLength` 0 is exempt — the documented idiom for a fixed-width target,
     carrying no width claim. Whether these should instead report `01004` with a
     truncated value, closer to msodbcsql, is open and untracked.
-12. A `varbinary` / `image` / CLR UDT column bound `SQL_C_DEFAULT` resolves to
+11. A `varbinary` / `image` / CLR UDT column bound `SQL_C_DEFAULT` resolves to
     `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY` /
     `SQL_SS_UDT`, then `resolve_default_c_type`), which bound delivery does not
     implement yet (AB#47239), so it fails per row with `HYC00`. For `varbinary`

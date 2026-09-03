@@ -1367,23 +1367,36 @@ TEST_F(ScalarConversionLiveTest, ScalarParamsBindWithoutAnIndicatorPointer) {
 // (sqlcfunc.cpp:2549), before any length check, so the indicator's value never
 // matters. Measured on both legs; this driver used to answer HY009 and now
 // matches.
-// A non-NULL parameter with a null ParameterValuePtr is HY009 here.
-//
-// Both drivers reject it, with different states: retail 18.6.2.1 answers HY090
-// ("Invalid string or buffer length") at SQLExecute, measured on ADO build
-// 172202 on both Build Linux and Build Windows. sqlcfunc.cpp:2549 reads as
-// though a null buffer is simply taken as NULL, but that reading does not hold
-// for this input - do not re-derive it from source. Registered deviation 7.
-TEST_F(ScalarConversionLiveTest, NullDataPointerWithZeroLengthIsHy009) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-
-    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
-
-    SQLLEN zero = 0;
-    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 10, 0,
-                                    nullptr, 0, &zero);
-    if (SQL_SUCCEEDED(rc)) {
-        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+TEST_F(ScalarConversionLiveTest, ANullValueBufferFollowsTheZeroLengthRule) {
+    struct Case {
+        SQLSMALLINT c;
+        SQLSMALLINT s;
+        SQLULEN size;
+        SQLLEN ind;
+        bool is_null;
+        const char* what;
+    };
+    const Case cases[] = {
+        {SQL_C_CHAR, SQL_VARCHAR, 10, 0, true, "char, zero length"},
+        {SQL_C_WCHAR, SQL_WVARCHAR, 10, 0, true, "wchar, zero length"},
+        {SQL_C_BINARY, SQL_VARBINARY, 10, 0, true, "binary, zero length"},
+        {SQL_C_CHAR, SQL_VARCHAR, 10, 4, false, "char, non-zero length"},
+        {SQL_C_CHAR, SQL_VARCHAR, 10, SQL_NTS, false, "char, SQL_NTS"},
+        {SQL_C_SLONG, SQL_INTEGER, 0, 0, false, "fixed width, zero length"},
+    };
+    for (const Case& c : cases) {
+        SQLLEN ind = c.ind;
+        ASSERT_SQL_OK(Prepare("SELECT CASE WHEN ? IS NULL THEN 'null' ELSE 'notnull' END"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c.c, c.s, c.size, 0, nullptr,
+                                       0, &ind),
+                      SQL_HANDLE_STMT, stmt_);
+        if (c.is_null) {
+            EXPECT_EQ("null", ExecuteAndReadBack()) << c.what;
+        } else {
+            EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << c.what;
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
+        }
+        ResetParams();
     }
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY009");
 }
