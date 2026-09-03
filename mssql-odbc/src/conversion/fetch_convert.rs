@@ -267,10 +267,16 @@ pub(crate) unsafe fn convert_float_c(
     }
     let v = numeric_source_or_parse(value)?.as_f64();
     let ret = match target_type {
-        // SQL_C_FLOAT is 32-bit.
-        SQL_C_FLOAT => unsafe {
-            write_fixed(target_value_ptr, narrow_f64_to_f32(v)?, strlen_or_ind_ptr)
-        },
+        // SQL_C_FLOAT is 32-bit. A `real` column is already that width, so it is
+        // copied rather than range-checked, matching the exact-write path in
+        // `try_write_exact_buffered_scalar` that normally serves this pairing.
+        SQL_C_FLOAT => {
+            let narrowed = match value {
+                ColumnValues::Real(x) => *x,
+                _ => narrow_f64_to_f32(v)?,
+            };
+            unsafe { write_fixed(target_value_ptr, narrowed, strlen_or_ind_ptr) }
+        }
         SQL_C_DOUBLE => unsafe { write_fixed(target_value_ptr, v, strlen_or_ind_ptr) },
         _ => return Err(ConvError::NotHandledHere),
     };
@@ -1158,6 +1164,44 @@ mod tests {
             &utf8_col("400000000000000000000000000000000000000000.5"),
             SQL_C_FLOAT,
             (&mut big as *mut f32).cast(),
+            &mut ind,
+        )
+        .unwrap_err();
+        assert_eq!(err, ConvError::OutOfRange);
+    }
+
+    /// A `real` column into `SQL_C_FLOAT` is the identity pairing, so it is
+    /// copied. Routing it through the narrowing check would make a subnormal
+    /// that the column already holds exactly come back as `22003`, and would
+    /// disagree with `try_write_exact_buffered_scalar`, which serves this
+    /// pairing on the buffered path.
+    ///
+    /// Measured on retail 18.6.2.1: round-tripping `1e-40` through a `real`
+    /// parameter and reading it back into a `SQL_C_FLOAT` buffer returns
+    /// `SQL_SUCCESS` and `9.99995e-41`.
+    #[test]
+    fn a_real_column_reaches_a_single_precision_target_unchecked() {
+        for v in [1e-40f32, -1e-40f32, f32::MIN_POSITIVE / 2.0] {
+            let mut out: f32 = 0.0;
+            let mut ind: SqlLen = 0;
+            conv_f(
+                &ColumnValues::Real(v),
+                SQL_C_FLOAT,
+                (&mut out as *mut f32).cast(),
+                &mut ind,
+            )
+            .unwrap();
+            assert_eq!(out, v, "value {v:e}");
+            assert_eq!(ind, 4);
+        }
+
+        // A genuine 64-bit source still meets the rule.
+        let mut out: f32 = 0.0;
+        let mut ind: SqlLen = 0;
+        let err = conv_f(
+            &ColumnValues::Float(1e-40),
+            SQL_C_FLOAT,
+            (&mut out as *mut f32).cast(),
             &mut ind,
         )
         .unwrap_err();

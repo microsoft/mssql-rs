@@ -122,7 +122,7 @@ impl ParamBuildError {
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
-            Self::InvalidBufferLength => crate::api::sqlstate::ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+            Self::InvalidBufferLength => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::StringTruncation => ERR_PARAM_STRING_TRUNCATION,
             Self::InvalidDateTime => ERR_INVALID_DATETIME_FORMAT,
             Self::DateTimeFieldOverflow => ERR_DATETIME_FIELD_OVERFLOW,
@@ -204,6 +204,7 @@ pub(crate) unsafe fn bound_param_to_value(
         }
         (AppValue::Bit(v), SqlFamily::Bit) => SqlType::Bit(Some(v)),
         (AppValue::Double(v), SqlFamily::Float) => convert_float_sql(param.sql_type, v)?,
+        (AppValue::Float(v), SqlFamily::Float) => convert_real_sql(param.sql_type, v),
         (AppValue::Guid(g), SqlFamily::Guid) => SqlType::Uuid(Some(guid_to_uuid(g))),
         (AppValue::DateTime(p), SqlFamily::DateTime) => {
             return convert_datetime_sql(param.sql_type, param.decimal_digits, p);
@@ -225,12 +226,12 @@ pub(crate) unsafe fn bound_param_to_value(
         }
         (AppValue::NarrowText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
             SQL_VARCHAR,
-            variant_column_size(param.column_size, SQL_PREC_BIGCHARBINARY),
+            variant_column_size(param.column_size, SQL_VARCHAR),
             AppText::Utf8(bytes),
         )?),
         (AppValue::WideText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
             SQL_WVARCHAR,
-            variant_column_size(param.column_size, SQL_PREC_NCHAR),
+            variant_column_size(param.column_size, SQL_WVARCHAR),
             AppText::Utf16(bytes),
         )?),
         _ => return Err(ParamBuildError::ConversionNotImplemented),
@@ -557,11 +558,7 @@ fn convert_character_sql(
     text: AppText,
 ) -> Result<SqlType, ParamBuildError> {
     let wide = is_wide_character_sql_type(sql_type);
-    let max_length = if wide {
-        SQL_PREC_NCHAR
-    } else {
-        SQL_PREC_BIGCHARBINARY
-    };
+    let max_length = character_max_length(sql_type);
 
     // The declared length for the T-SQL type, and the bound truncation is
     // measured against. They differ only for `text`/`ntext`, which carry no
@@ -814,6 +811,20 @@ fn convert_float_sql(sql_type: SqlSmallInt, v: f64) -> Result<SqlType, ParamBuil
     })
 }
 
+/// Widens a `SQL_C_FLOAT` source, which no `real` range check applies to
+/// because nothing narrows.
+///
+/// Measured on retail 18.6.2.1: `SQL_C_FLOAT` -> `SQL_REAL` at `1e-40` binds,
+/// executes and arrives as `9.99995e-41`, while the same value from
+/// `SQL_C_DOUBLE` is `22003` (`ADoubleOutsideTheRealRangeIs22003`). So the
+/// underflow rule keys off the source width, not the value.
+fn convert_real_sql(sql_type: SqlSmallInt, v: f32) -> SqlType {
+    match sql_type {
+        SQL_REAL => SqlType::Real(Some(v)),
+        _ => SqlType::Float(Some(f64::from(v))),
+    }
+}
+
 /// `SQLGUID` is little-endian in its first three fields and big-endian in the
 /// last, which is exactly `Uuid::from_fields`. The fetch direction takes the
 /// same layout apart in `convert_guid_c`.
@@ -826,17 +837,29 @@ fn variant_of(inner: SqlType) -> SqlType {
     SqlType::Variant(Box::new(inner))
 }
 
+/// The non-`max` ceiling on a character SQL type's declared length.
+fn character_max_length(sql_type: SqlSmallInt) -> usize {
+    if is_wide_character_sql_type(sql_type) {
+        SQL_PREC_NCHAR
+    } else {
+        SQL_PREC_BIGCHARBINARY
+    }
+}
+
 /// `sql_variant` cannot hold a `max` type (server error 529), so a `ColumnSize`
 /// of 0 - which means `max` everywhere else - is instead read as "unstated" and
-/// declared at `max_length`, the target's own non-`max` ceiling. A `ColumnSize`
-/// past that ceiling is clamped rather than passed through, because
-/// [`variable_length`] answers `None` above its bound and `None` is the `max`
-/// spelling.
+/// declared at the target's own non-`max` ceiling. A `ColumnSize` past that
+/// ceiling is clamped rather than passed through, because [`variable_length`]
+/// answers `None` above its bound and `None` is the `max` spelling.
 ///
-/// Measured on retail 18.6.2.1: a wide variant binding executes under every
-/// `ColumnSize` from 0 to 8000, so msodbcsql never lands on a `max` inner type
-/// here either.
-fn variant_column_size(column_size: usize, max_length: usize) -> usize {
+/// The ceiling comes from [`character_max_length`], the one
+/// [`convert_character_sql`] applies, so the two cannot drift apart and put
+/// `max` back inside a variant.
+///
+/// Measured on retail 18.6.2.1 at representative sizes through 100000: a wide
+/// variant binding executes without landing on a `max` inner type.
+fn variant_column_size(column_size: usize, sql_type: SqlSmallInt) -> usize {
+    let max_length = character_max_length(sql_type);
     if column_size == 0 || column_size > max_length {
         max_length
     } else {
@@ -1398,12 +1421,16 @@ mod tests {
         }
     }
 
-    /// `SQL_C_FLOAT` widens losslessly on the way in and narrows back exactly
-    /// for a `real` target, so a float-sized value survives the `f64` staging.
+    /// A `SQL_C_FLOAT` source is already `real`, so it is carried across at its
+    /// own width rather than staged as an `f64` and narrowed back.
     #[test]
-    fn a_float_buffer_round_trips_through_the_double_model() {
+    fn a_float_buffer_keeps_its_width() {
         let (value, _) = convert_fixed(SQL_C_FLOAT, SQL_REAL, 0, 0, 1.5f32).unwrap();
         assert_eq!(value, SqlType::Real(Some(1.5)));
+
+        // Widening the other way is lossless and unchecked.
+        let (value, _) = convert_fixed(SQL_C_FLOAT, SQL_DOUBLE, 0, 0, 1.5f32).unwrap();
+        assert_eq!(value, SqlType::Float(Some(1.5)));
 
         let (value, _) = convert_fixed(SQL_C_DOUBLE, SQL_DOUBLE, 0, 0, 1.5f64).unwrap();
         assert_eq!(value, SqlType::Float(Some(1.5)));
@@ -1411,6 +1438,21 @@ mod tests {
         // SQL_FLOAT and SQL_DOUBLE are one wire type.
         let (value, _) = convert_fixed(SQL_C_DOUBLE, SQL_FLOAT, 0, 0, -2.25f64).unwrap();
         assert_eq!(value, SqlType::Float(Some(-2.25)));
+    }
+
+    /// The `real` underflow rule keys off the source width, not the value: the
+    /// same magnitude that is `22003` from `SQL_C_DOUBLE`
+    /// (`a_double_outside_the_real_range_is_22003`) is sent unchanged from
+    /// `SQL_C_FLOAT`, where nothing narrows.
+    ///
+    /// Measured on retail 18.6.2.1: `SQL_C_FLOAT` -> `SQL_REAL` at `1e-40`
+    /// binds, executes, and the server reports `9.99995e-041`.
+    #[test]
+    fn a_float_sourced_subnormal_is_not_out_of_range() {
+        for v in [1e-40f32, -1e-40f32, f32::MIN_POSITIVE / 2.0] {
+            let (value, _) = convert_fixed(SQL_C_FLOAT, SQL_REAL, 0, 0, v).unwrap();
+            assert_eq!(value, SqlType::Real(Some(v)), "value {v:e}");
+        }
     }
 
     /// msodbcsql's `real` range check is symmetric - `sqlccnvt.cpp:5519` rejects
@@ -2193,6 +2235,29 @@ mod tests {
         }
     }
 
+    /// A payload past the wide ceiling cannot be sent as `sql_variant` by
+    /// anyone: measured on retail 18.6.2.1, 4000 wide characters execute and
+    /// 4001 fail with server error 8013 (`42000`, "invalid instance length"),
+    /// because `nvarchar(4000)` is already the variant's 8000-byte payload
+    /// limit.
+    ///
+    /// The clamp declares that ceiling, so the overflow is caught here as
+    /// `22001` at bind rather than by the server one call later. Both refuse;
+    /// only the diagnostic differs (AB#47800).
+    #[test]
+    fn a_variant_payload_past_the_wide_ceiling_is_truncation() {
+        let text = "x".repeat(SQL_PREC_NCHAR + 1);
+        let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut ind: SqlLen = SqlLen::try_from(bytes.len()).unwrap();
+        let mut p = param(SQL_C_WCHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 0;
+
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::StringTruncation);
+        assert_eq!(err.diag().state, *b"22001");
+    }
+
     /// Every newly bound row must produce a typed NULL from `ParameterType`
     /// alone, since a defaulted binding of these types is the common case and a
     /// NULL has no buffer to read.
@@ -2498,6 +2563,12 @@ mod tests {
             // from bind time to here.
             (SQL_C_CHAR, SQL_INTEGER),
             (SQL_C_WCHAR, SQL_BIGINT),
+            // Same move for the families this change adds. `xml` is the one
+            // most likely to be reached, streaming a large document being the
+            // ordinary reason to use DAE on it at all.
+            (SQL_C_WCHAR, SQL_SS_XML),
+            (SQL_C_CHAR, SQL_DECIMAL),
+            (SQL_C_WCHAR, SQL_SS_VARIANT),
         ] {
             let err = dae_placeholder_type(c_type, sql_type).unwrap_err();
             assert_eq!(

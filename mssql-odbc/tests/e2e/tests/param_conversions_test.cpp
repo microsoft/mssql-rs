@@ -1256,8 +1256,8 @@ TEST_F(ScalarConversionLiveTest, VariantWithNoColumnSizeIsNotAMaxType) {
 // application can act on.
 //
 // ColumnSize 0 means "unstated" here, and anything past the wide ceiling is
-// clamped to it. Measured on retail 18.6.2.1: every ColumnSize from 0 to 8000
-// executes, so msodbcsql never lands on a max inner type either.
+// clamped to it. Measured on retail 18.6.2.1 at representative sizes through
+// 100000: none lands on a max inner type.
 TEST_F(ScalarConversionLiveTest, AWideVariantIsNeverAMaxType) {
     for (SQLULEN size : {SQLULEN{0}, SQLULEN{3000}, SQLULEN{5000}, SQLULEN{8000}, SQLULEN{8001},
                          SQLULEN{100000}}) {
@@ -1267,6 +1267,30 @@ TEST_F(ScalarConversionLiveTest, AWideVariantIsNeverAMaxType) {
         SQLCloseCursor(stmt_);
         ResetParams();
     }
+}
+
+// A `real`-sized subnormal survives a round trip in both directions, because
+// neither end narrows: the source buffer is already the width of the target.
+// The same magnitude from SQL_C_DOUBLE is 22003
+// (`ADoubleOutsideTheRealRangeIs22003`), so the underflow rule keys off the
+// source width rather than the value.
+TEST_F(ScalarConversionLiveTest, ASubnormalSurvivesAFloatRoundTrip) {
+    const float kSubnormal = 1e-40f;
+    ASSERT_TRUE(kSubnormal != 0.0f && kSubnormal < (std::numeric_limits<float>::min)());
+
+    ASSERT_SQL_OK(Prepare("SELECT ?"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindFixed(SQL_C_FLOAT, SQL_REAL, kSubnormal), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    float got = 0.0f;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_FLOAT, &got, sizeof(got), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(got, kSubnormal);
+    EXPECT_EQ(ind, static_cast<SQLLEN>(sizeof(float)));
+    SQLCloseCursor(stmt_);
+    ResetParams();
 }
 
 // A defaulted binding of every scalar row must produce a typed NULL from

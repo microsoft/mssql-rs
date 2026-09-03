@@ -135,7 +135,7 @@ pub(crate) fn narrow_i128<T: TryFrom<i128>>(v: i128) -> Result<T, ConvError> {
     T::try_from(v).map_err(|_| ConvError::OutOfRange)
 }
 
-/// Narrows an `f64` to `real`, for either direction.
+/// Narrows a 64-bit source to `real`, for either direction.
 ///
 /// One function because msodbcsql has one arm: `SQL_C_FLOAT` and `SQL_REAL` are
 /// both `7`, so `case SQL_C_FLOAT` (`sqlccnvt.cpp:5519`) serves a `real`
@@ -152,11 +152,19 @@ pub(crate) fn narrow_i128<T: TryFrom<i128>>(v: i128) -> Result<T, ConvError> {
 /// So a non-zero magnitude *below* `f32::MIN_POSITIVE` is `22003` rather than a
 /// silent flush to zero - the half that is easy to miss.
 ///
+/// Only a genuine narrowing may reach here. A 32-bit source is already `real`,
+/// and retail 18.6.2.1 sends its subnormals in both directions rather than
+/// rejecting them, so `SQL_C_FLOAT` params take [`convert_real_sql`] and `real`
+/// columns are copied. Widening such a source to `f64` and arriving here would
+/// turn an exactly representable value into `22003`.
+///
 /// The comparisons are left to reproduce the C semantics on their own rather
 /// than being guarded by a finiteness check. `Temp` is a `DOUBLE`
 /// (`sqlccnvt.cpp:5327`) and `FLT_MAX` promotes to one, so `+INF > FLT_MAX`
 /// holds and an infinity is `22003`; a NaN compares false four times and
 /// passes. Zero passes on the `Temp > 0.0` / `Temp < 0.0` guards.
+///
+/// [`convert_real_sql`]: crate::conversion::param_convert
 pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
     let magnitude = v.abs();
     if magnitude > f64::from(f32::MAX) || (v != 0.0 && magnitude < f64::from(f32::MIN_POSITIVE)) {

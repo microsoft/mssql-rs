@@ -45,8 +45,11 @@ pub(crate) enum AppValue {
     Binary(Vec<u8>),
     /// `SQL_C_BIT`, already reduced to the two values `bit` can hold.
     Bit(bool),
-    /// `SQL_C_FLOAT` or `SQL_C_DOUBLE`. `SQL_C_FLOAT` widens losslessly, so one
-    /// variant serves both; a `real` target narrows back with a range check.
+    /// `SQL_C_FLOAT`, kept at its own width. Widening to [`AppValue::Double`]
+    /// would be lossless but would then face a `real` range check that only a
+    /// genuine 64-bit source should meet.
+    Float(f32),
+    /// `SQL_C_DOUBLE`. A `real` target narrows with a range check.
     Double(f64),
     /// `SQL_C_GUID`, in the `SQLGUID` field layout.
     Guid(SqlGuid),
@@ -173,9 +176,9 @@ pub(crate) unsafe fn read_param_value(
         SQL_C_BIT => Ok(AppValue::Bit(
             unsafe { (param.parameter_value_ptr as *const u8).read_unaligned() } != 0,
         )),
-        SQL_C_FLOAT => Ok(AppValue::Double(f64::from(unsafe {
+        SQL_C_FLOAT => Ok(AppValue::Float(unsafe {
             (param.parameter_value_ptr as *const f32).read_unaligned()
-        }))),
+        })),
         SQL_C_DOUBLE => Ok(AppValue::Double(unsafe {
             (param.parameter_value_ptr as *const f64).read_unaligned()
         })),
@@ -468,14 +471,15 @@ mod tests {
         }
     }
 
-    /// `SQL_C_FLOAT` widens to the same `Double` variant, which must be lossless
-    /// - a `real` target narrows back with its own range check.
+    /// Each float C type keeps its own width. Widening `SQL_C_FLOAT` here would
+    /// be lossless but would hand a `real` target a value it then range-checks
+    /// as though something had narrowed.
     #[test]
-    fn both_float_c_types_read_into_one_variant() {
+    fn each_float_c_type_keeps_its_width() {
         let mut ind: SqlLen = 0;
         let mut f: f32 = -2.25;
         let p = param(SQL_C_FLOAT, (&mut f as *mut f32).cast(), &mut ind);
-        assert_eq!(read(&p).unwrap(), Some(AppValue::Double(-2.25)));
+        assert_eq!(read(&p).unwrap(), Some(AppValue::Float(-2.25)));
 
         let mut d: f64 = 1.5;
         let p = param(SQL_C_DOUBLE, (&mut d as *mut f64).cast(), &mut ind);

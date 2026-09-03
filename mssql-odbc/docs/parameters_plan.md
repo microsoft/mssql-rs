@@ -662,6 +662,7 @@ Rules read from msodbcsql source, not derived:
 | Time components are bounded separately, with no leap-second allowance | `ValidateTimeStruct`, `:8844` | 60 seconds is `22007` |
 | A timezone offset's components must agree in sign; minutes <= 59, total <= +/-14:00 | `IsValidTimezoneOffsetValue`, `dataconv.cpp:118` | `+5h -30m` is rejected despite totalling a legal +04:30 |
 | The `real` range check is symmetric | `sqlccnvt.cpp:5519` | A non-zero magnitude *below* `FLT_MIN` is `22003`, not just one above `FLT_MAX`. An infinity is too: `Temp` is a `DOUBLE` (`:5327`), so `+INF > FLT_MAX` holds before the narrowing cast |
+| That check applies to a 64-bit source only | measured, retail 18.6.2.1 | `SQL_C_DOUBLE` -> `SQL_REAL` at `1e-40` is `22003`, but `SQL_C_FLOAT` -> `SQL_REAL` at the same magnitude binds, executes and arrives as `9.99995e-41`. Nothing narrows when the source is already `real`, so the rule keys off the source width, not the value |
 | `SQL_C_BIT` is read as one `SCHAR` and widened like a tinyint | `sqlccnvt.cpp:5057` | Any non-zero byte reaches `bit` as 1; no value is rejected |
 | A fraction past the declared scale follows the character rule - dropped when zero, `22001` when not | `sqlccnvt.cpp:7823`, rewritten inbound at `sqlcfunc.cpp:3348` | `"1.50"` into `decimal(5,1)` converts; `"1.55"` does not |
 | A dropped *datetime* fraction is `22008`, not the `22001` the character rule uses | measured, retail 18.6.2.1; `sqlcfunc.cpp:3128` | `time`, `datetime2` and `datetimeoffset` alike. `:3128` is unconditional and its `switch (fSqlType)` case list covers every temporal type; the guard at `:3131` then jumps to `ErrorRet`, so the C-type-gated rewrite at `:3350` is not reached this way. Whether any route reaches `:3350` with a temporal `fSqlType` is not established |
@@ -669,7 +670,12 @@ Rules read from msodbcsql source, not derived:
 
 `SQL_C_FLOAT` and `SQL_REAL` are both `7`, so that `real` arm serves the
 parameter direction too - the same identifier collision that makes
-`parse_numeric_text` shared between directions.
+`parse_numeric_text` shared between directions. It is the *narrowing* that is
+shared, not the arm: a `SQL_C_FLOAT` parameter and a `real` column into a
+`SQL_C_FLOAT` buffer are identity pairings and are carried across at their own
+width, so `AppValue` keeps `Float` and `Double` apart rather than widening both
+to `f64` and range-checking on the way back.
+`ASubnormalSurvivesAFloatRoundTrip` covers both ends on both legs.
 
 The decimal rescale is done here rather than delegated to
 `DecimalParts::from_string`, which rejects any input scale past the target,
@@ -682,10 +688,17 @@ Two behaviours are ours to justify rather than copy:
   `sql_variant` cannot hold a `max` type at all (server error 529), so the
   spelling that means `max` everywhere else declares at the target's own
   non-`max` ceiling, and a `ColumnSize` past that ceiling is clamped to it
-  rather than falling through to `max`. Measured on retail 18.6.2.1: a wide
-  variant binding executes under every `ColumnSize` from 0 to 8000, so
-  msodbcsql never lands on a `max` inner type either.
+  rather than falling through to `max`. Measured on retail 18.6.2.1 at
+  representative sizes through 100000: a wide variant binding never lands on
+  a `max` inner type.
   `AWideVariantIsNeverAMaxType` runs on both legs.
+  Above that ceiling neither driver can send the value, so the clamp costs no
+  reach: measured on retail 18.6.2.1, 4000 wide characters execute and 4001
+  fail with server error 8013 (`42000`, "invalid instance length"), because
+  `nvarchar(4000)` is already the variant's 8000-byte payload limit. Declaring
+  the ceiling turns that into `22001` at bind here rather than a server error
+  one call later - both refuse, only the diagnostic differs
+  (`a_variant_payload_past_the_wide_ceiling_is_truncation`).
   A **narrow** payload cannot reach the wire at all yet, because `mssql-tds`
   hard-codes the variant's inner context to `NVARCHAR` and
   sizes it as UTF-16, so five UTF-8 bytes are rejected as exceeding a schema
