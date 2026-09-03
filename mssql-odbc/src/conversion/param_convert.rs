@@ -327,9 +327,22 @@ pub(crate) fn dae_length_limit(
     };
 
     // Only a pairing whose buffer unit *is* the declaration's unit can be
-    // measured here. A narrow buffer against a wide declaration (or the
-    // reverse) counts different things on each side, so it is left to
-    // `convert_character_sql`, which measures both in UTF-16 units.
+    // measured here: a narrow buffer against a wide declaration (or the
+    // reverse) counts different things on each side.
+    //
+    // What happens to an unmeasurable bound depends on how the value travels.
+    // A *buffered* parameter is converted whole at close, so `ColumnSize` is
+    // still applied there by `convert_character_sql`, which measures both sides
+    // in UTF-16 units. A *streamed* one never reaches that conversion, so
+    // returning `None` here leaves it genuinely unbounded -- which is why
+    // `build_named_params` declines to narrow its declaration in that case
+    // rather than promising a bound nothing enforces.
+    //
+    // msodbcsql does bound this pairing: `ValidatePutDataLength`'s `SQL_C_WCHAR`
+    // arm (`odbc/sqlccmd.cpp:10931`) converts the chunk to the server code page
+    // precisely so it can measure the narrow length, and only `fIsVarMax`
+    // disables the check. Matching that needs the encoded length at this layer;
+    // tracked under AB#47590.
     let same_unit = match c_type {
         SQL_C_BINARY => sql_family(sql_type) == Some(SqlFamily::Binary),
         SQL_C_WCHAR => is_wide_character_sql_type(sql_type),
@@ -1834,6 +1847,55 @@ mod tests {
         assert_eq!(second, 0, "the continuation is already paid for");
         // One unit consumed in total, so a second character still fits.
         assert_eq!(limit.fit(b"z", first + second).unwrap().1, 1);
+    }
+
+    /// The pairings `park_dae_client` leaves without a transcode, so
+    /// `SQLPutData` forwards their chunks borrowed instead of copying each one
+    /// through a conversion that returns them unchanged. Binary is the case
+    /// that matters most: streaming a large `varbinary(max)` is the canonical
+    /// reason to use data-at-execution at all, and it never needs conversion.
+    #[test]
+    fn a_passthrough_pairing_needs_no_transcode() {
+        let collation = SqlCollation::default();
+        for (c_type, sql_type) in [
+            (SQL_C_BINARY, SQL_VARBINARY),
+            (SQL_C_BINARY, SQL_LONGVARBINARY),
+            (SQL_C_WCHAR, SQL_WVARCHAR),
+        ] {
+            assert!(
+                DaeTranscode::new(c_type, sql_type, collation).is_passthrough(),
+                "{c_type} -> {sql_type} is already the wire's bytes"
+            );
+        }
+
+        // A wideness mismatch does convert, so it keeps its transcode.
+        assert!(
+            !DaeTranscode::new(SQL_C_WCHAR, SQL_VARCHAR, collation).is_passthrough(),
+            "a wide buffer against a narrow target has to be re-encoded"
+        );
+    }
+
+    /// A wideness-mismatched pairing cannot be measured in the buffer's own
+    /// unit, so no bound is produced. Pinned because the streamed path has no
+    /// close-time conversion to fall back on: `build_named_params` reads this
+    /// `None` as the signal to leave the declaration at `max` rather than
+    /// narrowing it to a length nothing would enforce.
+    #[test]
+    fn dae_length_limit_is_absent_for_a_wideness_mismatch() {
+        for (c_type, sql_type) in [
+            (SQL_C_WCHAR, SQL_VARCHAR),
+            (SQL_C_WCHAR, SQL_CHAR),
+            (SQL_C_WCHAR, SQL_LONGVARCHAR),
+            (SQL_C_CHAR, SQL_WVARCHAR),
+            (SQL_C_CHAR, SQL_WCHAR),
+            (SQL_C_CHAR, SQL_WLONGVARCHAR),
+        ] {
+            assert_eq!(
+                dae_length_limit(c_type, sql_type, 10).unwrap(),
+                None,
+                "{c_type} -> {sql_type} counts different units on each side"
+            );
+        }
     }
 
     /// Once the budget is spent every later chunk must be padding, and the

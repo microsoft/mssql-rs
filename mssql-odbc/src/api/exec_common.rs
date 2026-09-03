@@ -102,11 +102,17 @@ pub(super) fn park_dae_client(
     let collation = client.get_collation();
     for param in &mut dae_params {
         if !param.plan.is_buffered() {
-            param.transcode = Some(DaeTranscode::new(
-                param.binding.c_type,
-                param.binding.sql_type,
-                collation,
-            ));
+            let transcode =
+                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+            // A pairing whose buffer bytes already are the wire's bytes keeps
+            // `None`, so `SQLPutData` forwards its chunks borrowed instead of
+            // copying each one through a conversion that would return them
+            // unchanged. Skipping the transcode also skips the close-time
+            // flush, which is right: a passthrough parameter never holds back a
+            // partial character to carry.
+            if !transcode.is_passthrough() {
+                param.transcode = Some(transcode);
+            }
         }
     }
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -678,7 +684,21 @@ pub(super) unsafe fn build_named_params(
                     // The body is PLP whatever `ColumnSize` says, but the
                     // variable it lands in is declared from `ParameterType`,
                     // matching the materialized path and msodbcsql (AB#47590).
-                    match dae_streamed_declaration(bound_param.sql_type, bound_param.column_size) {
+                    //
+                    // Only narrowed when the bound above can actually be
+                    // enforced. A streamed parameter never reaches a close-time
+                    // conversion, so an unenforced bound would have the client
+                    // declare `varchar(n)` and then stream past it, leaving the
+                    // overflow to the server instead of the `22001` the
+                    // declaration implies. Staying `max` keeps the value intact
+                    // until the bound is measurable on this path too
+                    // (AB#47590).
+                    let declaration = if length_limit.is_some() {
+                        dae_streamed_declaration(bound_param.sql_type, bound_param.column_size)
+                    } else {
+                        Ok(None)
+                    };
+                    match declaration {
                         Ok(Some(declaration)) => param.with_streamed_declaration(declaration),
                         Ok(None) => param,
                         Err(e) => {
@@ -1717,6 +1737,59 @@ mod tests {
         assert_eq!(dae.dae_params.len(), 1);
         assert_eq!(dae.dae_params[0].bound_index, 0);
         assert_eq!(dae.dae_params[0].expected_len, Some(7));
+    }
+
+    /// A streamed parameter is only declared at a narrowed length when the
+    /// bound that length implies is one `SQLPutData` can actually enforce.
+    ///
+    /// The two decisions are made independently, and for a wideness-mismatched
+    /// pairing they disagree: `dae_length_limit` cannot measure a wide buffer
+    /// against a narrow declaration, while `dae_streamed_declaration` would
+    /// happily narrow it. Narrowing there would have the client declare
+    /// `varchar(10)` and then stream past it -- a bound promised to the server
+    /// and kept by nobody, since a streamed value never reaches the close-time
+    /// conversion that bounds a buffered one.
+    #[test]
+    fn build_named_params_only_narrows_a_declaration_it_can_enforce() {
+        for (c_type, sql_type, expect_narrowed) in [
+            // Same unit on both sides: measurable, so narrowing is honoured.
+            (SQL_C_CHAR, SQL_VARCHAR, true),
+            // Wide buffer, narrow declaration: not measurable, so `max` stands.
+            (crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR, false),
+            // And the mirror image.
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_WVARCHAR, false),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+            let mut state = stmt.inner.lock().unwrap();
+            state.bound_params.push(Some(BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type,
+                sql_type,
+                column_size: 10,
+                decimal_digits: 0,
+                parameter_value_ptr: std::ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+                octet_length_ptr: &mut ind as *mut SqlLen,
+            }));
+
+            let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+            let bounded = dae.dae_params[0].length_limit.is_some();
+            assert_eq!(
+                bounded, expect_narrowed,
+                "{c_type} -> {sql_type}: the bound decides whether narrowing is honest"
+            );
+            // The declaration is only narrowed when the bound backs it, so the
+            // two travel together rather than being decided apart.
+            let narrowed = format!("{:?}", dae.params[0]).contains("streamed_declaration: Some");
+            assert_eq!(
+                narrowed, expect_narrowed,
+                "{c_type} -> {sql_type}: declaration narrowing must follow the bound"
+            );
+        }
     }
 
     /// Without an indicator pointer there is nothing to carry a
