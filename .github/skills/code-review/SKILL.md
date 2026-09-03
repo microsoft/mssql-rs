@@ -365,24 +365,46 @@ Report when:
 - A step cost time without changing the outcome, or you raised a class of finding that
   a lint, test, or CI check could have caught before review.
 
-File each one separately, with the evidence rather than a conclusion:
+File each one separately, with the evidence rather than a conclusion. Interactively, use
+the form so it prompts you for the fields:
+
+<https://github.com/microsoft/mssql-rs/issues/new?template=code_review_skill_drift.yml>
+
+`gh issue create` does not apply the form, so write the body yourself with the same
+headings. An issue missing them is a note, not something a later pass can promote:
+
+```markdown
+### Drift class
+wrong finding | missed defect | stale fact | wasted step | mechanizable
+### Where it happened
+<PR, review thread, or comment URL>
+### What the skill says today
+<quote the bullet, or state that nothing covers this>
+### What actually turned out to be true
+<the observation, in the terms a future reviewer would need>
+### Evidence
+<file:line, the command and its output, or the thread where it was settled>
+### What it cost
+retracted blocking finding | retracted lesser finding | defect reached main |
+review time only | nothing yet
+```
 
 ```bash
 gh issue create --repo microsoft/mssql-rs --label skill:code-review \
-  --title "[review-skill] <one-line drift>"
+  --title "[review-skill] <one-line drift>" --body-file <path>
 ```
 
-The `Code Review Skill Drift` issue form prompts for the same fields. These issues are
-the queue a periodic maintenance pass reads, so one that isn't acted on immediately is
-still doing its job. The bar is whether a future review would repeat the mistake — a
-one-off you could not have anticipated is not drift. Search the label before filing;
-recurrence belongs on the existing issue, where it is the evidence that promotes it:
+Search the label before filing; recurrence belongs on the existing issue, where it is the
+evidence that promotes it:
 
 ```bash
 gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --search "<symbol>"
 ```
 
-Unattended runs file these too — it is the one write worth making when no human is
+These issues are the queue a periodic maintenance pass reads, so one that isn't acted on
+immediately is still doing its job. The bar is whether a future review would repeat the
+mistake — a one-off you could not have anticipated is not drift. Unattended runs file
+these too, with the same body; it is the one write worth making when no human is
 watching, since nothing else preserves the observation.
 
 ## Principles
