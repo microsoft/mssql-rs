@@ -87,12 +87,16 @@ pub(crate) fn process_is_shutting_down() -> bool {
 /// How `SharedRuntime` lets go of its runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleasePolicy {
-    /// Signal the scheduler to stop and return without joining. The worker
-    /// threads wind themselves down, so nothing accumulates.
-    Detach,
+    /// Drop the runtime normally, waiting for its worker and blocking-pool
+    /// threads to exit before returning. Required whenever the process is
+    /// alive: `SQLFreeHandle(SQL_HANDLE_ENV)` returning is the host's signal
+    /// that it may unload `mssqlodbc.dll`, and a runtime thread still running
+    /// Tokio, mio, or driver code from this module when it does is a
+    /// use-after-unload (AB#47831).
+    Join,
     /// Signal nothing at all and leak the runtime. The only safe option once
-    /// the loader has terminated the threads the scheduler would synchronize
-    /// with; the OS reclaims them moments later.
+    /// the loader has terminated the threads a join would wait on; the OS
+    /// reclaims them moments later.
     Leak,
 }
 
@@ -103,47 +107,52 @@ fn release_policy(process_is_shutting_down: bool) -> ReleasePolicy {
     if process_is_shutting_down {
         ReleasePolicy::Leak
     } else {
-        ReleasePolicy::Detach
+        ReleasePolicy::Join
     }
 }
 
 fn release(runtime: Runtime, policy: ReleasePolicy) {
     match policy {
-        ReleasePolicy::Detach => runtime.shutdown_background(),
+        ReleasePolicy::Join => drop(runtime),
         ReleasePolicy::Leak => std::mem::forget(runtime),
     }
 }
 
-/// A Tokio runtime that never synchronizes with its worker threads when it
-/// goes away.
+/// A Tokio runtime whose teardown is chosen by whether the process is still
+/// alive, because the two states have opposite requirements.
 ///
-/// `SQLFreeHandle(SQL_HANDLE_ENV)` can run long after the OS has already
-/// force-terminated background threads — e.g. a caller that loads this driver
-/// directly instead of through the ODBC Driver Manager may defer the free to a
-/// C++ static destructor that only runs at `DLL_PROCESS_DETACH`, by which point
-/// Windows has already killed every thread but the one tearing the process
-/// down (AB#47509). The default `Runtime` drop unconditionally joins its worker
-/// thread, which panics ("threads should not terminate unexpectedly") if that
-/// thread no longer exists.
+/// **Process alive — [`ReleasePolicy::Join`], the default `Runtime` drop.**
+/// Returning from `SQLFreeHandle(SQL_HANDLE_ENV)` tells the host it may unload
+/// `mssqlodbc.dll`. Any runtime thread still executing Tokio, mio, or driver
+/// code statically linked into this module at that point is running code that
+/// is about to be unmapped. [`#459`] released the runtime with
+/// `shutdown_background()`, which signals the scheduler and returns without
+/// waiting, and that produced an intermittent `STATUS_STACK_BUFFER_OVERRUN`
+/// while mio's IOCP completion buffer was being destroyed — roughly one crash
+/// per 45 runs of a single e2e binary (AB#47831). DLL/thread lifetime is the
+/// leading hypothesis for that fault rather than an established mechanism; the
+/// captured stack proves only where it lands, not why. Either way, waiting for
+/// the threads is what makes the unload safe, so the join is not optional.
 ///
-/// `shutdown_background` is not sufficient (AB#47510). It skips the *join*, but
-/// it still signals the scheduler and takes its locks — locks a terminated
-/// worker may have been holding at the instruction the OS stopped it on. The
-/// result is a process that hangs on the way out instead of panicking, which is
-/// the worse failure: it strands the host after its last statement already
-/// succeeded, and it does so on the main-thread teardown path that previously
-/// only printed the panic and exited. So once the loader reports the process is
-/// already going away, [`ReleasePolicy::Leak`] signals nothing at all.
-///
-/// Outside that window [`ReleasePolicy::Detach`] runs, so an application that
-/// allocates and frees environments in a loop does not accumulate threads.
+/// **Process shutting down — [`ReleasePolicy::Leak`].** `SQLFreeHandle` can
+/// also run long after Windows has force-terminated every thread but the one
+/// calling `ExitProcess`: a host that defers the free to a C++ static
+/// destructor or a CRT `onexit` handler reaches it from `DLL_PROCESS_DETACH`
+/// inside `LdrShutdownProcess`. Joining there panics with "threads should not
+/// terminate unexpectedly" (AB#47509), and `shutdown_background()` is no better
+/// — it still takes the scheduler's locks, which a worker terminated
+/// mid-instruction may have been holding, hanging the process instead
+/// (AB#47510). Nothing may be signalled or waited on, so the runtime is leaked
+/// and the OS reclaims its threads moments later. The unload hazard above does
+/// not apply: the process is not going to run any more of this module's code.
 ///
 /// This lives on the shared value rather than on `EnvHandle` so the guarantee
 /// holds for whichever owner happens to release the last reference. A DBC that
 /// outlives its ENV — which a non-conformant caller can produce, since
 /// `SQLFreeHandle(ENV)` only `debug_assert!`s that the connection list is empty
-/// — would otherwise drop the runtime through the default joining path, which
-/// is exactly the teardown this exists to avoid.
+/// — would otherwise pick the policy for neither state.
+///
+/// [`#459`]: https://github.com/microsoft/mssql-rs/pull/459
 #[derive(Debug)]
 pub(crate) struct SharedRuntime(ManuallyDrop<Runtime>);
 
@@ -165,9 +174,8 @@ impl Drop for SharedRuntime {
     fn drop(&mut self) {
         // SAFETY: `drop` runs at most once and nothing reads `self.0` after
         // this, so taking ownership out of the `ManuallyDrop` is sound. Taking
-        // it by value is what lets `release` either forget the `Runtime` or
-        // call `shutdown_background`, both of which consume it; the default
-        // drop glue would join instead.
+        // it by value is what lets `release` choose between dropping the
+        // `Runtime` and forgetting it; the default drop glue would always join.
         let runtime = unsafe { ManuallyDrop::take(&mut self.0) };
         release(runtime, release_policy(process_is_shutting_down()));
     }
@@ -249,104 +257,133 @@ impl HasObjectType for EnvHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::*;
 
-    const PARK: Duration = Duration::from_secs(5);
+    const SETTLE: Duration = Duration::from_secs(5);
+    /// Long enough that a release which does not wait will observably return
+    /// while the task is still running, short enough not to stall the suite.
+    const WORK: Duration = Duration::from_millis(300);
 
-    /// Parks a blocking task on `runtime` and returns once it is confirmed
-    /// running, so a later drop has in-flight blocking work to contend with.
-    fn park_blocking_task(runtime: &SharedRuntime) {
+    /// Parks a blocking task that flips `finished` on its way out, and returns
+    /// once the task is confirmed running so a later release has genuine
+    /// in-flight blocking work to wait for.
+    fn park_blocking_task(runtime: &Runtime, finished: Arc<AtomicBool>) {
         let (started_tx, started_rx) = mpsc::channel();
         runtime.spawn_blocking(move || {
             let _ = started_tx.send(());
-            thread::sleep(PARK);
+            thread::sleep(WORK);
+            finished.store(true, Ordering::SeqCst);
         });
         started_rx
-            .recv_timeout(PARK)
+            .recv_timeout(SETTLE)
             .expect("blocking task should have started");
     }
 
-    fn assert_released_promptly(what: &str, release: impl FnOnce()) {
-        let start = Instant::now();
-        release();
-        let elapsed = start.elapsed();
+    /// The regression guard for AB#47831. Returning from `SQLFreeHandle(ENV)`
+    /// is the host's cue that it may unload the DLL, so a live-process release
+    /// must not return while a runtime thread is still executing code from this
+    /// module. `shutdown_background` — the [#459] behaviour this replaces —
+    /// signals and returns immediately, so it fails this test: the flag is
+    /// still false when the release returns.
+    ///
+    /// [#459]: https://github.com/microsoft/mssql-rs/pull/459
+    #[test]
+    fn the_join_policy_waits_for_blocking_work_to_finish() {
+        let runtime = new_runtime().expect("failed to build runtime for test");
+        let finished = Arc::new(AtomicBool::new(false));
+        park_blocking_task(&runtime, Arc::clone(&finished));
+
+        release(runtime, ReleasePolicy::Join);
+
         assert!(
-            elapsed < PARK / 2,
-            "{what} blocked for {elapsed:?} waiting on the runtime's blocking work; \
-             shutdown must detach via shutdown_background, not join"
+            finished.load(Ordering::SeqCst),
+            "Join returned while a blocking task was still running; the host may \
+             unload this DLL as soon as SQLFreeHandle(ENV) returns (AB#47831)"
         );
     }
 
-    /// Guards against reintroducing a blocking join. The default `Runtime` drop
-    /// waits out in-flight blocking work; `shutdown_background` detaches from
-    /// it. An idle runtime joins its idle worker promptly under either one, so
-    /// these park a blocking task to tell the two apart. The
-    /// OS-already-killed-the-thread case that actually panicked (AB#47509)
-    /// needs real process/DLL teardown and isn't reproducible from a unit test.
+    /// The same guarantee through the real teardown path, so the policy cannot
+    /// be right while `Drop` fails to reach it.
     #[test]
-    fn dropping_env_handle_does_not_wait_for_blocking_work() {
+    fn dropping_env_handle_waits_for_blocking_work_to_finish() {
         let env = EnvHandle::new().expect("failed to create EnvHandle for test");
-        park_blocking_task(&env.runtime);
+        let finished = Arc::new(AtomicBool::new(false));
+        park_blocking_task(&env.runtime, Arc::clone(&finished));
 
-        assert_released_promptly("dropping EnvHandle", || drop(env));
+        drop(env);
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "dropping EnvHandle returned while a blocking task was still running"
+        );
     }
 
     /// The ENV is not always the last owner: `SQLFreeHandle(ENV)` only
     /// `debug_assert!`s that the connection list is empty, so a non-conformant
-    /// caller can free the ENV while a DBC still holds a runtime reference.
-    /// Shutdown must still detach when that straggler releases the last one.
+    /// caller can free the ENV while a DBC still holds a runtime reference. The
+    /// wait has to happen whenever the *last* reference goes, not whenever the
+    /// ENV does.
     #[test]
-    fn dropping_a_dbc_that_outlived_its_env_does_not_wait_for_blocking_work() {
+    fn dropping_a_dbc_that_outlived_its_env_waits_for_blocking_work_to_finish() {
         let env = EnvHandle::new().expect("failed to create EnvHandle for test");
         let dbc_runtime = Arc::clone(&env.runtime);
-        park_blocking_task(&env.runtime);
+        let finished = Arc::new(AtomicBool::new(false));
+        park_blocking_task(&env.runtime, Arc::clone(&finished));
 
         drop(env);
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "dropping the ENV must not have released the runtime; the DBC still holds a reference"
+        );
 
-        assert_released_promptly("dropping the last DBC runtime reference", || {
-            drop(dbc_runtime)
-        });
+        drop(dbc_runtime);
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "dropping the last DBC runtime reference returned while a blocking task was running"
+        );
     }
 
     /// The mapping `Drop` relies on. Guards the condition itself: dropping it
-    /// and always returning `Detach` restores the AB#47510 hang, and this is
-    /// the only test that can see that, since a live test process never
-    /// observes the loader flag as true.
+    /// and always returning `Join` restores the AB#47510 hang, and this is the
+    /// only test that can see that, since a live test process never observes
+    /// the loader flag as true.
     #[test]
     fn only_a_shutting_down_process_selects_the_leak_policy() {
         assert_eq!(release_policy(true), ReleasePolicy::Leak);
-        assert_eq!(release_policy(false), ReleasePolicy::Detach);
+        assert_eq!(release_policy(false), ReleasePolicy::Join);
     }
 
     /// The flag feeding the mapping above reads false while the process is
-    /// alive, so a normal `SQLFreeHandle(ENV)` really does take `Detach`.
+    /// alive, so a normal `SQLFreeHandle(ENV)` really does take `Join`.
     #[test]
     fn a_live_process_is_not_reported_as_shutting_down() {
         assert!(!process_is_shutting_down());
     }
 
     /// Runs a task on `handle` and reports whether its scheduler is still
-    /// executing work. A detached runtime stops polling, so the task never
+    /// executing work. A released runtime stops polling, so the task never
     /// runs and the receiver times out; a leaked one keeps its worker alive.
     fn scheduler_still_runs_tasks(handle: &tokio::runtime::Handle) -> bool {
         let (ran_tx, ran_rx) = mpsc::channel();
         handle.spawn(async move {
             let _ = ran_tx.send(());
         });
-        ran_rx.recv_timeout(PARK / 2).is_ok()
+        ran_rx.recv_timeout(SETTLE / 2).is_ok()
     }
 
     /// The regression guard for AB#47510. `Leak` exists so that nothing is
-    /// signalled once the loader has terminated the scheduler's threads, and
-    /// the only in-process evidence of "signalled nothing" is that the
-    /// scheduler is still running afterwards. Swapping this back to
-    /// `shutdown_background` — the #459 behaviour that still hung — flips it.
+    /// signalled or waited on once the loader has terminated the scheduler's
+    /// threads, and the only in-process evidence of "touched nothing" is that
+    /// the scheduler is still running afterwards. Swapping this to either
+    /// `Join` or `shutdown_background` flips it.
     #[test]
-    fn the_leak_policy_signals_nothing_and_leaves_the_runtime_running() {
+    fn the_leak_policy_touches_nothing_and_leaves_the_runtime_running() {
         let runtime = new_runtime().expect("failed to build runtime for test");
         let handle = runtime.handle().clone();
 
@@ -354,24 +391,8 @@ mod tests {
 
         assert!(
             scheduler_still_runs_tasks(&handle),
-            "Leak must not signal the scheduler; a shut-down runtime stops \
-             polling, which is exactly the teardown AB#47510 hangs on"
-        );
-    }
-
-    /// The other half of the pair: outside process shutdown the runtime really
-    /// is released, so an application that allocates and frees environments in
-    /// a loop does not accumulate live schedulers.
-    #[test]
-    fn the_detach_policy_stops_the_runtime() {
-        let runtime = new_runtime().expect("failed to build runtime for test");
-        let handle = runtime.handle().clone();
-
-        release(runtime, ReleasePolicy::Detach);
-
-        assert!(
-            !scheduler_still_runs_tasks(&handle),
-            "Detach must actually shut the runtime down, not leak it"
+            "Leak must not touch the scheduler; a released runtime stops polling, \
+             which is exactly the teardown AB#47510 hangs on"
         );
     }
 }
