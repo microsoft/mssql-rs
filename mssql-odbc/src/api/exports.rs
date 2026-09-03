@@ -445,6 +445,9 @@ pub unsafe extern "C" fn SQLFreeStmt(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `parameter_value_ptr` / `strlen_or_ind_ptr`, if non-null, must remain valid
 ///   and readable until the statement is executed.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, the readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLBindParameter(
@@ -532,8 +535,10 @@ pub unsafe extern "C" fn SQLDescribeParam(
 ///   If `text_length` is `SQL_NTS`, the string must be NUL-terminated.
 /// - Each non-data-at-execution parameter's currently bound value and length
 ///   buffers must remain readable according to its C type and declared lengths.
-/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR`, when set, must remain readable for one
-///   `SqlLen`.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, those readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range. The
+///   offset pointer itself must remain readable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecDirectW(
     statement_handle: SqlHandle,
@@ -564,8 +569,10 @@ pub unsafe extern "C" fn SQLGetTypeInfoW(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - Each non-data-at-execution parameter's currently bound value and length
 ///   buffers must remain readable according to its C type and declared lengths.
-/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR`, when set, must remain readable for one
-///   `SqlLen`.
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, those readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range. The
+///   offset pointer itself must remain readable for one `SqlLen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLExecute(statement_handle: SqlHandle) -> SqlReturn {
     crate::init_tracing();

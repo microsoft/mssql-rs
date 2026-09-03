@@ -26,6 +26,9 @@ use crate::params::conversion_matrix::is_supported_conversion;
 /// - `statement_handle` must be a valid `StmtHandle` allocated by `SQLAllocHandle`.
 /// - `parameter_value_ptr` / `strlen_or_ind_ptr`, if non-null, must remain valid
 ///   until the statement is executed (ODBC binds by reference).
+/// - When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, the readable extents
+///   begin at each bound base plus the pointed-to signed byte offset, which may
+///   be negative, so every allocation must cover that displaced range.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_bind_parameter(
     statement_handle: SqlHandle,
@@ -72,7 +75,10 @@ pub(crate) unsafe fn sql_bind_parameter(
 /// # Safety
 /// `statement_handle` must point to a live `StmtHandle`.
 /// `parameter_value_ptr` and `strlen_or_ind_ptr`, when non-null, must remain
-/// valid until the parameter is unbound or the statement is freed.
+/// valid until the parameter is unbound or the statement is freed. When
+/// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, the readable extents begin at
+/// each bound base plus the pointed-to signed byte offset, which may be
+/// negative, so every allocation must cover that displaced range.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_bind_parameter_impl(
     statement_handle: SqlHandle,

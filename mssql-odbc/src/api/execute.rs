@@ -34,8 +34,11 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 /// `statement_handle` must be a valid `StmtHandle` allocated by `SQLAllocHandle`.
 /// For each non-data-at-execution parameter, the currently bound value,
 /// indicator, and octet-length buffers must remain readable according to the
-/// bound C type and lengths. `SQL_ATTR_PARAM_BIND_OFFSET_PTR`, when set, must
-/// remain readable for one `SqlLen`.
+/// bound C type and lengths. When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null,
+/// these readable extents begin at each bound base plus the pointed-to signed
+/// byte offset, which may be negative, so every allocation must cover that
+/// displaced range. The offset pointer itself must remain readable for one
+/// `SqlLen`.
 pub(crate) unsafe fn sql_execute(statement_handle: SqlHandle) -> SqlReturn {
     debug!(?statement_handle, "SQLExecute called");
     crate::ffi_entry!("SQLExecute", unsafe { sql_execute_impl(statement_handle) })
@@ -45,8 +48,11 @@ pub(crate) unsafe fn sql_execute(statement_handle: SqlHandle) -> SqlReturn {
 /// `statement_handle` must be null or point to a live `StmtHandle`.
 /// For each non-data-at-execution parameter, the currently bound value,
 /// indicator, and octet-length buffers must remain readable according to the
-/// bound C type and lengths. `SQL_ATTR_PARAM_BIND_OFFSET_PTR`, when set, must
-/// remain readable for one `SqlLen`.
+/// bound C type and lengths. When `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null,
+/// these readable extents begin at each bound base plus the pointed-to signed
+/// byte offset, which may be negative, so every allocation must cover that
+/// displaced range. The offset pointer itself must remain readable for one
+/// `SqlLen`.
 unsafe fn sql_execute_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLExecute: statement_handle is null");
