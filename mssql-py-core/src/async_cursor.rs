@@ -23,7 +23,7 @@
 //! preserved.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use mssql_tds::connection::tds_client::TdsClient;
 use mssql_tds::error::Error;
@@ -36,7 +36,7 @@ use tracing::instrument::WithSubscriber;
 use crate::async_description::DescriptionState;
 use crate::async_errors::ProgrammingError;
 use crate::async_execute::{ExecuteResources, PreparedState, release_prepared_statements};
-use crate::async_fetch::FetchState;
+use crate::async_fetch::{BufferedResults, FetchState};
 use crate::async_session::{
     AsyncConnectionState, ClaimError, CursorCloseClaim, CursorId, SessionOperationGuard,
 };
@@ -179,6 +179,8 @@ pub struct PyAsyncCursor {
     closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
     description_state: Arc<DescriptionState>,
+    rowcount: Arc<AtomicI64>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 impl PyAsyncCursor {
@@ -209,6 +211,8 @@ impl PyAsyncCursor {
             closed: Arc::new(AtomicBool::new(false)),
             fetch_state: Arc::new(FetchState::new()),
             description_state: Arc::new(DescriptionState::new()),
+            rowcount: Arc::new(AtomicI64::new(-1)),
+            buffered_results: Arc::new(BufferedResults::default()),
         }
     }
 
@@ -234,6 +238,8 @@ impl PyAsyncCursor {
             self.cursor_id,
             self.fetch_state.clone(),
             self.description_state.clone(),
+            self.buffered_results.clone(),
+            self.rowcount.clone(),
         ))
     }
 
@@ -254,6 +260,8 @@ impl PyAsyncCursor {
             self.cleanup_required.clone(),
             self.fetch_state.clone(),
             self.description_state.clone(),
+            self.rowcount.clone(),
+            self.buffered_results.clone(),
         ))
     }
 
@@ -390,6 +398,12 @@ impl PyAsyncCursor {
         self.description_state.get(py)
     }
 
+    /// Number of rows affected by the most recent operation, or `-1` when unknown.
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rowcount.load(Ordering::Acquire)
+    }
+
     /// Number of rows requested by `fetchmany()` when no size is supplied.
     #[getter]
     fn arraysize(&self) -> isize {
@@ -425,6 +439,28 @@ impl PyAsyncCursor {
         reset_cursor: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         crate::async_execute::execute(slf, py, operation, parameters, use_prepare, reset_cursor)
+    }
+
+    /// Execute T-SQL once for each parameter row and return this cursor.
+    ///
+    /// Rows execute sequentially after the complete input iterable is validated.
+    /// Positional rows use `?`; mapping rows use `%(name)s`. A SQL error stops
+    /// execution and reports its zero-based parameter-row index. Earlier rows may
+    /// already be committed when autocommit is enabled; an explicit transaction
+    /// remains open for the caller to commit or roll back.
+    ///
+    /// DML row counts are aggregated. Row-producing results set `rowcount` to
+    /// `-1`, are buffered, and retain their boundaries for `fetch*()` and
+    /// `nextset()`. The query timeout applies separately to each execution.
+    #[pyo3(signature = (operation, seq_of_parameters, *, use_prepare=true))]
+    fn executemany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        operation: String,
+        seq_of_parameters: &Bound<'_, PyAny>,
+        use_prepare: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::async_execute::executemany(slf, py, operation, seq_of_parameters, use_prepare)
     }
 
     /// Fetch the next row and return an awaitable resolving to a tuple or `None`.

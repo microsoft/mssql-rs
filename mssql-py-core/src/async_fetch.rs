@@ -3,8 +3,10 @@
 
 //! Asynchronous row fetching for [`crate::async_cursor::PyAsyncCursor`].
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Instant;
 
 use mssql_tds::connection::tds_client::StatementResult;
@@ -65,6 +67,48 @@ impl FetchState {
     }
 }
 
+pub(crate) struct BufferedRowSet {
+    pub(crate) metadata: Vec<mssql_tds::query::metadata::ColumnMetadata>,
+    pub(crate) rows: VecDeque<PyRowWriter>,
+}
+
+#[derive(Default)]
+pub(crate) struct BufferedResults(StdMutex<VecDeque<BufferedRowSet>>);
+
+impl BufferedResults {
+    pub(crate) fn replace(&self, results: VecDeque<BufferedRowSet>) -> VecDeque<BufferedRowSet> {
+        std::mem::replace(&mut *self.lock(), results)
+    }
+
+    pub(crate) fn has_current(&self) -> bool {
+        !self.lock().is_empty()
+    }
+
+    fn has_next(&self) -> bool {
+        self.lock().len() > 1
+    }
+
+    fn take_rows(&self, limit: usize) -> Option<(Vec<PyRowWriter>, bool, bool)> {
+        let mut results = self.lock();
+        let current = results.front_mut()?;
+        let count = limit.min(current.rows.len());
+        let rows = current.rows.drain(..count).collect();
+        let exhausted = current.rows.is_empty();
+        let has_next = results.len() > 1;
+        Some((rows, exhausted, has_next))
+    }
+
+    fn advance(&self) -> Option<Vec<mssql_tds::query::metadata::ColumnMetadata>> {
+        let mut results = self.lock();
+        results.pop_front();
+        results.front().map(|result| result.metadata.clone())
+    }
+
+    fn lock(&self) -> StdMutexGuard<'_, VecDeque<BufferedRowSet>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
 /// Python-independent resources captured before constructing a fetch future.
 pub(crate) struct FetchResources {
     client: Arc<Mutex<TdsClient>>,
@@ -73,9 +117,12 @@ pub(crate) struct FetchResources {
     cursor_id: CursorId,
     fetch_state: Arc<FetchState>,
     description_state: Arc<DescriptionState>,
+    buffered_results: Arc<BufferedResults>,
+    rowcount: Arc<AtomicI64>,
 }
 
 impl FetchResources {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client: Arc<Mutex<TdsClient>>,
         dispatch: Option<tracing::Dispatch>,
@@ -83,6 +130,8 @@ impl FetchResources {
         cursor_id: CursorId,
         fetch_state: Arc<FetchState>,
         description_state: Arc<DescriptionState>,
+        buffered_results: Arc<BufferedResults>,
+        rowcount: Arc<AtomicI64>,
     ) -> Self {
         Self {
             client,
@@ -91,6 +140,8 @@ impl FetchResources {
             cursor_id,
             fetch_state,
             description_state,
+            buffered_results,
+            rowcount,
         }
     }
 }
@@ -331,7 +382,23 @@ fn fetch<'py>(
         cursor_id,
         fetch_state,
         description_state: _,
+        buffered_results,
+        rowcount: _,
     } = resources;
+    if buffered_results.has_current() {
+        return fetch_buffered(
+            cursor,
+            py,
+            dispatch,
+            session_state,
+            cursor_id,
+            fetch_state,
+            buffered_results,
+            limit,
+            output,
+            operation,
+        );
+    }
     if matches!(
         fetch_state.status(),
         FetchStatus::NoResultSet | FetchStatus::TerminalNoRows
@@ -456,6 +523,72 @@ fn fetch<'py>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fetch_buffered<'py>(
+    cursor: Py<PyAsyncCursor>,
+    py: Python<'py>,
+    dispatch: Option<tracing::Dispatch>,
+    session_state: Arc<AsyncConnectionState>,
+    cursor_id: CursorId,
+    fetch_state: Arc<FetchState>,
+    buffered_results: Arc<BufferedResults>,
+    limit: usize,
+    output: FetchOutput,
+    operation: &'static str,
+) -> PyResult<Bound<'py, PyAny>> {
+    if fetch_state.status() == FetchStatus::Exhausted {
+        session_state.ensure_open().map_err(map_claim_error)?;
+        return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Python::attach(|py| output.empty(py))
+        });
+    }
+    let claim = session_state
+        .claim_fetch(cursor_id)
+        .map_err(map_claim_error)?;
+    let operation_id = claim.operation_id;
+    let future_state = session_state.clone();
+    let guard_dispatch = dispatch.clone();
+
+    let future = async move {
+        let started = Instant::now();
+        let _cursor = cursor;
+        let mut fetch_guard =
+            FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
+        let (rows, exhausted, has_next) = buffered_results
+            .take_rows(limit)
+            .expect("buffered fetch requires a current result set");
+        fetch_state.set(if exhausted {
+            FetchStatus::Exhausted
+        } else {
+            FetchStatus::Ready
+        });
+        fetch_guard.complete(exhausted, !exhausted || has_next);
+        let returned = rows.len();
+        let rows = materialize_rows(output, rows).await?;
+        tracing::debug!(
+            returned,
+            exhausted,
+            elapsed_ms = started.elapsed().as_millis(),
+            "PyAsyncCursor::{operation}: read buffered ExecuteMany rows"
+        );
+        Ok(rows)
+    };
+    let future = in_cursor_operation_span(future, cursor_id, operation_id, operation, "reading");
+    let future = async move {
+        match dispatch {
+            Some(dispatch) => future.with_subscriber(dispatch).await,
+            None => future.await,
+        }
+    };
+    match pyo3_async_runtimes::tokio::future_into_py(py, future) {
+        Ok(awaitable) => Ok(awaitable),
+        Err(error) => {
+            session_state.restore_fetch(operation_id);
+            Err(error)
+        }
+    }
+}
+
 /// Return an awaitable resolving to the next row tuple or `None`.
 pub(crate) fn fetchone<'py>(
     cursor: Py<PyAsyncCursor>,
@@ -526,7 +659,21 @@ pub(crate) fn nextset<'py>(
         cursor_id,
         fetch_state,
         description_state,
+        buffered_results,
+        rowcount,
     } = resources;
+    if buffered_results.has_current() {
+        return next_buffered_set(
+            py,
+            dispatch,
+            session_state,
+            cursor_id,
+            fetch_state,
+            description_state,
+            buffered_results,
+            rowcount,
+        );
+    }
     let claim = match session_state.claim_fetch(cursor_id) {
         Ok(claim) => claim,
         Err(ClaimError::NoResultSet)
@@ -586,12 +733,19 @@ pub(crate) fn nextset<'py>(
                     StatementResult::NoRows { .. } => FetchStatus::TerminalNoRows,
                     StatementResult::End => FetchStatus::Exhausted,
                 };
+                let next_rowcount = match result {
+                    StatementResult::NoRows { rows_affected } => rows_affected
+                        .and_then(|count| i64::try_from(count).ok())
+                        .unwrap_or(-1),
+                    StatementResult::Rows | StatementResult::End => -1,
+                };
 
                 let materialization_started = Instant::now();
                 match materialize(metadata).await {
                     Ok(description) => {
                         future_description_state.replace(description);
                         future_fetch_state.set(next_fetch_status);
+                        rowcount.store(next_rowcount, Ordering::Release);
                         fetch_guard.complete(!has_rows, has_open_batch);
                         tracing::debug!(
                             "PyAsyncCursor::nextset: completed; has_result={has_result}; has_rows={has_rows}; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}",
@@ -633,6 +787,77 @@ pub(crate) fn nextset<'py>(
         }
     };
 
+    match pyo3_async_runtimes::tokio::future_into_py(py, future) {
+        Ok(awaitable) => Ok(awaitable),
+        Err(error) => {
+            session_state.restore_fetch(operation_id);
+            fetch_state.set(previous_fetch_status);
+            description_state.replace(previous_description);
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn next_buffered_set<'py>(
+    py: Python<'py>,
+    dispatch: Option<tracing::Dispatch>,
+    session_state: Arc<AsyncConnectionState>,
+    cursor_id: CursorId,
+    fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
+    buffered_results: Arc<BufferedResults>,
+    rowcount: Arc<AtomicI64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if fetch_state.status() == FetchStatus::Exhausted && !buffered_results.has_next() {
+        buffered_results.advance();
+        description_state.replace(None);
+        return pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(false) });
+    }
+    let claim = session_state
+        .claim_fetch(cursor_id)
+        .map_err(map_claim_error)?;
+    let operation_id = claim.operation_id;
+    let future_state = session_state.clone();
+    let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
+    let previous_description = description_state.replace(None);
+    let future_fetch_state = fetch_state.clone();
+    let future_description_state = description_state.clone();
+    let guard_dispatch = dispatch.clone();
+
+    let future = async move {
+        let mut fetch_guard =
+            FetchGuard::new(future_state, operation_id, "nextset", guard_dispatch);
+        let metadata = buffered_results.advance();
+        let has_result = metadata.is_some();
+        let description = match materialize(metadata).await {
+            Ok(description) => description,
+            Err(error) => {
+                buffered_results.replace(VecDeque::new());
+                future_fetch_state.set(FetchStatus::NoResultSet);
+                fetch_guard.fail(false);
+                return Err(InternalError::new_err(format!(
+                    "Advanced buffered result set but cursor description materialization failed: {error}"
+                )));
+            }
+        };
+        future_description_state.replace(description);
+        rowcount.store(-1, Ordering::Release);
+        future_fetch_state.set(if has_result {
+            FetchStatus::Ready
+        } else {
+            FetchStatus::Exhausted
+        });
+        fetch_guard.complete(true, has_result);
+        Ok(has_result)
+    };
+    let future = in_cursor_operation_span(future, cursor_id, operation_id, "nextset", "advancing");
+    let future = async move {
+        match dispatch {
+            Some(dispatch) => future.with_subscriber(dispatch).await,
+            None => future.await,
+        }
+    };
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
