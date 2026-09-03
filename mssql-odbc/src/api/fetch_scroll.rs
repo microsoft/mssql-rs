@@ -710,8 +710,8 @@ impl RowWriter for BoundRowWriter<'_> {
 /// the result set also stays unresolved, but never reaches delivery: the fill
 /// loop skips it, matching msodbcsql.
 ///
-/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which bound
-/// delivery does not implement yet (AB#47239), so it fails per row with
+/// A `varbinary` / `image` / CLR UDT column resolves to `SQL_C_BINARY`, which
+/// bound delivery does not implement yet (AB#47239), so it fails per row with
 /// `HYC00`. That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred
 /// resolution makes it reachable without the application naming the C type, and
 /// it covers more common column types than the `time` / `datetimeoffset` stride

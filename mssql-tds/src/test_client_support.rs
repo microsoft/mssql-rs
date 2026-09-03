@@ -432,6 +432,20 @@ pub fn int_columns(n: usize) -> Vec<ColumnMetadata> {
         .collect()
 }
 
+/// A nullable CLR UDT column with the wire-declared maximum byte size.
+pub fn udt_column(max_byte_size: u16) -> ColumnMetadata {
+    ColumnMetadata {
+        user_type: 0,
+        flags: 0x01,
+        type_info: TypeInfo::partial_len(TdsDataType::Udt, usize::from(max_byte_size), None)
+            .expect("UDT is a PLP type"),
+        data_type: TdsDataType::Udt,
+        column_name: "udt".to_string(),
+        multi_part_name: None,
+        crypto_metadata: None,
+    }
+}
+
 /// Inline integer columns followed by one deferred `nvarchar(max)` column.
 pub fn mixed_lob_columns(prefix_columns: usize) -> Vec<ColumnMetadata> {
     let mut columns = int_columns(prefix_columns);

@@ -11,7 +11,7 @@
 //   7.  NullableFlag                        - sys.objects.name (NOT NULL) vs principal_id (NULL)
 //   8.  DateTime2AndDateTimeOffset          - datetime2 → SQL_TYPE_TIMESTAMP, datetimeoffset → -155
 //   9.  NVarCharColumnSizeIsCharCount       - NVARCHAR(100) → colSize=100 (chars, not bytes)
-//  10.  ClrUdtColumnsReportSqlSsUdt          - geography/geometry/hierarchyid → SQL_SS_UDT
+//  10.  ClrUdtColumnsReportSqlSsUdt          - CLR UDT type, size, scale, and nullability
 
 #include "odbc_test_fixture.h"
 
@@ -238,12 +238,36 @@ TEST_F(DescribeColLiveTest, ClrUdtColumnsReportSqlSsUdt) {
                "CAST(NULL AS geometry) AS geometry_col, "
                "CAST(NULL AS hierarchyid) AS hierarchyid_col");
 
-    for (SQLUSMALLINT column : {SQLUSMALLINT{1}, SQLUSMALLINT{2}, SQLUSMALLINT{3}}) {
+    struct UdtColumn {
+        SQLUSMALLINT ordinal;
+        SQLULEN size;
+    };
+    const UdtColumn columns[] = {
+        {1, 0},
+        {2, 0},
+        {3, 892},
+    };
+
+    for (const auto& column : columns) {
         SQLSMALLINT dataType = 0;
+        SQLULEN colSize = 0;
+        SQLSMALLINT decDigits = -1;
+        SQLSMALLINT nullable = SQL_NULLABLE_UNKNOWN;
         SQLRETURN rc = SQLDescribeCol(
-            stmt_, column, nullptr, 0, nullptr, &dataType, nullptr, nullptr, nullptr);
+            stmt_,
+            column.ordinal,
+            nullptr,
+            0,
+            nullptr,
+            &dataType,
+            &colSize,
+            &decDigits,
+            &nullable);
         ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
-        EXPECT_EQ(SQL_SS_UDT, dataType) << "column=" << column;
+        EXPECT_EQ(SQL_SS_UDT, dataType) << "column=" << column.ordinal;
+        EXPECT_EQ(column.size, colSize) << "column=" << column.ordinal;
+        EXPECT_EQ(0, decDigits) << "column=" << column.ordinal;
+        EXPECT_EQ(SQL_NULLABLE, nullable) << "column=" << column.ordinal;
     }
 
     SQLCloseCursor(stmt_);

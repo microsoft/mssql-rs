@@ -228,12 +228,19 @@ pub(crate) fn odbc_sql_type(meta: &mssql_tds::query::metadata::ColumnMetadata) -
         // reporting the column as character data hides the variant entirely.
         TdsDataType::SsVariant => SQL_SS_VARIANT,
         TdsDataType::Udt => SQL_SS_UDT,
+        // Result delivery does not support SQL_C_SS_VECTOR yet; retaining the
+        // character type keeps SQL_C_DEFAULT fetches on the working text path.
         TdsDataType::Vector => SQL_VARCHAR,
         _ => SQL_UNKNOWN_TYPE,
     }
 }
 
 pub(crate) fn column_size(meta: &mssql_tds::query::metadata::ColumnMetadata) -> u64 {
+    // CLR UDT metadata is PLP even when MAX_BYTE_SIZE is bounded. Only 0xFFFF
+    // carries the unbounded convention used by geography and geometry.
+    if meta.data_type == TdsDataType::Udt && meta.type_info.length != usize::from(u16::MAX) {
+        return meta.type_info.length as u64;
+    }
     // PLP / `*(max)` / xml / json: ColumnSize is "unbounded". Report 0 per ODBC spec
     if meta.is_plp() {
         return 0;
@@ -323,7 +330,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::TestHandles;
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{int_columns, udt_column};
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
@@ -354,14 +361,15 @@ mod tests {
     }
 
     #[test]
-    fn udt_column_reports_sql_ss_udt() {
-        let mut metadata = int_columns(1);
-        let meta = metadata.first_mut().unwrap();
-        meta.data_type = TdsDataType::Udt;
-        meta.type_info.tds_type = TdsDataType::Udt;
-        meta.type_info.length = usize::from(u16::MAX);
+    fn udt_column_reports_sql_ss_udt_metadata() {
+        for (max_byte_size, expected_column_size) in [(u16::MAX, 0), (892, 892)] {
+            let meta = udt_column(max_byte_size);
 
-        assert_eq!(odbc_sql_type(meta), SQL_SS_UDT);
+            assert!(meta.is_plp());
+            assert_eq!(odbc_sql_type(&meta), SQL_SS_UDT);
+            assert_eq!(column_size(&meta), expected_column_size);
+            assert_eq!(decimal_digits(&meta), 0);
+        }
     }
 
     #[test]
