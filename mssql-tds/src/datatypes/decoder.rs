@@ -443,37 +443,124 @@ impl PlpChunkStreamReader {
         Ok(Some(Self::new(length)))
     }
 
-    pub(crate) fn total_read(&self) -> usize {
-        self.total_read
+    /// Attempts to parse the 8-byte PLP length/sentinel header from already-buffered `bytes`.
+    ///
+    /// Returns `Ok(None)` when fewer than 8 bytes are buffered (not ready). `Ok(Some((None,
+    /// 8)))` means the header itself was the SQL NULL sentinel — `8` is still the number of
+    /// header bytes consumed. `Ok(Some((Some(reader), 8)))` returns a fresh chunk reader
+    /// positioned to read the first chunk-length header next, with `8` bytes consumed for
+    /// the PLP length header. Returns `Err` for a declared length that is negative or exceeds
+    /// `MAX_PLP_SIZE`.
+    fn try_begin_buffered(bytes: &[u8]) -> TdsResult<Option<(Option<Self>, usize)>> {
+        let Some(header) = bytes.get(..8) else {
+            return Ok(None);
+        };
+        let raw_len_i64 = i64::from_le_bytes(header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP header".to_string())
+        })?);
+        let raw_len = raw_len_i64 as u64;
+        let raw_len_usize = raw_len as usize;
+        if raw_len_usize == GenericDecoder::SQL_PLP_NULL {
+            return Ok(Some((None, 8)));
+        }
+        let length = if raw_len_usize == GenericDecoder::SQL_PLP_UNKNOWNLEN
+            || raw_len_usize == GenericDecoder::SQL_PLP_MAXLEN
+        {
+            PlpChunkReadLength::Unknown
+        } else {
+            let declared_len = raw_len as usize;
+            if raw_len_i64 < 0 || declared_len > MAX_PLP_SIZE {
+                return Err(crate::error::Error::ProtocolError(format!(
+                    "PLP length {declared_len} (raw i64: {raw_len_i64}) exceeds maximum allowed size of {MAX_PLP_SIZE} bytes"
+                )));
+            }
+            PlpChunkReadLength::Known(raw_len)
+        };
+        Ok(Some((Some(Self::new(length)), 8)))
     }
 
-    /// Declared total length of the whole PLP value in wire bytes when the
-    /// server sent a known-length PLP header; `None` for unknown-length
-    /// (streamed) PLP where the total is not known up front.
-    pub(crate) fn known_len(&self) -> Option<u64> {
-        match self.length {
-            PlpChunkReadLength::Known(n) => Some(n),
-            PlpChunkReadLength::Unknown => None,
+    /// Attempts to decode an entire known-length, single-chunk PLP value (chunk header,
+    /// payload, zero terminator) directly from buffered `bytes` in one call, without leaving
+    /// resumable per-chunk cursor state behind.
+    ///
+    /// Only applies before any chunk has been started (`total_read == 0 && chunk_remaining ==
+    /// 0 && !reached_end`) and when the length is known. Returns `Ok(None)` for unknown-length
+    /// PLP, a reader that already began reading, `out` smaller than the declared length, a
+    /// buffered chunk header/payload/terminator that isn't fully present yet, or a chunk
+    /// length that doesn't match the declared length (caller must fall back to the general
+    /// chunked path via `try_read_buffered`). On success returns `Ok(Some((consumed,
+    /// payload_len)))`: `consumed` is the number of input `bytes` consumed (chunk header +
+    /// payload + terminator), `payload_len` is the number of bytes copied into `out` (equal
+    /// to the declared length). Marks the reader as having reached the end.
+    fn try_read_complete_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let PlpChunkReadLength::Known(known_len) = self.length else {
+            return Ok(None);
+        };
+        if self.reached_end || self.chunk_remaining != 0 || self.total_read != 0 {
+            return Ok(None);
         }
+        let length = usize::try_from(known_len).map_err(|_| {
+            crate::error::Error::ProtocolError("PLP length does not fit usize".to_string())
+        })?;
+        if length > out.len() {
+            return Ok(None);
+        }
+        let Some(chunk_header) = bytes.get(..4) else {
+            return Ok(None);
+        };
+        let chunk_len = u32::from_le_bytes(chunk_header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP chunk header".to_string())
+        })?) as usize;
+        if length == 0 && chunk_len == 0 {
+            self.reached_end = true;
+            return Ok(Some((4, 0)));
+        }
+        if chunk_len != length {
+            return Ok(None);
+        }
+        let payload_end = 4usize.checked_add(length).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP length overflowed".to_string())
+        })?;
+        let terminator_end = payload_end.checked_add(4).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP terminator overflowed".to_string())
+        })?;
+        let Some(payload) = bytes.get(4..payload_end) else {
+            return Ok(None);
+        };
+        let Some(terminator) = bytes.get(payload_end..terminator_end) else {
+            return Ok(None);
+        };
+        if u32::from_le_bytes(terminator.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP terminator".to_string())
+        })?) != 0
+        {
+            return Ok(None);
+        }
+        out.get_mut(..length)
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(
+                    "Buffered PLP output range was unavailable".to_string(),
+                )
+            })?
+            .copy_from_slice(payload);
+        self.total_read = length;
+        self.reached_end = true;
+        Ok(Some((terminator_end, length)))
     }
 
-    pub(crate) fn reached_end(&self) -> bool {
-        self.reached_end
-    }
-
-    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
-    where
-        T: TdsPacketReader + Send + Sync,
-    {
-        if self.reached_end {
-            return Ok(false);
-        }
-
-        if self.chunk_remaining > 0 {
-            return Ok(true);
-        }
-
-        let chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
+    /// Validates a chunk-length header value just read from the wire/buffer and applies it to
+    /// reader state.
+    ///
+    /// A `chunk_len` of `0` is the terminator: sets `reached_end` and returns `Ok(false)`
+    /// (erroring if a known declared length wasn't fully consumed by then). A non-zero
+    /// `chunk_len` becomes the new `chunk_remaining` and returns `Ok(true)`. Returns `Err` if
+    /// the chunk exceeds the max chunk size, would overflow the accumulated total, exceeds
+    /// `MAX_PLP_SIZE`, or would exceed a known declared length.
+    fn accept_chunk_length(&mut self, chunk_len: usize) -> TdsResult<bool> {
         if chunk_len == 0 {
             self.reached_end = true;
             if let PlpChunkReadLength::Known(known_len) = self.length
@@ -517,6 +604,169 @@ impl PlpChunkStreamReader {
 
         self.chunk_remaining = chunk_len;
         Ok(true)
+    }
+
+    /// Ensures a chunk with remaining payload bytes is active at `*position`, reading a new
+    /// 4-byte chunk-length header from `bytes` if the current chunk is exhausted.
+    ///
+    /// Returns `Ok(None)` when the chunk-length header isn't fully buffered yet (`*position`
+    /// is left unchanged so the caller can retry once more bytes arrive). Returns
+    /// `Ok(Some(false))` when the terminator was just consumed and the stream has reached its
+    /// end (`*position` advanced past the 4-byte terminator). Returns `Ok(Some(true))` when a
+    /// chunk with remaining payload bytes is active — either it was already active, or a new
+    /// chunk header was just consumed and `*position` advanced past it.
+    fn try_ensure_active_buffered_chunk(
+        &mut self,
+        bytes: &[u8],
+        position: &mut usize,
+    ) -> TdsResult<Option<bool>> {
+        if self.reached_end {
+            return Ok(Some(false));
+        }
+        if self.chunk_remaining > 0 {
+            return Ok(Some(true));
+        }
+
+        let Some(end) = position.checked_add(4) else {
+            return Err(crate::error::Error::ProtocolError(
+                "Buffered PLP position overflowed".to_string(),
+            ));
+        };
+        let Some(header) = bytes.get(*position..end) else {
+            return Ok(None);
+        };
+        let chunk_len = u32::from_le_bytes(header.try_into().map_err(|_| {
+            crate::error::Error::ProtocolError("Invalid buffered PLP chunk header".to_string())
+        })?) as usize;
+        *position = end;
+        self.accept_chunk_length(chunk_len).map(Some)
+    }
+
+    /// Core buffered-read loop shared by the dry-run probe and the real copy in
+    /// `try_read_buffered`; advances `self`'s chunk cursor (`chunk_remaining`, `total_read`,
+    /// `reached_end`) regardless of whether `out` is provided.
+    ///
+    /// `out_len` is the number of payload bytes the caller ultimately wants. `out` is `None`
+    /// for a dry run that only validates enough bytes are buffered to satisfy `out_len`
+    /// (still consuming chunk headers and advancing state) and `Some` to also copy payload
+    /// into the destination. Returns `Ok(None)` when a chunk-length header needed to make
+    /// progress isn't fully buffered yet. Returns `Ok(Some((consumed, written)))` where
+    /// `consumed` is the number of input `bytes` consumed and `written` is the number of
+    /// payload bytes produced (less than `out_len` if the stream reached its end first). When
+    /// `written == out_len` and the current chunk is exhausted but the stream hasn't ended,
+    /// also peeks ahead to confirm the next chunk's length header is buffered, so a
+    /// successful result never requires "un-consuming" state on a later call.
+    fn try_read_buffered_inner(
+        &mut self,
+        bytes: &[u8],
+        mut out: Option<&mut [u8]>,
+        out_len: usize,
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let mut position = 0;
+        if out_len == 0 {
+            return match self.try_ensure_active_buffered_chunk(bytes, &mut position)? {
+                Some(_) => Ok(Some((position, 0))),
+                None => Ok(None),
+            };
+        }
+
+        let mut written = 0;
+        while written < out_len {
+            let Some(active) = self.try_ensure_active_buffered_chunk(bytes, &mut position)? else {
+                return Ok(None);
+            };
+            if !active {
+                break;
+            }
+
+            let to_read = std::cmp::min(out_len - written, self.chunk_remaining);
+            let Some(end) = position.checked_add(to_read) else {
+                return Err(crate::error::Error::ProtocolError(
+                    "Buffered PLP position overflowed".to_string(),
+                ));
+            };
+            let Some(payload) = bytes.get(position..end) else {
+                return Ok(None);
+            };
+            if let Some(output) = out.as_deref_mut() {
+                let Some(target) = output.get_mut(written..written + to_read) else {
+                    return Err(crate::error::Error::ProtocolError(
+                        "Buffered PLP output range was unavailable".to_string(),
+                    ));
+                };
+                target.copy_from_slice(payload);
+            }
+            position = end;
+            self.chunk_remaining -= to_read;
+            self.total_read += to_read;
+            written += to_read;
+        }
+
+        if written == out_len && self.chunk_remaining == 0 && !self.reached_end {
+            let Some(_) = self.try_ensure_active_buffered_chunk(bytes, &mut position)? else {
+                return Ok(None);
+            };
+        }
+
+        Ok(Some((position, written)))
+    }
+
+    /// Reads as much PLP payload as fits in `out` from already-buffered `bytes`, without
+    /// partially mutating `self` when the data isn't fully buffered.
+    ///
+    /// First dry-runs `try_read_buffered_inner` on a cloned reader to confirm every chunk
+    /// header needed to satisfy `out` is buffered; only if that succeeds does it re-run for
+    /// real on `self`, copying payload into `out`. Returns `Ok(None)` when the dry run
+    /// reports missing data (not ready; `self` left unchanged). Returns `Ok(Some((consumed,
+    /// written)))` — see `try_read_buffered_inner` for field semantics.
+    fn try_read_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        let out_len = out.len();
+        let mut probe = self.clone();
+        if probe
+            .try_read_buffered_inner(bytes, None, out_len)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.try_read_buffered_inner(bytes, Some(out), out_len)
+    }
+
+    pub(crate) fn total_read(&self) -> usize {
+        self.total_read
+    }
+
+    /// Declared total length of the whole PLP value in wire bytes when the
+    /// server sent a known-length PLP header; `None` for unknown-length
+    /// (streamed) PLP where the total is not known up front.
+    pub(crate) fn known_len(&self) -> Option<u64> {
+        match self.length {
+            PlpChunkReadLength::Known(n) => Some(n),
+            PlpChunkReadLength::Unknown => None,
+        }
+    }
+
+    pub(crate) fn reached_end(&self) -> bool {
+        self.reached_end
+    }
+
+    async fn ensure_active_chunk<T>(&mut self, reader: &mut T) -> TdsResult<bool>
+    where
+        T: TdsPacketReader + Send + Sync,
+    {
+        if self.reached_end {
+            return Ok(false);
+        }
+
+        if self.chunk_remaining > 0 {
+            return Ok(true);
+        }
+
+        let chunk_len = read_sync_first!(reader, try_read_uint32, read_uint32) as usize;
+        self.accept_chunk_length(chunk_len)
     }
 
     pub(crate) async fn read_into<T>(&mut self, reader: &mut T, out: &mut [u8]) -> TdsResult<usize>
@@ -638,6 +888,54 @@ impl PlpColumnStream {
             collation,
             inner,
         }))
+    }
+
+    /// Validates `metadata` is a PLP-capable type, then attempts to parse the 8-byte PLP
+    /// header from already-buffered `bytes`.
+    ///
+    /// See [`PlpChunkStreamReader::try_begin_buffered`] for the exact semantics: `Ok(None)`
+    /// not ready (header not fully buffered), `Ok(Some((None, used)))` SQL NULL,
+    /// `Ok(Some((Some(stream), used)))` a stream ready for buffered reads, with `used` the
+    /// header bytes consumed either way. Returns `Err` when `metadata` isn't PLP-capable.
+    pub(crate) fn try_begin_buffered(
+        metadata: &ColumnMetadata,
+        bytes: &[u8],
+    ) -> TdsResult<Option<(Option<Self>, usize)>> {
+        let (plp_type, collation) = Self::type_from_metadata(metadata)?;
+        let Some((inner, used)) = PlpChunkStreamReader::try_begin_buffered(bytes)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            inner.map(|inner| Self {
+                plp_type,
+                collation,
+                inner,
+            }),
+            used,
+        )))
+    }
+
+    /// Delegates to [`PlpChunkStreamReader::try_read_complete_buffered`] — attempts to decode
+    /// this column's entire known-length, single-chunk PLP value from buffered `bytes` in one
+    /// call. See that method for the exact `Ok(None)` / `Ok(Some((consumed, payload_len)))`
+    /// semantics.
+    pub(crate) fn try_read_complete_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        self.inner.try_read_complete_buffered(bytes, out)
+    }
+
+    /// Delegates to [`PlpChunkStreamReader::try_read_buffered`] — reads as much payload as
+    /// fits in `out` from already-buffered `bytes`. Returns `Ok(None)` when a needed chunk
+    /// header isn't fully buffered yet (not ready), otherwise `Ok(Some((consumed, written)))`.
+    pub(crate) fn try_read_buffered(
+        &mut self,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> TdsResult<Option<(usize, usize)>> {
+        self.inner.try_read_buffered(bytes, out)
     }
 
     /// The PLP-capable SQL Server type for this column.
@@ -1434,6 +1732,16 @@ impl GenericDecoder {
                     };
                     writer.write_bytes(col, Cow::Borrowed(bytes));
                 }
+            }
+            TdsDataType::SsVariant => {
+                let Some((base, value, used)) = self.try_decode_buffered_variant(bytes)? else {
+                    return Ok(None);
+                };
+                if let Some(base) = base {
+                    writer.write_variant_base_type(col, base);
+                }
+                write_column_value(writer, col, value);
+                return Ok(Some(used));
             }
             _ => {
                 let Some((value, used)) = self.try_decode_buffered(bytes, metadata)? else {
@@ -3446,7 +3754,8 @@ mod test {
     use crate::datatypes::{
         column_values::ColumnValues,
         decoder::{
-            DecimalParts, GenericDecoder, MAX_ALLOC_SIZE, StringDecoder, validate_alloc_size,
+            DecimalParts, GenericDecoder, MAX_ALLOC_SIZE, PlpChunkReadLength, PlpChunkStreamReader,
+            StringDecoder, validate_alloc_size,
         },
         sqldatatypes::TdsDataType,
     };
@@ -3481,6 +3790,73 @@ mod test {
         let parts = DecimalParts::new(true, 1, 0, magnitude);
 
         assert_eq!(expected, parts.to_f64());
+    }
+
+    #[test]
+    fn empty_buffered_plp_consumes_only_its_single_terminator() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(0));
+        let mut out = [];
+
+        assert_eq!(
+            stream
+                .try_read_complete_buffered(&[0; 8], &mut out)
+                .unwrap(),
+            Some((4, 0))
+        );
+        assert!(stream.reached_end());
+    }
+
+    #[test]
+    fn buffered_plp_chunks_continue_an_active_stream() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(10));
+        let mut first = Vec::from(10_u32.to_le_bytes());
+        first.extend(0_u8..10);
+        first.extend(0_u32.to_le_bytes());
+
+        let mut out = [0_u8; 4];
+        assert_eq!(
+            stream.try_read_buffered(&first, &mut out).unwrap(),
+            Some((8, 4))
+        );
+        assert_eq!(out, [0, 1, 2, 3]);
+        assert_eq!(stream.total_read(), 4);
+        assert!(!stream.reached_end());
+
+        let remaining = &first[8..];
+        assert_eq!(
+            stream.try_read_buffered(remaining, &mut out).unwrap(),
+            Some((4, 4))
+        );
+        assert_eq!(out, [4, 5, 6, 7]);
+
+        assert_eq!(
+            stream.try_read_buffered(&remaining[4..], &mut out).unwrap(),
+            Some((6, 2))
+        );
+        assert_eq!(&out[..2], &[8, 9]);
+        assert_eq!(stream.total_read(), 10);
+        assert!(stream.reached_end());
+    }
+
+    #[test]
+    fn incomplete_buffered_plp_chunk_does_not_advance() {
+        let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+        let mut bytes = Vec::from(4_u32.to_le_bytes());
+        bytes.extend([1, 2]);
+        let mut out = [0_u8; 4];
+
+        assert_eq!(stream.try_read_buffered(&bytes, &mut out).unwrap(), None);
+        assert_eq!(stream.total_read(), 0);
+        assert!(!stream.reached_end());
+
+        bytes.extend([3, 4]);
+        bytes.extend(0_u32.to_le_bytes());
+        assert_eq!(
+            stream.try_read_buffered(&bytes, &mut out).unwrap(),
+            Some((12, 4))
+        );
+        assert_eq!(out, [1, 2, 3, 4]);
+        assert!(stream.reached_end());
     }
 
     #[test]
@@ -4935,14 +5311,31 @@ mod test {
                     .is_err()
             );
 
-            let unsupported = fixed_metadata(TdsDataType::SsVariant, 0);
+            let variant = fixed_metadata(TdsDataType::SsVariant, 0);
             let mut writer = DefaultRowWriter::new(1);
             assert_eq!(
                 decoder
-                    .try_decode_buffered_into(&[0; 4], &unsupported, 0, &mut writer)
+                    .try_decode_buffered_into(&[0; 3], &variant, 0, &mut writer)
                     .unwrap(),
                 None
             );
+            assert!(writer.take_row().is_empty());
+        }
+
+        #[test]
+        fn buffered_variant_into_preserves_base_type() {
+            let decoder = GenericDecoder::default();
+            let variant = fixed_metadata(TdsDataType::SsVariant, 0);
+            let mut writer = DefaultRowWriter::new(1);
+            let wire = [6, 0, 0, 0, TdsDataType::Int4 as u8, 0, 42, 0, 0, 0];
+            assert_eq!(
+                decoder
+                    .try_decode_buffered_into(&wire, &variant, 0, &mut writer)
+                    .unwrap(),
+                Some(wire.len())
+            );
+            assert_eq!(writer.variant_base(0), Some(TdsDataType::Int4));
+            assert_eq!(writer.take_row(), vec![ColumnValues::Int(42)]);
         }
 
         #[tokio::test]
@@ -5761,6 +6154,182 @@ mod test {
         }
 
         // -------------------------------------------------------------------
+        // PlpChunkStreamReader buffered-path tests — synchronous helpers used
+        // when a full row can be decoded straight from already-buffered bytes.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn try_begin_buffered_returns_none_for_a_short_header() {
+            assert!(
+                PlpChunkStreamReader::try_begin_buffered(&[0; 7])
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn try_begin_buffered_reports_a_null_plp_value() {
+            let header = 0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes();
+            let result = PlpChunkStreamReader::try_begin_buffered(&header).unwrap();
+            assert!(matches!(result, Some((None, 8))));
+        }
+
+        #[test]
+        fn try_begin_buffered_rejects_a_declared_length_over_the_maximum() {
+            let header = (MAX_PLP_SIZE as u64 + 1).to_le_bytes();
+            assert!(PlpChunkStreamReader::try_begin_buffered(&header).is_err());
+        }
+
+        #[test]
+        fn try_read_complete_buffered_ignores_unknown_length_streams() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Unknown);
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_skips_once_already_finished() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(0));
+            let mut out = [];
+            assert!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[0; 8], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_an_output_buffer_too_small() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 2];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(0u32.to_le_bytes());
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_a_full_chunk_header() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_complete_buffered(&[1, 2, 3], &mut out)
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_a_chunk_length_mismatch() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(5u32.to_le_bytes()); // declared 4, chunk says 5
+            bytes.extend([1, 2, 3, 4, 5]);
+            bytes.extend(0u32.to_le_bytes());
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_the_full_payload() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2]); // only 2 of 4 payload bytes present
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_needs_the_full_terminator() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend([0, 0]); // only 2 of 4 terminator bytes present
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_read_complete_buffered_rejects_a_non_zero_terminator() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut out = [0u8; 4];
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(1u32.to_le_bytes()); // non-zero terminator
+            assert_eq!(
+                stream.try_read_complete_buffered(&bytes, &mut out).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn try_ensure_active_buffered_chunk_detects_position_overflow() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut position = usize::MAX - 2;
+            let err = stream
+                .try_ensure_active_buffered_chunk(&[], &mut position)
+                .unwrap_err();
+            assert!(matches!(err, crate::error::Error::ProtocolError(_)));
+        }
+
+        #[test]
+        fn try_read_buffered_inner_zero_output_reports_missing_header() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            assert_eq!(stream.try_read_buffered_inner(&[], None, 0).unwrap(), None);
+        }
+
+        #[test]
+        fn try_read_buffered_inner_rejects_an_inconsistent_output_length() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]);
+            bytes.extend(0u32.to_le_bytes());
+            let mut out = [0u8; 2];
+            let err = stream
+                .try_read_buffered_inner(&bytes, Some(&mut out), 4)
+                .unwrap_err();
+            assert!(matches!(err, crate::error::Error::ProtocolError(_)));
+        }
+
+        #[test]
+        fn try_read_buffered_inner_reports_missing_trailing_header_after_exact_fill() {
+            let mut stream = PlpChunkStreamReader::new(PlpChunkReadLength::Known(4));
+            let mut bytes = Vec::from(4u32.to_le_bytes());
+            bytes.extend([1, 2, 3, 4]); // no terminator/next-chunk header follows
+            let mut out = [0u8; 4];
+            assert_eq!(
+                stream
+                    .try_read_buffered_inner(&bytes, Some(&mut out), 4)
+                    .unwrap(),
+                None
+            );
+        }
+
+        // -------------------------------------------------------------------
         // PlpColumnStream tests — type-aware wrapper over PlpChunkStreamReader
         // -------------------------------------------------------------------
 
@@ -5811,6 +6380,20 @@ mod test {
             let mut reader = ByteReader::new(buf);
             let result = PlpColumnStream::begin(&md, &mut reader).await.unwrap();
             assert!(result.is_none());
+        }
+
+        #[test]
+        fn plp_column_stream_try_begin_buffered_returns_none_for_a_short_header() {
+            let md = plp_metadata(
+                TdsDataType::BigVarBinary,
+                PartialLengthType::BigVarBinary,
+                None,
+            );
+            assert!(
+                PlpColumnStream::try_begin_buffered(&md, &[0; 4])
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[tokio::test]

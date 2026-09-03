@@ -104,6 +104,11 @@ impl Drop for KeyGuard {
 }
 
 /// Opens a CNG algorithm provider for `alg_id` (e.g. `BCRYPT_AES_ALGORITHM`).
+///
+/// # Safety
+///
+/// `alg_id` must identify a valid, NUL-terminated CNG algorithm name and remain
+/// valid for the duration of the call.
 unsafe fn open_alg(alg_id: windows_sys::core::PCWSTR, flags: u32) -> TdsResult<BCRYPT_ALG_HANDLE> {
     let mut handle: BCRYPT_ALG_HANDLE = ptr::null_mut();
     nt_check("BCryptOpenAlgorithmProvider", unsafe {
@@ -113,6 +118,11 @@ unsafe fn open_alg(alg_id: windows_sys::core::PCWSTR, flags: u32) -> TdsResult<B
 }
 
 /// Reads a u32-valued property (such as `ObjectLength`) from a CNG object.
+///
+/// # Safety
+///
+/// `handle` must be a valid CNG handle and remain open for the duration of the
+/// call.
 unsafe fn get_u32_property(handle: BCRYPT_ALG_HANDLE, name: &str) -> TdsResult<u32> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut value = 0u32;
@@ -143,7 +153,7 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> TdsResult<()> {
 }
 
 /// Computes a SHA-256 digest (used internally before RSA sign/verify).
-unsafe fn sha256(data: &[u8]) -> TdsResult<[u8; 32]> {
+fn sha256(data: &[u8]) -> TdsResult<[u8; 32]> {
     let alg = unsafe { open_alg(BCRYPT_SHA256_ALGORITHM, 0) }?;
     let _alg = AlgGuard(alg);
     let mut hash: BCRYPT_HASH_HANDLE = ptr::null_mut();
@@ -194,7 +204,7 @@ pub(crate) fn aes_256_cbc_encrypt(
     iv: &[u8; 16],
     plaintext: &[u8],
 ) -> TdsResult<Vec<u8>> {
-    unsafe { aes_256_cbc(key, iv, plaintext, true) }
+    aes_256_cbc(key, iv, plaintext, true)
 }
 
 /// Decrypts AES-256-CBC ciphertext and strips PKCS#7 padding.
@@ -203,16 +213,11 @@ pub(crate) fn aes_256_cbc_decrypt(
     iv: &[u8; 16],
     ciphertext: &[u8],
 ) -> TdsResult<Vec<u8>> {
-    unsafe { aes_256_cbc(key, iv, ciphertext, false) }
+    aes_256_cbc(key, iv, ciphertext, false)
 }
 
 /// Shared AES-256-CBC (PKCS#7) transform. `encrypt` selects direction.
-unsafe fn aes_256_cbc(
-    key: &[u8; 32],
-    iv: &[u8; 16],
-    input: &[u8],
-    encrypt: bool,
-) -> TdsResult<Vec<u8>> {
+fn aes_256_cbc(key: &[u8; 32], iv: &[u8; 16], input: &[u8], encrypt: bool) -> TdsResult<Vec<u8>> {
     let alg = unsafe { open_alg(BCRYPT_AES_ALGORITHM, 0) }?;
     let _alg = AlgGuard(alg);
 
@@ -380,7 +385,7 @@ impl RsaKey {
     }
 
     /// Imports a legacy CAPI RSA private key blob into a CNG key handle.
-    unsafe fn import_capi(capi_blob: &[u8]) -> TdsResult<Self> {
+    fn import_capi(capi_blob: &[u8]) -> TdsResult<Self> {
         let alg = unsafe { open_alg(BCRYPT_RSA_ALGORITHM, 0) }?;
         let mut key: BCRYPT_KEY_HANDLE = ptr::null_mut();
         let status = unsafe {
@@ -439,7 +444,7 @@ impl RsaKey {
 
     /// Exports the key as a legacy CAPI RSA private blob.
     #[cfg(test)]
-    unsafe fn export_capi(&self) -> TdsResult<Vec<u8>> {
+    fn export_capi(&self) -> TdsResult<Vec<u8>> {
         let mut needed = 0u32;
         nt_check("BCryptExportKey", unsafe {
             BCryptExportKey(
@@ -632,7 +637,7 @@ impl RsaKey {
 }
 
 /// Decodes a PEM document (any label) into its DER bytes.
-unsafe fn pem_to_der(pem: &[u8]) -> TdsResult<Vec<u8>> {
+fn pem_to_der(pem: &[u8]) -> TdsResult<Vec<u8>> {
     let mut needed = 0u32;
     if unsafe {
         CryptStringToBinaryA(
@@ -669,7 +674,7 @@ unsafe fn pem_to_der(pem: &[u8]) -> TdsResult<Vec<u8>> {
 
 /// Base64-armors DER bytes into a PEM document with the given label.
 #[cfg(test)]
-unsafe fn der_to_pem(der: &[u8], label: &str) -> TdsResult<Vec<u8>> {
+fn der_to_pem(der: &[u8], label: &str) -> TdsResult<Vec<u8>> {
     let mut needed = 0u32;
     if unsafe {
         CryptBinaryToStringA(
@@ -703,6 +708,11 @@ unsafe fn der_to_pem(der: &[u8], label: &str) -> TdsResult<Vec<u8>> {
 
 /// CryptoAPI `CryptDecodeObjectEx` wrapped with the two-call size pattern. The
 /// returned buffer is self-contained (referenced data is stored inline).
+///
+/// # Safety
+///
+/// `struct_type` must be either a valid, NUL-terminated structure-type string
+/// or a predefined numeric identifier accepted by `CryptDecodeObjectEx`.
 unsafe fn decode_object(struct_type: windows_sys::core::PCSTR, der: &[u8]) -> TdsResult<Vec<u8>> {
     let mut needed = 0u32;
     if unsafe {
@@ -741,6 +751,13 @@ unsafe fn decode_object(struct_type: windows_sys::core::PCSTR, der: &[u8]) -> Td
 }
 
 /// CryptoAPI `CryptEncodeObjectEx` wrapped with the two-call size pattern.
+///
+/// # Safety
+///
+/// `struct_type` must be either a valid, NUL-terminated structure-type string
+/// or a predefined numeric identifier accepted by `CryptEncodeObjectEx`.
+/// `structure` must point to an initialized value of that type, and every
+/// buffer it references must remain valid for the duration of the call.
 #[cfg(test)]
 unsafe fn encode_object(
     struct_type: windows_sys::core::PCSTR,

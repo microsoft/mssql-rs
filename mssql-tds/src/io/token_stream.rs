@@ -50,6 +50,8 @@ use tokio::time::timeout;
 pub(crate) enum ColumnPolicy {
     /// Decode every column into the writer, never pause (push sinks).
     DecodeAll,
+    /// Decode columns before `end`, then pause without consuming column `end`.
+    DecodePrefix(usize),
     /// Skip columns `< target`, decode `target`, then pause after it.
     DecodeOne(usize),
     /// Skip every remaining column, allocating nothing (drain the current row).
@@ -60,6 +62,7 @@ pub(crate) enum ColumnPolicy {
 #[cfg(fuzzing)]
 pub enum ColumnPolicy {
     DecodeAll,
+    DecodePrefix(usize),
     DecodeOne(usize),
     SkipAll,
 }
@@ -548,11 +551,19 @@ async fn drive_row_columns<R: TdsPacketReader + Send + Sync, W: RowWriter + Send
     let decoder = GenericDecoder::default();
     let columns = &metadata.columns;
     for (col, meta) in columns.iter().enumerate().skip(start_col) {
+        if matches!(plan, ColumnPolicy::DecodePrefix(end) if col >= end) {
+            return Ok(RowReadResult::RowPaused(RowPauseState {
+                next_column_index: col,
+                metadata: Arc::clone(metadata),
+                nbc_null_bitmap: bitmap.cloned(),
+                decryptor: decryptor.cloned(),
+            }));
+        }
         let stop_here = matches!(plan, ColumnPolicy::DecodeOne(target) if target == col);
         let skip = match plan {
             ColumnPolicy::SkipAll => true,
             ColumnPolicy::DecodeOne(target) => col < target,
-            ColumnPolicy::DecodeAll => false,
+            ColumnPolicy::DecodeAll | ColumnPolicy::DecodePrefix(_) => false,
         };
 
         let is_null = bitmap.is_some_and(|bm| bm[col / 8] & (1 << (col % 8)) != 0);

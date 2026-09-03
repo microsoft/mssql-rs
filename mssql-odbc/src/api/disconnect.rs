@@ -29,6 +29,8 @@ pub(crate) unsafe fn sql_disconnect(connection_handle: SqlHandle) -> SqlReturn {
     })
 }
 
+/// # Safety
+/// `connection_handle` must be null or point to a live `DbcHandle`.
 unsafe fn sql_disconnect_impl(connection_handle: SqlHandle) -> SqlReturn {
     if connection_handle.is_null() {
         error!("SQLDisconnect: connection_handle is null");

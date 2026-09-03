@@ -26,7 +26,10 @@ use crate::handles::{DescHandle, HandleType, handle_from_raw};
 /// Implementation of [`SQLGetDescRecW`](super::exports::SQLGetDescRecW).
 ///
 /// # Safety
-/// See the exported function's doc for caller requirements.
+/// `descriptor_handle` must be null or point to a live `DescHandle`. `name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_get_desc_rec_w(
     descriptor_handle: SqlHandle,
@@ -72,6 +75,11 @@ pub(crate) unsafe fn sql_get_desc_rec_w(
     })
 }
 
+/// # Safety
+/// `descriptor_handle` must be null or point to a live `DescHandle`. `name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_get_desc_rec_w_impl(
     descriptor_handle: SqlHandle,

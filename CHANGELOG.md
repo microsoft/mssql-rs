@@ -157,6 +157,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   payload nor terminates a message — but was previously consumed as a
   zero-length packet. Empty end-of-message packets remain legal.
 
+- `mssql-odbc`: a data-at-execution (`SQLPutData`) character parameter whose C
+  type and declared SQL type disagreed on wideness — most commonly
+  `SQL_C_WCHAR` streamed against a narrow `SQL_VARCHAR`/`SQL_LONGVARCHAR`,
+  which is how mssql-python binds every ASCII string parameter once it exceeds
+  the ~4000-character inline threshold — was rejected outright with `HYC00`
+  ("Parameter conversion not yet implemented") instead of being bound.
+  `SQLPutData` cannot transcode a chunk in isolation, since a multi-byte
+  character can straddle two calls, so such a parameter's chunks are now
+  buffered instead of streamed untranscoded, and the complete value is
+  transcoded once, as a whole, when `SQLParamData` closes it.
+
 - `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced (AB#46385). Previously
   it was stored and reported back but silently ignored by `SQLExecute` and
   `SQLExecDirectW`, so a statement blocked server-side (e.g. behind another

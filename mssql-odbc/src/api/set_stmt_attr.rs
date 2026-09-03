@@ -115,6 +115,12 @@ pub(crate) unsafe fn sql_set_stmt_attr_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. For the two
+/// query-notification string attributes, `value_ptr` must be readable for
+/// `string_length` bytes of UTF-16 or through a NUL terminator when the length is
+/// `SQL_NTS`. Pointer-valued attributes must remain valid while associated with
+/// the statement.
 unsafe fn sql_set_stmt_attr_w_impl(
     statement_handle: SqlHandle,
     attribute: SqlInteger,
@@ -567,6 +573,11 @@ pub(crate) unsafe fn sql_get_stmt_attr_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `value_ptr`,
+/// when non-null, must be writable for `buffer_length` bytes for string-valued
+/// attributes or for one pointer-sized value otherwise. `string_length_ptr`,
+/// when non-null, must be writable for one `SqlInteger`.
 unsafe fn sql_get_stmt_attr_w_impl(
     statement_handle: SqlHandle,
     attribute: SqlInteger,
