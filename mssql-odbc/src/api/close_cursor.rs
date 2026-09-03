@@ -47,6 +47,8 @@ pub(crate) unsafe fn sql_free_stmt_close(statement_handle: SqlHandle) -> SqlRetu
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLCloseCursor: statement_handle is null");
@@ -114,6 +116,8 @@ fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
     }
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
 unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
     if statement_handle.is_null() {
         error!("SQLFreeStmt(SQL_CLOSE): statement_handle is null");
@@ -231,7 +235,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
     stmt_state.reset_row_stream();
-    stmt_state.column_metadata.clear();
+    stmt_state.clear_result_metadata();
     stmt_state.pending_row_counts.clear();
     stmt_state.clear_exhaustion_state();
 }

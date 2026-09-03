@@ -13,7 +13,7 @@ use crate::core::{
     CancelHandle, EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult,
 };
 use crate::datatypes::column_values::ColumnValues;
-use crate::datatypes::decoder::GenericDecoder;
+use crate::datatypes::decoder::{GenericDecoder, PlpColumnStream};
 use crate::datatypes::row_writer::RowWriter;
 use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
@@ -37,12 +37,24 @@ use std::cmp::min;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{self, TcpStream};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, error, event, info, trace, warn};
+
+/// Result of attempting to fully decode a buffered PLP column in one call.
+///
+/// Outer `None` means not enough bytes were buffered yet to complete the attempt (retry once
+/// more data arrives). `Some(None)` means the column is SQL NULL. `Some(Some((written,
+/// known_total, total_read)))` means the value was decoded: `written` is the payload bytes
+/// copied into the caller's output buffer this call, `known_total` is the value's declared
+/// length from the PLP header when the server sent a known length (`None` for unknown-length
+/// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
+type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
 
 #[cfg(windows)]
 use crate::connection::transport::localdb::resolve_localdb_instance;
@@ -907,6 +919,40 @@ impl NetworkTransport {
         Ok(())
     }
 
+    /// Non-blocking attempt to append one more complete TDS packet to the working buffer.
+    ///
+    /// Returns `Ok(true)` when a new packet was read and finalized synchronously (via
+    /// `try_get_new_tds_packet`'s no-op-waker poll). Returns `Ok(false)` when there is
+    /// nothing more to read right now: either the buffer already reached end-of-message, or
+    /// another maximum-sized packet cannot fit beside the unconsumed bytes, or the underlying
+    /// poll reported `Poll::Pending`. Callers must treat `Ok(false)` as "not ready", not as an
+    /// error or true end-of-data.
+    fn try_read_tds_packet(&mut self) -> TdsResult<bool> {
+        if self.tds_read_buffer.end_of_message {
+            return Ok(false);
+        }
+
+        let remaining_bytes = self.tds_read_buffer.get_remaining_byte_count();
+        // The async reader consumes this remainder while refilling; the
+        // synchronous probe cannot, so defer before another packet could overflow.
+        if remaining_bytes.saturating_add(self.tds_read_buffer.max_packet_size)
+            > self.tds_read_buffer.working_buffer.len()
+        {
+            return Ok(false);
+        }
+        if remaining_bytes > 0 {
+            self.tds_read_buffer.shift_data_to_front();
+        } else {
+            self.tds_read_buffer.reset_to_length(0);
+        }
+        let Some(new_packet_size) = self.try_get_new_tds_packet()? else {
+            return Ok(false);
+        };
+        self.tds_read_buffer
+            .remove_header_from_packet(new_packet_size);
+        Ok(true)
+    }
+
     /// Reads a complete TDS packet from the network into the working buffer.
     ///
     /// This method handles the case where a single `read()` call returns data for multiple
@@ -989,139 +1035,89 @@ impl NetworkTransport {
     /// - Shared Memory: Same as Named Pipes (uses Named Pipes internally)
     ///
     /// The fix ensures all bytes from `read()` are accounted for, not just the first packet.
-    async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
-        let base_offset = self.tds_read_buffer.buffer_length;
-
-        // Check if we have pending bytes from a previous read that included multiple packets
-        let mut bytes_available = self.tds_read_buffer.pending_bytes;
+    fn move_pending_packet_bytes(&mut self, base_offset: usize) -> TdsResult<usize> {
+        let bytes_available = self.tds_read_buffer.pending_bytes;
         let pending_offset = self.tds_read_buffer.pending_bytes_offset;
 
         if bytes_available > 0 {
-            // Validate bounds before copy_within to avoid panic on malformed data.
-            // These values are derived from packet lengths on the wire, so we must
-            // guard against corrupted or malicious packets.
             let src_end = pending_offset.saturating_add(bytes_available);
             let dest_end = base_offset.saturating_add(bytes_available);
             let buffer_len = self.tds_read_buffer.working_buffer.len();
-
             if src_end > buffer_len || dest_end > buffer_len {
                 return Err(crate::error::Error::ProtocolError(format!(
                     "Invalid pending bytes range: src {}..{}, dest {}, buffer_len {}",
                     pending_offset, src_end, base_offset, buffer_len
                 )));
             }
-
-            // We have pending bytes - move them to base_offset
             self.tds_read_buffer
                 .working_buffer
                 .copy_within(pending_offset..src_end, base_offset);
             self.tds_read_buffer.pending_bytes = 0;
             self.tds_read_buffer.pending_bytes_offset = 0;
         }
+        Ok(bytes_available)
+    }
 
-        let stream = self.stream.as_mut().ok_or_else(|| {
-            crate::error::Error::ConnectionClosed(
-                "Cannot read TDS packet: connection has been closed".to_string(),
-            )
-        })?;
-
-        // Read more data if we don't have enough for the header
-        while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
-            let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    // A read failure means the socket is broken; record it so the
-                    // cached liveness check reports the connection as dead.
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet header".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
+    /// Finalizes the packet at `base_offset` once `bytes_available` covers the full size
+    /// declared by its length header.
+    ///
+    /// Returns `Ok(None)` when fewer than a header's worth of bytes are available yet, or the
+    /// header is present but `bytes_available` doesn't yet cover the declared `packet_size`
+    /// (caller must read more before retrying). Returns `Ok(Some(packet_size))` once the
+    /// packet is complete: sets `end_of_message` from the packet's status flags and records
+    /// any bytes beyond `packet_size` as pending for the next packet. Returns `Err` for a
+    /// malformed, oversized, or out-of-bounds length header.
+    fn complete_tds_packet_if_available(
+        &mut self,
+        base_offset: usize,
+        bytes_available: usize,
+    ) -> TdsResult<Option<usize>> {
+        if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+            return Ok(None);
         }
 
         let length_from_packet_header = BigEndian::read_u16(
             &self.tds_read_buffer.working_buffer[base_offset + 2..base_offset + 4],
         );
-
-        let packet_size_from_header: usize = length_from_packet_header as usize;
-
-        // Validate packet_size_from_header against protocol constraints.
-        // A malicious or corrupted server could send invalid lengths.
-        if packet_size_from_header < PacketWriter::PACKET_HEADER_SIZE {
+        let packet_size = usize::from(length_from_packet_header);
+        if packet_size < PacketWriter::PACKET_HEADER_SIZE {
             return Err(crate::error::Error::ProtocolError(format!(
                 "Invalid TDS packet length {}: must be at least {} bytes (header size)",
-                packet_size_from_header,
+                packet_size,
                 PacketWriter::PACKET_HEADER_SIZE
             )));
         }
+        if packet_size > self.tds_read_buffer.max_packet_size {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "TDS packet length {} exceeds negotiated max packet size {}",
+                packet_size, self.tds_read_buffer.max_packet_size
+            )));
+        }
+        let buffer_len = self.tds_read_buffer.working_buffer.len();
+        if base_offset.saturating_add(packet_size) > buffer_len {
+            return Err(crate::error::Error::ProtocolError(format!(
+                "TDS packet length {} at offset {} exceeds buffer capacity {}",
+                packet_size, base_offset, buffer_len
+            )));
+        }
+        if bytes_available < packet_size {
+            return Ok(None);
+        }
 
-        // A payload-free packet that is not the end of its message is
-        // malformed: it neither carries payload nor terminates a message. An
-        // empty EOM packet is legal (it terminates a message), so only non-EOM
-        // ones are rejected.
         let is_end_of_message = self.tds_read_buffer.working_buffer[base_offset + 1]
             & PacketStatusFlags::Eom as u8
             != 0;
-        self.tds_read_buffer.end_of_message = is_end_of_message;
-        if packet_size_from_header == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
+        if packet_size == PacketWriter::PACKET_HEADER_SIZE && !is_end_of_message {
             return Err(crate::error::Error::ProtocolError(
                 "Received a payload-free TDS packet that is not end-of-message".to_string(),
             ));
         }
+        self.tds_read_buffer.end_of_message = is_end_of_message;
 
-        if packet_size_from_header > self.tds_read_buffer.max_packet_size {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} exceeds negotiated max packet size {}",
-                packet_size_from_header, self.tds_read_buffer.max_packet_size
-            )));
-        }
-
-        // Also ensure we won't exceed buffer capacity
-        let buffer_len = self.tds_read_buffer.working_buffer.len();
-        if base_offset.saturating_add(packet_size_from_header) > buffer_len {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "TDS packet length {} at offset {} exceeds buffer capacity {}",
-                packet_size_from_header, base_offset, buffer_len
-            )));
-        }
-
-        // Keep reading until we have the complete packet in memory.
-        while bytes_available < packet_size_from_header {
-            let bytes_read = match stream
-                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    self.known_dead = true;
-                    return Err(e.into());
-                }
-            };
-            if bytes_read == 0 {
-                self.known_dead = true;
-                return Err(crate::error::Error::ConnectionClosed(
-                    "Connection closed by server while reading TDS packet payload".to_string(),
-                ));
-            }
-            bytes_available += bytes_read;
-        }
-
-        // Calculate how many extra bytes we read beyond this packet
-        let extra_bytes = bytes_available - packet_size_from_header;
-
+        let extra_bytes = bytes_available - packet_size;
         if extra_bytes > 0 {
-            // Track where the extra bytes are - they're right after this packet in the buffer
             self.tds_read_buffer.pending_bytes = extra_bytes;
-            self.tds_read_buffer.pending_bytes_offset = base_offset + packet_size_from_header;
+            self.tds_read_buffer.pending_bytes_offset = base_offset + packet_size;
         } else {
             self.tds_read_buffer.pending_bytes = 0;
             self.tds_read_buffer.pending_bytes_offset = 0;
@@ -1130,19 +1126,124 @@ impl NetworkTransport {
         event!(
             tracing::Level::DEBUG,
             "Received packet of size: {:?}",
-            packet_size_from_header
+            packet_size
         );
-
         use pretty_hex::PrettyHex;
-
         event!(
             tracing::Level::DEBUG,
             "Packet content: {:?}",
-            &mut self.tds_read_buffer.working_buffer
-                [base_offset..base_offset + packet_size_from_header]
+            &mut self.tds_read_buffer.working_buffer[base_offset..base_offset + packet_size]
                 .hex_dump()
         );
-        Ok(packet_size_from_header)
+        Ok(Some(packet_size))
+    }
+
+    /// Records an in-progress, not-yet-complete packet's read position so the next call to
+    /// `try_get_new_tds_packet` resumes appending at `base_offset` with `bytes_available`
+    /// bytes already collected, instead of restarting.
+    ///
+    /// Debug-asserts that no pending bytes were already parked, since a fresh partial read
+    /// must never overwrite an unconsumed parked range.
+    fn park_partial_packet(&mut self, base_offset: usize, bytes_available: usize) {
+        debug_assert_eq!(self.tds_read_buffer.pending_bytes, 0);
+        self.tds_read_buffer.pending_bytes = bytes_available;
+        self.tds_read_buffer.pending_bytes_offset = base_offset;
+    }
+
+    /// Non-blocking probe for a complete TDS packet.
+    ///
+    /// A no-op waker makes `Poll::Pending` terminal for this probe, so callers
+    /// must treat `Ok(None)` as "not ready" and ultimately fall back to
+    /// `get_new_tds_packet`, which registers a real waker. The `&mut self`
+    /// receiver prevents this poll from replacing a parked async reader's waker.
+    fn try_get_new_tds_packet(&mut self) -> TdsResult<Option<usize>> {
+        let base_offset = self.tds_read_buffer.buffer_length;
+        let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        loop {
+            if let Some(packet_size) =
+                self.complete_tds_packet_if_available(base_offset, bytes_available)?
+            {
+                return Ok(Some(packet_size));
+            }
+
+            let stream = self.stream.as_mut().ok_or_else(|| {
+                crate::error::Error::ConnectionClosed(
+                    "Cannot read TDS packet: connection has been closed".to_string(),
+                )
+            })?;
+            let mut read_buffer = ReadBuf::new(
+                &mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..],
+            );
+            match Pin::new(stream).poll_read(&mut context, &mut read_buffer) {
+                Poll::Pending => {
+                    self.park_partial_packet(base_offset, bytes_available);
+                    return Ok(None);
+                }
+                Poll::Ready(Err(error)) => {
+                    self.known_dead = true;
+                    return Err(error.into());
+                }
+                Poll::Ready(Ok(())) => {
+                    let bytes_read = read_buffer.filled().len();
+                    if bytes_read == 0 {
+                        self.known_dead = true;
+                        let section = if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+                            "header"
+                        } else {
+                            "payload"
+                        };
+                        return Err(crate::error::Error::ConnectionClosed(format!(
+                            "Connection closed by server while reading TDS packet {section}"
+                        )));
+                    }
+                    bytes_available += bytes_read;
+                }
+            }
+        }
+    }
+
+    async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
+        let base_offset = self.tds_read_buffer.buffer_length;
+        let mut bytes_available = self.move_pending_packet_bytes(base_offset)?;
+
+        loop {
+            if let Some(packet_size) =
+                self.complete_tds_packet_if_available(base_offset, bytes_available)?
+            {
+                return Ok(packet_size);
+            }
+
+            let stream = self.stream.as_mut().ok_or_else(|| {
+                crate::error::Error::ConnectionClosed(
+                    "Cannot read TDS packet: connection has been closed".to_string(),
+                )
+            })?;
+            let bytes_read = match stream
+                .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
+                .await
+            {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    self.known_dead = true;
+                    return Err(error.into());
+                }
+            };
+            if bytes_read == 0 {
+                self.known_dead = true;
+                let section = if bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+                    "header"
+                } else {
+                    "payload"
+                };
+                return Err(crate::error::Error::ConnectionClosed(format!(
+                    "Connection closed by server while reading TDS packet {section}"
+                )));
+            }
+            bytes_available += bytes_read;
+        }
     }
 
     /// Tells the server to stop sending tokens for the token stream being read
@@ -1852,13 +1953,118 @@ impl NetworkTransport {
         Ok(Some((value, base)))
     }
 
+    /// Attempts to read `target`'s 8-byte PLP header from bytes already buffered in
+    /// `tds_read_buffer`, consuming those bytes only on success.
+    ///
+    /// Returns `Ok(None)` when `target` has no column metadata or the header isn't fully
+    /// buffered yet (not ready; retry once more bytes arrive). `Ok(Some(None))` means the
+    /// column is SQL NULL. `Ok(Some(Some(stream)))` returns a [`PlpColumnStream`] positioned
+    /// to read chunk payload via the buffered path.
+    pub(crate) fn try_begin_buffered_plp(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+    ) -> TdsResult<Option<Option<PlpColumnStream>>> {
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        let Some((stream, used)) = PlpColumnStream::try_begin_buffered(
+            metadata,
+            self.tds_read_buffer.get_buffered_slice(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.tds_read_buffer.consume_bytes(used)?;
+        Ok(Some(stream))
+    }
+
+    /// Attempts to fully decode `target`'s known-length, single-chunk PLP column from bytes
+    /// already buffered in `tds_read_buffer`, in one call, without leaving a resumable
+    /// [`PlpColumnStream`] behind.
+    ///
+    /// See [`CompleteBufferedPlp`] for the exact outer/inner/tuple semantics of the result;
+    /// `Ok(None)` also covers `target` having no column metadata, and a known-length header
+    /// whose chunk isn't a single complete chunk (caller must fall back to
+    /// `try_begin_buffered_plp` + `try_read_buffered_plp`).
+    pub(crate) fn try_read_complete_buffered_plp_column(
+        &mut self,
+        pause_state: &RowPauseState,
+        target: usize,
+        out: &mut [u8],
+    ) -> TdsResult<CompleteBufferedPlp> {
+        let Some(metadata) = pause_state.metadata.columns.get(target) else {
+            return Ok(None);
+        };
+        let buffered = self.tds_read_buffer.get_buffered_slice();
+        let Some((stream, header_used)) = PlpColumnStream::try_begin_buffered(metadata, buffered)?
+        else {
+            return Ok(None);
+        };
+        let Some(mut stream) = stream else {
+            self.tds_read_buffer.consume_bytes(header_used)?;
+            return Ok(Some(None));
+        };
+        let Some(remaining) = buffered.get(header_used..) else {
+            return Ok(None);
+        };
+        let Some((payload_used, written)) = stream.try_read_complete_buffered(remaining, out)?
+        else {
+            return Ok(None);
+        };
+        let total_used = header_used.checked_add(payload_used).ok_or_else(|| {
+            crate::error::Error::ProtocolError("Buffered PLP byte count overflowed".to_string())
+        })?;
+        let known_total = stream.known_len();
+        let total_read = stream.total_read();
+        self.tds_read_buffer.consume_bytes(total_used)?;
+        Ok(Some(Some((written, known_total, total_read))))
+    }
+
+    /// Continues reading payload for an in-progress buffered `plp_state`, pulling additional
+    /// TDS packets via `try_read_tds_packet` (non-blocking) whenever the currently buffered
+    /// bytes aren't enough.
+    ///
+    /// Returns `Ok(None)` once `try_read_tds_packet` reports no more data is available right
+    /// now (not ready). Returns `Ok(Some(written))` with the number of payload bytes copied
+    /// into `out` this call.
+    pub(crate) fn try_read_buffered_plp(
+        &mut self,
+        plp_state: &mut PlpPauseState,
+        out: &mut [u8],
+    ) -> TdsResult<Option<usize>> {
+        loop {
+            if let Some((used, written)) = plp_state
+                .plp_stream
+                .try_read_buffered(self.tds_read_buffer.get_buffered_slice(), out)?
+            {
+                self.tds_read_buffer.consume_bytes(used)?;
+                return Ok(Some(written));
+            }
+            if !self.try_read_tds_packet()? {
+                return Ok(None);
+            }
+        }
+    }
+
     /// Decodes consecutive buffered columns directly into `writer`.
     ///
     /// Returns `false` after preserving the partially advanced row state when
     /// the next value needs async continuation.
+    #[cfg(test)]
     pub(crate) fn try_read_buffered_row_into<W: RowWriter + ?Sized>(
         &mut self,
         pause_state: &mut RowPauseState,
+        writer: &mut W,
+    ) -> TdsResult<bool> {
+        self.try_read_buffered_row_prefix_into(pause_state, usize::MAX, writer)
+    }
+
+    /// Decodes consecutive buffered columns before `end_column` into `writer`.
+    pub(crate) fn try_read_buffered_row_prefix_into<W: RowWriter + ?Sized>(
+        &mut self,
+        pause_state: &mut RowPauseState,
+        end_column: usize,
         writer: &mut W,
     ) -> TdsResult<bool> {
         if pause_state.decryptor.is_some() {
@@ -1870,10 +2076,11 @@ impl NetworkTransport {
         let outcome = {
             let buffered = self.tds_read_buffer.get_buffered_slice();
             let mut outcome = Ok(true);
-            while let Some(metadata) = pause_state
-                .metadata
-                .columns
-                .get(pause_state.next_column_index)
+            while pause_state.next_column_index < end_column
+                && let Some(metadata) = pause_state
+                    .metadata
+                    .columns
+                    .get(pause_state.next_column_index)
             {
                 let col = pause_state.next_column_index;
                 if pause_state
@@ -1916,7 +2123,11 @@ impl NetworkTransport {
             outcome
         };
         self.tds_read_buffer.consume_bytes(consumed)?;
-        outcome
+        outcome.map(|complete| {
+            complete
+                && (pause_state.next_column_index >= end_column
+                    || pause_state.next_column_index >= pause_state.metadata.columns.len())
+        })
     }
 
     pub(crate) async fn receive_token(
@@ -2339,6 +2550,93 @@ pub(crate) mod tests {
         )
     }
 
+    /// A stream whose reads always fail, used to exercise the I/O-error arm of
+    /// `try_get_new_tds_packet` that a duplex stream's plain EOF can't reach.
+    struct ErroringStream;
+
+    impl AsyncRead for ErroringStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(Error::new(
+                ErrorKind::ConnectionReset,
+                "synthetic read failure",
+            )))
+        }
+    }
+
+    impl AsyncWrite for ErroringStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for ErroringStream {
+        fn tls_handshake_starting(&mut self) {}
+        fn tls_handshake_completed(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn get_new_tds_packet_surfaces_a_read_error_and_marks_the_connection_dead() {
+        let context = ClientContext::default();
+        let ssl_handler = SslHandler {
+            server_host_name: context.transport_context.get_server_name().clone(),
+            encryption_options: context.encryption_options.clone(),
+        };
+        let mut transport = NetworkTransport::new(
+            Box::new(ErroringStream),
+            ssl_handler,
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        );
+
+        let err = transport
+            .read_tds_packet()
+            .await
+            .expect_err("a failing stream must surface its read error");
+        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(transport.known_dead);
+    }
+
+    #[tokio::test]
+    async fn try_get_new_tds_packet_surfaces_a_read_error_and_marks_the_connection_dead() {
+        // Same as above, but through the synchronous, non-blocking
+        // `try_get_new_tds_packet` poll used by the buffered PLP read loop.
+        let context = ClientContext::default();
+        let ssl_handler = SslHandler {
+            server_host_name: context.transport_context.get_server_name().clone(),
+            encryption_options: context.encryption_options.clone(),
+        };
+        let mut transport = NetworkTransport::new(
+            Box::new(ErroringStream),
+            ssl_handler,
+            context.packet_size as u32,
+            context.encryption_options.mode,
+            false,
+        );
+
+        let err = transport
+            .try_read_tds_packet()
+            .expect_err("a failing stream must surface its read error");
+        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(transport.known_dead);
+    }
+
     #[tokio::test]
     async fn test_network_transport_send() {
         let context = ClientContext {
@@ -2652,6 +2950,194 @@ pub(crate) mod tests {
 
         // No pending bytes
         assert_eq!(transport.tds_read_buffer.pending_bytes, 0);
+    }
+
+    fn tabular_packet(payload: &[u8], end_of_message: bool) -> Vec<u8> {
+        let packet_len = PacketWriter::PACKET_HEADER_SIZE + payload.len();
+        let mut packet = vec![0; packet_len];
+        packet[0] = PacketType::TabularResult as u8;
+        packet[1] = u8::from(end_of_message);
+        BigEndian::write_u16(&mut packet[2..4], u16::try_from(packet_len).unwrap());
+        packet[PacketWriter::PACKET_HEADER_SIZE..].copy_from_slice(payload);
+        packet
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_appends_an_available_packet() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        server
+            .write_all(&tabular_packet(b"second", true))
+            .await
+            .unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_returns_pending_without_losing_payload() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        assert!(!transport.try_read_tds_packet().unwrap());
+        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"first");
+    }
+
+    #[tokio::test]
+    async fn buffered_plp_probe_defers_before_exhausting_packet_buffer() {
+        const PACKET_SIZE: usize = 512;
+        const PACKET_PAYLOAD: usize = PACKET_SIZE - PacketWriter::PACKET_HEADER_SIZE;
+        const VALUE_LEN: usize = 1600;
+
+        let mut plp_wire = Vec::with_capacity(VALUE_LEN + 8);
+        plp_wire.extend_from_slice(&u32::try_from(VALUE_LEN).unwrap().to_le_bytes());
+        plp_wire.extend(std::iter::repeat_n(0xAB, VALUE_LEN));
+        plp_wire.extend_from_slice(&0_u32.to_le_bytes());
+
+        let chunks = plp_wire.chunks(PACKET_PAYLOAD);
+        let packet_count = chunks.len();
+        let mut packets = Vec::new();
+        for (index, chunk) in chunks.enumerate() {
+            packets.extend_from_slice(&tabular_packet(chunk, index + 1 == packet_count));
+        }
+
+        let context = ClientContext {
+            packet_size: u16::try_from(PACKET_SIZE).unwrap(),
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server.write_all(&packets).await.unwrap();
+
+        let metadata = ColumnMetadata {
+            user_type: 0,
+            flags: 0,
+            type_info: TypeInfo::partial_len(
+                TdsDataType::BigVarBinary,
+                usize::from(u16::MAX),
+                None,
+            )
+            .unwrap(),
+            data_type: TdsDataType::BigVarBinary,
+            column_name: "payload".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+        let (stream, _) =
+            PlpColumnStream::try_begin_buffered(&metadata, &(VALUE_LEN as u64).to_le_bytes())
+                .unwrap()
+                .unwrap();
+        let mut plp_state = PlpPauseState {
+            row_pause_state: RowPauseState {
+                next_column_index: 1,
+                metadata: Arc::new(ColMetadataToken {
+                    column_count: 1,
+                    columns: vec![metadata],
+                    cek_table: Vec::new(),
+                }),
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            plp_stream: stream.unwrap(),
+        };
+        let mut out = vec![0; 1300];
+
+        assert!(matches!(
+            transport.try_read_buffered_plp(&mut plp_state, &mut out),
+            Ok(None)
+        ));
+        assert_eq!(
+            transport
+                .read_active_plp_bytes(&mut plp_state, None, None, &mut out)
+                .await
+                .unwrap(),
+            out.len()
+        );
+        assert!(out.iter().all(|byte| *byte == 0xAB));
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_preserves_a_fragmented_header() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        let second = tabular_packet(b"second", true);
+        server.write_all(&second[..4]).await.unwrap();
+        assert!(!transport.try_read_tds_packet().unwrap());
+        server.write_all(&second[4..]).await.unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_preserves_a_fragmented_payload() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"first", false))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        let second = tabular_packet(b"second", true);
+        server.write_all(&second[..10]).await.unwrap();
+        assert!(!transport.try_read_tds_packet().unwrap());
+        server.write_all(&second[10..]).await.unwrap();
+        assert!(transport.try_read_tds_packet().unwrap());
+        assert_eq!(
+            transport.tds_read_buffer.get_buffered_slice(),
+            b"firstsecond"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_packet_probe_stops_at_end_of_message() {
+        let context = ClientContext {
+            packet_size: 512,
+            ..Default::default()
+        };
+        let (mut transport, mut server) = create_readable_network_transport(&context);
+        server
+            .write_all(&tabular_packet(b"only", true))
+            .await
+            .unwrap();
+        transport.read_tds_packet().await.unwrap();
+
+        assert!(!transport.try_read_tds_packet().unwrap());
+        assert_eq!(transport.tds_read_buffer.get_buffered_slice(), b"only");
     }
 
     /// Test that demonstrates the multi-packet read bug WITHOUT checking internal fields.

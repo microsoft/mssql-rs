@@ -48,6 +48,10 @@ pub(crate) unsafe fn sql_prepare_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`.
+/// `statement_text` must be readable for `text_length` UTF-16 code units, or
+/// through a NUL terminator when `text_length` is `SQL_NTS`.
 unsafe fn sql_prepare_w_impl(
     statement_handle: SqlHandle,
     statement_text: *const SqlWChar,
@@ -123,7 +127,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
         marker_count,
     });
     stmt_state.parameter_metadata.clear();
-    stmt_state.column_metadata.clear();
+    stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.set_state(STMT_STATE_PREPARED);

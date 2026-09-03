@@ -40,6 +40,10 @@ pub(crate) unsafe fn sql_get_env_attr(
     })
 }
 
+/// # Safety
+/// `environment_handle` must be null or point to a live `EnvHandle`.
+/// `value_ptr`, when non-null, must be writable for one `u32`, and
+/// `string_length_ptr`, when non-null, must be writable for one `SqlInteger`.
 unsafe fn sql_get_env_attr_impl(
     environment_handle: SqlHandle,
     attribute: SqlInteger,

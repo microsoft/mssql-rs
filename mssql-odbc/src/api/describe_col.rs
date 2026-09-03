@@ -17,11 +17,18 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_INVALID_DESCRIPTOR_INDEX, WARN_STRING_TRUNCATION, post_diag,
 };
-use crate::api::util::{copy_with_nul, write_if_some};
+use crate::api::util::{copy_utf16_with_nul, copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
+/// Gets metadata for a result-set column.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_describe_col_w(
     statement_handle: SqlHandle,
@@ -62,6 +69,11 @@ pub(crate) unsafe fn sql_describe_col_w(
     })
 }
 
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. `column_name`,
+/// when non-null, must be writable for `buffer_length` UTF-16 code units. Every
+/// other output pointer, when non-null, must be writable for one value of its
+/// pointed-to type.
 #[allow(clippy::too_many_arguments)]
 unsafe fn sql_describe_col_w_impl(
     statement_handle: SqlHandle,
@@ -137,11 +149,25 @@ fn sql_describe_col_w_safe(
 
     let meta = &stmt_state.column_metadata[(column_number - 1) as usize];
 
-    let name_utf16: Vec<u16> = meta.column_name.encode_utf16().collect();
-    let name_len = SqlSmallInt::try_from(name_utf16.len()).unwrap_or(SqlSmallInt::MAX);
+    let cached_name = stmt_state
+        .column_names_utf16
+        .get((column_number - 1) as usize);
+    let name_len = SqlSmallInt::try_from(
+        cached_name.map_or_else(|| meta.column_name.encode_utf16().count(), Vec::len),
+    )
+    .unwrap_or(SqlSmallInt::MAX);
     unsafe { write_if_some(name_length_ptr, name_len) };
 
-    let truncated = unsafe { copy_with_nul(column_name, buffer_length as usize, &name_utf16) };
+    let truncated = match cached_name {
+        // SAFETY: per the SQLDescribeColW contract `column_name` is null or
+        // writable for `buffer_length` `SqlWChar`s, and `buffer_length` is
+        // nonnegative; both helpers null-check and reserve the terminator.
+        Some(name) => unsafe { copy_with_nul(column_name, buffer_length as usize, name) },
+        // SAFETY: as above, writing the same buffer from the uncached name.
+        None => unsafe {
+            copy_utf16_with_nul(column_name, buffer_length as usize, &meta.column_name)
+        },
+    };
 
     unsafe { write_if_some(data_type_ptr, odbc_sql_type(meta)) };
     unsafe { write_if_some(column_size_ptr, column_size(meta)) };
@@ -313,9 +339,13 @@ mod tests {
 
     use super::*;
     use crate::test_support::TestHandles;
+    use mssql_tds::test_client_support::int_columns;
 
     /// Calls `sql_describe_col_w` with default-ish out pointers. Intended for
     /// error-path tests where the values of the out params are irrelevant.
+    ///
+    /// # Safety
+    /// `stmt` must be null or point to a live `StmtHandle`.
     unsafe fn describe(stmt: SqlHandle, column_number: SqlUSmallInt) -> SqlReturn {
         let mut data_type: SqlSmallInt = 0;
         let mut col_size: u64 = 0;
@@ -406,5 +436,37 @@ mod tests {
             stmt_state.diag_records[0].sql_state,
             ERR_INVALID_DESCRIPTOR_INDEX.state
         );
+    }
+
+    #[test]
+    fn uncached_column_name_is_encoded_on_demand() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_EXEC_CONTEXT);
+            state.column_metadata = int_columns(1);
+            assert!(state.column_names_utf16.is_empty());
+        }
+
+        let mut name = [0_u16; 3];
+        let mut name_len = 0;
+        let rc = unsafe {
+            sql_describe_col_w(
+                h.stmt,
+                1,
+                name.as_mut_ptr(),
+                SqlSmallInt::try_from(name.len()).unwrap(),
+                &mut name_len,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(name, [u16::from(b'c'), u16::from(b'1'), 0]);
+        assert_eq!(name_len, 2);
     }
 }
