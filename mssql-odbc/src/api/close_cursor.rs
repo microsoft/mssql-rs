@@ -15,7 +15,7 @@ use crate::api::odbc_types::{
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
 ///
@@ -287,6 +287,25 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
         }
         return DrainOutcome::Failed;
     };
+
+    // The drain is a server round-trip, so it needs the scheduler's worker to
+    // drive the socket. During `DLL_PROCESS_DETACH` the OS has already
+    // terminated that worker and `block_on` would park this thread forever
+    // (AB#47510). Reached whenever a host frees a statement with an open cursor
+    // from an `onexit` handler. Skipping costs nothing the exit does not
+    // already cost: the undrained rows die with the connection, and the client
+    // is still returned below so the DBC is left consistent for whatever
+    // teardown runs after this.
+    if process_is_shutting_down() {
+        debug!("drain_and_release: process is exiting — skipping the drain round-trip");
+        if let Ok(mut ds) = dbc.inner.lock() {
+            ds.client = Some(client);
+            if ds.active_stmt == Some(statement_handle) {
+                ds.active_stmt = None;
+            }
+        }
+        return DrainOutcome::Clean;
+    }
 
     if let Err(e) = dbc.runtime.block_on(client.close_query()) {
         error!(%e, "drain_and_release: failed to drain TDS stream — connection may be broken");

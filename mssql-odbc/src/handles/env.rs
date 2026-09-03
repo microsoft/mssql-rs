@@ -44,23 +44,43 @@ impl TryFrom<u32> for OdbcVersion {
 /// lock. Synchronizing with those threads is what the loader documentation
 /// forbids during detach.
 ///
+/// **Any teardown path that would touch the shared runtime must consult this
+/// first.** `SharedRuntime::drop` is not the only one: an ODBC handle freed
+/// from a host's `onexit` table cascades into cursor drains, `sp_unprepare`
+/// round-trips, and data-at-execution unwinds, each of which reaches
+/// `Runtime::block_on`. That is strictly worse than the `shutdown_background`
+/// this type avoids — `block_on` parks the calling thread and needs the
+/// scheduler's worker to drive the socket, so with that worker already
+/// terminated the round-trip can never complete. Every such site is
+/// best-effort cleanup the server redoes when the connection drops, so the
+/// correct move during shutdown is to skip it (AB#47510).
+///
 /// Declared by hand rather than taken from the `windows` crate this crate
 /// already depends on: the flag is an `ntdll` export that the Win32 metadata
 /// does not cover, so neither `windows` 0.58 nor `windows-sys` 0.59 exposes it.
 #[cfg(windows)]
-fn process_is_shutting_down() -> bool {
+pub(crate) fn process_is_shutting_down() -> bool {
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn RtlDllShutdownInProgress() -> u8;
     }
-    // SAFETY: no arguments and no out-parameters; reads a loader flag.
+    // SAFETY: `RtlDllShutdownInProgress` is an undocumented but stable `ntdll`
+    // export whose signature — `BOOLEAN RtlDllShutdownInProgress(VOID)` — is
+    // asserted by the declaration above rather than checked by an import
+    // library. It takes no arguments, writes through no out-parameter, and
+    // returns a one-byte `BOOLEAN`, so the only way this could be unsound is
+    // if that signature were wrong: a mismatched return width would read
+    // uninitialised bytes of the return register and make the flag arbitrary,
+    // which would leak every runtime rather than corrupt memory. The name is
+    // also resolved at load time, so a missing export fails the driver's own
+    // load rather than dispatching to the wrong address.
     unsafe { RtlDllShutdownInProgress() != 0 }
 }
 
 /// Non-Windows platforms do not terminate the process's other threads before
-/// running library teardown, so the runtime can always be shut down normally.
+/// running library teardown, so the runtime can always be used normally.
 #[cfg(not(windows))]
-fn process_is_shutting_down() -> bool {
+pub(crate) fn process_is_shutting_down() -> bool {
     false
 }
 

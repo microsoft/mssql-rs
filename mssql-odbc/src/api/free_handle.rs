@@ -15,7 +15,7 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{
     DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, free_handle, handle_from_raw,
-    live_type,
+    live_type, process_is_shutting_down,
 };
 use mssql_tds::connection::tds_client::StatementId;
 
@@ -464,6 +464,20 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
     let Some(mut client) = try_claim_idle_client(dbc, handle) else {
         return;
     };
+
+    // Same trade as the skip above, on a harder deadline. `block_on` parks this
+    // thread until the scheduler's worker drives the socket, and during
+    // `DLL_PROCESS_DETACH` the OS has already terminated that worker — the
+    // round-trip would never complete, hanging a process that has finished its
+    // work. Reached whenever a host frees its handles from an `onexit` handler
+    // with a prepared statement still outstanding (AB#47510).
+    if process_is_shutting_down() {
+        debug!(
+            "SQLFreeHandle(STMT): process is exiting — leaving handles for the server to reclaim"
+        );
+        return_client_idle(dbc, handle, client);
+        return;
+    }
 
     // `unprepare` skips a handle from a superseded session (already gone
     // server-side) and releases a live one.

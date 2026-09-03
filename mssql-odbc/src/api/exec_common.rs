@@ -7,7 +7,7 @@
 //! execution paths stay in lockstep. None of these helpers hold a lock across
 //! network I/O.
 
-use tracing::error;
+use tracing::{debug, error};
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -31,7 +31,9 @@ use crate::handles::stmt::{
     DaeParam, DaeState, PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT,
     STMT_STATE_EXEC_STARTED, StmtState,
 };
-use crate::handles::{DbcHandle, DescHandle, StmtHandle, handle_from_raw};
+use crate::handles::{
+    DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
+};
 use crate::params::BoundParam;
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
@@ -73,7 +75,19 @@ pub(super) fn unwind_dae(
     };
 
     if let Some(mut client) = client {
-        dbc.runtime.block_on(client.cancel_streamed_write());
+        // `cancel_streamed_write` writes the request's cancel and drains the
+        // response, so it needs the scheduler's worker to drive the socket.
+        // During `DLL_PROCESS_DETACH` that worker is already terminated and
+        // `block_on` would park this thread forever (AB#47510) — reachable
+        // because `SQLFreeHandle(SQL_HANDLE_STMT)` unwinds a parked DAE
+        // sequence before freeing. The half-written request dies with the
+        // connection the exiting process is about to drop, so only the client
+        // hand-back below still matters.
+        if process_is_shutting_down() {
+            debug!("unwind_dae: process is exiting — skipping the cancel round-trip");
+        } else {
+            dbc.runtime.block_on(client.cancel_streamed_write());
+        }
         return_client_idle(dbc, statement_handle, client);
     }
 }
