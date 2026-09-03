@@ -1259,7 +1259,8 @@ TEST_F(ScalarConversionLiveTest, VariantWithNoColumnSizeIsNotAMaxType) {
 // clamped to it. Measured on retail 18.6.2.1: every ColumnSize from 0 to 8000
 // executes, so msodbcsql never lands on a max inner type either.
 TEST_F(ScalarConversionLiveTest, AWideVariantIsNeverAMaxType) {
-    for (SQLULEN size : {SQLULEN{0}, SQLULEN{3000}, SQLULEN{5000}, SQLULEN{8000}}) {
+    for (SQLULEN size : {SQLULEN{0}, SQLULEN{3000}, SQLULEN{5000}, SQLULEN{8000}, SQLULEN{8001},
+                         SQLULEN{100000}}) {
         ASSERT_SQL_OK(Prepare(kBaseTypeQuery), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(BindWide(SQL_SS_VARIANT, "hi", size), SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ("nvarchar", ExecuteAndReadBack()) << "ColumnSize " << size;

@@ -2170,6 +2170,10 @@ mod tests {
             (0, SQL_PREC_NCHAR as u16),
             // Past the wide ceiling but inside the narrow one: clamped, not `max`.
             (5000, SQL_PREC_NCHAR as u16),
+            // `SQL_SS_VARIANT` has no upper bound at bind (`type_rules.rs`
+            // answers `true` for it), so the clamp has to hold for any size.
+            (8001, SQL_PREC_NCHAR as u16),
+            (usize::MAX, SQL_PREC_NCHAR as u16),
         ];
 
         for &(column_size, expected) in cases {
