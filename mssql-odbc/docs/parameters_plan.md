@@ -124,11 +124,11 @@ transparent reconnects.
   value only bounds accumulation: the transform `SQLParamData` runs at close
   (`decode_utf16le`, `String::from_utf8_lossy`, `encode_narrow`) still
   allocates its output infallibly, and can be several times the buffered
-  size (NCR substitution alone is up to 8 bytes per unmappable character), so
-  a value that just fit under the guard can still abort the process one call
-  later. Not fixed: `AppText`/`decode_utf16le` are shared with the
-  materialized path, so bounding them is a broader change than this file's
-  DAE-specific scope (AB#47590).
+  size (NCR substitution alone is up to 10 bytes per unmappable character,
+  measured for U+10FFFF), so a value that just fit under the guard can still
+  abort the process one call later. Not fixed: `AppText`/`decode_utf16le` are
+  shared with the materialized path, so bounding them is a broader change
+  than this file's DAE-specific scope (AB#47590).
   Cross-*family* pairings (character/binary against an integer SQL type) are
   still **not** streamable: there is no transcode from arbitrary bytes to an
   integer wire value. Since P5 made those pairings bindable, the refusal

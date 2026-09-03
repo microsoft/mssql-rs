@@ -330,8 +330,9 @@ pub(crate) fn dae_placeholder_type(
 ///
 /// `SQLPutData`'s `try_reserve` guard against an unbounded `SQL_DATA_AT_EXEC`
 /// value stops here: `decode_utf16le`, `String::from_utf8_lossy`, and
-/// `encode_narrow`'s `encoding_rs::encode` (up to 8 bytes per character for an
-/// NCR substitution the target codepage can't represent) all allocate their
+/// `encode_narrow`'s `encoding_rs::encode` (up to 10 bytes per character for
+/// an NCR substitution the target codepage can't represent -- measured
+/// `&#1114111;` for U+10FFFF, the maximum scalar value) all allocate their
 /// output infallibly, so a value that just fit under that guard can still
 /// abort the process during this transform -- arguably a wider window, since
 /// the guard checks per chunk and this is one allocation for the whole value.
