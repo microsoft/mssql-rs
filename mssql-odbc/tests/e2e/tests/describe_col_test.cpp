@@ -7,7 +7,7 @@
 //   3.  BasicMetadata                       - INT/VARCHAR/NVARCHAR cols → name + type + size
 //   4.  NameTruncationReturnsInfo           - short name buf → SUCCESS_WITH_INFO + 01004 + full length
 //   5.  InvalidColumnOrdinal                - column 0 (bookmark) and past-end → 07009
-//   6.  DecimalPrecisionAndScale            - DECIMAL(10,2) → SQL_DECIMAL, colSize=10, decDigits=2
+//   6.  DecimalAndNumericPrecisionAndScale  - DECIMAL/NUMERIC preserve distinct SQL type codes
 //   7.  NullableFlag                        - sys.objects.name (NOT NULL) vs principal_id (NULL)
 //   8.  DateTime2AndDateTimeOffset          - datetime2 → SQL_TYPE_TIMESTAMP, datetimeoffset → -155
 //   9.  NVarCharColumnSizeIsCharCount       - NVARCHAR(100) → colSize=100 (chars, not bytes)
@@ -142,8 +142,8 @@ TEST_F(DescribeColLiveTest, InvalidColumnOrdinal) {
     SQLCloseCursor(stmt_);
 }
 
-TEST_F(DescribeColLiveTest, DecimalPrecisionAndScale) {
-    ExecDirect("SELECT CAST(3.14 AS DECIMAL(10,2)) AS d");
+TEST_F(DescribeColLiveTest, DecimalAndNumericPrecisionAndScale) {
+    ExecDirect("SELECT CAST(3.14 AS DECIMAL(10,2)) AS d, CAST(6.28 AS NUMERIC(12,3)) AS n");
 
     SQLSMALLINT dataType = 0;
     SQLULEN colSize = 0;
@@ -156,6 +156,13 @@ TEST_F(DescribeColLiveTest, DecimalPrecisionAndScale) {
     EXPECT_EQ(SQL_DECIMAL, dataType);
     EXPECT_EQ(10u, colSize);
     EXPECT_EQ(2, decDigits);
+
+    rc = SQLDescribeCol(
+        stmt_, 2, nullptr, 0, nullptr, &dataType, &colSize, &decDigits, &nullable);
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NUMERIC, dataType);
+    EXPECT_EQ(12u, colSize);
+    EXPECT_EQ(3, decDigits);
 
     SQLCloseCursor(stmt_);
 }
