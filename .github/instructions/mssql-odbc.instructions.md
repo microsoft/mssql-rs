@@ -566,6 +566,19 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   AB#47537 is the worked example — a zero-length `SQL_C_BINARY` probe answered
   `SQL_SUCCESS` with the byte count, and mssql-python copied those bytes out of
   the empty buffer it had passed.
+- **When an entry point answers the same request in more than one place, route
+  the answer through one shared function rather than repeating the rule.**
+  `SQLGetData` answers the zero-length `SQL_C_BINARY` probe both on the buffered
+  fast path in `sql_get_data_safe` and in `write_captured_column`, ~750 lines
+  apart in different functions. AB#47537 was fixed in the second and reopened by
+  a concurrent change that added the first: the merge was textually clean, every
+  unit test kept passing because they drove the fixed function directly, and the
+  crash came back on the only path the reporting application actually takes.
+  Both now go through `answer_binary_probe`. Two lessons worth generalising: a
+  test that calls an inner function directly proves nothing about which branch
+  production traffic reaches, so cover the entry point as the application calls
+  it; and duplicated protocol rules do not announce themselves when they drift,
+  because nothing conflicts.
 
 ## Types and casts
 

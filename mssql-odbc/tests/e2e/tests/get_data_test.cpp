@@ -1668,6 +1668,71 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceedsAndConsumesColu
     SQLCloseCursor(stmt_);
 }
 
+// AB#47537, second site. The two tests above run on a single-column result set,
+// which does not produce a buffered row, so they only ever exercise the
+// `write_captured_column` probe. #446 later added a second probe on the buffered
+// fast path in `sql_get_data_safe`, which returns before that one is reached --
+// and it is the path mssql-python's `arrow_batch` actually takes, because its
+// unbound single-row fetch is precisely what makes a row buffered.
+//
+// The two blocks sit ~750 lines apart in different functions, so the merge that
+// brought them together was textually clean and every existing test stayed
+// green while the reachable path silently regressed to the original SIGSEGV.
+// This test reproduces `test_arrow_lob_wide`'s actual shape -- a fixed
+// `binary(9)` alongside an `nvarchar(max)`, fetched unbound -- so the buffered
+// probe is covered on its own terms rather than by inference from the captured
+// one.
+//
+// The MAX column is what forces the whole result set onto SQLGetData and makes
+// the driver buffer the inline prefix; the `binary(9)` is the column that
+// crashed. It is read without ever binding a column, exactly as mssql-python
+// does.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationOnBufferedRow) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('asdfghjkl' AS BINARY(9)) AS c1,"
+                             " CAST(N'hey' AS NVARCHAR(MAX)) AS c2"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind))
+        << "a buffered-row probe must report truncation just like a captured one";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(9, ind);
+
+    // Bytes remain, so the column stays readable rather than being retired.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_EQ(9, ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// The empty-value half of the buffered path: nothing remains, so the probe is a
+// plain success and the column is consumed.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyBufferedValueConsumesColumn) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARBINARY(8)) AS c1,"
+                             " CAST(N'hey' AS NVARCHAR(MAX)) AS c2"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN ind = -1;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_EQ(0, ind);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+
+    // The MAX column that follows must still be readable -- retiring column 1
+    // must not disturb the rest of the row.
+    std::vector<SQLCHAR> buf(64, 0);
+    SQLLEN text_ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 2, SQL_C_CHAR, buf.data(),
+                              static_cast<SQLLEN>(buf.size()), &text_ind);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "rc=" << rc;
+    EXPECT_STREQ("hey", reinterpret_cast<const char*>(buf.data()));
+
+    SQLCloseCursor(stmt_);
+}
+
 // An integer column delivered to its natural fixed-width C target, rather than
 // being rendered as text.
 TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {

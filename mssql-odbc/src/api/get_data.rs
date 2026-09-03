@@ -242,17 +242,47 @@ fn sql_get_data_safe(
     if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
         row.discard_before(col_index - 1);
         let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
-        if binary_probe
-            && let Some(value) = row.values.get(col_index - 1).and_then(Option::as_ref)
-            && !matches!(value, ColumnValues::Null)
-        {
-            let length = binary_length(value);
-            let variant_base = row.variant_bases.get(col_index - 1).copied().flatten();
-            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+        // Length and base type are lifted out of the row before any
+        // `stmt_state` mutation, so the row borrow ends here.
+        let probe = if binary_probe {
+            row.values
+                .get(col_index - 1)
+                .and_then(Option::as_ref)
+                .filter(|value| !matches!(value, ColumnValues::Null))
+                .map(|value| {
+                    (
+                        binary_length(value),
+                        row.variant_bases.get(col_index - 1).copied().flatten(),
+                    )
+                })
+        } else {
+            None
+        };
+        if let Some((available, variant_base)) = probe {
+            // Routed through the shared helper rather than answering here, so
+            // this path and `write_captured_column` cannot disagree about what a
+            // probe means. They did once, and it reopened AB#47537 (see
+            // `answer_binary_probe`): this is the site mssql-python's
+            // `arrow_batch` actually reaches, because its unbound single-row
+            // fetch is exactly what makes a row buffered.
+            //
             // SAFETY: per the SQLGetData contract `strlen_or_ind_ptr` is null or
             // writable for one `SqlLen`; `write_if_some` null-checks.
-            unsafe { write_if_some(strlen_or_ind_ptr, length) };
-            return SQL_SUCCESS;
+            let rc = unsafe { answer_binary_probe(&mut stmt_state, available, strlen_or_ind_ptr) };
+            stmt_state.last_variant_base = variant_base.map(|base| (col_index, base));
+            if rc == SQL_SUCCESS {
+                // Fully delivered, so retire the column the same way the
+                // complete-delivery arms below do.
+                if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
+                    row.consumed = row.consumed.max(col_index);
+                }
+                stmt_state.current_row_last_col = col_index;
+                stmt_state.partial_text_offset = None;
+                return finish_get_data(stmt, statement_handle, stmt_state, col_index, rc);
+            }
+            // Bytes remain: leave the column readable so the caller can grow its
+            // buffer and come back for the value.
+            return rc;
         }
 
         // The eight-column cutoff is only a performance gate: below it, the
@@ -988,33 +1018,25 @@ fn write_captured_column(
     // Fixed / typed C targets deliver the whole value in one call through the
     // shared conversion core; only the character targets chunk.
     if binary_probe {
-        // Report what is available and leave the value resident — the caller
-        // reads it for real on a following call. Bytes left undelivered make
-        // this a truncation, and saying so is what tells the caller a second
-        // call is needed: `SQL_SUCCESS` claims its zero-length buffer now holds
-        // the value, and mssql-python then copies `indicator` bytes out of the
-        // empty buffer it passed, crashing the interpreter (AB#47537).
-        // `SQL_NO_TOTAL` is a truncation too — bytes remain, the count is just
-        // not known. Measured identical on msodbcsql 18.6.2.1: a `binary(9)`
-        // column answers `SQLGetData(SQL_C_BINARY, NULL, 0)` with
-        // `SQL_SUCCESS_WITH_INFO`, `01004` and indicator 9.
+        // Measured on msodbcsql 18.6.2.1: `binary(9)` answers
+        // `SQLGetData(SQL_C_BINARY, NULL, 0)` with `SQL_SUCCESS_WITH_INFO` /
+        // `01004` / indicator 9, while an empty `varbinary` answers
+        // `SQL_SUCCESS` and reports `SQL_NO_DATA` on a repeat.
         let available = binary_length(value);
-        unsafe { write_if_some(strlen_or_ind_ptr, available) };
-        if available == 0 {
-            // Nothing was left behind, so this call delivered the whole value
-            // and the column is done: consume it so a repeat reports
-            // SQL_NO_DATA and a last-column read can reach
-            // `finish_get_data`'s completion path. Measured on msodbcsql
-            // 18.6.2.1: a second probe of an empty `varbinary` answers
-            // SQL_NO_DATA, while a second probe of `binary(9)` repeats
-            // SQL_SUCCESS_WITH_INFO / 01004 because bytes are still pending.
+        // SAFETY: `strlen_or_ind_ptr` is null or valid for one `SqlLen` write
+        // per the SQLGetData contract.
+        let rc = unsafe { answer_binary_probe(stmt_state, available, strlen_or_ind_ptr) };
+        if rc == SQL_SUCCESS {
+            // Fully delivered, so the column is done: consume it, letting a
+            // repeat report SQL_NO_DATA and a last-column read reach
+            // `finish_get_data`'s completion path.
             stmt_state.current_row_last_col = col_index;
             stmt_state.last_captured = None;
             stmt_state.partial_text_offset = None;
-            return SQL_SUCCESS;
         }
-        post_diag(stmt_state, WARN_STRING_TRUNCATION);
-        return SQL_SUCCESS_WITH_INFO;
+        // Otherwise bytes remain and the value stays resident, so the caller can
+        // grow its buffer and read it for real.
+        return rc;
     }
 
     if typed_target {
@@ -2318,6 +2340,44 @@ fn binary_length(value: &ColumnValues) -> SqlLen {
     SqlLen::try_from(len).unwrap_or(SqlLen::MAX)
 }
 
+/// Answers a zero-length `SQL_C_BINARY` length probe: writes the indicator and
+/// says whether the probe delivered the whole value.
+///
+/// **Both probe sites must route through this.** `SQLGetData` answers the probe
+/// in two places — the buffered fast path in `sql_get_data_safe` and
+/// `write_captured_column` — and they have already drifted apart once: the
+/// buffered path kept returning a bare `SQL_SUCCESS` after the captured path was
+/// fixed, which silently reopened AB#47537 on the exact shape that first hit it.
+/// The two blocks sit ~750 lines apart in different functions, so nothing about
+/// a textual merge or a unit test on one of them catches the other.
+///
+/// The return code carries the disposition, so callers must not re-derive it:
+/// - `SQL_SUCCESS` — nothing was left behind, the value is fully delivered, and
+///   the caller must mark the column consumed so a repeat reports
+///   `SQL_NO_DATA`.
+/// - `SQL_SUCCESS_WITH_INFO` (with `01004`) — bytes remain, so the value must
+///   stay resident for the caller to grow its buffer and re-read.
+///
+/// Reporting plain success while bytes remain is the AB#47537 crash: it tells
+/// the application its buffer holds the value, and mssql-python then copies
+/// `indicator` bytes out of the zero-length buffer it passed. `SQL_NO_TOTAL`
+/// counts as bytes remaining — the count is merely unknown.
+///
+/// # Safety
+/// `strlen_or_ind_ptr` must be null or valid for one `SqlLen` write.
+unsafe fn answer_binary_probe(
+    stmt_state: &mut StmtState,
+    available: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    unsafe { write_if_some(strlen_or_ind_ptr, available) };
+    if available == 0 {
+        return SQL_SUCCESS;
+    }
+    post_diag(stmt_state, WARN_STRING_TRUNCATION);
+    SQL_SUCCESS_WITH_INFO
+}
+
 pub(crate) fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
     is_integer_c_target(target_type)
         || is_float_c_target(target_type)
@@ -3476,6 +3536,11 @@ mod tests {
         let mut probe = 0_u8;
         let mut indicator = 0;
 
+        // The probe reports truncation because the 4-byte value is still
+        // undelivered (AB#47537); this assertion was SQL_SUCCESS until that was
+        // fixed. Everything this test is actually about -- the base type
+        // surviving, and the value staying resident and re-readable -- is
+        // unchanged.
         assert_eq!(
             unsafe {
                 sql_get_data(
@@ -3487,7 +3552,18 @@ mod tests {
                     &mut indicator,
                 )
             },
-            SQL_SUCCESS
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(indicator, 4);
+        assert_eq!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            SQLSTATE_01004
         );
         assert_eq!(
             stmt.inner.lock().unwrap().last_variant_base,
@@ -3509,7 +3585,7 @@ mod tests {
                     &mut indicator,
                 )
             },
-            SQL_SUCCESS
+            SQL_SUCCESS_WITH_INFO
         );
 
         let mut value = 0_i32;
@@ -3526,6 +3602,61 @@ mod tests {
             },
             SQL_SUCCESS
         );
+        assert_eq!(value, 42);
+    }
+
+    /// The buffered fast path in `sql_get_data_safe` answers the probe before
+    /// `write_captured_column` is ever reached, so it needs its own coverage:
+    /// the tests around `write_captured_column` all kept passing while this site
+    /// silently reopened AB#47537 after #446 landed. Asserts the same contract
+    /// on the same shape mssql-python hits.
+    #[test]
+    fn buffered_binary_probe_reports_truncation_and_leaves_value_resident() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_buffered_get_data_row(&h, vec![42]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut probe = 0_u8;
+        let mut indicator: SqlLen = 0;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                (&mut probe as *mut u8).cast(),
+                0,
+                &mut indicator,
+            )
+        };
+        assert_eq!(
+            rc, SQL_SUCCESS_WITH_INFO,
+            "a buffered-row probe must report truncation, not claim delivery"
+        );
+        assert_eq!(indicator, 4);
+        assert_eq!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            SQLSTATE_01004
+        );
+
+        // Bytes remain, so the column must not have been retired.
+        let mut value = 0_i32;
+        let rc = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                crate::api::odbc_types::SQL_C_SLONG,
+                (&mut value as *mut i32).cast(),
+                0,
+                &mut indicator,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS);
         assert_eq!(value, 42);
     }
 
