@@ -30,7 +30,7 @@ use super::sqlstate::{
 use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
-use crate::handles::{StmtHandle, handle_from_raw};
+use crate::handles::{StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Maps an ODBC `SQL_TXN_*` bit to the T-SQL clause msodbcsql emits for it
 /// (`sqlcstr.cpp:56-60`). `None` for any value outside the accepted set, which
@@ -766,6 +766,11 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// session is not left holding locks when the socket drops. Best-effort: every
 /// failure is logged and swallowed, and no diagnostic is posted, because the
 /// caller is already tearing the connection down.
+///
+/// Skipped entirely once the process is exiting — see the round-trip guard
+/// below. `SQLDisconnect` sits between `SQLFreeHandle(SQL_HANDLE_STMT)` and
+/// `SQLFreeHandle(SQL_HANDLE_ENV)` in a host's teardown sequence, so it is on
+/// the same `DLL_PROCESS_DETACH` path those two already guard.
 pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
     const OP: &str = "SQLDisconnect(rollback)";
 
@@ -787,7 +792,16 @@ pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
     let Some(mut client) = client else {
         return;
     };
-    if client.has_active_transaction()
+    // The rollback is a server round-trip, so it needs the scheduler's worker to
+    // drive the socket — and that worker is gone if the host is disconnecting
+    // from a static destructor or `onexit` handler during
+    // `DLL_PROCESS_DETACH`, where `block_on` would park this thread forever
+    // (AB#47510). Skipping costs nothing the exit does not already cost: this
+    // transaction carries no user work, and the server rolls it back when the
+    // socket closes — the same fallback the cursor-sweep bail-out above takes.
+    if process_is_shutting_down() {
+        debug!("{OP}: process is exiting — the server will roll back on disconnect");
+    } else if client.has_active_transaction()
         && let Err(e) = dbc
             .runtime
             .block_on(client.rollback_transaction(None, None))
