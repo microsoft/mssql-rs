@@ -316,7 +316,9 @@ unsafe fn sql_put_data_safe(
             // the sequence down the same way the `is_null` / `expected_len`
             // checks above do, rather than the "something else is using this
             // sequence" retriable failure `checkout_client` returning `None`
-            // represents below.
+            // represents below. This only bounds accumulation, not the
+            // transform `SQLParamData` runs at close, which still allocates
+            // infallibly -- see `transcode_dae_bytes`'s doc comment.
             if stmt_state
                 .dae
                 .as_mut()

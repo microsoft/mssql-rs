@@ -327,6 +327,18 @@ pub(crate) fn dae_placeholder_type(
 /// the same "two ways to bind disagree" shape as the narrow/narrow residual
 /// below, just with the streamed side on the correct end this time. Tracked
 /// under AB#47590 alongside this file's other DAE-transcoding gaps.
+///
+/// `SQLPutData`'s `try_reserve` guard against an unbounded `SQL_DATA_AT_EXEC`
+/// value stops here: `decode_utf16le`, `String::from_utf8_lossy`, and
+/// `encode_narrow`'s `encoding_rs::encode` (up to 8 bytes per character for an
+/// NCR substitution the target codepage can't represent) all allocate their
+/// output infallibly, so a value that just fit under that guard can still
+/// abort the process during this transform -- arguably a wider window, since
+/// the guard checks per chunk and this is one allocation for the whole value.
+/// Not fixed here: `AppText`/`decode_utf16le` are shared with the
+/// materialized (non-DAE) path (`convert_character_sql`), so bounding them
+/// would be a broader change than this file's DAE-specific scope. Tracked
+/// under AB#47590.
 pub(crate) fn transcode_dae_bytes(
     c_type: SqlSmallInt,
     sql_type: SqlSmallInt,
