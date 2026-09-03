@@ -94,17 +94,18 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      `$BASE` and compare failure sets; only the difference belongs in the review.
    - **Is this coverage gap real?** Introduce the bug the missing test would catch and
      show the suite still passes.
-   - **Does the platform-gated half still compile?** `cargo check --target <triple>`
-     / `cargo clippy --target <triple> --all-targets` type-checks `#[cfg(windows)]`
-     and `#[cfg(target_os = ...)]` code from any host, since neither links. Use
-     `--all-targets`, not `--lib`: a substantial share of this repo's platform-gated
-     code — including platform-gated tests — lives inside inline `#[cfg(test)] mod
-     tests` blocks, which `--lib` skips silently (a different `--lib` than the
-     `nextest run --lib` below, which does run those tests). This is optional and
-     doesn't *run* anything either — still confirm the platform's CI job actually
-     passed on the head commit rather than assuming the matrix covers it. A
-     non-Windows/non-macOS triple also pulls in `openssl-sys`, whose build script can
-     fail without a target sysroot; that's an environment gap, not a finding.
+   - **Does the platform-gated half still compile?** `cargo check --target <triple>
+     --all-targets` / `cargo clippy --target <triple> --all-targets` type-checks
+     `#[cfg(windows)]` and `#[cfg(target_os = ...)]` code from any host, since
+     neither links. Use `--all-targets`, not `--lib`: a substantial share of this
+     repo's platform-gated code — including platform-gated tests — lives inside
+     inline `#[cfg(test)] mod tests` blocks, which `--lib` skips silently (a
+     different `--lib` than the `nextest run --lib` below, which does run those
+     tests). This is optional and doesn't *run* anything either — still confirm the
+     platform's CI job actually passed on the head commit rather than assuming the
+     matrix covers it. A non-Windows/non-macOS triple also pulls in `openssl-sys`,
+     whose build script can fail without a target sysroot; that's an environment
+     gap, not a finding.
 
    ```bash
    cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
