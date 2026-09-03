@@ -6,7 +6,7 @@
 
 use crate::core::TdsResult;
 use crate::io::reader_writer::NetworkWriter;
-use crate::io::token_stream::TdsTokenStreamReader;
+use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -63,7 +63,11 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// it as the answer to a different request. Implementations must mark such
     /// a connection dead rather than let it be reused, which is why callers may
     /// ignore the return value.
-    async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
+    async fn send_attention_with_timeout(
+        &mut self,
+        context: &ParserContext,
+        timeout: Duration,
+    ) -> TdsResult<bool>;
 
     /// Probe whether the underlying connection is dead via a non-blocking socket
     /// poll. Returns `true` if dead, `false` if alive or unknown.

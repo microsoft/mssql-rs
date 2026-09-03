@@ -61,10 +61,8 @@ pub(crate) struct ActiveOperation {
     pub(crate) cursor_id: Option<CursorId>,
     pub(crate) operation_id: OperationId,
     pub(crate) phase: OperationPhase,
-    // TODO: Add cursor cancellation that triggers this root handle only when
-    // cursor and operation IDs match. Complete ATTENTION cleanup before marking
-    // the connection reusable or broken.
     pub(crate) cancel_handle: Option<CancelHandle>,
+    cancel_requested: bool,
 }
 
 /// Mutex-protected connection lifecycle and operation ownership state.
@@ -178,6 +176,7 @@ impl AsyncConnectionState {
             operation_id,
             phase: OperationPhase::Executing,
             cancel_handle: Some(cancel_handle),
+            cancel_requested: false,
         });
 
         let child_handle = state
@@ -211,6 +210,7 @@ impl AsyncConnectionState {
             operation_id,
             phase: OperationPhase::Executing,
             cancel_handle: None,
+            cancel_requested: false,
         });
         Ok(operation_id)
     }
@@ -264,6 +264,7 @@ impl AsyncConnectionState {
             operation_id,
             phase: OperationPhase::Closing,
             cancel_handle: None,
+            cancel_requested: false,
         });
         Ok(CursorCloseClaim {
             operation_id,
@@ -292,13 +293,16 @@ impl AsyncConnectionState {
         operation_id: OperationId,
         result_set_exhausted: bool,
         has_open_batch: bool,
-    ) {
+    ) -> bool {
         let mut state = self.lock();
         let Some(active) = state.active_operation.as_mut() else {
-            return;
+            return false;
         };
         if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
-            return;
+            return false;
+        }
+        if active.cancel_requested {
+            return false;
         }
 
         if !result_set_exhausted || has_open_batch {
@@ -306,6 +310,7 @@ impl AsyncConnectionState {
         } else {
             state.active_operation = None;
         }
+        true
     }
 
     pub(crate) fn restore_fetch(&self, operation_id: OperationId) {
@@ -315,6 +320,28 @@ impl AsyncConnectionState {
             && active.phase == OperationPhase::FetchingRow
         {
             active.phase = OperationPhase::Fetching;
+        }
+    }
+
+    pub(crate) fn cancel_fetch(&self, operation_id: OperationId) -> bool {
+        let cancel_handle = {
+            let mut state = self.lock();
+            let Some(active) = state.active_operation.as_mut() else {
+                return false;
+            };
+            if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
+                return false;
+            }
+            active.cancel_requested = true;
+            active.cancel_handle.take()
+        };
+
+        match cancel_handle {
+            Some(cancel_handle) => {
+                cancel_handle.cancel();
+                true
+            }
+            None => false,
         }
     }
 
@@ -483,6 +510,23 @@ mod tests {
         state.restore_fetch(fetch.operation_id);
 
         assert!(state.claim_fetch(1).is_ok());
+    }
+
+    #[test]
+    fn fetch_cancellation_keeps_ownership_until_settlement() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+
+        assert!(state.cancel_fetch(fetch.operation_id));
+        assert!(!state.cancel_fetch(fetch.operation_id));
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
+
+        assert!(!state.finish_fetch(fetch.operation_id, true, false));
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
+        state.release_operation(fetch.operation_id);
+        assert!(state.claim_execute(2).is_ok());
     }
 
     #[test]

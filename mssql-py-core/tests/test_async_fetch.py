@@ -46,6 +46,20 @@ async def connect(client_context, python_logger=None):
         )
 
 
+async def execute_after_cancellation_settles(cursor, operation):
+    deadline = asyncio.get_running_loop().time() + 6
+    while True:
+        try:
+            await cursor.execute(operation, use_prepare=False)
+            return
+        except RuntimeError as error:
+            if "busy" not in str(error).lower():
+                raise
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("Cancelled fetch left the connection permanently busy")
+            await asyncio.sleep(0.01)
+
+
 def test_module_exposes_fetchone():
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchone")
     assert hasattr(mssql_py_core.PyAsyncCursor, "fetchmany")
@@ -705,7 +719,7 @@ def test_nextset_reports_batch_end_after_terminal_no_rows(client_context, use_pr
 
 
 @pytest.mark.integration
-def test_nextset_asyncio_timeout_breaks_connection_ownership(client_context):
+def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
     async def run():
         conn = await connect(client_context)
         try:
@@ -721,19 +735,34 @@ def test_nextset_asyncio_timeout_breaks_connection_ownership(client_context):
                 await asyncio.wait_for(cursor.nextset(), timeout=0.01)
 
             probe = conn.cursor()
-            for _ in range(100):
-                try:
-                    await probe.execute("SELECT 3", use_prepare=False)
-                except RuntimeError as error:
-                    if "busy" in str(error).lower():
-                        await asyncio.sleep(0.01)
-                        continue
-                    assert "broken" in str(error).lower()
-                    break
-                else:
-                    pytest.fail("Timed-out nextset left the connection reusable")
-            else:
-                pytest.fail("Timed-out nextset left the connection permanently busy")
+            await execute_after_cancellation_settles(probe, "SELECT 3")
+            assert await probe.fetchone() == (3,)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_cancelled_fetchone_resynchronizes_connection(client_context):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT REPLICATE(CAST('x' AS varchar(max)), 32 * 1024 * 1024)",
+                use_prepare=False,
+            )
+
+            fetch = asyncio.create_task(cursor.fetchone())
+            await asyncio.sleep(0.01)
+            fetch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await fetch
+
+            probe = conn.cursor()
+            await execute_after_cancellation_settles(probe, "SELECT 1")
+            assert await probe.fetchone() == (1,)
         finally:
             await conn.close()
 

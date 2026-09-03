@@ -386,14 +386,29 @@ impl AnyTransport {
 
     pub(crate) async fn send_attention_with_timeout(
         &mut self,
+        context: &ParserContext,
         timeout: Duration,
     ) -> TdsResult<bool> {
         match self {
             Self::Network(transport) => {
-                TdsTransport::send_attention_with_timeout(transport, timeout).await
+                TdsTransport::send_attention_with_timeout(transport, context, timeout).await
             }
             #[cfg(any(test, feature = "test-util", fuzzing))]
-            Self::Dynamic(transport) => transport.send_attention_with_timeout(timeout).await,
+            Self::Dynamic(transport) => {
+                transport
+                    .send_attention_with_timeout(context, timeout)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) fn take_attention_settlement(
+        &mut self,
+    ) -> Option<crate::connection::transport::network_transport::AttentionSettlement> {
+        match self {
+            Self::Network(transport) => transport.take_attention_settlement(),
+            #[cfg(any(test, feature = "test-util", fuzzing))]
+            Self::Dynamic(_) => None,
         }
     }
 

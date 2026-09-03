@@ -6,7 +6,6 @@ use crate::connection::client_context::{IPAddressPreference, TransportContext};
 use crate::connection::transport::buffers::TdsReadBuffer;
 use crate::connection::transport::extractable_stream;
 use crate::connection::transport::parallel_connect::{ParallelConnectConfig, parallel_connect};
-use crate::connection::transport::request_timeout::await_within_request_timeout;
 use crate::connection::transport::ssl_handler::SslHandler;
 use crate::connection_provider::tds_connection_provider::PARSER_REGISTRY;
 use crate::core::{
@@ -29,16 +28,17 @@ use crate::io::token_stream::{
 };
 use crate::message::attention::AttentionRequest;
 use crate::message::login_options::TdsVersion;
-use crate::message::messages::{PacketStatusFlags, Request, ResetConnectionMode};
-use crate::token::tokens::{DoneStatus, TokenType, Tokens};
+use crate::message::messages::{PacketStatusFlags, PacketType, Request, ResetConnectionMode};
+use crate::token::tokens::{ColMetadataToken, DoneStatus, TokenType, Tokens};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use std::cmp::min;
+use std::future::{Future, poll_fn};
 use std::io::Error;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -55,6 +55,72 @@ use tracing::{debug, error, event, info, trace, warn};
 /// length from the PLP header when the server sent a known length (`None` for unknown-length
 /// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
 type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
+
+#[derive(Debug)]
+pub(crate) struct AttentionSettlement {
+    pub(crate) tokens: Vec<Tokens>,
+}
+
+enum ReadInterruption {
+    Cancelled,
+    TimedOut(tokio::time::error::Elapsed),
+}
+
+enum InterruptibleRead<T> {
+    Completed(TdsResult<T>),
+    Interrupted {
+        error: Box<crate::error::Error>,
+        boundary: Option<(Instant, TdsResult<T>)>,
+    },
+}
+
+impl ReadInterruption {
+    fn into_error(self) -> crate::error::Error {
+        match self {
+            Self::Cancelled => OperationCancelledError("Request was cancelled".to_string()),
+            Self::TimedOut(elapsed) => TimeoutError(TimeoutErrorType::Elapsed(elapsed)),
+        }
+    }
+}
+
+async fn await_read_or_interrupt<F, T>(
+    mut read: Pin<&mut F>,
+    remaining_request_timeout: Option<Duration>,
+    cancel_handle: Option<&CancelHandle>,
+) -> Result<TdsResult<T>, ReadInterruption>
+where
+    F: Future<Output = TdsResult<T>>,
+{
+    if cancel_handle.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+        return Err(ReadInterruption::Cancelled);
+    }
+
+    let first = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+    if let Poll::Ready(result) = first {
+        return Ok(result);
+    }
+
+    let timed_read = async {
+        match remaining_request_timeout {
+            Some(remaining) => match timeout(remaining, read.as_mut()).await {
+                Ok(result) => Ok(result),
+                Err(elapsed) => Err(ReadInterruption::TimedOut(elapsed)),
+            },
+            None => Ok(read.await),
+        }
+    };
+
+    match cancel_handle {
+        Some(handle) => {
+            tokio::select! {
+                biased;
+                _ = handle.cancel_token.cancelled() => Err(ReadInterruption::Cancelled),
+                result = timed_read => result,
+            }
+        }
+        None => timed_read.await,
+    }
+}
 
 #[cfg(windows)]
 use crate::connection::transport::localdb::resolve_localdb_instance;
@@ -527,10 +593,174 @@ impl Stream for Box<dyn Stream> {
     }
 }
 
+#[derive(Clone)]
+struct SharedStream {
+    inner: Arc<Mutex<Box<dyn Stream>>>,
+}
+
+impl SharedStream {
+    fn new(stream: Box<dyn Stream>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(stream)),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Box<dyn Stream>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn into_inner(self) -> TdsResult<Box<dyn Stream>> {
+        Arc::try_unwrap(self.inner)
+            .map_err(|_| {
+                crate::error::Error::ImplementationError(
+                    "Cannot replace a network stream while an I/O operation still holds it"
+                        .to_string(),
+                )
+            })?
+            .into_inner()
+            .map_err(|error| {
+                crate::error::Error::ImplementationError(format!(
+                    "Cannot replace a poisoned network stream: {error}"
+                ))
+            })
+    }
+}
+
+impl AsyncRead for SharedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.lock()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SharedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut **self.lock()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.lock()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.lock()).poll_shutdown(cx)
+    }
+}
+
+impl Stream for SharedStream {
+    fn tls_handshake_starting(&mut self) {
+        self.lock().tls_handshake_starting();
+    }
+
+    fn tls_handshake_completed(&mut self) {
+        self.lock().tls_handshake_completed();
+    }
+
+    fn is_connection_dead(&self) -> bool {
+        self.lock().is_connection_dead()
+    }
+
+    fn channel_binding_token(&self) -> Option<Vec<u8>> {
+        self.lock().channel_binding_token()
+    }
+}
+
+async fn send_attention_packet(mut stream: SharedStream) -> TdsResult<()> {
+    let mut packet = Vec::with_capacity(PacketWriter::PACKET_HEADER_SIZE);
+    PacketWriter::build_header(
+        &mut packet,
+        PacketWriter::PACKET_HEADER_SIZE,
+        PacketType::Attention,
+        1,
+        true,
+        false,
+        ResetConnectionMode::None,
+    )?;
+    stream.write_all(&packet).await?;
+    Ok(())
+}
+
+async fn send_attention_and_complete_read<F, T>(
+    stream: SharedStream,
+    deadline: Instant,
+    read: Pin<&mut F>,
+) -> TdsResult<T>
+where
+    F: Future<Output = TdsResult<T>>,
+{
+    timeout_at(deadline, send_attention_packet(stream))
+        .await
+        .map_err(|_| {
+            TimeoutError(TimeoutErrorType::String(
+                "Timed out sending the attention packet".to_string(),
+            ))
+        })??;
+
+    timeout_at(deadline, read).await.map_err(|_| {
+        TimeoutError(TimeoutErrorType::String(
+            "Timed out finishing the in-flight token after attention".to_string(),
+        ))
+    })?
+}
+
+async fn read_to_attention_boundary<F, T>(
+    mut read: Pin<&mut F>,
+    remaining_request_timeout: Option<Duration>,
+    cancel_handle: Option<&CancelHandle>,
+    attention_stream: Option<SharedStream>,
+    already_dead: bool,
+) -> InterruptibleRead<T>
+where
+    F: Future<Output = TdsResult<T>>,
+{
+    let interruption = match await_read_or_interrupt(
+        read.as_mut(),
+        remaining_request_timeout,
+        cancel_handle,
+    )
+    .await
+    {
+        Ok(result) => return InterruptibleRead::Completed(result),
+        Err(interruption) => interruption,
+    };
+    let error = Box::new(interruption.into_error());
+    let boundary = if already_dead {
+        None
+    } else {
+        attention_stream.map(|stream| {
+            let deadline = Instant::now() + Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
+            (deadline, stream)
+        })
+    };
+    let boundary = match boundary {
+        Some((deadline, stream)) => Some((
+            deadline,
+            // Keep cold-path settlement state out of every row-read future.
+            Box::pin(send_attention_and_complete_read(stream, deadline, read)).await,
+        )),
+        None => None,
+    };
+    InterruptibleRead::Interrupted { error, boundary }
+}
+
+struct AttentionDrainContext {
+    metadata: Option<Arc<ColMetadataToken>>,
+    column_encryption_supported: bool,
+}
+
 pub(crate) struct NetworkTransport {
     encryption: Option<NegotiatedEncryptionSetting>,
     packet_size: u32,
-    stream: Option<Box<dyn Stream>>,
+    stream: Option<SharedStream>,
     ssl_handler: SslHandler,
     encryption_setting: EncryptionSetting,
     tds_read_buffer: TdsReadBuffer,
@@ -554,6 +784,8 @@ pub(crate) struct NetworkTransport {
     /// NBCROW row of a result set instead of reallocating per row; see
     /// `read_nbc_bitmap`.
     nbc_bitmap_scratch: Option<Arc<[u8]>>,
+    column_encryption_supported: bool,
+    attention_settlement: Option<Box<AttentionSettlement>>,
 }
 
 impl std::fmt::Debug for NetworkTransport {
@@ -656,7 +888,7 @@ impl NetworkTransport {
     ) -> Self {
         Self {
             encryption: None,
-            stream: Some(stream),
+            stream: Some(SharedStream::new(stream)),
             ssl_handler,
             packet_size,
             encryption_setting,
@@ -667,6 +899,8 @@ impl NetworkTransport {
             reset_dispatched: false,
             known_dead: false,
             nbc_bitmap_scratch: None,
+            column_encryption_supported: false,
+            attention_settlement: None,
         }
     }
 
@@ -678,9 +912,19 @@ impl NetworkTransport {
         self.encryption = Some(encryption);
     }
 
+    pub(crate) fn take_attention_settlement(&mut self) -> Option<AttentionSettlement> {
+        self.attention_settlement
+            .take()
+            .map(|settlement| *settlement)
+    }
+
     async fn enable_ssl_internal(&mut self) -> TdsResult<()> {
         // Take ownership of the stream temporarily
-        let base_stream = self.stream.take().expect("Stream already taken");
+        let base_stream = self
+            .stream
+            .take()
+            .expect("Stream already taken")
+            .into_inner()?;
 
         // For TDS 7.4, wrap the stream in TlsOverTdsStream before TLS handshake
         // This is required because TLS packets must be framed within TDS packets during the handshake
@@ -724,17 +968,21 @@ impl NetworkTransport {
             .await?;
 
         // Put back the encrypted stream
-        self.stream = Some(encrypted_stream);
+        self.stream = Some(SharedStream::new(encrypted_stream));
         Ok(())
     }
 
     async fn disable_ssl_internal(&mut self) -> TdsResult<()> {
         // Take the current encrypted TLS stream
-        let encrypted_stream = self.stream.take().ok_or_else(|| {
-            crate::error::Error::ImplementationError(
-                "disable_ssl called but stream is not available".to_string(),
-            )
-        })?;
+        let encrypted_stream = self
+            .stream
+            .take()
+            .ok_or_else(|| {
+                crate::error::Error::ImplementationError(
+                    "disable_ssl called but stream is not available".to_string(),
+                )
+            })?
+            .into_inner()?;
 
         // Extract the underlying stream from the ExtractableStream wrapper.
         // We use mem::forget on the TLS stream to avoid sending TLS close_notify,
@@ -767,7 +1015,7 @@ impl NetworkTransport {
             })?;
 
         info!("Successfully disabled TLS, reverting to unencrypted stream");
-        self.stream = Some(base_stream);
+        self.stream = Some(SharedStream::new(base_stream));
         Ok(())
     }
 
@@ -1246,44 +1494,6 @@ impl NetworkTransport {
         }
     }
 
-    /// Tells the server to stop sending tokens for the token stream being read
-    /// and waits, for a bounded time, for the acknowledgement.
-    ///
-    /// # Contract
-    ///
-    /// Cancelling a read is bounded end to end: the ATTENTION write and the
-    /// drain that follows it share a single [`ATTENTION_TIMEOUT_SECONDS`]
-    /// deadline, matching `Microsoft.Data.SqlClient`'s
-    /// `AttentionTimeoutSeconds`. Callers get their cancellation or timeout
-    /// back within that bound whatever the server does, so no separate
-    /// cancellation-cleanup deadline is needed.
-    ///
-    /// Acknowledged, the connection is left at a message boundary and stays
-    /// reusable. Unacknowledged — the send failed or stalled, the drain
-    /// errored, or the bound elapsed — the stream is parked at an unknown
-    /// point, so the connection is marked known-dead and pools will not hand
-    /// it out again. Once that verdict is in, a later cancelled read returns
-    /// straight away rather than spending the bound over again.
-    ///
-    /// This reports nothing to the caller on purpose. It runs on a path that
-    /// already has an error to deliver (the cancellation or the timeout), and
-    /// replacing that with a cleanup failure would hide why the read stopped.
-    /// The known-dead flag is how a failed cleanup is observed.
-    async fn cancel_read_stream_and_wait(&mut self) {
-        if self.known_dead {
-            // An earlier cancellation already spent the bound and gave up on
-            // this connection. There is nothing left to acknowledge, so
-            // re-entering would just charge this caller the bound again.
-            debug!("Skipping attention: the connection is already known dead");
-            return;
-        }
-
-        let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
-        if let Err(e) = self.send_attention_and_wait(attention_timeout).await {
-            debug!("Failed to cancel the read stream: {e:?}");
-        }
-    }
-
     /// Sends ATTENTION and drains to the acknowledgement, both under a single
     /// `attention_timeout` deadline.
     ///
@@ -1302,9 +1512,13 @@ impl NetworkTransport {
     /// * `Ok(true)` - Attention acknowledged by server
     /// * `Ok(false)` - The bound elapsed, sending or waiting
     /// * `Err(_)` - Error sending attention or reading the response
-    async fn send_attention_and_wait(&mut self, attention_timeout: Duration) -> TdsResult<bool> {
+    async fn send_attention_and_wait(
+        &mut self,
+        parser_context: &ParserContext,
+        attention_timeout: Duration,
+    ) -> TdsResult<bool> {
+        self.attention_settlement = None;
         let deadline = Instant::now() + attention_timeout;
-
         match timeout_at(deadline, self.cancel_read_stream()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -1323,7 +1537,10 @@ impl NetworkTransport {
             }
         }
 
-        match self.wait_for_attention_ack(deadline).await {
+        match self
+            .wait_for_attention_ack(parser_context, None, deadline)
+            .await
+        {
             Ok(true) => Ok(true),
             Ok(false) => {
                 warn!(
@@ -1350,11 +1567,22 @@ impl NetworkTransport {
     /// * `Ok(true)` - Attention acknowledged by server
     /// * `Ok(false)` - `deadline` passed before the acknowledgement
     /// * `Err(_)` - Error reading response
-    async fn wait_for_attention_ack(&mut self, deadline: Instant) -> TdsResult<bool> {
+    async fn wait_for_attention_ack(
+        &mut self,
+        parser_context: &ParserContext,
+        first_token: Option<Tokens>,
+        deadline: Instant,
+    ) -> TdsResult<bool> {
         let start = Instant::now();
 
-        match timeout_at(deadline, self.drain_to_attention_ack()).await {
-            Ok(Ok(())) => {
+        match timeout_at(
+            deadline,
+            self.drain_to_attention_ack(parser_context, first_token),
+        )
+        .await
+        {
+            Ok(Ok(settlement)) => {
+                self.attention_settlement = Some(Box::new(settlement));
                 debug!("Attention ACK received after {:?}", start.elapsed());
                 Ok(true)
             }
@@ -1366,29 +1594,219 @@ impl NetworkTransport {
         }
     }
 
-    /// Reads and discards tokens until the DONE carrying ATTN arrives.
+    fn attention_drain_context(&self, parser_context: &ParserContext) -> AttentionDrainContext {
+        match parser_context {
+            ParserContext::ColumnMetadata(metadata, _) => AttentionDrainContext {
+                metadata: Some(Arc::clone(metadata)),
+                column_encryption_supported: self.column_encryption_supported,
+            },
+            ParserContext::ColumnEncryption(enabled) => AttentionDrainContext {
+                metadata: None,
+                column_encryption_supported: *enabled,
+            },
+            ParserContext::None(()) => AttentionDrainContext {
+                metadata: None,
+                column_encryption_supported: self.column_encryption_supported,
+            },
+        }
+    }
+
+    fn apply_attention_token(
+        context: &mut AttentionDrainContext,
+        settlement: &mut AttentionSettlement,
+        token: Tokens,
+    ) -> bool {
+        match token {
+            Tokens::ColMetadata(metadata) => {
+                context.metadata = Some(Arc::new(metadata));
+                false
+            }
+            Tokens::Row(_) => false,
+            Tokens::Done(done) => {
+                let acknowledged = done.status.contains(DoneStatus::ATTN);
+                context.metadata = None;
+                settlement.tokens.push(Tokens::Done(done));
+                acknowledged
+            }
+            Tokens::DoneProc(done) => {
+                let acknowledged = done.status.contains(DoneStatus::ATTN);
+                context.metadata = None;
+                settlement.tokens.push(Tokens::DoneProc(done));
+                acknowledged
+            }
+            Tokens::DoneInProc(done) => {
+                let acknowledged = done.status.contains(DoneStatus::ATTN);
+                context.metadata = None;
+                settlement.tokens.push(Tokens::DoneInProc(done));
+                acknowledged
+            }
+            token => {
+                settlement.tokens.push(token);
+                false
+            }
+        }
+    }
+
+    async fn discard_paused_row(&mut self, pause_state: RowPauseState) -> TdsResult<()> {
+        let mut writer = crate::datatypes::row_writer::DiscardRowWriter;
+        match resume_row_into_internal(self, pause_state, ColumnPolicy::SkipAll, &mut writer)
+            .await?
+        {
+            RowReadResult::RowWritten => Ok(()),
+            RowReadResult::RowPaused(_) | RowReadResult::PlpPaused(_) => {
+                Err(crate::error::Error::ProtocolError(
+                    "Attention drain paused while discarding a row".to_string(),
+                ))
+            }
+            RowReadResult::Token(_) => Err(crate::error::Error::ProtocolError(
+                "Attention drain reached a control token inside a row".to_string(),
+            )),
+        }
+    }
+
+    async fn discard_paused_plp(&mut self, mut plp_state: PlpPauseState) -> TdsResult<()> {
+        let mut buffer = vec![0u8; 8192];
+        while !plp_state.reached_end() {
+            let read = read_active_plp_bytes_internal(self, &mut plp_state, &mut buffer).await?;
+            if read == 0 && !plp_state.reached_end() {
+                return Err(crate::error::Error::ProtocolError(
+                    "Attention drain made no progress while discarding a PLP value".to_string(),
+                ));
+            }
+        }
+        self.discard_paused_row(plp_state.row_pause_state).await
+    }
+
+    async fn discard_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
+        let mut buffer = vec![0u8; 8192];
+        while !plp_state.reached_end() {
+            let read = read_active_plp_bytes_internal(self, plp_state, &mut buffer).await?;
+            if read == 0 && !plp_state.reached_end() {
+                return Err(crate::error::Error::ProtocolError(
+                    "Attention drain made no progress while discarding an active PLP value"
+                        .to_string(),
+                ));
+            }
+        }
+        self.discard_paused_row(plp_state.row_pause_state.clone())
+            .await
+    }
+
+    async fn discard_interrupted_row_result(
+        &mut self,
+        result: RowReadResult,
+    ) -> TdsResult<Option<Tokens>> {
+        match result {
+            RowReadResult::RowWritten => Ok(None),
+            RowReadResult::Token(token) => Ok(Some(token)),
+            RowReadResult::RowPaused(pause_state) => {
+                self.discard_paused_row(pause_state).await?;
+                Ok(None)
+            }
+            RowReadResult::PlpPaused(plp_state) => {
+                self.discard_paused_plp(plp_state).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn wait_for_attention_after_row_result(
+        &mut self,
+        parser_context: &ParserContext,
+        result: RowReadResult,
+        deadline: Instant,
+    ) -> TdsResult<bool> {
+        let first_token =
+            match timeout_at(deadline, self.discard_interrupted_row_result(result)).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(false),
+            };
+        self.wait_for_attention_ack(parser_context, first_token, deadline)
+            .await
+    }
+
+    async fn wait_for_attention_after_row_header(
+        &mut self,
+        parser_context: &ParserContext,
+        header: RowHeader,
+        deadline: Instant,
+    ) -> TdsResult<bool> {
+        let first_token = match header {
+            RowHeader::Positioned(pause_state) => {
+                match timeout_at(deadline, self.discard_paused_row(pause_state)).await {
+                    Ok(result) => result?,
+                    Err(_) => return Ok(false),
+                }
+                None
+            }
+            RowHeader::Token(token) => Some(token),
+        };
+        self.wait_for_attention_ack(parser_context, first_token, deadline)
+            .await
+    }
+
+    async fn wait_for_attention_after_plp(
+        &mut self,
+        parser_context: &ParserContext,
+        plp_state: &mut PlpPauseState,
+        deadline: Instant,
+    ) -> TdsResult<bool> {
+        match timeout_at(deadline, self.discard_active_plp(plp_state)).await {
+            Ok(result) => result?,
+            Err(_) => return Ok(false),
+        }
+        self.wait_for_attention_ack(parser_context, None, deadline)
+            .await
+    }
+
+    /// Reads and discards complete rows and control tokens until DONE_ATTN.
     ///
-    /// Unbounded on its own — every caller wraps it in a timeout.
-    ///
-    /// Tokens are read with a dummy context, so a ROW/NBCROW still in flight
-    /// ends this drain with a parse error rather than being skipped: those
-    /// tokens carry no length prefix and are parseable only with the preceding
-    /// COLMETADATA in the context. The caller treats that error like any other
-    /// failed drain and retires the connection, which is the safe outcome —
-    /// the alternative is handing back a connection with unparsed row bytes
-    /// still in the transport. Consuming those rows instead needs the
-    /// COLMETADATA-aware loop that `TdsClient::drain_stream` has, since a new
-    /// COLMETADATA can arrive mid-drain and a caller's context alone would not
-    /// cover it.
-    async fn drain_to_attention_ack(&mut self) -> TdsResult<()> {
-        let dummy_context = ParserContext::None(());
+    /// The caller preserves any parser future that was active when cancellation
+    /// won, so this starts at a proven token boundary. Current metadata seeds the
+    /// row parser, and later COLMETADATA tokens replace it for queued result sets.
+    async fn drain_to_attention_ack(
+        &mut self,
+        parser_context: &ParserContext,
+        first_token: Option<Tokens>,
+    ) -> TdsResult<AttentionSettlement> {
+        let mut context = self.attention_drain_context(parser_context);
+        let mut settlement = AttentionSettlement { tokens: Vec::new() };
+
+        if let Some(token) = first_token
+            && Self::apply_attention_token(&mut context, &mut settlement, token)
+        {
+            return Ok(settlement);
+        }
 
         loop {
-            let token = receive_token_internal(self, &*PARSER_REGISTRY, &dummy_context).await?;
-            if let Tokens::Done(done_token) = token
-                && done_token.status.contains(DoneStatus::ATTN)
-            {
-                return Ok(());
+            if let Some(metadata) = context.metadata.as_ref().cloned() {
+                let parser_context = ParserContext::ColumnMetadata(metadata, None);
+                let mut writer = crate::datatypes::row_writer::DiscardRowWriter;
+                let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
+                let result = receive_row_into_internal(
+                    self,
+                    &*PARSER_REGISTRY,
+                    &parser_context,
+                    ColumnPolicy::SkipAll,
+                    &mut writer,
+                    &mut nbc_bitmap_scratch,
+                )
+                .await;
+                self.nbc_bitmap_scratch = nbc_bitmap_scratch;
+
+                if let Some(token) = self.discard_interrupted_row_result(result?).await?
+                    && Self::apply_attention_token(&mut context, &mut settlement, token)
+                {
+                    return Ok(settlement);
+                }
+                continue;
+            }
+
+            let parser_context =
+                ParserContext::ColumnEncryption(context.column_encryption_supported);
+            let token = receive_token_internal(self, &*PARSER_REGISTRY, &parser_context).await?;
+            if Self::apply_attention_token(&mut context, &mut settlement, token) {
+                return Ok(settlement);
             }
         }
     }
@@ -2136,30 +2554,56 @@ impl NetworkTransport {
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
     ) -> TdsResult<Tokens> {
-        let cancellable_receive_token = CancelHandle::run_until_cancelled(
-            cancel_handle,
-            receive_token_internal(self, &*PARSER_REGISTRY, context),
-        );
-        let token_result = match remaining_request_timeout.as_ref() {
-            Some(remaining_request_timeout) => {
-                match timeout(*remaining_request_timeout, cancellable_receive_token).await {
-                    Ok(result) => result,
-                    Err(elapsed) => Err(TimeoutError(TimeoutErrorType::Elapsed(elapsed))),
-                }
-            }
-            None => cancellable_receive_token.await,
+        if let ParserContext::ColumnEncryption(enabled) = context {
+            self.column_encryption_supported = *enabled;
+        }
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let outcome = {
+            let mut read = std::pin::pin!(receive_token_internal(self, &*PARSER_REGISTRY, context));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
+                cancel_handle,
+                attention_stream,
+                already_dead,
+            )
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
         };
 
-        match &token_result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await;
+        match completed {
+            Ok(token) => match self
+                .wait_for_attention_ack(context, Some(token), deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted token read"
+                    );
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted token read"
+                );
+                self.known_dead = true;
+            }
         }
-        token_result
+        Err(*error)
     }
 
     pub(crate) async fn receive_row_into<W>(
@@ -2178,33 +2622,56 @@ impl NetworkTransport {
         // below must stay unconditional, and no `?` may be introduced between
         // these two points: an early return would drop the cached bitmap and
         // silently cost an allocation on every subsequent row.
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        let outcome = {
+            let mut read = std::pin::pin!(receive_row_into_internal(
+                self,
+                &*PARSER_REGISTRY,
+                context,
+                plan,
+                writer,
+                &mut nbc_bitmap_scratch,
+            ));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                receive_row_into_internal(
-                    self,
-                    &*PARSER_REGISTRY,
-                    context,
-                    plan,
-                    writer,
-                    &mut nbc_bitmap_scratch,
-                ),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await;
+        match completed {
+            Ok(result) => match self
+                .wait_for_attention_after_row_result(context, result, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(?attention_error, "Failed to settle an interrupted row read");
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(?attention_error, "Failed to finish an interrupted row read");
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 
     pub(crate) async fn receive_row_header(
@@ -2215,31 +2682,60 @@ impl NetworkTransport {
     ) -> TdsResult<RowHeader> {
         // Same take/restore as `receive_row_into`: unconditional restore, no `?`
         // between the two points.
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
         let mut nbc_bitmap_scratch = self.nbc_bitmap_scratch.take();
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        let outcome = {
+            let mut read = std::pin::pin!(receive_row_header_internal(
+                self,
+                &*PARSER_REGISTRY,
+                context,
+                &mut nbc_bitmap_scratch,
+            ));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                receive_row_header_internal(
-                    self,
-                    &*PARSER_REGISTRY,
-                    context,
-                    &mut nbc_bitmap_scratch,
-                ),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
         self.nbc_bitmap_scratch = nbc_bitmap_scratch;
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await;
+        match completed {
+            Ok(header) => match self
+                .wait_for_attention_after_row_header(context, header, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted row header"
+                    );
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted row header"
+                );
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 
     pub(crate) async fn resume_row_into<W>(
@@ -2253,24 +2749,55 @@ impl NetworkTransport {
     where
         W: RowWriter + Send + ?Sized,
     {
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let drain_context = ParserContext::ColumnMetadata(Arc::clone(&pause_state.metadata), None);
+        let outcome = {
+            let mut read =
+                std::pin::pin!(resume_row_into_internal(self, pause_state, plan, writer));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                resume_row_into_internal(self, pause_state, plan, writer),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await;
+        match completed {
+            Ok(result) => match self
+                .wait_for_attention_after_row_result(&drain_context, result, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(
+                        ?attention_error,
+                        "Failed to settle an interrupted row continuation"
+                    );
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(
+                    ?attention_error,
+                    "Failed to finish an interrupted row continuation"
+                );
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 
     pub(crate) async fn read_active_plp_bytes(
@@ -2280,24 +2807,49 @@ impl NetworkTransport {
         cancel_handle: Option<&CancelHandle>,
         out: &mut [u8],
     ) -> TdsResult<usize> {
-        let result = await_within_request_timeout!(
-            remaining_request_timeout,
-            CancelHandle::run_until_cancelled(
+        self.attention_settlement = None;
+        let attention_stream = self.stream.as_ref().cloned();
+        let already_dead = self.known_dead;
+        let drain_context =
+            ParserContext::ColumnMetadata(Arc::clone(&plp_state.row_pause_state.metadata), None);
+        let outcome = {
+            let mut read = std::pin::pin!(read_active_plp_bytes_internal(self, plp_state, out));
+            read_to_attention_boundary(
+                read.as_mut(),
+                remaining_request_timeout,
                 cancel_handle,
-                read_active_plp_bytes_internal(self, plp_state, out),
+                attention_stream,
+                already_dead,
             )
-        );
+            .await
+        };
+        let (error, boundary) = match outcome {
+            InterruptibleRead::Completed(result) => return result,
+            InterruptibleRead::Interrupted { error, boundary } => (error, boundary),
+        };
+        let Some((deadline, completed)) = boundary else {
+            self.known_dead = true;
+            return Err(*error);
+        };
 
-        match &result {
-            Ok(_) => {}
-            Err(err) => match err {
-                OperationCancelledError(_) | TimeoutError(_) => {
-                    Box::pin(self.cancel_read_stream_and_wait()).await;
+        match completed {
+            Ok(_) => match self
+                .wait_for_attention_after_plp(&drain_context, plp_state, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.known_dead = true,
+                Err(attention_error) => {
+                    debug!(?attention_error, "Failed to settle an interrupted PLP read");
+                    self.known_dead = true;
                 }
-                _ => {}
             },
+            Err(attention_error) => {
+                debug!(?attention_error, "Failed to finish an interrupted PLP read");
+                self.known_dead = true;
+            }
         }
-        result
+        Err(*error)
     }
 }
 
@@ -2448,9 +3000,11 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
     /// attention ACK timeout per SqlClient behavior.
     async fn send_attention_with_timeout(
         &mut self,
+        context: &ParserContext,
         attention_timeout: Duration,
     ) -> TdsResult<bool> {
-        self.send_attention_and_wait(attention_timeout).await
+        self.send_attention_and_wait(context, attention_timeout)
+            .await
     }
 
     fn is_connection_dead(&self) -> bool {
@@ -5009,6 +5563,26 @@ pub(crate) mod tests {
             .build()
     }
 
+    fn int4_colmetadata_bytes(name: &str) -> Vec<u8> {
+        let mut bytes = vec![TokenType::ColMetadata as u8];
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.push(TdsDataType::Int4 as u8);
+        bytes.push(u8::try_from(name.chars().count()).unwrap());
+        bytes.extend_from_slice(&encode_utf16_le(name));
+        bytes
+    }
+
+    fn int4_row_message(token_type: u8, is_nbc: bool, value: i32) -> Vec<u8> {
+        let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
+        packet.append_byte(token_type);
+        if is_nbc {
+            packet.append_byte(0);
+        }
+        packet.append_i32(value).build()
+    }
+
     /// A handle that is already cancelled, so the read it guards is abandoned
     /// before a byte is consumed.
     fn cancelled_handle() -> CancelHandle {
@@ -5260,45 +5834,114 @@ pub(crate) mod tests {
         );
     }
 
-    /// A ROW queued behind the ATTENTION cannot be skipped. ROW/NBCROW tokens
-    /// carry no length prefix, so they are parseable only with the preceding
-    /// COLMETADATA in the parser context, and the drain reads with a dummy one.
-    /// The drain therefore ends on the parse error and the connection is
-    /// retired instead of being handed back desynchronized — the
-    /// acknowledgement sitting behind the ROW is never reached.
-    ///
-    /// This is the common shape for a cancelled row-returning query, so the
-    /// bound is doing its job here at the cost of the connection. Teaching the
-    /// drain to consume rows needs the COLMETADATA-aware loop that
-    /// `TdsClient::drain_stream` already has; this test pins today's outcome so
-    /// that change is a deliberate one rather than a silent behaviour flip.
-    ///
-    /// The ROW body is deliberately absent: the parser rejects on the context
-    /// before it reads a single value byte, so no body would ever be consumed.
     #[tokio::test(start_paused = true)]
-    async fn a_row_in_flight_ends_the_drain_and_retires_the_connection() {
-        let mut stream = TestPacketBuilder::new(PacketType::TabularResult)
-            .append_byte(crate::token::tokens::TokenType::Row as u8)
-            .build();
-        stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+    async fn queued_rows_are_drained_with_current_metadata() {
+        for (name, token_type, is_nbc) in [
+            ("ROW", TokenType::Row as u8, false),
+            ("NBCROW", TokenType::NbcRow as u8, true),
+        ] {
+            let mut stream = int4_row_message(token_type, is_nbc, 42);
+            stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&stream);
 
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&int4_row_context(1), None, Some(&cancelled_handle())),
+            )
+            .await
+            .expect("the attention drain hung on a queued row");
+
+            assert!(
+                matches!(result, Err(OperationCancelledError(_))),
+                "the caller must see its cancellation, got {result:?}"
+            );
+            assert!(
+                !is_known_dead(&transport),
+                "{name} was drained through DONE_ATTN, so the connection is reusable"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attention_drain_adopts_new_colmetadata() {
+        let mut response = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&int4_colmetadata_bytes("value"))
+            .append_byte(TokenType::Row as u8)
+            .append_i32(42)
+            .build();
+        response.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
         let (mut transport, _written) =
-            create_network_transport_with_live_peer_capturing_writes(&stream);
+            create_network_transport_with_live_peer_capturing_writes(&response);
 
         let result = timeout(
             Duration::from_secs(600),
-            transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+            transport.receive_token(
+                &ParserContext::ColumnEncryption(false),
+                None,
+                Some(&cancelled_handle()),
+            ),
         )
         .await
-        .expect("the drain hung instead of ending on the unparseable ROW");
+        .expect("the attention drain hung after new column metadata");
 
+        assert!(matches!(result, Err(OperationCancelledError(_))));
         assert!(
-            matches!(result, Err(OperationCancelledError(_))),
-            "the caller must see its cancellation, not the drain's parse error, got {result:?}"
+            !is_known_dead(&transport),
+            "the new metadata and its row were drained through DONE_ATTN"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_a_parser_paused_mid_row() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let second_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&42_i32.to_le_bytes()[2..])
+            .build();
+        let acknowledgement = done_token_message(DoneStatus::ATTN.bits());
+        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&second_packet).await.unwrap();
+            peer.write_all(&acknowledgement).await.unwrap();
+        });
+
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        let context = int4_row_context(1);
+        let mut writer = DefaultRowWriter::new(1);
+        let result = {
+            let mut read = std::pin::pin!(transport.receive_row_into(
+                &context,
+                None,
+                Some(&child),
+                ColumnPolicy::DecodeAll,
+                &mut writer,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "the row unexpectedly completed before cancellation"
+            );
+            parent.cancel();
+            timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the interrupted row did not settle")
+        };
+        peer_task.await.unwrap();
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
         assert!(
-            is_known_dead(&transport),
-            "the acknowledgement was never reached, so the connection must not be reused"
+            !is_known_dead(&transport),
+            "finishing the in-flight row reached DONE_ATTN and preserved the connection"
         );
     }
 }

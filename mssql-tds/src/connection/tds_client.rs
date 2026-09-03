@@ -4006,8 +4006,15 @@ impl TdsClient {
                     ColumnPolicy::SkipAll,
                     &mut writer,
                 )
-                .await?;
+                .await;
             self.update_remaining_timeout(start);
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.settle_interrupted_read(&error);
+                    return Err(error);
+                }
+            };
 
             match result {
                 RowReadResult::RowWritten => {
@@ -4078,6 +4085,57 @@ impl TdsClient {
             }
         }
         Ok(())
+    }
+
+    fn normalize_after_attention(&mut self) {
+        self.current_metadata = None;
+        self.current_decryptor = None;
+        self.buffered_row_support = None;
+        self.count_map.clear();
+        self.last_rows_affected = -1;
+        self.dml_result_counts.clear();
+        self.return_values.clear();
+        self.output_param_ceks.clear();
+        self.last_return_status = ReturnStatus::NotReceived;
+        self.abort_pending_prepare_capture();
+        self.remaining_request_timeout = None;
+        self.cancel_handle = None;
+        self.active_row_read_state = ActiveRowReadState::Idle;
+        self.row_already_positioned = false;
+        self.parked_token = None;
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
+        self.execution_context.set_has_open_batch(false);
+    }
+
+    fn consume_attention_settlement(&mut self) {
+        let Some(settlement) = self.transport.take_attention_settlement() else {
+            return;
+        };
+
+        let mut ignored_errors = Vec::new();
+        for token in settlement.tokens {
+            if let Err(error) = self
+                .observe_response_token(&token)
+                .and_then(|_| self.apply_drain_side_effect(token, &mut ignored_errors))
+            {
+                warn!(?error, "Failed to apply state from the attention drain");
+                self.retire_after_failed_drain(&error);
+                break;
+            }
+        }
+    }
+
+    fn settle_interrupted_read(&mut self, error: &crate::error::Error) {
+        if !matches!(
+            error,
+            crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
+        ) {
+            return;
+        }
+
+        self.consume_attention_settlement();
+        self.normalize_after_attention();
     }
 
     /// Reads tokens up to the next result boundary in the response stream.
@@ -4395,15 +4453,22 @@ impl TdsClient {
             return Ok(*token);
         }
         let start = Instant::now();
-        let token = self
+        let result = self
             .transport
             .receive_token(
                 parser_context,
                 self.remaining_request_timeout,
                 self.cancel_handle.as_ref(),
             )
-            .await?;
+            .await;
         self.update_remaining_timeout(start);
+        let token = match result {
+            Ok(token) => token,
+            Err(error) => {
+                self.settle_interrupted_read(&error);
+                return Err(error);
+            }
+        };
         self.observe_response_token(&token)?;
         Ok(token)
     }
@@ -5341,6 +5406,7 @@ impl TdsClient {
         match result {
             Ok(read) => Ok(read),
             Err(error) => {
+                self.settle_interrupted_read(&error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -5506,6 +5572,7 @@ impl TdsClient {
             {
                 Ok(result) => result,
                 Err(error) => {
+                    self.settle_interrupted_read(&error);
                     self.abort_pending_prepare_capture();
                     return Err(error);
                 }
@@ -5743,10 +5810,17 @@ impl TdsClient {
                     self.remaining_request_timeout,
                     self.cancel_handle.as_ref(),
                 )
-                .await?;
+                .await;
             if let Some(start) = start {
                 self.update_remaining_timeout(start);
             }
+            let header = match header {
+                Ok(header) => header,
+                Err(error) => {
+                    self.settle_interrupted_read(&error);
+                    return Err(error);
+                }
+            };
 
             match header {
                 RowHeader::Positioned(pause_state) => {
@@ -6181,6 +6255,7 @@ impl TdsClient {
                 "row continuation returned a control token".to_string(),
             )),
             Err(error) => {
+                self.settle_interrupted_read(&error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -6246,6 +6321,7 @@ impl TdsClient {
                 "Inline prefix continuation returned a control token".to_string(),
             )),
             Err(error) => {
+                self.settle_interrupted_read(&error);
                 self.abort_pending_prepare_capture();
                 Err(error)
             }
@@ -6339,10 +6415,17 @@ impl TdsClient {
                 ColumnPolicy::DecodeOne(target),
                 &mut capture,
             )
-            .await?;
+            .await;
         if let Some(start) = start {
             self.update_remaining_timeout(start);
         }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.settle_interrupted_read(&error);
+                return Err(error);
+            }
+        };
 
         match result {
             RowReadResult::RowPaused(next_pause) => {
@@ -6446,8 +6529,15 @@ impl TdsClient {
                     self.cancel_handle.as_ref(),
                     &mut buffer,
                 )
-                .await?;
+                .await;
             self.update_remaining_timeout(start);
+            let read = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    self.settle_interrupted_read(&error);
+                    return Err(error);
+                }
+            };
 
             if read == 0 && !plp_state.reached_end() {
                 return Err(crate::error::Error::ProtocolError(
@@ -6478,8 +6568,15 @@ impl TdsClient {
                 plan,
                 writer,
             )
-            .await?;
+            .await;
         self.update_remaining_timeout(start);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.settle_interrupted_read(&error);
+                return Err(error);
+            }
+        };
         match result {
             RowReadResult::RowWritten => {
                 writer.end_row();
@@ -6791,7 +6888,19 @@ impl TdsClient {
     /// * `Err(_)` - Error sending attention or reading response
     #[instrument(skip(self), level = "info")]
     pub async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool> {
-        self.transport.send_attention_with_timeout(timeout).await
+        let parser_context = match self.current_metadata.as_ref() {
+            Some(metadata) => ParserContext::ColumnMetadata(Arc::clone(metadata), None),
+            None => ParserContext::ColumnEncryption(
+                self.negotiated_settings.is_column_encryption_supported(),
+            ),
+        };
+        let result = self
+            .transport
+            .send_attention_with_timeout(&parser_context, timeout)
+            .await;
+        self.consume_attention_settlement();
+        self.normalize_after_attention();
+        result
     }
 
     /// Check if the connection has an active transaction.
@@ -7372,6 +7481,7 @@ mod tests {
     use crate::test_packet_support::{
         TestPacketBuilder, create_network_transport_with_data,
         create_network_transport_with_live_peer,
+        create_network_transport_with_live_peer_capturing_writes,
     };
     use crate::token::tokens::{
         ColMetadataToken, CurrentCommand, DoneStatus, DoneToken, InfoToken, TokenType, Tokens,
@@ -7684,7 +7794,11 @@ mod tests {
             self.closed = true;
             Ok(())
         }
-        async fn send_attention_with_timeout(&mut self, _timeout: Duration) -> TdsResult<bool> {
+        async fn send_attention_with_timeout(
+            &mut self,
+            _context: &ParserContext,
+            _timeout: Duration,
+        ) -> TdsResult<bool> {
             self.attentions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Acknowledged. `Ok(false)` would mean the ACK never came, and
@@ -11630,6 +11744,43 @@ mod tests {
             assert!(!client.transport.connection_known_dead());
             assert!(client.recovery_context.session_recovery_negotiated);
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_row_read_normalizes_client_state_after_attention() {
+        let mut response = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(TokenType::Row as u8)
+            .append_i32(42)
+            .build();
+        response.extend_from_slice(
+            &TestPacketBuilder::new(PacketType::TabularResult)
+                .append_bytes(&done_bytes(DoneStatus::ATTN.bits()))
+                .build(),
+        );
+        let (transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&response);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+
+        let mut writer = DefaultRowWriter::new(1);
+        let result = client.next_row_into(&mut writer).await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        assert!(client.current_metadata.is_none());
+        assert!(client.current_result_set_has_been_read_till_end);
+        assert!(client.remaining_request_timeout.is_none());
+        assert!(client.cancel_handle.is_none());
+        assert!(!client.command_is_busy());
+        assert!(!client.is_connection_dead());
     }
 
     /// A malicious or corrupt server cannot keep the trailer scanner alive

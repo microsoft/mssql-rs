@@ -44,6 +44,7 @@
 /// against a budget measured in seconds. It does not change the verdict on an
 /// exhausted budget either, because `sleep(ZERO)` is itself `Pending` on its
 /// first poll, so eager `timeout` grants that same extra poll.
+#[allow(unused_macros)]
 macro_rules! await_within_request_timeout {
     ($budget:expr, $fut:expr) => {{
         let mut fut = ::std::pin::pin!($fut);
@@ -67,8 +68,6 @@ macro_rules! await_within_request_timeout {
         }
     }};
 }
-
-pub(crate) use await_within_request_timeout;
 
 #[cfg(test)]
 mod tests {

@@ -125,7 +125,7 @@ pub enum RowHeader {
 ///
 /// Passed back to [`TdsTokenStreamReader::resume_row_into`] to continue
 /// decoding the rest of the row from where it paused.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg(not(fuzzing))]
 pub(crate) struct RowPauseState {
     /// Index of the first column that has not yet been decoded.
@@ -139,7 +139,7 @@ pub(crate) struct RowPauseState {
     pub(crate) decryptor: Option<Arc<dyn CellDecryptor>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg(fuzzing)]
 #[allow(private_interfaces)]
 pub struct RowPauseState {
