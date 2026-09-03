@@ -549,9 +549,33 @@ fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
         | TdsDataType::VarBinary
         | TdsDataType::BigVarBinary => SQL_C_BINARY,
         TdsDataType::Guid => SQL_C_GUID,
-        // SQL Server rejects the remaining types at insert time, so a variant
-        // cannot actually carry them; character is the safe fallback.
-        _ => SQL_C_CHAR,
+        // Enumerated rather than left to a `_` arm: every type below is one a
+        // variant provably cannot carry, and spelling them out is what makes
+        // adding a `TdsDataType` a compile error here instead of a silent
+        // `SQL_C_CHAR`. Character stays the answer for all of them, so this is
+        // about the next person's mistake, not about today's behavior.
+        //
+        // `IntN` is the non-obvious one: a variant carries an integer as
+        // `INT1/2/4/8TYPE` and never as `INTNTYPE` (MS-TDS 2.2.5.5.2), so the
+        // nullable spelling never reaches the wire inside a variant even though
+        // the other `*N` types do.
+        //
+        // The rest SQL Server rejects when the value is assigned to a
+        // `sql_variant`: the LOB types, the structured and CLR types, a nested
+        // variant, and `Void`/`None`, which are placeholders rather than column
+        // types at all.
+        TdsDataType::IntN
+        | TdsDataType::Image
+        | TdsDataType::Text
+        | TdsDataType::NText
+        | TdsDataType::Xml
+        | TdsDataType::Json
+        | TdsDataType::Vector
+        | TdsDataType::Udt
+        | TdsDataType::SqlTable
+        | TdsDataType::SsVariant
+        | TdsDataType::Void
+        | TdsDataType::None => SQL_C_CHAR,
     }
 }
 

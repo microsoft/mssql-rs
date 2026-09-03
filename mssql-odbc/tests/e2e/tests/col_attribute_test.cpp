@@ -561,9 +561,13 @@ TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
 
 // Every base type whose answer is measured to agree with msodbcsql, in one
 // place. Spot-checking a couple of types is what let the exact-numeric answer
-// (AB#47702) and the `tinyint` signedness answer both survive unnoticed, so the
-// table is exhaustive by construction rather than by whichever type someone
-// thought to add.
+// (AB#47702) and the `tinyint` signedness answer both survive unnoticed.
+//
+// This list is hand-written, so it does not by itself stop a new base type from
+// going unchecked. What does is `variant_c_type`'s match, which enumerates every
+// `TdsDataType` instead of ending in a `_` arm: adding a type fails to compile
+// until someone answers for it, and this table is where the answer gets pinned
+// against msodbcsql.
 //
 // Deliberately excluded, because the drivers genuinely differ:
 //
