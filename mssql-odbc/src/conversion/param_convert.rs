@@ -1004,7 +1004,7 @@ fn convert_datetime_sql(
             // The struct is local wall clock; the wire carries UTC, so the
             // offset is subtracted here. `extract_datetime_parts` adds it back.
             let utc = i64::from(datetime2.days) * TICKS_PER_DAY
-                + datetime2.time.time_nanoseconds as i64
+                + i64::try_from(datetime2.time.time_nanoseconds).map_err(|_| invalid)?
                 - i64::from(offset) * 600_000_000;
             let days = utc.div_euclid(TICKS_PER_DAY);
             if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
@@ -1012,9 +1012,10 @@ fn convert_datetime_sql(
             }
             let value = SqlDateTimeOffset {
                 datetime2: SqlDateTime2 {
-                    days: days as u32,
+                    days: u32::try_from(days).map_err(|_| invalid)?,
                     time: SqlTime {
-                        time_nanoseconds: utc.rem_euclid(TICKS_PER_DAY) as u64,
+                        time_nanoseconds: u64::try_from(utc.rem_euclid(TICKS_PER_DAY))
+                            .map_err(|_| invalid)?,
                         scale: MAX_DATETIME_SCALE,
                     },
                 },

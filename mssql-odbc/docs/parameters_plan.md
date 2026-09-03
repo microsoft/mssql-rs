@@ -783,9 +783,9 @@ role `Convert()`'s dispatch switch plays - not a legality table.
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
 - **`mssql-tds` gaps found by P8:** a `sql_variant` cannot carry a `varchar`
   payload - `get_variant_base_type` and `create_variant_inner_context` assume
-  every `ColumnValues::String` is UTF-16 - and `write_variant_type_info` /
-  `calculate_type_info_length` answer an unhandled base type with
-  `unreachable!`, which aborts rather than erroring. AB#47800.
+  every `ColumnValues::String` is UTF-16. AB#47800. The other half is closed
+  here: `write_variant_type_info` and `calculate_type_info_length` answered an
+  unhandled base type with `unreachable!` and now return `ProtocolError`.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
   both `SQLPrepare` + `SQLExecute` and `SQLExecDirect` (see the
   delivered-features list above and `data-at-execution-streaming.md`), and a

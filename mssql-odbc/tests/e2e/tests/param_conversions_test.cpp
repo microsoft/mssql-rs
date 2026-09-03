@@ -1362,11 +1362,10 @@ TEST_F(ScalarConversionLiveTest, ScalarParamsBindWithoutAnIndicatorPointer) {
     EXPECT_EQ("2024-06-15 12:30:00 +05:30", ExecuteAndReadBack());
 }
 
-// A null value buffer is SQL NULL, whatever the indicator says. msodbcsql sets
-// DBRPCVALUE_NULL on the bound-parameter path when lpbData is null
-// (sqlcfunc.cpp:2549), before any length check, so the indicator's value never
-// matters. Measured on both legs; this driver used to answer HY009 and now
-// matches.
+// A null value buffer is SQL NULL only for a variable-length C type carrying a
+// zero length - the SQLPutData NULL/0 convention (sqlccmd.cpp:4497). Every
+// other shape answers HY090. Measured on retail 18.6.2.1; sqlcfunc.cpp:2549
+// reads as though any null buffer is NULL, which ADO build 172202 falsified.
 TEST_F(ScalarConversionLiveTest, ANullValueBufferFollowsTheZeroLengthRule) {
     struct Case {
         SQLSMALLINT c;

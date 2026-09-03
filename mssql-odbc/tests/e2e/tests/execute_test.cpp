@@ -906,7 +906,7 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionSti
 // from bind time to here.
 //
 // msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute (see
-// param_cross_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute),
+// param_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute),
 // but does not actually stream it: SQLPutData itself then rejects with
 // HY019 ("Processing of fixed length targets cannot be spread over multiple
 // calls to SQLPutData"). Both drivers agree the pairing cannot stream
