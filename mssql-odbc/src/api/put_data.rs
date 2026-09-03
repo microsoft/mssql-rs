@@ -414,10 +414,19 @@ unsafe fn sql_put_data_safe(
         // that this chunk ended part-way through. An untranscoded one is already
         // the wire's bytes, so it is forwarded borrowed.
         let transcode = dae.current_param().and_then(|param| param.transcode);
+        // `push` consumes the carry it is handed, so the checkout below can fail
+        // after the partial character it held is already gone -- and that
+        // failure is the retriable "something else holds this sequence" one, so
+        // the retry would decode the continuation bytes alone and emit U+FFFD.
+        // The carry is at most one incomplete character, so keeping a copy
+        // across the checkout costs a few bytes and makes the failure free of
+        // side effects.
+        let mut carry_restore: Option<Vec<u8>> = None;
         let outgoing: Cow<'_, [u8]> = match transcode {
             Some(transcode) => match stmt_state.dae.as_mut() {
                 Some(dae) => {
                     let mut carry = std::mem::take(&mut dae.progress.carry);
+                    carry_restore = Some(carry.clone());
                     let out = transcode.push(&mut carry, fitted);
                     dae.progress.carry = carry;
                     Cow::Owned(out)
@@ -440,6 +449,11 @@ unsafe fn sql_put_data_safe(
             {
                 Some(client) => Some(client),
                 None => {
+                    // Put the partial character back, so a retry sees exactly
+                    // the state this call found.
+                    if let (Some(restore), Some(dae)) = (carry_restore, stmt_state.dae.as_mut()) {
+                        dae.progress.carry = restore;
+                    }
                     error!("SQLPutData: DAE client is unavailable — internal state corruption");
                     post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                     return SQL_ERROR;

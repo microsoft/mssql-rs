@@ -259,14 +259,13 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // with no request in flight and run the execute from the last
             // `SQLParamData`, once every value can be built (AB#47590).
             if dae_params.iter().any(|param| param.plan.is_buffered()) {
-                let marker_count = params.len();
                 return park_deferred_dae(
                     stmt,
                     client,
                     Some(prepared),
                     orphaned,
                     dae_params,
-                    marker_count,
+                    params,
                     None,
                     query_timeout,
                     "SQLExecute",

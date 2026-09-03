@@ -22,7 +22,9 @@ use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs::Decoder;
+use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
+use mssql_tds::token::tokens::SqlCollation;
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
 pub(crate) struct ActivePlpStream {
@@ -818,8 +820,16 @@ pub(crate) struct DaeState {
     /// Collected values for buffered parameters as `(bound index, bytes,
     /// is_null)`, in close order.
     pub(crate) buffered: Vec<(usize, Vec<u8>, bool)>,
-    /// Marker count for the deferred execute's parameter rebuild.
-    pub(crate) marker_count: usize,
+    /// The RPC parameters as `build_named_params` materialized them at execute
+    /// time, data-at-execution slots included as placeholders. The deferred
+    /// execute replaces only those slots and keeps the rest verbatim.
+    ///
+    /// Held rather than re-read because `bound_params` is itself an
+    /// execute-time snapshot that `SQLFreeStmt(SQL_RESET_PARAMS)` does not
+    /// clear: an application that releases its bindings mid-sequence -- which
+    /// that call invites -- would otherwise have its freed buffers dereferenced
+    /// when the last `SQLParamData` rebuilt the list.
+    pub(crate) prebuilt: Vec<RpcParameter>,
     /// Rewritten SQL for a deferred `SQLExecDirect`, which runs ad-hoc
     /// `sp_executesql` and has no prepared plan to execute instead.
     pub(crate) sql: Option<String>,
@@ -845,7 +855,7 @@ impl DaeState {
             progress: DaeProgress::default(),
             deferred: false,
             buffered: Vec::new(),
-            marker_count: 0,
+            prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
         }
@@ -855,15 +865,50 @@ impl DaeState {
     /// closes, rather than one already streaming into an open RPC.
     pub(crate) fn deferred(
         mut self,
-        marker_count: usize,
+        prebuilt: Vec<RpcParameter>,
         sql: Option<String>,
         timeout_secs: u32,
     ) -> Self {
         self.deferred = true;
-        self.marker_count = marker_count;
+        self.prebuilt = prebuilt;
         self.sql = sql;
         self.timeout_secs = timeout_secs;
+        // Buffered parameters are visited first so the RPC can open as soon as
+        // their values are known: a materialized parameter has to be on the wire
+        // before any streamed one, so anything still uncollected at that point
+        // would have to be collected whole. Visiting them first lets every
+        // PLP-capable parameter stream, whatever order they were bound in.
+        //
+        // ODBC leaves the order `SQLParamData` hands parameters back to the
+        // driver -- it returns "the next parameter for which data is needed" --
+        // and the application identifies each one by the token it returns, not
+        // by position. `sort_by_key` is stable, so parameters keep their
+        // relative order within each group.
+        self.params.sort_by_key(|param| !param.plan.is_buffered());
         self
+    }
+
+    /// Every parameter still to be visited is streamed, so the collected values
+    /// are complete and the RPC can be opened.
+    pub(crate) fn buffered_phase_complete(&self) -> bool {
+        self.current_param()
+            .is_some_and(|param| !param.plan.is_buffered())
+    }
+
+    /// Switches the sequence from collecting to streaming once its RPC is open,
+    /// giving each remaining parameter the transcode its chunks need.
+    pub(crate) fn begin_streaming_phase(&mut self, client: TdsClient, collation: SqlCollation) {
+        for param in &mut self.params {
+            if !param.plan.is_buffered() && param.transcode.is_none() {
+                let transcode =
+                    DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+                if !transcode.is_passthrough() {
+                    param.transcode = Some(transcode);
+                }
+            }
+        }
+        self.deferred = false;
+        self.return_client(client);
     }
 
     /// The parameters, for the deferred execute's rebuild.
@@ -933,7 +978,7 @@ impl DaeState {
             progress: DaeProgress::default(),
             deferred: false,
             buffered: Vec::new(),
-            marker_count: 0,
+            prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
         }

@@ -168,7 +168,7 @@ fn sql_param_data_safe(
         stmt_state.dae.as_ref().is_some_and(|dae| dae.deferred)
     };
     if is_deferred {
-        let (has_more, next_ptr) = {
+        let (has_more, buffered_phase_done, next_ptr) = {
             let Ok(mut stmt_state) = stmt.inner.lock() else {
                 error!("SQLParamData: stmt mutex poisoned closing a buffered parameter");
                 return SQL_ERROR;
@@ -186,8 +186,17 @@ fn sql_param_data_safe(
             dae.buffered.push((bound_index, bytes, is_null));
             dae.advance();
             let has_more = dae.current_param().is_some();
-            (has_more, stmt_state.dae_current_value_ptr())
+            let buffered_done = dae.buffered_phase_complete();
+            (has_more, buffered_done, stmt_state.dae_current_value_ptr())
         };
+
+        // Every remaining parameter streams, so the collected values are
+        // complete and the RPC can be opened now. The rest of the sequence goes
+        // onto the wire as it arrives instead of being collected whole, which is
+        // the whole point of data-at-execution for a LOB.
+        if buffered_phase_done && let Some(rc) = open_deferred_rpc(dbc, stmt, statement_handle) {
+            return rc;
+        }
 
         // More parameters to collect: hand back the next token.
         if has_more {
@@ -355,6 +364,136 @@ fn sql_param_data_safe(
     }
 }
 
+/// Opens the RPC for a deferred sequence whose buffered parameters are all
+/// collected, so the streamed ones that remain go onto the wire as their chunks
+/// arrive.
+///
+/// Returns `Some(rc)` only on failure; success leaves the sequence open with its
+/// cursor untouched, so the caller hands back the next parameter's token exactly
+/// as it would have.
+///
+/// Without this the whole sequence stays deferred and every parameter is
+/// collected whole, so one fixed-width value alongside a `varbinary(max)` would
+/// cost memory proportional to the LOB — the opposite of what data-at-execution
+/// is for (AB#47590).
+fn open_deferred_rpc(
+    dbc: &crate::handles::DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+) -> Option<SqlReturn> {
+    let taken = {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLParamData: stmt mutex poisoned opening the deferred RPC");
+            return Some(SQL_ERROR);
+        };
+        let Some(dae) = stmt_state.dae.as_mut() else {
+            error!("SQLParamData: DAE sequence vanished opening the deferred RPC");
+            return Some(SQL_ERROR);
+        };
+        let collected = std::mem::take(&mut dae.buffered);
+        let dae_params = dae.params().to_vec();
+        let prebuilt = std::mem::take(&mut dae.prebuilt);
+        let sql = dae.sql.take();
+        let timeout_secs = dae.timeout_secs;
+        let prepared = dae.take_prepared();
+        let orphaned = dae.take_orphaned();
+        let Some(client) = dae.checkout_client() else {
+            error!("SQLParamData: DAE sequence has no client to open its RPC on");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return Some(SQL_ERROR);
+        };
+
+        let params = match rebuild_deferred_params(
+            &mut stmt_state,
+            prebuilt,
+            &collected,
+            &dae_params,
+            "SQLParamData",
+        ) {
+            Ok(params) => params,
+            Err(rc) => {
+                // Nothing was sent, so the statement goes back to being merely
+                // prepared rather than needing a cancel.
+                let client = stmt_state.take_dae();
+                stmt_state.prepared = prepared;
+                stmt_state.pending_unprepare = orphaned;
+                stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+                drop(stmt_state);
+                if let Some(client) = client {
+                    return_client_idle(dbc, statement_handle, client);
+                }
+                return Some(rc);
+            }
+        };
+        (client, params, prepared, orphaned, sql, timeout_secs)
+    };
+
+    let (mut client, params, mut prepared, mut orphaned, sql, timeout_secs) = taken;
+    let collation = client.get_collation();
+    let options = ExecuteOptions::new().timeout_secs(timeout_secs);
+
+    let begin_result = match (prepared.as_mut(), sql) {
+        (Some(plan), _) => dbc.runtime.block_on(client.begin_execute_prepared(
+            &mut plan.stmt,
+            params,
+            &mut orphaned,
+            options,
+        )),
+        (None, Some(sql)) => dbc
+            .runtime
+            .block_on(client.begin_sp_executesql(sql, params, options)),
+        (None, None) => {
+            error!("SQLParamData: deferred sequence has neither a plan nor SQL text");
+            return_client_idle(dbc, statement_handle, client);
+            clear_exec_started(stmt);
+            return Some(SQL_ERROR);
+        }
+    };
+
+    // The plan goes back before either outcome is reported, exactly as the
+    // immediate path does: a failure must still leave the statement prepared.
+    match begin_result {
+        Ok(StreamedParamStatus::NeedData { .. }) => {
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
+                error!("SQLParamData: stmt mutex poisoned parking the opened RPC");
+                return Some(SQL_ERROR);
+            };
+            stmt_state.prepared = prepared;
+            stmt_state.pending_unprepare = orphaned;
+            let Some(dae) = stmt_state.dae.as_mut() else {
+                error!("SQLParamData: DAE sequence vanished with its RPC open");
+                return Some(SQL_ERROR);
+            };
+            dae.begin_streaming_phase(client, collation);
+            None
+        }
+        Ok(StreamedParamStatus::Complete(_)) => {
+            // Unreachable: this runs only while a streamed parameter is still
+            // open, so the RPC cannot have completed.
+            error!("SQLParamData: deferred RPC completed despite a streamed parameter");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.prepared = prepared;
+                stmt_state.pending_unprepare = orphaned;
+            }
+            Some(finish_execute(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                "SQLParamData",
+            ))
+        }
+        Err(e) => {
+            error!(%e, "SQLParamData: opening the deferred RPC failed");
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.prepared = prepared;
+                stmt_state.pending_unprepare = orphaned;
+            }
+            Some(fail_with_tds(dbc, stmt, statement_handle, client, &e))
+        }
+    }
+}
+
 /// Runs the execute a data-at-execution sequence deferred, now that every value
 /// has been collected.
 ///
@@ -382,21 +521,19 @@ fn run_deferred_execute(
         };
         let collected = std::mem::take(&mut dae.buffered);
         let dae_params = dae.params().to_vec();
-        let marker_count = dae.marker_count;
+        let prebuilt = std::mem::take(&mut dae.prebuilt);
         let sql = dae.sql.take();
         let timeout_secs = dae.timeout_secs;
         let prepared = dae.take_prepared();
         let mut orphaned = dae.take_orphaned();
 
-        let params = match unsafe {
-            rebuild_deferred_params(
-                &mut stmt_state,
-                marker_count,
-                &collected,
-                &dae_params,
-                "SQLParamData",
-            )
-        } {
+        let params = match rebuild_deferred_params(
+            &mut stmt_state,
+            prebuilt,
+            &collected,
+            &dae_params,
+            "SQLParamData",
+        ) {
             Ok(params) => params,
             Err(rc) => {
                 // Nothing was sent, so the statement goes back to being merely

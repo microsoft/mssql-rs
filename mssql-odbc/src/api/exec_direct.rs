@@ -226,14 +226,13 @@ fn sql_exec_direct_w_safe(
         // so no RPC is opened: the sequence collects its values and runs
         // `sp_executesql` from the last `SQLParamData` (AB#47590).
         if dae_params.iter().any(|param| param.plan.is_buffered()) {
-            let marker_count = params.len();
             return park_deferred_dae(
                 stmt,
                 client,
                 None,
                 None,
                 dae_params,
-                marker_count,
+                params,
                 Some(rewritten_sql),
                 query_timeout,
                 "SQLExecDirectW",

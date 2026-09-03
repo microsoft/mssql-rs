@@ -139,7 +139,7 @@ pub(super) fn park_deferred_dae(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     dae_params: Vec<DaeParam>,
-    marker_count: usize,
+    prebuilt: Vec<RpcParameter>,
     sql: Option<String>,
     timeout_secs: u32,
     op: &str,
@@ -149,11 +149,7 @@ pub(super) fn park_deferred_dae(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(
-        DaeState::new(client, prepared, orphaned, dae_params).deferred(
-            marker_count,
-            sql,
-            timeout_secs,
-        ),
+        DaeState::new(client, prepared, orphaned, dae_params).deferred(prebuilt, sql, timeout_secs),
     );
     SQL_NEED_DATA
 }
@@ -743,59 +739,55 @@ pub(super) unsafe fn build_named_params(
     Ok(ParamsWithDae { params, dae_params })
 }
 
-/// Rebuilds the whole RPC parameter list once every data-at-execution value has
-/// been collected, for a sequence that deferred its execute.
+/// Rebuilds the RPC parameter list once every data-at-execution value has been
+/// collected, for a sequence that deferred its execute.
 ///
-/// Non-streamed parameters are re-read from the application's buffers, which
-/// ODBC requires to stay valid until execution completes, and the buffered ones
-/// are converted from their collected bytes by [`buffered_dae_to_rpc`]. Both
-/// therefore go through the same conversion the materialized path uses, so a
-/// value supplied in chunks is declared and bounded exactly like one supplied in
-/// a single buffer (AB#47590).
+/// Only the data-at-execution slots are rebuilt, from the bytes
+/// [`buffered_dae_to_rpc`] converts; every other parameter is the one
+/// `build_named_params` already materialized at execute time and is kept
+/// verbatim. A buffered value therefore still goes through the same conversion
+/// the materialized path uses, so it is declared and bounded exactly like a
+/// value supplied in a single buffer (AB#47590).
 ///
-/// # Safety
-/// Each bound parameter's value/indicator pointers must still satisfy the
-/// `SQLBindParameter` contract.
-pub(super) unsafe fn rebuild_deferred_params(
+/// Nothing here reads application memory. Re-reading it would be unsound rather
+/// than merely redundant: `bound_params` is an execute-time snapshot that
+/// `SQLFreeStmt(SQL_RESET_PARAMS)` leaves in place while releasing the bindings
+/// it describes, so an application that resets its parameters mid-sequence --
+/// which this driver explicitly supports -- would have freed buffers
+/// dereferenced here.
+pub(super) fn rebuild_deferred_params(
     stmt_state: &mut StmtState,
-    marker_count: usize,
+    prebuilt: Vec<RpcParameter>,
     collected: &[(usize, Vec<u8>, bool)],
     dae_params: &[DaeParam],
     op: &str,
 ) -> Result<Vec<RpcParameter>, SqlReturn> {
-    let mut params = Vec::with_capacity(marker_count);
-    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+    let mut params = prebuilt;
 
-    for i in 0..marker_count {
-        let name = format!("@P{}", i + 1);
-
-        let built =
-            if let Some((_, bytes, is_null)) = collected.iter().find(|(index, _, _)| *index == i) {
-                let Some(dae) = dae_params.iter().find(|p| p.bound_index == i) else {
-                    error!(
-                        "{op}: collected value for parameter {} has no binding",
-                        i + 1
-                    );
-                    post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
-                    return Err(SQL_ERROR);
-                };
-                buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null)
-            } else {
-                let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
-                    error!("{op}: parameter {} has no bound value", i + 1);
-                    post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
-                    return Err(SQL_ERROR);
-                };
-                let bound_param = bound_param.with_bind_offset(bind_offset);
-                unsafe { bound_param_to_rpc(name, &bound_param) }
-            };
-
-        match built {
-            Ok(param) => params.push(param),
+    for (index, bytes, is_null) in collected {
+        let Some(dae) = dae_params.iter().find(|p| p.bound_index == *index) else {
+            error!(
+                "{op}: collected value for parameter {} has no binding",
+                index + 1
+            );
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+        let Some(slot) = params.get_mut(*index) else {
+            error!(
+                "{op}: collected value for parameter {} has no slot",
+                index + 1
+            );
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+        let name = format!("@P{}", index + 1);
+        match buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null) {
+            Ok(param) => *slot = param,
             Err(e) => {
                 error!(
                     "{op}: parameter {} conversion failed: {}",
-                    i + 1,
+                    index + 1,
                     e.diag().text
                 );
                 post_diag(stmt_state, e.diag());

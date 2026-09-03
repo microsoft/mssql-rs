@@ -178,6 +178,103 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
 // that reaches the advance branch in SQLParamData (dae_current_idx += 1) and so
 // the only one that can catch the driver stalling on the first parameter,
 // skipping the second, or handing back the wrong token.
+// A mixed sequence -- one parameter that must be collected whole (a fixed-width
+// target has no PLP form) alongside one that streams. The collected one is
+// offered first so the RPC can open as soon as its value is known, leaving the
+// PLP-capable parameter to stream rather than be held in memory. Parameters are
+// identified by the token SQLParamData returns, which is what ODBC specifies, so
+// the order they are offered in is the driver's to choose.
+TEST_F(PrepareExecuteLiveTest, MixedDataAtExecutionStreamsThePlpParameter) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS a, ? AS b"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token_streamed = 0;
+    SQLCHAR token_buffered = 0;
+
+    // Parameter 1 is PLP-capable (varchar(max)) and streams; parameter 2 is
+    // fixed-width (char(4)) and must be collected. Bound in that order, so the
+    // buffered one is offered second by position but first by plan.
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &token_streamed, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_CHAR, 4, 0, &token_buffered, 0,
+                                   &buffered_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    SQLRETURN rc = SQLParamData(stmt_, &value_ptr);
+    int iterations = 0;
+    bool sent_streamed = false;
+    bool sent_buffered = false;
+    bool buffered_came_first = false;
+
+    while (rc == SQL_NEED_DATA) {
+        ASSERT_LT(++iterations, 10) << "SQLParamData did not terminate";
+        if (value_ptr == &token_streamed) {
+            EXPECT_FALSE(sent_streamed) << "streamed token offered twice";
+            if (!sent_buffered) {
+                buffered_came_first = false;
+            }
+            sent_streamed = true;
+            // Two chunks, so the streamed value genuinely spans calls.
+            const char first[] = "ab";
+            const char second[] = "cd";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first), 2),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second), 2),
+                          SQL_HANDLE_STMT, stmt_);
+        } else if (value_ptr == &token_buffered) {
+            EXPECT_FALSE(sent_buffered) << "buffered token offered twice";
+            if (!sent_streamed) {
+                buffered_came_first = true;
+            }
+            sent_buffered = true;
+            const char chunk[] = "wxyz";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 4),
+                          SQL_HANDLE_STMT, stmt_);
+        } else {
+            FAIL() << "SQLParamData returned an unrecognised token";
+        }
+        rc = SQLParamData(stmt_, &value_ptr);
+    }
+
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_TRUE(sent_streamed);
+    EXPECT_TRUE(sent_buffered);
+    // Only this driver promises the order. msodbcsql offers parameters in bind
+    // order because it can declare a fixed-width target without seeing its
+    // value; this driver derives the declaration from the collected bytes, so it
+    // has to visit the collected ones first to open the RPC at all. The values
+    // below are asserted on both drivers -- that is the part that must agree.
+    {
+        const char* target = std::getenv("ODBC_TEST_TARGET");
+        if (!target || std::string(target) != "msodbcsql") {
+            EXPECT_TRUE(buffered_came_first)
+                << "the collected parameter must be offered before the streamed "
+                   "one, or the streamed one cannot reach the wire as it "
+                   "arrives";
+        }
+    }
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR a[32] = {0};
+    SQLCHAR b[32] = {0};
+    SQLLEN a_len = 0;
+    SQLLEN b_len = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, a, sizeof(a), &a_len),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, b, sizeof(b), &b_len),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ(reinterpret_cast<const char*>(a), "abcd");
+    EXPECT_STREQ(reinterpret_cast<const char*>(b), "wxyz");
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 TEST_F(PrepareExecuteLiveTest, DataAtExecutionLoopsOverMultipleStreamedParams) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
 
