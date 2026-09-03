@@ -85,19 +85,13 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_INVALID_HANDLE, SQL_VARCHAR};
+    use crate::api::odbc_types::SQL_INVALID_HANDLE;
     use crate::handles::stmt::{DaeParam, DaeState, STMT_STATE_EXEC_STARTED};
     use crate::test_support::TestHandles;
 
     fn dae_with_one_param(cursor: Option<usize>) -> DaeState {
         DaeState::for_test(
-            vec![DaeParam {
-                value_ptr: std::ptr::null_mut(),
-                expected_len: None,
-                needs_transcode: false,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR,
-            }],
+            vec![DaeParam::unbounded(0, std::ptr::null_mut(), None)],
             cursor,
         )
     }
