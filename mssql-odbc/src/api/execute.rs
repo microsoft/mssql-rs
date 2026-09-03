@@ -417,7 +417,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     let orphaned = stmt_state.pending_unprepare.take();
     let query_timeout = stmt_state.query_timeout;
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
-    stmt_state.column_metadata.clear();
+    stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.row_count = -1;
     stmt_state.pending_row_counts.clear();
@@ -828,9 +828,11 @@ mod tests {
                 assert_eq!(
                     dae.dae_params,
                     vec![DaeParam {
-                        bound_index: 0,
                         value_ptr: std::ptr::null_mut(),
-                        expected_len: None
+                        expected_len: None,
+                        needs_transcode: false,
+                        c_type: SQL_C_CHAR,
+                        sql_type: SQL_VARCHAR
                     }]
                 );
                 assert_eq!(dae.params.len(), 1, "one param in list");

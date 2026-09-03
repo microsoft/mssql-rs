@@ -93,15 +93,62 @@ transparent reconnects.
 - **Data-at-execution streaming** - `SQLParamData` / `SQLPutData` stream
   `SQL_C_CHAR`, `SQL_C_WCHAR`, and `SQL_C_BINARY` as PLP
   `(n)varchar(max)` / `varbinary(max)`, matching msodbcsql sequencing.
-  Cross-family pairings are **not** streamable: the chunks go to the wire
-  untranscoded, which cannot serve an integer wire type. Since P5 made those
-  pairings bindable, the refusal moved from `SQLBindParameter` to execute - the
-  DAE indicator is only read while building the parameter list - so an
-  application gets `HYC00` from `SQLExecute` after setting up its
-  `SQLParamData` loop rather than at bind. msodbcsql streams the pairing
-  instead, returning `SQL_NEED_DATA`, so this is the same gap as the
-  narrow-to-wide case and closes with it (AB#47590). Pinned by
-  `CrossFamilyDataAtExecutionIsRejectedAtExecute`.
+  Same-family pairings always stream. A C-type/SQL-type wideness mismatch
+  within the character family (e.g. `SQL_C_WCHAR` against a narrow SQL type)
+  is buffered and transcoded once at `SQLParamData` close via the
+  connection's collation rather than rejected - msodbcsql accepts the same
+  pairing. A msodbcsql parity run for the narrow-to-wide direction measured a
+  UTF-8 character split across two `SQLPutData` calls coming back as 5
+  UTF-16 units instead of 4
+  (`NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodesASplitCharacter`,
+  skipped for msodbcsql parity because of it), but this is very likely
+  msodbcsql reading `SQL_C_CHAR` bytes in the client code page rather than
+  UTF-8 (AB#47565) -- a mismatch that would reproduce for a single-chunk
+  value too -- not evidence about whether msodbcsql carries a residual
+  across `SQLPutData` calls; not confirmed at the code-point level. Either
+  way, whole-value buffering here is a documented deviation from msodbcsql's
+  incremental approach, not a gap. The same-wideness narrow path
+  (`SQL_C_CHAR` against a narrow SQL type) still assumes UTF-8 on the wire
+  instead of reading the connection's collation (AB#47590); only the
+  wideness-mismatch half of that gap has closed. Under a UTF8-flagged
+  database collation, this transcode fix is now *more* correct than the
+  materialized (non-DAE) path: `encode_narrow` checks `collation.utf8()`
+  like `get_encoding_type` does, but the serializer's `VARCHAR | CHAR | TEXT`
+  arm predates that flag and always encodes through the single-byte LCID
+  codepage regardless of it, so the same value now gets correct UTF-8 wire
+  bytes streamed but single-byte-miscoded bytes bound inline - a new
+  instance of the same "two ways to bind disagree" shape, just with the
+  streamed side on the correct end this time (AB#47590; the serializer fix
+  itself is out of scope here).
+  `SQLPutData`'s `try_reserve` guard against an unbounded `SQL_DATA_AT_EXEC`
+  value only bounds accumulation: the transform `SQLParamData` runs at close
+  (`decode_utf16le`, `String::from_utf8_lossy`, `encode_narrow`) still
+  allocates its output infallibly, and can be several times the buffered
+  size (NCR substitution alone is up to 10 bytes per unmappable character,
+  measured for U+10FFFF), so a value that just fit under the guard can still
+  abort the process one call later. Not fixed: `AppText`/`decode_utf16le` are
+  shared with the materialized path, so bounding them is a broader change
+  than this file's DAE-specific scope (AB#47590).
+  Cross-*family* pairings (character/binary against an integer SQL type) are
+  still **not** streamable: there is no transcode from arbitrary bytes to an
+  integer wire value. Since P5 made those pairings bindable, the refusal
+  moved from `SQLBindParameter` to execute - the DAE indicator is only read
+  while building the parameter list - so an application gets `HYC00` from
+  `SQLExecute` after setting up its `SQLParamData` loop rather than at bind.
+  msodbcsql returns `SQL_NEED_DATA` for this pairing at `SQLExecute` rather
+  than refusing there, but it does not actually stream it: `SQLPutData`
+  itself then rejects with `HY019` ("Processing of fixed length targets
+  cannot be spread over multiple calls to SQLPutData",
+  `sqlccmd.cpp:11079-11082`, `:11185-11188`) once the streamed value's
+  integer target is a fixed-length one. So the two drivers agree that this
+  pairing cannot stream a value through, they just detect it one call apart
+  -- msodbcsql at `SQLPutData`, this driver at `SQLExecute` -- which is why
+  the parity run stays skipped rather than comparing error codes that
+  differ by construction.
+  Pinned by `CrossFamilyDataAtExecutionIsRejectedAtExecute` and, for the
+  wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
+  / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
+  `execute_test.cpp`.
 
 ## `mssql-tds` prepared API
 

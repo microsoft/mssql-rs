@@ -432,6 +432,48 @@ pub fn int_columns(n: usize) -> Vec<ColumnMetadata> {
         .collect()
 }
 
+/// Inline integer columns followed by one deferred `nvarchar(max)` column.
+pub fn mixed_lob_columns(prefix_columns: usize) -> Vec<ColumnMetadata> {
+    let mut columns = int_columns(prefix_columns);
+    columns.push(ColumnMetadata {
+        user_type: 0,
+        flags: 0x01,
+        type_info: TypeInfo::partial_len(TdsDataType::NVarChar, usize::from(u16::MAX), None)
+            .expect("nvarchar(max) is a PLP type"),
+        data_type: TdsDataType::NVarChar,
+        column_name: "lob".to_string(),
+        multi_part_name: None,
+        crypto_metadata: None,
+    });
+    columns
+}
+
+/// Builds mixed-LOB rows whose scripted payload contains only the inline prefix.
+///
+/// Consumer tests use this to verify fetch-time prefix capture and bypass
+/// selection; PLP streaming itself is exercised by the real byte transport.
+pub fn tds_client_from_mixed_lob_prefix_rows(rows: Vec<Vec<i32>>) -> TdsClient {
+    let prefix_columns = rows.first().map_or(0, Vec::len);
+    let columns = mixed_lob_columns(prefix_columns);
+    let metadata = Tokens::ColMetadata(ColMetadataToken {
+        column_count: u16::try_from(columns.len()).unwrap_or(u16::MAX),
+        columns,
+        cek_table: Vec::new(),
+    });
+    let transport =
+        AnyTransport::dynamic(TokenReplayTransport::with_int_rows(metadata, rows, None));
+    let negotiated_settings = create_test_negotiated_settings_internal();
+    let execution_context = ExecutionContext::new();
+    let client_context = ClientContext::with_data_source("tcp:localhost,1433");
+    TdsClient::new(
+        transport,
+        negotiated_settings,
+        execution_context,
+        client_context,
+        Vec::new(),
+    )
+}
+
 /// A DONE token with the MORE flag set (more results follow in the batch).
 pub fn done_more() -> ScriptedToken {
     ScriptedToken(Tokens::Done(DoneToken {

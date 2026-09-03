@@ -235,7 +235,7 @@ pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandl
 pub(super) fn reset_cursor_state(stmt_state: &mut crate::handles::stmt::StmtState) {
     stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_CONTEXT);
     stmt_state.reset_row_stream();
-    stmt_state.column_metadata.clear();
+    stmt_state.clear_result_metadata();
     stmt_state.pending_row_counts.clear();
     stmt_state.clear_exhaustion_state();
 }

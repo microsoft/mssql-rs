@@ -148,7 +148,7 @@ fn sql_get_type_info_w_safe(
         // A new query invalidates prior metadata/context immediately, so a later
         // failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
-        stmt_state.column_metadata.clear();
+        stmt_state.clear_result_metadata();
         stmt_state.reset_row_stream();
         // A cached prepared plan is superseded; release its server handle
         // (deferred) once we hold the client below.
@@ -327,6 +327,7 @@ fn rename_type_info_columns(stmt: &StmtHandle, is_2x_app: bool) {
             col.column_name = name.to_string();
         }
     }
+    stmt_state.refresh_metadata_caches();
 }
 
 /// Clears the nullable flag on the type-info columns the ODBC spec guarantees

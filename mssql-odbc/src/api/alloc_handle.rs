@@ -3,6 +3,8 @@
 
 //! Implementation of SQLAllocHandle — the ODBC handle allocation entry point.
 
+use std::sync::Arc;
+
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
@@ -121,7 +123,7 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         "SQLAllocHandle(DBC): SQL_ATTR_ODBC_VERSION not set on env"
     );
 
-    let dbc = Box::new(DbcHandle::new(input_handle, env.runtime.clone()));
+    let dbc = Box::new(DbcHandle::new(input_handle, Arc::clone(&env.runtime)));
     let raw = handle_to_raw(dbc);
     env_state.connections.push(raw);
 

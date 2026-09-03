@@ -12,7 +12,9 @@ use tracing::error;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementId, TdsClient};
+use mssql_tds::connection::tds_client::{
+    CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
+};
 use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
@@ -262,7 +264,11 @@ pub(super) fn release_busy_if_row_exhausted(
     mut client: TdsClient,
     row_delivered: bool,
 ) {
-    let peek_result = dbc.runtime.block_on(client.peek_past_current_row());
+    let peek_result = match client.try_peek_past_current_row() {
+        Ok(CursorPoll::Ready(has_row)) => Ok(has_row),
+        Ok(CursorPoll::Pending) => dbc.runtime.block_on(client.peek_past_current_row()),
+        Err(error) => Err(error),
+    };
     let batch_done = !client.has_open_batch();
 
     // `Ok(true)`: another row, already parked for the next fetch — never
@@ -579,24 +585,26 @@ pub(super) unsafe fn build_named_params(
         };
 
         if let Some(indicator) = dae_indicator {
-            let placeholder_type =
-                match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(
-                            "{op}: parameter {} DAE type not streamable: {}",
-                            i + 1,
-                            e.diag().text
-                        );
-                        post_diag(stmt_state, e.diag());
-                        return Err(SQL_ERROR);
-                    }
-                };
-            let rpc = RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, placeholder_type);
+            let dae_stream = match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(
+                        "{op}: parameter {} DAE type not streamable: {}",
+                        i + 1,
+                        e.diag().text
+                    );
+                    post_diag(stmt_state, e.diag());
+                    return Err(SQL_ERROR);
+                }
+            };
+            let rpc =
+                RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, dae_stream.sql_type);
             dae_params.push(DaeParam {
-                bound_index: i,
                 value_ptr: bound_param.parameter_value_ptr,
                 expected_len: dae_expected_length(indicator),
+                needs_transcode: dae_stream.needs_transcode,
+                c_type: bound_param.c_type,
+                sql_type: bound_param.sql_type,
             });
             params.push(rpc);
         } else {
@@ -1525,9 +1533,11 @@ mod tests {
         assert_eq!(
             dae.dae_params,
             vec![DaeParam {
-                bound_index: 1,
                 value_ptr: std::ptr::null_mut(),
-                expected_len: None
+                expected_len: None,
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR
             }]
         );
     }
@@ -1558,9 +1568,11 @@ mod tests {
         assert_eq!(
             dae.dae_params,
             vec![DaeParam {
-                bound_index: 0,
                 value_ptr: std::ptr::null_mut(),
-                expected_len: Some(7)
+                expected_len: Some(7),
+                needs_transcode: false,
+                c_type: SQL_C_CHAR,
+                sql_type: SQL_VARCHAR
             }]
         );
     }

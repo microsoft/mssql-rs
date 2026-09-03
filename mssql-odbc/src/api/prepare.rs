@@ -127,7 +127,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
         marker_count,
     });
     stmt_state.parameter_metadata.clear();
-    stmt_state.column_metadata.clear();
+    stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.set_state(STMT_STATE_PREPARED);
