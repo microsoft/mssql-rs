@@ -474,6 +474,11 @@ fn open_deferred_rpc(
             // across a `let ... else` would forbid. Put back below on success.
             let Some(mut dae) = stmt_state.dae.take() else {
                 error!("SQLParamData: DAE sequence vanished with its RPC open");
+                // Cleared while the guard is still held, so the statement is
+                // reusable rather than stuck mid-execute — the same thing the
+                // no-plan-no-SQL arm above does through `clear_exec_started`.
+                // The poisoned-mutex arm cannot: it never got a guard.
+                stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
                 drop(stmt_state);
                 abandon_open_rpc(dbc, statement_handle, client);
                 return Some(SQL_ERROR);
