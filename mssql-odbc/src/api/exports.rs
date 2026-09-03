@@ -609,6 +609,11 @@ pub unsafe extern "C" fn SQLParamData(
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
 /// - `data_ptr`, when `strlen_or_ind` is a positive byte count, must be
 ///   readable for that many bytes.
+/// - `data_ptr`, when `strlen_or_ind` is `SQL_NTS`, must be non-null and
+///   NUL-terminated within an allocation it owns. The terminator search reads
+///   potentially unaligned `u16` units for `SQL_C_WCHAR` and `u8` units
+///   otherwise, and runs off the end of the allocation if no terminator is
+///   present.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLPutData(
     statement_handle: SqlHandle,
@@ -864,7 +869,9 @@ pub unsafe extern "C" fn SQLRowCount(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLTablesW(
@@ -898,7 +905,9 @@ pub unsafe extern "C" fn SQLTablesW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLColumnsW(
@@ -932,7 +941,9 @@ pub unsafe extern "C" fn SQLColumnsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLPrimaryKeysW(
     statement_handle: SqlHandle,
@@ -961,7 +972,9 @@ pub unsafe extern "C" fn SQLPrimaryKeysW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLForeignKeysW(
@@ -1003,7 +1016,9 @@ pub unsafe extern "C" fn SQLForeignKeysW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLStatisticsW(
@@ -1038,7 +1053,9 @@ pub unsafe extern "C" fn SQLStatisticsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn SQLSpecialColumnsW(
@@ -1074,7 +1091,9 @@ pub unsafe extern "C" fn SQLSpecialColumnsW(
 ///
 /// # Safety
 /// - `statement_handle` must be a valid STMT handle returned by `SQLAllocHandle`.
-/// - Each name pointer must be null or reference `*_len` readable UTF-16 units.
+/// - Each name pointer must be null, reference its paired length in readable
+///   UTF-16 units, or be readable through a NUL terminator when that length is
+///   `SQL_NTS`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn SQLProceduresW(
     statement_handle: SqlHandle,
