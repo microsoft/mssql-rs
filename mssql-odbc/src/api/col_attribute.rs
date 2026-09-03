@@ -14,7 +14,7 @@ use crate::api::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{
     SQL_ATTR_READWRITE_UNKNOWN, SQL_BIGINT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE,
     SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2,
-    SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP,
+    SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_UTINYINT,
     SQL_C_WCHAR, SQL_CA_SS_VARIANT_TYPE, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
     SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME, SQL_DESC_CASE_SENSITIVE,
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE,
@@ -506,7 +506,13 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
 /// decides it rather than the column's declared type.
 fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
     match base {
-        TdsDataType::Int1 => SQL_C_TINYINT,
+        // `tinyint` is unsigned 0-255 on the server, so the unsigned C type is
+        // the accurate answer: a caller that fetched 200 into a signed char
+        // through SQL_C_TINYINT would read -56. Measured against retail
+        // msodbcsql18 18.06.0001, which answers SQL_C_UTINYINT (-28), and
+        // consistent with this driver's own `type_rules::resolve_default_c_type`,
+        // which resolves SQL_TINYINT to SQL_C_UTINYINT for a column binding.
+        TdsDataType::Int1 => SQL_C_UTINYINT,
         TdsDataType::Int2 => SQL_C_SSHORT,
         TdsDataType::Int4 => SQL_C_SLONG,
         TdsDataType::Int8 => SQL_C_SBIGINT,
@@ -1216,7 +1222,7 @@ mod tests {
     #[test]
     fn variant_c_type_covers_the_base_types() {
         let cases: &[(TdsDataType, SqlSmallInt)] = &[
-            (TdsDataType::Int1, SQL_C_TINYINT),
+            (TdsDataType::Int1, SQL_C_UTINYINT),
             (TdsDataType::Int2, SQL_C_SSHORT),
             (TdsDataType::Int4, SQL_C_SLONG),
             (TdsDataType::Int8, SQL_C_SBIGINT),

@@ -30,6 +30,8 @@
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
 //   23. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
 //   24. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   25. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   26. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
 
 #include "odbc_test_fixture.h"
 
@@ -555,4 +557,100 @@ TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
     EXPECT_STREQ("999.9900", reinterpret_cast<const char*>(text));
 
     SQLCloseCursor(stmt_);
+}
+
+// Every base type whose answer is measured to agree with msodbcsql, in one
+// place. Spot-checking a couple of types is what let the exact-numeric answer
+// (AB#47702) and the `tinyint` signedness answer both survive unnoticed, so the
+// table is exhaustive by construction rather than by whichever type someone
+// thought to add.
+//
+// Deliberately excluded, because the drivers genuinely differ:
+//
+//   * date / smalldatetime / datetime / datetime2 - msodbcsql answers the 2.x
+//     spellings (SQL_C_DATE 9, SQL_C_TIMESTAMP 11), this driver the 3.x ones
+//     (91 / 93). That is the documented canonicalization direction in
+//     api/type_rules.rs, not a defect, and it is covered separately below.
+//   * time / datetimeoffset - both drivers answer SQL_C_SS_TIME2 /
+//     SQL_C_SS_TIMESTAMPOFFSET when the application declares ODBC 3.80, but
+//     msodbcsql falls back to SQL_C_BINARY under plain SQL_OV_ODBC3 while this
+//     driver does not. The fixture's declared version decides the answer, so
+//     the row would assert the fixture rather than the driver.
+TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
+    struct Case {
+        const char* label;
+        const char* expr;
+        SQLSMALLINT expected;
+    };
+    const Case cases[] = {
+        {"bit", "CAST(1 AS BIT)", SQL_C_BIT},
+        // Unsigned: tinyint is 0-255 on the server, so a signed answer would
+        // make a caller read 200 as -56.
+        {"tinyint", "CAST(200 AS TINYINT)", SQL_C_UTINYINT},
+        {"smallint", "CAST(300 AS SMALLINT)", SQL_C_SSHORT},
+        {"int", "CAST(42 AS INT)", SQL_C_SLONG},
+        {"bigint", "CAST(42 AS BIGINT)", SQL_C_SBIGINT},
+        {"real", "CAST(1.5 AS REAL)", SQL_C_FLOAT},
+        {"float", "CAST(1.5 AS FLOAT)", SQL_C_DOUBLE},
+        {"decimal", "CAST(1.5 AS DECIMAL(18, 4))", SQL_C_NUMERIC},
+        {"numeric", "CAST(1.5 AS NUMERIC(10, 2))", SQL_C_NUMERIC},
+        {"money", "CAST(1.5 AS MONEY)", SQL_C_NUMERIC},
+        {"smallmoney", "CAST(1.5 AS SMALLMONEY)", SQL_C_NUMERIC},
+        {"char", "CAST('ab' AS CHAR(2))", SQL_C_CHAR},
+        {"varchar", "CAST('ab' AS VARCHAR(10))", SQL_C_CHAR},
+        {"nchar", "CAST(N'ab' AS NCHAR(2))", SQL_C_WCHAR},
+        {"nvarchar", "CAST(N'ab' AS NVARCHAR(10))", SQL_C_WCHAR},
+        {"binary", "CAST(0x01 AS BINARY(1))", SQL_C_BINARY},
+        {"varbinary", "CAST(0x01 AS VARBINARY(10))", SQL_C_BINARY},
+        {"uniqueidentifier", "CAST(NEWID() AS UNIQUEIDENTIFIER)", SQL_C_GUID},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_NE(SQL_NULL_DATA, indicator);
+        EXPECT_EQ(c.expected, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// The date/time family, which the table above excludes. msodbcsql answers the
+// 2.x spellings here regardless of the declared ODBC version; this driver
+// canonicalizes toward the 3.x ones (api/type_rules.rs). Pinning our side keeps
+// the difference deliberate instead of accidental, so it skips the reference leg.
+TEST_F(ColAttributeLiveTest, VariantDateTimeBaseTypesUseTheThreeXSpellings) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    struct Case {
+        const char* label;
+        const char* expr;
+        SQLSMALLINT expected;
+    };
+    const Case cases[] = {
+        {"date", "CAST('2023-06-15' AS DATE)", SQL_C_TYPE_DATE},
+        {"smalldatetime", "CAST('2023-06-15 12:00' AS SMALLDATETIME)", SQL_C_TYPE_TIMESTAMP},
+        {"datetime", "CAST('2023-06-15 12:00' AS DATETIME)", SQL_C_TYPE_TIMESTAMP},
+        {"datetime2", "CAST('2023-06-15 12:00' AS DATETIME2)", SQL_C_TYPE_TIMESTAMP},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_NE(SQL_NULL_DATA, indicator);
+        EXPECT_EQ(c.expected, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+        SQLCloseCursor(stmt_);
+    }
 }
