@@ -21,10 +21,9 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    Azure DevOps work item — flag a PR that has neither. Resolving an `AB#` reference
    is worth it when you can: it catches a PR that drifts from what its work item
    asked, or one still open against a closed item. Attempt the lookup before treating
-   it as out of reach — on an already-authenticated host, the Azure DevOps MCP server
-   answers `wit_work_item` without an interactive prompt (verified 2026-09-02). See
-   step 6 for what to do when a call actually fails or isn't exposed in this session
-   at all, and for unattended runs.
+   it as out of reach — see step 6 for what the Azure DevOps MCP server actually
+   does, what to do when a call fails or isn't exposed in this session at all, and
+   how unattended runs handle this differently.
 2. **Check the PR out locally.** A diff alone is not enough to review this codebase —
    most defects here turn on unchanged code (the other implementer of a trait, the
    caller three layers up, the `#[cfg]` variant of a constant). Use a dedicated
@@ -95,38 +94,17 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      `$BASE` and compare failure sets; only the difference belongs in the review.
    - **Is this coverage gap real?** Introduce the bug the missing test would catch and
      show the suite still passes.
-   - **Does the platform-gated half still compile?** Where the toolchain is already
-     available, `cargo check --target <triple>` / `cargo clippy --target <triple>`
-     type-checks `#[cfg(windows)]` and `#[cfg(target_os = ...)]` code without a
-     matching host, because neither links (`rustup target add
-     aarch64-pc-windows-msvc`; ~26 s warm for `-p mssql-tds --all-targets`). Use
-     `--all-targets`, not `--lib`: most of this repo's platform-gated code lives
-     inside inline `#[cfg(test)] mod tests` blocks, which `--lib` compiles without the
-     `test` cfg and so skips silently, `--target` notwithstanding — confirmed by
-     mutating a `#[cfg(windows)]` test in `datasource_parser.rs`, which `--lib` missed
-     and `--all-targets` caught. (This example measures `mssql-tds`, not `mssql-odbc`,
-     because it carries far more platform-gated surface to demonstrate against —
-     roughly 120 `cfg(windows)`/`cfg(target_os)` sites against `mssql-odbc`'s ~18 —
-     not because it's a crate to default to: check whichever crate the diff actually
-     touches, per the crate-selection rule below.) This is a convenience, not a
-     requirement — installing a target and building locally isn't something every
-     reviewer wants or needs to do.
-     Either way, confirm the specific CI job for that platform actually ran and passed
-     on the PR's head commit rather than assuming "the matrix owns this" without
-     looking; a local check only adds a faster answer to the same question CI already
-     gates, since neither `cargo check` nor `cargo clippy` executes a compiled test
-     binary — only CI's Windows job actually runs the `#[cfg(windows)]` tests. A
-     mutation applied to an arm your invocation doesn't select — the wrong target, or
-     `--lib` over `--all-targets` — proves nothing on its own. A local check can also
-     fail in a dependency's build script rather than the reviewed code: targeting a
-     non-Windows, non-macOS triple pulls in `openssl-sys` — through `native-tls`'s
-     backend choice and, in `mssql-tds`, through a direct `openssl` dependency for the
-     Always Encrypted primitives — and its build script fails before rustc ever sees
-     the crate if it can't find a target OpenSSL sysroot. Confirmed on `mssql-tds`:
-     the Windows-target direction above needs none at all (`native-tls` routes
-     through Schannel on Windows, Security.framework on macOS). That is an
-     environment gap, not a type error; read what actually failed before attributing
-     it to the diff.
+   - **Does the platform-gated half still compile?** `cargo check --target <triple>`
+     / `cargo clippy --target <triple> --all-targets` type-checks `#[cfg(windows)]`
+     and `#[cfg(target_os = ...)]` code from any host, since neither links. Use
+     `--all-targets`, not `--lib`: a substantial share of this repo's platform-gated
+     code — including platform-gated tests — lives inside inline `#[cfg(test)] mod
+     tests` blocks, which `--lib` skips silently (a different `--lib` than the
+     `nextest run --lib` below, which does run those tests). This is optional and
+     doesn't *run* anything either — still confirm the platform's CI job actually
+     passed on the head commit rather than assuming the matrix covers it. A
+     non-Windows/non-macOS triple also pulls in `openssl-sys`, whose build script can
+     fail without a target sysroot; that's an environment gap, not a finding.
 
    ```bash
    cargo nextest run -p <affected-crate> --lib --no-fail-fast   # or `cargo btest`
@@ -160,14 +138,10 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
      rather than to any one server: a flow that would open a browser has nobody to
      answer it, and the run can keep reporting itself as healthy while it hangs. Bound
      each such call with a timeout, and on a real failure mark that dependency
-     unavailable for the rest of the run instead of retrying per PR.
-
-     This does **not** describe the Azure DevOps MCP server in ordinary use. It answers
-     `wit_work_item` non-interactively on an already-authenticated host — verified
-     2026-09-02, an `action: get` on a work item returned immediately with no prompt
-     and no hang (`wit_query` hasn't been invoked, so it isn't claimed here). Earlier
-     revisions of this file named it as a known trap; that has since been read as a
-     standing fact about the tool and has cost real cross-checks. Call it, then decide.
+     unavailable for the rest of the run instead of retrying per PR. This is not a
+     reason to skip the Azure DevOps MCP server: it answers `wit_work_item`
+     non-interactively on an already-authenticated host (verified 2026-09-02). Call
+     it, then decide.
 
    **Fail open — after a failed call, not instead of one.** ADO is context, not a
    gate: it confirms a PR does what its work item asked. When a lookup *actually*
@@ -175,9 +149,7 @@ you happen to be reviewing. Skill maintenance is not that author's problem.
    nothing to call, take an `AB#<number>` at face value as satisfying the
    linked-work-item requirement in step 1, review normally, and report the skipped
    cross-check in the run log rather than in the PR — a reviewer's infrastructure
-   trouble is not the author's problem. Reaching for this paragraph while the tool is
-   available but unattempted is the failure mode it exists to bound, and it silently
-   drops the one check that catches a PR drifting from what its work item asked.
+   trouble is not the author's problem.
 7. Ground yourself in reference code and public/private documentation/specifications.
    If you don't know the codebase, or which references to use, ask for context before
    reviewing.
@@ -401,18 +373,11 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
 - Distinguish facts (verified in code) from concerns (worth checking). Don't state
   guesses as defects. Say what you ran and what you read.
 - **An unavailability is a claim, and it carries the same burden as a defect.** Write
-  "I could not check X" only after recording what happened when you tried: quote the
-  response when one comes back, state that none did (a timeout after a bounded wait, a
-  hard error) when it doesn't, or say the tool isn't exposed in this session's
-  inventory at all when there was nothing to call — a silent hang or a missing tool is
-  an outcome, not an excuse to skip the record. Two of the four caveats closing a
-  2026-09-02 review of #459 (AB#47509) — no ADO access, type-checking Windows-gated
-  code without a Windows host — did not survive being tested; Linux-only mutation
-  scope and running a Windows test binary both did, since neither invoking
-  `wit_work_item` nor cross-target `clippy` executes a test. Keep two categories
-  apart: *the environment cannot do this* needs a failed invocation or a confirmed
-  absence, while *the defect is inherently untestable* (process teardown, a TOCTOU
-  window) needs only an argument and stays valid.
+  "I could not check X" only after recording the attempt: the response, the timeout
+  after a bounded wait, or that the tool isn't in this session's inventory at all.
+  Keep two categories apart: *the environment cannot do this* needs a failed
+  invocation or a confirmed absence, while *the defect is inherently untestable*
+  (process teardown, a TOCTOU window) needs only an argument and stays valid.
 - If a change is correct, don't invent problems. An empty severity group means "none
   found" — say so briefly.
 - Reviewing is not merging. The PR author owns the merge — never merge someone
