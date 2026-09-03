@@ -320,6 +320,12 @@ stages:
             publishArtifacts: false
         - script: |
             set -e
+            mkdir -p "$(Build.SourcesDirectory)/drivers/linux/musl/arm64/lib"
+            cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/musl/arm64/lib/mssqlodbc.so"
+          displayName: 'Stage musl driver (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - script: |
+            set -e
             command -v python3 >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y python3; }
             sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
             python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
