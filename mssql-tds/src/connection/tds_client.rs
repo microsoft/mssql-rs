@@ -467,6 +467,10 @@ pub struct TdsClient {
     /// The cancel handle for this client. Used to cancel operations.
     pub(in crate::connection) cancel_handle: Option<CancelHandle>,
 
+    /// One-shot evidence that the latest interrupted read reached DONE_ATTN and
+    /// applied its drained control tokens while the transport remained live.
+    interrupted_read_settled: bool,
+
     /// Empty metadata vector for returning when no metadata is available
     empty_metadata: Vec<ColumnMetadata>,
 
@@ -566,6 +570,7 @@ impl TdsClient {
             prepared_handles: HashMap::new(),
             remaining_request_timeout: None,
             cancel_handle: None,
+            interrupted_read_settled: false,
             empty_metadata: Vec::new(),
             active_row_read_state: ActiveRowReadState::Idle,
             row_already_positioned: false,
@@ -3884,14 +3889,18 @@ impl TdsClient {
     /// Retires the connection after a drain failed, picking the remedy that
     /// fits the cause.
     ///
+    /// A timeout or cancellation returned after a successful ATTENTION is not a
+    /// failed drain: the one-shot settlement marker proves DONE_ATTN was reached,
+    /// so that interruption leaves the connection live.
+    ///
     /// Both cases mark the transport dead, which is what a pool consults, so a
     /// pooled consumer discards the connection either way. They differ in
     /// whether session recovery stays armed:
     ///
-    /// * **Stream desync** (protocol error, timeout, cancellation) — recovery
-    ///   is disarmed. The socket may be perfectly healthy, so leaving it armed
-    ///   would let the next command silently reconnect and paper over a decoder
-    ///   bug instead of surfacing it.
+    /// * **Stream desync** (protocol error, or an interruption with no successful
+    ///   settlement) — recovery is disarmed. The socket may be perfectly healthy,
+    ///   so leaving it armed would let the next command silently reconnect and
+    ///   paper over a decoder bug instead of surfacing it.
     /// * **Transport loss** (I/O, TLS, connection closed) — recovery is left
     ///   armed. Disarming it would turn a network blip that resiliency handles
     ///   transparently into a hard failure, and these run on routine cursor
@@ -3911,10 +3920,28 @@ impl TdsClient {
     /// retirement exists for. Dropping the stream with no I/O is the fix; it
     /// needs a new transport method and is left as follow-up.
     fn retire_after_failed_drain(&mut self, error: &crate::error::Error) {
+        if self.take_settled_drain_interruption(error) {
+            return;
+        }
         self.transport.mark_known_dead();
         if !Self::drain_failure_lost_the_transport(error) {
             self.recovery_context.session_recovery_negotiated = false;
         }
+    }
+
+    /// Consumes the settlement evidence produced by the failing drain itself.
+    ///
+    /// A successful ATTENTION still returns the original timeout or cancellation,
+    /// but DONE_ATTN proves the stream is synchronized and must not be retired.
+    fn take_settled_drain_interruption(&mut self, error: &crate::error::Error) -> bool {
+        let settled = std::mem::take(&mut self.interrupted_read_settled);
+        settled
+            && matches!(
+                error,
+                crate::error::Error::TimeoutError(_)
+                    | crate::error::Error::OperationCancelledError(_)
+            )
+            && !self.transport.connection_known_dead()
     }
 
     /// Drains the stream, retiring the connection if the drain gives up partway.
@@ -3953,6 +3980,7 @@ impl TdsClient {
     /// Skipping that step would leave unparsed row bytes in the transport and
     /// corrupt the connection for reuse.
     pub(in crate::connection) async fn drain_stream(&mut self) -> TdsResult<Vec<SqlErrorInfo>> {
+        self.interrupted_read_settled = false;
         let mut collected_errors: Vec<SqlErrorInfo> = Vec::new();
         // A COLMETADATA reached at the top level of the drain must be parsed with
         // the same Always Encrypted awareness as advance_to_result_boundary: when
@@ -4138,9 +4166,9 @@ impl TdsClient {
     /// The transport must read through DONE_ATTN to realign the wire, but
     /// `TdsClient` still owns transaction, environment, and recovery state.
     /// Replaying those tokens here keeps that state synchronized with the server.
-    fn consume_attention_settlement(&mut self) {
+    fn consume_attention_settlement(&mut self) -> bool {
         let Some(settlement) = self.transport.take_attention_settlement() else {
-            return;
+            return false;
         };
 
         let mut ignored_errors = Vec::new();
@@ -4151,9 +4179,10 @@ impl TdsClient {
             {
                 warn!(?error, "Failed to apply state from the attention drain");
                 self.retire_after_failed_drain(&error);
-                break;
+                return false;
             }
         }
+        true
     }
 
     /// Finalizes client state after a read ended through cancellation or timeout.
@@ -4161,6 +4190,7 @@ impl TdsClient {
     /// Every interruptible read surface calls this so settlement tokens are
     /// applied once and the cancelled result is discarded before reuse.
     fn settle_interrupted_read(&mut self, error: &crate::error::Error) {
+        self.interrupted_read_settled = false;
         if !matches!(
             error,
             crate::error::Error::TimeoutError(_) | crate::error::Error::OperationCancelledError(_)
@@ -4168,8 +4198,10 @@ impl TdsClient {
             return;
         }
 
-        self.consume_attention_settlement();
+        let settlement_applied = self.consume_attention_settlement();
         self.normalize_after_attention();
+        self.interrupted_read_settled =
+            settlement_applied && !self.transport.connection_known_dead();
     }
 
     /// Reads tokens up to the next result boundary in the response stream.
@@ -6861,6 +6893,7 @@ impl TdsClient {
     /// command that triggered the reconnect.
     fn begin_command(&mut self) {
         self.settle_abandoned_reset_verification();
+        self.interrupted_read_settled = false;
         self.info_messages.clear();
         // A token parked by the look-ahead belongs to the previous response;
         // replaying it here would desynchronize this command's reader.
@@ -6918,6 +6951,7 @@ impl TdsClient {
     /// cover.
     #[instrument(skip(self), level = "info")]
     pub async fn close_query(&mut self) -> TdsResult<()> {
+        self.interrupted_read_settled = false;
         if !self.has_open_batch() {
             return Ok(());
         }
@@ -13039,6 +13073,89 @@ mod tests {
             "losing the transport mid-drain is what resiliency exists for; \
              disarming it turns a recoverable blip into a hard failure"
         );
+    }
+
+    fn cancelled_client_with_attention_ack() -> TdsClient {
+        let response = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&done_bytes(DoneStatus::ATTN.bits()))
+            .build();
+        let (transport, _written) =
+            create_network_transport_with_live_peer_capturing_writes(&response);
+        let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
+        client.current_metadata = Some(int_column_metadata(1));
+        client.current_result_set_has_been_read_till_end = false;
+        client.execution_context.set_has_open_batch(true);
+        client.remaining_request_timeout = Some(Duration::from_secs(30));
+        client.recovery_context.session_recovery_negotiated = true;
+        let cancellation = CancelHandle::new();
+        client.cancel_handle = Some(cancellation.child_handle());
+        cancellation.cancel();
+        client
+    }
+
+    /// A drain that returned the original cancellation after reaching DONE_ATTN
+    /// must leave the synchronized connection reusable.
+    #[tokio::test]
+    async fn drain_stream_or_retire_preserves_settled_cancellation() {
+        let mut client = cancelled_client_with_attention_ack();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), client.drain_stream_or_retire())
+            .await
+            .expect("settled cancellation should not hang")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(!client.interrupted_read_settled);
+    }
+
+    /// Closing a query uses a separate outer drain wrapper and must apply the
+    /// same DONE_ATTN distinction before deciding to retire the connection.
+    #[tokio::test]
+    async fn close_query_preserves_settled_cancellation() {
+        let mut client = cancelled_client_with_attention_ack();
+
+        let error = tokio::time::timeout(Duration::from_secs(5), client.close_query())
+            .await
+            .expect("settled cancellation should not hang")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(!client.transport.connection_known_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(!client.interrupted_read_settled);
+    }
+
+    /// A timeout/cancellation without a transport settlement is still an
+    /// unproven partial drain and must retire the connection.
+    #[tokio::test]
+    async fn drain_stream_or_retire_retires_unsettled_cancellation() {
+        let mut client = create_test_client_with_transport(TestTransport::with_tokens_then_error(
+            Vec::new(),
+            crate::error::Error::OperationCancelledError("test cancellation".to_string()),
+        ));
+        client.execution_context.set_has_open_batch(true);
+        client.recovery_context.session_recovery_negotiated = true;
+
+        let error = client.drain_stream_or_retire().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
+        assert!(!client.recovery_context.session_recovery_negotiated);
+        assert!(!client.interrupted_read_settled);
     }
 
     /// The other half of the split: when the drain failed because the *token
