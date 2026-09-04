@@ -20,6 +20,10 @@
 
 use std::borrow::Cow;
 
+use mssql_tds::datatypes::column_values::{
+    SqlDate, SqlDateTime2, SqlDateTimeOffset, SqlTime, SqlXml,
+};
+use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
@@ -27,6 +31,7 @@ use mssql_tds::message::parameters::rpc_parameters::{
     RpcParameter, RpcTypeMetadata, StatusFlags, StreamedSqlType,
 };
 use mssql_tds::token::tokens::SqlCollation;
+use uuid::Uuid;
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_WCHAR, SQL_CHAR,
@@ -35,12 +40,13 @@ use crate::api::odbc_types::{
     SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_VECTOR,
     SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME,
     SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
-    SqlLen, SqlSmallInt, SqlSsVectorLayout,
+    SqlGuid, SqlLen, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
-    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_NULL_POINTER,
-    ERR_INVALID_PARAM_PRECISION_OR_SCALE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
-    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INVALID_CHARACTER_VALUE,
+    ERR_INVALID_DATETIME_FORMAT, ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
+    ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_INVALID_USE_OF_DEFAULT_PARAM,
+    ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_CONVERSION_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
 };
@@ -48,8 +54,13 @@ use crate::api::type_rules::{
     SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
     is_wide_character_sql_type,
 };
+use crate::conversion::datetime::{
+    DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY, days_since_0001_from_civil,
+};
 use crate::conversion::error::ConvError;
-use crate::conversion::numeric::{narrow_i128, parse_numeric_text};
+use crate::conversion::numeric::{
+    NumericSource, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
+};
 use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
 use crate::params::BoundParam;
 
@@ -79,9 +90,17 @@ pub(crate) enum ParamBuildError {
     InvalidLength(SqlLen),
     /// The parameter carries a value but `ParameterValuePtr` is null.
     NullValuePointer,
+    /// A null `ParameterValuePtr` paired with a length that is not zero, or
+    /// with a fixed-width C type. msodbcsql answers `HY090` here.
+    InvalidBufferLength,
     /// Character data longer than the declared length, in more than trailing
     /// blanks.
     StringTruncation,
+    /// A date/time C struct that names no real instant.
+    InvalidDateTime,
+    /// A date/time component the declared target cannot carry, and it was not
+    /// zero - a time on a `date`, or a fraction past the declared scale.
+    DateTimeFieldOverflow,
     /// `ColumnSize` cannot be expressed as a T-SQL declaration for `SqlType`.
     InvalidParameterSize(usize),
     /// `DecimalDigits` cannot be expressed as a T-SQL scale for `SqlType`.
@@ -103,7 +122,10 @@ impl ParamBuildError {
             Self::InvalidUseOfDefaultParam => ERR_INVALID_USE_OF_DEFAULT_PARAM,
             Self::InvalidLength(_) => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
+            Self::InvalidBufferLength => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::StringTruncation => ERR_PARAM_STRING_TRUNCATION,
+            Self::InvalidDateTime => ERR_INVALID_DATETIME_FORMAT,
+            Self::DateTimeFieldOverflow => ERR_DATETIME_FIELD_OVERFLOW,
             Self::InvalidParameterSize(_) | Self::InvalidDecimalDigits(_) => {
                 ERR_INVALID_PARAM_PRECISION_OR_SCALE
             }
@@ -180,13 +202,39 @@ pub(crate) unsafe fn bound_param_to_value(
         (AppValue::WideText(bytes), SqlFamily::Integer) => {
             integer_from_text(param.sql_type, AppText::Utf16(bytes))?
         }
-        (
-            AppValue::Integer(_) | AppValue::NarrowText(_) | AppValue::WideText(_),
-            SqlFamily::Binary,
-        )
-        | (AppValue::Binary(_), SqlFamily::Integer | SqlFamily::Character) => {
-            return Err(ParamBuildError::ConversionNotImplemented);
+        (AppValue::Bit(v), SqlFamily::Bit) => SqlType::Bit(Some(v)),
+        (AppValue::Double(v), SqlFamily::Float) => convert_float_sql(param.sql_type, v)?,
+        (AppValue::Float(v), SqlFamily::Float) => convert_real_sql(param.sql_type, v),
+        (AppValue::Guid(g), SqlFamily::Guid) => SqlType::Uuid(Some(guid_to_uuid(g))),
+        (AppValue::DateTime(p), SqlFamily::DateTime) => {
+            return convert_datetime_sql(param.sql_type, param.decimal_digits, p);
         }
+        // `xml` is UTF-16LE on the wire, which is exactly what a `SQL_C_WCHAR`
+        // buffer already holds, so the wide path moves the allocation through.
+        (AppValue::WideText(bytes), SqlFamily::Xml) => SqlType::Xml(Some(SqlXml { bytes })),
+        (AppValue::NarrowText(bytes), SqlFamily::Xml) => SqlType::Xml(Some(SqlXml::from(
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ))),
+        // Decimal is the one off-diagonal pairing this milestone carries, and it
+        // is not optional: `SQL_C_DEFAULT` resolves `SQL_DECIMAL` to
+        // `SQL_C_CHAR`, so without it every defaulted decimal binding fails.
+        (AppValue::NarrowText(bytes), SqlFamily::Decimal) => {
+            return decimal_from_text(param, AppText::Utf8(bytes));
+        }
+        (AppValue::WideText(bytes), SqlFamily::Decimal) => {
+            return decimal_from_text(param, AppText::Utf16(bytes));
+        }
+        (AppValue::NarrowText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
+            SQL_VARCHAR,
+            variant_column_size(param.column_size, SQL_VARCHAR),
+            AppText::Utf8(bytes),
+        )?),
+        (AppValue::WideText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
+            SQL_WVARCHAR,
+            variant_column_size(param.column_size, SQL_WVARCHAR),
+            AppText::Utf16(bytes),
+        )?),
+        _ => return Err(ParamBuildError::ConversionNotImplemented),
     };
 
     Ok((value, None))
@@ -297,7 +345,7 @@ pub(crate) fn dae_placeholder_type(
         // Unreachable: `c_family` above only ever produces `Character` or
         // `Binary`. An explicit error rather than `unreachable!()`, since this
         // runs behind an FFI boundary.
-        SqlFamily::Integer => return Err(ParamBuildError::UnsupportedCType(c_type)),
+        _ => return Err(ParamBuildError::UnsupportedCType(c_type)),
     };
     Ok(DaeStream {
         sql_type,
@@ -370,6 +418,17 @@ enum SqlFamily {
     Integer,
     Character,
     Binary,
+    Bit,
+    Float,
+    Decimal,
+    Guid,
+    DateTime,
+    /// `xml` takes the same UTF-16 payload as the wide character types but
+    /// declares its own wire type, so it cannot ride the character converter.
+    Xml,
+    /// `sql_variant` wraps whatever the application supplied; the declaration is
+    /// the inner type's, not a `sql_variant` of its own.
+    Variant,
 }
 
 /// `None` for a SQL type no builder covers yet, which the bind-time matrix has
@@ -381,6 +440,17 @@ fn sql_family(sql_type: SqlSmallInt) -> Option<SqlFamily> {
             Some(SqlFamily::Character)
         }
         SQL_BINARY | SQL_VARBINARY | SQL_LONGVARBINARY => Some(SqlFamily::Binary),
+        SQL_BIT => Some(SqlFamily::Bit),
+        SQL_REAL | SQL_FLOAT | SQL_DOUBLE => Some(SqlFamily::Float),
+        SQL_DECIMAL | SQL_NUMERIC => Some(SqlFamily::Decimal),
+        SQL_GUID => Some(SqlFamily::Guid),
+        SQL_TYPE_DATE
+        | SQL_TYPE_TIME
+        | SQL_TYPE_TIMESTAMP
+        | SQL_SS_TIME2
+        | SQL_SS_TIMESTAMPOFFSET => Some(SqlFamily::DateTime),
+        SQL_SS_XML => Some(SqlFamily::Xml),
+        SQL_SS_VARIANT => Some(SqlFamily::Variant),
         _ => None,
     }
 }
@@ -400,6 +470,17 @@ enum AppText {
 }
 
 impl AppText {
+    /// Decodes to a `String` for the converters that parse text rather than
+    /// ship it. Lossy for the same reason [`AppText::transcode`] is: malformed
+    /// input has no msodbcsql behaviour to copy, since its narrow decode is out
+    /// of this source tree (AB#47565).
+    fn into_string(self) -> String {
+        match self {
+            Self::Utf8(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Self::Utf16(bytes) => decode_utf16le(&bytes),
+        }
+    }
+
     /// Re-encodes into the target family's encoding.
     fn transcode(self, wide_target: bool) -> Self {
         match (self, wide_target) {
@@ -477,11 +558,7 @@ fn convert_character_sql(
     text: AppText,
 ) -> Result<SqlType, ParamBuildError> {
     let wide = is_wide_character_sql_type(sql_type);
-    let max_length = if wide {
-        SQL_PREC_NCHAR
-    } else {
-        SQL_PREC_BIGCHARBINARY
-    };
+    let max_length = character_max_length(sql_type);
 
     // The declared length for the T-SQL type, and the bound truncation is
     // measured against. They differ only for `text`/`ntext`, which carry no
@@ -724,6 +801,291 @@ type TypedValue = (SqlType, Option<RpcTypeMetadata>);
 /// Largest fractional-seconds scale of `time`/`datetime2`/`datetimeoffset`.
 const MAX_DATETIME_SCALE: u8 = 7;
 
+/// Narrows to the declared float width. The `real` range check is
+/// [`narrow_f64_to_f32`], shared with the fetch direction because msodbcsql
+/// applies one arm to both.
+fn convert_float_sql(sql_type: SqlSmallInt, v: f64) -> Result<SqlType, ParamBuildError> {
+    Ok(match sql_type {
+        SQL_REAL => SqlType::Real(Some(narrow_f64_to_f32(v).map_err(ParamBuildError::Value)?)),
+        _ => SqlType::Float(Some(v)),
+    })
+}
+
+/// Widens a `SQL_C_FLOAT` source, which no `real` range check applies to
+/// because nothing narrows.
+///
+/// Measured on retail 18.6.2.1: `SQL_C_FLOAT` -> `SQL_REAL` at `1e-40` binds,
+/// executes and arrives as `9.99995e-41`, while the same value from
+/// `SQL_C_DOUBLE` is `22003` (`ADoubleOutsideTheRealRangeIs22003`). So the
+/// underflow rule keys off the source width, not the value.
+fn convert_real_sql(sql_type: SqlSmallInt, v: f32) -> SqlType {
+    match sql_type {
+        SQL_REAL => SqlType::Real(Some(v)),
+        _ => SqlType::Float(Some(f64::from(v))),
+    }
+}
+
+/// `SQLGUID` is little-endian in its first three fields and big-endian in the
+/// last, which is exactly `Uuid::from_fields`. The fetch direction takes the
+/// same layout apart in `convert_guid_c`.
+fn guid_to_uuid(g: SqlGuid) -> Uuid {
+    Uuid::from_fields(g.data1, g.data2, g.data3, &g.data4)
+}
+
+/// Wraps a converted value as `sql_variant`.
+fn variant_of(inner: SqlType) -> SqlType {
+    SqlType::Variant(Box::new(inner))
+}
+
+/// The non-`max` ceiling on a character SQL type's declared length.
+fn character_max_length(sql_type: SqlSmallInt) -> usize {
+    if is_wide_character_sql_type(sql_type) {
+        SQL_PREC_NCHAR
+    } else {
+        SQL_PREC_BIGCHARBINARY
+    }
+}
+
+/// `sql_variant` cannot hold a `max` type (server error 529), so a `ColumnSize`
+/// of 0 - which means `max` everywhere else - is instead read as "unstated" and
+/// declared at the target's own non-`max` ceiling. A `ColumnSize` past that
+/// ceiling is clamped rather than passed through, because [`variable_length`]
+/// answers `None` above its bound and `None` is the `max` spelling.
+///
+/// The ceiling comes from [`character_max_length`], the one
+/// [`convert_character_sql`] applies, so the two cannot drift apart and put
+/// `max` back inside a variant.
+///
+/// Measured on retail 18.6.2.1 at representative sizes through 100000: a wide
+/// variant binding executes without landing on a `max` inner type.
+fn variant_column_size(column_size: usize, sql_type: SqlSmallInt) -> usize {
+    let max_length = character_max_length(sql_type);
+    if column_size == 0 || column_size > max_length {
+        max_length
+    } else {
+        column_size
+    }
+}
+
+/// Builds `decimal`/`numeric` from a character buffer, reusing the fetch
+/// direction's literal parser so both directions accept exactly the same forms.
+///
+/// Rescaling follows msodbcsql rather than `DecimalParts::from_string`, which
+/// rejects *any* input scale past the target. msodbcsql drops the excess digits
+/// and only errors when one of them is non-zero - `if (c != '0') Error =
+/// CVT_FRACT_TRUNC` (`sqlccnvt.cpp:7823`) - and `ParamToSQLType` rewrites that
+/// warning to `22001` for a non-2.x application (`sqlcfunc.cpp:3348`). So
+/// `"1.50"` into `decimal(5,1)` is `1.5`, and `"1.55"` is `22001`.
+fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
+    let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
+    let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
+    let parsed = parse_numeric_text(&text.into_string()).map_err(ParamBuildError::Value)?;
+    let (mantissa, source_scale) = match parsed {
+        NumericSource::Int(v) => (v, 0u32),
+        NumericSource::Scaled { mantissa, scale } => (mantissa, scale),
+        NumericSource::WideDecimal {
+            approx,
+            fractional_precision,
+            ..
+        } => {
+            if fractional_precision > u32::from(scale) {
+                return Err(ParamBuildError::StringTruncation);
+            }
+            let value = DecimalParts::from_f64(approx, precision, scale)
+                .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+            return Ok((decimal_of(param.sql_type, value), Some(metadata)));
+        }
+        // Exponent literals have no exact form to rescale and reach the wire
+        // through the f64 approximation (`sqlccnvt.cpp:5118`).
+        NumericSource::Float(approx) => {
+            let value = DecimalParts::from_f64(approx, precision, scale)
+                .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+            return Ok((decimal_of(param.sql_type, value), Some(metadata)));
+        }
+    };
+
+    let target_scale = u32::from(scale);
+    let scaled = if target_scale >= source_scale {
+        let factor = 10i128
+            .checked_pow(target_scale - source_scale)
+            .ok_or(ParamBuildError::Value(ConvError::OutOfRange))?;
+        mantissa
+            .checked_mul(factor)
+            .ok_or(ParamBuildError::Value(ConvError::OutOfRange))?
+    } else {
+        // Dropping more than 38 digits leaves no representable divisor, but the
+        // answer does not depend on one: a non-zero mantissa must have a
+        // non-zero dropped digit, and a zero mantissa is exactly zero. Falling
+        // back to `OutOfRange` here would report 22003 where every smaller
+        // literal of the same shape reports 22001.
+        match 10i128.checked_pow(source_scale - target_scale) {
+            Some(divisor) if mantissa % divisor == 0 => mantissa / divisor,
+            Some(_) => return Err(ParamBuildError::StringTruncation),
+            None if mantissa == 0 => 0,
+            None => return Err(ParamBuildError::StringTruncation),
+        }
+    };
+
+    let magnitude = scaled.unsigned_abs();
+    // The precision check has to run on the digit count, not on the mantissa
+    // width: `decimal(3,0)` cannot hold 1000 even though the mantissa is tiny.
+    if magnitude >= 10u128.pow(u32::from(precision)) {
+        return Err(ParamBuildError::Value(ConvError::OutOfRange));
+    }
+    let value = DecimalParts::new(scaled >= 0, precision, scale, magnitude);
+    Ok((decimal_of(param.sql_type, value), Some(metadata)))
+}
+
+fn decimal_of(sql_type: SqlSmallInt, value: DecimalParts) -> SqlType {
+    if sql_type == SQL_NUMERIC {
+        SqlType::Numeric(Some(value))
+    } else {
+        SqlType::Decimal(Some(value))
+    }
+}
+
+/// Builds a date/time value from an application struct.
+///
+/// The struct carries no scale, so the wire scale comes from `DecimalDigits`,
+/// exactly as it does for a typed NULL. A component the target cannot hold is
+/// dropped silently when it is zero and is `22008` when it is not.
+///
+/// That state is **measured, not derived**. `ParamToSQLType` reads as though it
+/// splits by target - `IDS_22_008` for the timestamp family and `IDS_22_001`
+/// for everything else (`sqlcfunc.cpp:3357`) - but retail 18.6.2.1 answers
+/// `22008` for `time`, `datetimeoffset` and `date` as well, so that reading is
+/// incomplete. `ADroppedFractionIsAlways22008` pins all three on the compare leg.
+fn convert_datetime_sql(
+    sql_type: SqlSmallInt,
+    decimal_digits: SqlSmallInt,
+    p: DateTimeParts,
+) -> Result<TypedValue, ParamBuildError> {
+    let invalid = ParamBuildError::InvalidDateTime;
+    let truncated = ParamBuildError::DateTimeFieldOverflow;
+    let days = |p: &DateTimeParts| {
+        p.has_date
+            .then(|| days_since_0001_from_civil(p.year, p.month, p.day))
+            .flatten()
+            .ok_or(invalid)
+    };
+    // `SqlTime` counts 100 ns ticks despite its field name; the fetch direction
+    // reads it the same way in `hms_from_ticks_100ns`.
+    let ticks = |p: &DateTimeParts| -> Result<u64, ParamBuildError> {
+        if !p.has_time {
+            return Ok(0);
+        }
+        if p.hour > 23 || p.minute > 59 || p.second > 59 || p.fraction_ns > 999_999_999 {
+            return Err(invalid);
+        }
+        if !p.fraction_ns.is_multiple_of(100) {
+            return Err(truncated);
+        }
+        Ok(u64::from(p.hour) * 36_000_000_000
+            + u64::from(p.minute) * 600_000_000
+            + u64::from(p.second) * 10_000_000
+            + u64::from(p.fraction_ns / 100))
+    };
+
+    match sql_type {
+        SQL_TYPE_DATE => {
+            // Unreachable through the API: the conversion matrix has no
+            // `SQL_C_TYPE_TIMESTAMP` -> `SQL_TYPE_DATE` row, so no binding can
+            // carry a time here yet (AB#47790). msodbcsql accepts the pairing.
+            if p.has_time && ((p.hour | p.minute | p.second) != 0 || p.fraction_ns != 0) {
+                return Err(truncated);
+            }
+            let date = SqlDate::create(u32::try_from(days(&p)?).map_err(|_| invalid)?)
+                .map_err(|_| invalid)?;
+            Ok((SqlType::Date(Some(date)), None))
+        }
+        SQL_TYPE_TIME | SQL_SS_TIME2 => {
+            if !p.has_time {
+                return Err(invalid);
+            }
+            let (metadata, app_scale) = datetime_metadata(decimal_digits)?;
+            let time = SqlTime {
+                time_nanoseconds: reject_fraction_past_scale(ticks(&p)?, app_scale, truncated)?,
+                scale: MAX_DATETIME_SCALE,
+            };
+            Ok((SqlType::Time(Some(time)), Some(metadata)))
+        }
+        SQL_TYPE_TIMESTAMP | SQL_SS_TIMESTAMPOFFSET => {
+            let (metadata, app_scale) = datetime_metadata(decimal_digits)?;
+            // The offset is validated before the fraction: msodbcsql checks it
+            // after DateTime2FromTimestamp, where a truncated fraction is still
+            // only a warning, so a value that is both over-precise and outside
+            // the legal offset range answers 22007 rather than 22008.
+            if sql_type == SQL_SS_TIMESTAMPOFFSET
+                && !is_valid_timezone_offset(p.tz_hour, p.tz_minute)
+            {
+                return Err(invalid);
+            }
+            let datetime2 = SqlDateTime2 {
+                days: u32::try_from(days(&p)?).map_err(|_| invalid)?,
+                time: SqlTime {
+                    time_nanoseconds: reject_fraction_past_scale(ticks(&p)?, app_scale, truncated)?,
+                    scale: MAX_DATETIME_SCALE,
+                },
+            };
+            if sql_type == SQL_TYPE_TIMESTAMP {
+                return Ok((SqlType::DateTime2(Some(datetime2)), Some(metadata)));
+            }
+            let offset = p.tz_hour * 60 + p.tz_minute;
+            // The struct is local wall clock; the wire carries UTC, so the
+            // offset is subtracted here. `extract_datetime_parts` adds it back.
+            let utc = i64::from(datetime2.days) * TICKS_PER_DAY
+                + i64::try_from(datetime2.time.time_nanoseconds).map_err(|_| invalid)?
+                - i64::from(offset) * 600_000_000;
+            let days = utc.div_euclid(TICKS_PER_DAY);
+            if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
+                return Err(invalid);
+            }
+            let value = SqlDateTimeOffset {
+                datetime2: SqlDateTime2 {
+                    days: u32::try_from(days).map_err(|_| invalid)?,
+                    time: SqlTime {
+                        time_nanoseconds: u64::try_from(utc.rem_euclid(TICKS_PER_DAY))
+                            .map_err(|_| invalid)?,
+                        scale: MAX_DATETIME_SCALE,
+                    },
+                },
+                offset,
+            };
+            Ok((SqlType::DateTimeOffset(Some(value)), Some(metadata)))
+        }
+        other => Err(ParamBuildError::UnsupportedSqlType(other)),
+    }
+}
+
+/// Rejects a fraction the declared scale cannot carry. Nothing is rescaled -
+/// the wire scale is always [`MAX_DATETIME_SCALE`], so the ticks either pass
+/// through untouched or the value is refused. A dropped zero is silent,
+/// matching `if (c != '0')` in `sqlccnvt.cpp:7823`.
+fn reject_fraction_past_scale(
+    ticks: u64,
+    scale: u8,
+    on_truncation: ParamBuildError,
+) -> Result<u64, ParamBuildError> {
+    let divisor = 10u64.pow(u32::from(MAX_DATETIME_SCALE - scale));
+    if !ticks.is_multiple_of(divisor) {
+        return Err(on_truncation);
+    }
+    Ok(ticks)
+}
+
+/// Port of msodbcsql's `IsValidTimezoneOffsetValue` (`dataconv.cpp:118`).
+///
+/// The mixed-sign rules are the non-obvious part: `+5h -30m` is rejected even
+/// though it totals a legal +4:30, because the two components must agree in
+/// sign. Checking only the total would silently accept it.
+fn is_valid_timezone_offset(tz_hour: i16, tz_minute: i16) -> bool {
+    let total = i32::from(tz_hour) * 60 + i32::from(tz_minute);
+    !((tz_hour > 0 && tz_minute < 0)
+        || (tz_hour < 0 && tz_minute > 0)
+        || !(-59..=59).contains(&tz_minute)
+        || total.abs() > 14 * 60)
+}
+
 /// Typed NULL for a bound parameter.
 ///
 /// The type comes from `sql_type` whether or not the binding was defaulted: the
@@ -784,15 +1146,15 @@ fn typed_null(
         SQL_GUID => SqlType::Uuid(None),
         SQL_TYPE_DATE => SqlType::Date(None),
         SQL_TYPE_TIME | SQL_SS_TIME2 => {
-            let metadata = datetime_metadata(decimal_digits)?;
+            let (metadata, _) = datetime_metadata(decimal_digits)?;
             return Ok((SqlType::Time(None), Some(metadata)));
         }
         SQL_TYPE_TIMESTAMP => {
-            let metadata = datetime_metadata(decimal_digits)?;
+            let (metadata, _) = datetime_metadata(decimal_digits)?;
             return Ok((SqlType::DateTime2(None), Some(metadata)));
         }
         SQL_SS_TIMESTAMPOFFSET => {
-            let metadata = datetime_metadata(decimal_digits)?;
+            let (metadata, _) = datetime_metadata(decimal_digits)?;
             return Ok((SqlType::DateTimeOffset(None), Some(metadata)));
         }
         SQL_SS_XML => SqlType::Xml(None),
@@ -865,15 +1227,35 @@ fn decimal_metadata(
     })
 }
 
-fn datetime_metadata(decimal_digits: SqlSmallInt) -> Result<RpcTypeMetadata, ParamBuildError> {
-    let scale = u8::try_from(decimal_digits)
+/// Temporal parameters are always declared at the maximum fractional-seconds
+/// scale, whatever the application asked for. Returns that declaration and the
+/// validated application scale together, so a caller cannot obtain one without
+/// the other having been checked.
+///
+/// Measured, not derived: retail 18.6.2.1 reports `SQL_DESC_SCALE` 7 for
+/// `time`, `datetime2` and `datetimeoffset` parameters under every combination
+/// of `ColumnSize` and `DecimalDigits`, including an explicit 0.
+/// `TemporalParamsAreDeclaredAtMaximumScale` is the measurement, and
+/// `sqlccmd.cpp:2806` says the same in passing - "the time(n) portion is
+/// normalized to maximum precision".
+///
+/// `DecimalDigits` still bounds the *value*: a fraction it cannot carry is
+/// `22008` even though the declaration would hold it. msodbcsql draws the same
+/// line.
+fn datetime_metadata(
+    decimal_digits: SqlSmallInt,
+) -> Result<(RpcTypeMetadata, u8), ParamBuildError> {
+    let app_scale = u8::try_from(decimal_digits)
         .ok()
         .filter(|scale| *scale <= MAX_DATETIME_SCALE)
         .ok_or(ParamBuildError::InvalidDecimalDigits(decimal_digits))?;
-    Ok(RpcTypeMetadata {
-        precision: None,
-        scale: Some(scale),
-    })
+    Ok((
+        RpcTypeMetadata {
+            precision: None,
+            scale: Some(MAX_DATETIME_SCALE),
+        },
+        app_scale,
+    ))
 }
 
 /// Recovers a vector's dimension count and base type from the `ColumnSize` and
@@ -908,10 +1290,11 @@ fn vector_metadata(
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_FLOAT, SQL_C_LONG, SQL_C_SBIGINT, SQL_C_SLONG,
-        SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC,
-        SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT,
-        SqlULen,
+        SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG,
+        SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SS_VECTOR,
+        SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
+        SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS,
+        SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
     };
     use crate::params::conversion_matrix::is_supported_conversion;
     use std::ffi::c_void;
@@ -962,6 +1345,979 @@ mod tests {
         let mut p = param(c_type, ptr, ind);
         p.sql_type = sql_type;
         p
+    }
+
+    // ---- Scalar conversions ---------------------------------------------
+    //
+    // Each helper binds one fixed-width C buffer and returns the built value, so
+    // a case reads as "this struct, that declaration".
+
+    /// Binds `value` as `c_type` against `sql_type` and converts it.
+    fn convert_fixed<T>(
+        c_type: SqlSmallInt,
+        sql_type: SqlSmallInt,
+        column_size: SqlULen,
+        decimal_digits: SqlSmallInt,
+        mut value: T,
+    ) -> Result<TypedValue, ParamBuildError> {
+        let mut ind: SqlLen = std::mem::size_of::<T>() as SqlLen;
+        let mut p = param(c_type, &mut value as *mut T as *mut c_void, &mut ind);
+        p.sql_type = sql_type;
+        p.column_size = column_size;
+        p.decimal_digits = decimal_digits;
+        unsafe { bound_param_to_value(&p) }
+    }
+
+    /// Binds narrow text against a `decimal`/`numeric` declaration.
+    fn convert_decimal(
+        sql_type: SqlSmallInt,
+        precision: SqlULen,
+        scale: SqlSmallInt,
+        text: &str,
+    ) -> Result<TypedValue, ParamBuildError> {
+        let mut bytes = text.as_bytes().to_vec();
+        let mut ind: SqlLen = bytes.len() as SqlLen;
+        let mut p = param(SQL_C_CHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = sql_type;
+        p.column_size = precision;
+        p.decimal_digits = scale;
+        unsafe { bound_param_to_value(&p) }
+    }
+
+    fn date_struct(year: i16, month: u16, day: u16) -> crate::api::odbc_types::SqlDateStruct {
+        crate::api::odbc_types::SqlDateStruct { year, month, day }
+    }
+
+    fn timestamp_struct(
+        year: i16,
+        month: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        fraction: u32,
+    ) -> crate::api::odbc_types::SqlTimestampStruct {
+        crate::api::odbc_types::SqlTimestampStruct {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            fraction,
+        }
+    }
+
+    /// `bit` takes the byte as a truth value, not as a 0/1-only enum: msodbcsql
+    /// reads the buffer as one `SCHAR` and widens it like a tinyint
+    /// (`sqlccnvt.cpp:5057`), so it never rejects another value. Parity, not a
+    /// relaxation.
+    #[test]
+    fn any_non_zero_bit_byte_is_true() {
+        for (byte, expected) in [(0u8, false), (1, true), (2, true), (0xFF, true)] {
+            let (value, meta) = convert_fixed(SQL_C_BIT, SQL_BIT, 0, 0, byte).unwrap();
+            assert_eq!(value, SqlType::Bit(Some(expected)), "byte {byte}");
+            assert!(meta.is_none());
+        }
+    }
+
+    /// A `SQL_C_FLOAT` source is already `real`, so it is carried across at its
+    /// own width rather than staged as an `f64` and narrowed back.
+    #[test]
+    fn a_float_buffer_keeps_its_width() {
+        let (value, _) = convert_fixed(SQL_C_FLOAT, SQL_REAL, 0, 0, 1.5f32).unwrap();
+        assert_eq!(value, SqlType::Real(Some(1.5)));
+
+        // Widening the other way is lossless and unchecked.
+        let (value, _) = convert_fixed(SQL_C_FLOAT, SQL_DOUBLE, 0, 0, 1.5f32).unwrap();
+        assert_eq!(value, SqlType::Float(Some(1.5)));
+
+        let (value, _) = convert_fixed(SQL_C_DOUBLE, SQL_DOUBLE, 0, 0, 1.5f64).unwrap();
+        assert_eq!(value, SqlType::Float(Some(1.5)));
+
+        // SQL_FLOAT and SQL_DOUBLE are one wire type.
+        let (value, _) = convert_fixed(SQL_C_DOUBLE, SQL_FLOAT, 0, 0, -2.25f64).unwrap();
+        assert_eq!(value, SqlType::Float(Some(-2.25)));
+    }
+
+    /// The `real` underflow rule keys off the source width, not the value: the
+    /// same magnitude that is `22003` from `SQL_C_DOUBLE`
+    /// (`a_double_outside_the_real_range_is_22003`) is sent unchanged from
+    /// `SQL_C_FLOAT`, where nothing narrows.
+    ///
+    /// Measured on retail 18.6.2.1: `SQL_C_FLOAT` -> `SQL_REAL` at `1e-40`
+    /// binds, executes, and the server reports `9.99995e-041`.
+    #[test]
+    fn a_float_sourced_subnormal_is_not_out_of_range() {
+        for v in [1e-40f32, -1e-40f32, f32::MIN_POSITIVE / 2.0] {
+            let (value, _) = convert_fixed(SQL_C_FLOAT, SQL_REAL, 0, 0, v).unwrap();
+            assert_eq!(value, SqlType::Real(Some(v)), "value {v:e}");
+        }
+    }
+
+    /// msodbcsql's `real` range check is symmetric - `sqlccnvt.cpp:5519` rejects
+    /// a non-zero magnitude below `FLT_MIN` as well as one above `FLT_MAX`, both
+    /// as `CVT_PREC` (`IDS_22_003`). Underflow is the half that is easy to miss.
+    #[test]
+    fn a_double_outside_the_real_range_is_22003() {
+        for v in [1e39f64, -1e39, 1e-40, -1e-40] {
+            assert_eq!(
+                convert_fixed(SQL_C_DOUBLE, SQL_REAL, 0, 0, v).unwrap_err(),
+                ParamBuildError::Value(ConvError::OutOfRange),
+                "value {v}"
+            );
+        }
+        // The boundaries themselves are representable, and zero is not underflow.
+        for v in [0.0f64, f64::from(f32::MAX), f64::from(f32::MIN_POSITIVE)] {
+            assert!(
+                convert_fixed(SQL_C_DOUBLE, SQL_REAL, 0, 0, v).is_ok(),
+                "{v}"
+            );
+        }
+        // `float` is 8 bytes, so nothing narrows and nothing is rejected.
+        assert!(convert_fixed(SQL_C_DOUBLE, SQL_DOUBLE, 0, 0, 1e-40f64).is_ok());
+    }
+
+    /// An infinity bound to `real` exceeds `FLT_MAX` and is `22003`; a NaN
+    /// compares false against every bound and reaches the wire. Both fall out
+    /// of the same four comparisons msodbcsql uses.
+    #[test]
+    fn an_infinite_double_is_out_of_range_but_a_nan_is_not() {
+        for v in [f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                convert_fixed(SQL_C_DOUBLE, SQL_REAL, 0, 0, v).unwrap_err(),
+                ParamBuildError::Value(ConvError::OutOfRange),
+                "value {v}"
+            );
+        }
+
+        let (value, _) = convert_fixed(SQL_C_DOUBLE, SQL_REAL, 0, 0, f64::NAN).unwrap();
+        match value {
+            SqlType::Real(Some(f)) => assert!(f.is_nan()),
+            other => panic!("expected Real(Some), got {other:?}"),
+        }
+
+        // `float` is 8 bytes, so no narrowing check applies at all. The server
+        // still has no float encoding for an infinity and rejects it on the
+        // wire - that is not this converter's business.
+        assert!(convert_fixed(SQL_C_DOUBLE, SQL_DOUBLE, 0, 0, f64::INFINITY).is_ok());
+    }
+
+    /// A timezone offset can push the UTC-normalised instant outside the
+    /// representable range at either end. This is the one piece of arithmetic in
+    /// the temporal path that is not a direct port of msodbcsql, so both ends
+    /// are pinned.
+    #[test]
+    fn a_timezone_offset_can_push_the_instant_out_of_range() {
+        let underflow = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 1,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            fraction: 0,
+            timezone_hour: 5,
+            timezone_minute: 30,
+        };
+        let err = convert_fixed(
+            SQL_C_SS_TIMESTAMPOFFSET,
+            SQL_SS_TIMESTAMPOFFSET,
+            0,
+            0,
+            underflow,
+        )
+        .unwrap_err();
+        assert_eq!(err.diag().state, *b"22007");
+
+        let overflow = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 9999,
+            month: 12,
+            day: 31,
+            hour: 23,
+            minute: 59,
+            second: 59,
+            fraction: 0,
+            timezone_hour: -14,
+            timezone_minute: 0,
+        };
+        let err = convert_fixed(
+            SQL_C_SS_TIMESTAMPOFFSET,
+            SQL_SS_TIMESTAMPOFFSET,
+            0,
+            0,
+            overflow,
+        )
+        .unwrap_err();
+        assert_eq!(err.diag().state, *b"22007");
+    }
+
+    /// Rescaling a literal onto the target scale can exceed `i128` in both
+    /// directions. Neither arm is defensive: the mantissa comes from the
+    /// application, and the source scale comes from the literal, so both are
+    /// unbounded by anything the target declaration says.
+    ///
+    /// The scale-up `checked_pow` is the one arm that cannot fire - the
+    /// exponent is `target_scale - source_scale` and `target_scale <=
+    /// SQL_PREC_NUMERIC` (38), so `10^38` always fits. Only the multiply
+    /// overflows there.
+    #[test]
+    fn rescaling_a_decimal_literal_can_overflow_in_either_direction() {
+        // 30-digit mantissa scaled up by 10^20 needs ~10^50; i128 holds ~1.7e38.
+        let wide = "1".repeat(30);
+        let err = convert_decimal(SQL_DECIMAL, 38, 20, &wide).unwrap_err();
+        assert_eq!(err.diag().state, *b"22003", "scale-up multiply overflow");
+
+        // Dropping more than 38 fractional digits overflows the divisor. The
+        // dropped digit is non-zero, so this is a truncation, not a range
+        // error - the same answer a smaller literal gets.
+        let deep = format!("0.{}1", "0".repeat(39));
+        let err = convert_decimal(SQL_DECIMAL, 38, 0, &deep).unwrap_err();
+        assert_eq!(err.diag().state, *b"22001", "scale-down divisor overflow");
+
+        // The same shape with nothing but zeros past the target scale is not a
+        // truncation at all - it is exactly zero.
+        let zeros = format!("0.{}", "0".repeat(45));
+        assert!(convert_decimal(SQL_DECIMAL, 38, 0, &zeros).is_ok());
+
+        let rounded_away = format!("1.{}1", "0".repeat(39));
+        let err = convert_decimal(SQL_DECIMAL, 38, 0, &rounded_away).unwrap_err();
+        assert_eq!(err.diag().state, *b"22001", "wide decimal fraction");
+
+        let trailing_zeros = format!("0.1{}", "0".repeat(39));
+        assert!(convert_decimal(SQL_DECIMAL, 38, 1, &trailing_zeros).is_ok());
+    }
+
+    /// Trailing fraction zeros must not push a literal onto the `f64` path.
+    /// They carry no value, but they do count against the exact mantissa, so
+    /// `"1" x 38 + ".00"` used to parse as a 40-digit wide decimal and reach
+    /// the wire as the nearest double - a different number, reported as
+    /// `SQL_SUCCESS`. Asserted by value rather than by `is_ok`, which is what
+    /// let the rounding through in the first place.
+    #[test]
+    fn a_wide_literal_with_trailing_fraction_zeros_is_exact() {
+        for digits in [
+            "1".repeat(38),
+            "12345678901234567890123456789012345678".into(),
+        ] {
+            let (value, _) = convert_decimal(SQL_DECIMAL, 38, 0, &format!("{digits}.00")).unwrap();
+            let SqlType::Decimal(Some(parts)) = value else {
+                panic!("expected a decimal for {digits}");
+            };
+            assert_eq!(
+                parts.magnitude(),
+                digits.parse::<u128>().unwrap(),
+                "{digits}"
+            );
+            assert_eq!(parts.scale, 0);
+            assert!(parts.is_positive);
+        }
+    }
+
+    /// `ColumnSize` 0 on a decimal is `HY104`, and that matches msodbcsql for
+    /// the applications this driver serves. `CheckSqlPrec`
+    /// (`sqlcdesc.cpp:11471`) treats 0 as `SQL_PREC_UNLIMITED` and returns
+    /// `IDS_S1_104` for a 3.x application; only a 2.x application gets the
+    /// silent fix-up to the maximum precision, and 2.x applications are out of
+    /// scope. `FixupColumnSizeDecimalDigits` does no fix-up for these types, so
+    /// nothing defaults the precision to 18 first.
+    #[test]
+    fn a_decimal_with_no_declared_precision_is_hy104() {
+        for sql_type in [SQL_DECIMAL, SQL_NUMERIC] {
+            let err = convert_decimal(sql_type, 0, 0, "1").unwrap_err();
+            assert_eq!(err.diag().state, *b"HY104", "sql_type {sql_type}");
+        }
+    }
+
+    /// A value that is both over-precise and outside the legal offset range is
+    /// `22007`: msodbcsql validates the offset where a truncated fraction is
+    /// still only a warning, so the offset wins.
+    #[test]
+    fn an_illegal_offset_outranks_a_dropped_fraction() {
+        let dto = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 1,
+            minute: 2,
+            second: 3,
+            fraction: 123_400_000,
+            timezone_hour: 15,
+            timezone_minute: 0,
+        };
+        let err =
+            convert_fixed(SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIMESTAMPOFFSET, 0, 3, dto).unwrap_err();
+        assert_eq!(err.diag().state, *b"22007");
+    }
+
+    /// `SQLGUID` is little-endian in its first three fields and big-endian in
+    /// the last, which is what `Uuid::from_fields` expects. Pinned against a
+    /// literal so a field reorder cannot pass.
+    #[test]
+    fn a_guid_keeps_its_field_layout() {
+        let g = SqlGuid {
+            data1: 0x0123_4567,
+            data2: 0x89AB,
+            data3: 0xCDEF,
+            data4: [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
+        };
+        let (value, _) = convert_fixed(SQL_C_GUID, SQL_GUID, 0, 0, g).unwrap();
+        assert_eq!(
+            value,
+            SqlType::Uuid(Some(
+                Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap()
+            ))
+        );
+    }
+
+    /// The declared precision and scale reach the wire as metadata, and the
+    /// value is rescaled to that scale rather than to the literal's own.
+    #[test]
+    fn a_decimal_literal_is_rescaled_to_the_declared_scale() {
+        let (value, meta) = convert_decimal(SQL_DECIMAL, 10, 2, "1.5").unwrap();
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 10, 2, 150)))
+        );
+        let meta = meta.expect("decimal carries precision and scale");
+        assert_eq!((meta.precision, meta.scale), (Some(10), Some(2)));
+
+        // `numeric` differs only in the wire type name.
+        let (value, _) = convert_decimal(SQL_NUMERIC, 10, 2, "1.5").unwrap();
+        assert_eq!(
+            value,
+            SqlType::Numeric(Some(DecimalParts::new(true, 10, 2, 150)))
+        );
+
+        // Negative, and an integer literal against a non-zero scale.
+        let (value, _) = convert_decimal(SQL_DECIMAL, 5, 3, "-2").unwrap();
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(false, 5, 3, 2000)))
+        );
+    }
+
+    /// The excess-fraction rule is msodbcsql's, not `DecimalParts::from_string`'s:
+    /// digits past the declared scale are dropped when they are zero and are
+    /// `22001` when they are not - `if (c != '0') Error = CVT_FRACT_TRUNC`
+    /// (`sqlccnvt.cpp:7823`), rewritten to `IDS_22_001` inbound
+    /// (`sqlcfunc.cpp:3348`). `from_string` would reject both.
+    #[test]
+    fn a_decimal_fraction_past_the_scale_is_dropped_only_when_zero() {
+        let (value, _) = convert_decimal(SQL_DECIMAL, 5, 1, "1.50").unwrap();
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 5, 1, 15)))
+        );
+
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 5, 1, "1.55").unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+        // Scale 0 is the same rule, and is where "12.0" must still convert.
+        let (value, _) = convert_decimal(SQL_DECIMAL, 5, 0, "12.0").unwrap();
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 5, 0, 12)))
+        );
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 5, 0, "12.3").unwrap_err(),
+            ParamBuildError::StringTruncation
+        );
+    }
+
+    /// More integer digits than the declaration holds is a range error, not a
+    /// truncation: `decimal(3,0)` cannot carry 1000 however small the mantissa.
+    #[test]
+    fn a_decimal_past_its_declared_precision_is_22003() {
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 3, 0, "1000").unwrap_err(),
+            ParamBuildError::Value(ConvError::OutOfRange)
+        );
+        // The boundary itself fits.
+        assert!(convert_decimal(SQL_DECIMAL, 3, 0, "999").is_ok());
+        // Scale eats precision: decimal(3,2) holds 9.99, not 999.
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 3, 2, "10").unwrap_err(),
+            ParamBuildError::Value(ConvError::OutOfRange)
+        );
+    }
+
+    /// An unparseable literal is `22018`, the same state and the same parser the
+    /// fetch direction uses.
+    #[test]
+    fn an_unparseable_decimal_literal_is_22018() {
+        for text in ["abc", "", "-", ".", "1.2.3"] {
+            assert_eq!(
+                convert_decimal(SQL_DECIMAL, 10, 2, text).unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "text {text:?}"
+            );
+        }
+    }
+
+    /// `decimal` rejects a zero precision before the value is even parsed, so a
+    /// defaulted binding that leaves `ColumnSize` at 0 is `HY104` rather than a
+    /// silently mis-declared parameter.
+    #[test]
+    fn a_zero_precision_decimal_is_rejected() {
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 0, 0, "1").unwrap_err(),
+            ParamBuildError::InvalidParameterSize(0)
+        );
+        assert_eq!(
+            convert_decimal(SQL_DECIMAL, 5, 6, "1").unwrap_err(),
+            ParamBuildError::InvalidDecimalDigits(6)
+        );
+    }
+
+    /// A date struct becomes a day count on the same 0001-01-01 axis the fetch
+    /// direction reads, so the two share one calendar.
+    #[test]
+    fn a_date_struct_becomes_a_day_count() {
+        let (value, meta) =
+            convert_fixed(SQL_C_TYPE_DATE, SQL_TYPE_DATE, 0, 0, date_struct(1, 1, 1)).unwrap();
+        assert_eq!(value, SqlType::Date(Some(SqlDate::create(0).unwrap())));
+        assert!(meta.is_none());
+
+        let (value, _) = convert_fixed(
+            SQL_C_TYPE_DATE,
+            SQL_TYPE_DATE,
+            0,
+            0,
+            date_struct(9999, 12, 31),
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            SqlType::Date(Some(SqlDate::create(MAX_DAYS_SINCE_0001 as u32).unwrap()))
+        );
+
+        // A leap day exists in 2024 and the count is one past 28 February.
+        let (leap, _) = convert_fixed(
+            SQL_C_TYPE_DATE,
+            SQL_TYPE_DATE,
+            0,
+            0,
+            date_struct(2024, 2, 29),
+        )
+        .unwrap();
+        let (prev, _) = convert_fixed(
+            SQL_C_TYPE_DATE,
+            SQL_TYPE_DATE,
+            0,
+            0,
+            date_struct(2024, 2, 28),
+        )
+        .unwrap();
+        match (leap, prev) {
+            (SqlType::Date(Some(a)), SqlType::Date(Some(b))) => {
+                assert_eq!(a.get_days(), b.get_days() + 1)
+            }
+            other => panic!("expected two dates, got {other:?}"),
+        }
+    }
+
+    /// Exactly msodbcsql's `ValidateDateStruct` (`sqlccnvt.cpp:8821`), which
+    /// answers `CVT_DT_ERROR` = `IDS_22_007_00`. The month-length and leap-year
+    /// arms are the ones plain day arithmetic would silently roll over.
+    #[test]
+    fn an_impossible_date_is_22007() {
+        let cases = [
+            (0i16, 1u16, 1u16), // year below 1
+            (10000, 1, 1),      // year above 9999
+            (2024, 0, 1),       // month 0
+            (2024, 13, 1),      // month 13
+            (2024, 1, 0),       // day 0
+            (2024, 1, 32),      // past a 31-day month
+            (2024, 4, 31),      // past a 30-day month
+            (2023, 2, 29),      // 29 February in a common year
+            (2024, 2, 30),      // 30 February in a leap year
+            (1900, 2, 29),      // 1900 is not a leap year
+        ];
+        for (y, m, d) in cases {
+            assert_eq!(
+                convert_fixed(SQL_C_TYPE_DATE, SQL_TYPE_DATE, 0, 0, date_struct(y, m, d))
+                    .unwrap_err(),
+                ParamBuildError::InvalidDateTime,
+                "{y}-{m}-{d}"
+            );
+        }
+        // 2000 *is* a leap year - the 400-year rule, the opposite of 1900.
+        assert!(
+            convert_fixed(
+                SQL_C_TYPE_DATE,
+                SQL_TYPE_DATE,
+                0,
+                0,
+                date_struct(2000, 2, 29)
+            )
+            .is_ok()
+        );
+    }
+
+    /// A `date` target drops the time, which is only lossless at midnight.
+    #[test]
+    fn a_timestamp_with_a_time_component_cannot_become_a_date() {
+        assert_eq!(
+            convert_fixed(
+                SQL_C_TYPE_TIMESTAMP,
+                SQL_TYPE_DATE,
+                0,
+                0,
+                timestamp_struct(2024, 1, 1, 12, 0, 0, 0)
+            )
+            .unwrap_err(),
+            ParamBuildError::DateTimeFieldOverflow
+        );
+        assert!(
+            convert_fixed(
+                SQL_C_TYPE_TIMESTAMP,
+                SQL_TYPE_DATE,
+                0,
+                0,
+                timestamp_struct(2024, 1, 1, 0, 0, 0, 0)
+            )
+            .is_ok()
+        );
+    }
+
+    /// `ValidateTimeStruct` (`sqlccnvt.cpp:8844`) bounds each component
+    /// separately and answers `CVT_TM_ERROR` = `IDS_22_007_01`. Note 60 seconds
+    /// is rejected: there is no leap-second allowance.
+    #[test]
+    fn an_impossible_time_is_22007() {
+        let cases = [
+            (24u16, 0u16, 0u16, 0u32),
+            (0, 60, 0, 0),
+            (0, 0, 60, 0),
+            (0, 0, 0, 1_000_000_000),
+        ];
+        for (h, mi, s, f) in cases {
+            let value = crate::api::odbc_types::SqlSsTime2Struct {
+                hour: h,
+                minute: mi,
+                second: s,
+                fraction: f,
+            };
+            assert_eq!(
+                convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 7, value).unwrap_err(),
+                ParamBuildError::InvalidDateTime,
+                "{h}:{mi}:{s}.{f}"
+            );
+        }
+    }
+
+    /// The declared scale bounds the fraction, and a dropped non-zero digit is
+    /// `22008` whatever the target.
+    ///
+    /// Measured, not derived: `ParamToSQLType` reads as though only the
+    /// timestamp family gets `IDS_22_008` (`sqlcfunc.cpp:3357`), but retail
+    /// 18.6.2.1 answers it for `time` and `datetimeoffset` too.
+    #[test]
+    fn a_fraction_past_the_declared_scale_is_rejected_unless_zero() {
+        // Scale 3 carries milliseconds; 100 ns ticks below that must be zero.
+        let ok = crate::api::odbc_types::SqlSsTime2Struct {
+            hour: 1,
+            minute: 2,
+            second: 3,
+            fraction: 123_000_000,
+        };
+        assert!(convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 3, ok).is_ok());
+
+        let lossy = crate::api::odbc_types::SqlSsTime2Struct {
+            fraction: 123_400_000,
+            ..ok
+        };
+        let err = convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 3, lossy).unwrap_err();
+        assert_eq!(err, ParamBuildError::DateTimeFieldOverflow);
+        assert_eq!(err.diag().state, *b"22008");
+
+        let sub_tick = crate::api::odbc_types::SqlSsTime2Struct {
+            fraction: 123_000_001,
+            ..ok
+        };
+        let err = convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 7, sub_tick).unwrap_err();
+        assert_eq!(err.diag().state, *b"22008");
+
+        let ts = timestamp_struct(2024, 6, 15, 1, 2, 3, 123_400_000);
+        let err = convert_fixed(SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 3, ts).unwrap_err();
+        assert_eq!(err.diag().state, *b"22008");
+
+        let dto = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 1,
+            minute: 2,
+            second: 3,
+            fraction: 123_400_000,
+            timezone_hour: 0,
+            timezone_minute: 0,
+        };
+        let err =
+            convert_fixed(SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIMESTAMPOFFSET, 0, 3, dto).unwrap_err();
+        assert_eq!(err.diag().state, *b"22008");
+    }
+
+    /// The struct is local wall clock and the wire is UTC, so the offset is
+    /// subtracted on the way out - the mirror of what `extract_datetime_parts`
+    /// adds back on the way in.
+    #[test]
+    fn a_timestampoffset_is_sent_as_utc() {
+        let value = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 12,
+            minute: 30,
+            second: 0,
+            fraction: 0,
+            timezone_hour: 5,
+            timezone_minute: 30,
+        };
+        let (built, meta) = convert_fixed(
+            SQL_C_SS_TIMESTAMPOFFSET,
+            SQL_SS_TIMESTAMPOFFSET,
+            0,
+            0,
+            value,
+        )
+        .unwrap();
+        assert_eq!(meta.and_then(|m| m.scale), Some(MAX_DATETIME_SCALE));
+        match built {
+            SqlType::DateTimeOffset(Some(dto)) => {
+                assert_eq!(dto.offset, 330);
+                // 12:30 local at +05:30 is 07:00 UTC on the same day.
+                assert_eq!(dto.datetime2.time.time_nanoseconds, 7 * 36_000_000_000);
+                let expected_days = days_since_0001_from_civil(2024, 6, 15).unwrap() as u32;
+                assert_eq!(dto.datetime2.days, expected_days);
+            }
+            other => panic!("expected DateTimeOffset(Some), got {other:?}"),
+        }
+    }
+
+    /// A negative offset borrows a day rather than producing a negative
+    /// time-of-day, which is the case Euclidean division exists for here.
+    #[test]
+    fn a_negative_offset_borrows_a_day() {
+        let value = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 1,
+            minute: 0,
+            second: 0,
+            fraction: 0,
+            timezone_hour: -5,
+            timezone_minute: 0,
+        };
+        let (built, _) = convert_fixed(
+            SQL_C_SS_TIMESTAMPOFFSET,
+            SQL_SS_TIMESTAMPOFFSET,
+            0,
+            0,
+            value,
+        )
+        .unwrap();
+        match built {
+            SqlType::DateTimeOffset(Some(dto)) => {
+                assert_eq!(dto.offset, -300);
+                // 01:00 at -05:00 is 06:00 UTC the same day, not the day before.
+                assert_eq!(dto.datetime2.time.time_nanoseconds, 6 * 36_000_000_000);
+                assert_eq!(
+                    dto.datetime2.days,
+                    days_since_0001_from_civil(2024, 6, 15).unwrap() as u32
+                );
+            }
+            other => panic!("expected DateTimeOffset(Some), got {other:?}"),
+        }
+    }
+
+    /// `IsValidTimezoneOffsetValue` (`dataconv.cpp:118`) rejects components that
+    /// disagree in sign, even when the total is legal. Checking only the total
+    /// would accept `+5h -30m` as +04:30.
+    #[test]
+    fn a_mixed_sign_timezone_offset_is_rejected() {
+        assert!(!is_valid_timezone_offset(5, -30));
+        assert!(!is_valid_timezone_offset(-5, 30));
+        // Same totals, consistent signs, both legal.
+        assert!(is_valid_timezone_offset(4, 30));
+        assert!(is_valid_timezone_offset(-4, -30));
+        // Bounds: +/-14:00 exactly is legal, one minute past is not.
+        assert!(is_valid_timezone_offset(14, 0));
+        assert!(is_valid_timezone_offset(-14, 0));
+        assert!(!is_valid_timezone_offset(14, 1));
+        assert!(!is_valid_timezone_offset(15, 0));
+        // A minute component of its own cannot exceed 59.
+        assert!(!is_valid_timezone_offset(0, 60));
+        assert!(is_valid_timezone_offset(0, 59));
+        // Both mixed-sign guards require a strictly non-zero hour
+        // (`dataconv.cpp:128-129`), so a zero hour with a negative minute is a
+        // legal -00:30 rather than a sign disagreement.
+        assert!(is_valid_timezone_offset(0, -30));
+        assert!(!is_valid_timezone_offset(-14, -1));
+    }
+
+    /// `ValidateTimeStruct` bounds the fraction field itself
+    /// (`sqlccnvt.cpp:8852`), so a value past one second is `22007` before any
+    /// scale check runs.
+    ///
+    /// msodbcsql's own corpus value for this is
+    /// `{10, 10, 12, 1233111111}` (`KatmaiDatetimeODBC.cpp:12253`), but its test
+    /// asserts `22008` because it binds through `SQL_C_BINARY` (`:12358`), which
+    /// skips `ValidateTimeStruct` entirely. The state depends on the C type - do
+    /// not copy their expected value for a native binding.
+    #[test]
+    fn a_fraction_past_one_second_is_22007() {
+        let t2 = crate::api::odbc_types::SqlSsTime2Struct {
+            hour: 10,
+            minute: 10,
+            second: 12,
+            fraction: 1_233_111_111,
+        };
+        let err = convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 7, t2).unwrap_err();
+        assert_eq!(err.diag().state, *b"22007");
+    }
+
+    /// The edges themselves have to work, not just fail one past them.
+    #[test]
+    fn the_maximum_representable_values_convert() {
+        let t2 = crate::api::odbc_types::SqlSsTime2Struct {
+            hour: 23,
+            minute: 59,
+            second: 59,
+            fraction: 999_999_900,
+        };
+        assert!(convert_fixed(SQL_C_SS_TIME2, SQL_SS_TIME2, 0, 7, t2).is_ok());
+
+        let ts = timestamp_struct(9999, 12, 31, 23, 59, 59, 999_999_900);
+        assert!(convert_fixed(SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 7, ts).is_ok());
+
+        let floor = timestamp_struct(1, 1, 1, 0, 0, 0, 0);
+        assert!(convert_fixed(SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 7, floor).is_ok());
+    }
+
+    /// An offset that normalises to exactly the minimum instant is in range.
+    /// `0001-01-01 05:45:00 +05:45` is UTC `0001-01-01 00:00:00` - the floor
+    /// itself, not one past it, and the shape an off-by-one would break.
+    #[test]
+    fn an_offset_landing_exactly_on_the_floor_is_in_range() {
+        let dto = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 1,
+            month: 1,
+            day: 1,
+            hour: 5,
+            minute: 45,
+            second: 0,
+            fraction: 0,
+            timezone_hour: 5,
+            timezone_minute: 45,
+        };
+        assert!(convert_fixed(SQL_C_SS_TIMESTAMPOFFSET, SQL_SS_TIMESTAMPOFFSET, 0, 7, dto).is_ok());
+    }
+
+    /// An out-of-range offset reaches the application as `22007`, the same state
+    /// as an impossible date.
+    #[test]
+    fn an_out_of_range_offset_is_22007() {
+        let value = crate::api::odbc_types::SqlSsTimestampoffsetStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 12,
+            minute: 0,
+            second: 0,
+            fraction: 0,
+            timezone_hour: 15,
+            timezone_minute: 0,
+        };
+        assert_eq!(
+            convert_fixed(
+                SQL_C_SS_TIMESTAMPOFFSET,
+                SQL_SS_TIMESTAMPOFFSET,
+                0,
+                0,
+                value
+            )
+            .unwrap_err(),
+            ParamBuildError::InvalidDateTime
+        );
+    }
+
+    /// `time` and its SS spelling are one wire type, so both C spellings reach
+    /// both SQL spellings and produce the same value.
+    #[test]
+    fn the_two_time_spellings_are_interchangeable() {
+        let ss = crate::api::odbc_types::SqlSsTime2Struct {
+            hour: 13,
+            minute: 45,
+            second: 30,
+            fraction: 0,
+        };
+        let plain = crate::api::odbc_types::SqlTimeStruct {
+            hour: 13,
+            minute: 45,
+            second: 30,
+        };
+        let expected = 13 * 36_000_000_000u64 + 45 * 600_000_000 + 30 * 10_000_000;
+        for sql_type in [SQL_TYPE_TIME, SQL_SS_TIME2] {
+            let (a, _) = convert_fixed(SQL_C_SS_TIME2, sql_type, 0, 0, ss).unwrap();
+            let (b, _) = convert_fixed(SQL_C_TYPE_TIME, sql_type, 0, 0, plain).unwrap();
+            assert_eq!(a, b, "sql_type {sql_type}");
+            match a {
+                SqlType::Time(Some(t)) => assert_eq!(t.time_nanoseconds, expected),
+                other => panic!("expected Time(Some), got {other:?}"),
+            }
+        }
+    }
+
+    /// `SQL_TIME_STRUCT` has no fractional field, so the plain C spelling can
+    /// never carry one - the fraction is zero by construction rather than
+    /// dropped. The declaration is still the maximum scale, as measured.
+    #[test]
+    fn the_plain_time_struct_carries_no_fraction() {
+        let plain = crate::api::odbc_types::SqlTimeStruct {
+            hour: 0,
+            minute: 0,
+            second: 1,
+        };
+        // Scale 0 would reject any non-zero fraction; this converts, so there is
+        // none to reject.
+        let (value, _) = convert_fixed(SQL_C_TYPE_TIME, SQL_TYPE_TIME, 0, 0, plain).unwrap();
+        assert_eq!(
+            value,
+            SqlType::Time(Some(SqlTime {
+                time_nanoseconds: 10_000_000,
+                scale: MAX_DATETIME_SCALE
+            }))
+        );
+    }
+
+    /// `xml` takes the UTF-16 payload straight through, and a narrow buffer is
+    /// transcoded to reach it.
+    #[test]
+    fn xml_takes_utf16_from_either_character_c_type() {
+        let mut wide: Vec<u8> = "<a/>".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut ind: SqlLen = wide.len() as SqlLen;
+        let mut p = param(SQL_C_WCHAR, wide.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_XML;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::Xml(Some(x)) => assert_eq!(x.as_string(), "<a/>"),
+            other => panic!("expected Xml(Some), got {other:?}"),
+        }
+
+        let mut narrow = b"<a/>".to_vec();
+        let mut ind: SqlLen = narrow.len() as SqlLen;
+        let mut p = param(SQL_C_CHAR, narrow.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_XML;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        match value {
+            SqlType::Xml(Some(x)) => assert_eq!(x.as_string(), "<a/>"),
+            other => panic!("expected Xml(Some), got {other:?}"),
+        }
+    }
+
+    /// `sql_variant` wraps the inner declaration rather than declaring itself,
+    /// and cannot hold a `max` type - server error 529 - so a `ColumnSize` of 0
+    /// is read as "unstated" and a `ColumnSize` past the target's ceiling is
+    /// clamped, rather than either falling through to `max`.
+    ///
+    /// Bound `SQL_C_WCHAR` because that is the only pairing the matrix admits
+    /// (AB#47800); the ceiling is the wide one, so a narrow binding here would
+    /// assert 8000 on a path no application can reach.
+    #[test]
+    fn a_variant_wraps_a_bounded_inner_declaration() {
+        let wide =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+
+        let cases: &[(usize, u16)] = &[
+            (8, 8),
+            // Unstated: the wide ceiling, not `max`.
+            (0, SQL_PREC_NCHAR as u16),
+            // Past the wide ceiling but inside the narrow one: clamped, not `max`.
+            (5000, SQL_PREC_NCHAR as u16),
+            // `SQL_SS_VARIANT` has no upper bound at bind (`type_rules.rs`
+            // answers `true` for it), so the clamp has to hold for any size.
+            (8001, SQL_PREC_NCHAR as u16),
+            (usize::MAX, SQL_PREC_NCHAR as u16),
+        ];
+
+        for &(column_size, expected) in cases {
+            let mut bytes = wide("hi");
+            let mut ind: SqlLen = 4;
+            let mut p = param(SQL_C_WCHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+            p.sql_type = SQL_SS_VARIANT;
+            p.column_size = column_size;
+            let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+            match value {
+                SqlType::Variant(inner) => assert!(
+                    matches!(*inner, SqlType::NVarchar(Some(_), n) if n == expected),
+                    "column_size {column_size}: got {inner:?}"
+                ),
+                other => panic!("column_size {column_size}: expected Variant, got {other:?}"),
+            }
+        }
+    }
+
+    /// A payload past the wide ceiling cannot be sent as `sql_variant` by
+    /// anyone: measured on retail 18.6.2.1, 4000 wide characters execute and
+    /// 4001 fail with server error 8013 (`42000`, "invalid instance length"),
+    /// because `nvarchar(4000)` is already the variant's 8000-byte payload
+    /// limit.
+    ///
+    /// The clamp declares that ceiling, so the overflow is caught here as
+    /// `22001` at bind rather than by the server one call later. Both refuse;
+    /// only the diagnostic differs (AB#47800).
+    #[test]
+    fn a_variant_payload_past_the_wide_ceiling_is_truncation() {
+        let text = "x".repeat(SQL_PREC_NCHAR + 1);
+        let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut ind: SqlLen = SqlLen::try_from(bytes.len()).unwrap();
+        let mut p = param(SQL_C_WCHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = SQL_SS_VARIANT;
+        p.column_size = 0;
+
+        let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
+        assert_eq!(err, ParamBuildError::StringTruncation);
+        assert_eq!(err.diag().state, *b"22001");
+    }
+
+    /// Every newly bound row must produce a typed NULL from `ParameterType`
+    /// alone, since a defaulted binding of these types is the common case and a
+    /// NULL has no buffer to read.
+    #[test]
+    fn every_new_row_types_its_null_from_the_parameter_type() {
+        let cases: &[(SqlSmallInt, SqlULen, SqlSmallInt)] = &[
+            (SQL_BIT, 0, 0),
+            (SQL_REAL, 0, 0),
+            (SQL_FLOAT, 0, 0),
+            (SQL_DOUBLE, 0, 0),
+            (SQL_DECIMAL, 18, 2),
+            (SQL_NUMERIC, 18, 2),
+            (SQL_GUID, 0, 0),
+            (SQL_TYPE_DATE, 0, 0),
+            (SQL_TYPE_TIME, 0, 3),
+            (SQL_TYPE_TIMESTAMP, 0, 3),
+            (SQL_SS_TIME2, 0, 3),
+            (SQL_SS_TIMESTAMPOFFSET, 0, 3),
+            (SQL_SS_XML, 0, 0),
+            (SQL_SS_VARIANT, 0, 0),
+        ];
+        for (sql_type, column_size, decimal_digits) in cases {
+            let mut ind: SqlLen = SQL_NULL_DATA;
+            let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+            p.sql_type = *sql_type;
+            p.column_size = *column_size;
+            p.decimal_digits = *decimal_digits;
+            let (value, _) = unsafe { bound_param_to_value(&p) }
+                .unwrap_or_else(|e| panic!("sql_type {sql_type}: {e:?}"));
+            assert!(
+                !matches!(value, SqlType::VarcharMax(_)),
+                "sql_type {sql_type} fell back to varchar(max)"
+            );
+        }
     }
 
     /// One buffer, four declarations: the wire type follows `ParameterType`, so
@@ -1233,6 +2589,12 @@ mod tests {
             // from bind time to here.
             (SQL_C_CHAR, SQL_INTEGER),
             (SQL_C_WCHAR, SQL_BIGINT),
+            // Same move for the families this change adds. `xml` is the one
+            // most likely to be reached, streaming a large document being the
+            // ordinary reason to use DAE on it at all.
+            (SQL_C_WCHAR, SQL_SS_XML),
+            (SQL_C_CHAR, SQL_DECIMAL),
+            (SQL_C_WCHAR, SQL_SS_VARIANT),
         ] {
             let err = dae_placeholder_type(c_type, sql_type).unwrap_err();
             assert_eq!(
@@ -2344,8 +3706,24 @@ mod tests {
     /// assignment itself is pinned by the explicit lists that follow.
     #[test]
     fn sql_family_agrees_with_the_conversion_matrix() {
+        // One C type per matrix row, so "reachable" means reachable by anything.
+        let probes = [
+            SQL_C_CHAR,
+            SQL_C_WCHAR,
+            SQL_C_SLONG,
+            SQL_C_BINARY,
+            SQL_C_BIT,
+            SQL_C_FLOAT,
+            SQL_C_DOUBLE,
+            SQL_C_GUID,
+            SQL_C_TYPE_DATE,
+            SQL_C_TYPE_TIME,
+            SQL_C_TYPE_TIMESTAMP,
+            SQL_C_SS_TIME2,
+            SQL_C_SS_TIMESTAMPOFFSET,
+        ];
         for sql_type in -160..=120 {
-            let reachable = [SQL_C_CHAR, SQL_C_SLONG, SQL_C_BINARY]
+            let reachable = probes
                 .iter()
                 .any(|c_type| is_supported_conversion(*c_type, sql_type));
             assert_eq!(
@@ -2375,6 +3753,22 @@ mod tests {
                 SqlFamily::Binary,
                 &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY],
             ),
+            (SqlFamily::Bit, &[SQL_BIT]),
+            (SqlFamily::Float, &[SQL_REAL, SQL_FLOAT, SQL_DOUBLE]),
+            (SqlFamily::Decimal, &[SQL_DECIMAL, SQL_NUMERIC]),
+            (SqlFamily::Guid, &[SQL_GUID]),
+            (
+                SqlFamily::DateTime,
+                &[
+                    SQL_TYPE_DATE,
+                    SQL_TYPE_TIME,
+                    SQL_TYPE_TIMESTAMP,
+                    SQL_SS_TIME2,
+                    SQL_SS_TIMESTAMPOFFSET,
+                ],
+            ),
+            (SqlFamily::Xml, &[SQL_SS_XML]),
+            (SqlFamily::Variant, &[SQL_SS_VARIANT]),
         ];
         for (family, sql_types) in families {
             for sql_type in *sql_types {
@@ -2392,13 +3786,15 @@ mod tests {
         assert!(matches!(value, SqlType::VarcharMax(None)));
     }
 
+    /// `SQL_C_SS_VECTOR` is a real ODBC C type with no matrix row yet
+    /// (AB#47790), so it is the one that still reaches this backstop.
     #[test]
     fn unsupported_c_type_is_rejected() {
         let mut ind: SqlLen = 4;
-        let mut val: f32 = 1.5;
-        let p = param(SQL_C_FLOAT, &mut val as *mut f32 as *mut c_void, &mut ind);
+        let mut val: [u8; 8] = [0; 8];
+        let p = param(SQL_C_SS_VECTOR, val.as_mut_ptr() as *mut c_void, &mut ind);
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
-        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_FLOAT));
+        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_SS_VECTOR));
     }
 
     #[test]
@@ -2580,10 +3976,10 @@ mod tests {
                 scale: Some(scale),
             })
         };
-        let temporal = |scale| {
+        let temporal = || {
             Some(RpcTypeMetadata {
                 precision: None,
-                scale: Some(scale),
+                scale: Some(MAX_DATETIME_SCALE),
             })
         };
         let cases: &[(
@@ -2595,20 +3991,20 @@ mod tests {
         )] = &[
             (SQL_DECIMAL, 12, 3, SqlType::Decimal(None), decimal(12, 3)),
             (SQL_NUMERIC, 38, 0, SqlType::Numeric(None), decimal(38, 0)),
-            (SQL_SS_TIME2, 16, 4, SqlType::Time(None), temporal(4)),
+            (SQL_SS_TIME2, 16, 4, SqlType::Time(None), temporal()),
             (
                 SQL_TYPE_TIMESTAMP,
                 27,
                 7,
                 SqlType::DateTime2(None),
-                temporal(7),
+                temporal(),
             ),
             (
                 SQL_SS_TIMESTAMPOFFSET,
                 34,
                 7,
                 SqlType::DateTimeOffset(None),
-                temporal(7),
+                temporal(),
             ),
             (SQL_INTEGER, 10, 0, SqlType::Int(None), None),
             (SQL_CHAR, 10, 0, SqlType::Char(None, 10), None),

@@ -13,9 +13,9 @@ use tracing::{debug, error};
 use crate::api::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{
     SQL_ATTR_READWRITE_UNKNOWN, SQL_BIGINT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE,
-    SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
-    SQL_C_SSHORT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR,
-    SQL_CA_SS_VARIANT_TYPE, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
+    SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2,
+    SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_UTINYINT,
+    SQL_C_WCHAR, SQL_CA_SS_VARIANT_TYPE, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
     SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME, SQL_DESC_CASE_SENSITIVE,
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE,
     SQL_DESC_FIXED_PREC_SCALE, SQL_DESC_LABEL, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_NULLABLE,
@@ -335,7 +335,7 @@ fn binary_precision(meta: &ColumnMetadata) -> Option<SqlSmallInt> {
 /// digits) for a column size of 10, a GUID needs 36, and binary renders as two
 /// hex characters per byte.
 fn display_size(meta: &ColumnMetadata) -> SqlLen {
-    // `*(max)`, xml and json are unbounded; ODBC reports zero.
+    // `*(max)`, xml, json, and opaque UDTs have no fixed character display size.
     if meta.is_plp() {
         return 0;
     }
@@ -408,6 +408,11 @@ fn display_size(meta: &ColumnMetadata) -> SqlLen {
 /// representation, which for the temporal types is the C struct the driver
 /// hands back, not the TDS payload width.
 pub(super) fn octet_length(meta: &ColumnMetadata) -> SqlLen {
+    // A bounded UDT is still PLP; use its byte limit for binary transfer while
+    // display_size remains zero because the opaque value has no text rendering.
+    if meta.data_type == TdsDataType::Udt {
+        return desc_length(meta);
+    }
     if meta.is_plp() {
         return 0;
     }
@@ -518,30 +523,59 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
 /// decides it rather than the column's declared type.
 fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
     match base {
-        TdsDataType::Int1 => SQL_C_TINYINT,
+        // `tinyint` is unsigned 0-255 on the server, so the unsigned C type is
+        // the accurate answer: a caller that fetched 200 into a signed char
+        // through SQL_C_TINYINT would read -56. Measured against retail
+        // msodbcsql18 18.06.0001, which answers SQL_C_UTINYINT (-28), and
+        // consistent with this driver's own `type_rules::resolve_default_c_type`,
+        // which resolves SQL_TINYINT to SQL_C_UTINYINT for a column binding.
+        TdsDataType::Int1 => SQL_C_UTINYINT,
         TdsDataType::Int2 => SQL_C_SSHORT,
         TdsDataType::Int4 => SQL_C_SLONG,
         TdsDataType::Int8 => SQL_C_SBIGINT,
         TdsDataType::Bit | TdsDataType::BitN => SQL_C_BIT,
         TdsDataType::Flt4 => SQL_C_FLOAT,
         TdsDataType::Flt8 | TdsDataType::FltN => SQL_C_DOUBLE,
-        // msodbcsql reports SQL_C_NUMERIC here, but emitting SQL_NUMERIC_STRUCT
-        // is a permanent non-goal for this driver (see the divergence table), so
-        // the exact numerics are advertised as character data, which is how they
-        // are actually delivered.
+        // Measured against retail msodbcsql18 18.06.0001: decimal, numeric and
+        // money all answer SQL_C_NUMERIC. Money belongs here because it is
+        // reported as SQL_DECIMAL in the column form too.
+        //
+        // Known cost, stated plainly: this answer is not yet serviceable. A
+        // caller that follows the ODBC data-type-mapping workflow and binds the
+        // returned C type gets HYC00 from SQLGetData / SQLBindCol until AB#47816
+        // lands, where msodbcsql succeeds. That mismatch is new here - the
+        // previous answer, SQL_C_CHAR, was always deliverable.
+        //
+        // Shipped in this order deliberately. The alternative was to keep
+        // answering SQL_C_CHAR, which is not a safe holding position: it is the
+        // wrong answer, and it fails silently. mssql-python routes on this value
+        // alone and handed back `str` where the value is a decimal (AB#47702),
+        // with nothing to indicate the type was wrong. A defined
+        // "optional feature not implemented" is a better failure than data of
+        // the wrong shape, and it only reaches a caller that asks for the struct
+        // this driver has never offered on any path.
         TdsDataType::Decimal
         | TdsDataType::DecimalN
         | TdsDataType::Numeric
         | TdsDataType::NumericN
         | TdsDataType::Money
         | TdsDataType::Money4
-        | TdsDataType::MoneyN => SQL_C_CHAR,
+        | TdsDataType::MoneyN => SQL_C_NUMERIC,
         TdsDataType::DateN => SQL_C_TYPE_DATE,
+        // Not gated on the declared ODBC version, where
+        // `type_rules::resolve_default_c_type` gates the same two types
+        // (`SQL_SS_TIME2 if is_3_80`, else `SQL_C_BINARY`). Under
+        // `SQL_OV_ODBC3` the same value is therefore described one way as a
+        // variant and another as a column resolved from `SQL_C_DEFAULT`.
+        // Deliverable either way - `is_valid_c_type` accepts both
+        // unconditionally - but inconsistent, and unfixable here until this
+        // module can reach the environment's `OdbcVersion`. Tracked in AB#47830.
         TdsDataType::TimeN => SQL_C_SS_TIME2,
         TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
             SQL_C_TYPE_TIMESTAMP
         }
         TdsDataType::DateTime2N => SQL_C_TYPE_TIMESTAMP,
+        // Same version-gating gap as `TimeN` above (AB#47830).
         TdsDataType::DateTimeOffsetN => SQL_C_SS_TIMESTAMPOFFSET,
         TdsDataType::Char
         | TdsDataType::BigChar
@@ -553,9 +587,33 @@ fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
         | TdsDataType::VarBinary
         | TdsDataType::BigVarBinary => SQL_C_BINARY,
         TdsDataType::Guid => SQL_C_GUID,
-        // SQL Server rejects the remaining types at insert time, so a variant
-        // cannot actually carry them; character is the safe fallback.
-        _ => SQL_C_CHAR,
+        // Enumerated rather than left to a `_` arm: every type below is one a
+        // variant provably cannot carry, and spelling them out is what makes
+        // adding a `TdsDataType` a compile error here instead of a silent
+        // `SQL_C_CHAR`. Character stays the answer for all of them, so this is
+        // about the next person's mistake, not about today's behavior.
+        //
+        // `IntN` is the non-obvious one: a variant carries an integer as
+        // `INT1/2/4/8TYPE` and never as `INTNTYPE` (MS-TDS 2.2.5.5.2), so the
+        // nullable spelling never reaches the wire inside a variant even though
+        // the other `*N` types do.
+        //
+        // The rest SQL Server rejects when the value is assigned to a
+        // `sql_variant`: the LOB types, the structured and CLR types, a nested
+        // variant, and `Void`/`None`, which are placeholders rather than column
+        // types at all.
+        TdsDataType::IntN
+        | TdsDataType::Image
+        | TdsDataType::Text
+        | TdsDataType::NText
+        | TdsDataType::Xml
+        | TdsDataType::Json
+        | TdsDataType::Vector
+        | TdsDataType::Udt
+        | TdsDataType::SqlTable
+        | TdsDataType::SsVariant
+        | TdsDataType::Void
+        | TdsDataType::None => SQL_C_CHAR,
     }
 }
 
@@ -632,8 +690,7 @@ fn type_name(meta: &ColumnMetadata) -> &'static str {
     }
 }
 
-// Only `int` column metadata can be built outside the decoder (`int_columns`),
-// so the per-type mapping tables are covered end-to-end by
+// Most per-type mapping tables are covered end-to-end by
 // `tests/e2e/tests/col_attribute_test.cpp` against a live SQL Server.
 #[cfg(test)]
 mod tests {
@@ -646,7 +703,7 @@ mod tests {
     use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_FIELD;
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sqldatatypes::TypeInfo;
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{int_columns, udt_column};
 
     /// A statement positioned on a result set of `n` nullable `int` columns.
     fn stmt_with_int_columns(h: &TestHandles, n: usize) {
@@ -1226,17 +1283,17 @@ mod tests {
     #[test]
     fn variant_c_type_covers_the_base_types() {
         let cases: &[(TdsDataType, SqlSmallInt)] = &[
-            (TdsDataType::Int1, SQL_C_TINYINT),
+            (TdsDataType::Int1, SQL_C_UTINYINT),
             (TdsDataType::Int2, SQL_C_SSHORT),
             (TdsDataType::Int4, SQL_C_SLONG),
             (TdsDataType::Int8, SQL_C_SBIGINT),
             (TdsDataType::Bit, SQL_C_BIT),
             (TdsDataType::Flt4, SQL_C_FLOAT),
             (TdsDataType::Flt8, SQL_C_DOUBLE),
-            // The exact numerics are advertised as character data because
-            // SQL_NUMERIC_STRUCT is a permanent non-goal.
-            (TdsDataType::Numeric, SQL_C_CHAR),
-            (TdsDataType::MoneyN, SQL_C_CHAR),
+            (TdsDataType::Numeric, SQL_C_NUMERIC),
+            (TdsDataType::DecimalN, SQL_C_NUMERIC),
+            (TdsDataType::MoneyN, SQL_C_NUMERIC),
+            (TdsDataType::Money4, SQL_C_NUMERIC),
             (TdsDataType::DateN, SQL_C_TYPE_DATE),
             (TdsDataType::TimeN, SQL_C_SS_TIME2),
             (TdsDataType::DateTimeN, SQL_C_TYPE_TIMESTAMP),
@@ -1387,6 +1444,18 @@ mod tests {
                 .expect("varchar(max) is a PLP type");
         }
         assert_eq!(numeric(&h, 1, SQL_DESC_OCTET_LENGTH), 0);
+    }
+
+    #[test]
+    fn udt_size_attributes_match_bounded_and_unbounded_metadata() {
+        for (max_byte_size, expected_size) in [(u16::MAX, 0), (892, 892)] {
+            let meta = udt_column(max_byte_size);
+
+            assert_eq!(desc_length(&meta), expected_size);
+            assert_eq!(SqlLen::from(precision(&meta)), expected_size);
+            assert_eq!(octet_length(&meta), expected_size);
+            assert_eq!(display_size(&meta), 0);
+        }
     }
 
     /// A `decimal` carries its own precision on the wire, which takes

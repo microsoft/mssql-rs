@@ -906,7 +906,7 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionSti
 // from bind time to here.
 //
 // msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute (see
-// param_cross_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute),
+// param_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute),
 // but does not actually stream it: SQLPutData itself then rejects with
 // HY019 ("Processing of fixed length targets cannot be spread over multiple
 // calls to SQLPutData"). Both drivers agree the pairing cannot stream
@@ -1386,26 +1386,6 @@ TEST_F(PrepareExecuteLiveTest, NullIndicatorPointerMeansNullTerminated) {
     EXPECT_EQ("abc", GetColumnChar(1));
 
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
-}
-
-// A defaulted binding is checked against the conversion matrix like an explicit
-// one, so an application gets the same answer either way. SQL_GUID has no
-// conversion row yet, so the bind is rejected with HYC00 - unbuilt, not illegal.
-// msodbcsql accepts it (it resolves to SQL_C_CHAR via rgbTRANSTYPE380 and can
-// convert), hence the skip.
-//
-// Re-enable as a round-trip test when SQL_C_GUID -> SQL_GUID lands: AB#47500.
-TEST_F(PrepareExecuteLiveTest, DefaultCTypeGuidIsRejectedAtBind) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-
-    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
-
-    SQLGUID value = {};
-    SQLLEN ind = 0;
-    EXPECT_EQ(SQL_ERROR,
-              SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT,
-                               SQL_GUID, 0, 0, &value, sizeof(value), &ind));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 }
 
 // A NULL-indicator parameter produces a SQL NULL result.

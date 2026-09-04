@@ -6,6 +6,10 @@
 #include <array>
 #include <string>
 
+#ifndef SQL_SS_UDT
+#define SQL_SS_UDT (-151)
+#endif
+
 namespace {
 
 struct ParamDescription {
@@ -130,6 +134,28 @@ TEST_F(DescribeParamLiveTest, ReportsRepresentativeMetadata) {
     }
 }
 
+TEST_F(DescribeParamLiveTest, DescribesClrUdtMetadata) {
+    ASSERT_SQL_OK(
+        Prepare("SELECT CAST(? AS geography), CAST(? AS geometry), CAST(? AS hierarchyid)"),
+        SQL_HANDLE_STMT, stmt_);
+
+    const std::array<ParamDescription, 3> expected = {{
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+        {SQL_SS_UDT, 0, 0, SQL_NULLABLE},
+    }};
+
+    for (SQLUSMALLINT ordinal = 1; ordinal <= expected.size(); ++ordinal) {
+        ParamDescription actual;
+        ASSERT_TRUE(Describe(ordinal, actual)) << "ordinal " << ordinal;
+        const ParamDescription& wanted = expected[ordinal - 1];
+        EXPECT_EQ(wanted.data_type, actual.data_type) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.size, actual.size) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.scale, actual.scale) << "ordinal " << ordinal;
+        EXPECT_EQ(wanted.nullable, actual.nullable) << "ordinal " << ordinal;
+    }
+}
+
 // Benefits-from-mock-tds: a mock TDS server could assert the typed NULL that
 // SQL_C_DEFAULT produces reaches the wire as INTN rather than inferring it from
 // the ISNULL result.
@@ -229,13 +255,7 @@ TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
 
 // A described decimal must be re-declared with the same precision and scale, or
 // the first non-NULL value bound from that description would be truncated.
-//
-// Disabled because every bind is checked against the conversion matrix,
-// defaulted ones included: `SQL_DECIMAL` resolves to `SQL_C_CHAR`, which the
-// matrix pairs only with the character SQL types, so the bind is rejected with
-// HYC00. Re-enable when decimal conversions land (AB#47500) - this test also
-// guards the scale-0 wire-metadata regression, so it should come back with them.
-TEST_F(DescribeParamLiveTest, DISABLED_DescribedDecimalRoundTripsPrecisionAndScale) {
+TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, CAST(1.5 AS DECIMAL(12,3)))"),
                   SQL_HANDLE_STMT, stmt_);
 

@@ -68,33 +68,182 @@ authoritative parity reference for this crate. Its source lives in the
     therefore does **not** prove it supports 2.x applications, and a branch that
     looks reachable in a validator may be dead once the caller's normalization is
     accounted for. Read the caller before concluding either way.
-- Deliberate deviations (exceed-parity) are allowed with product-owner sign-off;
-  record the rationale in code comments and the tracking work item.
-- Deliberate deviations are listed below:
-  - `ActiveDirectoryManagedIdentity` is accepted as an alias for managed-identity
-    authentication. msodbcsql recognizes only `ActiveDirectoryMSI`
-    (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h` → `OPTIONADMSI L"ActiveDirectoryMSI"`);
-    `ActiveDirectoryManagedIdentity` does not appear anywhere in the msodbcsql source.
-    Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
-  - `SQL_C_DEFAULT` resolves the wide character SQL types to `SQL_C_WCHAR`, and
-    `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
-    Applies to both directions: `SQLBindParameter` resolves at bind time, and
-    `SQLFetchScroll` resolves a bound column per fetch from the IRD, through the
-    same `type_rules::resolve_default_c_type`.
-    msodbcsql's `Sql2CDefault` reads `rgbTRANSTYPE380`
-    (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which resolves both to `SQL_C_CHAR`
-    — an ANSI-transfer default this driver has no equivalent for, since its
-    `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
-    type would silently corrupt data. On the fetch side the same choice avoids
-    transcoding every wide column by default. Confirmed against msodbcsql18 for
-    `nvarchar` (three narrow bytes, indicator 3) and `uniqueidentifier` (the
-    36-character text form, indicator 36). Note this covers only those two rows:
-    `SQL_SS_XML` resolves to `SQL_C_WCHAR` in *both* drivers
-    (`sqlcmisc.cpp:179` and `:218`, measured as UTF-16 with indicator 30), so it
-    is **not** a deviation. Tracked in AB#47365.
-  - A bound `time` / `datetimeoffset` column strides by `sizeof(SQL_SS_TIME2_STRUCT)`
-    (12) and `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by
-    `BufferLength`. Both drivers resolve these to the same C types under ODBC 3.8
+- **A divergence justified by "the consumer does not need parity here" is a claim
+  about the consumer's code, and needs the same evidence as a claim about
+  msodbcsql: cite the file and function you read.** `SQL_CA_SS_VARIANT_TYPE` was
+  recorded as a *permanent* divergence returning `SQL_C_CHAR` for exact numerics
+  on the reasoning that mssql-python "requests decimal as character data, so
+  `SQL_NUMERIC_STRUCT` is not needed". mssql-python does fetch the characters —
+  but only after routing on a `SQL_C_NUMERIC` answer
+  (`ddbc_bindings.cpp`, `MapVariantCTypeToSQLType` → the `SQL_DECIMAL`/`SQL_NUMERIC`
+  case), so answering `SQL_C_CHAR` made it hand back `str` instead of
+  `decimal.Decimal` (AB#47702). The delivery path was read correctly and the
+  routing that selects it was never read at all. Never mark a divergence
+  "permanent" on an unread consumer.
+
+## Deliberate deviations
+
+Entries here are **decisions**: we know what msodbcsql does, we could match it,
+and we chose not to.
+
+Add one only when both are true:
+
+- **An application can tell the difference.** Rejecting something msodbcsql
+  accepts always qualifies; accepting something it rejects is milder but counts.
+- **The decision is bigger than one function.** It sets a rule other code has to
+  follow - an encoding, a connection-string keyword, a length unit - or it
+  needed sign-off that a reader must be able to find without reading code.
+
+Two things that look like deviations but are not:
+
+- **A gap** - something not built yet, however deliberately deferred.
+  Ex: `SQLBindCol` rejects `SQL_C_DEFAULT` where msodbcsql resolves it at fetch
+  time; that is a code comment plus a work item, not an entry here.
+- **A difference nothing can observe**, or one that lives in a single function.
+  Explain those where they happen.
+
+Each entry gives: what msodbcsql does, with a source citation; what this driver
+does instead; why; the work item; and, where applications can regress, who
+signed off and when. Keep per-build measurements in the work item so this file
+does not grow every time a new msodbcsql build is measured.
+
+1. `ActiveDirectoryManagedIdentity` is accepted as an alias for managed-identity
+   authentication. msodbcsql recognizes only `ActiveDirectoryMSI`
+   (`Sql/Ntdbms/sqlncli/msdart/inc/dlgattr.h` → `OPTIONADMSI L"ActiveDirectoryMSI"`);
+   `ActiveDirectoryManagedIdentity` does not appear anywhere in the msodbcsql source.
+   Added to match MS Learn and the sibling drivers (JDBC/.NET/go-sqlcmd). Tracked in AB#46066.
+2. `SQL_C_DEFAULT` resolves the wide character SQL types to `SQL_C_WCHAR`, and
+   `SQL_GUID` to `SQL_C_GUID`, following the ODBC 3.x default-C-type table.
+   Applies to both directions: `SQLBindParameter` resolves at bind time, and
+   `SQLFetchScroll` resolves a bound column per fetch from the IRD, through the
+   same `type_rules::resolve_default_c_type`.
+   msodbcsql's `Sql2CDefault` reads `rgbTRANSTYPE380`
+   (`Sql/Ntdbms/sqlncli/odbc/sqlcmisc.cpp`), which resolves both to `SQL_C_CHAR`
+   — an ANSI-transfer default this driver has no equivalent for, since its
+   `SQL_C_CHAR` is UTF-8. Resolving UTF-16 application input to a UTF-8 buffer
+   type would silently corrupt data. On the fetch side the same choice avoids
+   transcoding every wide column by default. Confirmed against msodbcsql18 for
+   `nvarchar` (three narrow bytes, indicator 3) and `uniqueidentifier` (the
+   36-character text form, indicator 36). Note this covers only those two rows:
+   `SQL_SS_XML` resolves to `SQL_C_WCHAR` in *both* drivers
+   (`sqlcmisc.cpp:179` and `:218`, measured as UTF-16 with indicator 30), so it
+   is **not** a deviation. `DefaultCTypeWideCharParam` and
+   `DefaultCTypeGuidRoundTrips` carry `SKIP_IF_COMPARING_MSODBCSQL()` for the
+   two parameter-side halves. Tracked in AB#47365.
+3. `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
+   writes the client code page. msodbcsql uses the client code page -
+   `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
+   (`odbc/sqlcprot.h:2830`), which is `GetACP()` on Windows
+   (`Common/include/Localization.hpp:742`) and `nl_langinfo(CODESET)` elsewhere
+   (`LocalizationImpl.hpp:386`); the parameter path reads it directly at
+   `sqlcfunc.cpp:2913`. The two therefore agree under a UTF-8 locale and differ
+   on a default Windows one. Taken because mssql-python, the only supported
+   consumer, is UTF-8 native; the ODBC "C Data Types" appendix fixes no encoding
+   for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
+   consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
+   AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
+4. **Parameter length is measured in UTF-16 units for both character C types.**
+   msodbcsql counts UTF-16 units in three of its four arms - both wide-source
+   arms, and the narrow-to-wide walk, which counts an astral character as two
+   (`odbc/sqlcfunc.cpp:2935`) - but counts source bytes for narrow-to-narrow
+   (`cchDest = cbData`, `:2952`). That byte count is the wire length only while
+   no client-side transcode happens: TDS carries a collation with char data, so
+   the bytes normally ship under a declared collation and the server converts.
+   `DoCharToCharConversion` (`odbc/sqlcprot.h:4113`) enables client-side
+   conversion for an encoding TDS cannot name - a UTF-8 client against a
+   non-UTF-8 server, or the ISO-8859-x range - and translation is on by default
+   (`SQL_XL_DEFAULT`). In that configuration msodbcsql transcodes yet still
+   measures the *pre-transcode* UTF-8 bytes, so it rejects a four-character
+   accented string from a `varchar(4)` that the four bytes it actually sends
+   would fit, while accepting the same value as `SQL_C_WCHAR`. Because this
+   driver's `SQL_C_CHAR` is always UTF-8, copying the byte rule made that
+   latent msodbcsql defect unconditional. The uniform unit is therefore taken
+   to stop the two C types disagreeing on one value, not to match msodbcsql -
+   it is a divergence in the configuration closest to this driver, on the same
+   footing as the narrow-to-wide off-by-one at `sqlcfunc.cpp:2926` that is also
+   deliberately not replicated. The count still errs low against a `_UTF8` or
+   DBCS collation: a bounded `char`/`varchar` surfaces `HY000` from
+   `serialize_char_varchar_direct` rather than `22001`, and the `max` and
+   `text`/`ntext` types carry no check at all and send the over-long value.
+   **This regresses a subset of inputs rather than being a pure win** - three
+   U+2615 into `varchar(3)` was a correct `22001` and is now an opaque failure,
+   so CJK and astral input bound with an exact character count is the shape that
+   suffers. Taken because over-rejection has no application workaround while
+   under-rejection still errors, and because byte-counting both C types would
+   break the wide arm that msodbcsql gets right. Exactness needs the collation at
+   this layer. Signed off by Theekshna Kotian (product owner) on 2026-08-27.
+   Tracked in AB#47584.
+5. **An integer parameter bound to a character type is length-checked.**
+   msodbcsql length-checks no integer C type (`odbc/sqlcfunc.cpp:2586`, `:2854`,
+   `:3165`, `:3177`); what it does instead is undefined per build. Binding
+   `12345` as `SQL_C_SLONG` to a `SQL_VARCHAR` of `ColumnSize` 3: retail
+   18.05.0002 returns `SQL_SUCCESS` with no diagnostic and sends `varchar(3)`
+   holding `"123"`, debug 18.06.0002 aborts on
+   `assert(*pstMaxLen > 0 && *pstMaxLen >= stLen)` (`odbc/sqlcmisc.cpp:7458`),
+   retail 18.6.2.1 hangs in `SQLExecute`. This driver reports `22001`. The
+   fallthrough at `:7459` reads as *widening* the declaration and no measured
+   build does that, so do not re-derive this one from source.
+   `IntegerParamTooWideForColumnSizeIs22001` and
+   `NegativeSignCountsAgainstColumnSize` carry `SKIP_IF_COMPARING_MSODBCSQL()`.
+   Signed off by Theekshna Kotian (product owner) on 2026-08-28. Tracked in
+   AB#47369.
+6. **A `SQL_C_WCHAR` buffer of nothing but blanks bound to an integer type is
+   `22018`; msodbcsql answers `HY000`** (retail 18.05.0002). The only input on
+   this path where the two differ - the same blanks as `SQL_C_CHAR`, a
+   zero-length wide buffer, and every other invalid literal in either width
+   answer `22018` on both, so `CharParamInvalidLiteralIs22018` and
+   `LocaleFormattedNumbersAreRejected` run unskipped. Mechanism not established;
+   only the state is evidence. Do not generalise it - `CVT_ERROR` =
+   `IDS_22_005` otherwise resolves to `22018` through the `std_error` branch of
+   `SQL_DIAG_SQLSTATE` (`odbc/sqlcerr.cpp:990`) and
+   `cli_common/src/clntcomn.cpp:1015`, not the server-keyed table at
+   `odbc/sqlcstr.cpp:136`. `BlankOnlyWideLiteralIs22018` carries
+   `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
+   outstanding 18.6.2.1 measurements land - keep the running record there
+   rather than growing this file per build.
+7. **A bound `max`/LOB text column converted to a typed C target is refused
+   above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
+   cap what a typed conversion may materialize - a `varchar(max)` carries up to
+   2 GB and the converter needs one contiguous literal. This driver's cap is
+   `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
+   value is drained to keep the row synchronized and answered `HYC00`.
+   msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
+   legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
+   converts that prefix and reports `01004` rather than failing.
+   **Measured on 18.06.0001**, `varchar(max)` bound to a typed target:
+   `'0'`×2000 + `'1'` returns `SQL_SUCCESS_WITH_INFO` with `01004` and a value
+   of **`0`** - the truncated prefix, not the `1` in the column - for both
+   `SQL_C_SBIGINT` and `SQL_C_SLONG`, and the same past 1 MiB; `'x'`×5000
+   returns `22018` (the parse fails before truncation is considered, so both
+   drivers agree there); a short `'42'` returns `42` on both. The skipped
+   case's own payload, `'1'`×1048577 into `SQL_C_SLONG`, overflows even the
+   clamped prefix and returns `22003` there against this driver's `HYC00` - so
+   both drivers error on it, with different states, and
+   `AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained` carries
+   `SKIP_IF_COMPARING_MSODBCSQL()` on a measured divergence rather than an
+   assumed one. Refusing is deliberate: `01004` is "string data, right
+   truncated", which application code routinely ignores on a numeric fetch
+   because scalars are not expected to be truncatable, so on the prefix-parses
+   shape msodbcsql's answer is a silently wrong number. Note the cap keys on
+   the column's byte count, not on whether the text parses, so any large
+   `varchar(max)` bound to a typed target reaches it - schema drift, not a
+   contrived input. CI compares against 18.6.2.1; this measurement is
+   18.06.0001, so re-measure there before relying on the exact prefix length.
+   Tracked in AB#47767.
+8. **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
+   character.** A buffer with no room for the final surrogate pair ends before
+   it; msodbcsql leaves the lone high surrogate in the last payload slot on this
+   narrow-source widening path, though its wide-source path is surrogate-safe
+   (`GetColDataSurrogateSafe`, and `TrimPartialCodePt` for partial sequences).
+   This driver's existing bound `nvarchar(max)` delivery already trims to a
+   character boundary, and handing back text that does not decode from one `max`
+   type but not the other would be worse than the divergence.
+   `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
+   `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
+9. A bound `time` / `datetimeoffset` column strides by
+    `sizeof(SQL_SS_TIME2_STRUCT)` (12) and
+    `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by `BufferLength`.
+    Both drivers resolve these to the same C types under ODBC 3.8
     (`rgbTRANSTYPE380`, `sqlcmisc.cpp:220-221`), but msodbcsql's `BindOffset`
     switch has no case for them and falls through to
     `default: dwOffset = lpbindinfo->cbValueMax` (`sqlcfunc.cpp:2280-2283`).
@@ -106,7 +255,7 @@ authoritative parity reference for this crate. Its source lives in the
     Pre-existing for an explicit `SQL_C_SS_TIME2` bind; deferred
     `SQL_C_DEFAULT` resolution makes it reachable without the application naming
     the C type.
-  - A `SQL_C_DEFAULT` binding that resolves to a fixed-width C type wider than
+10. A `SQL_C_DEFAULT` binding that resolves to a fixed-width C type wider than
     the application's declared `BufferLength` is left unresolved and fails the
     row (`HYC00`) rather than writing. `BufferLength` is ignored for a
     fixed-width target, which is safe when the application named that type; a
@@ -116,123 +265,15 @@ authoritative parity reference for this crate. Its source lives in the
     `BufferLength` 0 is exempt — the documented idiom for a fixed-width target,
     carrying no width claim. Whether these should instead report `01004` with a
     truncated value, closer to msodbcsql, is open and untracked.
-  - A `varbinary` / `image` column bound `SQL_C_DEFAULT` resolves to
-    `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY`,
-    then `resolve_default_c_type`), which bound delivery does not implement yet
-    (AB#47239), so it fails per row with `HYC00`. msodbcsql resolves identically
-    and delivers the bytes. Pre-existing for an explicit `SQL_C_BINARY` bind;
-    deferred resolution makes it reachable without the application naming the C
-    type.
-  - `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
-    writes the client code page. msodbcsql uses the client code page -
-    `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
-    (`odbc/sqlcprot.h:2830`), which is `GetACP()` on Windows
-    (`Common/include/Localization.hpp:742`) and `nl_langinfo(CODESET)` elsewhere
-    (`LocalizationImpl.hpp:386`); the parameter path reads it directly at
-    `sqlcfunc.cpp:2913`. The two therefore agree under a UTF-8 locale and differ
-    on a default Windows one. Taken because mssql-python, the only supported
-    consumer, is UTF-8 native; the ODBC "C Data Types" appendix fixes no encoding
-    for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
-    consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
-    AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
-  - **Parameter length is measured in UTF-16 units for both character C types.**
-    msodbcsql counts UTF-16 units in three of its four arms - both wide-source
-    arms, and the narrow-to-wide walk, which counts an astral character as two
-    (`odbc/sqlcfunc.cpp:2935`) - but counts source bytes for narrow-to-narrow
-    (`cchDest = cbData`, `:2952`). That byte count is the wire length only while
-    no client-side transcode happens: TDS carries a collation with char data, so
-    the bytes normally ship under a declared collation and the server converts.
-    `DoCharToCharConversion` (`odbc/sqlcprot.h:4113`) enables client-side
-    conversion for an encoding TDS cannot name - a UTF-8 client against a
-    non-UTF-8 server, or the ISO-8859-x range - and translation is on by default
-    (`SQL_XL_DEFAULT`). In that configuration msodbcsql transcodes yet still
-    measures the *pre-transcode* UTF-8 bytes, so it rejects a four-character
-    accented string from a `varchar(4)` that the four bytes it actually sends
-    would fit, while accepting the same value as `SQL_C_WCHAR`. Because this
-    driver's `SQL_C_CHAR` is always UTF-8, copying the byte rule made that
-    latent msodbcsql defect unconditional. The uniform unit is therefore taken
-    to stop the two C types disagreeing on one value, not to match msodbcsql -
-    it is a divergence in the configuration closest to this driver, on the same
-    footing as the narrow-to-wide off-by-one at `sqlcfunc.cpp:2926` that is also
-    deliberately not replicated. The count still errs low against a `_UTF8` or
-    DBCS collation: a bounded `char`/`varchar` surfaces `HY000` from
-    `serialize_char_varchar_direct` rather than `22001`, and the `max` and
-    `text`/`ntext` types carry no check at all and send the over-long value.
-    **This regresses a subset of inputs rather than being a pure win** - three
-    U+2615 into `varchar(3)` was a correct `22001` and is now an opaque failure,
-    so CJK and astral input bound with an exact character count is the shape that
-    suffers. Taken because over-rejection has no application workaround while
-    under-rejection still errors, and because byte-counting both C types would
-    break the wide arm that msodbcsql gets right. Exactness needs the collation at
-    this layer. Signed off by Theekshna Kotian (product owner) on 2026-08-27.
-    Tracked in AB#47584.
-  - **An integer parameter bound to a character type is length-checked.**
-    msodbcsql length-checks no integer C type (`odbc/sqlcfunc.cpp:2586`, `:2854`,
-    `:3165`, `:3177`); what it does instead is undefined per build. Binding
-    `12345` as `SQL_C_SLONG` to a `SQL_VARCHAR` of `ColumnSize` 3: retail
-    18.05.0002 returns `SQL_SUCCESS` with no diagnostic and sends `varchar(3)`
-    holding `"123"`, debug 18.06.0002 aborts on
-    `assert(*pstMaxLen > 0 && *pstMaxLen >= stLen)` (`odbc/sqlcmisc.cpp:7458`),
-    retail 18.6.2.1 hangs in `SQLExecute`. This driver reports `22001`. The
-    fallthrough at `:7459` reads as *widening* the declaration and no measured
-    build does that, so do not re-derive this one from source.
-    `IntegerParamTooWideForColumnSizeIs22001` and
-    `NegativeSignCountsAgainstColumnSize` carry `SKIP_IF_COMPARING_MSODBCSQL()`.
-    Signed off by Theekshna Kotian (product owner) on 2026-08-28. Tracked in
-    AB#47369.
-  - **A `SQL_C_WCHAR` buffer of nothing but blanks bound to an integer type is
-    `22018`; msodbcsql answers `HY000`** (retail 18.05.0002). The only input on
-    this path where the two differ - the same blanks as `SQL_C_CHAR`, a
-    zero-length wide buffer, and every other invalid literal in either width
-    answer `22018` on both, so `CharParamInvalidLiteralIs22018` and
-    `LocaleFormattedNumbersAreRejected` run unskipped. Mechanism not established;
-    only the state is evidence. Do not generalise it - `CVT_ERROR` =
-    `IDS_22_005` otherwise resolves to `22018` through the `std_error` branch of
-    `SQL_DIAG_SQLSTATE` (`odbc/sqlcerr.cpp:990`) and
-    `cli_common/src/clntcomn.cpp:1015`, not the server-keyed table at
-    `odbc/sqlcstr.cpp:136`. `BlankOnlyWideLiteralIs22018` carries
-    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47369, which is where the
-    outstanding 18.6.2.1 measurements land - keep the running record there
-    rather than growing this file per build.
-  - **A bound `max`/LOB text column converted to a typed C target is refused
-    above 1 MiB; msodbcsql converts a truncated prefix and warns.** Both drivers
-    cap what a typed conversion may materialize - a `varchar(max)` carries up to
-    2 GB and the converter needs one contiguous literal. This driver's cap is
-    `PLP_TYPED_MATERIALIZE_LIMIT` (`api/fetch_scroll.rs`) at 1 MiB; past it the
-    value is drained to keep the row synchronized and answered `HYC00`.
-    msodbcsql clamps to `2*CONVBUF_SIZE` (~1244 bytes, sized for the longest
-    legal `double` literal) in `EstimateBytesToRead` (`odbc/sqlcdata.cpp`), then
-    converts that prefix and reports `01004` rather than failing.
-    **Measured on 18.06.0001**, `varchar(max)` bound to a typed target:
-    `'0'`×2000 + `'1'` returns `SQL_SUCCESS_WITH_INFO` with `01004` and a value
-    of **`0`** - the truncated prefix, not the `1` in the column - for both
-    `SQL_C_SBIGINT` and `SQL_C_SLONG`, and the same past 1 MiB; `'x'`×5000
-    returns `22018` (the parse fails before truncation is considered, so both
-    drivers agree there); a short `'42'` returns `42` on both. The skipped
-    case's own payload, `'1'`×1048577 into `SQL_C_SLONG`, overflows even the
-    clamped prefix and returns `22003` there against this driver's `HYC00` - so
-    both drivers error on it, with different states, and
-    `AOversizedBoundVarcharMaxTypedConversionIsRefusedAndDrained` carries
-    `SKIP_IF_COMPARING_MSODBCSQL()` on a measured divergence rather than an
-    assumed one. Refusing is deliberate: `01004` is "string data, right
-    truncated", which application code routinely ignores on a numeric fetch
-    because scalars are not expected to be truncatable, so on the prefix-parses
-    shape msodbcsql's answer is a silently wrong number. Note the cap keys on
-    the column's byte count, not on whether the text parses, so any large
-    `varchar(max)` bound to a typed target reaches it - schema drift, not a
-    contrived input. CI compares against 18.6.2.1; this measurement is
-    18.06.0001, so re-measure there before relying on the exact prefix length.
-    Tracked in AB#47767.
-  - **Widening a bound narrow `max` column to `SQL_C_WCHAR` truncates on a whole
-    character.** A buffer with no room for the final surrogate pair ends before
-    it; msodbcsql leaves the lone high surrogate in the last payload slot on this
-    narrow-source widening path, though its wide-source path is surrogate-safe
-    (`GetColDataSurrogateSafe`, and `TrimPartialCodePt` for partial sequences).
-    This driver's existing bound `nvarchar(max)` delivery already trims to a
-    character boundary, and handing back text that does not decode from one `max`
-    type but not the other would be worse than the divergence.
-    `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
-    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
+11. A `varbinary` / `image` / CLR UDT column bound `SQL_C_DEFAULT` resolves to
+    `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY` /
+    `SQL_SS_UDT`, then `resolve_default_c_type`), which bound delivery does not
+    implement yet (AB#47239), so it fails per row with `HYC00`. For `varbinary`
+    and `image`, deferred resolution exposes the pre-existing explicit
+    `SQL_C_BINARY` gap without the application naming the C type. A UDT's former
+    `SQL_C_CHAR` default was already unsupported, so the new mapping does not
+    regress observable fetch behavior. msodbcsql resolves all three to
+    `SQL_C_BINARY` and delivers the bytes.
 
 ## No panics
 

@@ -56,9 +56,10 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::resolve_default_c_type;
 use crate::api::util::{copy_with_nul, write_if_some};
+use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
-    DateTimeParts, date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
+    date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::OdbcVersion;
@@ -737,11 +738,12 @@ impl RowWriter for BoundRowWriter<'_> {
 /// loop skips it, matching msodbcsql.
 ///
 /// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which bound
-/// delivery does not implement yet (AB#47239), so it fails per row with
-/// `HYC00`. That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred
-/// resolution makes it reachable without the application naming the C type, and
-/// it covers more common column types than the `time` / `datetimeoffset` stride
-/// case. msodbcsql resolves identically and delivers the bytes.
+/// delivery does not implement yet (AB#47239), so it fails per row with `HYC00`.
+/// That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred resolution
+/// makes it reachable without the application naming the C type. A CLR UDT now
+/// resolves to `SQL_C_BINARY` too, but its former `SQL_C_CHAR` default was
+/// already unsupported, so the mapping change introduces no fetch regression.
+/// msodbcsql resolves all three identically and delivers the bytes.
 ///
 /// A resolved fixed-width target is left unresolved as well when the
 /// application declared a `BufferLength` too small to hold it. `BufferLength`

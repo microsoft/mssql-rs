@@ -274,6 +274,58 @@ TEST_F(DateTimeTypesLiveTest, Datetime2ToTimestampTargetViaBoundFetch) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(DateTimeTypesLiveTest, LegacyDatetimeRoundsFractionToMillisecondsOnBothPaths) {
+    const std::string query =
+        "SELECT CAST('2024-05-20T12:34:56.127' AS DATETIME) AS c1";
+
+    ASSERT_SQL_OK(ExecDirect(query), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQL_TIMESTAMP_STRUCT viaGetData{};
+    SQLLEN getInd = 0;
+    ASSERT_SQL_OK(
+        SQLGetData(stmt_, 1, SQL_C_TYPE_TIMESTAMP, &viaGetData, sizeof(viaGetData), &getInd),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2024, viaGetData.year);
+    EXPECT_EQ(5, viaGetData.month);
+    EXPECT_EQ(20, viaGetData.day);
+    EXPECT_EQ(12, viaGetData.hour);
+    EXPECT_EQ(34, viaGetData.minute);
+    EXPECT_EQ(56, viaGetData.second);
+    EXPECT_EQ(127000000u, viaGetData.fraction);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQL_TIMESTAMP_STRUCT)), getInd);
+    SQLCloseCursor(stmt_);
+
+    ASSERT_SQL_OK(ExecDirect(query), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    constexpr char expectedText[] = "2024-05-20 12:34:56.127";
+    char text[sizeof(expectedText)]{};
+    SQLLEN textInd = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, text, sizeof(text), &textInd), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_STREQ(expectedText, text);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(expectedText) - 1), textInd);
+    SQLCloseCursor(stmt_);
+
+    ASSERT_SQL_OK(ExecDirect(query), SQL_HANDLE_STMT, stmt_);
+
+    SQL_TIMESTAMP_STRUCT bound{};
+    SQLLEN boundInd = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_TYPE_TIMESTAMP, &bound, sizeof(bound), &boundInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2024, bound.year);
+    EXPECT_EQ(5, bound.month);
+    EXPECT_EQ(20, bound.day);
+    EXPECT_EQ(12, bound.hour);
+    EXPECT_EQ(34, bound.minute);
+    EXPECT_EQ(56, bound.second);
+    EXPECT_EQ(127000000u, bound.fraction);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQL_TIMESTAMP_STRUCT)), boundInd);
+    SQLCloseCursor(stmt_);
+}
+
 // A NULL date/time column must report SQL_NULL_DATA and leave the buffer alone,
 // on both paths. Covered once here rather than per type: the NULL path is in
 // the delivery layer, not per-conversion.
