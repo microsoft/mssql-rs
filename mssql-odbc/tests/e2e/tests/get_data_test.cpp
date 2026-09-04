@@ -780,9 +780,10 @@ TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable
 
 // An unsupported C target type is rejected with HYC00 and does not consume the
 // column. SQL_C_NUMERIC is the durable anchor for this: emitting the
-// SQL_NUMERIC_STRUCT is a permanent non-goal, recorded in the "Known divergences
-// from msodbcsql" table in docs/typed-columnar-fetch-plan.md, so unlike the
-// other C targets it is not scheduled to become supported.
+// SQL_NUMERIC_STRUCT is not implemented, recorded as a tracked gap (AB#47816)
+// in the "Known divergences from msodbcsql" table in
+// docs/typed-columnar-fetch-plan.md. Retarget this test at another unimplemented
+// C type when that gap closes, rather than deleting the coverage.
 TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
