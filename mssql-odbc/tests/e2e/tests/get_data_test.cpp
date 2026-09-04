@@ -1789,7 +1789,8 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnFixedSourceTypesReportsTruncation
 
 // An integer column delivered to its natural fixed-width C target, rather than
 // being rendered as text.
-TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {    ASSERT_SQL_OK(ExecDirect("SELECT CAST(-2000000 AS INT) AS c1"), SQL_HANDLE_STMT,
+TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(-2000000 AS INT) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
