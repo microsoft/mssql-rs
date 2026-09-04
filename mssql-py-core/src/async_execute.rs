@@ -37,6 +37,13 @@ use crate::types::ParameterHint;
 
 const EXECUTEMANY_PREFLIGHT_CHUNK_SIZE: usize = 256;
 const EXECUTEMANY_EXECUTION_YIELD_INTERVAL: usize = 256;
+const EXECUTEMANY_BUFFER_YIELD_INTERVAL: usize = 256;
+
+async fn yield_at_interval(completed: usize, interval: usize) {
+    if completed.is_multiple_of(interval) {
+        tokio::task::yield_now().await;
+    }
+}
 
 /// Cursor-local state for prepared execution and deferred handle cleanup.
 #[derive(Default)]
@@ -513,9 +520,7 @@ async fn execute_many_on_client(
             }
         }
         client.take_dml_result_counts();
-        if (row_index + 1).is_multiple_of(EXECUTEMANY_EXECUTION_YIELD_INTERVAL) {
-            tokio::task::yield_now().await;
-        }
+        yield_at_interval(row_index + 1, EXECUTEMANY_EXECUTION_YIELD_INTERVAL).await;
     }
 
     Ok((
@@ -539,9 +544,7 @@ async fn read_buffered_row_set(
             break;
         }
         rows.push_back(writer);
-        if rows.len().is_multiple_of(256) {
-            tokio::task::yield_now().await;
-        }
+        yield_at_interval(rows.len(), EXECUTEMANY_BUFFER_YIELD_INTERVAL).await;
     }
     Ok(BufferedRowSet { metadata, rows })
 }
@@ -955,6 +958,8 @@ pub(crate) fn executemany<'py>(
                     description_state.replace(description);
                     fetch_state.set(if produced_rows {
                         FetchStatus::Ready
+                    } else if batch_count > 0 {
+                        FetchStatus::TerminalNoRows
                     } else {
                         FetchStatus::NoResultSet
                     });
@@ -1032,12 +1037,14 @@ pub(crate) fn executemany<'py>(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use mssql_tds::connection::tds_client::PreparedStatement;
     use mssql_tds::error::Error;
 
     use super::{
-        ExecuteFailure, ParameterMetadata, PreparedState, should_replace_prepared_statement,
+        EXECUTEMANY_BUFFER_YIELD_INTERVAL, EXECUTEMANY_EXECUTION_YIELD_INTERVAL, ExecuteFailure,
+        ParameterMetadata, PreparedState, should_replace_prepared_statement, yield_at_interval,
     };
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
@@ -1049,6 +1056,27 @@ mod tests {
             parameter_signature: signature,
             orphaned: None,
         }
+    }
+
+    async fn assert_yields_at_boundary(interval: usize) {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            ticker_ticks.fetch_add(1, Ordering::Release);
+        });
+
+        yield_at_interval(interval - 1, interval).await;
+        assert_eq!(ticks.load(Ordering::Acquire), 0);
+
+        yield_at_interval(interval, interval).await;
+        assert_eq!(ticks.load(Ordering::Acquire), 1);
+        ticker.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executemany_yields_at_execution_and_buffer_boundaries() {
+        assert_yields_at_boundary(EXECUTEMANY_EXECUTION_YIELD_INTERVAL).await;
+        assert_yields_at_boundary(EXECUTEMANY_BUFFER_YIELD_INTERVAL).await;
     }
 
     #[test]

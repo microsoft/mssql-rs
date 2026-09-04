@@ -811,6 +811,7 @@ fn next_buffered_set<'py>(
     rowcount: Arc<AtomicI64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if fetch_state.status() == FetchStatus::Exhausted && !buffered_results.has_next() {
+        session_state.ensure_open().map_err(map_claim_error)?;
         buffered_results.advance();
         description_state.replace(None);
         return pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(false) });

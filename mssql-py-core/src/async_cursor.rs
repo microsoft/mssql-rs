@@ -66,9 +66,19 @@ struct CursorCleanup {
     cursor_id: CursorId,
     timeout: u32,
     closed: Arc<AtomicBool>,
+    fetch_state: Arc<FetchState>,
+    description_state: Arc<DescriptionState>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 impl CursorCleanup {
+    fn clear_result_state(&self) {
+        self.buffered_results.replace(Default::default());
+        self.description_state.replace(None);
+        self.fetch_state
+            .set(crate::async_fetch::FetchStatus::NoResultSet);
+    }
+
     async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
         let mut cleanup_guard =
             SessionOperationGuard::new(self.session_state.clone(), claim.operation_id);
@@ -89,6 +99,7 @@ impl CursorCleanup {
 
         cleanup_guard.settle(has_open_batch);
         // Cleanup consumes the close attempt even when draining or unprepare fails.
+        self.clear_result_state();
         self.closed.store(true, Ordering::Release);
         result?;
         Ok(())
@@ -224,6 +235,9 @@ impl PyAsyncCursor {
             cursor_id: self.cursor_id,
             timeout: self.default_query_timeout,
             closed: self.closed.clone(),
+            fetch_state: self.fetch_state.clone(),
+            description_state: self.description_state.clone(),
+            buffered_results: self.buffered_results.clone(),
         }
     }
 
@@ -517,6 +531,7 @@ impl PyAsyncCursor {
         let claim = match session_state.claim_cursor_close(cleanup.cursor_id) {
             Ok(claim) => claim,
             Err(ClaimError::Closing | ClaimError::Closed) => {
+                cleanup.clear_result_state();
                 cleanup.closed.store(true, Ordering::Release);
                 return pyo3_async_runtimes::tokio::future_into_py(py, async move {
                     Python::attach(|py| Ok(py.None()))
