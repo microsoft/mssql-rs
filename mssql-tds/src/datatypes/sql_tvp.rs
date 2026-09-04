@@ -562,6 +562,7 @@ pub(crate) async fn write_tvp_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset};
     use crate::io::packet_writer::PacketWriter;
     use crate::io::packet_writer::tests::MockNetworkWriter;
     use crate::message::messages::PacketType;
@@ -830,17 +831,38 @@ mod tests {
 
     #[test]
     fn test_validate_unrepresentable_temporal_value() {
-        let mut column = TvpColumnDef::new(SqlType::Time(None));
-        column.scale = Some(3);
-        let data = TvpTableData::new(
-            vec![column],
-            vec![vec![SqlType::Time(Some(SqlTime {
-                time_nanoseconds: 10_000_001,
-                scale: 7,
-            }))]],
-        );
+        let time = SqlTime {
+            time_nanoseconds: 10_000_001,
+            scale: 7,
+        };
+        let cases = [
+            (SqlType::Time(None), SqlType::Time(Some(time.clone()))),
+            (
+                SqlType::DateTime2(None),
+                SqlType::DateTime2(Some(SqlDateTime2 {
+                    days: 1,
+                    time: time.clone(),
+                })),
+            ),
+            (
+                SqlType::DateTimeOffset(None),
+                SqlType::DateTimeOffset(Some(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 1,
+                        time: time.clone(),
+                    },
+                    offset: 60,
+                })),
+            ),
+        ];
 
-        assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        for (column_type, value) in cases {
+            let mut column = TvpColumnDef::new(column_type);
+            column.scale = Some(3);
+            let data = TvpTableData::new(vec![column], vec![vec![value]]);
+
+            assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+        }
     }
 
     #[test]
@@ -866,6 +888,59 @@ mod tests {
             )))]],
         );
         assert!(matches!(data.validate(), Err(Error::UsageError(_))));
+    }
+
+    #[test]
+    fn test_apply_decimal_metadata_rejects_scale_factor_overflow() {
+        let mut value = DecimalParts::new(true, 38, u8::MAX, 1);
+
+        let error = apply_decimal_metadata(&mut value, 38, 0).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message == "TVP decimal/numeric value scale 255 cannot be converted to scale 0"
+        ));
+    }
+
+    #[test]
+    fn test_apply_decimal_metadata_rejects_magnitude_overflow() {
+        let mut value = DecimalParts::new(true, 38, 0, u128::MAX);
+
+        let error = apply_decimal_metadata(&mut value, 38, 1).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message == "TVP decimal/numeric value overflows precision 38 at scale 1"
+        ));
+    }
+
+    #[test]
+    fn test_apply_decimal_metadata_preserves_zero() {
+        let mut value = DecimalParts::new(false, 4, 2, 0);
+
+        apply_decimal_metadata(&mut value, 4, 4).unwrap();
+
+        assert_eq!(value, DecimalParts::new(false, 4, 4, 0));
+    }
+
+    #[test]
+    fn test_apply_temporal_scale_rejects_invalid_scale() {
+        let mut value = ColumnValues::Time(SqlTime {
+            time_nanoseconds: 0,
+            scale: DEFAULT_VARTIME_SCALE,
+        });
+        let invalid_scale = DEFAULT_VARTIME_SCALE + 1;
+
+        let error = apply_temporal_scale(&mut value, invalid_scale).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::UsageError(message)
+                if message
+                    == format!("TVP temporal value cannot be represented at scale {invalid_scale}")
+        ));
     }
 
     #[tokio::test]
