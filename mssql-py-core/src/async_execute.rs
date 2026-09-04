@@ -992,6 +992,7 @@ pub(crate) fn executemany<'py>(
                     rowcount.store(total_rows_affected, Ordering::Release);
                     operation_guard.finish_execute(produced_rows);
                     interruption_guard.complete();
+                    // Empty input dispatches no operation, so preserve hints for the next execution.
                     if batch_count > 0 {
                         consume_input_sizes(&cursor, input_sizes_generation);
                     }

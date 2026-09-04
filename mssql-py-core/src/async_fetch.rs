@@ -814,6 +814,7 @@ fn next_buffered_set<'py>(
         session_state.ensure_open().map_err(map_claim_error)?;
         buffered_results.advance();
         description_state.replace(None);
+        rowcount.store(-1, Ordering::Release);
         return pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(false) });
     }
     let claim = session_state
