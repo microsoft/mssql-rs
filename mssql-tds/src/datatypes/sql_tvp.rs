@@ -234,7 +234,7 @@ fn apply_decimal_metadata(value: &mut DecimalParts, precision: u8, scale: u8) ->
         let scale_factor = 10_u128.pow(u32::from(scale - value.scale));
         magnitude = magnitude.checked_mul(scale_factor).ok_or_else(|| {
             Error::UsageError(format!(
-                "TVP decimal/numeric value overflows precision {precision} at scale {scale}"
+                "TVP decimal/numeric value magnitude is too large to rescale to scale {scale}"
             ))
         })?;
     }
@@ -278,6 +278,8 @@ fn temporal_value_fits_scale(value: &SqlTime, scale: u8) -> bool {
         return false;
     }
 
+    // Despite the name, `time_nanoseconds` counts 100-ns ticks (scale 7), so a
+    // value survives scale N only when it is a multiple of 10^(7-N) ticks.
     let scale_factor = 10_u64.pow(u32::from(DEFAULT_VARTIME_SCALE - scale));
     value.time_nanoseconds.is_multiple_of(scale_factor)
 }
@@ -390,6 +392,9 @@ impl TvpTableData {
                 if let Some((precision, scale)) = column.decimal_metadata()
                     && let SqlType::Decimal(Some(value)) | SqlType::Numeric(Some(value)) = cell
                 {
+                    // Rescale a copy and discard it: this only pre-flights the
+                    // conversion that `write_tvp_rows` performs for real, so a
+                    // rejectable value fails before any bytes reach the wire.
                     let mut value = *value;
                     apply_decimal_metadata(&mut value, precision, scale)?;
                 }
@@ -549,6 +554,9 @@ pub(crate) async fn write_tvp_rows(
             // the declared metadata; the value bytes come from the cell.
             let (_, ctx) = column.column_type.to_column_value_and_context(db_collation);
             let (mut value, _) = cell.to_column_value_and_context(db_collation);
+            // Callers must have run `TvpTableData::validate` first: this can
+            // reject a value after `TVP_ROW_TOKEN` and earlier cells are already
+            // buffered, which would leave a half-written TVP on the wire.
             apply_column_metadata(column, &mut value)?;
             TdsValueSerializer::serialize_value(packet_writer, &value, &ctx).await?;
         }
@@ -912,7 +920,8 @@ mod tests {
         assert!(matches!(
             error,
             Error::UsageError(message)
-                if message == "TVP decimal/numeric value overflows precision 38 at scale 1"
+                if message
+                    == "TVP decimal/numeric value magnitude is too large to rescale to scale 1"
         ));
     }
 
