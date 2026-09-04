@@ -136,6 +136,14 @@ fn rowcount_from_rows_affected(rows_affected: Option<u64>) -> i64 {
         .unwrap_or(-1)
 }
 
+fn accumulate_rowcount(total: &mut Option<i64>, count: i64) {
+    if count < 0 {
+        *total = None;
+    } else if let Some(total) = total {
+        *total = total.saturating_add(count);
+    }
+}
+
 pub(crate) struct ExecuteResources {
     client: Arc<Mutex<TdsClient>>,
     dispatch: Option<tracing::Dispatch>,
@@ -462,8 +470,7 @@ async fn execute_many_on_client(
         timeout,
         autocommit,
     } = request;
-    let mut total = 0_i64;
-    let mut has_known_count = false;
+    let mut total = Some(0_i64);
     let mut results = VecDeque::new();
 
     if parameter_sets.is_empty() && claim.drain_previous {
@@ -505,10 +512,7 @@ async fn execute_many_on_client(
                 );
             }
             ExecuteOutcome::NoRows(count) | ExecuteOutcome::TerminalNoRows(count) => {
-                if count >= 0 {
-                    has_known_count = true;
-                    total = total.saturating_add(count);
-                }
+                accumulate_rowcount(&mut total, count);
             }
         }
 
@@ -529,10 +533,7 @@ async fn execute_many_on_client(
                 }
                 StatementResult::NoRows { rows_affected } => {
                     let count = rowcount_from_rows_affected(rows_affected);
-                    if count >= 0 {
-                        has_known_count = true;
-                        total = total.saturating_add(count);
-                    }
+                    accumulate_rowcount(&mut total, count);
                 }
                 StatementResult::End => break,
             }
@@ -547,8 +548,8 @@ async fn execute_many_on_client(
     }
 
     Ok((
-        if results.is_empty() && has_known_count {
-            total
+        if results.is_empty() {
+            total.unwrap_or(-1)
         } else {
             -1
         },

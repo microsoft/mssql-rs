@@ -790,6 +790,33 @@ def test_executemany_inserts_rows_and_aggregates_rowcount(client_context, use_pr
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("no_count_values", [(True, False), (False, True)])
+def test_executemany_unknown_rowcount_makes_aggregate_unknown(
+    client_context, no_count_values
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #async_executemany_unknown_count (value int)",
+                use_prepare=False,
+            )
+            await cursor.executemany(
+                "IF ? = 1 SET NOCOUNT ON ELSE SET NOCOUNT OFF; "
+                "INSERT INTO #async_executemany_unknown_count VALUES (?)",
+                [(no_count, value) for value, no_count in enumerate(no_count_values)],
+                use_prepare=False,
+            )
+
+            assert cursor.rowcount == -1
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_executemany_reaches_execution_yield_boundary(client_context):
     async def run():
         logger = RecordingLogger()
