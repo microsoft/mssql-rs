@@ -99,6 +99,20 @@ def _record_line(arcname: str, data: bytes) -> str:
     return f"{arcname},sha256={encoded},{len(data)}"
 
 
+def _zip_info_for(arcname: str, infos: dict[str, zipfile.ZipInfo]) -> zipfile.ZipInfo:
+    """Reuse the source entry's ZipInfo so rewriting preserves its stored mode
+    and timestamp. Passing a bare str to writestr() would instead synthesize a
+    fresh ZipInfo (mode 0o600, mtime now) for every file, silently mutating the
+    whole wheel. Injected files get a deterministic timestamp and a
+    world-readable, non-executable mode."""
+    info = infos.get(arcname)
+    if info is None:
+        info = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+        info.external_attr = 0o644 << 16
+    info.compress_type = zipfile.ZIP_DEFLATED
+    return info
+
+
 def inject_wheel(wheel: Path, drivers_dir: Path) -> None:
     platform_tag = platform_tag_of(wheel.name)
     rel_paths = drivers_for_platform_tag(platform_tag)
@@ -121,6 +135,7 @@ def inject_wheel(wheel: Path, drivers_dir: Path) -> None:
 
     with zipfile.ZipFile(wheel, "r") as zf:
         names = zf.namelist()
+        infos = {info.filename: info for info in zf.infolist()}
         entries = {name: zf.read(name) for name in names}
 
     record_name = next((n for n in names if n.endswith(".dist-info/RECORD")), None)
@@ -147,7 +162,7 @@ def inject_wheel(wheel: Path, drivers_dir: Path) -> None:
     tmp = wheel.with_name(wheel.name + ".tmp")
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in entries.items():
-            zf.writestr(name, data)
+            zf.writestr(_zip_info_for(name, infos), data)
     tmp.replace(wheel)
 
     for arcname in additions:

@@ -107,6 +107,31 @@ def test_inject_roundtrip(tmp_path):
     assert "mssql_py_core-0.1.0.dist-info/RECORD,," in record
 
 
+def test_inject_preserves_entry_modes(tmp_path):
+    drivers = tmp_path / "drivers"
+    (drivers / "windows" / "x64").mkdir(parents=True)
+    (drivers / "windows" / "x64" / "mssqlodbc.dll").write_bytes(b"MZ")
+
+    wheel = tmp_path / "mssql_py_core-0.1.0-cp312-cp312-win_amd64.whl"
+    with zipfile.ZipFile(wheel, "w") as zf:
+        exe = zipfile.ZipInfo("mssql_py_core/_core.pyd")
+        exe.external_attr = 0o755 << 16
+        zf.writestr(exe, b"\x4d\x5a")
+        zf.writestr(
+            "mssql_py_core-0.1.0.dist-info/RECORD",
+            "mssql_py_core/_core.pyd,,\nmssql_py_core-0.1.0.dist-info/RECORD,,\n",
+        )
+
+    inject.inject_wheel(wheel, drivers)
+
+    with zipfile.ZipFile(wheel, "r") as zf:
+        modes = {i.filename: (i.external_attr >> 16) & 0o777 for i in zf.infolist()}
+    # Pre-existing entry keeps its stored mode (not clobbered to 0o600).
+    assert modes["mssql_py_core/_core.pyd"] == 0o755
+    # Injected driver gets an explicit world-readable, non-executable mode.
+    assert modes["mssql_py_core/libs/windows/x64/mssqlodbc.dll"] == 0o644
+
+
 def test_inject_missing_driver_fails(tmp_path):
     wheel = tmp_path / "mssql_py_core-0.1.0-cp312-cp312-win_amd64.whl"
     _make_wheel(wheel)
