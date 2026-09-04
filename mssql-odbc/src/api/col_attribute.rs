@@ -535,6 +535,8 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
     }
 }
 
+/// ODBC 3.8 introduced the `SQL_C_SS_*` temporal types; earlier or unset
+/// versions use the binary fallback (`IS351ORLESSAPP`, `sqlcdesc.cpp:6474`).
 fn uses_3_80_variant_types(odbc_version: OdbcVersion) -> bool {
     odbc_version == OdbcVersion::Odbc3_80
 }
@@ -1331,6 +1333,7 @@ mod tests {
 
     #[test]
     fn only_odbc_3_80_uses_extended_variant_types() {
+        assert!(!uses_3_80_variant_types(OdbcVersion::Unset));
         assert!(!uses_3_80_variant_types(OdbcVersion::Odbc2));
         assert!(!uses_3_80_variant_types(OdbcVersion::Odbc3));
         assert!(uses_3_80_variant_types(OdbcVersion::Odbc3_80));
