@@ -535,8 +535,9 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
     }
 }
 
-/// ODBC 3.8 introduced the `SQL_C_SS_*` temporal types; earlier or unset
-/// versions use the binary fallback (`IS351ORLESSAPP`, `sqlcdesc.cpp:6474`).
+/// ODBC 3.8 introduced the `SQL_C_SS_*` mappings for variant `time` and
+/// `datetimeoffset`; earlier or unset versions use the binary fallback
+/// (`IS351ORLESSAPP`, `sqlcdesc.cpp:6474`).
 fn uses_3_80_variant_types(odbc_version: OdbcVersion) -> bool {
     odbc_version == OdbcVersion::Odbc3_80
 }
@@ -585,6 +586,8 @@ fn variant_c_type(base: TdsDataType, uses_3_80_types: bool) -> SqlSmallInt {
         | TdsDataType::Money
         | TdsDataType::Money4
         | TdsDataType::MoneyN => SQL_C_NUMERIC,
+        // GetIRDField reports the legacy C codes for variant date and datetime
+        // at every ODBC version (`sqlcdesc.cpp:6462-6469`).
         TdsDataType::DateN => SQL_C_DATE,
         TdsDataType::TimeN if uses_3_80_types => SQL_C_SS_TIME2,
         TdsDataType::TimeN => SQL_C_BINARY,
