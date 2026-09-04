@@ -167,33 +167,78 @@ def download_blob(formula, token, manifest_digest):
     return blob
 
 
+def _members(tar, root):
+    """Files under root/, rejecting anything whose path escapes it."""
+    for member in tar.getmembers():
+        if not (member.isfile() or member.issym()):
+            continue
+        name = os.path.normpath(member.name)
+        if not name.startswith(root) or ".." in name.split("/"):
+            continue
+        yield member, name[len(root):]
+
+
 def extract_bin(blob, formula, version, dest_dir):
+    """Extract just the executables, flattened into dest_dir."""
     os.makedirs(dest_dir, exist_ok=True)
-    wanted = f"{formula}/{version}/bin/"
+    root = f"{formula}/{version}/bin/"
     installed = []
     with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
         tmp.write(blob)
         tmp.flush()
         with tarfile.open(tmp.name, "r:gz") as tar:
-            for member in tar.getmembers():
-                # Only regular files directly under the formula's bin/, and never
-                # a path that escapes it -- the archive is untrusted input.
-                name = os.path.normpath(member.name)
-                if not member.isfile() or not name.startswith(wanted):
-                    continue
-                if os.path.basename(name) != name[len(wanted):]:
+            for member, relative in _members(tar, root):
+                if "/" in relative or not member.isfile():
                     continue
                 src = tar.extractfile(member)
                 if src is None:
                     continue
-                target = os.path.join(dest_dir, os.path.basename(name))
+                target = os.path.join(dest_dir, relative)
                 with open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
                 os.chmod(target, 0o755)
-                installed.append(os.path.basename(name))
+                installed.append(relative)
     if not installed:
         raise RuntimeError(f"bottle for {formula} {version} contained no bin/ entries")
     return installed
+
+
+def extract_prefix(blob, formula, version, dest_root):
+    """Extract the whole install prefix, merging into dest_root.
+
+    lima is not self-contained in bin/: limactl reaches for
+    ../share/lima/lima-guestagent.* and ../libexec/lima/*, so a bin-only copy
+    produces a lima that cannot boot a VM.
+    """
+    root = f"{formula}/{version}/"
+    extracted = []
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
+        tmp.write(blob)
+        tmp.flush()
+        with tarfile.open(tmp.name, "r:gz") as tar:
+            for member, relative in _members(tar, root):
+                if relative.startswith(".brew/"):
+                    continue
+                target = os.path.join(dest_root, relative)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if member.issym():
+                    link = os.path.normpath(os.path.join(os.path.dirname(relative), member.linkname))
+                    if link.startswith("..") or os.path.isabs(member.linkname):
+                        continue
+                    if os.path.lexists(target):
+                        os.unlink(target)
+                    os.symlink(member.linkname, target)
+                else:
+                    src = tar.extractfile(member)
+                    if src is None:
+                        continue
+                    with open(target, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    os.chmod(target, member.mode or 0o644)
+                extracted.append(relative)
+    if not extracted:
+        raise RuntimeError(f"bottle for {formula} {version} extracted nothing")
+    return extracted
 
 
 def main():

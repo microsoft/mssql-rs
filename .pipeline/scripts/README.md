@@ -101,6 +101,35 @@ runs, the bottled path took 29s median and failed 1% of the time, the
 source-build path took 441s median (774s max) and failed 36%. `colima` and
 `lima` are still bottled on Intel and install normally.
 
+### build-macos-docker-toolchain.py
+Assembles the macOS docker toolchain payload for one architecture: the install
+prefixes of the `docker`, `colima` and `lima` Homebrew bottles, plus the Ubuntu
+guest disk image colima boots, plus a `manifest.json` recording versions, source
+URLs and digests. Published as a Universal Package by
+`.pipeline/macos-docker-toolchain-pipeline.yml`, so macOS jobs install the
+toolchain from our own feed rather than reaching Homebrew, ghcr.io and
+github.com at job time.
+
+The whole prefix is packaged, not just `bin/`: `limactl` resolves
+`../share/lima/lima-guestagent.*` and `../libexec/lima/*` relative to itself, so
+a bin-only payload yields a lima that cannot boot a VM. The build fails if the
+guest agent is missing rather than shipping one that would.
+
+The guest image is not hard-coded. colima embeds a table of
+`<arch> <runtime> <url> <sha512> <filename>` for the image release it expects, so
+both the image and the checksum to verify it against are read out of the binary
+being packaged — colima 0.10.3 wants colima-core v0.10.4, which a hand-maintained
+mapping would get wrong.
+
+Runs on Linux and cross-builds both macOS payloads, so it verifies the Mach-O
+architecture of every binary it packs; a mis-resolved bottle fails the build
+instead of shipping.
+
+**Usage:** `build-macos-docker-toolchain.py --arch x86_64|arm64 --out <dir>`
+`--macos-major` sets the oldest macOS the payload must run on (default 14);
+bottles built for an older macOS run on newer hosts, so this is a compatibility
+floor rather than a target.
+
 ### install-brew-bottle.py
 Installs the newest Homebrew bottle of a formula that exists for the running
 platform, by reading Homebrew's OCI registry on ghcr.io directly. Used as the
@@ -112,7 +141,11 @@ registry advertises rather than a checksum vendored here. Bottles built for an
 older macOS are accepted (they run on newer hosts) but never a newer one.
 
 **Usage:** `install-brew-bottle.py <formula> <dest-bin-dir>`; prints the resolved
-version. Test overrides: `BOTTLE_ARCH_OVERRIDE`, `BOTTLE_MACOS_MAJOR_OVERRIDE`.
+version. `extract_bin` flattens just the executables (what the docker CLI
+fallback needs); `extract_prefix` keeps the whole install tree (what a packaged
+lima needs). `BOTTLE_ARCH_OVERRIDE` and `BOTTLE_MACOS_MAJOR_OVERRIDE` select a
+platform other than the running one — used by the toolchain producer to
+cross-build both macOS payloads from Linux, and handy for testing.
 
 Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
 boot still reaches the delete/retry path rather than running until the pipeline

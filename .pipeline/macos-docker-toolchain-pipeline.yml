@@ -1,0 +1,79 @@
+# Publishes the macOS docker toolchain (docker CLI, colima, lima and the guest
+# disk image colima boots) as a Universal Package per architecture, so macOS CI
+# jobs install it from our own feed instead of reaching Homebrew, ghcr.io and
+# github.com at job time.
+#
+# Background: Homebrew stopped bottling the docker CLI for Intel macOS at 29.8.0,
+# so `brew install docker` began source-building it (and Go with it, ~8 min),
+# timing out Test MacOS. Colima also downloads a ~350 MB guest image from a
+# personal GitHub repo on every run, which has independently failed on DNS.
+#
+# Manual trigger by design: bumping the toolchain should be a deliberate act with
+# a reviewed version, not something an agent's Homebrew state decides.
+#
+# The build runs on Linux -- it only fetches, verifies and repacks; nothing in
+# the payload is executed here. build-macos-docker-toolchain.py checks the Mach-O
+# architecture of every binary it packs, so a mis-resolved bottle fails the build
+# rather than shipping.
+
+trigger: none
+pr: none
+
+parameters:
+# Versioning is about the payload, not the tools inside it -- manifest.json is
+# the record of which docker/colima/lima/image versions a package contains:
+#   MAJOR  the directory layout changed, so consumers must change with it
+#   MINOR  component versions changed (a colima or docker bump)
+#   PATCH  same components, rebuilt
+- name: packageVersion
+  displayName: 'Package version, e.g. 1.2.0 (SemVer, immutable once published)'
+  type: string
+
+- name: publishX64
+  displayName: 'Publish x86_64 package'
+  type: boolean
+  default: true
+
+- name: publishArm64
+  displayName: 'Publish arm64 package'
+  type: boolean
+  default: true
+
+- name: dryRun
+  displayName: 'Dry run (build and inspect, do not publish)'
+  type: boolean
+  default: false
+
+- name: macosMajorFloor
+  displayName: 'Oldest macOS major version the payload must run on'
+  type: number
+  default: 14
+
+# A parameter rather than a variable: the job template consumes it at compile
+# time, where runtime variables are not available.
+- name: feed
+  displayName: 'Azure Artifacts feed to publish to'
+  type: string
+  default: 'public/mssql-rs_Public'
+
+stages:
+- stage: Publish_macOS_Docker_Toolchain
+  displayName: 'Publish macOS docker toolchain'
+  jobs:
+  - ${{ if eq(parameters.publishX64, true) }}:
+    - template: templates/macos-toolchain-job.yml
+      parameters:
+        arch: x86_64
+        packageVersion: ${{ parameters.packageVersion }}
+        macosMajorFloor: ${{ parameters.macosMajorFloor }}
+        dryRun: ${{ parameters.dryRun }}
+        feed: ${{ parameters.feed }}
+
+  - ${{ if eq(parameters.publishArm64, true) }}:
+    - template: templates/macos-toolchain-job.yml
+      parameters:
+        arch: arm64
+        packageVersion: ${{ parameters.packageVersion }}
+        macosMajorFloor: ${{ parameters.macosMajorFloor }}
+        dryRun: ${{ parameters.dryRun }}
+        feed: ${{ parameters.feed }}
