@@ -11,8 +11,8 @@ affected code — do not critique pre-existing code outside the PR's scope.
 Every concrete number, constant, and known-failure list below is a dated observation,
 not a standing truth. Prefer the command that re-derives a fact over the value written
 here. If what you observe contradicts this file, trust the observation and report the
-drift separately — an issue or PR against this skill, not the summary of whatever PR
-you happen to be reviewing. Skill maintenance is not that author's problem.
+drift separately — see "Reporting Skill Drift", not the summary of whatever PR you
+happen to be reviewing. Skill maintenance is not that author's problem.
 
 ## Process
 
@@ -363,6 +363,68 @@ than `gh pr review`, diff-hunk anchoring, `--paginate` when verifying — are in
 3. Each finding for a specific `file:line` gives a concrete fix or a focused code
    snippet — not just "this is wrong." Leave the comment at that line so it carries
    context and can be tracked to resolution.
+4. **Skill drift** — one line per observation, or `none`. Report it every time; a
+   section left off is indistinguishable from one nobody checked. This is a note to
+   the human, not part of the posted review.
+
+## Reporting Skill Drift
+
+You are the only reader who sees both this file and what the code actually did, and
+that pairing is gone the moment the review ends. Reconstructing it later from the
+thread is far more expensive than a line written now.
+
+Report when:
+
+- You retracted or downgraded a finding after checking it — most of all one this file
+  told you to check anyway.
+- A defect got past the checks in this file, whether CI, a human, or a later PR caught
+  it.
+- A fact here no longer matches the repo: a constant, a path, a workflow behavior, a
+  known-failure list.
+- A step cost time without changing the outcome, or you raised a class of finding that
+  a lint, test, or CI check could have caught before review.
+
+File each one separately, with the evidence rather than a conclusion. Interactively, use
+the form so it prompts you for the fields:
+
+<https://github.com/microsoft/mssql-rs/issues/new?template=code_review_skill_drift.yml>
+
+`gh issue create` does not apply the form, so write the body yourself with the same
+headings. An issue missing them is a note, not something a later pass can promote:
+
+```markdown
+### Drift class
+wrong finding | missed defect | stale fact | wasted step | mechanizable
+### Where it happened
+<PR, review thread, or comment URL>
+### What the skill says today
+<quote the bullet, or state that nothing covers this>
+### What actually turned out to be true
+<the observation, in the terms a future reviewer would need>
+### Evidence
+<file:line, the command and its output, or the thread where it was settled>
+### What it cost
+retracted blocking finding | retracted lesser finding | defect reached main |
+review time only | nothing yet
+```
+
+```bash
+gh issue create --repo microsoft/mssql-rs --label skill:code-review \
+  --title "[review-skill] <one-line drift>" --body-file <path>
+```
+
+Search the label before filing; recurrence belongs on the existing issue, where it is the
+evidence that promotes it:
+
+```bash
+gh issue list --repo microsoft/mssql-rs --label skill:code-review --state all --search "<symbol>"
+```
+
+These issues are the queue a periodic maintenance pass reads, so one that isn't acted on
+immediately is still doing its job. The bar is whether a future review would repeat the
+mistake — a one-off you could not have anticipated is not drift. Unattended runs file
+these too, with the same body; it is the one write worth making when no human is
+watching, since nothing else preserves the observation.
 
 ## Principles
 

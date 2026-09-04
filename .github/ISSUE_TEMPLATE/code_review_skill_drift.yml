@@ -1,0 +1,95 @@
+name: Code Review Skill Drift
+description: Record something a review learned that the code-review skill got wrong, missed, or no longer matches
+title: "[review-skill] "
+labels: ["skill:code-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For observations about `.github/skills/code-review/SKILL.md` itself — not about the code under review.
+        File one issue per observation so each can be judged on its own evidence.
+
+        These issues are the queue a periodic maintenance pass reads when proposing skill edits, so
+        favor a precise observation with evidence over a polished suggestion.
+
+  - type: dropdown
+    id: class
+    attributes:
+      label: Drift class
+      options:
+        - Wrong finding — raised, then retracted or downgraded after checking
+        - Missed defect — the skill's checklist should have caught it and didn't
+        - Stale fact — a constant, path, or behavior in the skill no longer matches the repo
+        - Wasted step — cost review time without changing the outcome
+        - Mechanizable — this finding class recurs and a lint, test, or CI check could catch it
+    validations:
+      required: true
+
+  - type: input
+    id: source
+    attributes:
+      label: Where it happened
+      description: PR, review thread, or comment URL.
+    validations:
+      required: true
+
+  - type: textarea
+    id: says
+    attributes:
+      label: What the skill says today
+      description: >-
+        Quote the bullet or section, or state that nothing covers this. If the skill is silent,
+        say what a reviewer would reasonably have assumed instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What actually turned out to be true
+      description: The observation that contradicts it, in the terms a future reviewer would need.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >-
+        `file:line`, the command you ran and its output, the reference-driver source, or the
+        thread where it was settled. An assertion without one of these can't be promoted.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cost
+    attributes:
+      label: What it cost
+      description: Sets the bar for acting on a single occurrence rather than waiting for a repeat.
+      options:
+        - A retracted blocking finding
+        - A retracted or downgraded non-blocking finding
+        - A defect reached main
+        - Review time only
+        - Nothing yet — noticed before it mattered
+    validations:
+      required: true
+
+  - type: textarea
+    id: recurrence
+    attributes:
+      label: Prior occurrences
+      description: Links to earlier instances, if you know of any. Recurrence is what promotes an entry.
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: >-
+        Optional. If prose, name the section it belongs in and what it would replace — the skill is
+        read on every review and has a size budget, so additions are traded against removals. If a
+        check would catch it instead, say which one and skip the prose.
+    validations:
+      required: false
