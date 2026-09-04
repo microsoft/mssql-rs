@@ -124,6 +124,13 @@ stages:
       - template: install-dependencies.yml
         parameters:
           osType: Windows
+      # Unit-test the ODBC wheel-injection script on PR runs; the injection
+      # pipeline steps themselves are non-PR gated, so this is the only part of
+      # that change PR validation can exercise.
+      - pwsh: |
+          python -m pip install --quiet pytest
+          python -m pytest scripts/test_inject_odbc.py -q
+        displayName: 'Unit test ODBC wheel injection script'
       - template: build-template.yml
         parameters:
           osType: Windows
