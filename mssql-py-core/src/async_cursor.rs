@@ -497,9 +497,10 @@ impl PyAsyncCursor {
     /// already be committed when autocommit is enabled; an explicit transaction
     /// remains open for the caller to commit or roll back.
     ///
-    /// DML row counts are aggregated. Row-producing results set `rowcount` to
-    /// `-1`, are buffered, and retain their boundaries for `fetch*()` and
-    /// `nextset()`. The query timeout applies separately to each execution.
+    /// DML row counts are aggregated. The aggregate is `-1` if any surfaced
+    /// statement result has an unknown row count. Row-producing results also set
+    /// `rowcount` to `-1`, are buffered, and retain their boundaries for
+    /// `fetch*()` and `nextset()`. The query timeout applies separately to each execution.
     /// Peak memory scales with the complete parameter input plus all buffered
     /// result rows; the input iterable is not streamed during execution.
     #[pyo3(signature = (operation, seq_of_parameters, *, use_prepare=true))]

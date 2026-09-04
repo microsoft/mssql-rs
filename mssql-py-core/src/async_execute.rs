@@ -139,8 +139,8 @@ fn rowcount_from_rows_affected(rows_affected: Option<u64>) -> i64 {
 fn accumulate_rowcount(total: &mut Option<i64>, count: i64) {
     if count < 0 {
         *total = None;
-    } else if let Some(total) = total {
-        *total = total.saturating_add(count);
+    } else if let Some(current) = *total {
+        *total = current.checked_add(count);
     }
 }
 
@@ -1072,8 +1072,8 @@ mod tests {
 
     use super::{
         EXECUTEMANY_BUFFER_YIELD_INTERVAL, EXECUTEMANY_EXECUTION_YIELD_INTERVAL, ExecuteFailure,
-        ParameterMetadata, PreparedState, get_or_create_binding_plan, rowcount_from_rows_affected,
-        should_replace_prepared_statement, yield_at_interval,
+        ParameterMetadata, PreparedState, accumulate_rowcount, get_or_create_binding_plan,
+        rowcount_from_rows_affected, should_replace_prepared_statement, yield_at_interval,
     };
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
@@ -1125,6 +1125,29 @@ mod tests {
         assert_eq!(rowcount_from_rows_affected(Some(i64::MAX as u64)), i64::MAX);
         assert_eq!(rowcount_from_rows_affected(Some(i64::MAX as u64 + 1)), -1);
         assert_eq!(rowcount_from_rows_affected(Some(u64::MAX)), -1);
+    }
+
+    #[test]
+    fn unknown_rowcount_latches_the_aggregate() {
+        let mut total = Some(0_i64);
+        accumulate_rowcount(&mut total, 2);
+        assert_eq!(total, Some(2));
+
+        accumulate_rowcount(&mut total, -1);
+        assert_eq!(total, None);
+
+        accumulate_rowcount(&mut total, 5);
+        assert_eq!(total, None);
+    }
+
+    #[test]
+    fn rowcount_aggregate_overflow_is_unknown() {
+        let mut total = Some(i64::MAX - 1);
+        accumulate_rowcount(&mut total, 5);
+        assert_eq!(total, None);
+
+        accumulate_rowcount(&mut total, 1);
+        assert_eq!(total, None);
     }
 
     #[test]

@@ -803,6 +803,18 @@ def test_executemany_unknown_rowcount_makes_aggregate_unknown(
                 use_prepare=False,
             )
             await cursor.executemany(
+                "SET NOCOUNT OFF; "
+                "INSERT INTO #async_executemany_unknown_count VALUES (?)",
+                [(10,), (11,)],
+                use_prepare=False,
+            )
+            assert cursor.rowcount == 2
+            await cursor.execute(
+                "TRUNCATE TABLE #async_executemany_unknown_count",
+                use_prepare=False,
+            )
+
+            await cursor.executemany(
                 "IF ? = 1 SET NOCOUNT ON ELSE SET NOCOUNT OFF; "
                 "INSERT INTO #async_executemany_unknown_count VALUES (?)",
                 [(no_count, value) for value, no_count in enumerate(no_count_values)],
@@ -810,6 +822,11 @@ def test_executemany_unknown_rowcount_makes_aggregate_unknown(
             )
 
             assert cursor.rowcount == -1
+            await cursor.execute(
+                "SELECT COUNT(*) FROM #async_executemany_unknown_count",
+                use_prepare=False,
+            )
+            assert await cursor.fetchone() == (2,)
         finally:
             await conn.close()
 

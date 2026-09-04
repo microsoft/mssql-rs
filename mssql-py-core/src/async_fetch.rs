@@ -88,14 +88,16 @@ impl BufferedResults {
         self.lock().len() > 1
     }
 
-    fn take_rows(&self, limit: usize) -> Option<(Vec<PyRowWriter>, bool, bool)> {
+    fn take_rows(&self, limit: usize) -> (Vec<PyRowWriter>, bool, bool) {
         let mut results = self.lock();
-        let current = results.front_mut()?;
+        let Some(current) = results.front_mut() else {
+            return (Vec::new(), true, false);
+        };
         let count = limit.min(current.rows.len());
         let rows = current.rows.drain(..count).collect();
         let exhausted = current.rows.is_empty();
         let has_next = results.len() > 1;
-        Some((rows, exhausted, has_next))
+        (rows, exhausted, has_next)
     }
 
     fn advance(&self) -> Option<Vec<mssql_tds::query::metadata::ColumnMetadata>> {
@@ -107,15 +109,6 @@ impl BufferedResults {
     fn lock(&self) -> StdMutexGuard<'_, VecDeque<BufferedRowSet>> {
         self.0.lock().unwrap_or_else(|error| error.into_inner())
     }
-}
-
-fn take_buffered_rows(
-    buffered_results: &BufferedResults,
-    limit: usize,
-) -> (Vec<PyRowWriter>, bool, bool) {
-    buffered_results
-        .take_rows(limit)
-        .unwrap_or_else(|| (Vec::new(), true, false))
 }
 
 /// Python-independent resources captured before constructing a fetch future.
@@ -563,7 +556,7 @@ fn fetch_buffered<'py>(
         let _cursor = cursor;
         let mut fetch_guard =
             FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
-        let (rows, exhausted, has_next) = take_buffered_rows(&buffered_results, limit);
+        let (rows, exhausted, has_next) = buffered_results.take_rows(limit);
         fetch_state.set(if exhausted {
             FetchStatus::Exhausted
         } else {
@@ -887,7 +880,7 @@ mod tests {
 
     use super::{
         FetchGuard, MaterializationGuard, map_fetch_error, map_materialization_join_error,
-        map_nextset_error, take_buffered_rows,
+        map_nextset_error,
     };
     use crate::async_fetch::BufferedResults;
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
@@ -904,7 +897,7 @@ mod tests {
     fn cleared_buffer_is_treated_as_exhausted() {
         let buffered_results = BufferedResults::default();
 
-        let (rows, exhausted, has_next) = take_buffered_rows(&buffered_results, usize::MAX);
+        let (rows, exhausted, has_next) = buffered_results.take_rows(usize::MAX);
 
         assert!(rows.is_empty());
         assert!(exhausted);
