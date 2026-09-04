@@ -477,11 +477,11 @@ fn fetch<'py>(
                 let returned = batch.rows.len();
                 let exhausted = batch.exhausted;
                 record_result_set_status(if exhausted { "exhausted" } else { "ready" });
-                fetch_state.set(if batch.exhausted {
+                let fetch_status = if exhausted {
                     FetchStatus::Exhausted
                 } else {
                     FetchStatus::Ready
-                });
+                };
                 if !fetch_guard.complete(batch.exhausted, has_open_batch) {
                     let (has_open_batch, connection_dead) = {
                         let mut client = client.lock().await;
@@ -501,6 +501,7 @@ fn fetch<'py>(
                         started.elapsed().as_millis(),
                     ));
                 }
+                fetch_state.set(fetch_status);
                 let materialization_started = Instant::now();
                 let mut materialization_guard =
                     MaterializationGuard::new(operation, materialization_dispatch);
