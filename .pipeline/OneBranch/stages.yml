@@ -90,7 +90,7 @@ stages:
           architecture: x64
           publishArtifacts: false
           signWindowsWheels: ${{ parameters.isOfficial }}
-    - ${{ if eq(parameters.buildOdbcNative, true) }}:
+    - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
       - template: /.pipeline/templates/build-odbc-windows-template.yml
         parameters:
           architecture: x64
@@ -161,7 +161,7 @@ stages:
             - '3.12'
             - '3.13'
             - '3.14'
-      - ${{ if eq(parameters.buildOdbcNative, true) }}:
+      - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
         - template: /.pipeline/templates/build-odbc-windows-template.yml
           parameters:
             architecture: ARM64
@@ -222,23 +222,23 @@ stages:
           osType: Alpine
           architecture: x64
           publishArtifacts: false
-    - ${{ if eq(parameters.buildOdbcNative, true) }}:
-      - template: /.pipeline/templates/build-odbc-template.yml
+    - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+      - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
         parameters:
-          architecture: x64
-          artifactName: 'Odbc_Linux_x64_glibc'
-          publishArtifacts: false
+          image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest'
+          libc: glibc
+          displaySuffix: 'glibc Linux x64'
       - script: |
           set -e
           mkdir -p "$(Build.SourcesDirectory)/drivers/linux/glibc/x86_64/lib"
           cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/glibc/x86_64/lib/mssqlodbc.so"
         displayName: 'Stage glibc driver (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-      - template: /.pipeline/templates/build-odbc-alpine-template.yml
+      - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
         parameters:
-          architecture: x64
-          artifactName: 'Odbc_Linux_x64_musl'
-          publishArtifacts: false
+          image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_x86_64_rust:latest'
+          libc: musl
+          displaySuffix: 'musl Linux x64'
       - script: |
           set -e
           mkdir -p "$(Build.SourcesDirectory)/drivers/linux/musl/x86_64/lib"
@@ -301,23 +301,23 @@ stages:
             osType: Alpine
             architecture: arm64
             publishArtifacts: false
-      - ${{ if eq(parameters.buildOdbcNative, true) }}:
-        - template: /.pipeline/templates/build-odbc-template.yml
+      - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
+        - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
           parameters:
-            architecture: ARM64
-            artifactName: 'Odbc_Linux_ARM64_glibc'
-            publishArtifacts: false
+            image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest'
+            libc: glibc
+            displaySuffix: 'glibc Linux ARM64'
         - script: |
             set -e
             mkdir -p "$(Build.SourcesDirectory)/drivers/linux/glibc/arm64/lib"
             cp "$(Build.SourcesDirectory)/odbc-drop/build/mssqlodbc.so" "$(Build.SourcesDirectory)/drivers/linux/glibc/arm64/lib/mssqlodbc.so"
           displayName: 'Stage glibc driver (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-        - template: /.pipeline/templates/build-odbc-alpine-template.yml
+        - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
           parameters:
-            architecture: ARM64
-            artifactName: 'Odbc_Linux_ARM64_musl'
-            publishArtifacts: false
+            image: 'ghcr.io/microsoft/mssql-rs/python-build/musllinux_1_2_aarch64_rust:latest'
+            libc: musl
+            displaySuffix: 'musl Linux ARM64'
         - script: |
             set -e
             mkdir -p "$(Build.SourcesDirectory)/drivers/linux/musl/arm64/lib"
@@ -371,7 +371,7 @@ stages:
             osType: MacOS
             architecture: universal2
             publishArtifacts: false
-      - ${{ if eq(parameters.buildOdbcNative, true) }}:
+      - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
         - template: /.pipeline/templates/build-odbc-macos-template.yml
           parameters:
             architecture: x64
