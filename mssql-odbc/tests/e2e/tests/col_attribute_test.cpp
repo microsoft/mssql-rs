@@ -28,10 +28,12 @@
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
 //   23. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
-//   24. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
-//   25. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
-//   26. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
-//   27. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
+//   24. Odbc3TemporalVariantsUseBinaryCType - pre-3.8 temporal fallback
+//   25. Odbc38TemporalVariantsUseExtendedCTypes - 3.8 temporal types
+//   26. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   27. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   28. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   29. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
 
 #include "odbc_test_fixture.h"
 
@@ -48,6 +50,10 @@
 #ifndef SQL_SS_UDT
 #define SQL_SS_UDT (-151)
 #endif
+#ifndef SQL_C_SS_TIME2
+#define SQL_C_SS_TIME2 0x4000
+#define SQL_C_SS_TIMESTAMPOFFSET 0x4001
+#endif
 
 class ColAttributeLiveTest : public ODBCTest {
 protected:
@@ -56,6 +62,20 @@ protected:
         if (!ODBCTestConfig::Instance().HasConnection()) {
             FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
+        Connect();
+    }
+};
+
+class ColAttributeOdbc3LiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0),
+                      SQL_HANDLE_ENV, env_);
         Connect();
     }
 };
@@ -468,6 +488,52 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_C_CHAR, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    SQLCloseCursor(stmt_);
+}
+
+// ODBC 3.8 introduced the SQL Server temporal C types. An application that
+// declares ODBC 3.0 receives the same binary fallback here that
+// SQL_C_DEFAULT uses for ordinary time and datetimeoffset columns.
+TEST_F(ColAttributeOdbc3LiveTest, Odbc3TemporalVariantsUseBinaryCType) {
+    ExecDirect(
+        "SELECT CAST(CAST('12:34:56.1234567' AS TIME(7)) AS SQL_VARIANT),"
+        " CAST(CAST('2026-09-03T12:34:56.1234567+05:30' AS DATETIMEOFFSET(7))"
+        " AS SQL_VARIANT)");
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_C_BINARY, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_C_BINARY, NumericAttr(stmt_, 2, SQL_CA_SS_VARIANT_TYPE));
+
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeLiveTest, Odbc38TemporalVariantsUseExtendedCTypes) {
+    ExecDirect(
+        "SELECT CAST(CAST('12:34:56.1234567' AS TIME(7)) AS SQL_VARIANT),"
+        " CAST(CAST('2026-09-03T12:34:56.1234567+05:30' AS DATETIMEOFFSET(7))"
+        " AS SQL_VARIANT)");
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_C_SS_TIME2, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_C_SS_TIMESTAMPOFFSET,
+              NumericAttr(stmt_, 2, SQL_CA_SS_VARIANT_TYPE));
 
     SQLCloseCursor(stmt_);
 }

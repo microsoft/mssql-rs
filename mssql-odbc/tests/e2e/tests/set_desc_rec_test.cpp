@@ -68,6 +68,13 @@ protected:
         EXPECT_SQL_OK(rc, SQL_HANDLE_DESC, hdesc);
         return value;
     }
+
+    SQLLEN GetLen(SQLHDESC hdesc, SQLSMALLINT record, SQLSMALLINT field) {
+        SQLLEN value = -1;
+        SQLRETURN rc = SQLGetDescFieldW(hdesc, record, field, &value, sizeof(value), nullptr);
+        EXPECT_SQL_OK(rc, SQL_HANDLE_DESC, hdesc);
+        return value;
+    }
 };
 
 TEST_F(SetDescRecLiveTest, CannotModifyIrd) {
@@ -166,8 +173,8 @@ TEST_F(SetDescRecLiveTest, EquivalentToSetDescFieldSequence) {
 
     EXPECT_EQ(GetSmallInt(via_rec, 1, SQL_DESC_CONCISE_TYPE),
               GetSmallInt(via_field, 1, SQL_DESC_CONCISE_TYPE));
-    EXPECT_EQ(GetSmallInt(via_rec, 1, SQL_DESC_OCTET_LENGTH),
-              GetSmallInt(via_field, 1, SQL_DESC_OCTET_LENGTH));
+    EXPECT_EQ(GetLen(via_rec, 1, SQL_DESC_OCTET_LENGTH),
+              GetLen(via_field, 1, SQL_DESC_OCTET_LENGTH));
 
     EXPECT_SQL_OK(SQLFreeHandle(SQL_HANDLE_STMT, stmt2), SQL_HANDLE_STMT, stmt2);
 }

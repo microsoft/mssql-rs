@@ -33,7 +33,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 
 /// Gets a descriptor field for a result-set column.
 ///
@@ -130,6 +130,19 @@ fn sql_col_attribute_w_safe(
     string_length_ptr: *mut SqlSmallInt,
     numeric_attribute_ptr: *mut SqlLen,
 ) -> SqlReturn {
+    // The declared ODBC version selects the temporal sql_variant C types. Read
+    // it before the stmt lock to preserve parent-before-child lock ordering.
+    let variant_odbc_version = if field_identifier == SQL_CA_SS_VARIANT_TYPE {
+        let env = stmt.parent_dbc().parent_env();
+        let Ok(env_state) = env.inner.lock() else {
+            error!("SQLColAttributeW: env mutex poisoned");
+            return SQL_ERROR;
+        };
+        env_state.odbc_version
+    } else {
+        OdbcVersion::Unset
+    };
+
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLColAttributeW: stmt mutex poisoned");
         return SQL_ERROR;
@@ -176,7 +189,12 @@ fn sql_col_attribute_w_safe(
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
         };
-        unsafe { write_if_some(numeric_attribute_ptr, SqlLen::from(variant_c_type(base))) };
+        unsafe {
+            write_if_some(
+                numeric_attribute_ptr,
+                SqlLen::from(variant_c_type(base, variant_odbc_version)),
+            )
+        };
         return SQL_SUCCESS;
     }
 
@@ -521,7 +539,8 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
 ///
 /// msodbcsql answers this from its per-row column info, so the value's base type
 /// decides it rather than the column's declared type.
-fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
+fn variant_c_type(base: TdsDataType, odbc_version: OdbcVersion) -> SqlSmallInt {
+    let is_3_80 = odbc_version == OdbcVersion::Odbc3_80;
     match base {
         // `tinyint` is unsigned 0-255 on the server, so the unsigned C type is
         // the accurate answer: a caller that fetched 200 into a signed char
@@ -562,21 +581,14 @@ fn variant_c_type(base: TdsDataType) -> SqlSmallInt {
         | TdsDataType::Money4
         | TdsDataType::MoneyN => SQL_C_NUMERIC,
         TdsDataType::DateN => SQL_C_TYPE_DATE,
-        // Not gated on the declared ODBC version, where
-        // `type_rules::resolve_default_c_type` gates the same two types
-        // (`SQL_SS_TIME2 if is_3_80`, else `SQL_C_BINARY`). Under
-        // `SQL_OV_ODBC3` the same value is therefore described one way as a
-        // variant and another as a column resolved from `SQL_C_DEFAULT`.
-        // Deliverable either way - `is_valid_c_type` accepts both
-        // unconditionally - but inconsistent, and unfixable here until this
-        // module can reach the environment's `OdbcVersion`. Tracked in AB#47830.
-        TdsDataType::TimeN => SQL_C_SS_TIME2,
+        TdsDataType::TimeN if is_3_80 => SQL_C_SS_TIME2,
+        TdsDataType::TimeN => SQL_C_BINARY,
         TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
             SQL_C_TYPE_TIMESTAMP
         }
         TdsDataType::DateTime2N => SQL_C_TYPE_TIMESTAMP,
-        // Same version-gating gap as `TimeN` above (AB#47830).
-        TdsDataType::DateTimeOffsetN => SQL_C_SS_TIMESTAMPOFFSET,
+        TdsDataType::DateTimeOffsetN if is_3_80 => SQL_C_SS_TIMESTAMPOFFSET,
+        TdsDataType::DateTimeOffsetN => SQL_C_BINARY,
         TdsDataType::Char
         | TdsDataType::BigChar
         | TdsDataType::VarChar
@@ -1307,8 +1319,21 @@ mod tests {
             (TdsDataType::Xml, SQL_C_CHAR),
         ];
         for (base, expected) in cases {
-            assert_eq!(variant_c_type(*base), *expected, "{base:?}");
+            assert_eq!(
+                variant_c_type(*base, OdbcVersion::Odbc3_80),
+                *expected,
+                "{base:?}"
+            );
         }
+
+        assert_eq!(
+            variant_c_type(TdsDataType::TimeN, OdbcVersion::Odbc3),
+            SQL_C_BINARY
+        );
+        assert_eq!(
+            variant_c_type(TdsDataType::DateTimeOffsetN, OdbcVersion::Odbc3),
+            SQL_C_BINARY
+        );
     }
 
     /// The success path: a variant column whose value has been probed reports
@@ -1326,6 +1351,31 @@ mod tests {
         assert_eq!(
             numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),
             SqlLen::from(SQL_C_WCHAR)
+        );
+    }
+
+    #[test]
+    fn temporal_variant_type_honors_the_declared_odbc_version() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_int_columns(&h, 1);
+        retype_column(&h, 1, TdsDataType::SsVariant, 8);
+        {
+            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            stmt_handle.inner.lock().unwrap().last_variant_base = Some((1, TdsDataType::TimeN));
+        }
+
+        assert_eq!(
+            numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),
+            SqlLen::from(SQL_C_SS_TIME2)
+        );
+
+        {
+            let env_handle = unsafe { handle_from_raw::<crate::handles::EnvHandle>(h.env) };
+            env_handle.inner.lock().unwrap().odbc_version = OdbcVersion::Odbc3;
+        }
+        assert_eq!(
+            numeric(&h, 1, SQL_CA_SS_VARIANT_TYPE),
+            SqlLen::from(SQL_C_BINARY)
         );
     }
 
