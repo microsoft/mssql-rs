@@ -2029,7 +2029,6 @@ impl TdsClient {
             {
                 warn!(%error, "Failed to cancel a fully sent request");
             }
-            self.execution_context.set_has_open_batch(false);
             return;
         }
 
@@ -2554,9 +2553,6 @@ impl TdsClient {
             // with an ATTENTION still outstanding.
             let attention_timeout = Duration::from_secs(ATTENTION_TIMEOUT_SECONDS);
             let _ = self.send_attention_with_timeout(attention_timeout).await;
-            // Clear the open batch flag since we've cancelled the operation
-            // This allows subsequent operations to use this connection
-            self.execution_context.set_has_open_batch(false);
             return Err(original_error);
         }
 

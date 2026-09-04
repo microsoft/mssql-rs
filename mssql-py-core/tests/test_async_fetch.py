@@ -966,6 +966,8 @@ def test_nextset_logs_result_transitions(client_context):
                 mssql_py_core.ProgrammingError, match="No active result set"
             ):
                 await cursor.fetchone()
+            # The failed conversion leaves this row set owned but unread;
+            # nextset drains it before exposing the following result.
             assert await cursor.nextset() is True
             assert cursor.description[0][:2] == ("recovered_value", int)
             assert await cursor.fetchone() == (3,)

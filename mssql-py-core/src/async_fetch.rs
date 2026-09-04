@@ -868,6 +868,8 @@ pub(crate) fn nextset<'py>(
 
                 let materialization_started = Instant::now();
                 let materialized = materialize(metadata).await;
+                // Description conversion does not consume a row result. Keep
+                // cursor ownership so a later nextset can drain those rows.
                 if !fetch_guard.complete(!has_rows, has_open_batch) {
                     let (has_open_batch, connection_dead) = {
                         let mut client = client.lock().await;

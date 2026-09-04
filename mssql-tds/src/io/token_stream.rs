@@ -860,7 +860,7 @@ where
         }
     }
 
-    /// The fuzzing counterpart of `NetworkTransport::cancel_read_stream_and_wait`.
+    /// The fuzzing counterpart of the network transport's ATTENTION drain.
     ///
     /// No bound is needed here, unlike the network path: `FuzzReader` serves a
     /// fixed in-memory buffer and returns EOF past its end, so this loop always

@@ -13,8 +13,6 @@ pub(crate) mod named_pipes;
 pub mod network_transport;
 /// Parallel TCP connect for MultiSubnetFailover.
 pub mod parallel_connect;
-#[cfg(test)]
-mod request_timeout;
 /// SSL/TLS stream handling.
 pub mod ssl_handler;
 /// High-level TDS transport abstraction.

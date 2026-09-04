@@ -106,6 +106,10 @@ impl ReadInterruption {
 ///
 /// Returning the interruption separately is necessary because callers must keep
 /// polling this same future to a safe boundary before they can drain ATTENTION.
+/// A non-cancelled read is polled once before constructing its timeout so
+/// buffered rows avoid both the timer setup and moving a large parser future
+/// into `Timeout`. This retains Tokio's zero-budget behavior: a ready read wins
+/// immediately, while a read that suspends observes the elapsed timer.
 async fn await_read_or_interrupt<F, T>(
     mut read: Pin<&mut F>,
     remaining_request_timeout: Option<Duration>,
@@ -719,7 +723,9 @@ impl Stream for SharedStream {
 /// Writes the header-only TDS ATTENTION message through a cloned stream handle.
 ///
 /// Keeping this independent of `NetworkTransport` allows it to run while the
-/// interrupted parser future still borrows the transport.
+/// interrupted parser future still borrows the transport. It deliberately
+/// bypasses request reset bookkeeping: ATTENTION terminates a request already
+/// on the wire and must not consume a reset intended for the next request.
 async fn send_attention_packet(mut stream: SharedStream) -> TdsResult<()> {
     let mut packet = Vec::with_capacity(PacketWriter::PACKET_HEADER_SIZE);
     PacketWriter::build_header(
@@ -2335,6 +2341,8 @@ impl TdsPacketReader for NetworkTransport {
     }
 
     async fn cancel_read_stream(&mut self) -> TdsResult<()> {
+        // This standalone path has no outstanding parser borrow, so it can use
+        // the regular packet writer rather than a cloned SharedStream.
         let attention = AttentionRequest::new();
         let mut packet_writer = attention.create_packet_writer(self.as_writer(), None, None);
         attention.serialize(&mut packet_writer).await?;
@@ -5681,6 +5689,31 @@ pub(crate) mod tests {
         packet.append_i32(value).build()
     }
 
+    /// Buffered reads must complete without constructing a Tokio timer.
+    #[test]
+    fn ready_read_does_not_require_a_time_driver() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime without the time driver");
+
+        runtime.block_on(async {
+            let mut read = std::pin::pin!(async { Ok::<_, crate::error::Error>(7) });
+            let result =
+                await_read_or_interrupt(read.as_mut(), Some(Duration::from_secs(30)), None).await;
+
+            assert!(matches!(result, Ok(Ok(7))));
+        });
+    }
+
+    /// A spent budget still times out once the eager read poll suspends.
+    #[tokio::test(start_paused = true)]
+    async fn suspended_read_observes_an_exhausted_timeout_budget() {
+        let mut read = std::pin::pin!(std::future::pending::<TdsResult<()>>());
+        let result = await_read_or_interrupt(read.as_mut(), Some(Duration::ZERO), None).await;
+
+        assert!(matches!(result, Err(ReadInterruption::TimedOut(_))));
+    }
+
     /// A handle that is already cancelled, so the read it guards is abandoned
     /// before a byte is consumed.
     fn cancelled_handle() -> CancelHandle {
@@ -5941,6 +5974,7 @@ pub(crate) mod tests {
             ("NBCROW", TokenType::NbcRow as u8, true),
         ] {
             let mut stream = int4_row_message(token_type, is_nbc, 42);
+            stream.extend_from_slice(&int4_row_message(token_type, is_nbc, 43));
             stream.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
             let (mut transport, _written) =
                 create_network_transport_with_live_peer_capturing_writes(&stream);
