@@ -186,6 +186,22 @@ fn sql_get_data_safe(
     // the same TargetType must give the same SQLSTATE whichever way the column
     // is delivered. Each path's own HYC00 check then covers valid target types
     // it cannot deliver yet. msodbcsql draws the same line in `IsValidCType`.
+    //
+    // Known gap: `SQL_ARD_TYPE` (-99) lands here. It is the ODBC spec's other
+    // placeholder `TargetType` for this argument — "use the type already on the
+    // ARD record" — and this driver does not implement it, so it falls through
+    // to `HY003`. That inverts the SQLSTATE: the spec defines `HY003` as
+    // *TargetType* being none of {a valid type, `SQL_C_DEFAULT`,
+    // `SQL_ARD_TYPE`}, so returning it *for* `SQL_ARD_TYPE` reports an
+    // application error for a documented spelling. msodbcsql resolves it itself
+    // in `GetColData` (`Sql/Ntdbms/sqlncli/odbc/sqlcdata.cpp:209`), reading
+    // `fCType` off the column's ARD binding — the same function whose
+    // `Sql2CDefault` call the `SQL_C_DEFAULT` resolution below mirrors — and
+    // reports `07009` for an unbound column. Deliberately not re-spelled to
+    // `HYC00` here: that would make the gap look handled without implementing
+    // it. Implementing it needs the ARD-record lookup, the unbound-column case,
+    // and `SQL_C_NUMERIC` precision/scale from that same binding. Raised in
+    // review of AB#47815; needs its own work item.
     if !is_valid_c_type(canonical_c_type(target_type)) {
         post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
         return SQL_ERROR;

@@ -780,9 +780,10 @@ TEST_F(GetDataLiveTest, InvalidCharacterForNumericTargetIs22018ThenValueReadable
 
 // An unsupported C target type is rejected with HYC00 and does not consume the
 // column. SQL_C_NUMERIC is the durable anchor for this: emitting the
-// SQL_NUMERIC_STRUCT is a permanent non-goal, recorded in the "Known divergences
-// from msodbcsql" table in docs/typed-columnar-fetch-plan.md, so unlike the
-// other C targets it is not scheduled to become supported.
+// SQL_NUMERIC_STRUCT is not implemented, recorded as a tracked gap (AB#47816)
+// in the "Known divergences from msodbcsql" table in
+// docs/typed-columnar-fetch-plan.md. Retarget this test at another unimplemented
+// C type when that gap closes, rather than deleting the coverage.
 TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('hello' AS VARCHAR(20)) AS c1"),
@@ -1714,7 +1715,7 @@ TEST_F(GetDataLiveTest, EmbeddedNulEndsANumericColumn) {
 // A character column holding more digits than an exact i128 mantissa still
 // reaches a float target at full precision. The parser is shared with the
 // parameter direction, which reduces such a literal to an integer part plus a
-// dropped-fraction flag (param_cross_conversions_test.cpp,
+// dropped-fraction flag (param_conversions_test.cpp,
 // WideDecimalLiteralReportsTruncation); routing that reduction to a double would
 // yield about 1.1 here.
 TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
@@ -2000,3 +2001,49 @@ TEST_F(GetDataLiveTest, DefaultTargetStreamsAnNvarcharMaxAsWideChunks) {
     SQLCloseCursor(stmt_);
 }
 
+// The underflow half of the `real` range check, on the fetch direction. Runs
+// unskipped on the msodbcsql parity leg, so retail is what pins the answer: a
+// `float` column at 1e-40 read into a `SQL_C_FLOAT` buffer is 22003 there too,
+// not a silent subnormal write.
+TEST_F(GetDataLiveTest, FloatTargetRejectsUnderflowAsWellAsOverflow) {
+    struct Case {
+        const char* literal;
+        const char* what;
+    };
+    for (const Case& c : {Case{"1e-40", "positive underflow"},
+                          Case{"-1e-40", "negative underflow"},
+                          Case{"1e40", "positive overflow"},
+                          Case{"-1e40", "negative overflow"}}) {
+        ASSERT_SQL_OK(ExecDirect(std::string("SELECT CAST(") + c.literal + " AS FLOAT)"),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        float out = 9.0f;
+        SQLLEN ind = 0;
+        EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_FLOAT, &out, sizeof(out), &ind))
+            << c.what;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+        EXPECT_EQ(9.0f, out) << c.what << ": a rejected conversion must not write the buffer";
+
+        SQLCloseCursor(stmt_);
+    }
+
+    // Zero is not underflow, and the same value reaches SQL_C_DOUBLE intact -
+    // only the 32-bit target narrows.
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0 AS FLOAT), CAST(1e-40 AS FLOAT)"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    float zero = 9.0f;
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_FLOAT, &zero, sizeof(zero), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0.0f, zero);
+
+    double wide = 0.0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_DOUBLE, &wide, sizeof(wide), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_DOUBLE_EQ(1e-40, wide);
+
+    SQLCloseCursor(stmt_);
+}
