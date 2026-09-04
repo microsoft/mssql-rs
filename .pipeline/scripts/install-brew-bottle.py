@@ -245,6 +245,48 @@ def extract_bin(blob, formula, version, dest_dir):
     return installed
 
 
+def extract_prefix(blob, formula, version, dest_root):
+    """Extract the whole install prefix, merging it into dest_root.
+
+    lima is not self-contained in bin/: limactl reaches for
+    ../share/lima/lima-guestagent.* and ../libexec/lima/*, so a bin-only copy
+    produces a lima that cannot boot a VM.
+    """
+    base, _ = ref_parts(version)
+    root = f"{formula}/{base}/"
+    extracted = []
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if not (member.isfile() or member.issym()):
+                continue
+            # Never a path that escapes the prefix -- the archive is untrusted.
+            name = os.path.normpath(member.name).replace(os.sep, "/")
+            if not name.startswith(root) or ".." in name.split("/"):
+                continue
+            relative = name[len(root):]
+            if relative.startswith(".brew/"):
+                continue
+            target = os.path.join(dest_root, relative)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if member.issym():
+                if os.path.isabs(member.linkname) or member.linkname.startswith("../"):
+                    continue
+                if os.path.lexists(target):
+                    os.unlink(target)
+                os.symlink(member.linkname, target)
+            else:
+                src = tar.extractfile(member)
+                if src is None:
+                    continue
+                with open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.chmod(target, member.mode or 0o644)
+            extracted.append(relative)
+    if not extracted:
+        raise RuntimeError(f"bottle for {formula} {version} extracted nothing")
+    return extracted
+
+
 def main():
     if len(sys.argv) != 3:
         print(__doc__, file=sys.stderr)
