@@ -384,6 +384,10 @@ impl AnyTransport {
         }
     }
 
+    /// Dispatches ATTENTION with the parser state needed to drain queued rows.
+    ///
+    /// Row tokens are not self-describing, so the network transport needs the
+    /// interrupted operation's metadata to reach DONE_ATTN safely.
     pub(crate) async fn send_attention_with_timeout(
         &mut self,
         context: &ParserContext,
@@ -402,6 +406,10 @@ impl AnyTransport {
         }
     }
 
+    /// Takes control tokens consumed while the network transport drained ATTENTION.
+    ///
+    /// The client must apply these tokens because transaction and session state
+    /// live above the transport layer.
     pub(crate) fn take_attention_settlement(
         &mut self,
     ) -> Option<crate::connection::transport::network_transport::AttentionSettlement> {

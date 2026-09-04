@@ -62,6 +62,7 @@ pub(crate) struct ActiveOperation {
     pub(crate) operation_id: OperationId,
     pub(crate) phase: OperationPhase,
     pub(crate) cancel_handle: Option<CancelHandle>,
+    /// Prevents a detached fetch from publishing results after its Python awaitable was cancelled.
     cancel_requested: bool,
 }
 
@@ -288,6 +289,10 @@ impl AsyncConnectionState {
         }
     }
 
+    /// Publishes a completed fetch only while it still owns an uncancelled read.
+    ///
+    /// A false result keeps ownership with the detached worker so it can settle
+    /// ATTENTION before another operation is allowed onto the TDS session.
     pub(crate) fn finish_fetch(
         &self,
         operation_id: OperationId,
@@ -323,6 +328,10 @@ impl AsyncConnectionState {
         }
     }
 
+    /// Requests cancellation for the matching in-flight fetch task exactly once.
+    ///
+    /// Session ownership intentionally remains in `FetchingRow`; releasing it
+    /// here would let another command race with the background ATTENTION drain.
     pub(crate) fn cancel_fetch(&self, operation_id: OperationId) -> bool {
         let cancel_handle = {
             let mut state = self.lock();
@@ -512,6 +521,8 @@ mod tests {
         assert!(state.claim_fetch(1).is_ok());
     }
 
+    /// Verifies that cancellation does not release the shared session before
+    /// the detached protocol task reports settlement.
     #[test]
     fn fetch_cancellation_keeps_ownership_until_settlement() {
         let state = AsyncConnectionState::new();

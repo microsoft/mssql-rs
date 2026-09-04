@@ -47,6 +47,7 @@ async def connect(client_context, python_logger=None):
 
 
 async def execute_after_cancellation_settles(cursor, operation):
+    """Wait for the detached ATTENTION drain to release session ownership."""
     deadline = asyncio.get_running_loop().time() + 6
     while True:
         try:
@@ -720,6 +721,8 @@ def test_nextset_reports_batch_end_after_terminal_no_rows(client_context, use_pr
 
 @pytest.mark.integration
 def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
+    """A timed-out nextset drains through DONE_ATTN so the session remains usable."""
+
     async def run():
         conn = await connect(client_context)
         try:
@@ -745,6 +748,8 @@ def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
 
 @pytest.mark.integration
 def test_cancelled_fetchone_resynchronizes_connection(client_context):
+    """Cancelling a Python fetch does not abandon its in-flight TDS row parser."""
+
     async def run():
         conn = await connect(client_context)
         try:
@@ -944,6 +949,8 @@ def test_nextset_logs_result_transitions(client_context):
 def test_nextset_cancellation_during_description_materialization_does_not_publish_rows(
     client_context,
 ):
+    """Late cancellation suppresses materialized metadata and preserves the session."""
+
     async def run():
         conn = await connect(client_context)
         entered = threading.Event()
@@ -990,6 +997,8 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
 def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusable(
     client_context,
 ):
+    """Python row conversion can be cancelled after protocol ownership is released."""
+
     async def run():
         conn = await connect(client_context)
         entered = threading.Event()
@@ -1082,6 +1091,8 @@ def test_nextset_keeps_event_loop_responsive_while_draining(client_context):
 def test_nextset_rejects_concurrent_operation_and_cancellation_resynchronizes_session(
     client_context,
 ):
+    """A busy nextset stays exclusive until its cancellation drain completes."""
+
     async def run():
         conn = await connect(client_context)
         cursor = conn.cursor()
@@ -1637,6 +1648,8 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
 @pytest.mark.integration
 @pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
 def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operation):
+    """Every fetch API preserves connection reuse when cancelled during a row read."""
+
     async def run():
         conn = await connect(client_context)
         cursor = conn.cursor()

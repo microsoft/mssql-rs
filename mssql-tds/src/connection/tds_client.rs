@@ -4087,6 +4087,11 @@ impl TdsClient {
         Ok(())
     }
 
+    /// Clears result-local state after ATTENTION handling finishes.
+    ///
+    /// Whether the transport reached DONE_ATTN or retired the connection, the
+    /// cancelled result can no longer be resumed. Retaining its metadata,
+    /// timeout, row cursor, or open-batch flag would expose stale state.
     fn normalize_after_attention(&mut self) {
         self.current_metadata = None;
         self.current_decryptor = None;
@@ -4108,6 +4113,11 @@ impl TdsClient {
         self.execution_context.set_has_open_batch(false);
     }
 
+    /// Applies client-visible control tokens consumed by the transport's drain.
+    ///
+    /// The transport must read through DONE_ATTN to realign the wire, but
+    /// `TdsClient` still owns transaction, environment, and recovery state.
+    /// Replaying those tokens here keeps that state synchronized with the server.
     fn consume_attention_settlement(&mut self) {
         let Some(settlement) = self.transport.take_attention_settlement() else {
             return;
@@ -4126,6 +4136,10 @@ impl TdsClient {
         }
     }
 
+    /// Finalizes client state after a read ended through cancellation or timeout.
+    ///
+    /// Every interruptible read surface calls this so settlement tokens are
+    /// applied once and the cancelled result is discarded before reuse.
     fn settle_interrupted_read(&mut self, error: &crate::error::Error) {
         if !matches!(
             error,
@@ -6869,17 +6883,21 @@ impl TdsClient {
         Ok(())
     }
 
-    /// Send an attention packet and wait for acknowledgment with a timeout.
+    /// Sends ATTENTION and attempts to drain the active response through DONE_ATTN.
     ///
-    /// This method is used by bulk copy operations to implement timeout handling
-    /// per the SqlClient behavior:
+    /// This method:
     /// 1. Send MT_ATTN (0x06) packet to cancel the current operation
-    /// 2. Wait for DONE token with ATTN (0x0020) status flag
-    /// 3. If no acknowledgment within timeout, return false
+    /// 2. Drain unread row and control tokens using the current parser metadata
+    /// 3. Apply state-bearing control tokens and clear the cancelled result
+    /// 4. Stop at a DONE token with the ATTN (0x0020) status flag
+    ///
+    /// Draining is required before reuse because ATTENTION is asynchronous; a
+    /// later command would otherwise consume bytes from the cancelled response.
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for attention acknowledgment
+    /// * `timeout` - Maximum time for sending ATTENTION and draining through its
+    ///   acknowledgement
     ///
     /// # Returns
     ///
@@ -11746,6 +11764,8 @@ mod tests {
         }
     }
 
+    /// Verifies that cancelling inside a ROW both preserves the connection and
+    /// removes all state belonging to the cancelled result.
     #[tokio::test]
     async fn cancelled_row_read_normalizes_client_state_after_attention() {
         let mut response = TestPacketBuilder::new(PacketType::TabularResult)

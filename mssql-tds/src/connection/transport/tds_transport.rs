@@ -37,7 +37,8 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// This should cleanly shut down any underlying network connections.
     async fn close_transport(&mut self) -> TdsResult<()>;
 
-    /// Send an attention packet and wait for acknowledgment with a timeout.
+    /// Send an attention packet and drain the response to its acknowledgment
+    /// with a timeout.
     ///
     /// This method implements the attention sending flow:
     /// 1. Send MT_ATTN (0x06) packet to the server
@@ -46,6 +47,9 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     ///
     /// # Arguments
     ///
+    /// * `context` - Parser state needed to decode row tokens left in the
+    ///   cancelled response. Rows do not carry their own metadata, so the drain
+    ///   cannot safely reach DONE_ATTN without it.
     /// * `timeout` - Maximum time for the whole flow, covering the send as well
     ///   as the wait. Writing the packet can itself stall on a peer that has
     ///   stopped reading, so implementations must not leave the send unbounded.

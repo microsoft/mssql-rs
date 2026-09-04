@@ -123,6 +123,10 @@ impl FetchGuard {
         }
     }
 
+    /// Publishes the fetch result only if cancellation has not already won.
+    ///
+    /// The return value lets the detached worker suppress stale rows and settle
+    /// ATTENTION when Python cancels while protocol work is completing.
     fn complete(&mut self, result_set_exhausted: bool, has_open_batch: bool) -> bool {
         self.completed = self.session_state.finish_fetch(
             self.operation_id,
@@ -132,6 +136,10 @@ impl FetchGuard {
         self.completed
     }
 
+    /// Releases session ownership after a failed fetch.
+    ///
+    /// The connection is marked broken only when the protocol task could not
+    /// prove that it reached a reusable TDS boundary.
     fn fail(&mut self, break_connection: bool) {
         if break_connection {
             self.session_state.mark_broken();
@@ -155,6 +163,11 @@ impl Drop for FetchGuard {
     }
 }
 
+/// Converts cancellation of a Python awaitable into protocol cancellation.
+///
+/// The TDS work runs in a detached Tokio task so dropping the Python-facing
+/// future cannot abandon a parser mid-token. This guard signals that task to
+/// send ATTENTION while leaving it responsible for settling the session.
 struct FetchCancellationGuard {
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
@@ -164,6 +177,7 @@ struct FetchCancellationGuard {
 }
 
 impl FetchCancellationGuard {
+    /// Arms cancellation tracking around the join of a detached fetch task.
     fn new(
         session_state: Arc<AsyncConnectionState>,
         operation_id: OperationId,
@@ -179,12 +193,14 @@ impl FetchCancellationGuard {
         }
     }
 
+    /// Disarms cancellation after the detached task has finished settling TDS.
     fn complete(&mut self) {
         self.completed = true;
     }
 }
 
 impl Drop for FetchCancellationGuard {
+    /// Requests ATTENTION when Python stops waiting before settlement finishes.
     fn drop(&mut self) {
         if !self.completed && self.session_state.cancel_fetch(self.operation_id) {
             let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
@@ -309,6 +325,11 @@ fn map_materialization_join_error(error: tokio::task::JoinError) -> PyErr {
     PyRuntimeError::new_err(format!("Failed to materialize fetched rows: {error}"))
 }
 
+/// Runs fetch protocol work in a task that outlives its Python awaitable.
+///
+/// Tokio detaches a spawned task when its join handle is dropped. Keeping the
+/// TDS future inside that task preserves parser state long enough to drain
+/// through DONE_ATTN; the surrounding cancellation guard only signals it.
 async fn run_fetch_in_background<F, T>(
     future: F,
     session_state: Arc<AsyncConnectionState>,

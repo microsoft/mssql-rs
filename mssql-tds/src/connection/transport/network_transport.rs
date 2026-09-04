@@ -56,18 +56,36 @@ use tracing::{debug, error, event, info, trace, warn};
 /// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
 type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
 
+/// Client-visible control tokens consumed while draining to DONE_ATTN.
+///
+/// The transport has to consume these tokens to realign the wire, but the
+/// client still needs them to update transaction, environment, and recovery
+/// state before the connection can be reused.
 #[derive(Debug)]
 pub(crate) struct AttentionSettlement {
+    /// Ordered control tokens to replay through `TdsClient` state handling.
     pub(crate) tokens: Vec<Tokens>,
 }
 
+/// Records why a pending parser read stopped before producing its result.
+///
+/// Keeping this separate from the parser future lets cleanup finish first while
+/// still returning the original cancellation or timeout to the caller.
 enum ReadInterruption {
+    /// The operation's cancellation token fired.
     Cancelled,
+    /// The remaining request-timeout budget elapsed.
     TimedOut(tokio::time::error::Elapsed),
 }
 
+/// Separates an ordinary read result from an interrupted read's settlement state.
+///
+/// On interruption the original parser is driven to a typed boundary rather
+/// than dropped mid-token, which preserves enough state to drain to DONE_ATTN.
 enum InterruptibleRead<T> {
+    /// The parser completed before cancellation or timeout won.
     Completed(TdsResult<T>),
+    /// The caller-visible error plus any result reached while settling the parser.
     Interrupted {
         error: Box<crate::error::Error>,
         boundary: Option<(Instant, TdsResult<T>)>,
@@ -75,6 +93,7 @@ enum InterruptibleRead<T> {
 }
 
 impl ReadInterruption {
+    /// Converts the internal arbitration result into the error returned after cleanup.
     fn into_error(self) -> crate::error::Error {
         match self {
             Self::Cancelled => OperationCancelledError("Request was cancelled".to_string()),
@@ -83,6 +102,10 @@ impl ReadInterruption {
     }
 }
 
+/// Waits for a pinned parser while preserving it when cancellation or timeout wins.
+///
+/// Returning the interruption separately is necessary because callers must keep
+/// polling this same future to a safe boundary before they can drain ATTENTION.
 async fn await_read_or_interrupt<F, T>(
     mut read: Pin<&mut F>,
     remaining_request_timeout: Option<Duration>,
@@ -593,24 +616,35 @@ impl Stream for Box<dyn Stream> {
     }
 }
 
+/// Cloneable access to one network stream with a lock held only for each poll.
+///
+/// A parser future mutably borrows `NetworkTransport`. The clone lets ATTENTION
+/// be written while that future remains alive, without concurrently polling the
+/// underlying stream or abandoning parser state.
 #[derive(Clone)]
 struct SharedStream {
     inner: Arc<Mutex<Box<dyn Stream>>>,
 }
 
 impl SharedStream {
+    /// Wraps a transport stream so a pending parser and ATTENTION sender can share it.
     fn new(stream: Box<dyn Stream>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(stream)),
         }
     }
 
+    /// Borrows the underlying stream for one synchronous operation or poll.
     fn lock(&self) -> MutexGuard<'_, Box<dyn Stream>> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Recovers exclusive stream ownership for TLS replacement.
+    ///
+    /// Extraction fails while another clone exists because that means an I/O
+    /// operation may still refer to the old stream.
     fn into_inner(self) -> TdsResult<Box<dyn Stream>> {
         Arc::try_unwrap(self.inner)
             .map_err(|_| {
@@ -629,6 +663,7 @@ impl SharedStream {
 }
 
 impl AsyncRead for SharedStream {
+    /// Delegates one read poll, releasing the lock on `Pending` so ATTENTION can write.
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -639,6 +674,7 @@ impl AsyncRead for SharedStream {
 }
 
 impl AsyncWrite for SharedStream {
+    /// Serializes one write poll with reads on the same physical stream.
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -647,33 +683,43 @@ impl AsyncWrite for SharedStream {
         Pin::new(&mut **self.lock()).poll_write(cx, buf)
     }
 
+    /// Forwards flushing so the shared wrapper remains transparent to packet writes.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self.lock()).poll_flush(cx)
     }
 
+    /// Forwards shutdown so closing the wrapper closes the physical stream.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self.lock()).poll_shutdown(cx)
     }
 }
 
 impl Stream for SharedStream {
+    /// Preserves the wrapped stream's TLS handshake transition.
     fn tls_handshake_starting(&mut self) {
         self.lock().tls_handshake_starting();
     }
 
+    /// Preserves the wrapped stream's post-handshake transition.
     fn tls_handshake_completed(&mut self) {
         self.lock().tls_handshake_completed();
     }
 
+    /// Delegates liveness probing to the physical stream.
     fn is_connection_dead(&self) -> bool {
         self.lock().is_connection_dead()
     }
 
+    /// Exposes the physical stream's TLS channel binding for authentication.
     fn channel_binding_token(&self) -> Option<Vec<u8>> {
         self.lock().channel_binding_token()
     }
 }
 
+/// Writes the header-only TDS ATTENTION message through a cloned stream handle.
+///
+/// Keeping this independent of `NetworkTransport` allows it to run while the
+/// interrupted parser future still borrows the transport.
 async fn send_attention_packet(mut stream: SharedStream) -> TdsResult<()> {
     let mut packet = Vec::with_capacity(PacketWriter::PACKET_HEADER_SIZE);
     PacketWriter::build_header(
@@ -689,6 +735,10 @@ async fn send_attention_packet(mut stream: SharedStream) -> TdsResult<()> {
     Ok(())
 }
 
+/// Sends ATTENTION and drives the same parser future to its next typed boundary.
+///
+/// Both steps share one deadline so neither a blocked write nor an incomplete
+/// token can make cancellation hang indefinitely.
 async fn send_attention_and_complete_read<F, T>(
     stream: SharedStream,
     deadline: Instant,
@@ -712,6 +762,11 @@ where
     })?
 }
 
+/// Runs a parser read and, when interrupted, preserves it through resynchronization.
+///
+/// The normal path stays allocation-free. Cancellation and timeout use a boxed
+/// cold path to send ATTENTION, finish the in-flight token, and return both the
+/// original error and the boundary result needed by the drain.
 async fn read_to_attention_boundary<F, T>(
     mut read: Pin<&mut F>,
     remaining_request_timeout: Option<Duration>,
@@ -752,8 +807,14 @@ where
     InterruptibleRead::Interrupted { error, boundary }
 }
 
+/// Mutable row-decoding state used while discarding a cancelled response.
+///
+/// Metadata can change between queued result sets, and row tokens are not
+/// self-describing, so the drain must track the active shape until DONE_ATTN.
 struct AttentionDrainContext {
+    /// Metadata required to skip ROW and NBCROW payloads.
     metadata: Option<Arc<ColMetadataToken>>,
+    /// Whether newly encountered metadata may contain encrypted-column fields.
     column_encryption_supported: bool,
 }
 
@@ -785,6 +846,7 @@ pub(crate) struct NetworkTransport {
     /// `read_nbc_bitmap`.
     nbc_bitmap_scratch: Option<Arc<[u8]>>,
     column_encryption_supported: bool,
+    /// Tokens drained by the transport but still needed by client state handling.
     attention_settlement: Option<Box<AttentionSettlement>>,
 }
 
@@ -912,6 +974,7 @@ impl NetworkTransport {
         self.encryption = Some(encryption);
     }
 
+    /// Takes the last successful drain's control tokens for one-time client replay.
     pub(crate) fn take_attention_settlement(&mut self) -> Option<AttentionSettlement> {
         self.attention_settlement
             .take()
@@ -1594,6 +1657,7 @@ impl NetworkTransport {
         }
     }
 
+    /// Seeds drain decoding from the parser state active when interruption occurred.
     fn attention_drain_context(&self, parser_context: &ParserContext) -> AttentionDrainContext {
         match parser_context {
             ParserContext::ColumnMetadata(metadata, _) => AttentionDrainContext {
@@ -1611,6 +1675,10 @@ impl NetworkTransport {
         }
     }
 
+    /// Advances drain metadata and records client-visible control tokens.
+    ///
+    /// Returns true only for DONE_ATTN, the boundary that proves the stream can
+    /// serve another request.
     fn apply_attention_token(
         context: &mut AttentionDrainContext,
         settlement: &mut AttentionSettlement,
@@ -1647,6 +1715,10 @@ impl NetworkTransport {
         }
     }
 
+    /// Finishes a partially decoded row without materializing its remaining columns.
+    ///
+    /// Reaching the row boundary is required before token-oriented ATTENTION
+    /// draining can resume safely.
     async fn discard_paused_row(&mut self, pause_state: RowPauseState) -> TdsResult<()> {
         let mut writer = crate::datatypes::row_writer::DiscardRowWriter;
         match resume_row_into_internal(self, pause_state, ColumnPolicy::SkipAll, &mut writer)
@@ -1664,6 +1736,10 @@ impl NetworkTransport {
         }
     }
 
+    /// Discards an owned paused PLP value and then the rest of its row.
+    ///
+    /// PLP chunk framing must be consumed before the drain can recognize later
+    /// row or DONE tokens.
     async fn discard_paused_plp(&mut self, mut plp_state: PlpPauseState) -> TdsResult<()> {
         let mut buffer = vec![0u8; 8192];
         while !plp_state.reached_end() {
@@ -1677,6 +1753,10 @@ impl NetworkTransport {
         self.discard_paused_row(plp_state.row_pause_state).await
     }
 
+    /// Discards a caller-owned active PLP value and completes its containing row.
+    ///
+    /// This variant is needed when cancellation interrupts incremental PLP
+    /// delivery and the pause state must remain available to the caller.
     async fn discard_active_plp(&mut self, plp_state: &mut PlpPauseState) -> TdsResult<()> {
         let mut buffer = vec![0u8; 8192];
         while !plp_state.reached_end() {
@@ -1692,6 +1772,10 @@ impl NetworkTransport {
             .await
     }
 
+    /// Converts any completed row-parser outcome into an optional first control token.
+    ///
+    /// Paused row and PLP outcomes are finished here so every variant reaches
+    /// the token boundary expected by the acknowledgement drain.
     async fn discard_interrupted_row_result(
         &mut self,
         result: RowReadResult,
@@ -1710,6 +1794,10 @@ impl NetworkTransport {
         }
     }
 
+    /// Settles a completed row-parser result, then drains to DONE_ATTN.
+    ///
+    /// The shared deadline prevents row completion from extending the
+    /// cancellation bound.
     async fn wait_for_attention_after_row_result(
         &mut self,
         parser_context: &ParserContext,
@@ -1725,6 +1813,10 @@ impl NetworkTransport {
             .await
     }
 
+    /// Finishes a positioned row header, then drains to DONE_ATTN.
+    ///
+    /// A header can leave the reader inside a row, so token draining cannot
+    /// start until that row has been discarded.
     async fn wait_for_attention_after_row_header(
         &mut self,
         parser_context: &ParserContext,
@@ -1745,6 +1837,10 @@ impl NetworkTransport {
             .await
     }
 
+    /// Finishes an interrupted incremental PLP read, then drains to DONE_ATTN.
+    ///
+    /// The active PLP and the rest of its row must be consumed before control
+    /// tokens are parseable again.
     async fn wait_for_attention_after_plp(
         &mut self,
         parser_context: &ParserContext,
@@ -5563,6 +5659,7 @@ pub(crate) mod tests {
             .build()
     }
 
+    /// Encodes one INT4 COLMETADATA token for queued-result drain tests.
     fn int4_colmetadata_bytes(name: &str) -> Vec<u8> {
         let mut bytes = vec![TokenType::ColMetadata as u8];
         bytes.extend_from_slice(&1_u16.to_le_bytes());
@@ -5574,6 +5671,7 @@ pub(crate) mod tests {
         bytes
     }
 
+    /// Frames a one-column ROW or NBCROW message used to test metadata-aware drains.
     fn int4_row_message(token_type: u8, is_nbc: bool, value: i32) -> Vec<u8> {
         let mut packet = TestPacketBuilder::new(PacketType::TabularResult);
         packet.append_byte(token_type);
@@ -5834,6 +5932,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Verifies that queued ROW and NBCROW payloads are discarded with the
+    /// interrupted result set's metadata rather than parsed as control tokens.
     #[tokio::test(start_paused = true)]
     async fn queued_rows_are_drained_with_current_metadata() {
         for (name, token_type, is_nbc) in [
@@ -5863,6 +5963,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Verifies that COLMETADATA encountered during a drain supplies the shape
+    /// needed to discard rows from a later queued result set.
     #[tokio::test(start_paused = true)]
     async fn attention_drain_adopts_new_colmetadata() {
         let mut response = TestPacketBuilder::new(PacketType::TabularResult)
@@ -5892,6 +5994,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Verifies that cancellation retains a parser paused inside ROW bytes long
+    /// enough to finish the row and reach DONE_ATTN.
     #[tokio::test]
     async fn cancellation_preserves_a_parser_paused_mid_row() {
         let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
