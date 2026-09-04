@@ -56,9 +56,10 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::resolve_default_c_type;
 use crate::api::util::{copy_with_nul, write_if_some};
+use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
-    DateTimeParts, date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
+    date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::OdbcVersion;
