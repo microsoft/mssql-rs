@@ -1,70 +1,21 @@
-# CI trigger only on development. Main-branch builds are produced by the
-# Official pipeline (OneBranch/OfficialPythonWheelsBuild.yml) on merge.
-trigger:
-- development
+# ############################################################################
+# THROWAWAY. This file has been gutted on branch david/macos-toolchain-producer
+# so PR validation runs nothing but the vendored macOS toolchain smoke test.
+#
+# Restore this file from main before merging anything. Nothing else in the
+# branch touches it, and validation-stages.yml is untouched.
+# ############################################################################
 
-parameters:
-- name: buildType
-  displayName: Type of the build to produce
-  type: string
-  values:
-  - Both
-  - Debug
-  - Release
-  default: Both
-
-- name: RunFuzz
-  displayName: Run Fuzz Tests (30 min)
-  type: boolean
-  default: false
-
-- name: RunLongHaul
-  displayName: Run Long-Haul BCP Test (30 min)
-  type: boolean
-  default: false
-
-- name: sqlInstanceMode
-  displayName: SQL host cardinality for ARM test stages
-  type: string
-  values:
-  - shared
-  - per-job
-  default: shared
-
-- name: sqlImageTag
-  displayName: SQL Server docker image tag for ARM test stages
-  type: string
-  default: '2025-latest'
-
-variables:
-  # msodbcsql18 reference-driver version for the ODBC C++ e2e parity comparison.
-  # Pinned so an upstream release can't silently change what the parity table
-  # compares against. Consumed on Windows by install-msodbcsql.ps1 and on Linux
-  # by containerized-odbc-e2e.sh (which appends the Debian package revision).
-  msodbcsqlVersion: '18.6.2.1'
+trigger: none
 
 stages:
-- template: templates/validation-stages.yml
-  parameters:
-    buildType: ${{ parameters.buildType }}
-    RunFuzz: ${{ parameters.RunFuzz }}
-    RunLongHaul: ${{ parameters.RunLongHaul }}
-    sqlInstanceMode: ${{ parameters.sqlInstanceMode }}
-    sqlImageTag: ${{ parameters.sqlImageTag }}
-    # This file is shared by TWO pipeline definitions: 2267 in the `public`
-    # project (GitHub PRs, i.e. unreviewed code) and 2204 in `mssql-rs` (the ADO
-    # mirror). Pool names must resolve at compile time, so this is a template
-    # rather than a runtime variable. The pools are project-scoped, so a wrong
-    # branch here fails with "pool not found" rather than putting unreviewed
-    # code on a trusted agent.
-    ${{ if eq(variables['System.TeamProject'], 'public') }}:
-      poolName: RUST-PUBLIC-X64-WUS3
-      armPoolName: RUST-PUBLIC-ARM64-WUS3
-      utilPoolName: RUST-PUBLIC-UTIL-WUS3
-    ${{ else }}:
-      poolName: RUST-X64-WUS3
-      armPoolName: RUST-ARM64-WUS3
-      utilPoolName: RUST-UTIL-WUS3
-    # PR validation for internal ADO and GitHub PRs. GitHub PRs run in the public
-    # project, which lacks 'Magnitude Test', so exclude the infra stages here.
-    includeInfraStages: false
+- stage: Toolchain_Smoke
+  displayName: macOS vendored-toolchain smoke test
+  jobs:
+  - template: templates/macos-toolchain-smoke-template.yml
+    parameters:
+      # GitHub PRs build in the `public` project, which has its own pools.
+      ${{ if eq(variables['System.TeamProject'], 'public') }}:
+        utilPoolName: RUST-PUBLIC-UTIL-WUS3
+      ${{ else }}:
+        utilPoolName: RUST-UTIL-WUS3

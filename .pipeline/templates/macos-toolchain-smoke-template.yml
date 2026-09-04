@@ -1,0 +1,155 @@
+# TEMPORARY validation stage for the vendored macOS docker toolchain.
+#
+# Proves the parts that cannot be checked on Linux: that the packaged binaries
+# actually run on a macOS agent, that seeding colima's cache stops it fetching
+# the ~350 MB guest image, and that lima's guest agent (which lives outside
+# bin/) is complete enough to boot a VM. The payload is moved as a pipeline
+# artifact rather than a Universal Package so this loop stays fast and does not
+# publish throwaway versions into the feed; feed publish/download is a separate
+# question.
+#
+# Ends by running the real start-sql-server-macos.sh: if SQL Server comes up on
+# a vendored toolchain, the whole chain is proven, not just the daemon.
+
+parameters:
+- name: utilPoolName
+  type: string
+
+jobs:
+- job: Toolchain_Build_Payloads
+  displayName: 'Build toolchain payloads (Linux)'
+  timeoutInMinutes: 30
+  pool:
+    name: ${{ parameters.utilPoolName }}
+    demands:
+      - imageOverride -equals RUST-UBUSLIM
+  steps:
+  - checkout: self
+
+  - ${{ each arch in split('x86_64,arm64', ',') }}:
+    - script: |
+        set -euo pipefail
+        python3 .pipeline/scripts/build-macos-docker-toolchain.py \
+          --arch ${{ arch }} \
+          --out "$(Build.ArtifactStagingDirectory)/${{ arch }}"
+        du -sh "$(Build.ArtifactStagingDirectory)/${{ arch }}"
+      displayName: 'Assemble ${{ arch }} payload'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish ${{ arch }} payload artifact'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/${{ arch }}'
+        artifact: 'toolchain-${{ arch }}'
+
+- job: Toolchain_Consume_MacOS
+  displayName: 'Install and boot from payload (macOS)'
+  dependsOn: Toolchain_Build_Payloads
+  timeoutInMinutes: 45
+  pool:
+    name: Azure Pipelines
+    vmImage: macOS-latest
+  variables:
+    toolchainRoot: '$(Agent.TempDirectory)/macos-toolchain'
+  steps:
+  - checkout: self
+
+  - script: |
+      set -euo pipefail
+      arch=$(uname -m)
+      echo "agent architecture: $arch"
+      if [ "$arch" != "x86_64" ]; then
+        echo "##[error]This smoke test downloads the x86_64 payload; agent reports $arch."
+        echo "##[error]Switch the artifact below to toolchain-arm64 once the pool moves."
+        exit 1
+      fi
+    displayName: 'Confirm agent architecture'
+
+  - task: DownloadPipelineArtifact@2
+    displayName: 'Download x86_64 payload'
+    inputs:
+      artifact: 'toolchain-x86_64'
+      path: '$(toolchainRoot)'
+
+  - script: |
+      set -euo pipefail
+      cd "$(toolchainRoot)"
+      chmod +x bin/* libexec/lima/* 2>/dev/null || true
+      echo "##[group]payload"
+      du -sh . bin share libexec image
+      cat manifest.json
+      echo "##[endgroup]"
+
+      echo "##vso[task.prependpath]$(toolchainRoot)/bin"
+      export PATH="$(toolchainRoot)/bin:$PATH"
+
+      # The packaged binaries must run at all -- the producer only checked their
+      # Mach-O headers, which a corrupt or truncated download would still pass.
+      docker --version
+      colima version
+      limactl --version
+    displayName: 'Install payload and prove the binaries run'
+
+  - script: |
+      set -euo pipefail
+      cd "$(toolchainRoot)"
+      cache_name=$(python3 -c "import json;print(json.load(open('manifest.json'))['image']['cache_filename'])")
+      image=$(python3 -c "import json;print(json.load(open('manifest.json'))['image']['filename'])")
+      dest="$HOME/Library/Caches/colima/caches"
+      mkdir -p "$dest"
+      cp "image/$image" "$dest/$cache_name"
+      # Recorded so the next step can prove colima used this file rather than
+      # replacing it with a fresh download.
+      stat -f '%m' "$dest/$cache_name" > "$(Agent.TempDirectory)/seed-mtime"
+      ls -la "$dest"
+    displayName: 'Seed colima image cache'
+
+  - script: |
+      set -euo pipefail
+      export PATH="$(toolchainRoot)/bin:$PATH"
+      start=$(date +%s)
+      colima start --cpu 4 --memory 4 --disk 50 2>&1 | tee "$(Agent.TempDirectory)/colima.log"
+      echo "colima start took $(( $(date +%s) - start ))s"
+
+      cache_name=$(python3 -c "import json;print(json.load(open('$(toolchainRoot)/manifest.json'))['image']['cache_filename'])")
+      seeded=$(cat "$(Agent.TempDirectory)/seed-mtime")
+      now=$(stat -f '%m' "$HOME/Library/Caches/colima/caches/$cache_name")
+      if [ "$seeded" != "$now" ]; then
+        echo "##[error]colima replaced the seeded image, so it still downloaded ~350 MB"
+        exit 1
+      fi
+      echo "seeded image was reused (mtime unchanged): the guest image download is gone"
+
+      docker context use colima >/dev/null || true
+      docker version
+      docker info | head -20
+    displayName: 'Boot colima from the seeded image'
+
+  - template: generate-sql-password-template.yml
+    parameters:
+      osType: MacOS
+
+  # The real workload: a container actually has to run on this toolchain.
+  - script: bash .pipeline/scripts/start-sql-server-macos.sh
+    displayName: 'Start SQL Server on the vendored toolchain'
+    timeoutInMinutes: 22
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+
+  - script: |
+      set -euo pipefail
+      export PATH="$(toolchainRoot)/bin:$PATH"
+      docker exec sqlserver /opt/mssql-tools18/bin/sqlcmd \
+        -S localhost -U SA -P "$SQL_PASSWORD" -C -b -Q "SELECT @@VERSION"
+    displayName: 'Query SQL Server'
+    env:
+      SQL_PASSWORD: $(SQL_PASSWORD)
+
+  - script: |
+      set +e
+      export PATH="$(toolchainRoot)/bin:$PATH"
+      echo "=== colima log ==="; cat "$(Agent.TempDirectory)/colima.log"
+      echo "=== containers ==="; docker ps -a
+      colima delete --force
+      exit 0
+    displayName: 'Diagnostics and cleanup'
+    condition: always()
