@@ -290,6 +290,7 @@ steps:
         $ErrorActionPreference = 'Stop'
 
         $wheelsDir = "$(ob_outputDirectory)\wheels"
+        $unsignedDir = "$(ob_outputDirectory)\unsigned-wheels"
         $unpackedRoot = "$(ob_outputDirectory)\wheel-unpacked"
         $signedDir = "$(ob_outputDirectory)\signed-wheels"
         $verifyRoot = "$(ob_outputDirectory)\wheel-verify"
@@ -344,7 +345,9 @@ steps:
           exit 1
         }
 
-        Remove-Item -Recurse -Force $unpackedRoot, $signedDir, $verifyRoot
+        # Also drop the pre-signing originals so no un-injected, unsigned copy
+        # rides along in the Build artifact and wins the Publish collect.
+        Remove-Item -Recurse -Force $unsignedDir, $unpackedRoot, $signedDir, $verifyRoot
       displayName: 'Repack and verify signed Windows wheels'
   
   - pwsh: |
