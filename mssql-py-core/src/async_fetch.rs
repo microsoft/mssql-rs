@@ -109,6 +109,15 @@ impl BufferedResults {
     }
 }
 
+fn take_buffered_rows(
+    buffered_results: &BufferedResults,
+    limit: usize,
+) -> (Vec<PyRowWriter>, bool, bool) {
+    buffered_results
+        .take_rows(limit)
+        .unwrap_or_else(|| (Vec::new(), true, false))
+}
+
 /// Python-independent resources captured before constructing a fetch future.
 pub(crate) struct FetchResources {
     client: Arc<Mutex<TdsClient>>,
@@ -554,9 +563,7 @@ fn fetch_buffered<'py>(
         let _cursor = cursor;
         let mut fetch_guard =
             FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
-        let (rows, exhausted, has_next) = buffered_results
-            .take_rows(limit)
-            .expect("buffered fetch requires a current result set");
+        let (rows, exhausted, has_next) = take_buffered_rows(&buffered_results, limit);
         fetch_state.set(if exhausted {
             FetchStatus::Exhausted
         } else {
@@ -880,8 +887,9 @@ mod tests {
 
     use super::{
         FetchGuard, MaterializationGuard, map_fetch_error, map_materialization_join_error,
-        map_nextset_error,
+        map_nextset_error, take_buffered_rows,
     };
+    use crate::async_fetch::BufferedResults;
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
 
     fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64) {
@@ -890,6 +898,17 @@ mod tests {
         state.finish_execute(execute.operation_id, true);
         let fetch = state.claim_fetch(1).unwrap();
         (state, fetch.operation_id)
+    }
+
+    #[test]
+    fn cleared_buffer_is_treated_as_exhausted() {
+        let buffered_results = BufferedResults::default();
+
+        let (rows, exhausted, has_next) = take_buffered_rows(&buffered_results, usize::MAX);
+
+        assert!(rows.is_empty());
+        assert!(exhausted);
+        assert!(!has_next);
     }
 
     #[test]
