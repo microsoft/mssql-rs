@@ -1,0 +1,68 @@
+# Builds and publishes the macOS docker toolchain payload for one architecture.
+# See macos-docker-toolchain-pipeline.yml for why this exists.
+
+parameters:
+- name: arch
+  type: string
+  values:
+  - x86_64
+  - arm64
+- name: packageVersion
+  type: string
+- name: macosMajorFloor
+  type: number
+- name: dryRun
+  type: boolean
+- name: feed
+  type: string
+
+jobs:
+- job: Build_${{ parameters.arch }}
+  displayName: 'Build and publish ${{ parameters.arch }}'
+  timeoutInMinutes: 30
+  # Downloads, verifies and repacks ~400 MB; nothing is compiled, so the cheap
+  # util pool is enough.
+  pool:
+    name: RUST-UTIL-WUS3
+    demands:
+      - imageOverride -equals RUST-UBUSLIM
+  steps:
+  - checkout: self
+
+  - script: |
+      set -euo pipefail
+      python3 .pipeline/scripts/build-macos-docker-toolchain.py \
+        --arch ${{ parameters.arch }} \
+        --macos-major ${{ parameters.macosMajorFloor }} \
+        --out "$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}"
+    displayName: 'Assemble payload'
+
+  - script: |
+      set -euo pipefail
+      payload="$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}"
+      echo "##[group]manifest.json"
+      cat "$payload/manifest.json"
+      echo "##[endgroup]"
+      echo "payload size: $(du -sh "$payload" | cut -f1)"
+    displayName: 'Show manifest'
+
+  # Published even on a dry run: the manifest is the record of what a given
+  # package version actually contains.
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish manifest as a build artifact'
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}/manifest.json'
+      artifact: 'manifest-${{ parameters.arch }}'
+
+  - ${{ if eq(parameters.dryRun, false) }}:
+    - task: UniversalPackages@0
+      displayName: 'Publish macos-docker-toolchain-${{ parameters.arch }} ${{ parameters.packageVersion }}'
+      inputs:
+        command: publish
+        publishDirectory: '$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}'
+        feedsToUsePublish: 'internal'
+        vstsFeedPublish: '${{ parameters.feed }}'
+        vstsFeedPackagePublish: 'macos-docker-toolchain-${{ parameters.arch }}'
+        versionOption: 'custom'
+        versionPublish: '${{ parameters.packageVersion }}'
+        packagePublishDescription: 'docker CLI, colima, lima and colima guest image for macOS ${{ parameters.arch }}'
