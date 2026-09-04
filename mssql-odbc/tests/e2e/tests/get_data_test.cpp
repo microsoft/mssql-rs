@@ -1733,10 +1733,63 @@ TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyBufferedValueConsumesColumn)
     SQLCloseCursor(stmt_);
 }
 
+// AB#47537 parity table, the *divergence* row -- deliberately guarded on the
+// reference leg.
+//
+// The probe tests above all cover the agreement row (`binary`/`varbinary`/
+// `nvarchar`), where this driver and msodbcsql answer identically. A
+// fixed-source-type column is where the two intentionally part company:
+// msodbcsql treats a short buffer for a fixed SQL type as a data overflow
+// (`22003` / `SQL_ERROR`, indicator untouched), while this driver reports the
+// truncation (`01004` / `SQL_SUCCESS_WITH_INFO`) so a caller is told to grow its
+// buffer instead of believing an undelivered value landed.
+//
+// That divergence was only covered by unit tests built from synthetic
+// `ColumnValues` until now, which cannot catch a change in how a real column
+// reaches the probe. It is the row most worth a live guard precisely because it
+// is the deliberate disagreement, and the parity note in
+// `.github/instructions/mssql-odbc.instructions.md` is otherwise its only record.
+//
+// Both indicator sub-classes are covered: a type `binary_length` has an explicit
+// arm for (`int` -> 4) and one that falls through to `SQL_NO_TOTAL`
+// (`decimal`, `datetime2`).
+//
+// SKIP_IF_COMPARING_MSODBCSQL is justified by measurement, not assumption:
+// against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) each query below
+// answers `SQL_ERROR` with `22003`, so the comparison leg genuinely fails rather
+// than the macro papering over an untested guess.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnFixedSourceTypesReportsTruncation) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Case {
+        const char* query;
+        SQLLEN expected_indicator;
+    };
+    const Case cases[] = {
+        {"SELECT CAST(7 AS INT) AS c1", 4},
+        {"SELECT CAST(1.23 AS DECIMAL(10,2)) AS c1", SQL_NO_TOTAL},
+        {"SELECT CAST('2025-01-01 12:00:05.123' AS DATETIME2(3)) AS c1", SQL_NO_TOTAL},
+    };
+
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.query);
+        ASSERT_SQL_OK(ExecDirect(c.query), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN ind = 12345;
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind))
+            << "a fixed-source type must report truncation, not claim delivery";
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        EXPECT_EQ(c.expected_indicator, ind);
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
 // An integer column delivered to its natural fixed-width C target, rather than
 // being rendered as text.
-TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {
-    ASSERT_SQL_OK(ExecDirect("SELECT CAST(-2000000 AS INT) AS c1"), SQL_HANDLE_STMT,
+TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {    ASSERT_SQL_OK(ExecDirect("SELECT CAST(-2000000 AS INT) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
