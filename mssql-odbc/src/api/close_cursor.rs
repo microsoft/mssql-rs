@@ -260,6 +260,18 @@ pub(super) enum DrainOutcome {
 /// that surfaced server INFO messages, and — importantly — from a drain failure,
 /// which must not be reported to the app as success.
 pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) -> DrainOutcome {
+    drain_and_release_inner(stmt, statement_handle, process_is_shutting_down())
+}
+
+/// The body of [`drain_and_release`], with the loader's shutdown flag passed in
+/// rather than read. The skip arm below is unreachable in a live process, so
+/// threading the flag is the only way a test can exercise it — without that,
+/// deleting the arm leaves the suite green and restores the AB#47510 hang.
+fn drain_and_release_inner(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    process_is_shutting_down: bool,
+) -> DrainOutcome {
     let dbc = stmt.parent_dbc();
 
     // Take the client; intentionally leave active_stmt set while draining.
@@ -300,7 +312,7 @@ pub(super) fn drain_and_release(stmt: &StmtHandle, statement_handle: SqlHandle) 
     // already cost: the undrained rows die with the connection, and the client
     // is still returned below so the DBC is left consistent for whatever
     // teardown runs after this.
-    if process_is_shutting_down() {
+    if process_is_shutting_down {
         debug!("drain_and_release: process is exiting — skipping the drain round-trip");
         if let Ok(mut ds) = dbc.inner.lock() {
             ds.client = Some(client);
@@ -609,6 +621,93 @@ mod tests {
         assert!(
             ds.client.as_ref().is_some_and(|c| c.has_open_batch()),
             "B's result set must still be open — not drained by A's close"
+        );
+    }
+
+    /// The AB#47510 guard on the cursor drain. Once the loader has terminated
+    /// the runtime's worker, `block_on(close_query())` can never complete, so
+    /// the drain must be skipped entirely. The flag is threaded in because a
+    /// live test process always reads it as `false`; without that seam this arm
+    /// is dead code under test and deleting it leaves the suite green.
+    ///
+    /// The client is left holding an open batch, which is what proves no drain
+    /// was attempted — a real `close_query()` would have consumed it.
+    #[test]
+    fn drain_and_release_skips_the_round_trip_while_the_process_is_exiting() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{col_metadata_empty, tds_client_from_tokens};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        // Positioned on an open result set with an empty token queue behind it,
+        // so an actual drain would error rather than silently succeed.
+        let mut client = tds_client_from_tokens(vec![col_metadata_empty()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let outcome = drain_and_release_inner(
+            unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
+            h.stmt,
+            true,
+        );
+
+        assert!(
+            matches!(outcome, DrainOutcome::Clean),
+            "skipping during shutdown must report a clean close, not a failure"
+        );
+        let ds = dbc.inner.lock().unwrap();
+        assert!(
+            ds.client.as_ref().is_some_and(|c| c.has_open_batch()),
+            "the batch must be left undrained — a skipped drain performs no I/O"
+        );
+        assert_eq!(
+            ds.active_stmt, None,
+            "the connection must still be released, or it stays busy forever"
+        );
+    }
+
+    /// The same call with the flag false takes the ordinary path and does drain
+    /// the batch. Without this pair, a guard that fired unconditionally would
+    /// also pass the test above.
+    #[test]
+    fn drain_and_release_still_drains_while_the_process_is_alive() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, tds_client_from_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+
+        let mut client = tds_client_from_tokens(vec![col_metadata_empty(), done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1;".to_string(), ()))
+            .unwrap();
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+            ds.active_stmt = Some(h.stmt);
+        }
+
+        let _ = drain_and_release_inner(
+            unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
+            h.stmt,
+            false,
+        );
+
+        let ds = dbc.inner.lock().unwrap();
+        assert!(
+            ds.client.as_ref().is_some_and(|c| !c.has_open_batch()),
+            "the live-process path must actually drain the batch"
         );
     }
 }

@@ -772,6 +772,13 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// `SQLFreeHandle(SQL_HANDLE_ENV)` in a host's teardown sequence, so it is on
 /// the same `DLL_PROCESS_DETACH` path those two already guard.
 pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
+    rollback_before_disconnect_inner(dbc, process_is_shutting_down())
+}
+
+/// The body of [`rollback_before_disconnect`], with the loader's shutdown flag
+/// passed in rather than read, so the skip arm below — unreachable in a live
+/// process — is testable.
+fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: bool) {
     const OP: &str = "SQLDisconnect(rollback)";
 
     // A cursor that will not close leaves the connection mid-batch, so the
@@ -799,7 +806,7 @@ pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
     // (AB#47510). Skipping costs nothing the exit does not already cost: this
     // transaction carries no user work, and the server rolls it back when the
     // socket closes — the same fallback the cursor-sweep bail-out above takes.
-    if process_is_shutting_down() {
+    if process_is_shutting_down {
         debug!("{OP}: process is exiting — the server will roll back on disconnect");
     } else if client.has_active_transaction()
         && let Err(e) = dbc
@@ -1617,5 +1624,53 @@ mod tests {
             .expect("same client reused across cycle");
         assert!(!client.is_connection_dead());
         assert!(state.diag_records().is_empty());
+    }
+
+    /// The AB#47510 guard on the `SQLDisconnect` rollback. A host that
+    /// disconnects from a static destructor or `onexit` handler reaches this
+    /// after the loader has terminated the runtime's worker, where
+    /// `block_on(rollback_transaction())` can never complete. The flag is
+    /// threaded in because a live test process always reads it as `false`;
+    /// without that seam this arm is dead code under test.
+    ///
+    /// The transaction is left open on the client, which is what proves no
+    /// rollback was sent — the server discards it when the socket closes.
+    #[test]
+    fn rollback_before_disconnect_skips_the_round_trip_while_the_process_is_exiting() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            done_no_more, env_change_rollback_transaction, tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            // Queued so a rollback that *is* sent completes and clears the
+            // transaction. That is what makes "still active" below evidence of
+            // a skip rather than of a round-trip that merely failed.
+            state.client = Some(tds_client_from_tokens_in_transaction(
+                vec![env_change_rollback_transaction(), done_no_more()],
+                1,
+            ));
+            state.local_tran_started = true;
+        }
+
+        rollback_before_disconnect_inner(dbc, true);
+
+        let state = dbc.inner.lock().unwrap();
+        let client = state
+            .client
+            .as_ref()
+            .expect("the client must be handed back so teardown stays consistent");
+        assert!(
+            client.has_active_transaction(),
+            "the transaction must be left open — a skipped rollback sends nothing"
+        );
+        assert!(
+            state.diag_records().is_empty(),
+            "this path is best-effort and must post no diagnostic"
+        );
     }
 }

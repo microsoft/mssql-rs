@@ -29,8 +29,12 @@
 // needs to close.
 //
 // Env (connection settings are shared with the rest of the e2e suite):
-//   MSSQL_ODBC_DLL           Path to the driver under test. Required; the test
-//                            skips without it, so DM-only runs stay green.
+//   MSSQL_ODBC_DLL           Path to the driver under test. Set by run_e2e.ps1
+//                            for the mssql-odbc leg only — the runtime whose
+//                            teardown this guards is ours, so the reference-
+//                            driver leg has nothing to test and skips. A skip
+//                            on one side is parity-neutral (parity_report.py
+//                            classifies it "skipped (not compared)").
 //   MSSQL_ODBC_UNLOAD_ITERS  Iteration count (default 200 — comfortably above
 //                            the observed mean time to failure).
 //   ODBC_TEST_CONNSTR        Full connection string override.

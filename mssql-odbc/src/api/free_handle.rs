@@ -417,6 +417,18 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
 /// disconnected or busy with another statement, the handles are left for the
 /// server to reclaim when the connection closes. No lock is held across I/O.
 fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &DbcHandle) {
+    best_effort_unprepare_on_free_inner(handle, stmt, dbc, process_is_shutting_down())
+}
+
+/// The body of [`best_effort_unprepare_on_free`], with the loader's shutdown
+/// flag passed in rather than read, so the skip arm below — unreachable in a
+/// live process — is testable.
+fn best_effort_unprepare_on_free_inner(
+    handle: SqlHandle,
+    stmt: &StmtHandle,
+    dbc: &DbcHandle,
+    process_is_shutting_down: bool,
+) {
     // If a cursor is still open, drain it first: `drain_and_release` reads the
     // trailing `@handle` token (capturing it into `prepared`), returns the
     // client, and clears `active_stmt` — leaving the connection idle so the
@@ -471,7 +483,7 @@ fn best_effort_unprepare_on_free(handle: SqlHandle, stmt: &StmtHandle, dbc: &Dbc
     // round-trip would never complete, hanging a process that has finished its
     // work. Reached whenever a host frees its handles from an `onexit` handler
     // with a prepared statement still outstanding (AB#47510).
-    if process_is_shutting_down() {
+    if process_is_shutting_down {
         debug!(
             "SQLFreeHandle(STMT): process is exiting — leaving handles for the server to reclaim"
         );
@@ -1170,5 +1182,62 @@ mod tests {
         use crate::api::odbc_types::SQL_HANDLE_DBC_INFO_TOKEN;
         let ret = unsafe { sql_free_handle(SQL_HANDLE_DBC_INFO_TOKEN, 0x1 as SqlHandle) };
         assert_eq!(ret, SQL_ERROR);
+    }
+
+    /// State consistency for the AB#47510 guard on `sp_unprepare` at statement
+    /// free — the exact path the bug was reported on, a host freeing its pooled
+    /// handles from a CRT `onexit` handler.
+    ///
+    /// This pins the hand-off the skip arm still owes the DBC: client returned,
+    /// connection not left claimed. It does **not** pin the skip itself, unlike
+    /// the `drain_and_release` and `rollback_before_disconnect` pairs — a
+    /// scripted client makes a skipped `unprepare` and an attempted one
+    /// indistinguishable, because the round-trip neither errors observably nor
+    /// marks the connection dead. The skip is covered end to end instead, by
+    /// the `mssql-python` swap job.
+    #[test]
+    fn unprepare_on_free_leaves_the_connection_usable_while_the_process_is_exiting() {
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let (env, dbc) = alloc_env_dbc_connected();
+        let mut stmt: SqlHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { sql_alloc_handle(SQL_HANDLE_STMT, dbc, &mut stmt) },
+            SQL_SUCCESS
+        );
+        let dbc_ref = unsafe { &*(dbc as *const DbcHandle) };
+        let stmt_ref = unsafe { &*(stmt as *const StmtHandle) };
+
+        // A live, idle client with no tokens queued: an actual sp_unprepare
+        // would have nothing to read and would fail rather than quietly pass.
+        {
+            let mut ds = dbc_ref.inner.lock().unwrap();
+            ds.client = Some(tds_client_from_tokens(Vec::new()));
+            ds.active_stmt = None;
+        }
+        {
+            let mut ss = stmt_ref.inner.lock().unwrap();
+            ss.pending_unprepare = Some(StatementId::from_raw_for_test(42));
+        }
+
+        best_effort_unprepare_on_free_inner(stmt, stmt_ref, dbc_ref, true);
+
+        let ds = dbc_ref.inner.lock().unwrap();
+        assert!(
+            ds.client.is_some(),
+            "the client must be handed back so the connection is left usable"
+        );
+        assert_eq!(
+            ds.active_stmt, None,
+            "the connection must not be left claimed by a statement being freed"
+        );
+        drop(ds);
+
+        assert_eq!(
+            unsafe { sql_free_handle(SQL_HANDLE_STMT, stmt) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { sql_free_handle(SQL_HANDLE_DBC, dbc) }, SQL_SUCCESS);
+        assert_eq!(unsafe { sql_free_handle(SQL_HANDLE_ENV, env) }, SQL_SUCCESS);
     }
 }

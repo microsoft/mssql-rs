@@ -63,6 +63,25 @@ pub(super) fn unwind_dae(
     statement_handle: SqlHandle,
     diag: Option<DiagMsg>,
 ) {
+    unwind_dae_inner(
+        dbc,
+        stmt,
+        statement_handle,
+        diag,
+        process_is_shutting_down(),
+    )
+}
+
+/// The body of [`unwind_dae`], with the loader's shutdown flag passed in rather
+/// than read, so the skip arm below — unreachable in a live process — is
+/// testable.
+fn unwind_dae_inner(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    diag: Option<DiagMsg>,
+    process_is_shutting_down: bool,
+) {
     let client = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("stmt mutex poisoned unwinding DAE sequence");
@@ -85,7 +104,7 @@ pub(super) fn unwind_dae(
         // sequence before freeing. The half-written request dies with the
         // connection the exiting process is about to drop, so only the client
         // hand-back below still matters.
-        if process_is_shutting_down() {
+        if process_is_shutting_down {
             debug!("unwind_dae: process is exiting — skipping the cancel round-trip");
         } else {
             dbc.runtime.block_on(client.cancel_streamed_write());
@@ -1850,6 +1869,67 @@ mod tests {
         assert!(
             built.dae_params.is_empty(),
             "nothing should be staged for streaming"
+        );
+    }
+
+    /// State consistency for the AB#47510 guard on the data-at-execution
+    /// unwind. `SQLFreeHandle(SQL_HANDLE_STMT)` unwinds a parked DAE sequence
+    /// before freeing, so a host freeing handles from an `onexit` handler
+    /// reaches it after the loader has terminated the runtime's worker.
+    ///
+    /// This pins what the skip arm still owes: the sequence is unwound, the
+    /// client is handed back, and the connection is released — without which
+    /// the DBC records the freed statement as busy forever. It does **not** pin
+    /// the skip itself, unlike the `drain_and_release` and
+    /// `rollback_before_disconnect` pairs: `cancel_streamed_write` returns `()`
+    /// and has no observable effect on a scripted client, so a skipped cancel
+    /// and an attempted one are indistinguishable here. The skip is covered end
+    /// to end instead, by the `mssql-python` swap job.
+    #[test]
+    fn unwind_dae_leaves_the_connection_usable_while_the_process_is_exiting() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        // Park a client mid-DAE with no tokens queued behind it: a real cancel
+        // would have nothing to read and would fail rather than quietly pass.
+        // Routed through `park_dae_client` rather than building `DaeState` by
+        // hand, so the setup is the same one the execute path produces.
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = None;
+            ds.active_stmt = Some(h.stmt);
+        }
+        assert_eq!(
+            park_dae_client(
+                stmt,
+                tds_client_from_tokens(Vec::new()),
+                None,
+                None,
+                Vec::new(),
+                "test",
+            ),
+            crate::api::odbc_types::SQL_NEED_DATA
+        );
+
+        unwind_dae_inner(dbc, stmt, h.stmt, None, true);
+
+        assert!(
+            !stmt.inner.lock().unwrap().needs_data(),
+            "the parked sequence must still be unwound"
+        );
+        let ds = dbc.inner.lock().unwrap();
+        assert!(
+            ds.client.is_some(),
+            "the client must be handed back even when the cancel is skipped"
+        );
+        assert_eq!(
+            ds.active_stmt, None,
+            "the connection must be released, or it stays busy forever"
         );
     }
 }
