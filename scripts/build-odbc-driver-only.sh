@@ -34,4 +34,16 @@ DRIVER="$(bash scripts/finalize-artifact.sh release)"
 
 mkdir -p "$DROP_DIR/build"
 cp -f "$DRIVER" "$DROP_DIR/build/mssqlodbc.so"
+
+if [ "$LIBC" = "glibc" ]; then
+  # Fail loudly if a base-image bump ever raises the driver's GLIBC floor above
+  # the manylinux_2_34 wheel it ships in.
+  max="$(readelf -V "$DROP_DIR/build/mssqlodbc.so" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)"
+  echo "max required GLIBC: $max"
+  if [ "$(printf '%s\nGLIBC_2.34\n' "$max" | sort -V | tail -1)" != "GLIBC_2.34" ]; then
+    echo "ERROR: $max exceeds the manylinux_2_34 (GLIBC_2.34) floor" >&2
+    exit 1
+  fi
+fi
+
 echo "Staged driver: $DROP_DIR/build/mssqlodbc.so"
