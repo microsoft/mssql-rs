@@ -11,8 +11,8 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, flush_pending_unprepare, park_dae_client, query_timeout_expired_error,
-    snapshot_bound_params,
+    finish_execute, flush_pending_unprepare, park_dae_client, park_deferred_dae,
+    query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -240,6 +240,22 @@ fn sql_exec_direct_w_safe(
     // and hand control to SQLParamData / SQLPutData. There is no prepared plan
     // to restore afterwards, so `None` is passed for it.
     if !dae_params.is_empty() {
+        // A buffered parameter cannot be declared until its bytes are all in,
+        // so no RPC is opened: the sequence collects its values and runs
+        // `sp_executesql` from the last `SQLParamData` (AB#47590).
+        if dae_params.iter().any(|param| param.plan.is_buffered()) {
+            return park_deferred_dae(
+                stmt,
+                client,
+                None,
+                None,
+                dae_params,
+                params,
+                Some(rewritten_sql),
+                query_timeout,
+                "SQLExecDirectW",
+            );
+        }
         let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
             rewritten_sql,
             params,

@@ -178,6 +178,87 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
 // that reaches the advance branch in SQLParamData (dae_current_idx += 1) and so
 // the only one that can catch the driver stalling on the first parameter,
 // skipping the second, or handing back the wrong token.
+// A mixed sequence -- one parameter that must be collected whole (a fixed-width
+// target has no PLP form) alongside one that streams. Parameters are offered in
+// bind order, as msodbcsql offers them; the RPC opens as soon as no parameter
+// still to be visited needs collecting, so the PLP-capable one bound after it
+// streams rather than being held in memory.
+TEST_F(PrepareExecuteLiveTest, MixedDataAtExecutionStreamsThePlpParameter) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS a, ? AS b"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token_buffered = 0;
+    SQLCHAR token_streamed = 0;
+
+    // Parameter 1 is fixed-width (char(4)) and must be collected; parameter 2 is
+    // PLP-capable (varchar(max)) and streams once the first is in.
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_CHAR, 4, 0, &token_buffered, 0,
+                                   &buffered_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &token_streamed, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    SQLRETURN rc = SQLParamData(stmt_, &value_ptr);
+    int iterations = 0;
+    bool sent_streamed = false;
+    bool sent_buffered = false;
+    bool buffered_came_first = false;
+
+    while (rc == SQL_NEED_DATA) {
+        ASSERT_LT(++iterations, 10) << "SQLParamData did not terminate";
+        if (value_ptr == &token_streamed) {
+            EXPECT_FALSE(sent_streamed) << "streamed token offered twice";
+            sent_streamed = true;
+            // Two chunks, so the streamed value genuinely spans calls.
+            const char first[] = "ab";
+            const char second[] = "cd";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(first), 2),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(second), 2),
+                          SQL_HANDLE_STMT, stmt_);
+        } else if (value_ptr == &token_buffered) {
+            EXPECT_FALSE(sent_buffered) << "buffered token offered twice";
+            if (!sent_streamed) {
+                buffered_came_first = true;
+            }
+            sent_buffered = true;
+            const char chunk[] = "wxyz";
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 4),
+                          SQL_HANDLE_STMT, stmt_);
+        } else {
+            FAIL() << "SQLParamData returned an unrecognised token";
+        }
+        rc = SQLParamData(stmt_, &value_ptr);
+    }
+
+    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_TRUE(sent_streamed);
+    EXPECT_TRUE(sent_buffered);
+    // Bind order, which is what msodbcsql does too -- asserted on both legs.
+    EXPECT_TRUE(buffered_came_first)
+        << "parameters must be offered in bind order";
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR a[32] = {0};
+    SQLCHAR b[32] = {0};
+    SQLLEN a_len = 0;
+    SQLLEN b_len = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, a, sizeof(a), &a_len),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_CHAR, b, sizeof(b), &b_len),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ(reinterpret_cast<const char*>(a), "wxyz");
+    EXPECT_STREQ(reinterpret_cast<const char*>(b), "abcd");
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 TEST_F(PrepareExecuteLiveTest, DataAtExecutionLoopsOverMultipleStreamedParams) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ? + ? + ? AS v"), SQL_HANDLE_STMT, stmt_);
 
@@ -843,20 +924,24 @@ TEST_F(PrepareExecuteLiveTest, WideCTypeAgainstNarrowSqlTypeDataAtExecutionTrans
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// Same-wideness narrow pairing (needs_transcode: false): SQLPutData streams
-// SQL_C_CHAR bytes to the wire untranscoded, on the assumption they are
-// already the wire encoding. They are not -- this driver's SQL_C_CHAR is
-// UTF-8 by convention, not a wire encoding -- so a non-ASCII value round-trips
-// as mojibake under a non-UTF8 collation (AB#47590's narrow-to-narrow half,
-// left open by this PR: only the wideness-mismatch half above closes here).
-// Written as the passing assertions AB#47590 would need to satisfy, with an
-// unconditional skip at the top: pins the gap's location for whoever picks
-// that up, and removing the skip is the whole activation step once fixed,
-// rather than writing this test from scratch then.
-TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionStillMisencodesNonAscii) {
-    GTEST_SKIP() << "known gap, not fixed by this PR: same-wideness narrow "
-                    "DAE streams SQL_C_CHAR bytes as UTF-8 regardless of the "
-                    "connection's actual collation (AB#47590)";
+// Same-wideness narrow pairing. `SQLPutData` used to stream `SQL_C_CHAR` bytes
+// to the wire untranscoded, on the assumption they were already the wire
+// encoding. They are not -- this driver's `SQL_C_CHAR` is UTF-8 by convention,
+// not a wire encoding -- so a non-ASCII value round-tripped as mojibake under a
+// non-UTF8 collation. Every streamed chunk now goes through the connection's
+// collation on its way out, so this pairing encodes like the materialized path
+// (AB#47590's narrow-to-narrow half).
+//
+// Skipped in the parity run because the two drivers disagree by construction,
+// not by defect: msodbcsql reads `SQL_C_CHAR` as the client's ANSI codepage and
+// passes those bytes through, so it round-trips these five UTF-8 bytes as five
+// characters ("caf" + U+00C3 + U+00A9), while this driver decodes them as one
+// character ("caf" + U+00E9). The divergence is the driver-wide `SQL_C_CHAR`
+// convention, which the materialized path already follows; it is not specific
+// to the streamed path this test covers. Only visible under a non-UTF8
+// collation -- under a UTF8 one, transcode and passthrough are byte-identical.
+TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes) {
+    SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
@@ -894,29 +979,26 @@ TEST_F(PrepareExecuteLiveTest, NarrowCTypeAgainstNarrowSqlTypeDataAtExecutionSti
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// A genuine cross-*family* pairing -- character streamed against an integer
-// SQL type -- has no transcode to fall back on: there is nothing it could
-// mean other than one side declaring one encoding and sending another, so it
-// is still refused at execute rather than risking corruption.
+// A cross-*family* pairing -- character supplied at execution against an
+// integer SQL type -- is no longer refused. It cannot be PLP-framed, so the
+// chunks are collected and the complete value is converted by the same code a
+// materialized parameter uses, which already parses text into an integer
+// (AB#47590).
 //
 // SQL_C_CHAR -> SQL_INTEGER is reachable here (rather than failing at bind,
 // like SQL_C_CHAR -> a binary type still does) specifically because the
-// integer/character cross-conversions feature made it a valid *materialized*
-// binding; DAE has no equivalent, so the refusal for this one pairing moves
-// from bind time to here.
+// integer/character cross-conversions feature made it a valid materialized
+// binding; supplying it at execution now goes through that same conversion.
 //
-// msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute (see
-// param_cross_conversions_test.cpp/CrossFamilyDataAtExecutionIsRejectedAtExecute),
-// but does not actually stream it: SQLPutData itself then rejects with
-// HY019 ("Processing of fixed length targets cannot be spread over multiple
-// calls to SQLPutData"). Both drivers agree the pairing cannot stream
-// through -- they just detect it one call apart, this driver at SQLExecute
-// -- so the parity run stays skipped rather than comparing error codes that
-// differ by construction.
-TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
+// msodbcsql accepts the pairing at SQLExecute and then rejects at SQLPutData
+// with HY019 ("Processing of fixed length targets cannot be spread over
+// multiple calls to SQLPutData"), so the parity run stays skipped: the two
+// drivers genuinely differ here rather than differing only in which call
+// reports it.
+TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
-    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Prepare("SELECT ? + 1"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN ind = SQL_DATA_AT_EXEC;
     SQLCHAR token = 0;
@@ -924,15 +1006,25 @@ TEST_F(PrepareExecuteLiveTest, CrossFamilyDataAtExecutionIsRejected) {
                                    SQL_INTEGER, 0, 0, &token, 0, &ind),
                   SQL_HANDLE_STMT, stmt_);
 
-    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER returned = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
 
-    // The refusal happens while building the parameter list, before any RPC is
-    // opened, so no streaming sequence is left half-started: the statement takes
-    // a new binding without an intervening SQLCancel.
+    const SQLCHAR digits[] = {'4', '1'};
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(digits), sizeof(digits)),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("42", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // The statement is reusable straight afterwards: the sequence completed
+    // rather than being torn down, so no SQLCancel is needed in between.
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
     std::vector<SQLCHAR> value = {'o', 'k', '\0'};
     SQLLEN value_ind = SQL_NTS;
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindChar(1, value, value_ind), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);

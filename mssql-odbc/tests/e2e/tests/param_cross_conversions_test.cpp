@@ -494,31 +494,46 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
     EXPECT_EQ("7", ExecuteAndReadBack());
 }
 
-// The cross-family pairings are bindable now, so a data-at-execution indicator
-// on one is refused at execute rather than at bind: the DAE indicator is only
-// read when the parameter list is built.
+// A character C buffer against an integer wire type is supplied at execution
+// like any other pairing: it cannot be PLP-framed, so the chunks are collected
+// and the complete value is converted by the same code the materialized path
+// uses. Text parses to an integer here exactly as it does when bound directly
+// (AB#47590).
 //
-// msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute, but does not
-// actually stream it: SQLPutData itself then rejects with HY019 ("Processing
-// of fixed length targets cannot be spread over multiple calls to
-// SQLPutData"). Both drivers agree the pairing cannot stream through -- they
-// just detect it one call apart -- so the parity run stays skipped rather
-// than comparing error codes that differ by construction.
-TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
+// msodbcsql returns SQL_NEED_DATA for this pairing at SQLExecute but does not
+// actually stream it: SQLPutData then rejects with HY019 ("Processing of fixed
+// length targets cannot be spread over multiple calls to SQLPutData"), so the
+// parity run stays skipped.
+TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionConvertsToInteger) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
     for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
-        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(Prepare("SELECT ? + 1"), SQL_HANDLE_STMT, stmt_);
 
-        SQLLEN ind = SQL_DATA_AT_EXEC;
+        SQLLEN ind = SQL_LEN_DATA_AT_EXEC(0);
         SQLCHAR token = 0;
-        // The bind itself is accepted - that is the change from before.
         ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c_type, SQL_INTEGER,
                                        0, 0, &token, 0, &ind),
                       SQL_HANDLE_STMT, stmt_);
 
-        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << "c type " << c_type;
-        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+        ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_)) << "c type " << c_type;
+        SQLPOINTER returned = nullptr;
+        ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &returned));
+
+        if (c_type == SQL_C_WCHAR) {
+            const SQLCHAR wide[] = {'4', 0, '1', 0};
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(wide), sizeof(wide)),
+                          SQL_HANDLE_STMT, stmt_);
+        } else {
+            const SQLCHAR narrow[] = {'4', '1'};
+            ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<SQLCHAR*>(narrow), sizeof(narrow)),
+                          SQL_HANDLE_STMT, stmt_);
+        }
+
+        ASSERT_SQL_OK(SQLParamData(stmt_, &returned), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ("42", GetColumnChar(1)) << "c type " << c_type;
+        EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
         ResetParams();
     }
 }
