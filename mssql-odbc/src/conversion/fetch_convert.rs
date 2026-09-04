@@ -397,14 +397,15 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             // `datetime` time is counted in 1/300-second ticks since midnight.
             let ticks = u64::from(dt.time);
             let secs = ticks / 300;
-            let fraction_ns = ((ticks % 300) * 1_000_000_000 / 300) as u32;
+            // ODBC exposes the legacy type rounded to millisecond precision.
+            let fraction_ms = ((dt.time % 300) * 1_000 + 150) / 300;
             p.year = y;
             p.month = m;
             p.day = day;
             p.hour = (secs / 3600) as u16;
             p.minute = ((secs % 3600) / 60) as u16;
             p.second = (secs % 60) as u16;
-            p.fraction_ns = fraction_ns;
+            p.fraction_ns = fraction_ms * 1_000_000;
             // `datetime` always renders 3 fractional digits.
             p.scale = 3;
             p.has_date = true;
@@ -2292,6 +2293,30 @@ mod tests {
         assert_eq!(out.month, 1);
         assert_eq!(out.day, 1);
         assert_eq!(out.second, 1);
+    }
+
+    #[test]
+    fn datetime_legacy_fraction_rounds_to_milliseconds() {
+        use mssql_tds::datatypes::column_values::SqlDateTime;
+
+        for ticks in 0u32..300 {
+            let expected_fraction = ((ticks * 20 + 3) / 6) * 1_000_000;
+            let mut out = SqlTimestampStruct::default();
+            let mut ind: SqlLen = 0;
+            unsafe {
+                convert_datetime_c(
+                    &ColumnValues::DateTime(SqlDateTime {
+                        days: 0,
+                        time: ticks,
+                    }),
+                    SQL_C_TYPE_TIMESTAMP,
+                    (&mut out as *mut SqlTimestampStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .unwrap();
+            assert_eq!(out.fraction, expected_fraction, "ticks: {ticks}");
+        }
     }
 
     #[test]
