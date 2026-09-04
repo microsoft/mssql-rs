@@ -58,6 +58,16 @@ pub(crate) fn map_claim_error(error: ClaimError) -> PyErr {
     map_claim_error_with_busy_message(error, "Connection is busy with another cursor operation")
 }
 
+fn clear_result_state(
+    fetch_state: &FetchState,
+    description_state: &DescriptionState,
+    buffered_results: &BufferedResults,
+) {
+    buffered_results.replace(Default::default());
+    description_state.replace(None);
+    fetch_state.set(crate::async_fetch::FetchStatus::NoResultSet);
+}
+
 /// Python-independent resources required to drain and release a cursor.
 struct CursorCleanup {
     client: Arc<Mutex<TdsClient>>,
@@ -73,10 +83,11 @@ struct CursorCleanup {
 
 impl CursorCleanup {
     fn clear_result_state(&self) {
-        self.buffered_results.replace(Default::default());
-        self.description_state.replace(None);
-        self.fetch_state
-            .set(crate::async_fetch::FetchStatus::NoResultSet);
+        clear_result_state(
+            &self.fetch_state,
+            &self.description_state,
+            &self.buffered_results,
+        );
     }
 
     async fn run(self, claim: CursorCloseClaim) -> Result<(), Error> {
@@ -356,13 +367,35 @@ impl Drop for PyAsyncCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
     use pyo3::Python;
 
-    use super::{FinalizerCompletionGuard, map_claim_error};
+    use super::{FinalizerCompletionGuard, clear_result_state, map_claim_error};
+    use crate::async_description::DescriptionState;
     use crate::async_errors::ProgrammingError;
+    use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatus};
     use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+    use crate::row_writer::PyRowWriter;
+
+    #[test]
+    fn clear_result_state_discards_buffered_results() {
+        let fetch_state = FetchState::new();
+        fetch_state.set(FetchStatus::Ready);
+        let description_state = DescriptionState::new();
+        let buffered_results = BufferedResults::default();
+        buffered_results.replace(VecDeque::from([BufferedRowSet {
+            metadata: Vec::new(),
+            rows: VecDeque::from([PyRowWriter::new(0)]),
+        }]));
+        assert!(buffered_results.has_current());
+
+        clear_result_state(&fetch_state, &description_state, &buffered_results);
+
+        assert!(!buffered_results.has_current());
+        assert!(fetch_state.status() == FetchStatus::NoResultSet);
+    }
 
     #[test]
     fn no_result_set_claim_maps_to_programming_error() {
@@ -467,6 +500,8 @@ impl PyAsyncCursor {
     /// DML row counts are aggregated. Row-producing results set `rowcount` to
     /// `-1`, are buffered, and retain their boundaries for `fetch*()` and
     /// `nextset()`. The query timeout applies separately to each execution.
+    /// Peak memory scales with the complete parameter input plus all buffered
+    /// result rows; the input iterable is not streamed during execution.
     #[pyo3(signature = (operation, seq_of_parameters, *, use_prepare=true))]
     fn executemany<'py>(
         slf: Py<Self>,

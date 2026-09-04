@@ -790,6 +790,37 @@ def test_executemany_inserts_rows_and_aggregates_rowcount(client_context, use_pr
 
 
 @pytest.mark.integration
+def test_executemany_reaches_execution_yield_boundary(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "CREATE TABLE #async_executemany_yield (value int)",
+                use_prepare=False,
+            )
+            logger.events.clear()
+
+            await cursor.executemany(
+                "INSERT INTO #async_executemany_yield VALUES (?)",
+                [(value,) for value in range(256)],
+                use_prepare=False,
+            )
+
+            assert any(
+                level == 10
+                and "yielding at execution interval; completed=256" in message
+                and module == "async_execute.rs"
+                for level, message, module in logger.events
+            ), logger.events
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_executemany_accepts_named_rows_and_outer_generator(client_context):
     async def run():
         conn = await connect(client_context)
@@ -1056,6 +1087,33 @@ def test_executemany_buffered_awaitable_creation_failure_restores_fetch_state(
             loop.run_until_complete(close_connection())
         loop.close()
         asyncio.set_event_loop(None)
+
+
+@pytest.mark.integration
+def test_executemany_reaches_result_buffering_yield_boundary(client_context):
+    async def run():
+        logger = RecordingLogger()
+        conn = await connect(client_context, logger)
+        try:
+            cursor = conn.cursor()
+            logger.events.clear()
+
+            await cursor.executemany(
+                "SELECT TOP (256) CAST(? AS int) AS value FROM sys.all_objects",
+                [(7,)],
+                use_prepare=False,
+            )
+
+            assert any(
+                level == 10
+                and "yielding at result_buffering interval; completed=256" in message
+                and module == "async_execute.rs"
+                for level, message, module in logger.events
+            ), logger.events
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.integration

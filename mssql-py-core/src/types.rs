@@ -409,13 +409,10 @@ pub(crate) fn py_to_sql_type_with_hint(
             _ => Err(Error::UsageError("Expected a date parameter".to_string())),
         },
         InputSqlType::Time => Ok(SqlType::Time(Some(py_time(py_obj, hint.scale)?))),
-        InputSqlType::DateTime => match py_datetime_to_sql_type(py_obj, Some(hint.scale))? {
-            SqlType::DateTime2(value) => Ok(SqlType::DateTime2(value)),
-            SqlType::DateTimeOffset(value) => {
-                Ok(SqlType::DateTime2(value.map(|value| value.datetime2)))
-            }
-            _ => unreachable!("datetime conversion returns a temporal SQL type"),
-        },
+        InputSqlType::DateTime => Ok(SqlType::DateTime2(Some(SqlDateTime2 {
+            days: datetime_days(py_obj)?,
+            time: py_time(py_obj, hint.scale)?,
+        }))),
         InputSqlType::DateTimeOffset => match py_datetime_to_sql_type(py_obj, Some(hint.scale))? {
             SqlType::DateTimeOffset(value) => Ok(SqlType::DateTimeOffset(value)),
             _ => Err(Error::UsageError(
@@ -1911,15 +1908,35 @@ mod tests {
         Python::attach(|py| {
             let datetime = PyModule::import(py, "datetime").unwrap();
             let datetime_type = datetime.getattr("datetime").unwrap();
-            let utc = datetime
-                .getattr("timezone")
+            let timezone = datetime.getattr("timezone").unwrap();
+            let timedelta = datetime
+                .getattr("timedelta")
                 .unwrap()
-                .getattr("utc")
+                .call1((0, 14 * 60 * 60))
                 .unwrap();
-            let aware = datetime_type.call1((2024, 1, 2, 3, 4, 5, 6, &utc)).unwrap();
+            let offset = timezone.call1((timedelta,)).unwrap();
+            let aware = datetime_type
+                .call1((2024, 1, 2, 3, 4, 5, 6, offset))
+                .unwrap();
+            let expected_days = datetime
+                .getattr("date")
+                .unwrap()
+                .call1((2024, 1, 2))
+                .unwrap()
+                .call_method0("toordinal")
+                .unwrap()
+                .extract::<u32>()
+                .unwrap()
+                - 1;
             assert!(matches!(
                 py_to_sql_type_with_hint(&aware, ParameterHint::new(93, 0, 7).unwrap()).unwrap(),
-                SqlType::DateTime2(Some(_))
+                SqlType::DateTime2(Some(SqlDateTime2 {
+                    days,
+                    time: SqlTime {
+                        time_nanoseconds: 110_450_000_060,
+                        scale: 7,
+                    },
+                })) if days == expected_days
             ));
 
             let naive = datetime_type.call1((2024, 1, 2, 3, 4, 5, 6)).unwrap();

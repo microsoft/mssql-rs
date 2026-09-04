@@ -3,6 +3,7 @@
 
 //! Asynchronous command execution for [`crate::async_cursor::PyAsyncCursor`].
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -39,10 +40,26 @@ const EXECUTEMANY_PREFLIGHT_CHUNK_SIZE: usize = 256;
 const EXECUTEMANY_EXECUTION_YIELD_INTERVAL: usize = 256;
 const EXECUTEMANY_BUFFER_YIELD_INTERVAL: usize = 256;
 
-async fn yield_at_interval(completed: usize, interval: usize) {
+async fn yield_at_interval(completed: usize, interval: usize, phase: &'static str) {
     if completed.is_multiple_of(interval) {
+        tracing::trace!(
+            phase,
+            completed,
+            "PyAsyncCursor::executemany: yielding at {phase} interval; completed={completed}"
+        );
         tokio::task::yield_now().await;
     }
+}
+
+fn get_or_create_binding_plan<'a>(
+    plan: &'a mut Option<ParameterBindingPlan>,
+    operation: &str,
+    named: bool,
+) -> PyResult<&'a ParameterBindingPlan> {
+    if plan.is_none() {
+        *plan = Some(ParameterBindingPlan::new(operation, named)?);
+    }
+    Ok(plan.as_ref().expect("binding plan was initialized"))
 }
 
 /// Cursor-local state for prepared execution and deferred handle cleanup.
@@ -102,8 +119,8 @@ fn should_replace_prepared_statement(
         || state.parameter_signature != parameter_signature
 }
 
-struct ExecuteRequest {
-    operation: String,
+struct ExecuteRequest<'a> {
+    operation: Cow<'a, str>,
     rpc_parameters: Vec<RpcParameter>,
     parameter_signature: Vec<ParameterMetadata>,
     use_prepare: bool,
@@ -111,6 +128,12 @@ struct ExecuteRequest {
     timeout: u32,
     autocommit: bool,
     drain_previous: bool,
+}
+
+fn rowcount_from_rows_affected(rows_affected: Option<u64>) -> i64 {
+    rows_affected
+        .and_then(|count| i64::try_from(count).ok())
+        .unwrap_or(-1)
 }
 
 pub(crate) struct ExecuteResources {
@@ -235,7 +258,7 @@ async fn execute_on_client(
     client: &mut TdsClient,
     prepared_state: &Mutex<PreparedState>,
     claim: &ExecuteClaim,
-    request: ExecuteRequest,
+    request: ExecuteRequest<'_>,
 ) -> Result<ExecuteOutcome, ExecuteFailure> {
     let ExecuteRequest {
         operation,
@@ -273,7 +296,7 @@ async fn execute_on_client(
         let mut state = prepared_state.lock().await;
         let replace_statement = should_replace_prepared_statement(
             &state,
-            &operation,
+            operation.as_ref(),
             &parameter_signature,
             reset_cursor,
         );
@@ -283,7 +306,7 @@ async fn execute_on_client(
             {
                 state.orphaned = Some(statement_id);
             }
-            state.statement = Some(PreparedStatement::new(operation));
+            state.statement = Some(PreparedStatement::new(operation.into_owned()));
             state.parameter_signature = parameter_signature;
         }
         let PreparedState {
@@ -302,26 +325,20 @@ async fn execute_on_client(
             )
             .await?
     } else if rpc_parameters.is_empty() {
-        client.execute(operation, options).await?
+        client.execute(operation.into_owned(), options).await?
     } else {
         client
-            .execute_sp_executesql(operation, rpc_parameters, options)
+            .execute_sp_executesql(operation.into_owned(), rpc_parameters, options)
             .await?
     };
     Ok(match first {
         StatementResult::Rows => ExecuteOutcome::Rows(client.get_metadata().clone()),
         StatementResult::NoRows { rows_affected } if client.has_open_batch() => {
-            ExecuteOutcome::NoRows(
-                rows_affected
-                    .and_then(|count| i64::try_from(count).ok())
-                    .unwrap_or(-1),
-            )
+            ExecuteOutcome::NoRows(rowcount_from_rows_affected(rows_affected))
         }
-        StatementResult::NoRows { rows_affected } => ExecuteOutcome::TerminalNoRows(
-            rows_affected
-                .and_then(|count| i64::try_from(count).ok())
-                .unwrap_or(-1),
-        ),
+        StatementResult::NoRows { rows_affected } => {
+            ExecuteOutcome::TerminalNoRows(rowcount_from_rows_affected(rows_affected))
+        }
         StatementResult::End => ExecuteOutcome::TerminalNoRows(-1),
     })
 }
@@ -467,7 +484,7 @@ async fn execute_many_on_client(
             prepared_state,
             claim,
             ExecuteRequest {
-                operation: operation.clone(),
+                operation: Cow::Borrowed(&operation),
                 rpc_parameters,
                 parameter_signature,
                 use_prepare,
@@ -511,16 +528,22 @@ async fn execute_many_on_client(
                     );
                 }
                 StatementResult::NoRows { rows_affected } => {
-                    if let Some(count) = rows_affected {
+                    let count = rowcount_from_rows_affected(rows_affected);
+                    if count >= 0 {
                         has_known_count = true;
-                        total = total.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
+                        total = total.saturating_add(count);
                     }
                 }
                 StatementResult::End => break,
             }
         }
         client.take_dml_result_counts();
-        yield_at_interval(row_index + 1, EXECUTEMANY_EXECUTION_YIELD_INTERVAL).await;
+        yield_at_interval(
+            row_index + 1,
+            EXECUTEMANY_EXECUTION_YIELD_INTERVAL,
+            "execution",
+        )
+        .await;
     }
 
     Ok((
@@ -544,7 +567,12 @@ async fn read_buffered_row_set(
             break;
         }
         rows.push_back(writer);
-        yield_at_interval(rows.len(), EXECUTEMANY_BUFFER_YIELD_INTERVAL).await;
+        yield_at_interval(
+            rows.len(),
+            EXECUTEMANY_BUFFER_YIELD_INTERVAL,
+            "result_buffering",
+        )
+        .await;
     }
     Ok(BufferedRowSet { metadata, rows })
 }
@@ -623,9 +651,7 @@ fn bind_parameter_chunk(
         }
         state.named = Some(row_is_named);
 
-        let plan = state
-            .plan
-            .get_or_insert(ParameterBindingPlan::new(&state.operation, row_is_named)?);
+        let plan = get_or_create_binding_plan(&mut state.plan, &state.operation, row_is_named)?;
         let parameter_set = plan
             .bind_row(&row, state.hints.as_deref())
             .map_err(|error| {
@@ -697,7 +723,7 @@ pub(crate) fn execute<'py>(
         .claim_execute(cursor_id)
         .map_err(map_claim_error)?;
     let request = ExecuteRequest {
-        operation,
+        operation: Cow::Owned(operation),
         rpc_parameters,
         parameter_signature,
         use_prepare,
@@ -1044,7 +1070,8 @@ mod tests {
 
     use super::{
         EXECUTEMANY_BUFFER_YIELD_INTERVAL, EXECUTEMANY_EXECUTION_YIELD_INTERVAL, ExecuteFailure,
-        ParameterMetadata, PreparedState, should_replace_prepared_statement, yield_at_interval,
+        ParameterMetadata, PreparedState, get_or_create_binding_plan, rowcount_from_rows_affected,
+        should_replace_prepared_statement, yield_at_interval,
     };
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
@@ -1065,10 +1092,10 @@ mod tests {
             ticker_ticks.fetch_add(1, Ordering::Release);
         });
 
-        yield_at_interval(interval - 1, interval).await;
+        yield_at_interval(interval - 1, interval, "test").await;
         assert_eq!(ticks.load(Ordering::Acquire), 0);
 
-        yield_at_interval(interval, interval).await;
+        yield_at_interval(interval, interval, "test").await;
         assert_eq!(ticks.load(Ordering::Acquire), 1);
         ticker.await.unwrap();
     }
@@ -1077,6 +1104,25 @@ mod tests {
     async fn executemany_yields_at_execution_and_buffer_boundaries() {
         assert_yields_at_boundary(EXECUTEMANY_EXECUTION_YIELD_INTERVAL).await;
         assert_yields_at_boundary(EXECUTEMANY_BUFFER_YIELD_INTERVAL).await;
+    }
+
+    #[test]
+    fn executemany_reuses_parameter_binding_plan() {
+        let mut plan = None;
+        let first = get_or_create_binding_plan(&mut plan, "SELECT ?", false).unwrap() as *const _;
+
+        let reused =
+            get_or_create_binding_plan(&mut plan, "SELECT %(value)s", false).unwrap() as *const _;
+
+        assert_eq!(first, reused);
+    }
+
+    #[test]
+    fn rows_affected_overflow_is_unknown() {
+        assert_eq!(rowcount_from_rows_affected(None), -1);
+        assert_eq!(rowcount_from_rows_affected(Some(i64::MAX as u64)), i64::MAX);
+        assert_eq!(rowcount_from_rows_affected(Some(i64::MAX as u64 + 1)), -1);
+        assert_eq!(rowcount_from_rows_affected(Some(u64::MAX)), -1);
     }
 
     #[test]
