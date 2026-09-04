@@ -83,10 +83,13 @@ transparent reconnects.
   `SQL_SS_UDT` and `SQL_SS_TABLE` are still rejected at bind
   time, since they need a server type name no describe call reports.
 - **Value conversion** - the wire type follows `ParameterType`, not the C type:
-  an integer, character or binary buffer is declared as the SQL type the
-  application named and converted to it. Integer and character buffers reach
-  each other's SQL types (P5); `SQL_C_BINARY` reaches only the binary SQL types,
-  so binary is binary-to-binary only.
+  the buffer is declared as the SQL type the application named and converted to
+  it. Integer and character buffers reach each other's SQL types (P5), and
+  AB#47500 added the scalar rows - `bit`, `real`/`float`, decimal/numeric, GUID,
+  the temporal types, `xml` and `sql_variant`. Those are same-family pairings
+  apart from character to decimal and character to `sql_variant`, which exist
+  because `SQL_C_DEFAULT` resolves both of those SQL types to a character C type.
+  `SQL_C_BINARY` reaches only the binary SQL types.
   Character indicators support `SQL_NULL_DATA`, `SQL_NTS`, and
   explicit byte length; binary values use explicit byte length or
   `BufferLength` when no indicator pointer is supplied.
@@ -206,9 +209,15 @@ Four conversion quadrants:
 | **character C** | D: parse (`22018`, `22003`, `22001`) | B: transcode and length (`22001`) |
 
 Out of scope for this milestone: decimal/numeric, money, temporal, GUID, binary,
-output parameters, data-at-exec, parameter arrays, and TVPs. Binary (AB#47688)
-and data-at-execution landed separately, outside this milestone; the rest still
-emit their P0-era shapes.
+output parameters, data-at-exec, parameter arrays, and TVPs. Several of those
+landed separately outside this milestone: binary (AB#47688), data-at-execution,
+and the scalar rows of P8 - `bit`, the float types, decimal/numeric, GUID, the
+temporal types, `xml` and `sql_variant`. Money needs no row of its own: ODBC
+names no money type - there is no `SQL_MONEY` identifier and no entry for one in
+`rgbTRANSTYPE380` - so `money` and `smallmoney` parameters are bound as
+`SQL_DECIMAL`, which is what `SQLDescribeParam` reports for them, and P8's
+decimal row carries them. What remains is P9 (AB#47790): `vector`, UDT, TVP,
+`SQL_C_NUMERIC`, and the off-diagonal cross-product.
 
 ### Design rules
 
@@ -260,8 +269,11 @@ one task per phase.
 | P5 | [47369](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47369) | Code complete | Quadrants C and D: cross conversions |
 | P6 | [47370](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47370) | Not started | Parity and e2e hardening |
 | P7 | [47371](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47371) | Not started | Cleanup and follow-up hooks |
+| P8 | [47500](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47500) | Code complete | Scalar rows: bit, float, decimal, GUID, temporal, XML, variant |
+| P9 | [47790](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47790) | Not started | Complete the matrix: vector, UDT, TVP, `SQL_C_NUMERIC`, the `07006` flip |
 
-P1 is independent of P0; P3 onward depend on both.
+P1 is independent of P0; P3 onward depend on both. P8 landed ahead of P6 and P7;
+P9 follows P8.
 
 #### P0 - Extract shared conversion core (code complete)
 
@@ -357,8 +369,11 @@ Rules it fixes:
 - `StrLen_or_Ind` is a length only for the variable-length C types (msodbcsql's
   `IsFixedCType`); a fixed-width type takes its size from the C type.
 - A null indicator pointer means `SQL_NTS`, not NULL.
-- A non-NULL parameter with a null `ParameterValuePtr` is `HY009` - wider than
-  msodbcsql, which leaves the reachable case unguarded.
+- A null `ParameterValuePtr` is SQL NULL only for a variable-length C type
+  carrying a zero length - the `SQLPutData` NULL/0 convention of
+  `sqlccmd.cpp:4497`. Every other shape is `HY090`. Measured on retail
+  18.6.2.1: `SQL_C_CHAR` / `WCHAR` / `BINARY` with an indicator of 0 execute,
+  while a non-zero length, `SQL_NTS`, or any fixed-width C type is rejected.
 - `AppValue::Integer` is `i128`, so `SQL_C_UBIGINT` above `i64::MAX` reaches the
   narrowing check intact rather than as a negative.
 
@@ -522,8 +537,10 @@ Verified against msodbcsql source:
 - Malformed UTF-8 stays lossy - there is no msodbcsql behaviour to copy, since
   its conversion goes through `SystemLocale::FromUtf16` (`sqlccmd.cpp:10952`),
   which is not in this source tree. `22018` is tracked with AB#47565.
-- Still `HYC00`: `SQL_SS_XML`. `DescribesMaxLengthParameters` is re-enabled with
-  the binary types; the decimal case parked beside it still waits on AB#47500.
+- Still `HYC00`: `SQL_SS_VECTOR`, `SQL_SS_UDT` and `SQL_SS_TABLE`, all owned by
+  AB#47790 (P9). `DescribesMaxLengthParameters` and
+  `DescribedDecimalRoundTripsPrecisionAndScale` are both re-enabled - the first
+  with the binary types (AB#47688), the second with decimal (AB#47500).
 
 Deferred:
 
@@ -621,6 +638,87 @@ and nothing wider. Registered as a deviation and pinned by
 `BlankOnlyWideLiteralIs22018`; the rest of `CharParamInvalidLiteralIs22018` runs
 on the compare leg.
 
+#### P8 - Scalar rows: bit, float, decimal, GUID, temporal, XML, variant (AB#47500)
+
+Landed ahead of P6 and P7, on P0-P5 infrastructure. `typed_null` already built
+the declaration for each of these, so every row is one converter plus one matrix
+entry.
+
+Same-family throughout except `SQL_C_CHAR` / `SQL_C_WCHAR` -> `SQL_DECIMAL` /
+`SQL_NUMERIC` / `SQL_SS_VARIANT`, which are forced rather than chosen:
+`SQL_C_DEFAULT` resolves those SQL types to a character C type, so a strict
+diagonal would reject every defaulted decimal binding.
+
+Shared with fetch rather than reimplemented - `days_since_0001_from_civil` sits
+beside its existing inverse, decimal text goes through
+`numeric::parse_numeric_text`, and `SqlGuid` is taken apart with
+`Uuid::from_fields`, the mirror of `convert_guid_c`.
+
+Rules read from msodbcsql source, not derived:
+
+| Rule | Source | Consequence |
+| --- | --- | --- |
+| Date structs are validated, not just converted: year `1..=9999`, month, day-of-month length, 29 February under the 100/400 rule | `ValidateDateStruct`, `sqlccnvt.cpp:8821` | `22007`. Day arithmetic alone would roll 31 April into 1 May |
+| Time components are bounded separately, with no leap-second allowance | `ValidateTimeStruct`, `:8844` | 60 seconds is `22007` |
+| A timezone offset's components must agree in sign; minutes <= 59, total <= +/-14:00 | `IsValidTimezoneOffsetValue`, `dataconv.cpp:118` | `+5h -30m` is rejected despite totalling a legal +04:30 |
+| The `real` range check is symmetric | `sqlccnvt.cpp:5519` | A non-zero magnitude *below* `FLT_MIN` is `22003`, not just one above `FLT_MAX`. An infinity is too: `Temp` is a `DOUBLE` (`:5327`), so `+INF > FLT_MAX` holds before the narrowing cast |
+| That check applies to a 64-bit source only | measured, retail 18.6.2.1 | `SQL_C_DOUBLE` -> `SQL_REAL` at `1e-40` is `22003`, but `SQL_C_FLOAT` -> `SQL_REAL` at the same magnitude binds, executes and arrives as `9.99995e-41`. Nothing narrows when the source is already `real`, so the rule keys off the source width, not the value |
+| `SQL_C_BIT` is read as one `SCHAR` and widened like a tinyint | `sqlccnvt.cpp:5057` | Any non-zero byte reaches `bit` as 1; no value is rejected |
+| A fraction past the declared scale follows the character rule - dropped when zero, `22001` when not | `sqlccnvt.cpp:7823`, rewritten inbound at `sqlcfunc.cpp:3348` | `"1.50"` into `decimal(5,1)` converts; `"1.55"` does not |
+| A dropped *datetime* fraction is `22008`, not the `22001` the character rule uses | measured, retail 18.6.2.1; `sqlcfunc.cpp:3128` | `time`, `datetime2` and `datetimeoffset` alike. `:3128` is unconditional and its `switch (fSqlType)` case list covers every temporal type; the guard at `:3131` then jumps to `ErrorRet`, so the C-type-gated rewrite at `:3350` is not reached this way. Whether any route reaches `:3350` with a temporal `fSqlType` is not established |
+| A temporal parameter is declared at the **maximum** fractional-seconds scale | measured, retail 18.6.2.1 | `SQL_DESC_SCALE` is 7 under every `ColumnSize` and `DecimalDigits`, including an explicit 0. `DecimalDigits` still bounds the value, so a fraction it cannot carry is `22008` even though the declaration would hold it |
+
+`SQL_C_FLOAT` and `SQL_REAL` are both `7`, so that `real` arm serves the
+parameter direction too - the same identifier collision that makes
+`parse_numeric_text` shared between directions. It is the *narrowing* that is
+shared, not the arm: a `SQL_C_FLOAT` parameter and a `real` column into a
+`SQL_C_FLOAT` buffer are identity pairings and are carried across at their own
+width, so `AppValue` keeps `Float` and `Double` apart rather than widening both
+to `f64` and range-checking on the way back.
+`ASubnormalSurvivesAFloatRoundTrip` covers both ends on both legs.
+
+The decimal rescale is done here rather than delegated to
+`DecimalParts::from_string`, which rejects any input scale past the target,
+`"12.0"` into scale 0 included. A divergence from our own helper, not from
+msodbcsql.
+
+Two behaviours are ours to justify rather than copy:
+
+- **`sql_variant` reads `ColumnSize` 0 as unstated, not as `max`.** A
+  `sql_variant` cannot hold a `max` type at all (server error 529), so the
+  spelling that means `max` everywhere else declares at the target's own
+  non-`max` ceiling, and a `ColumnSize` past that ceiling is clamped to it
+  rather than falling through to `max`. Measured on retail 18.6.2.1 at
+  representative sizes through 100000: a wide variant binding never lands on
+  a `max` inner type.
+  `AWideVariantIsNeverAMaxType` runs on both legs.
+  Above that ceiling neither driver can send the value, so the clamp costs no
+  reach: measured on retail 18.6.2.1, 4000 wide characters execute and 4001
+  fail with server error 8013 (`42000`, "invalid instance length"), because
+  `nvarchar(4000)` is already the variant's 8000-byte payload limit. Declaring
+  the ceiling turns that into `22001` at bind here rather than a server error
+  one call later - both refuse, only the diagnostic differs
+  (`a_variant_payload_past_the_wide_ceiling_is_truncation`).
+  A **narrow** payload cannot reach the wire at all yet, because `mssql-tds`
+  hard-codes the variant's inner context to `NVARCHAR` and
+  sizes it as UTF-16, so five UTF-8 bytes are rejected as exceeding a schema
+  size of two. The matrix therefore admits `SQL_SS_VARIANT` only from
+  `SQL_C_WCHAR`, which leaves the defaulted path short of msodbcsql:
+  `SQL_C_DEFAULT` resolves `SQL_SS_VARIANT` to `SQL_C_CHAR`, so an ordinary
+  defaulted variant binding is `HYC00` at bind rather than executing. Chosen
+  over admitting a pairing that cannot execute, and lifted when AB#47800 lands.
+  `VariantParamWrapsItsInnerType` and
+  `VariantWithNoColumnSizeIsNotAMaxType` are skipped against AB#47800; both
+  pass on msodbcsql.
+- **`SQL_C_GUID` resolves from `SQL_GUID`**, per the ODBC 3.x default-C-type
+  table; msodbcsql's `rgbTRANSTYPE380` says `SQL_C_CHAR`. The deviation already
+  registered for the wide character types.
+
+msodbcsql's own test tree covers almost none of this - the date/time C types have
+round-trip cases under `testsrc/.../NewODBCCTypes`, bit, float, decimal and GUID
+parameters none at all - so the e2e cases in `param_conversions_test.cpp` run on
+the compare leg, where a wrong reading fails rather than sits.
+
 #### P6 - Parity and e2e hardening (not started)
 
 - Parameter-numbered diagnostics.
@@ -632,11 +730,6 @@ on the compare leg.
   assertions with `SKIP_IF_COMPARING_MSODBCSQL()`.
 - Add `Benefits-from-mock-tds:` notes where only the round-tripped value is
   observable and the declared RPC type is not.
-- Settle one open `HY009` question: msodbcsql treats a null data pointer with a
-  zero count as `SQL_NULL_DATA` on the `SQLPutData` path (`sqlccmd.cpp:4494`).
-  If that convention also holds for a bound buffer, `SQL_C_CHAR` with a null
-  pointer and `*ind == 0` is NULL there and `HY009` here. Not settleable from
-  the source; needs a `--compare-with-msodbcsql` run on that exact binding.
 - **`DecimalDigits` is validated at execute, not at bind.** `CheckSqlPrecScale`
   lives up to its name: `SQLBindParameter` runs it (`sqlcdesc.cpp:3038`) and it
   rejects a bad scale there, not later. `SQL_NUMERIC` / `SQL_DECIMAL` reject
@@ -646,7 +739,11 @@ on the compare leg.
   the same `HY104` in `decimal_metadata` / `datetime_metadata`, only later -
   the same divergence already accepted for `ColumnSize` in `fixed_length`.
   Closing it means `parameter_column_size_is_valid` grows a scale argument, and
-  `MAX_DATETIME_SCALE` moves to `type_rules.rs` with it.
+  `MAX_DATETIME_SCALE` moves to `type_rules.rs` with it. A `ColumnSize` of 0 is
+  the one place the timing does not matter: `CheckSqlPrec` (`:11471`) reads 0 as
+  `SQL_PREC_UNLIMITED` and returns `HY104` for a 3.x application, which is what
+  we do. `FixupColumnSizeDecimalDigits` never runs for these types, so nothing
+  defaults the precision to 18 first.
 - **`SQL_TYPE_DATE` accepts any `DecimalDigits`.** msodbcsql requires
   `SCALE_DATE == 0` (`sqlcdesc.cpp:11641`); `typed_null` maps the type with no
   metadata and never looks at the scale.
@@ -691,13 +788,22 @@ role `Convert()`'s dispatch switch plays - not a legality table.
   correctness issue.
 - **Type matrix and TDS type selection:** tracked by the conversion milestone
   above. P3-P5 drive the wire type from `ParameterType` for the integer and
-  character types, in both directions across the two families, and AB#47688 does
-  the same for the binary types. Beyond this milestone the same work is needed
-  for `uniqueidentifier`, money, decimal, and date/time values, which still emit
-  their P0-era shapes. `ColumnSize` still does not bound a data-at-execution
-  value in either family (AB#47590).
+  character types, in both directions across the two families; AB#47688 does the
+  same for the binary types and P8 for the scalar rows. `money` / `smallmoney`
+  need nothing further: ODBC has no money type identifier, so they arrive as
+  `SQL_DECIMAL` and are declared `decimal(19,4)` / `decimal(10,4)` for the
+  server to convert on assignment. msodbcsql declares the same, for the same
+  reason. The remaining matrix work - `vector`, UDT, TVP, `SQL_C_NUMERIC` and
+  the off-diagonal cross-product, together with the `HYC00` -> `07006` flip that
+  depends on it - is P9 (AB#47790). `ColumnSize` still does not bound a
+  data-at-execution value in either family (AB#47590).
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
+- **`mssql-tds` gaps found by P8:** a `sql_variant` cannot carry a `varchar`
+  payload - `get_variant_base_type` and `create_variant_inner_context` assume
+  every `ColumnValues::String` is UTF-16. AB#47800. The other half is closed
+  here: `write_variant_type_info` and `calculate_type_info_length` answered an
+  unhandled base type with `unreachable!` and now return `ProtocolError`.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
   both `SQLPrepare` + `SQLExecute` and `SQLExecDirect` (see the
   delivered-features list above and `data-at-execution-streaming.md`), and a

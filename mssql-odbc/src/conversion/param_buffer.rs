@@ -9,12 +9,16 @@
 
 use std::slice;
 
+use super::datetime::DateTimeParts;
 use super::param_convert::ParamBuildError;
 use crate::api::odbc_types::{
-    SQL_C_BINARY, SQL_C_CHAR, SQL_C_LONG, SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_VECTOR,
-    SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT,
-    SQL_C_UTINYINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_LEN_DATA_AT_EXEC_OFFSET,
-    SQL_NTS, SQL_NULL_DATA, SqlLen, SqlPointer, SqlSmallInt,
+    SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG,
+    SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+    SQL_C_SS_VECTOR, SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
+    SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR,
+    SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NTS, SQL_NULL_DATA,
+    SqlDateStruct, SqlGuid, SqlLen, SqlPointer, SqlSmallInt, SqlSsTime2Struct,
+    SqlSsTimestampoffsetStruct, SqlTimeStruct, SqlTimestampStruct,
 };
 use crate::api::type_rules::effective_param_c_type;
 use crate::params::BoundParam;
@@ -23,7 +27,11 @@ use crate::params::BoundParam;
 ///
 /// Covers the C types the conversion matrix currently admits. SQL NULL is not
 /// here: [`read_indicator`] settles it before any buffer is read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` without `Eq`, because [`AppValue::Double`] carries an `f64`:
+/// `Double(NAN) != Double(NAN)`. Fine for the assertion use it has today, but
+/// it cannot key a map or back a dedup.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AppValue {
     /// Any integer C type widened to `i128`, which represents every ODBC
     /// integer C type exactly — including `SQL_C_UBIGINT` above `i64::MAX`,
@@ -35,6 +43,19 @@ pub(crate) enum AppValue {
     WideText(Vec<u8>),
     /// `SQL_C_BINARY` bytes, as supplied.
     Binary(Vec<u8>),
+    /// `SQL_C_BIT`, already reduced to the two values `bit` can hold.
+    Bit(bool),
+    /// `SQL_C_FLOAT`, kept at its own width. Widening to [`AppValue::Double`]
+    /// would be lossless but would then face a `real` range check that only a
+    /// genuine 64-bit source should meet.
+    Float(f32),
+    /// `SQL_C_DOUBLE`. A `real` target narrows with a range check.
+    Double(f64),
+    /// `SQL_C_GUID`, in the `SQLGUID` field layout.
+    Guid(SqlGuid),
+    /// Any of the five date/time C structs, normalised onto the same calendar
+    /// breakdown the fetch direction fills those structs from.
+    DateTime(DateTimeParts),
 }
 
 /// Whether `StrLen_or_Ind` carries a length for this C type.
@@ -74,6 +95,10 @@ pub(crate) enum Indicator {
 /// `param.strlen_or_ind_ptr` and `param.octet_length_ptr`, if non-null, must
 /// each point to one valid `SqlLen`.
 pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, ParamBuildError> {
+    // `SQLBindParameter` aims `SQL_DESC_INDICATOR_PTR` and
+    // `SQL_DESC_OCTET_LENGTH_PTR` at one address, so reading NULL from the
+    // first and the length from the second agrees unless a separate
+    // `SQLSetDescField` splits them - unmeasured against msodbcsql.
     if !param.strlen_or_ind_ptr.is_null() {
         let ind = unsafe { param.strlen_or_ind_ptr.read_unaligned() };
         if ind == SQL_NULL_DATA {
@@ -104,6 +129,20 @@ pub(crate) unsafe fn read_indicator(param: &BoundParam) -> Result<Indicator, Par
         }
     }
 
+    // A null value buffer with a zero length is the SQLPutData NULL/0
+    // convention (`sqlccmd.cpp:4497`) and reaches the wire as NULL - but only
+    // for a variable-length C type, which is the only kind that carries a
+    // length. Measured on retail 18.6.2.1: `SQL_C_CHAR`/`WCHAR`/`BINARY` with
+    // an indicator of 0 execute successfully, while the same C types with a
+    // non-zero length or `SQL_NTS`, and every fixed-width C type whatever the
+    // indicator, answer `HY090`.
+    if param.parameter_value_ptr.is_null() {
+        if indicator_is_a_length(param.c_type) && indicator == Some(0) {
+            return Ok(Indicator::Null);
+        }
+        return Err(ParamBuildError::InvalidBufferLength);
+    }
+
     // For the character C types a null octet-length pointer means "null-terminated".
     Ok(Indicator::Length(indicator.unwrap_or(SQL_NTS as SqlLen)))
 }
@@ -119,8 +158,8 @@ pub(crate) unsafe fn read_param_value(
     param: &BoundParam,
     len_spec: SqlLen,
 ) -> Result<AppValue, ParamBuildError> {
-    // ODBC permits a null `ParameterValuePtr` only for `SQL_NULL_DATA` or
-    // data-at-exec, and `read_indicator` has already returned on both.
+    // Unreachable: `read_indicator` answers every null-buffer shape itself,
+    // with `Null` or `InvalidBufferLength`. Kept as an FFI-boundary guard.
     if param.parameter_value_ptr.is_null() {
         return Err(ParamBuildError::NullValuePointer);
     }
@@ -132,6 +171,27 @@ pub(crate) unsafe fn read_param_value(
             read_wchar_bytes(param.parameter_value_ptr as *const u16, len_spec)
         })),
         SQL_C_BINARY => unsafe { read_binary_bytes(param, len_spec) }.map(AppValue::Binary),
+        // In msodbcsql, anything non-zero reaches `bit` as 1.
+        // Matched here rather than made stricter.
+        SQL_C_BIT => Ok(AppValue::Bit(
+            unsafe { (param.parameter_value_ptr as *const u8).read_unaligned() } != 0,
+        )),
+        SQL_C_FLOAT => Ok(AppValue::Float(unsafe {
+            (param.parameter_value_ptr as *const f32).read_unaligned()
+        })),
+        SQL_C_DOUBLE => Ok(AppValue::Double(unsafe {
+            (param.parameter_value_ptr as *const f64).read_unaligned()
+        })),
+        SQL_C_GUID => Ok(AppValue::Guid(unsafe {
+            (param.parameter_value_ptr as *const SqlGuid).read_unaligned()
+        })),
+        SQL_C_TYPE_DATE
+        | SQL_C_TYPE_TIME
+        | SQL_C_TYPE_TIMESTAMP
+        | SQL_C_SS_TIME2
+        | SQL_C_SS_TIMESTAMPOFFSET => Ok(AppValue::DateTime(unsafe {
+            read_datetime_parts(param.parameter_value_ptr, param.c_type)
+        })),
         other => {
             let effective = effective_param_c_type(other, param.sql_type);
             unsafe { read_integer(param.parameter_value_ptr, effective) }
@@ -139,6 +199,56 @@ pub(crate) unsafe fn read_param_value(
                 .ok_or(ParamBuildError::UnsupportedCType(other))
         }
     }
+}
+
+/// Reads one of the five date/time C structs into the shared calendar
+/// breakdown. Nothing is validated here - the converter decides which
+/// components its target needs and reports an impossible date itself.
+///
+/// `scale` stays 0: an application struct carries no declared precision, so the
+/// wire scale comes from `DecimalDigits` instead.
+///
+/// # Safety
+/// `ptr` must be non-null and readable for the struct `c_type` names;
+/// `read_param_value` has already rejected a null buffer. Reads are unaligned:
+/// the ODBC contract does not promise an aligned application buffer.
+unsafe fn read_datetime_parts(ptr: SqlPointer, c_type: SqlSmallInt) -> DateTimeParts {
+    debug_assert!(!ptr.is_null(), "read_param_value rejects a null buffer");
+    let mut p = DateTimeParts::default();
+    match c_type {
+        SQL_C_TYPE_DATE => {
+            let s = unsafe { (ptr as *const SqlDateStruct).read_unaligned() };
+            (p.year, p.month, p.day) = (s.year, s.month, s.day);
+            p.has_date = true;
+        }
+        SQL_C_TYPE_TIME => {
+            let s = unsafe { (ptr as *const SqlTimeStruct).read_unaligned() };
+            (p.hour, p.minute, p.second) = (s.hour, s.minute, s.second);
+            p.has_time = true;
+        }
+        SQL_C_SS_TIME2 => {
+            let s = unsafe { (ptr as *const SqlSsTime2Struct).read_unaligned() };
+            (p.hour, p.minute, p.second) = (s.hour, s.minute, s.second);
+            p.fraction_ns = s.fraction;
+            p.has_time = true;
+        }
+        SQL_C_TYPE_TIMESTAMP => {
+            let s = unsafe { (ptr as *const SqlTimestampStruct).read_unaligned() };
+            (p.year, p.month, p.day) = (s.year, s.month, s.day);
+            (p.hour, p.minute, p.second) = (s.hour, s.minute, s.second);
+            p.fraction_ns = s.fraction;
+            (p.has_date, p.has_time) = (true, true);
+        }
+        _ => {
+            let s = unsafe { (ptr as *const SqlSsTimestampoffsetStruct).read_unaligned() };
+            (p.year, p.month, p.day) = (s.year, s.month, s.day);
+            (p.hour, p.minute, p.second) = (s.hour, s.minute, s.second);
+            p.fraction_ns = s.fraction;
+            (p.tz_hour, p.tz_minute) = (s.timezone_hour, s.timezone_minute);
+            (p.has_date, p.has_time, p.has_tz) = (true, true, true);
+        }
+    }
+    p
 }
 
 /// Reads a fixed-width integer C buffer, widening to `i128`. `None` for a C
@@ -339,17 +449,216 @@ mod tests {
     #[test]
     fn unsupported_c_type_is_rejected() {
         let mut ind: SqlLen = 4;
-        let mut val: f32 = 1.5;
+        let mut val: [u8; 8] = [0; 8];
+        let p = param(SQL_C_SS_VECTOR, val.as_mut_ptr() as *mut c_void, &mut ind);
+        let err = read(&p).unwrap_err();
+        assert_eq!(err, ParamBuildError::UnsupportedCType(SQL_C_SS_VECTOR));
+    }
+
+    /// msodbcsql reads the buffer as one `SCHAR` and widens it like a tinyint
+    /// (`sqlccnvt.cpp:5057`), so no byte is rejected and every non-zero one is 1.
+    #[test]
+    fn bit_reads_any_non_zero_byte_as_one() {
+        let mut ind: SqlLen = 0;
+        for (byte, expected) in [(0u8, false), (1, true), (2, true), (0xFF, true)] {
+            let mut raw = byte;
+            let p = param(SQL_C_BIT, (&mut raw as *mut u8).cast(), &mut ind);
+            assert_eq!(
+                read(&p).unwrap(),
+                Some(AppValue::Bit(expected)),
+                "byte {byte:#x}"
+            );
+        }
+    }
+
+    /// Each float C type keeps its own width. Widening `SQL_C_FLOAT` here would
+    /// be lossless but would hand a `real` target a value it then range-checks
+    /// as though something had narrowed.
+    #[test]
+    fn each_float_c_type_keeps_its_width() {
+        let mut ind: SqlLen = 0;
+        let mut f: f32 = -2.25;
+        let p = param(SQL_C_FLOAT, (&mut f as *mut f32).cast(), &mut ind);
+        assert_eq!(read(&p).unwrap(), Some(AppValue::Float(-2.25)));
+
+        let mut d: f64 = 1.5;
+        let p = param(SQL_C_DOUBLE, (&mut d as *mut f64).cast(), &mut ind);
+        assert_eq!(read(&p).unwrap(), Some(AppValue::Double(1.5)));
+    }
+
+    #[test]
+    fn guid_is_read_in_its_field_layout() {
+        let mut ind: SqlLen = 0;
+        let mut g = SqlGuid {
+            data1: 0x0123_4567,
+            data2: 0x89AB,
+            data3: 0xCDEF,
+            data4: [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
+        };
+        let p = param(SQL_C_GUID, (&mut g as *mut SqlGuid).cast(), &mut ind);
+        assert_eq!(read(&p).unwrap(), Some(AppValue::Guid(g)));
+    }
+
+    /// Each of the five date/time structs fills only the components it carries,
+    /// so the converter can tell a bare time from a timestamp. Nothing is
+    /// validated here - an impossible date reaches the converter intact.
+    #[test]
+    fn each_datetime_c_struct_fills_only_its_own_components() {
+        let mut ind: SqlLen = 0;
+
+        let mut date = SqlDateStruct {
+            year: 2024,
+            month: 2,
+            day: 29,
+        };
         let p = param(
-            crate::api::odbc_types::SQL_C_FLOAT,
-            &mut val as *mut f32 as *mut c_void,
+            SQL_C_TYPE_DATE,
+            (&mut date as *mut SqlDateStruct).cast(),
             &mut ind,
         );
-        let err = read(&p).unwrap_err();
-        assert_eq!(
-            err,
-            ParamBuildError::UnsupportedCType(crate::api::odbc_types::SQL_C_FLOAT)
+        let Some(AppValue::DateTime(p)) = read(&p).unwrap() else {
+            panic!("expected a DateTime value");
+        };
+        assert_eq!((p.year, p.month, p.day), (2024, 2, 29));
+        assert_eq!((p.has_date, p.has_time, p.has_tz), (true, false, false));
+
+        let mut time = SqlTimeStruct {
+            hour: 13,
+            minute: 45,
+            second: 30,
+        };
+        let p = param(
+            SQL_C_TYPE_TIME,
+            (&mut time as *mut SqlTimeStruct).cast(),
+            &mut ind,
         );
+        let Some(AppValue::DateTime(p)) = read(&p).unwrap() else {
+            panic!("expected a DateTime value");
+        };
+        assert_eq!((p.hour, p.minute, p.second, p.fraction_ns), (13, 45, 30, 0));
+        assert_eq!((p.has_date, p.has_time, p.has_tz), (false, true, false));
+
+        let mut t2 = SqlSsTime2Struct {
+            hour: 13,
+            minute: 45,
+            second: 30,
+            fraction: 123_000_000,
+        };
+        let p = param(
+            SQL_C_SS_TIME2,
+            (&mut t2 as *mut SqlSsTime2Struct).cast(),
+            &mut ind,
+        );
+        let Some(AppValue::DateTime(p)) = read(&p).unwrap() else {
+            panic!("expected a DateTime value");
+        };
+        assert_eq!(p.fraction_ns, 123_000_000);
+        assert_eq!((p.has_date, p.has_time, p.has_tz), (false, true, false));
+
+        let mut ts = SqlTimestampStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 12,
+            minute: 30,
+            second: 45,
+            fraction: 500_000_000,
+        };
+        let p = param(
+            SQL_C_TYPE_TIMESTAMP,
+            (&mut ts as *mut SqlTimestampStruct).cast(),
+            &mut ind,
+        );
+        let Some(AppValue::DateTime(p)) = read(&p).unwrap() else {
+            panic!("expected a DateTime value");
+        };
+        assert_eq!(
+            (p.year, p.day, p.second, p.fraction_ns),
+            (2024, 15, 45, 500_000_000)
+        );
+        assert_eq!((p.has_date, p.has_time, p.has_tz), (true, true, false));
+
+        let mut dto = SqlSsTimestampoffsetStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 12,
+            minute: 30,
+            second: 0,
+            fraction: 0,
+            timezone_hour: -5,
+            timezone_minute: -30,
+        };
+        let p = param(
+            SQL_C_SS_TIMESTAMPOFFSET,
+            (&mut dto as *mut SqlSsTimestampoffsetStruct).cast(),
+            &mut ind,
+        );
+        let Some(AppValue::DateTime(p)) = read(&p).unwrap() else {
+            panic!("expected a DateTime value");
+        };
+        assert_eq!((p.tz_hour, p.tz_minute), (-5, -30));
+        assert_eq!((p.has_date, p.has_time, p.has_tz), (true, true, true));
+
+        // An application struct carries no declared precision, so the wire scale
+        // comes from `DecimalDigits` rather than from here.
+        assert_eq!(p.scale, 0);
+    }
+
+    /// An impossible date is carried through rather than rejected here: the
+    /// converter owns the `22007`, and a reader that silently normalised would
+    /// take that decision away from it.
+    #[test]
+    fn an_impossible_date_survives_the_read_unchanged() {
+        let mut ind: SqlLen = 0;
+        let mut date = SqlDateStruct {
+            year: 2023,
+            month: 2,
+            day: 30,
+        };
+        let p = param(
+            SQL_C_TYPE_DATE,
+            (&mut date as *mut SqlDateStruct).cast(),
+            &mut ind,
+        );
+        let Some(AppValue::DateTime(p)) = read(&p).unwrap() else {
+            panic!("expected a DateTime value");
+        };
+        assert_eq!((p.year, p.month, p.day), (2023, 2, 30));
+    }
+
+    /// The scalar structs are read with `read_unaligned` for the same reason the
+    /// integer buffers are: ODBC promises no alignment, and a plain read of a
+    /// misaligned struct is UB on every target.
+    #[test]
+    fn misaligned_scalar_buffers_are_read() {
+        #[repr(align(8))]
+        struct Backing([u8; 64]);
+        let mut backing = Backing([0u8; 64]);
+        let mut ind: SqlLen = 0;
+
+        let ts = SqlTimestampStruct {
+            year: 2024,
+            month: 6,
+            day: 15,
+            hour: 12,
+            minute: 30,
+            second: 45,
+            fraction: 500_000_000,
+        };
+        let ptr = unsafe { backing.0.as_mut_ptr().add(1) };
+        unsafe { (ptr as *mut SqlTimestampStruct).write_unaligned(ts) };
+        let p = param(SQL_C_TYPE_TIMESTAMP, ptr as *mut c_void, &mut ind);
+        let Some(AppValue::DateTime(got)) = read(&p).unwrap() else {
+            panic!("expected a DateTime value");
+        };
+        assert_eq!((got.year, got.month, got.day), (2024, 6, 15));
+        assert_eq!(got.fraction_ns, 500_000_000);
+
+        let ptr = unsafe { backing.0.as_mut_ptr().add(3) };
+        unsafe { (ptr as *mut f64).write_unaligned(1.5) };
+        let p = param(SQL_C_DOUBLE, ptr as *mut c_void, &mut ind);
+        assert_eq!(read(&p).unwrap(), Some(AppValue::Double(1.5)));
     }
 
     #[test]
@@ -521,25 +830,31 @@ mod tests {
         );
     }
 
-    /// Both pointers null is the case msodbcsql rejects: without an indicator
-    /// the parameter is not NULL, so there is a value to send and nowhere to
-    /// read it from.
+    /// The null-buffer rule, measured on retail 18.6.2.1 across every shape:
+    /// a variable-length C type with a zero length is NULL, everything else is
+    /// `HY090`.
     #[test]
-    fn non_null_parameter_without_a_value_buffer_is_rejected() {
-        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_SLONG] {
-            let p = param(c_type, std::ptr::null_mut(), std::ptr::null_mut());
-            assert_eq!(
-                read(&p).unwrap_err(),
-                ParamBuildError::NullValuePointer,
-                "c_type {c_type}"
-            );
+    fn a_null_value_buffer_follows_the_zero_length_rule() {
+        // Variable-length C types with a zero length: SQL NULL.
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {
+            let mut zero: SqlLen = 0;
+            let p = param(c_type, std::ptr::null_mut(), &mut zero);
+            assert_eq!(read(&p).unwrap(), None, "c_type {c_type}");
         }
-        // An explicit length does not make the missing buffer readable either.
-        let mut ind: SqlLen = 4;
-        let p = param(SQL_C_SLONG, std::ptr::null_mut(), &mut ind);
-        let err = read(&p).unwrap_err();
-        assert_eq!(err, ParamBuildError::NullValuePointer);
-        assert_eq!(err.diag().state, *b"HY009");
+
+        // Same C type, non-zero length: HY090.
+        let mut four: SqlLen = 4;
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut four);
+        assert_eq!(read(&p).unwrap_err().diag().state, *b"HY090");
+
+        // A fixed-width C type never carries a length, so even zero is HY090.
+        let mut zero: SqlLen = 0;
+        let p = param(SQL_C_SLONG, std::ptr::null_mut(), &mut zero);
+        assert_eq!(read(&p).unwrap_err().diag().state, *b"HY090");
+
+        // No indicator at all means SQL_NTS, not zero.
+        let p = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(read(&p).unwrap_err().diag().state, *b"HY090");
     }
 
     /// Pins the helpers' own length handling. The null-pointer and negative-length
