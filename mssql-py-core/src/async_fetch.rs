@@ -439,21 +439,8 @@ fn fetch<'py>(
 
         let (result, info_messages, has_open_batch, connection_dead) = {
             let mut client = client.lock().await;
-            let mut result = fetch_rows_on_client(&mut client, limit).await;
-            let mut has_open_batch = client.has_open_batch();
-            if let Ok(batch) = &result
-                && !fetch_guard.complete(batch.exhausted, has_open_batch)
-            {
-                if has_open_batch {
-                    let _ = client
-                        .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
-                        .await;
-                }
-                result = Err(Error::OperationCancelledError(
-                    "Fetch was cancelled".to_string(),
-                ));
-                has_open_batch = client.has_open_batch();
-            }
+            let result = fetch_rows_on_client(&mut client, limit).await;
+            let has_open_batch = client.has_open_batch();
             let info_messages = if matches!(result, Err(Error::SqlServerError { .. })) {
                 client.take_info_messages()
             } else {
@@ -474,6 +461,25 @@ fn fetch<'py>(
                 } else {
                     FetchStatus::Ready
                 });
+                if !fetch_guard.complete(batch.exhausted, has_open_batch) {
+                    let (has_open_batch, connection_dead) = {
+                        let mut client = client.lock().await;
+                        if client.has_open_batch() {
+                            let _ = client
+                                .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
+                                .await;
+                        }
+                        (client.has_open_batch(), client.is_connection_dead())
+                    };
+                    fetch_guard.fail(has_open_batch || connection_dead);
+                    fetch_state.set(FetchStatus::NoResultSet);
+                    return Err(map_fetch_error(
+                        operation,
+                        Error::OperationCancelledError("Fetch was cancelled".to_string()),
+                        Vec::new(),
+                        started.elapsed().as_millis(),
+                    ));
+                }
                 let materialization_started = Instant::now();
                 let mut materialization_guard =
                     MaterializationGuard::new(operation, materialization_dispatch);
@@ -647,28 +653,12 @@ pub(crate) fn nextset<'py>(
 
         let (result, info_messages, has_open_batch, connection_dead) = {
             let mut client = client.lock().await;
-            let mut result = client.advance().await.map(|result| {
+            let result = client.advance().await.map(|result| {
                 let metadata =
                     matches!(result, StatementResult::Rows).then(|| client.get_metadata().clone());
                 (result, metadata)
             });
-            let mut has_open_batch = client.has_open_batch();
-            if let Ok((statement_result, _)) = &result
-                && !fetch_guard.complete(
-                    !matches!(statement_result, StatementResult::Rows),
-                    has_open_batch,
-                )
-            {
-                if has_open_batch {
-                    let _ = client
-                        .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
-                        .await;
-                }
-                result = Err(Error::OperationCancelledError(
-                    "Result-set advance was cancelled".to_string(),
-                ));
-                has_open_batch = client.has_open_batch();
-            }
+            let has_open_batch = client.has_open_batch();
             let info_messages = if matches!(result, Err(Error::SqlServerError { .. })) {
                 client.take_info_messages()
             } else {
@@ -701,7 +691,30 @@ pub(crate) fn nextset<'py>(
                 };
 
                 let materialization_started = Instant::now();
-                match materialize(metadata).await {
+                let materialized = materialize(metadata).await;
+                if !fetch_guard.complete(!has_rows, has_open_batch) {
+                    let (has_open_batch, connection_dead) = {
+                        let mut client = client.lock().await;
+                        if client.has_open_batch() {
+                            let _ = client
+                                .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
+                                .await;
+                        }
+                        (client.has_open_batch(), client.is_connection_dead())
+                    };
+                    fetch_guard.fail(has_open_batch || connection_dead);
+                    future_fetch_state.set(FetchStatus::NoResultSet);
+                    future_description_state.replace(None);
+                    return Err(map_nextset_error(
+                        Error::OperationCancelledError(
+                            "Result-set advance was cancelled".to_string(),
+                        ),
+                        Vec::new(),
+                        started.elapsed().as_millis(),
+                    ));
+                }
+
+                match materialized {
                     Ok(description) => {
                         future_description_state.replace(description);
                         future_fetch_state.set(next_fetch_status);

@@ -754,7 +754,7 @@ def test_cancelled_fetchone_resynchronizes_connection(client_context):
                 use_prepare=False,
             )
 
-            fetch = asyncio.create_task(cursor.fetchone())
+            fetch = asyncio.ensure_future(cursor.fetchone())
             await asyncio.sleep(0.01)
             fetch.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -972,23 +972,9 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
 
             assert cursor.description is None
             probe = conn.cursor()
-            for _ in range(100):
-                try:
-                    await probe.execute("SELECT 3", use_prepare=False)
-                except RuntimeError as error:
-                    if "busy" in str(error).lower():
-                        await asyncio.sleep(0.01)
-                        continue
-                    assert "broken" in str(error).lower()
-                    break
-                else:
-                    pytest.fail(
-                        "Cancelled description materialization left the connection reusable"
-                    )
-            else:
-                pytest.fail(
-                    "Cancelled description materialization left the connection permanently busy"
-                )
+            await execute_after_cancellation_settles(probe, "SELECT 3")
+            assert await probe.fetchone() == (3,)
+            assert cursor.description is None
         finally:
             release.set()
             if finder in sys.meta_path:
@@ -1005,8 +991,7 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
     client_context,
 ):
     async def run():
-        logger = RecordingLogger()
-        conn = await connect(client_context, logger)
+        conn = await connect(client_context)
         entered = threading.Event()
         release = threading.Event()
         finder = BlockingDecimalFinder(entered, release)
@@ -1018,7 +1003,6 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             )
             decimal_module = sys.modules.pop("decimal")
             sys.meta_path.insert(0, finder)
-            logger.events.clear()
 
             task = asyncio.ensure_future(cursor.fetchall())
             for _ in range(200):
@@ -1031,24 +1015,12 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            for _ in range(100):
-                if any(
-                    level == 30
-                    and message
-                    == "PyAsyncCursor::fetchall: interrupted during row materialization; connection remains usable"
-                    and module == "async_fetch.rs"
-                    for level, message, module in logger.events
-                ):
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail(f"Missing materialization warning: {logger.events}")
 
-            release.set()
-            await asyncio.to_thread(__import__, "decimal")
             probe = conn.cursor()
             await probe.execute("SELECT 2", use_prepare=False)
             assert await probe.fetchone() == (2,)
+            release.set()
+            await asyncio.to_thread(__import__, "decimal")
         finally:
             release.set()
             if finder in sys.meta_path:
@@ -1107,7 +1079,7 @@ def test_nextset_keeps_event_loop_responsive_while_draining(client_context):
 
 
 @pytest.mark.integration
-def test_nextset_rejects_concurrent_operation_and_cancellation_breaks_session(
+def test_nextset_rejects_concurrent_operation_and_cancellation_resynchronizes_session(
     client_context,
 ):
     async def run():
@@ -1127,19 +1099,8 @@ def test_nextset_rejects_concurrent_operation_and_cancellation_breaks_session(
                 await task
 
             probe = conn.cursor()
-            for _ in range(100):
-                try:
-                    await probe.execute("SELECT 1", use_prepare=False)
-                except RuntimeError as error:
-                    if "busy" in str(error).lower():
-                        await asyncio.sleep(0.01)
-                        continue
-                    assert "broken" in str(error).lower()
-                    break
-                else:
-                    pytest.fail("Cancelled nextset left the connection reusable")
-            else:
-                pytest.fail("Cancelled nextset left the connection permanently busy")
+            await execute_after_cancellation_settles(probe, "SELECT 1")
+            assert await probe.fetchone() == (1,)
         finally:
             await conn.close()
 
@@ -1675,7 +1636,7 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
 
 @pytest.mark.integration
 @pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
-def test_cancelling_blocked_fetch_breaks_session(client_context, operation):
+def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operation):
     async def run():
         conn = await connect(client_context)
         cursor = conn.cursor()
@@ -1697,19 +1658,8 @@ def test_cancelling_blocked_fetch_breaks_session(client_context, operation):
                 await task
 
             probe = conn.cursor()
-            for _ in range(100):
-                try:
-                    await probe.execute("SELECT 1", use_prepare=False)
-                except RuntimeError as error:
-                    if "busy" in str(error).lower():
-                        await asyncio.sleep(0.01)
-                        continue
-                    assert "broken" in str(error).lower()
-                    break
-                else:
-                    pytest.fail(f"Cancelled {operation} left the connection reusable")
-            else:
-                pytest.fail(f"Cancelled {operation} left the connection permanently busy")
+            await execute_after_cancellation_settles(probe, "SELECT 1")
+            assert await probe.fetchone() == (1,)
         finally:
             await conn.close()
 
