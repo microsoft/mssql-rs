@@ -4157,25 +4157,52 @@ impl TdsClient {
         self.row_already_positioned = false;
         self.parked_token = None;
         self.current_result_set_has_been_read_till_end = true;
+        self.current_result_ended_with_done_in_proc = false;
         self.current_command_ce_setting = ExecutionColumnEncryptionSetting::UseConnectionSetting;
         self.execution_context.set_has_open_batch(false);
     }
 
-    /// Applies client-visible control tokens consumed by the transport's drain.
+    /// Applies connection-level control tokens consumed by an ATTENTION drain.
+    ///
+    /// Result-local output and status are intentionally discarded: cancellation
+    /// normalization clears them, and finalizing an encrypted return value could
+    /// fail and retire a stream that already reached DONE_ATTN.
+    fn apply_attention_side_effect(&mut self, token: Tokens) -> TdsResult<()> {
+        match token {
+            Tokens::Error(error_token) => {
+                let _ = self.record_error_token(&error_token);
+            }
+            Tokens::Info(info_token) => self.capture_info_message(&info_token),
+            Tokens::EnvChange(env_change) => {
+                if env_change.sub_type == EnvChangeTokenSubType::ResetConnection {
+                    self.on_reset_connection_ack();
+                }
+                self.execution_context
+                    .capture_change_property(&env_change, &mut self.negotiated_settings)?;
+            }
+            Tokens::SessionState(session_state) => {
+                self.recovery_context
+                    .process_session_state(&session_state)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Applies client-visible session state consumed by the transport's drain.
     ///
     /// The transport must read through DONE_ATTN to realign the wire, but
-    /// `TdsClient` still owns transaction, environment, and recovery state.
-    /// Replaying those tokens here keeps that state synchronized with the server.
+    /// `TdsClient` still owns transaction, environment, recovery, and reset
+    /// acknowledgement state.
     fn consume_attention_settlement(&mut self) -> bool {
         let Some(settlement) = self.transport.take_attention_settlement() else {
             return false;
         };
 
-        let mut ignored_errors = Vec::new();
         for token in settlement.tokens {
             if let Err(error) = self
                 .observe_response_token(&token)
-                .and_then(|_| self.apply_drain_side_effect(token, &mut ignored_errors))
+                .and_then(|_| self.apply_attention_side_effect(token))
             {
                 warn!(?error, "Failed to apply state from the attention drain");
                 self.retire_after_failed_drain(&error);
@@ -7044,6 +7071,7 @@ impl TdsClient {
     /// * `Err(_)` - Error sending attention or reading response
     #[instrument(skip(self), level = "info")]
     pub async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool> {
+        self.interrupted_read_settled = false;
         let parser_context = match self.current_metadata.as_ref() {
             Some(metadata) => ParserContext::ColumnMetadata(Arc::clone(metadata), None),
             None => ParserContext::ColumnEncryption(
@@ -10790,6 +10818,24 @@ mod tests {
     }
 
     #[test]
+    fn attention_settlement_discards_encrypted_return_value_without_finalizing() {
+        let mut client = create_test_client();
+        client.current_command_ce_setting = ExecutionColumnEncryptionSetting::Enabled;
+        let token = ae_return_value_token(
+            "@out",
+            ColumnValues::Bytes(vec![1, 2, 3]),
+            Some(ae_crypto_metadata()),
+        );
+
+        client
+            .apply_attention_side_effect(Tokens::ReturnValue(token))
+            .unwrap();
+
+        assert!(client.return_values.is_empty());
+        assert!(!client.transport.connection_known_dead());
+    }
+
+    #[test]
     fn finalize_return_value_decrypts_null_output() {
         // A NULL encrypted output parameter decrypts to NULL without invoking the
         // cipher.
@@ -12179,6 +12225,7 @@ mod tests {
         let mut client = create_test_client_with_any_transport(AnyTransport::network(transport));
         client.current_metadata = Some(int_column_metadata(1));
         client.current_result_set_has_been_read_till_end = false;
+        client.current_result_ended_with_done_in_proc = true;
         client.execution_context.set_has_open_batch(true);
         client.remaining_request_timeout = Some(Duration::from_secs(30));
         let cancellation = CancelHandle::new();
@@ -12194,6 +12241,7 @@ mod tests {
         ));
         assert!(client.current_metadata.is_none());
         assert!(client.current_result_set_has_been_read_till_end);
+        assert!(!client.current_result_ended_with_done_in_proc);
         assert!(client.remaining_request_timeout.is_none());
         assert!(client.cancel_handle.is_none());
         assert!(!client.command_is_busy());
