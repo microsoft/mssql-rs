@@ -376,6 +376,89 @@ pub(crate) fn bind_parameters(
     bind_positional(operation, parameters.iter(), hints)
 }
 
+/// Rewritten SQL and placeholder metadata reused for every ExecuteMany row.
+pub(crate) struct ParameterBindingPlan {
+    operation: String,
+    placeholders: Vec<Placeholder>,
+    named: bool,
+}
+
+impl ParameterBindingPlan {
+    pub(crate) fn new(operation: &str, named: bool) -> PyResult<Self> {
+        let (operation, placeholders) = rewrite_placeholders(operation, named)?;
+        Ok(Self {
+            operation,
+            placeholders,
+            named,
+        })
+    }
+
+    pub(crate) fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub(crate) fn bind_row(
+        &self,
+        row: &Bound<'_, PyAny>,
+        hints: Option<&[ParameterHint]>,
+    ) -> PyResult<(Vec<RpcParameter>, Vec<ParameterMetadata>)> {
+        validate_hint_count(hints, self.placeholders.len())?;
+        if self.named {
+            let values = row.cast::<PyDict>()?;
+            if self.placeholders.is_empty() && !values.is_empty() {
+                return Err(PyTypeError::new_err(format!(
+                    "The SQL contains no parameter markers, but {} parameters were supplied. \
+                     Named parameters use the %(name)s style.",
+                    values.len()
+                )));
+            }
+            let bound = self
+                .placeholders
+                .iter()
+                .enumerate()
+                .map(|(index, placeholder)| {
+                    let source_name = placeholder
+                        .source_name
+                        .as_ref()
+                        .expect("named placeholders include source names");
+                    let value = values
+                        .get_item(source_name)?
+                        .ok_or_else(|| PyKeyError::new_err(source_name.clone()))?;
+                    rpc_parameter(
+                        placeholder.rpc_name.clone(),
+                        &value,
+                        hints.and_then(|hints| hints.get(index)),
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            return Ok(bound.into_iter().unzip());
+        }
+
+        let values = row.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        if self.placeholders.len() != values.len() {
+            return Err(PyTypeError::new_err(format!(
+                "The SQL contains {} parameter markers, but {} parameters were supplied",
+                self.placeholders.len(),
+                values.len()
+            )));
+        }
+        let bound = self
+            .placeholders
+            .iter()
+            .zip(values)
+            .enumerate()
+            .map(|(index, (placeholder, value))| {
+                rpc_parameter(
+                    placeholder.rpc_name.clone(),
+                    &value,
+                    hints.and_then(|hints| hints.get(index)),
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(bound.into_iter().unzip())
+    }
+}
+
 /// Parses `setinputsizes()` entries into validated conversion hints.
 ///
 /// Each entry may be a SQL type integer or `(sql_type[, size[, scale]])`.
