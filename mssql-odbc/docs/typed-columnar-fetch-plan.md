@@ -286,18 +286,26 @@ Recorded so they are not re-tried.
 
 **Windows, `mssql-python`.** Build the bindings from source the way the Linux leg does (`mssql_python/pybind/build.bat x64`); it needs `CUSTOM_PYTHON_LIB_DIR` pointed at the base interpreter's `libs\` because a venv has no `python3xx.lib`. Then overwrite `mssql_python_odbc/libs/windows/x64/msodbcsql18.dll` in **every** copy the interpreter could resolve — the in-repo package wins on `sys.path` when pytest runs from the repo root, and the `site-packages` copy otherwise — leaving `mssql-auth.dll` and the rest of that directory in place.
 
-There is **no Windows equivalent of the Linux 42-file suite result yet.** A per-file runner over the same 42 files gets through `test_000_dependencies` (passed), `test_001_globals` (failed) and `test_002_types` (crashed) and then hangs indefinitely inside `test_003_connection`, which exercises connection pooling. The hang survives a per-file kill, so producing a comparable Windows count needs a runner that tree-kills a wedged pytest child. That is worth doing, but it is a testing-infrastructure task for P5 rather than a P4 blocker — none of the P4 conclusions rest on it.
+**Windows, 42-file suite.** A per-file run over the same 42 files completes, with zero timeouts. Getting here needed a driver fix rather than harness work: the run used to stop dead in `test_003_connection`, and because that file exercises connection pooling, the wedge was first read as a pooling defect and the missing Windows count was filed as a P5 task for a runner that tree-kills a hung pytest child ([Task 46582](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46582)). Both readings were wrong. The hang was in teardown, not pooling, and not specific to that file — any process that used the driver from a thread other than the one calling `ExitProcess` wedged on the way out, so `test_003_connection` was just the first file unlucky enough to do it. It is fixed ([AB#47510](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47510)); see [Teardown under `LoadLibraryW`](#teardown-under-loadlibraryw) below for the mechanism.
 
-#### Unrelated observation
+A tree-killing runner is therefore no longer needed to produce a Windows count, though it is still worth building so that a future wedge costs one file instead of the whole run.
 
-Every `mssql-python` process using this driver prints, after its last statement completes and the connection closes:
+#### Teardown under `LoadLibraryW`
+
+Every `mssql-python` process using this driver used to print, after its last statement completed and the connection closed:
 
 ```
 thread '<unnamed>' panicked at library\std\src\thread\lifecycle.rs:247:14:
 threads should not terminate unexpectedly
 ```
 
-It does not affect results — the process still exits 0 — and it does not appear when the same driver is driven through the Driver Manager, so it looks specific to teardown under direct `LoadLibraryW` loading. Out of scope for P4; needs its own triage.
+It looked cosmetic — the process still exited 0 — and it did not appear when the same driver was driven through the Driver Manager, so it was filed as specific to teardown under direct `LoadLibraryW` loading. It was the benign face of a real defect, tracked and fixed as [AB#47510](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47510).
+
+`mssql_python`'s extension module frees its pooled ODBC handles from its CRT `onexit` table, which the loader runs from `DLL_PROCESS_DETACH` inside `LdrShutdownProcess`. `SQLFreeHandle` there released the last `Arc<Runtime>`, and `Runtime`'s teardown waits on its worker threads — threads Windows had already terminated. Whether that wait returned or not came down to which thread called `ExitProcess`: work done on the main thread produced the panic above and exited, work done on any other thread hung the process forever, after the workload had already succeeded. The Driver Manager never showed it because it, not the application, owns handle teardown.
+
+[#459](https://github.com/microsoft/mssql-rs/pull/459) addressed the panic with `Runtime::shutdown_background`, which skips the join. That is necessary but not sufficient, in two directions. During shutdown it still signals the scheduler and takes its locks, which a worker terminated mid-instruction may have been holding: measured against that build, both the main-thread and worker-thread cases hang, so it converted the visible panic into a silent hang on the one path that used to exit — `test_025_logging_concurrency_deadlock.py` went from one failure to two. And while the process is *alive* it is unsafe for the opposite reason, because returning from `SQLFreeHandle(ENV)` without waiting lets a host unload the DLL out from under a still-running runtime thread (AB#47831).
+
+Reproduced minimally as a single `connect()`/`close()` on a `threading.Thread`, and end to end by `tests/test_025_logging_concurrency_deadlock.py`, which passed against msodbcsql18 in 2s throughout. `SharedRuntime::drop` now picks its teardown by process state: leak the runtime outright — touching nothing — once `RtlDllShutdownInProgress` reports the loader is shutting the process down, and drop it normally, waiting for its threads, while the process is alive.
 
 
 ### P5 — Testing & end-to-end validation — Task [46582](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46582)
