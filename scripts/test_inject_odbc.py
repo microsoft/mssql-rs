@@ -125,11 +125,16 @@ def test_inject_preserves_entry_modes(tmp_path):
     inject.inject_wheel(wheel, drivers)
 
     with zipfile.ZipFile(wheel, "r") as zf:
-        modes = {i.filename: (i.external_attr >> 16) & 0o777 for i in zf.infolist()}
+        infos = {i.filename: i for i in zf.infolist()}
+    modes = {n: (i.external_attr >> 16) & 0o777 for n, i in infos.items()}
+    driver_arc = "mssql_py_core/libs/windows/x64/mssqlodbc.dll"
     # Pre-existing entry keeps its stored mode (not clobbered to 0o600).
     assert modes["mssql_py_core/_core.pyd"] == 0o755
     # Injected driver gets an explicit world-readable, non-executable mode.
-    assert modes["mssql_py_core/libs/windows/x64/mssqlodbc.dll"] == 0o644
+    assert modes[driver_arc] == 0o644
+    # ...and a fixed timestamp so the same driver is byte-identical across the
+    # per-Python-version wheels that receive it.
+    assert infos[driver_arc].date_time == (1980, 1, 1, 0, 0, 0)
 
 
 def test_inject_missing_driver_fails(tmp_path):
