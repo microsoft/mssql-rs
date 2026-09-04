@@ -22,7 +22,9 @@ use tracing::instrument::WithSubscriber;
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::{InternalError, map_tds_error};
-use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
+use crate::async_session::{
+    AsyncConnectionState, ClaimError, CursorId, FetchCompletion, OperationId,
+};
 use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::row_writer::PyRowWriter;
 
@@ -178,15 +180,29 @@ impl FetchGuard {
 
     /// Publishes the fetch result only if cancellation has not already won.
     ///
-    /// The return value lets the detached worker suppress stale rows and settle
-    /// ATTENTION when Python cancels while protocol work is completing.
-    fn complete(&mut self, result_set_exhausted: bool, has_open_batch: bool) -> bool {
-        self.completed = self.session_state.finish_fetch(
+    /// Only explicit cancellation leaves the guard armed for ATTENTION
+    /// settlement. An operation already released elsewhere needs no cleanup.
+    fn complete(&mut self, result_set_exhausted: bool, has_open_batch: bool) -> FetchCompletion {
+        let completion = self.session_state.finish_fetch(
             self.operation_id,
             result_set_exhausted,
             has_open_batch,
         );
-        self.completed
+        self.completed = completion != FetchCompletion::CancellationRequested;
+        completion
+    }
+
+    fn complete_without_protocol_cancellation(
+        &mut self,
+        result_set_exhausted: bool,
+        has_open_batch: bool,
+    ) {
+        match self.complete(result_set_exhausted, has_open_batch) {
+            FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+            FetchCompletion::CancellationRequested => {
+                self.fail(false);
+            }
+        }
     }
 
     /// Releases session ownership after a failed fetch.
@@ -551,24 +567,27 @@ fn fetch<'py>(
                 } else {
                     FetchStatus::Ready
                 };
-                if !fetch_guard.complete(batch.exhausted, has_open_batch) {
-                    let (has_open_batch, connection_dead) = {
-                        let mut client = client.lock().await;
-                        if client.has_open_batch() {
-                            let _ = client
-                                .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
-                                .await;
-                        }
-                        (client.has_open_batch(), client.is_connection_dead())
-                    };
-                    fetch_guard.fail(has_open_batch || connection_dead);
-                    fetch_state.set(FetchStatus::NoResultSet);
-                    return Err(map_fetch_error(
-                        operation,
-                        Error::OperationCancelledError("Fetch was cancelled".to_string()),
-                        Vec::new(),
-                        started.elapsed().as_millis(),
-                    ));
+                match fetch_guard.complete(batch.exhausted, has_open_batch) {
+                    FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+                    FetchCompletion::CancellationRequested => {
+                        let (has_open_batch, connection_dead) = {
+                            let mut client = client.lock().await;
+                            if client.has_open_batch() {
+                                let _ = client
+                                    .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
+                                    .await;
+                            }
+                            (client.has_open_batch(), client.is_connection_dead())
+                        };
+                        fetch_guard.fail(has_open_batch || connection_dead);
+                        fetch_state.set(FetchStatus::NoResultSet);
+                        return Err(map_fetch_error(
+                            operation,
+                            Error::OperationCancelledError("Fetch was cancelled".to_string()),
+                            Vec::new(),
+                            started.elapsed().as_millis(),
+                        ));
+                    }
                 }
                 fetch_state.set(fetch_status);
                 let materialization_started = Instant::now();
@@ -679,7 +698,7 @@ fn fetch_buffered<'py>(
         } else {
             FetchStatus::Ready
         });
-        fetch_guard.complete(exhausted, !exhausted || has_next);
+        fetch_guard.complete_without_protocol_cancellation(exhausted, !exhausted || has_next);
         let returned = rows.len();
         let rows = materialize_rows(output, rows).await?;
         let elapsed_ms = started.elapsed().as_millis();
@@ -870,26 +889,29 @@ pub(crate) fn nextset<'py>(
                 let materialized = materialize(metadata).await;
                 // Description conversion does not consume a row result. Keep
                 // cursor ownership so a later nextset can drain those rows.
-                if !fetch_guard.complete(!has_rows, has_open_batch) {
-                    let (has_open_batch, connection_dead) = {
-                        let mut client = client.lock().await;
-                        if client.has_open_batch() {
-                            let _ = client
-                                .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
-                                .await;
-                        }
-                        (client.has_open_batch(), client.is_connection_dead())
-                    };
-                    fetch_guard.fail(has_open_batch || connection_dead);
-                    future_fetch_state.set(FetchStatus::NoResultSet);
-                    future_description_state.replace(None);
-                    return Err(map_nextset_error(
-                        Error::OperationCancelledError(
-                            "Result-set advance was cancelled".to_string(),
-                        ),
-                        Vec::new(),
-                        started.elapsed().as_millis(),
-                    ));
+                match fetch_guard.complete(!has_rows, has_open_batch) {
+                    FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+                    FetchCompletion::CancellationRequested => {
+                        let (has_open_batch, connection_dead) = {
+                            let mut client = client.lock().await;
+                            if client.has_open_batch() {
+                                let _ = client
+                                    .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
+                                    .await;
+                            }
+                            (client.has_open_batch(), client.is_connection_dead())
+                        };
+                        fetch_guard.fail(has_open_batch || connection_dead);
+                        future_fetch_state.set(FetchStatus::NoResultSet);
+                        future_description_state.replace(None);
+                        return Err(map_nextset_error(
+                            Error::OperationCancelledError(
+                                "Result-set advance was cancelled".to_string(),
+                            ),
+                            Vec::new(),
+                            started.elapsed().as_millis(),
+                        ));
+                    }
                 }
 
                 match materialized {
@@ -1006,7 +1028,7 @@ fn next_buffered_set<'py>(
         } else {
             FetchStatus::Exhausted
         });
-        fetch_guard.complete(true, has_result);
+        fetch_guard.complete_without_protocol_cancellation(true, has_result);
         Ok(has_result)
     };
     let future = in_cursor_operation_span(future, cursor_id, operation_id, "nextset", "advancing");
@@ -1038,7 +1060,9 @@ mod tests {
         map_nextset_error,
     };
     use crate::async_fetch::BufferedResults;
-    use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+    use crate::async_session::{
+        AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion,
+    };
 
     fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64) {
         let state = Arc::new(AsyncConnectionState::new());
@@ -1079,6 +1103,36 @@ mod tests {
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Broken);
+    }
+
+    #[test]
+    fn completing_a_fetch_that_no_longer_owns_the_session_disarms_its_guard() {
+        let (state, operation_id) = claimed_fetch();
+        state.release_operation(operation_id);
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
+
+        assert_eq!(guard.complete(false, true), FetchCompletion::NoLongerActive);
+        assert!(guard.completed);
+        drop(guard);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn cancelled_fetch_keeps_its_guard_armed_until_settlement() {
+        let (state, operation_id) = claimed_fetch();
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
+        assert!(state.cancel_fetch(operation_id));
+
+        assert_eq!(
+            guard.complete(false, true),
+            FetchCompletion::CancellationRequested
+        );
+        assert!(!guard.completed);
+
+        guard.fail(false);
+        assert!(state.claim_execute(2).is_ok());
     }
 
     #[test]

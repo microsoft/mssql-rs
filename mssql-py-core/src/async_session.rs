@@ -30,6 +30,14 @@ pub(crate) struct FetchClaim {
     pub(crate) operation_id: OperationId,
 }
 
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FetchCompletion {
+    Published,
+    CancellationRequested,
+    NoLongerActive,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimError {
     Closing,
@@ -291,23 +299,24 @@ impl AsyncConnectionState {
 
     /// Publishes a completed fetch only while it still owns an uncancelled read.
     ///
-    /// A false result keeps ownership with the detached worker so it can settle
-    /// ATTENTION before another operation is allowed onto the TDS session.
+    /// Cancellation keeps ownership with the detached worker so it can settle
+    /// ATTENTION. A missing or mismatched operation has already been released and
+    /// needs no further protocol cleanup.
     pub(crate) fn finish_fetch(
         &self,
         operation_id: OperationId,
         result_set_exhausted: bool,
         has_open_batch: bool,
-    ) -> bool {
+    ) -> FetchCompletion {
         let mut state = self.lock();
         let Some(active) = state.active_operation.as_mut() else {
-            return false;
+            return FetchCompletion::NoLongerActive;
         };
         if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
-            return false;
+            return FetchCompletion::NoLongerActive;
         }
         if active.cancel_requested {
-            return false;
+            return FetchCompletion::CancellationRequested;
         }
 
         if !result_set_exhausted || has_open_batch {
@@ -315,7 +324,7 @@ impl AsyncConnectionState {
         } else {
             state.active_operation = None;
         }
-        true
+        FetchCompletion::Published
     }
 
     pub(crate) fn restore_fetch(&self, operation_id: OperationId) {
@@ -406,7 +415,9 @@ impl AsyncConnectionState {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AsyncConnectionState, ClaimError, ConnectionLifecycle, OperationPhase};
+    use super::{
+        AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion, OperationPhase,
+    };
 
     #[test]
     fn allocates_unique_cursor_ids() {
@@ -487,7 +498,10 @@ mod tests {
         assert_eq!(state.claim_fetch(2).unwrap_err(), ClaimError::Busy);
         assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
 
-        state.finish_fetch(fetch.operation_id, false, true);
+        assert_eq!(
+            state.finish_fetch(fetch.operation_id, false, true),
+            FetchCompletion::Published
+        );
         assert_eq!(
             state.lock().active_operation.as_ref().unwrap().phase,
             OperationPhase::Fetching
@@ -501,11 +515,17 @@ mod tests {
         state.finish_execute(execute.operation_id, true);
 
         let current_result_end = state.claim_fetch(1).unwrap();
-        state.finish_fetch(current_result_end.operation_id, true, true);
+        assert_eq!(
+            state.finish_fetch(current_result_end.operation_id, true, true),
+            FetchCompletion::Published
+        );
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
 
         let batch_end = state.claim_fetch(1).unwrap();
-        state.finish_fetch(batch_end.operation_id, true, false);
+        assert_eq!(
+            state.finish_fetch(batch_end.operation_id, true, false),
+            FetchCompletion::Published
+        );
         assert!(state.claim_execute(2).is_ok());
     }
 
@@ -534,10 +554,27 @@ mod tests {
         assert!(!state.cancel_fetch(fetch.operation_id));
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
 
-        assert!(!state.finish_fetch(fetch.operation_id, true, false));
+        assert_eq!(
+            state.finish_fetch(fetch.operation_id, true, false),
+            FetchCompletion::CancellationRequested
+        );
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
         state.release_operation(fetch.operation_id);
         assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn finished_fetch_distinguishes_an_already_released_operation() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+        state.abandon_cursor(1);
+
+        assert_eq!(
+            state.finish_fetch(fetch.operation_id, true, false),
+            FetchCompletion::NoLongerActive
+        );
     }
 
     #[test]
