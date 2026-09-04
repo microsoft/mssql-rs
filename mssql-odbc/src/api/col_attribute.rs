@@ -138,7 +138,7 @@ fn sql_col_attribute_w_safe(
             error!("SQLColAttributeW: env mutex poisoned");
             return SQL_ERROR;
         };
-        env_state.odbc_version == OdbcVersion::Odbc3_80
+        uses_3_80_variant_types(env_state.odbc_version)
     } else {
         false
     };
@@ -533,6 +533,10 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
         // Non-numeric columns have no radix.
         _ => 0,
     }
+}
+
+fn uses_3_80_variant_types(odbc_version: OdbcVersion) -> bool {
+    odbc_version == OdbcVersion::Odbc3_80
 }
 
 /// The C type a `sql_variant` value reports for `SQL_CA_SS_VARIANT_TYPE`.
@@ -1319,25 +1323,17 @@ mod tests {
             // A variant cannot carry these, so character is the fallback.
             (TdsDataType::Xml, SQL_C_CHAR, SQL_C_CHAR),
         ];
-        for version in [
-            OdbcVersion::Odbc2,
-            OdbcVersion::Odbc3,
-            OdbcVersion::Odbc3_80,
-        ] {
-            let uses_3_80_types = version == OdbcVersion::Odbc3_80;
-            for (base, before_3_80, in_3_80) in cases {
-                let expected = if uses_3_80_types {
-                    *in_3_80
-                } else {
-                    *before_3_80
-                };
-                assert_eq!(
-                    variant_c_type(*base, uses_3_80_types),
-                    expected,
-                    "{version:?} {base:?}"
-                );
-            }
+        for (base, before_3_80, in_3_80) in cases {
+            assert_eq!(variant_c_type(*base, false), *before_3_80, "{base:?}");
+            assert_eq!(variant_c_type(*base, true), *in_3_80, "{base:?}");
         }
+    }
+
+    #[test]
+    fn only_odbc_3_80_uses_extended_variant_types() {
+        assert!(!uses_3_80_variant_types(OdbcVersion::Odbc2));
+        assert!(!uses_3_80_variant_types(OdbcVersion::Odbc3));
+        assert!(uses_3_80_variant_types(OdbcVersion::Odbc3_80));
     }
 
     /// The success path: a variant column whose value has been probed reports

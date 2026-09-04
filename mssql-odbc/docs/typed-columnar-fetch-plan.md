@@ -132,6 +132,8 @@ Reading a `sql_variant` column takes three things, not one, and mssql-python nee
 2. `SQLGetData(col, SQL_C_BINARY, NULL, 0, &indicator)` must succeed. This is a length/NULL probe, not a data read; it is admitted while binary delivery stays unimplemented (a real buffer is still `HYC00`, tracked as Task [47239](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47239)).
 3. `SQLColAttribute(SQL_CA_SS_VARIANT_TYPE)` returns the C type of the value just probed. For ODBC 2 and 3, variant `time` and `datetimeoffset` values report `SQL_C_BINARY` because their SQL Server-specific C types require ODBC 3.8. This is metadata parity only: retrieving either value into a real binary buffer still returns `HYC00` under Task [47239](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/47239).
 
+Variant `date` and datetime-family values deliberately report the legacy C type codes `SQL_C_DATE` / `SQL_C_TIMESTAMP` (9/11), matching msodbcsql at every declared ODBC version, while `SQLDescribeCol` and `SQL_DESC_CONCISE_TYPE` continue to report the ODBC 3 SQL type codes `SQL_TYPE_DATE` / `SQL_TYPE_TIMESTAMP` (91/93).
+
 The underlying type is a property of the **value**, not the column — a variant column can hold a different type in every row — so it is carried up from the decoder rather than derived from metadata: `RowWriter` gained a defaulted `write_variant_base_type`, `CursorColumn::Value` carries the base type alongside the value, and `StmtState` clears it with the rest of the row-stream state. `ColumnValues` is deliberately untouched, which is what keeps this change out of the Python and Node bindings.
 
 ### P3 — SQLBindCol + block SQLFetchScroll — Task [46580](https://sqlclientdrivers.visualstudio.com/mssql-rs/_workitems/edit/46580)

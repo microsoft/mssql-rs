@@ -105,6 +105,7 @@ static SQLLEN NumericAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
 }
 
 static void ExpectVariantType(SQLHSTMT stmt, SQLUSMALLINT col, SQLLEN expected) {
+    SCOPED_TRACE("column " + std::to_string(col));
     SQLCHAR probe = 0;
     SQLLEN indicator = 0;
     ASSERT_SQL_OK(SQLGetData(stmt, col, SQL_C_BINARY, &probe, 0, &indicator),
@@ -531,12 +532,12 @@ TEST_F(ColAttributeOdbc2LiveTest, Odbc2TemporalVariantTypes) {
     ExecDirect(TEMPORAL_VARIANTS_QUERY);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    ExpectVariantType(stmt_, 1, SQL_C_DATE);
-    ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 5, SQL_C_BINARY);
-    ExpectVariantType(stmt_, 6, SQL_C_BINARY);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
 
     SQLCloseCursor(stmt_);
 }
@@ -545,12 +546,12 @@ TEST_F(ColAttributeOdbc3LiveTest, Odbc3TemporalVariantTypes) {
     ExecDirect(TEMPORAL_VARIANTS_QUERY);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    ExpectVariantType(stmt_, 1, SQL_C_DATE);
-    ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 5, SQL_C_BINARY);
-    ExpectVariantType(stmt_, 6, SQL_C_BINARY);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
 
     SQLCloseCursor(stmt_);
 }
@@ -559,12 +560,12 @@ TEST_F(ColAttributeLiveTest, Odbc38TemporalVariantTypes) {
     ExecDirect(TEMPORAL_VARIANTS_QUERY);
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    ExpectVariantType(stmt_, 1, SQL_C_DATE);
-    ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP);
-    ExpectVariantType(stmt_, 5, SQL_C_SS_TIME2);
-    ExpectVariantType(stmt_, 6, SQL_C_SS_TIMESTAMPOFFSET);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_SS_TIME2));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_SS_TIMESTAMPOFFSET));
 
     SQLCloseCursor(stmt_);
 }
