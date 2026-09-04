@@ -192,10 +192,10 @@ four measure that path.
   Manager, which rejects a `NULL` target with `HY009` before the driver sees the
   call. Both drivers treat the two forms identically.
 
-  Only base types whose reported C type is unambiguous are used. `mssql-odbc`
-  deliberately reports `SQL_C_CHAR` where msodbcsql reports `SQL_C_NUMERIC` for
-  decimal/money variants, and a benchmark that depended on that difference would
-  not be the same work on both drivers.
+  The exact numerics are not among the base types measured, but no longer for a
+  parity reason: since AB#47702 both drivers answer `SQL_C_NUMERIC` for
+  decimal/money variants, which the harness folds onto `SQL_C_CHAR` on either
+  driver. The column set is unchanged so existing baselines stay comparable.
 
 ## Measurement boundaries
 
