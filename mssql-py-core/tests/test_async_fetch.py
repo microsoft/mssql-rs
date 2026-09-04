@@ -16,6 +16,11 @@ from decimal import Decimal
 import mssql_py_core
 import pytest
 
+# Pytest invokes the outer synchronous test functions. Each nested `run`
+# coroutine contains the asynchronous scenario, and `asyncio.run(run())`
+# creates an event loop, drives that coroutine to completion, and closes the
+# loop before the test returns.
+
 
 class RecordingLogger:
     def __init__(self):
@@ -26,6 +31,13 @@ class RecordingLogger:
 
 
 class BlockingDecimalFinder(importlib.abc.MetaPathFinder):
+    """Pause decimal imports in a worker thread at a deterministic test point.
+
+    Row and description materialization import ``decimal`` outside the asyncio
+    event-loop thread. The two threading events let a test wait until that
+    import starts and release it after cancelling the Python-facing future.
+    """
+
     def __init__(self, entered, release):
         self.entered = entered
         self.release = release
@@ -33,6 +45,8 @@ class BlockingDecimalFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
         if fullname != "decimal":
             return None
+        # Tell the event-loop thread that materialization reached the intended
+        # cancellation point, then block only this worker thread.
         self.entered.set()
         self.release.wait()
         return importlib.machinery.PathFinder.find_spec(fullname, path, target)
@@ -47,7 +61,14 @@ async def connect(client_context, python_logger=None):
 
 
 async def execute_after_cancellation_settles(cursor, operation):
-    """Wait for the detached ATTENTION drain to release session ownership."""
+    """Run a probe after the detached ATTENTION drain releases the session.
+
+    Cancelling the Python future ends the caller's wait immediately, but the
+    Rust task keeps ownership while it sends ATTENTION and drains to DONE_ATTN.
+    During that short interval another execute reports ``busy``. Sleeping
+    yields control to the event loop so the detached task can make progress;
+    the deadline turns a lost ownership release into a clear test failure.
+    """
     deadline = asyncio.get_running_loop().time() + 6
     while True:
         try:
@@ -721,7 +742,14 @@ def test_nextset_reports_batch_end_after_terminal_no_rows(client_context, use_pr
 
 @pytest.mark.integration
 def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
-    """A timed-out nextset drains through DONE_ATTN so the session remains usable."""
+    """A timed-out nextset drains through DONE_ATTN and leaves a reusable session.
+
+    1. Execute a batch whose first result is deliberately expensive to drain.
+    2. Give ``nextset`` a 10 ms asyncio deadline; ``wait_for`` cancels its
+       awaitable when that deadline expires.
+    3. Let the detached Rust task finish ATTENTION settlement.
+    4. Execute and fetch a new query to prove the same session is synchronized.
+    """
 
     async def run():
         conn = await connect(client_context)
@@ -735,6 +763,7 @@ def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
             )
 
             with pytest.raises(asyncio.TimeoutError):
+                # wait_for requests cancellation of nextset when 10 ms elapse.
                 await asyncio.wait_for(cursor.nextset(), timeout=0.01)
 
             probe = conn.cursor()
@@ -748,7 +777,13 @@ def test_nextset_asyncio_timeout_resynchronizes_connection(client_context):
 
 @pytest.mark.integration
 def test_cancelled_fetchone_resynchronizes_connection(client_context):
-    """Cancelling a Python fetch does not abandon its in-flight TDS row parser."""
+    """Explicit cancellation does not abandon an in-flight TDS row parser.
+
+    1. Start fetching a large value so the row parser remains in progress.
+    2. Schedule the PyO3 Future and yield to let its read begin.
+    3. Cancel and await it so Python observes ``CancelledError``.
+    4. Wait for background ATTENTION settlement, then reuse the connection.
+    """
 
     async def run():
         conn = await connect(client_context)
@@ -759,8 +794,12 @@ def test_cancelled_fetchone_resynchronizes_connection(client_context):
                 use_prepare=False,
             )
 
+            # PyO3 returns an asyncio Future rather than a coroutine.
+            # ensure_future accepts either and gives the test a cancellable handle.
             fetch = asyncio.ensure_future(cursor.fetchone())
+            # Suspend this coroutine so the event loop can start the fetch.
             await asyncio.sleep(0.01)
+            # cancel() requests cancellation; awaiting delivers CancelledError.
             fetch.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await fetch
@@ -949,13 +988,21 @@ def test_nextset_logs_result_transitions(client_context):
 def test_nextset_cancellation_during_description_materialization_does_not_publish_rows(
     client_context,
 ):
-    """Late cancellation suppresses materialized metadata and preserves the session."""
+    """Cancellation during description conversion cannot publish stale metadata.
+
+    1. Force decimal metadata conversion through a deliberately blocked worker.
+    2. Schedule ``nextset`` and yield until that worker reaches the block.
+    3. Cancel the Python Future, then release the worker.
+    4. Verify cancellation wins the publication race: description stays empty.
+    5. Wait for ATTENTION settlement and prove the connection remains reusable.
+    """
 
     async def run():
         conn = await connect(client_context)
         entered = threading.Event()
         release = threading.Event()
         finder = BlockingDecimalFinder(entered, release)
+        # Removing the cached module guarantees materialization invokes finder.
         decimal_module = sys.modules.pop("decimal")
         sys.meta_path.insert(0, finder)
         try:
@@ -964,14 +1011,19 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
                 "SELECT 1; SELECT CAST(2 AS decimal(10, 2)) AS value",
                 use_prepare=False,
             )
+            # ensure_future schedules the PyO3 Future on the current event loop.
             task = asyncio.ensure_future(cursor.nextset())
             for _ in range(200):
                 if entered.is_set():
                     break
+                # Poll the cross-thread signal without blocking the event loop.
                 await asyncio.sleep(0.01)
             else:
                 pytest.fail("Description materialization did not start")
 
+            # Cancellation is requested while the detached task still owns the
+            # session. Releasing the worker lets it observe that request and
+            # settle ATTENTION without publishing its completed description.
             task.cancel()
             release.set()
             with pytest.raises(asyncio.CancelledError):
@@ -997,7 +1049,14 @@ def test_nextset_cancellation_during_description_materialization_does_not_publis
 def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusable(
     client_context,
 ):
-    """Python row conversion can be cancelled after protocol ownership is released."""
+    """Row conversion cancellation does not reclaim already-released TDS ownership.
+
+    1. Fetch the complete SQL row, then block its Python decimal conversion.
+    2. Cancel the Python-facing Future while conversion remains blocked.
+    3. Run another query before releasing the worker to prove protocol ownership
+       was released as soon as the row read completed.
+    4. Release the worker and wait for its import to finish during cleanup.
+    """
 
     async def run():
         conn = await connect(client_context)
@@ -1010,6 +1069,7 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             await cursor.execute(
                 "SELECT CAST(1 AS decimal(10, 2)) AS value", use_prepare=False
             )
+            # Force row conversion through the blocking import hook.
             decimal_module = sys.modules.pop("decimal")
             sys.meta_path.insert(0, finder)
 
@@ -1017,6 +1077,7 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             for _ in range(200):
                 if entered.is_set():
                     break
+                # Keep the event loop responsive while the worker is blocked.
                 await asyncio.sleep(0.01)
             else:
                 pytest.fail("Row materialization did not start")
@@ -1025,10 +1086,13 @@ def test_fetchall_cancellation_during_row_materialization_keeps_connection_reusa
             with pytest.raises(asyncio.CancelledError):
                 await task
 
+            # Do not release materialization yet: successful reuse here proves
+            # the completed TDS read no longer owns the session.
             probe = conn.cursor()
             await probe.execute("SELECT 2", use_prepare=False)
             assert await probe.fetchone() == (2,)
             release.set()
+            # Wait outside the event-loop thread for the import lock to clear.
             await asyncio.to_thread(__import__, "decimal")
         finally:
             release.set()
@@ -1091,7 +1155,13 @@ def test_nextset_keeps_event_loop_responsive_while_draining(client_context):
 def test_nextset_rejects_concurrent_operation_and_cancellation_resynchronizes_session(
     client_context,
 ):
-    """A busy nextset stays exclusive until its cancellation drain completes."""
+    """A nextset stays exclusive until cancellation has resynchronized the session.
+
+    1. Create the first ``nextset`` awaitable, which claims cursor ownership.
+    2. Confirm a second call is rejected instead of reading concurrently.
+    3. Yield once so the scheduled operation enters protocol work, then cancel it.
+    4. Wait for ATTENTION settlement and prove a new cursor can reuse the session.
+    """
 
     async def run():
         conn = await connect(client_context)
@@ -1104,6 +1174,7 @@ def test_nextset_rejects_concurrent_operation_and_cancellation_resynchronizes_se
             task = asyncio.ensure_future(cursor.nextset())
             with pytest.raises(RuntimeError, match="busy with another cursor operation"):
                 cursor.nextset()
+            # sleep(0) yields one event-loop turn without adding a real delay.
             await asyncio.sleep(0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1648,7 +1719,14 @@ def test_fetch_rejects_concurrent_read_on_same_cursor(client_context, operation)
 @pytest.mark.integration
 @pytest.mark.parametrize("operation", ["fetchone", "fetchmany", "fetchall"])
 def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operation):
-    """Every fetch API preserves connection reuse when cancelled during a row read."""
+    """Every fetch API resynchronizes when cancelled during a blocked row read.
+
+    1. Start a large result and choose one of the three fetch APIs.
+    2. Schedule its awaitable and yield one event-loop turn so reading begins.
+    3. Cancel it and verify Python receives ``CancelledError``.
+    4. Wait for the detached Rust task to finish ATTENTION settlement.
+    5. Execute another query to prove the shared session can be reused.
+    """
 
     async def run():
         conn = await connect(client_context)
@@ -1664,7 +1742,9 @@ def test_cancelling_blocked_fetch_resynchronizes_session(client_context, operati
                 "fetchall": lambda: cursor.fetchall(),
             }
             awaitable = operations[operation]()
+            # ensure_future accepts the Future returned by the PyO3 binding.
             task = asyncio.ensure_future(awaitable)
+            # Give the scheduled fetch one turn to enter the large row read.
             await asyncio.sleep(0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
