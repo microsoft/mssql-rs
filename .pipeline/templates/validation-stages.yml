@@ -259,9 +259,8 @@ stages:
           osType: Linux
       - bash: |
           set -euo pipefail
-          python3 -m unittest discover -s .pipeline/scripts \
-            -p 'test_compare_odbc_benchmarks.py' -v
-        displayName: Test ODBC benchmark comparison policy
+          python3 -m unittest discover -s .pipeline/scripts -p 'test_*.py' -v
+        displayName: Test pipeline helper scripts
       - template: build-template-container.yml
         parameters:
           architecture: x64

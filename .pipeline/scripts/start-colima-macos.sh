@@ -44,21 +44,29 @@ DOCKER_CLI_DIR=${DOCKER_CLI_DIR:-$HOME/.docker-cli/bin}
 INSTALL_TIMEOUT_SECONDS=${INSTALL_TIMEOUT_SECONDS:-300}
 
 install_tooling() {
-  brew update
-  brew install colima
+  # `set -e` is suppressed inside a function called from a conditional, so every
+  # prerequisite has to report failure explicitly or a broken brew would look
+  # like a successful install and only surface as a confusing colima failure.
+  brew update || return 1
+  brew install colima || return 1
 
   if brew install --force-bottle docker; then
     return 0
   fi
   echo "##[warning]No docker CLI bottle for the current version on this platform; falling back to the newest bottled version"
-  python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR"
+  python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR" || return 1
 }
 
 # A leftover directory would make the "did we fall back?" check below lie.
 rm -rf "$DOCKER_CLI_DIR"
 
-if ! run_bounded "$INSTALL_TIMEOUT_SECONDS" install_tooling; then
+install_status=0
+run_bounded "$INSTALL_TIMEOUT_SECONDS" install_tooling || install_status=$?
+if [ "$install_status" -eq 124 ]; then
   echo "##[error]Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
+  exit 1
+elif [ "$install_status" -ne 0 ]; then
+  echo "##[error]Installing colima and the docker CLI failed (exit $install_status)"
   exit 1
 fi
 
