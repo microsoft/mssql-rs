@@ -944,7 +944,8 @@ def test_executemany_exhausted_nextset_checks_connection_lifecycle(client_contex
             description = cursor.description
 
             close_awaitable = conn.close()
-            with pytest.raises(RuntimeError, match="Connection is closing"):
+            # Shutdown may complete before this coroutine gets its next turn.
+            with pytest.raises(RuntimeError, match=r"Connection is (?:closing|closed)"):
                 await cursor.nextset()
             assert cursor.description == description
 
