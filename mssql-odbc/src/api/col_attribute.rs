@@ -12,9 +12,9 @@ use tracing::{debug, error};
 
 use crate::api::describe_col::{column_size, decimal_digits, odbc_sql_type};
 use crate::api::odbc_types::{
-    SQL_ATTR_READWRITE_UNKNOWN, SQL_BIGINT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE,
-    SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2,
-    SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_UTINYINT,
+    SQL_ATTR_READWRITE_UNKNOWN, SQL_BIGINT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DATE,
+    SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SLONG,
+    SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TIMESTAMP, SQL_C_UTINYINT,
     SQL_C_WCHAR, SQL_CA_SS_VARIANT_TYPE, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
     SQL_DESC_AUTO_UNIQUE_VALUE, SQL_DESC_BASE_COLUMN_NAME, SQL_DESC_CASE_SENSITIVE,
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATETIME_INTERVAL_CODE, SQL_DESC_DISPLAY_SIZE,
@@ -132,15 +132,15 @@ fn sql_col_attribute_w_safe(
 ) -> SqlReturn {
     // The declared ODBC version selects the temporal sql_variant C types. Read
     // it before the stmt lock to preserve parent-before-child lock ordering.
-    let variant_odbc_version = if field_identifier == SQL_CA_SS_VARIANT_TYPE {
+    let variant_uses_3_80_types = if field_identifier == SQL_CA_SS_VARIANT_TYPE {
         let env = stmt.parent_dbc().parent_env();
         let Ok(env_state) = env.inner.lock() else {
             error!("SQLColAttributeW: env mutex poisoned");
             return SQL_ERROR;
         };
-        env_state.odbc_version
+        env_state.odbc_version == OdbcVersion::Odbc3_80
     } else {
-        OdbcVersion::Unset
+        false
     };
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -192,7 +192,7 @@ fn sql_col_attribute_w_safe(
         unsafe {
             write_if_some(
                 numeric_attribute_ptr,
-                SqlLen::from(variant_c_type(base, variant_odbc_version)),
+                SqlLen::from(variant_c_type(base, variant_uses_3_80_types)),
             )
         };
         return SQL_SUCCESS;
@@ -539,8 +539,7 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
 ///
 /// msodbcsql answers this from its per-row column info, so the value's base type
 /// decides it rather than the column's declared type.
-fn variant_c_type(base: TdsDataType, odbc_version: OdbcVersion) -> SqlSmallInt {
-    let is_3_80 = odbc_version == OdbcVersion::Odbc3_80;
+fn variant_c_type(base: TdsDataType, uses_3_80_types: bool) -> SqlSmallInt {
     match base {
         // `tinyint` is unsigned 0-255 on the server, so the unsigned C type is
         // the accurate answer: a caller that fetched 200 into a signed char
@@ -580,14 +579,12 @@ fn variant_c_type(base: TdsDataType, odbc_version: OdbcVersion) -> SqlSmallInt {
         | TdsDataType::Money
         | TdsDataType::Money4
         | TdsDataType::MoneyN => SQL_C_NUMERIC,
-        TdsDataType::DateN => SQL_C_TYPE_DATE,
-        TdsDataType::TimeN if is_3_80 => SQL_C_SS_TIME2,
+        TdsDataType::DateN => SQL_C_DATE,
+        TdsDataType::TimeN if uses_3_80_types => SQL_C_SS_TIME2,
         TdsDataType::TimeN => SQL_C_BINARY,
-        TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
-            SQL_C_TYPE_TIMESTAMP
-        }
-        TdsDataType::DateTime2N => SQL_C_TYPE_TIMESTAMP,
-        TdsDataType::DateTimeOffsetN if is_3_80 => SQL_C_SS_TIMESTAMPOFFSET,
+        TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => SQL_C_TIMESTAMP,
+        TdsDataType::DateTime2N => SQL_C_TIMESTAMP,
+        TdsDataType::DateTimeOffsetN if uses_3_80_types => SQL_C_SS_TIMESTAMPOFFSET,
         TdsDataType::DateTimeOffsetN => SQL_C_BINARY,
         TdsDataType::Char
         | TdsDataType::BigChar
@@ -1294,46 +1291,53 @@ mod tests {
     /// value, which unit tests cannot produce.
     #[test]
     fn variant_c_type_covers_the_base_types() {
-        let cases: &[(TdsDataType, SqlSmallInt)] = &[
-            (TdsDataType::Int1, SQL_C_UTINYINT),
-            (TdsDataType::Int2, SQL_C_SSHORT),
-            (TdsDataType::Int4, SQL_C_SLONG),
-            (TdsDataType::Int8, SQL_C_SBIGINT),
-            (TdsDataType::Bit, SQL_C_BIT),
-            (TdsDataType::Flt4, SQL_C_FLOAT),
-            (TdsDataType::Flt8, SQL_C_DOUBLE),
-            (TdsDataType::Numeric, SQL_C_NUMERIC),
-            (TdsDataType::DecimalN, SQL_C_NUMERIC),
-            (TdsDataType::MoneyN, SQL_C_NUMERIC),
-            (TdsDataType::Money4, SQL_C_NUMERIC),
-            (TdsDataType::DateN, SQL_C_TYPE_DATE),
-            (TdsDataType::TimeN, SQL_C_SS_TIME2),
-            (TdsDataType::DateTimeN, SQL_C_TYPE_TIMESTAMP),
-            (TdsDataType::DateTime2N, SQL_C_TYPE_TIMESTAMP),
-            (TdsDataType::DateTimeOffsetN, SQL_C_SS_TIMESTAMPOFFSET),
-            (TdsDataType::BigVarChar, SQL_C_CHAR),
-            (TdsDataType::NVarChar, SQL_C_WCHAR),
-            (TdsDataType::BigVarBinary, SQL_C_BINARY),
-            (TdsDataType::Guid, SQL_C_GUID),
+        let cases: &[(TdsDataType, SqlSmallInt, SqlSmallInt)] = &[
+            (TdsDataType::Int1, SQL_C_UTINYINT, SQL_C_UTINYINT),
+            (TdsDataType::Int2, SQL_C_SSHORT, SQL_C_SSHORT),
+            (TdsDataType::Int4, SQL_C_SLONG, SQL_C_SLONG),
+            (TdsDataType::Int8, SQL_C_SBIGINT, SQL_C_SBIGINT),
+            (TdsDataType::Bit, SQL_C_BIT, SQL_C_BIT),
+            (TdsDataType::Flt4, SQL_C_FLOAT, SQL_C_FLOAT),
+            (TdsDataType::Flt8, SQL_C_DOUBLE, SQL_C_DOUBLE),
+            (TdsDataType::Numeric, SQL_C_NUMERIC, SQL_C_NUMERIC),
+            (TdsDataType::DecimalN, SQL_C_NUMERIC, SQL_C_NUMERIC),
+            (TdsDataType::MoneyN, SQL_C_NUMERIC, SQL_C_NUMERIC),
+            (TdsDataType::Money4, SQL_C_NUMERIC, SQL_C_NUMERIC),
+            (TdsDataType::DateN, SQL_C_DATE, SQL_C_DATE),
+            (TdsDataType::TimeN, SQL_C_BINARY, SQL_C_SS_TIME2),
+            (TdsDataType::DateTimeN, SQL_C_TIMESTAMP, SQL_C_TIMESTAMP),
+            (TdsDataType::DateTime2N, SQL_C_TIMESTAMP, SQL_C_TIMESTAMP),
+            (
+                TdsDataType::DateTimeOffsetN,
+                SQL_C_BINARY,
+                SQL_C_SS_TIMESTAMPOFFSET,
+            ),
+            (TdsDataType::BigVarChar, SQL_C_CHAR, SQL_C_CHAR),
+            (TdsDataType::NVarChar, SQL_C_WCHAR, SQL_C_WCHAR),
+            (TdsDataType::BigVarBinary, SQL_C_BINARY, SQL_C_BINARY),
+            (TdsDataType::Guid, SQL_C_GUID, SQL_C_GUID),
             // A variant cannot carry these, so character is the fallback.
-            (TdsDataType::Xml, SQL_C_CHAR),
+            (TdsDataType::Xml, SQL_C_CHAR, SQL_C_CHAR),
         ];
-        for (base, expected) in cases {
-            assert_eq!(
-                variant_c_type(*base, OdbcVersion::Odbc3_80),
-                *expected,
-                "{base:?}"
-            );
+        for version in [
+            OdbcVersion::Odbc2,
+            OdbcVersion::Odbc3,
+            OdbcVersion::Odbc3_80,
+        ] {
+            let uses_3_80_types = version == OdbcVersion::Odbc3_80;
+            for (base, before_3_80, in_3_80) in cases {
+                let expected = if uses_3_80_types {
+                    *in_3_80
+                } else {
+                    *before_3_80
+                };
+                assert_eq!(
+                    variant_c_type(*base, uses_3_80_types),
+                    expected,
+                    "{version:?} {base:?}"
+                );
+            }
         }
-
-        assert_eq!(
-            variant_c_type(TdsDataType::TimeN, OdbcVersion::Odbc3),
-            SQL_C_BINARY
-        );
-        assert_eq!(
-            variant_c_type(TdsDataType::DateTimeOffsetN, OdbcVersion::Odbc3),
-            SQL_C_BINARY
-        );
     }
 
     /// The success path: a variant column whose value has been probed reports
@@ -1370,6 +1374,8 @@ mod tests {
         );
 
         {
+            // Directly mutating the ENV after DBC allocation is test-only; a
+            // Driver Manager rejects this state transition.
             let env_handle = unsafe { handle_from_raw::<crate::handles::EnvHandle>(h.env) };
             env_handle.inner.lock().unwrap().odbc_version = OdbcVersion::Odbc3;
         }
