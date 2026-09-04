@@ -91,16 +91,41 @@ Installs Docker + Colima on a hosted macOS agent and boots the VM, retrying on
 the transient lima hostagent boot failures seen in ~3% of runs. VM size stays at
 the long-standing 4 GiB / 4 CPU.
 
+The docker CLI is installed with `brew install --force-bottle`, which uses
+Homebrew's bottle when one exists for the platform and *fails* rather than
+falling back to a source build. When it fails, `install-brew-bottle.py` installs
+the newest version that *is* bottled for this platform, taken straight from
+Homebrew's own registry. As of 29.8.0 there is no Intel macOS bottle, so a bare
+`brew install docker` compiles the CLI and builds Go to do it: measured over 147
+runs, the bottled path took 29s median and failed 1% of the time, the
+source-build path took 441s median (774s max) and failed 36%. `colima` and
+`lima` are still bottled on Intel and install normally.
+
+### install-brew-bottle.py
+Installs the newest Homebrew bottle of a formula that exists for the running
+platform, by reading Homebrew's OCI registry on ghcr.io directly. Used as the
+docker CLI fallback above, and generic enough to cover `colima` or `lima` if they
+lose their Intel bottles too.
+
+Bottles are content-addressed, so the download is verified against the digest the
+registry advertises rather than a checksum vendored here. Bottles built for an
+older macOS are accepted (they run on newer hosts) but never a newer one.
+
+**Usage:** `install-brew-bottle.py <formula> <dest-bin-dir>`; prints the resolved
+version. Test overrides: `BOTTLE_ARCH_OVERRIDE`, `BOTTLE_MACOS_MAJOR_OVERRIDE`.
+
 Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
 boot still reaches the delete/retry path rather than running until the pipeline
-step timeout. That bound sits above the slowest healthy boot observed over 113
-runs (509s; p95 366s) — the real failures give up within seconds, so a shorter
-bound would only kill slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps
-the retries as a whole.
+step timeout. That bound sits above the slowest healthy boot observed (509s over
+113 runs in 2026-08; re-measured 2026-09 at max 453s over 123 runs) — the real
+failures give up within seconds, so a shorter bound would only kill
+slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps the retries as a
+whole, and the install phase has its own `INSTALL_TIMEOUT_SECONDS`.
 
 **Environment overrides:** `COLIMA_CPU`, `COLIMA_MEMORY`, `COLIMA_DISK`,
 `COLIMA_START_ATTEMPTS` (3), `COLIMA_START_TIMEOUT_SECONDS` (540),
-`COLIMA_BUDGET_SECONDS` (480).
+`COLIMA_BUDGET_SECONDS` (480), `INSTALL_TIMEOUT_SECONDS` (300),
+`DOCKER_CLI_DIR`.
 
 ### start-sql-server-macos.sh
 Starts the SQL Server test container inside the Colima VM. Retries the image

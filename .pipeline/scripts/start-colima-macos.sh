@@ -25,9 +25,50 @@ COLIMA_START_TIMEOUT_SECONDS=${COLIMA_START_TIMEOUT_SECONDS:-540}
 # The macOS job only gets 60 minutes, so cap the retries by wall clock rather
 # than letting three boots of an unhealthy agent eat the test budget.
 COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-480}
+# `brew install docker` is deliberately not used bare. Homebrew ships no bottle
+# for the docker CLI on Intel macOS as of 29.8.0, so a bare install compiles it
+# from source and builds Go (~8 min) to do so. Measured over 147 runs: agents
+# that resolved the bottled 29.7.2 finished this phase in 29s median and failed
+# 1% of the time, while agents that built 29.8.0 took 441s median (774s max) and
+# failed 36% — the build alone exhausted the step timeout.
+#
+# `--force-bottle` makes brew fail rather than fall back to source. When it does
+# fail, install-brew-bottle.py takes the newest version that *is* bottled for
+# this platform straight from Homebrew's registry, so there is no version to pin
+# by hand and no third-party download. Both paths therefore install exactly what
+# Homebrew would have, and this self-heals once the current version is bottled
+# again — which on arm64 it already is.
+DOCKER_CLI_DIR=${DOCKER_CLI_DIR:-$HOME/.docker-cli/bin}
+# Bounded so a slow install fails here with a message rather than silently
+# consuming the step budget and surfacing as an opaque "task has timed out".
+INSTALL_TIMEOUT_SECONDS=${INSTALL_TIMEOUT_SECONDS:-300}
 
-brew update
-brew install docker colima
+install_tooling() {
+  brew update
+  brew install colima
+
+  if brew install --force-bottle docker; then
+    return 0
+  fi
+  echo "##[warning]No docker CLI bottle for the current version on this platform; falling back to the newest bottled version"
+  python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR"
+}
+
+# A leftover directory would make the "did we fall back?" check below lie.
+rm -rf "$DOCKER_CLI_DIR"
+
+if ! run_bounded "$INSTALL_TIMEOUT_SECONDS" install_tooling; then
+  echo "##[error]Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
+  exit 1
+fi
+
+# Only the fallback populates DOCKER_CLI_DIR; brew's own docker is already on PATH.
+# prependpath only affects later steps, so also fix PATH for this one.
+if [ -x "$DOCKER_CLI_DIR/docker" ]; then
+  export PATH="$DOCKER_CLI_DIR:$PATH"
+  echo "##vso[task.prependpath]$DOCKER_CLI_DIR"
+fi
+docker --version
 
 start_time=$(date +%s)
 deadline=$((start_time + COLIMA_BUDGET_SECONDS))
