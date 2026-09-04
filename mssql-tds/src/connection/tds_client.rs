@@ -4166,7 +4166,9 @@ impl TdsClient {
     ///
     /// Result-local output and status are intentionally discarded: cancellation
     /// normalization clears them, and finalizing an encrypted return value could
-    /// fail and retire a stream that already reached DONE_ATTN.
+    /// fail and retire a stream that already reached DONE_ATTN. The managed
+    /// `sp_prepexec` handle is the exception: it is a plain integer needed to
+    /// release the server-side prepared statement later.
     fn apply_attention_side_effect(&mut self, token: Tokens) -> TdsResult<()> {
         match token {
             Tokens::Error(error_token) => {
@@ -4183,6 +4185,14 @@ impl TdsClient {
             Tokens::SessionState(session_state) => {
                 self.recovery_context
                     .process_session_state(&session_state)?;
+            }
+            Tokens::ReturnValue(return_value)
+                if self.pending_capture.is_some()
+                    && return_value.param_ordinal == 0
+                    && return_value.column_metadata.crypto_metadata.is_none()
+                    && matches!(&return_value.value, ColumnValues::Int(_)) =>
+            {
+                self.push_return_value(return_value.into());
             }
             _ => {}
         }
@@ -10833,6 +10843,31 @@ mod tests {
 
         assert!(client.return_values.is_empty());
         assert!(!client.transport.connection_known_dead());
+    }
+
+    #[test]
+    fn attention_settlement_captures_plain_prepexec_handle() {
+        use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
+
+        let mut client = create_test_client();
+        client.pending_capture = Some(sid(4));
+        let describe = Arc::new(DescribeParameterEncryptionResult::new());
+        client.pending_prepared_param_encryption = Some(Arc::clone(&describe));
+        let token = ae_return_value_token("@handle", ColumnValues::Int(27), None);
+
+        client
+            .apply_attention_side_effect(Tokens::ReturnValue(token))
+            .unwrap();
+        client.normalize_after_attention();
+
+        assert_eq!(client.prepared_handles.get(&sid(4)).copied(), Some(27));
+        assert!(Arc::ptr_eq(
+            client.prepared_param_encryption.get(&sid(4)).unwrap(),
+            &describe
+        ));
+        assert!(client.pending_capture.is_none());
+        assert!(client.pending_prepared_param_encryption.is_none());
+        assert!(client.return_values.is_empty());
     }
 
     #[test]
