@@ -99,9 +99,13 @@ steps:
 # ── 4. Start Docker via Colima ───────────────────────────────────────────────
 # timeoutInMinutes backstops the scripts' own wall-clock budgets: the macOS job
 # caps at 60 minutes and SQL setup must not be what exhausts it.
+#
+# Kept in step with sql-setup-template.yml, which carries the measurements: at
+# 13 this cap fell inside the normal spread of boot times and cut the step off
+# mid-attempt. AB#47510 (PR 486).
 - script: bash .pipeline/scripts/start-colima-macos.sh
   displayName: 'Install and start Colima-based Docker'
-  timeoutInMinutes: 13
+  timeoutInMinutes: 20
 
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
 - script: bash .pipeline/scripts/start-sql-server-macos.sh

@@ -260,9 +260,20 @@ steps:
 - ${{ if eq(parameters.buildTarget, 'MacOS') }}:
   # timeoutInMinutes backstops the scripts' own wall-clock budgets: the macOS
   # job caps at 60 minutes and SQL setup must not be what exhausts it.
+  #
+  # 20, not 13: at 13 this cap sat *inside* the normal spread of boot times and
+  # cut the step off mid-attempt. Measured over 14 runs, successful boots took
+  # 531-725s while every failure landed at 790-794s — no overlap, a hard wall at
+  # the old 780s cap rather than a hung VM, and a ~43% failure rate across
+  # unrelated PRs. It also starved the script's own retry path: with `brew`
+  # ahead of it, COLIMA_START_TIMEOUT_SECONDS (540) alone reaches ~790s, so the
+  # first attempt was killed before COLIMA_BUDGET_SECONDS could fund a retry.
+  # 20 minutes clears the observed maximum with headroom and lets that retry
+  # logic actually run; successful Test MacOS jobs finish in 29-37 min, so this
+  # stays well inside the 60-minute job cap. AB#47510 (PR 486).
   - script: bash .pipeline/scripts/start-colima-macos.sh
     displayName: 'Install and start Colima-based Docker'
-    timeoutInMinutes: 13
+    timeoutInMinutes: 20
 
   - script: bash .pipeline/scripts/start-sql-server-macos.sh
     displayName: 'Start SQL Server (Docker, no TLS certs)'
