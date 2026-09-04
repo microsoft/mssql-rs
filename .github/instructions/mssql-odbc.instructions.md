@@ -126,18 +126,22 @@ authoritative parity reference for this crate. Its source lives in the
     regress observable fetch behavior. msodbcsql resolves all three to
     `SQL_C_BINARY` and delivers the bytes.
   - A zero-length `SQL_C_BINARY` `SQLGetData` on a column whose **source SQL
-    type is fixed-length** (`int`, `datetime2`, ...) reports `01004` /
-    `SQL_SUCCESS_WITH_INFO`, where msodbcsql reports `22003` / `SQL_ERROR`. The
-    indicator carries a byte count where `binary_length` knows one (`int` → 4)
-    and `SQL_NO_TOTAL` where it does not — every temporal variant falls through
-    to `SQL_NO_TOTAL`, since this driver has no binary encoding for them to
+    type is fixed-length** reports `01004` / `SQL_SUCCESS_WITH_INFO`, where
+    msodbcsql reports `22003` / `SQL_ERROR` and leaves the indicator untouched.
+    The indicator carries a byte count where `binary_length` has an explicit arm
+    (`int` → 4, `money` → 8, `uniqueidentifier` → 16) and `SQL_NO_TOTAL` where it
+    falls through to the catch-all. That `SQL_NO_TOTAL` class is **decimal and
+    numeric as well as every temporal type** (`date`, `time`, `datetime2`,
+    `datetimeoffset`) — this driver has no binary encoding for any of them to
     promise a length for.
     **Source-verified.** msodbcsql selects between two policy classes on
     `IsFixedSqlType()` (`Sql/Ntdbms/sqlncli/odbc/sqlcprot.h`), which
     deliberately classifies `SQL_BINARY`, `SQL_CHAR`, `SQL_WCHAR` and every
     partial-length type (`sqlcprot.h`, `IsPartialLenType`) as *not* fixed —
     so the boundary is the **SQL** type, not the C type, and `binary(9)` sits
-    on the variable side. `ColDataRetriever<>::GetColData`
+    on the variable side, while `decimal` / `numeric` sit on the fixed side
+    (absent from both the `IsPartialLenType` case list and the
+    `IsFixedSqlType` exclusion set). `ColDataRetriever<>::GetColData`
     (`odbc/sqlcdata.h`) instantiates `BinaryOutputWithFixedLengthSqlType` for a
     fixed source type, where delivery to `SQL_C_BINARY` is all-or-nothing (the
     source comments that such data "is fetched in one call"), so a short buffer
@@ -153,10 +157,18 @@ authoritative parity reference for this crate. Its source lives in the
     Line numbers are deliberately omitted: the reading is from `master`
     (`7a0c3d59`), not the 18.6.2.1 release branch, so the file + function +
     condition are the durable part of the citation.
-    Matching runtime measurement against 18.6.2.1 (`SQL_DRIVER_VER`
-    `18.06.0002`): `int` and `datetime2(3)` both answer `SQL_ERROR` with
-    `22003`, while `binary(9)`, `varbinary(max)` and `nvarchar(10)` answer
-    `SQL_SUCCESS_WITH_INFO` with `01004`.
+    **Measured against 18.6.2.1** (`SQL_DRIVER_VER` `18.06.0002`) — every
+    fixed-source type below answers `SQL_ERROR` / `22003` there, and `01004` /
+    `SQL_SUCCESS_WITH_INFO` here, differing only in the indicator this driver
+    reports:
+
+    | column | msodbcsql | this driver |
+    |---|---|---|
+    | `int`, `money`, `smallmoney`, `uniqueidentifier` | `22003` | `01004`, byte count (4 / 8 / 4 / 16) |
+    | `decimal(10,2)`, `decimal(38,10)`, `numeric(18,4)` | `22003` | `01004`, `SQL_NO_TOTAL` |
+    | `date`, `time(7)`, `datetime2(3)`, `datetimeoffset(3)` | `22003` | `01004`, `SQL_NO_TOTAL` |
+    | `binary(9)`, `varbinary(max)`, `nvarchar(10)` | `01004` + length | `01004` + length (agrees) |
+
     This driver does not distinguish a `sql_variant` column from the value it
     captured, and mssql-python's `sql_variant` support depends on that same
     zero-length probe succeeding (`ddbc_bindings.cpp`,

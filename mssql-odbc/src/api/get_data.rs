@@ -3857,7 +3857,10 @@ mod tests {
     /// the caller falls back to reading without a size hint.
     #[test]
     fn binary_length_covers_the_value_kinds() {
-        use mssql_tds::datatypes::column_values::SqlXml;
+        use mssql_tds::datatypes::column_values::{
+            SqlDate, SqlDateTime2, SqlMoney, SqlSmallMoney, SqlTime, SqlXml,
+        };
+        use mssql_tds::datatypes::decoder::DecimalParts;
         use mssql_tds::datatypes::sql_string::SqlString;
 
         let cases: &[(ColumnValues, SqlLen)] = &[
@@ -3883,6 +3886,54 @@ mod tests {
             (ColumnValues::Float(1.0), 8),
             (ColumnValues::Uuid(uuid::Uuid::nil()), 16),
             (ColumnValues::Null, SQL_NO_TOTAL),
+            // The catch-all group. It is not only the temporal types: decimal
+            // and numeric land here too, because this driver has no binary
+            // encoding for them either. The parity note in
+            // `.github/instructions/mssql-odbc.instructions.md` names this exact
+            // set, so pin it here rather than leaving the doc as the only record.
+            (
+                ColumnValues::Decimal(DecimalParts::new(true, 10, 2, 123)),
+                SQL_NO_TOTAL,
+            ),
+            (
+                ColumnValues::Numeric(DecimalParts::new(true, 18, 4, 123_456)),
+                SQL_NO_TOTAL,
+            ),
+            (
+                ColumnValues::Date(SqlDate::create(738_685).unwrap()),
+                SQL_NO_TOTAL,
+            ),
+            (
+                ColumnValues::Time(SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                }),
+                SQL_NO_TOTAL,
+            ),
+            (
+                ColumnValues::DateTime2(SqlDateTime2 {
+                    days: 738_685,
+                    time: SqlTime {
+                        time_nanoseconds: 0,
+                        scale: 7,
+                    },
+                }),
+                SQL_NO_TOTAL,
+            ),
+            // Money is the counter-example that keeps the boundary honest: it is
+            // a fixed-source type like the rows above, but it *does* have an
+            // explicit arm, so it reports a byte count rather than SQL_NO_TOTAL.
+            (
+                ColumnValues::Money(SqlMoney {
+                    lsb_part: 123_400,
+                    msb_part: 0,
+                }),
+                8,
+            ),
+            (
+                ColumnValues::SmallMoney(SqlSmallMoney { int_val: 123_400 }),
+                4,
+            ),
         ];
         for (value, expected) in cases {
             assert_eq!(binary_length(value), *expected, "{value:?}");
