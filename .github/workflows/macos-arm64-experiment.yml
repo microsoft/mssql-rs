@@ -51,11 +51,12 @@ jobs:
       - name: Generate mock server certificates
         run: ./scripts/generate_mock_tds_server_certs.sh
 
-      - name: Run non-connectivity tests
+      - name: Run unit and mock server tests
         env:
           CERT_HOST_NAME: sql1
           RUST_BACKTRACE: full
         run: >-
           cargo nextest run --workspace --frozen --all-targets
           --no-fail-fast --profile ci --success-output immediate
-          -E 'not test(connectivity)'
+          -E 'kind(lib) | binary(test_mock_server) |
+          binary(test_mock_server_fedauth) | binary(test_mock_server_tls)'
