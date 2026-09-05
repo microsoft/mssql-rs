@@ -284,6 +284,75 @@ does not grow every time a new msodbcsql build is measured.
     zero-length length probe, while a `varbinary(max)` / `image` refuses even
     that, because `stream_active_plp_chunk` admits only the two character
     targets before it looks at `BufferLength` (AB#47815).
+12. A zero-length `SQL_C_BINARY` `SQLGetData` on a column whose **source SQL
+    type is fixed-length** reports `01004` / `SQL_SUCCESS_WITH_INFO`, where
+    msodbcsql reports `22003` / `SQL_ERROR` and leaves the indicator untouched.
+    The indicator carries a byte count where `binary_length` has an explicit arm
+    (`int` → 4, `money` → 8, `uniqueidentifier` → 16) and `SQL_NO_TOTAL` where it
+    falls through to the catch-all. That `SQL_NO_TOTAL` class is **decimal and
+    numeric as well as every temporal type** (`date`, `time`, `datetime2`,
+    `datetimeoffset`) — this driver has no binary encoding for any of them to
+    promise a length for.
+    **Source-verified.** msodbcsql selects between two policy classes on
+    `IsFixedSqlType()` (`Sql/Ntdbms/sqlncli/odbc/sqlcprot.h`), which
+    deliberately classifies `SQL_BINARY`, `SQL_CHAR`, `SQL_WCHAR` and every
+    partial-length type (`sqlcprot.h`, `IsPartialLenType`) as *not* fixed —
+    so the boundary is the **SQL** type, not the C type, and `binary(9)` sits
+    on the variable side, while `decimal` / `numeric` sit on the fixed side
+    (absent from both the `IsPartialLenType` case list and the
+    `IsFixedSqlType` exclusion set). `ColDataRetriever<>::GetColData`
+    (`odbc/sqlcdata.h`) instantiates `BinaryOutputWithFixedLengthSqlType` for a
+    fixed source type, where delivery to `SQL_C_BINARY` is all-or-nothing (the
+    source comments that such data "is fetched in one call"), so a short buffer
+    is a data overflow rather than a truncation:
+    `if (... == BinaryWithFixedLengthSqlType && (SIZE_T)cbBuf < cbDataAvail)
+    { wError = IDS_22_003; }` in `InternalGetColData`, and `Error = CVT_PREC`
+    (`#define CVT_PREC IDS_22_003`, `sqlcprot.h`) out of `ConvertToBinary`
+    (`odbc/sqlccnvt.cpp`) on the converting route that `datetime2` takes.
+    `IDS_22_003` maps to `22003` in `cli_common/src/clntcomn.cpp`. A variable
+    source type instead reads `min(cbBuf, avail)` bytes and reports
+    `if (!IsFixedOrBinaryWithFixedServerType() && cbDataAvail)
+    wError = IDS_01_004;` with the full remaining length in the indicator.
+    Line numbers are deliberately omitted: the reading is from `master`
+    (`7a0c3d59`), not the 18.6.2.1 release branch, so the file + function +
+    condition are the durable part of the citation.
+    **Measured against 18.6.2.1** (`SQL_DRIVER_VER` `18.06.0002`) — every
+    fixed-source type below answers `SQL_ERROR` / `22003` there, and `01004` /
+    `SQL_SUCCESS_WITH_INFO` here, differing only in the indicator this driver
+    reports:
+
+    | column | msodbcsql | this driver |
+    |---|---|---|
+    | `int`, `money`, `smallmoney`, `uniqueidentifier` | `22003` | `01004`, byte count (4 / 8 / 4 / 16) |
+    | `decimal(10,2)`, `decimal(38,10)`, `numeric(18,4)` | `22003` | `01004`, `SQL_NO_TOTAL` |
+    | `date`, `time(7)`, `datetime2(3)`, `datetimeoffset(3)` | `22003` | `01004`, `SQL_NO_TOTAL` |
+    | `binary(9)`, `varbinary(max)`, `nvarchar(10)` | `01004` + length | `01004` + length (agrees) |
+
+    This driver does not distinguish a `sql_variant` column from the value it
+    captured, and mssql-python's `sql_variant` support depends on that same
+    zero-length probe succeeding (`ddbc_bindings.cpp`,
+    `SQLGetData_ptr(hStmt, i, SQL_C_BINARY, NULL, 0, ...)` gated on
+    `SQL_SUCCEEDED`), so matching `22003` would break every integer variant. The
+    reported truncation is the important half — it is what stops a caller
+    treating an undelivered value as delivered (AB#47537) — and the exact
+    fixed-width SQLSTATE is left to AB#47239, which reworks binary delivery.
+13. An **empty** (zero-length, non-NULL) value answers that same probe with
+    `SQL_SUCCESS` and consumes the column, so a repeat reports `SQL_NO_DATA`;
+    a value with bytes still pending stays resident and repeats its `01004`.
+    This matches msodbcsql, which short-circuits ahead of both checks above on
+    `if (!cbDataAvail) goto Return3;` (`sqlcdata.h`, `InternalGetColData`) and
+    then marks the column `STMT_ST_GETDATA_DONE` because the TDS layer reports
+    nothing remaining (`FIsLenRemaining()`, `tds/TdsParser.h`); the non-empty
+    case is never discarded because `SQLGetData` passes `fFlush = FALSE`
+    (`odbc/sqlcdata.cpp`). Measured identical on 18.6.2.1. One residual
+    divergence, deliberately not matched: a `sql_variant` wrapping an empty
+    value answers `SQL_SUCCESS_WITH_INFO` / `01004` on msodbcsql where this
+    driver answers `SQL_SUCCESS` (a bare empty `varbinary(8)` is `SQL_SUCCESS`
+    on both). It is invisible to mssql-python, whose probe is gated on
+    `SQL_SUCCEEDED`, and
+    `ColAttributeLiveTest.EmptyVariantProbeConsumesValueButKeepsBaseType`
+    accepts either so the parity leg still compares the base type and the
+    `SQL_NO_DATA` re-read.
 
 ## No panics
 
@@ -549,6 +618,30 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   to keep intent clear.
 - Pointer parameters from C must be treated as potentially null, invalid, or
   misaligned — validate before use.
+- **A success code is a promise about the caller's buffer, so never report
+  `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Any
+  out-buffer entry point that could not deliver everything must say so —
+  `SQL_SUCCESS_WITH_INFO` with `01004` for a truncated read — because that is
+  the only signal telling the caller to grow its buffer and come back. The
+  memory safety of this driver ends at the ABI: a caller that believes an
+  undelivered value landed will read out of bounds and take the host process
+  down with it, and no amount of care on our side of the boundary prevents it.
+  AB#47537 is the worked example — a zero-length `SQL_C_BINARY` probe answered
+  `SQL_SUCCESS` with the byte count, and mssql-python copied those bytes out of
+  the empty buffer it had passed.
+- **When an entry point answers the same request in more than one place, route
+  the answer through one shared function rather than repeating the rule.**
+  `SQLGetData` answers the zero-length `SQL_C_BINARY` probe both on the buffered
+  fast path in `sql_get_data_safe` and in `write_captured_column`, ~750 lines
+  apart in different functions. AB#47537 was fixed in the second and reopened by
+  a concurrent change that added the first: the merge was textually clean, every
+  unit test kept passing because they drove the fixed function directly, and the
+  crash came back on the only path the reporting application actually takes.
+  Both now go through `answer_binary_probe`. Two lessons worth generalising: a
+  test that calls an inner function directly proves nothing about which branch
+  production traffic reaches, so cover the entry point as the application calls
+  it; and duplicated protocol rules do not announce themselves when they drift,
+  because nothing conflicts.
 
 ## Types and casts
 

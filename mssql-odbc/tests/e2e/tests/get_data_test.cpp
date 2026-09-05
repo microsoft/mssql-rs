@@ -1617,6 +1617,260 @@ TEST_F(GetDataLiveTest, NullVarbinaryMaxToBinaryTargetReportsNull) {
     SQLCloseCursor(stmt_);
 }
 
+// tests/test_004_cursor_arrow.py::test_arrow_lob_wide (AB#47537) -- the shape
+// that crashed the interpreter. mssql-python's Arrow fetch takes the SQLGetData
+// branch whenever the result set holds a MAX column, and reads every column of
+// the row that way, including a fixed `binary(9)`. Its GetDataVar helper starts
+// each SQL_C_BINARY read with an empty buffer, so the first call arrives with
+// BufferLength 0, and it grows and retries only while the driver reports there
+// is more to come.
+//
+// Reporting SQL_SUCCESS there says the value fits in a zero-length buffer, so
+// the caller stops retrying and copies `indicator` bytes out of a buffer it
+// never grew. A truncation warning is what tells it to retry. Measured on
+// msodbcsql 18.6.2.1 (SQL_DRIVER_VER 18.06.0002): SQL_SUCCESS_WITH_INFO with
+// 01004 and indicator 9.
+//
+// This only asserts the probe contract; delivering the bytes on the retry is
+// AB#47239.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationWhenBytesRemain) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('asdfghjkl' AS BINARY(9)) AS c1"), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // The probe is keyed on a zero buffer length, not on a null pointer:
+    // mssql-python passes NULL because it dlopen's the driver directly, while
+    // these tests go through the Driver Manager, which rejects a null
+    // TargetValuePtr with HY009 before the driver ever sees the call.
+    SQLCHAR probe = 0;
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(9, ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// The other half of the contract: an empty value has nothing left to deliver, so
+// the same probe is a plain success, and because that call delivered the whole
+// value the column is consumed -- a repeat reports SQL_NO_DATA. Measured
+// identically on msodbcsql 18.6.2.1 (SQL_SUCCESS with indicator 0 and no
+// diagnostic, then SQL_NO_DATA).
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyValueSucceedsAndConsumesColumn) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARBINARY(8)) AS c1"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN ind = -1;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_EQ(0, ind);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+
+    SQLCloseCursor(stmt_);
+}
+
+// AB#47537, second site. The two tests above run on a single-column result set,
+// which does not produce a buffered row, so they only ever exercise the
+// `write_captured_column` probe. #446 later added a second probe on the buffered
+// fast path in `sql_get_data_safe`, which returns before that one is reached --
+// and it is the path mssql-python's `arrow_batch` actually takes, because its
+// unbound single-row fetch is precisely what makes a row buffered.
+//
+// The two blocks sit ~750 lines apart in different functions, so the merge that
+// brought them together was textually clean and every existing test stayed
+// green while the reachable path silently regressed to the original SIGSEGV.
+// This test reproduces `test_arrow_lob_wide`'s actual shape -- a fixed
+// `binary(9)` alongside an `nvarchar(max)`, fetched unbound -- so the buffered
+// probe is covered on its own terms rather than by inference from the captured
+// one.
+//
+// The MAX column is what forces the whole result set onto SQLGetData and makes
+// the driver buffer the inline prefix; the `binary(9)` is the column that
+// crashed. It is read without ever binding a column, exactly as mssql-python
+// does.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationOnBufferedRow) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('asdfghjkl' AS BINARY(9)) AS c1,"
+                             " CAST(N'hey' AS NVARCHAR(MAX)) AS c2"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind))
+        << "a buffered-row probe must report truncation just like a captured one";
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(9, ind);
+
+    // Bytes remain, so the column stays readable rather than being retired.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_EQ(9, ind);
+
+    SQLCloseCursor(stmt_);
+}
+
+// The empty-value half of the buffered path: nothing remains, so the probe is a
+// plain success and the column is consumed.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnEmptyBufferedValueConsumesColumn) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST('' AS VARBINARY(8)) AS c1,"
+                             " CAST(N'hey' AS NVARCHAR(MAX)) AS c2"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN ind = -1;
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+    EXPECT_EQ(0, ind);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind));
+
+    // The MAX column that follows must still be readable -- retiring column 1
+    // must not disturb the rest of the row.
+    std::vector<SQLCHAR> buf(64, 0);
+    SQLLEN text_ind = 0;
+    SQLRETURN rc = SQLGetData(stmt_, 2, SQL_C_CHAR, buf.data(),
+                              static_cast<SQLLEN>(buf.size()), &text_ind);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "rc=" << rc;
+    EXPECT_STREQ("hey", reinterpret_cast<const char*>(buf.data()));
+
+    SQLCloseCursor(stmt_);
+}
+
+// AB#47537 parity table, the *divergence* row -- deliberately guarded on the
+// reference leg.
+//
+// The probe tests above all cover the agreement row (`binary`/`varbinary`/
+// `nvarchar`), where this driver and msodbcsql answer identically. A
+// fixed-source-type column is where the two intentionally part company:
+// msodbcsql treats a short buffer for a fixed SQL type as a data overflow
+// (`22003` / `SQL_ERROR`, indicator untouched), while this driver reports the
+// truncation (`01004` / `SQL_SUCCESS_WITH_INFO`) so a caller is told to grow its
+// buffer instead of believing an undelivered value landed.
+//
+// That divergence was only covered by unit tests built from synthetic
+// `ColumnValues` until now, which cannot catch a change in how a real column
+// reaches the probe. It is the row most worth a live guard precisely because it
+// is the deliberate disagreement, and the parity note in
+// `.github/instructions/mssql-odbc.instructions.md` is otherwise its only record.
+//
+// Both indicator sub-classes are covered: a type `binary_length` has an explicit
+// arm for (`int` -> 4) and one that falls through to `SQL_NO_TOTAL`
+// (`decimal`, `datetime2`).
+//
+// SKIP_IF_COMPARING_MSODBCSQL is justified by measurement, not assumption:
+// against msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`) each query below
+// answers `SQL_ERROR` with `22003`, so the comparison leg genuinely fails rather
+// than the macro papering over an untested guess.
+TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeOnFixedSourceTypesReportsTruncation) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Case {
+        const char* query;
+        SQLLEN expected_indicator;
+    };
+    const Case cases[] = {
+        {"SELECT CAST(7 AS INT) AS c1", 4},
+        {"SELECT CAST(1.23 AS DECIMAL(10,2)) AS c1", SQL_NO_TOTAL},
+        {"SELECT CAST('2025-01-01 12:00:05.123' AS DATETIME2(3)) AS c1", SQL_NO_TOTAL},
+    };
+
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.query);
+        ASSERT_SQL_OK(ExecDirect(c.query), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN ind = 12345;
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &ind))
+            << "a fixed-source type must report truncation, not claim delivery";
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        EXPECT_EQ(c.expected_indicator, ind);
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// AB#47482 / AB#47537 -- pins the crash *shape*, stated as the invariant the
+// consumer actually relies on rather than as this driver's return codes.
+//
+// `FetchArrowBatch_wrap` (mssql-python `ddbc_bindings.cpp`) does:
+//
+//     while (target_vec->size() < start + dataLen) target_vec->resize(...);
+//     std::memcpy(&(*target_vec)[start], &buffers.charBuffers[idxCol][...], dataLen);
+//
+// It grows the *destination* to the indicator and then memcpy's that many bytes
+// out of the *source* buffer it handed us -- without ever checking the source
+// actually received them. So the indicator is a promise about bytes delivered
+// into the caller's buffer, and a call that delivered none must not report a
+// nonzero indicator alongside plain success. That is precisely what this driver
+// used to do, and the memcpy read off the end of an empty vector:
+//
+//     #0  __memcpy_avx_unaligned_erms ()
+//     #1  FetchArrowBatch_wrap(...)
+//
+// Shape matters and is the cheap part to get wrong: neither column crashes
+// alone. The `nvarchar(max)` must be present and must come *after* the
+// `binary(9)`, because a LOB anywhere in the result set makes mssql-python drop
+// to fetchSize 1 and pull every column row-by-row through `SQLGetData`, which is
+// what routes the fixed-length binary column through `GetDataVar`.
+//
+// Deliberately mirrors `GetDataVar`'s zero-length-probe-then-grow-and-retry loop
+// rather than doing one clean sized read, because the crash lived in that loop.
+TEST_F(GetDataLiveTest, BinaryColumnBesideALobStaysWithinItsBuffer) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x010203040506070809 AS BINARY(9)) AS b,"
+                             " CAST(N'hey' AS NVARCHAR(MAX)) AS lob"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // 1. The probe, exactly as GetDataVar opens: an empty buffer.
+    SQLCHAR empty = 0xCC;
+    SQLLEN probe_ind = -999;
+    const SQLRETURN probe_rc = SQLGetData(stmt_, 1, SQL_C_BINARY, &empty, 0, &probe_ind);
+
+    // The invariant. Zero bytes reached the caller, so reporting plain success
+    // would tell it those `probe_ind` bytes are sitting in its buffer. Whatever
+    // else changes here, this must not.
+    EXPECT_NE(SQL_SUCCESS, probe_rc)
+        << "delivered 0 bytes but claimed success -- this is the AB#47537 crash: the caller "
+           "memcpy's the indicator out of the empty buffer it passed";
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, probe_rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(9, probe_ind) << "the probe should still report the full length";
+    EXPECT_EQ(0xCC, empty) << "a zero-length buffer must not be written to";
+
+    // 2. Grow to the reported length and read for real, as GetDataVar then does.
+    std::vector<SQLCHAR> buf(static_cast<size_t>(probe_ind), 0xCC);
+    SQLLEN read_ind = -999;
+    const SQLRETURN read_rc =
+        SQLGetData(stmt_, 1, SQL_C_BINARY, buf.data(), static_cast<SQLLEN>(buf.size()), &read_ind);
+
+    if (SQL_SUCCEEDED(read_rc)) {
+        // Delivering is fine; over-promising is not.
+        EXPECT_LE(read_ind, static_cast<SQLLEN>(buf.size()))
+            << "indicator exceeds the caller's buffer -- the memcpy would run off the end";
+        EXPECT_EQ(9, read_ind);
+    } else {
+        // Binary *data* delivery is still AB#47239, so a refusal is expected
+        // today. Refusing is safe; the crash came from claiming success.
+        EXPECT_EQ(SQL_ERROR, read_rc);
+    }
+
+    // 3. The LOB after it must still decode. A desync left behind by the binary
+    //    column would otherwise surface as silent corruption rather than a
+    //    failure, which is how this stayed hidden as a crash for so long.
+    std::vector<SQLWCHAR> wbuf(64, 0);
+    SQLLEN lob_ind = 0;
+    const SQLRETURN lob_rc = SQLGetData(stmt_, 2, SQL_C_WCHAR, wbuf.data(),
+                                        static_cast<SQLLEN>(wbuf.size() * sizeof(SQLWCHAR)),
+                                        &lob_ind);
+    EXPECT_TRUE(SQL_SUCCEEDED(lob_rc)) << "rc=" << lob_rc;
+    std::u16string units;
+    for (size_t i = 0; i < wbuf.size() && wbuf[i] != 0; ++i) {
+        units.push_back(static_cast<char16_t>(wbuf[i]));
+    }
+    EXPECT_EQ("hey", Utf16ToUtf8(units));
+
+    SQLCloseCursor(stmt_);
+}
+
 // An integer column delivered to its natural fixed-width C target, rather than
 // being rendered as text.
 TEST_F(GetDataLiveTest, IntColumnToSlongTarget) {
