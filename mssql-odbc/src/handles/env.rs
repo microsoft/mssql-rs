@@ -23,6 +23,18 @@ pub(crate) enum OdbcVersion {
     Odbc3_80 = 380,
 }
 
+impl OdbcVersion {
+    /// Whether the application declared ODBC 3.8, which gates the SQL Server
+    /// extended C types (`SQL_C_SS_TIME2`, `SQL_C_SS_TIMESTAMPOFFSET`).
+    ///
+    /// Default binding resolution and `SQL_CA_SS_VARIANT_TYPE` metadata must
+    /// answer this the same way, so both read it here rather than spelling the
+    /// comparison out separately (`IS351ORLESSAPP`, `sqlcdesc.cpp:6474`).
+    pub(crate) fn uses_3_80_types(self) -> bool {
+        self == OdbcVersion::Odbc3_80
+    }
+}
+
 impl TryFrom<u32> for OdbcVersion {
     type Error = ();
 

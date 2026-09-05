@@ -539,7 +539,7 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
 /// `datetimeoffset`; earlier or unset versions use the binary fallback
 /// (`IS351ORLESSAPP`, `sqlcdesc.cpp:6474`).
 fn uses_3_80_variant_types(odbc_version: OdbcVersion) -> bool {
-    odbc_version == OdbcVersion::Odbc3_80
+    odbc_version.uses_3_80_types()
 }
 
 /// The C type a `sql_variant` value reports for `SQL_CA_SS_VARIANT_TYPE`.
