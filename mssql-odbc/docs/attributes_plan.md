@@ -31,8 +31,8 @@ those attributes drive — that is already split into sibling stories.
 | `{fn}` / `{ts}` / `{call}` translation when NOSCAN is off | AB#46384 ODBC escape sequences |
 | `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` as attributes | **46377** |
 | Descriptor handle semantics behind them | AB#46374 Descriptors |
-| `SQL_ATTR_PARAMSET_SIZE` accept/store | **46377** |
-| Array-bound `executemany` execution | AB#46576 Batch insert |
+| `SQL_ATTR_PARAMSET_SIZE` accept/store and buffer layout | AB#47819 Parameter-array layout |
+| Array-bound `executemany` execution | AB#47820 Parameter-array execution |
 | `SQL_ATTR_RESET_CONNECTION`, `SQL_ATTR_CONNECTION_DEAD` | AB#47317 (Closed) |
 | `SQL_ATTR_AUTOCOMMIT`, `SQL_ATTR_TXN_ISOLATION` | AB#46379 (Closed) |
 | Connection-string keyword parsing | AB#46372 (Closed) |
@@ -95,6 +95,18 @@ their measured not-implemented diagnostic; an unknown identifier returns `HY092`
 
 Unknown identifiers return `HY092`; recognized optional behavior that is not
 implemented returns `HYC00`.
+
+AB#47819 accepts and preserves every positive `SQL_ATTR_PARAMSET_SIZE` so
+applications can configure the complete parameter-array layout. Until AB#47820
+iterates those rows, parameterized `SQLExecute` and `SQLExecDirect` calls return
+`HYC00` when the size exceeds one, before reading application value buffers.
+Parameterless statements continue normally because they have no array rows to
+discard. The prepared path also leaves its plan in place for retry. This is a
+temporary execution gap, not an attribute rejection: reporting success for a
+parameterized statement would execute only row zero and silently discard the
+rest of mssql-python's batch. `SQL_ATTR_PARAMS_PROCESSED_PTR` and
+`SQL_ATTR_PARAM_STATUS_PTR` remain stored-only in AB#47819; AB#47820 owns
+writing aggregate and per-row outcomes once row execution exists.
 
 ---
 
@@ -407,7 +419,7 @@ ideal rather than what this driver does.
 | 15 | `ENABLE_AUTO_IPD` | 0 | stored |
 | 17 | `PARAM_BIND_OFFSET_PTR` | 0 (null) | **enforced**: dereferenced at execute and added to both bound pointers |
 | 16, 18–21, 23–24 | bind/offset/status pointers | 0 | stored |
-| 22 | `PARAMSET_SIZE` | 1 | 1 → success; above 1 → `HYC00` (array binding is a deferred feature) |
+| 22 | `PARAMSET_SIZE` | 1 | positive values are stored; 0 → `HY024` |
 | 10014 | `METADATA_ID` | 0 | `SQL_FALSE` accepted; `SQL_TRUE` → `HYC00` |
 | -1 | `CURSOR_SCROLLABLE` | `SQL_NONSCROLLABLE` | the boolean face of `CURSOR_TYPE` |
 | -2 | `CURSOR_SENSITIVITY` | `SQL_INSENSITIVE` | `SQL_UNSPECIFIED` normalises to insensitive, silently |

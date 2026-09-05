@@ -398,6 +398,19 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         .expect("prepared checked non-None above")
         .marker_count;
 
+    // P1 stores parameter-array layout but does not execute its rows. Refuse
+    // parameterized execution until AB#47820 consumes `paramset_size`;
+    // succeeding here would send only row zero and silently discard the rest
+    // of the batch. Parameterless statements have no array rows to discard.
+    if marker_count > 0 && stmt_state.paramset_size > 1 {
+        error!(
+            paramset_size = stmt_state.paramset_size,
+            "SQLExecute: parameter-array execution is not implemented"
+        );
+        post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+        return Err(SQL_ERROR);
+    }
+
     // All state-sequencing checks passed: this is a real new execute, so the
     // fresh snapshot now becomes the one `build_named_params` and any DAE
     // sequence it opens will read for the rest of this execute.
@@ -524,14 +537,15 @@ mod tests {
     }
 
     #[test]
-    fn prepared_but_disconnected_returns_error() {
+    fn parameterless_array_execute_reaches_the_connection() {
         let h = TestHandles::with_env_dbc_stmt();
         // No parameter markers, so gathering succeeds and we reach the
         // connection claim, which fails because the DBC is not connected.
         set_prepared(h.stmt, "SELECT 1");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().paramset_size = 2;
         let ret = unsafe { sql_execute(h.stmt) };
         assert_eq!(ret, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(
             state.diag_records[0].sql_state,
@@ -554,6 +568,29 @@ mod tests {
             ERR_INVALID_CURSOR_STATE.state
         );
         // The pre-I/O guard must not set EXEC_STARTED.
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    #[test]
+    fn parameter_array_execute_is_rejected_before_staging() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT ?");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().paramset_size = 2;
+
+        let ret = unsafe { sql_execute(h.stmt) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED.state
+        );
+        assert!(
+            state.prepared.is_some(),
+            "prepared plan must remain retryable"
+        );
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 

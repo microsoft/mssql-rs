@@ -21,8 +21,8 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+    SQL_ATTR_PARAM_BIND_TYPE, SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET,
+    SQL_NEED_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
 };
 use crate::conversion::param_convert::{
     ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
@@ -614,6 +614,10 @@ pub(super) unsafe fn build_named_params(
     // Read once per execution: the attribute holds a pointer, and every
     // binding shifts by the same amount.
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+    let param_bind_type = stmt_state
+        .inert_attrs
+        .get(SQL_ATTR_PARAM_BIND_TYPE)
+        .unwrap_or_default();
 
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
@@ -621,10 +625,12 @@ pub(super) unsafe fn build_named_params(
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
-        // Applied before anything reads the binding: ODBC shifts the
-        // indicator pointer alongside the value pointer, so the
-        // data-at-execution check below has to see the shifted indicator.
-        let bound_param = bound_param.with_bind_offset(bind_offset);
+        // Row zero is the scalar execution path. Positioning it through the
+        // same API as parameter arrays keeps bind-offset ownership in one
+        // place and makes the data-at-execution check see the shifted pointer.
+        let bound_param = bound_param
+            .for_row(0, bind_offset, param_bind_type)
+            .expect("row zero does not require an array stride");
 
         let name = format!("@P{}", i + 1);
 

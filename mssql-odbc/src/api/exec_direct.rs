@@ -149,11 +149,19 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
+        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        if marker_count > 0 && stmt_state.paramset_size > 1 {
+            error!(
+                paramset_size = stmt_state.paramset_size,
+                "SQLExecDirectW: parameter-array execution is not implemented"
+            );
+            post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+            return SQL_ERROR;
+        }
         stmt_state.bound_params = bound_params;
         // Rewrite markers and read the bound parameter buffers before mutating
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
-        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
         let named_params =
             match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
                 Ok(params) => params,
@@ -332,6 +340,22 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
     }
 
+    #[test]
+    fn parameterless_array_execute_reaches_the_connection() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().paramset_size = 2;
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".to_string());
+
+        assert_eq!(ret, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
+    }
+
     /// A statement awaiting `SQLPutData` is in the Need Data state, where the
     /// spec calls anything but SQLPutData/SQLParamData/SQLCancel a sequence
     /// error. Without the dedicated guard this falls through to the
@@ -344,6 +368,7 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_EXEC_STARTED);
             state.dae = Some(crate::handles::stmt::DaeState::for_test(Vec::new(), None));
+            state.paramset_size = 2;
         }
 
         let sql: Vec<u16> = "SELECT 1"
@@ -357,6 +382,23 @@ mod tests {
 
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY010);
+    }
+
+    #[test]
+    fn exec_direct_with_open_cursor_and_parameter_array_posts_24000() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.set_state(STMT_STATE_CURSOR_OPEN);
+            state.paramset_size = 2;
+        }
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".to_string());
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_24000);
     }
 
     #[test]
@@ -458,6 +500,30 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn parameter_array_execute_is_rejected_before_staging() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 2;
+            state
+                .diag_records
+                .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        }
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT ?".to_string());
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1, "stale record must be cleared");
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED.state
+        );
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
     /// A `snapshot_bound_params` failure (here, a poisoned APD) must still
     /// post an HY000 diagnostic, and post it as record 1 — not leave
     /// `SQLGetDiagRec` reporting `SQL_NO_DATA`, and not append after a stale
@@ -466,11 +532,13 @@ mod tests {
     fn snapshot_failure_posts_hy000_as_the_first_diagnostic_record() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        stmt.inner
-            .lock()
-            .unwrap()
-            .diag_records
-            .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 2;
+            state
+                .diag_records
+                .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
+        }
         poison_apd(h.apd());
 
         let sql: Vec<u16> = "SELECT 1"

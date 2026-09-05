@@ -20,12 +20,11 @@
 //! written; the handful whose reported value msodbcsql pins regardless of the
 //! request (`SQL_ATTR_MAX_LENGTH`, `SQL_ATTR_KEYSET_SIZE`,
 //! `SQL_ATTR_SIMULATE_CURSOR`) substitute and warn with `01S02`.
-//! `SQL_ATTR_PARAMSET_SIZE` accepts the ODBC default of 1 but rejects larger
-//! batches, since parameter arrays are not yet consumed and a silent success
-//! would execute only the first row. `SQL_ATTR_METADATA_ID` accepts its
-//! pattern-mode default (`SQL_FALSE`) but returns `HYC00` for `SQL_TRUE` until
-//! catalog calls implement identifier matching. Unrecognized attribute
-//! identifiers fail with `HY092`.
+//! `SQL_ATTR_PARAMSET_SIZE` stores the number of values in each column-wise
+//! parameter array; execution of those arrays is owned by AB#47820.
+//! `SQL_ATTR_METADATA_ID` accepts its pattern-mode default (`SQL_FALSE`) but
+//! returns `HYC00` for `SQL_TRUE` until catalog calls implement identifier
+//! matching. Unrecognized attribute identifiers fail with `HY092`.
 //!
 //! The SQL Server vendor attributes (`SQL_SOPT_SS_*`, ids 1225-1238) differ from
 //! the rest in that the driver, not the Driver Manager, validates their values:
@@ -67,7 +66,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{
     DiagMsg, ERR_FUNCTION_SEQUENCE, ERR_INVALID_ATTRIBUTE_VALUE, ERR_INVALID_CURSOR_STATE,
     ERR_INVALID_USE_OF_AUTO_DESC, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_01S02,
-    SQLSTATE_HYC00, WARN_OPTION_VALUE_CHANGED, post_diag,
+    WARN_OPTION_VALUE_CHANGED, post_diag,
 };
 use crate::api::util::{read_utf16_attr, write_if_some, write_wide_attr};
 use crate::error::{free_errors, post_sql_error};
@@ -205,30 +204,14 @@ unsafe fn sql_set_stmt_attr_w_safe(
             SQL_SUCCESS
         }
         SQL_ATTR_PARAMSET_SIZE => {
-            // Parameter arrays are not yet consumed (executemany batch insert is
-            // tracked separately). Accept the ODBC default of 1; reject a larger
-            // batch (HYC00) instead of silently executing only the first row,
-            // and reject 0 as an invalid value (HY024).
-            match value_ptr as SqlULen {
-                1 => SQL_SUCCESS,
-                0 => {
-                    error!("SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE of 0 is invalid");
-                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
-                    SQL_ERROR
-                }
-                n => {
-                    error!(
-                        paramset_size = n,
-                        "SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE > 1 not supported"
-                    );
-                    post_sql_error(
-                        &mut state,
-                        SQLSTATE_HYC00,
-                        0,
-                        "Parameter arrays (SQL_ATTR_PARAMSET_SIZE > 1) are not supported",
-                    );
-                    SQL_ERROR
-                }
+            let n = value_ptr as SqlULen;
+            if n == 0 {
+                error!("SQLSetStmtAttrW: SQL_ATTR_PARAMSET_SIZE of 0 is invalid");
+                post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                SQL_ERROR
+            } else {
+                state.paramset_size = n;
+                SQL_SUCCESS
             }
         }
         SQL_ATTR_CURSOR_TYPE => {
@@ -689,7 +672,7 @@ unsafe fn sql_get_stmt_attr_w_safe(
             write_if_some(value_ptr as *mut SqlULen, SQL_CONCUR_READ_ONLY);
         },
         SQL_ATTR_PARAMSET_SIZE => unsafe {
-            write_if_some(value_ptr as *mut SqlULen, 1);
+            write_if_some(value_ptr as *mut SqlULen, state.paramset_size);
         },
         // ARD/APD report the active association (an explicit descriptor if
         // one was set via SQLSetStmtAttrW, else the implicit default), so
@@ -770,7 +753,9 @@ mod tests {
         SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_QUERYNOTIFICATION_TIMEOUT, SQL_SOPT_SS_REGIONALIZE,
         SQL_SOPT_SS_TEXTPTR_LOGGING, SqlLen,
     };
-    use crate::api::sqlstate::{SQLSTATE_01004, SQLSTATE_24000, SQLSTATE_HY024, SQLSTATE_HY092};
+    use crate::api::sqlstate::{
+        SQLSTATE_01004, SQLSTATE_24000, SQLSTATE_HY024, SQLSTATE_HY092, SQLSTATE_HYC00,
+    };
     use crate::handles::handle_from_raw;
     use crate::handles::stmt::InertStmtAttrs;
     use crate::test_support::TestHandles;
@@ -1204,19 +1189,79 @@ mod tests {
     }
 
     #[test]
-    fn set_paramset_size_greater_than_one_rejected() {
+    fn set_paramset_size_greater_than_one_is_stored_and_returned() {
         let h = TestHandles::with_env_dbc_stmt();
         let ret =
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 100 as SqlPointer, 0) };
-        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let mut out: SqlULen = 0;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_PARAMSET_SIZE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 100);
     }
 
     #[test]
     fn set_paramset_size_zero_rejected() {
         let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 7 as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
         let ret =
             unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 0 as SqlPointer, 0) };
         assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+
+        let mut out: SqlULen = 0;
+        let ret = unsafe {
+            sql_get_stmt_attr_w(
+                h.stmt,
+                SQL_ATTR_PARAMSET_SIZE,
+                (&mut out as *mut SqlULen).cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, 7, "a rejected zero must not mutate the prior value");
+    }
+
+    #[test]
+    fn paramset_size_accepts_boundaries_and_repeated_writes() {
+        let h = TestHandles::with_env_dbc_stmt();
+        for value in [1, 2, 255, 65_536, SqlULen::MAX, 1] {
+            assert_eq!(
+                unsafe {
+                    sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, value as SqlPointer, 0)
+                },
+                SQL_SUCCESS,
+                "set {value}"
+            );
+            let mut out: SqlULen = 0;
+            assert_eq!(
+                unsafe {
+                    sql_get_stmt_attr_w(
+                        h.stmt,
+                        SQL_ATTR_PARAMSET_SIZE,
+                        (&mut out as *mut SqlULen).cast(),
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                SQL_SUCCESS,
+                "get after setting {value}"
+            );
+            assert_eq!(out, value);
+        }
     }
 
     #[test]
@@ -2295,6 +2340,7 @@ mod tests {
             SQL_ATTR_CURSOR_TYPE,
             SQL_ATTR_CONCURRENCY,
             SQL_ATTR_ROW_ARRAY_SIZE,
+            SQL_ATTR_PARAMSET_SIZE,
             SQL_ATTR_METADATA_ID,
             SQL_SOPT_SS_DEFER_PREPARE,
         ] {

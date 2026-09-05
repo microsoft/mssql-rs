@@ -4,10 +4,11 @@
 use std::ffi::c_void;
 
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
+    SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
+use crate::conversion::parameter_value_stride;
 use crate::handles::OdbcVersion;
 use crate::handles::desc::{DescRecord, DescState};
 
@@ -58,6 +59,15 @@ pub(crate) struct BoundParam {
     pub(crate) octet_length_ptr: *mut SqlLen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Returned by the row execution loop in AB#47820.
+pub(crate) enum ParamArrayLayoutError {
+    InvalidValueStride {
+        c_type: SqlSmallInt,
+        buffer_length: SqlLen,
+    },
+}
+
 impl BoundParam {
     /// Returns the binding with `SQL_ATTR_PARAM_BIND_OFFSET_PTR` applied.
     ///
@@ -66,7 +76,7 @@ impl BoundParam {
     /// binding across a buffer without rebinding it. A null pointer stays
     /// null — the offset addresses a buffer that was never supplied, and
     /// offsetting null would turn "no indicator" into a wild pointer.
-    pub(crate) fn with_bind_offset(mut self, offset: isize) -> Self {
+    fn with_bind_offset(mut self, offset: isize) -> Self {
         if offset == 0 {
             return self;
         }
@@ -80,6 +90,59 @@ impl BoundParam {
             self.octet_length_ptr = self.octet_length_ptr.wrapping_byte_offset(offset);
         }
         self
+    }
+
+    /// Returns this binding positioned at `row` without mutating the
+    /// descriptor-derived snapshot.
+    ///
+    /// The global bind offset applies to every pointer. Column-wise value
+    /// buffers then advance by their C-type stride and indicator buffers by
+    /// one `SQLLEN`; row-wise buffers all advance by the application-supplied
+    /// structure size in `param_bind_type`.
+    /// Pointer arithmetic is wrapping because ODBC makes the application
+    /// responsible for supplying a live array of the declared shape; wrapping
+    /// here avoids a Rust arithmetic panic without weakening that contract.
+    #[allow(dead_code)] // Consumed by parameter-array execution in AB#47820.
+    pub(crate) fn for_row(
+        self,
+        row: usize,
+        bind_offset: isize,
+        param_bind_type: SqlULen,
+    ) -> Result<Self, ParamArrayLayoutError> {
+        let mut positioned = self.with_bind_offset(bind_offset);
+        if row == 0 {
+            return Ok(positioned);
+        }
+        let (value_stride, indicator_stride) = if param_bind_type == SQL_BIND_BY_COLUMN {
+            let Some(value_stride) = parameter_value_stride(self.c_type, self.buffer_length) else {
+                return Err(ParamArrayLayoutError::InvalidValueStride {
+                    c_type: self.c_type,
+                    buffer_length: self.buffer_length,
+                });
+            };
+            (value_stride, std::mem::size_of::<SqlLen>())
+        } else {
+            let row_stride = param_bind_type;
+            (row_stride, row_stride)
+        };
+        let value_offset = row.wrapping_mul(value_stride);
+        let indicator_offset = row.wrapping_mul(indicator_stride);
+        if !positioned.parameter_value_ptr.is_null() {
+            positioned.parameter_value_ptr = positioned
+                .parameter_value_ptr
+                .wrapping_byte_add(value_offset);
+        }
+        if !positioned.strlen_or_ind_ptr.is_null() {
+            positioned.strlen_or_ind_ptr = positioned
+                .strlen_or_ind_ptr
+                .wrapping_byte_add(indicator_offset);
+        }
+        if !positioned.octet_length_ptr.is_null() {
+            positioned.octet_length_ptr = positioned
+                .octet_length_ptr
+                .wrapping_byte_add(indicator_offset);
+        }
+        Ok(positioned)
     }
 
     /// Writes this binding into the matching APD and IPD records at the same
@@ -232,7 +295,7 @@ impl BoundParam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_PARAM_INPUT, SQL_VARCHAR};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_PARAM_INPUT, SQL_VARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
 
     const ODBC_VERSION: OdbcVersion = OdbcVersion::Odbc3_80;
@@ -298,6 +361,235 @@ mod tests {
         assert_eq!(
             shifted.strlen_or_ind_ptr as usize,
             original.strlen_or_ind_ptr as usize
+        );
+    }
+
+    #[test]
+    fn array_row_combines_bind_offset_with_variable_width_stride() {
+        let mut buf = [0u8; 40];
+        let mut indicators = [0 as SqlLen; 4];
+        let original = param(buf.as_mut_ptr().cast(), indicators.as_mut_ptr());
+        let positioned = original
+            .for_row(2, 3, SQL_BIND_BY_COLUMN)
+            .expect("column-wise binding has a valid stride");
+        assert_eq!(
+            positioned.parameter_value_ptr as usize,
+            original.parameter_value_ptr as usize + 3 + 16
+        );
+        assert_eq!(
+            positioned.strlen_or_ind_ptr as usize,
+            original.strlen_or_ind_ptr as usize + 3 + 2 * size_of::<SqlLen>()
+        );
+    }
+
+    #[test]
+    fn array_row_uses_c_type_width_for_fixed_values() {
+        let mut values = [0i32; 3];
+        let mut indicators = [0 as SqlLen; 3];
+        let original = BoundParam {
+            c_type: SQL_C_SLONG,
+            buffer_length: 400,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+            ..param(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        let positioned = original
+            .for_row(2, 0, SQL_BIND_BY_COLUMN)
+            .expect("fixed-width binding has a C-type stride");
+        assert_eq!(
+            positioned.parameter_value_ptr as usize,
+            original.parameter_value_ptr as usize + 2 * size_of::<i32>()
+        );
+    }
+
+    #[test]
+    fn array_row_advances_split_indicator_pointers_independently() {
+        let mut buf = [0u8; 24];
+        let mut indicators = [0 as SqlLen; 3];
+        let mut lengths = [0 as SqlLen; 3];
+        let mut original = param(buf.as_mut_ptr().cast(), indicators.as_mut_ptr());
+        original.octet_length_ptr = lengths.as_mut_ptr();
+        let positioned = original
+            .for_row(2, 0, SQL_BIND_BY_COLUMN)
+            .expect("column-wise binding has a valid stride");
+        assert_eq!(positioned.strlen_or_ind_ptr, unsafe {
+            indicators.as_mut_ptr().add(2)
+        });
+        assert_eq!(positioned.octet_length_ptr, unsafe {
+            lengths.as_mut_ptr().add(2)
+        });
+    }
+
+    #[test]
+    fn array_row_preserves_each_null_indicator_pointer_independently() {
+        let mut buf = [0u8; 16];
+        let mut indicator = [0 as SqlLen; 2];
+
+        let mut indicator_only = param(buf.as_mut_ptr().cast(), indicator.as_mut_ptr());
+        indicator_only.octet_length_ptr = std::ptr::null_mut();
+        let positioned = indicator_only
+            .for_row(1, 0, SQL_BIND_BY_COLUMN)
+            .expect("character binding has a valid stride");
+        assert_eq!(positioned.strlen_or_ind_ptr, unsafe {
+            indicator.as_mut_ptr().add(1)
+        });
+        assert!(positioned.octet_length_ptr.is_null());
+
+        let mut octet_only = param(buf.as_mut_ptr().cast(), std::ptr::null_mut());
+        octet_only.octet_length_ptr = indicator.as_mut_ptr();
+        let positioned = octet_only
+            .for_row(1, 0, SQL_BIND_BY_COLUMN)
+            .expect("character binding has a valid stride");
+        assert!(positioned.strlen_or_ind_ptr.is_null());
+        assert_eq!(positioned.octet_length_ptr, unsafe {
+            indicator.as_mut_ptr().add(1)
+        });
+    }
+
+    #[test]
+    fn array_row_combines_negative_bind_offset_with_row_stride() {
+        let mut values = [0u8; 40];
+        let mut indicators = [0 as SqlLen; 4];
+        let original = param(
+            values.as_mut_ptr().wrapping_add(8).cast(),
+            indicators.as_mut_ptr().wrapping_add(1),
+        );
+        let positioned = original
+            .for_row(2, -8, SQL_BIND_BY_COLUMN)
+            .expect("character binding has a valid stride");
+        assert_eq!(
+            positioned.parameter_value_ptr as usize,
+            original.parameter_value_ptr as usize - 8 + 16
+        );
+        assert_eq!(
+            positioned.strlen_or_ind_ptr as usize,
+            original.strlen_or_ind_ptr as usize - 8 + 2 * size_of::<SqlLen>()
+        );
+    }
+
+    #[test]
+    fn array_row_zero_is_identity_without_a_bind_offset() {
+        let mut values = [0u8; 8];
+        let mut indicator: SqlLen = 0;
+        let original = param(values.as_mut_ptr().cast(), &raw mut indicator);
+        let positioned = original
+            .for_row(0, 0, SQL_BIND_BY_COLUMN)
+            .expect("character binding has a valid stride");
+        assert_eq!(positioned.parameter_value_ptr, original.parameter_value_ptr);
+        assert_eq!(positioned.strlen_or_ind_ptr, original.strlen_or_ind_ptr);
+        assert_eq!(positioned.octet_length_ptr, original.octet_length_ptr);
+    }
+
+    #[test]
+    fn array_row_preserves_null_value_and_indicator_pointers() {
+        let positioned = param(std::ptr::null_mut(), std::ptr::null_mut())
+            .for_row(3, 7, SQL_BIND_BY_COLUMN)
+            .expect("null pointers do not change the array layout");
+        assert!(positioned.parameter_value_ptr.is_null());
+        assert!(positioned.strlen_or_ind_ptr.is_null());
+        assert!(positioned.octet_length_ptr.is_null());
+    }
+
+    #[test]
+    fn array_row_does_not_mutate_misaligned_source_pointers() {
+        let mut value_storage = [0u8; 24];
+        let mut indicator_storage = [0u8; 32];
+        let value = value_storage.as_mut_ptr().wrapping_add(1).cast();
+        let indicator = indicator_storage.as_mut_ptr().wrapping_add(1).cast();
+        let original = param(value, indicator);
+
+        let positioned = original
+            .for_row(1, 1, SQL_BIND_BY_COLUMN)
+            .expect("misalignment does not change byte-stride arithmetic");
+
+        assert_eq!(original.parameter_value_ptr, value);
+        assert_eq!(original.strlen_or_ind_ptr, indicator);
+        assert_eq!(positioned.parameter_value_ptr as usize, value as usize + 9);
+        assert_eq!(
+            positioned.strlen_or_ind_ptr as usize,
+            indicator as usize + 1 + size_of::<SqlLen>()
+        );
+    }
+
+    #[test]
+    fn array_row_extreme_index_does_not_panic() {
+        let mut buf = [0u8; 8];
+        let bound = param(buf.as_mut_ptr().cast(), std::ptr::null_mut());
+        assert!(
+            bound
+                .for_row(usize::MAX, isize::MAX, SQL_BIND_BY_COLUMN)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn array_row_uses_structure_size_for_row_wise_pointers() {
+        let mut storage = [0u8; 96];
+        let value = storage.as_mut_ptr().cast();
+        let indicator = storage.as_mut_ptr().wrapping_add(8).cast();
+        let octet_length = storage.as_mut_ptr().wrapping_add(16).cast();
+        let mut original = param(value, indicator);
+        original.octet_length_ptr = octet_length;
+
+        let positioned = original
+            .for_row(2, 3, 32)
+            .expect("row-wise layout uses the declared structure size");
+
+        assert_eq!(positioned.parameter_value_ptr as usize, value as usize + 67);
+        assert_eq!(
+            positioned.strlen_or_ind_ptr as usize,
+            indicator as usize + 67
+        );
+        assert_eq!(
+            positioned.octet_length_ptr as usize,
+            octet_length as usize + 67
+        );
+    }
+
+    #[test]
+    fn row_wise_layout_does_not_require_a_c_type_stride() {
+        let mut storage = [0u8; 64];
+        let mut bound = param(storage.as_mut_ptr().cast(), std::ptr::null_mut());
+        bound.c_type = SQL_C_DEFAULT;
+
+        let positioned = bound
+            .for_row(2, 0, 24)
+            .expect("row-wise layout uses only the structure size");
+
+        assert_eq!(
+            positioned.parameter_value_ptr as usize,
+            bound.parameter_value_ptr as usize + 48
+        );
+    }
+
+    #[test]
+    fn array_row_rejects_an_unresolved_c_type() {
+        let mut bound = param(std::ptr::null_mut(), std::ptr::null_mut());
+        bound.c_type = SQL_C_DEFAULT;
+        assert_eq!(
+            bound
+                .for_row(1, 0, SQL_BIND_BY_COLUMN)
+                .expect_err("an unresolved C type has no value stride"),
+            ParamArrayLayoutError::InvalidValueStride {
+                c_type: SQL_C_DEFAULT,
+                buffer_length: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn array_row_rejects_negative_variable_width() {
+        let mut bound = param(std::ptr::null_mut(), std::ptr::null_mut());
+        bound.buffer_length = -1;
+        assert_eq!(
+            bound
+                .for_row(1, 0, SQL_BIND_BY_COLUMN)
+                .expect_err("a negative variable width has no valid array stride"),
+            ParamArrayLayoutError::InvalidValueStride {
+                c_type: SQL_C_CHAR,
+                buffer_length: -1,
+            }
         );
     }
 
