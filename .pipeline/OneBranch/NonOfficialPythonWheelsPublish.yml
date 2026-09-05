@@ -71,10 +71,24 @@ extends:
       - name: public/mssql-rs_Public
         continueOnConflict: true
     stages:
-    - template: /.pipeline/OneBranch/stages.yml@self
-      parameters:
-        buildAllTargets: true
-        buildPythonWheels: true
-        buildOdbcNative: ${{ parameters.buildOdbcNative }}
-        isOfficial: false
-        publishToFeed: ${{ parameters.publishToFeed }}
+    - stage: Build
+      jobs:
+      - job: MacOS_Architecture
+        displayName: macOS architecture
+        timeoutInMinutes: 15
+        pool:
+          type: linux
+          isCustom: true
+          name: Azure Pipelines
+          vmImage: 'macOS-latest'
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+        steps:
+        - pwsh: |
+            $machine = & uname -m
+            Write-Host "Reason: $(Build.Reason)"
+            Write-Host "Branch: $(Build.SourceBranch)"
+            Write-Host "Operating System: $(Agent.OS)"
+            Write-Host "Architecture: $(Agent.OSArchitecture)"
+            Write-Host "Machine: $machine"
+          displayName: Debug information
