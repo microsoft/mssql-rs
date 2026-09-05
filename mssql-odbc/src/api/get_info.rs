@@ -6,16 +6,25 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_ACTIVE_STATEMENTS, SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE,
-    SQL_ASYNC_NOTIFICATION, SQL_ASYNC_NOTIFICATION_NOT_CAPABLE, SQL_CB_CLOSE,
-    SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DBMS_NAME, SQL_DBMS_VER,
+    SQL_ACCESSIBLE_PROCEDURES, SQL_ACCESSIBLE_TABLES, SQL_ACTIVE_STATEMENTS,
+    SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE, SQL_ASYNC_NOTIFICATION,
+    SQL_ASYNC_NOTIFICATION_NOT_CAPABLE, SQL_CATALOG_NAME_SEPARATOR, SQL_CATALOG_TERM, SQL_CB_CLOSE,
+    SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DATA_SOURCE_NAME,
+    SQL_DATA_SOURCE_READ_ONLY, SQL_DATABASE_NAME, SQL_DBMS_NAME, SQL_DBMS_VER,
     SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER, SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER,
-    SQL_ERROR, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS,
-    SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_MAX_DRIVER_CONNECTIONS,
-    SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE,
-    SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_TC_ALL, SQL_TXN_CAPABLE, SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT,
-    SQL_TXN_READ_COMMITTED, SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_ERROR, SQL_EXPRESSIONS_IN_ORDERBY, SQL_FN_NUM_SPT, SQL_FN_STR_SPT, SQL_FN_SYS_SPT,
+    SQL_FN_TD_SPT, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS,
+    SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_KEYWORDS, SQL_LIKE_ESCAPE_CLAUSE,
+    SQL_MAX_CATALOG_NAME_LEN, SQL_MAX_COLUMN_NAME_LEN, SQL_MAX_DRIVER_CONNECTIONS,
+    SQL_MAX_IDENTIFIER_LEN, SQL_MAX_SCHEMA_NAME_LEN, SQL_MAX_STATEMENT_LEN, SQL_MAX_TABLE_NAME_LEN,
+    SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_NUMERIC_FUNCTIONS, SQL_OAC_LEVEL2,
+    SQL_ODBC_API_CONFORMANCE, SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE,
+    SQL_OUTER_JOINS, SQL_PROCEDURE_TERM, SQL_PROCEDURES, SQL_SC_SQL92_ENTRY, SQL_SCHEMA_TERM,
+    SQL_SEARCH_PATTERN_ESCAPE, SQL_SERVER_NAME, SQL_SPECIAL_CHARACTERS, SQL_SQL_CONFORMANCE,
+    SQL_STRING_FUNCTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_SYSTEM_FUNCTIONS, SQL_TABLE_TERM,
+    SQL_TC_ALL, SQL_TIMEDATE_FUNCTIONS, SQL_TXN_CAPABLE, SQL_TXN_ISOLATION_OPTION,
+    SQL_TXN_ISOLATION_OPTION_SPT, SQL_TXN_READ_COMMITTED, SQL_USER_NAME, SqlHandle, SqlPointer,
+    SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, WARN_STRING_TRUNCATION, post_diag};
 use crate::api::util::{copy_with_nul, write_if_some};
@@ -88,9 +97,6 @@ unsafe fn sql_get_info_w_impl(
     )
 }
 
-// TODO: This function implements only what is needed for
-//       Windows ODBC Driver Manager to load the driver. Fix
-//       hardcoded values and implement the rest of the info types.
 fn sql_get_info_w_safe(
     dbc: &DbcHandle,
     info_type: SqlUSmallInt,
@@ -112,6 +118,13 @@ fn sql_get_info_w_safe(
             write_u16(info_value_ptr, 0, string_length_ptr)
         }
         SQL_ACTIVE_STATEMENTS => write_u16(info_value_ptr, 0, string_length_ptr),
+        SQL_DATA_SOURCE_NAME => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "",
+        ),
         SQL_DRIVER_NAME => write_wide_str(
             &mut state,
             info_value_ptr,
@@ -186,6 +199,41 @@ fn sql_get_info_w_safe(
                 &version,
             )
         }
+        SQL_DATABASE_NAME => {
+            let database = state
+                .client
+                .as_ref()
+                .map(|client| client.database().to_string())
+                .or_else(|| state.current_catalog.clone())
+                .unwrap_or_default();
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                &database,
+            )
+        }
+        SQL_SERVER_NAME => {
+            let server_name = state.server_name.clone();
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                &server_name,
+            )
+        }
+        SQL_USER_NAME => {
+            let user_name = state.user_name.clone();
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                &user_name,
+            )
+        }
         SQL_IDENTIFIER_QUOTE_CHAR => write_wide_str(
             &mut state,
             info_value_ptr,
@@ -193,6 +241,96 @@ fn sql_get_info_w_safe(
             string_length_ptr,
             "\"",
         ),
+        SQL_SEARCH_PATTERN_ESCAPE => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "\\",
+        ),
+        SQL_CATALOG_NAME_SEPARATOR => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            ".",
+        ),
+        SQL_CATALOG_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "database",
+        ),
+        SQL_SCHEMA_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "owner",
+        ),
+        SQL_TABLE_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "table",
+        ),
+        SQL_PROCEDURE_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "stored procedure",
+        ),
+        SQL_SPECIAL_CHARACTERS => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "_#$",
+        ),
+        SQL_KEYWORDS => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            SQL_SERVER_KEYWORDS,
+        ),
+        SQL_ACCESSIBLE_TABLES
+        | SQL_ACCESSIBLE_PROCEDURES
+        | SQL_PROCEDURES
+        | SQL_EXPRESSIONS_IN_ORDERBY
+        | SQL_LIKE_ESCAPE_CLAUSE
+        | SQL_OUTER_JOINS => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "Y",
+        ),
+        SQL_DATA_SOURCE_READ_ONLY => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "N",
+        ),
+        SQL_MAX_COLUMN_NAME_LEN
+        | SQL_MAX_SCHEMA_NAME_LEN
+        | SQL_MAX_CATALOG_NAME_LEN
+        | SQL_MAX_TABLE_NAME_LEN
+        | SQL_MAX_IDENTIFIER_LEN => write_u16(info_value_ptr, 128, string_length_ptr),
+        SQL_MAX_STATEMENT_LEN => write_u32(
+            info_value_ptr,
+            state.packet_size.saturating_mul(128),
+            string_length_ptr,
+        ),
+        SQL_NUMERIC_FUNCTIONS => write_u32(info_value_ptr, SQL_FN_NUM_SPT, string_length_ptr),
+        SQL_STRING_FUNCTIONS => write_u32(info_value_ptr, SQL_FN_STR_SPT, string_length_ptr),
+        SQL_SYSTEM_FUNCTIONS => write_u32(info_value_ptr, SQL_FN_SYS_SPT, string_length_ptr),
+        SQL_TIMEDATE_FUNCTIONS => write_u32(info_value_ptr, SQL_FN_TD_SPT, string_length_ptr),
+        SQL_SQL_CONFORMANCE => write_u32(info_value_ptr, SQL_SC_SQL92_ENTRY, string_length_ptr),
         SQL_NEED_LONG_DATA_LEN => write_wide_str(
             &mut state,
             info_value_ptr,
@@ -278,12 +416,22 @@ fn driver_name() -> &'static str {
     env!("MSSQL_ODBC_ARTIFACT")
 }
 
+const SQL_SERVER_KEYWORDS: &str = concat!(
+    "BACKUP,BREAK,BROWSE,BULK,CHECKPOINT,CLUSTERED,COMMITTED,COMPUTE,CONFIRM,CONTROLROW,",
+    "DATABASE,DBCC,DISK,DISTRIBUTED,DUMMY,ERRLVL,ERROREXIT,EXIT,FILE,FILLFACTOR,FLOPPY,",
+    "HOLDLOCK,IDENTITY_INSERT,IDENTITYCOL,IF,KILL,LINENO,MERGE,MIRROREXIT,NONCLUSTERED,",
+    "OFF,OFFSETS,ONCE,OVER,PERCENT,PERM,PERMANENT,PLAN,PRINT,PROC,PROCESSEXIT,RAISERROR,",
+    "READ,READTEXT,RECONFIGURE,REPEATABLE,RESTORE,RETURN,ROWCOUNT,RULE,SAVE,SERIALIZABLE,",
+    "SETUSER,SHUTDOWN,STATISTICS,TAPE,TEMP,TEXTSIZE,TOP,TRAN,TRIGGER,TRUNCATE,TSEQUEL,",
+    "UNCOMMITTED,UPDATETEXT,USE,WAITFOR,WHILE,WRITETEXT",
+);
+
 #[cfg(test)]
 mod tests {
     use std::ptr;
 
     use super::*;
-    use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_NULL_HANDLE};
     use crate::test_support::TestHandles;
 
     fn get_u16(dbc: SqlHandle, info_type: SqlUSmallInt) -> (SqlReturn, u16, SqlSmallInt) {
@@ -314,6 +462,22 @@ mod tests {
             )
         };
         (rc, val, len)
+    }
+
+    fn get_wide(dbc: SqlHandle, info_type: SqlUSmallInt) -> (SqlReturn, String, SqlSmallInt) {
+        let mut buf = [0u16; 1024];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                dbc,
+                info_type,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                &mut len,
+            )
+        };
+        let units = usize::try_from(len.max(0)).unwrap_or(0) / std::mem::size_of::<SqlWChar>();
+        (rc, String::from_utf16_lossy(&buf[..units]), len)
     }
 
     #[test]
@@ -355,6 +519,76 @@ mod tests {
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
             assert_eq!(val, expected, "info_type {info_type}");
             assert_eq!(len, 4, "info_type {info_type}");
+        }
+    }
+
+    #[test]
+    fn standard_string_info_types_report_sql_server_values() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.server_name = "db.example.test,1433".to_string();
+            state.user_name = "test-user".to_string();
+        }
+
+        for (info_type, expected) in [
+            (SQL_DATA_SOURCE_NAME, ""),
+            (SQL_SERVER_NAME, "db.example.test,1433"),
+            (SQL_USER_NAME, "test-user"),
+            (SQL_SEARCH_PATTERN_ESCAPE, "\\"),
+            (SQL_CATALOG_NAME_SEPARATOR, "."),
+            (SQL_CATALOG_TERM, "database"),
+            (SQL_SCHEMA_TERM, "owner"),
+            (SQL_TABLE_TERM, "table"),
+            (SQL_PROCEDURE_TERM, "stored procedure"),
+            (SQL_SPECIAL_CHARACTERS, "_#$"),
+            (SQL_ACCESSIBLE_TABLES, "Y"),
+            (SQL_ACCESSIBLE_PROCEDURES, "Y"),
+            (SQL_PROCEDURES, "Y"),
+            (SQL_EXPRESSIONS_IN_ORDERBY, "Y"),
+            (SQL_LIKE_ESCAPE_CLAUSE, "Y"),
+            (SQL_OUTER_JOINS, "Y"),
+            (SQL_DATA_SOURCE_READ_ONLY, "N"),
+        ] {
+            let (rc, value, len) = get_wide(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(value, expected, "info_type {info_type}");
+            assert_eq!(
+                usize::try_from(len).unwrap(),
+                expected.encode_utf16().count() * std::mem::size_of::<SqlWChar>(),
+                "info_type {info_type}"
+            );
+        }
+        let (rc, keywords, _) = get_wide(h.dbc, SQL_KEYWORDS);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert!(keywords.contains("BACKUP"));
+        assert!(keywords.contains("WRITETEXT"));
+    }
+
+    #[test]
+    fn standard_numeric_info_types_report_sql_server_values() {
+        let h = TestHandles::with_env_dbc();
+        for info_type in [
+            SQL_MAX_COLUMN_NAME_LEN,
+            SQL_MAX_SCHEMA_NAME_LEN,
+            SQL_MAX_CATALOG_NAME_LEN,
+            SQL_MAX_TABLE_NAME_LEN,
+            SQL_MAX_IDENTIFIER_LEN,
+        ] {
+            let (rc, value, len) = get_u16(h.dbc, info_type);
+            assert_eq!((rc, value, len), (SQL_SUCCESS, 128, 2));
+        }
+        for (info_type, expected) in [
+            (SQL_MAX_STATEMENT_LEN, 128 * DEFAULT_PACKET_SIZE),
+            (SQL_NUMERIC_FUNCTIONS, SQL_FN_NUM_SPT),
+            (SQL_STRING_FUNCTIONS, SQL_FN_STR_SPT),
+            (SQL_SYSTEM_FUNCTIONS, SQL_FN_SYS_SPT),
+            (SQL_TIMEDATE_FUNCTIONS, SQL_FN_TD_SPT),
+            (SQL_SQL_CONFORMANCE, SQL_SC_SQL92_ENTRY),
+        ] {
+            let (rc, value, len) = get_u32(h.dbc, info_type);
+            assert_eq!((rc, value, len), (SQL_SUCCESS, expected, 4));
         }
     }
 

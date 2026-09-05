@@ -415,9 +415,8 @@ driver, not by what is convenient to write:
   read sequence.
 - **Nullable inline variable width, separate from MAX/PLP.** They are different
   driver paths — one fills a bound buffer, the other streams — so they are
-  measured separately. `VARBINARY` is deliberately absent: binary delivery is
-  still unimplemented in `mssql-odbc` (AB#47239), so including it would fail two
-  legs and pass the third.
+  measured separately. `VARBINARY` remains outside this character-width
+  workload; raw binary delivery is covered by the ODBC functional tests.
 
 Every workload is a C++ call into the driver through the ODBC Driver Manager.
 `mssql-python` is a workload-shape reference only — the source of the rowset

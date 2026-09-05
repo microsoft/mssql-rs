@@ -36,8 +36,10 @@ use crate::api::odbc_types::{
     SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_INTERVAL_MINUTE_TO_SECOND, SQL_INTERVAL_YEAR,
     SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TABLE,
     SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_XML,
-    SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR,
-    SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlSmallInt,
+    SQL_TIMESTAMP, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY,
+    SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlDateStruct, SqlGuid,
+    SqlNumericStruct, SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct, SqlTimeStruct,
+    SqlTimestampStruct,
 };
 use crate::handles::OdbcVersion;
 
@@ -69,6 +71,38 @@ pub(crate) fn canonical_c_type(c_type: SqlSmallInt) -> SqlSmallInt {
     } else {
         c_type
     }
+}
+
+/// Folds the unambiguous ODBC 2.x `SQL_TIMESTAMP` parameter spelling onto
+/// `SQL_TYPE_TIMESTAMP`.
+///
+/// The adjacent `SQL_DATE` and `SQL_TIME` values cannot be folded here because
+/// ODBC 3.x reuses those numbers for the verbose datetime and interval types.
+pub(crate) fn canonical_parameter_sql_type(sql_type: SqlSmallInt) -> SqlSmallInt {
+    if sql_type == SQL_TIMESTAMP {
+        SQL_TYPE_TIMESTAMP
+    } else {
+        sql_type
+    }
+}
+
+/// Fixed byte width of a C value, or `None` when the application sizes the
+/// buffer through `BufferLength`.
+pub(crate) fn c_type_octet_width(c_type: SqlSmallInt) -> Option<usize> {
+    Some(match canonical_c_type(c_type) {
+        SQL_C_BIT | SQL_C_TINYINT | SQL_C_STINYINT | SQL_C_UTINYINT => 1,
+        SQL_C_SHORT | SQL_C_SSHORT | SQL_C_USHORT => 2,
+        SQL_C_LONG | SQL_C_SLONG | SQL_C_ULONG | SQL_C_FLOAT => 4,
+        SQL_C_SBIGINT | SQL_C_UBIGINT | SQL_C_DOUBLE => 8,
+        SQL_C_GUID => std::mem::size_of::<SqlGuid>(),
+        SQL_C_NUMERIC => std::mem::size_of::<SqlNumericStruct>(),
+        SQL_C_TYPE_DATE => std::mem::size_of::<SqlDateStruct>(),
+        SQL_C_TYPE_TIME => std::mem::size_of::<SqlTimeStruct>(),
+        SQL_C_TYPE_TIMESTAMP => std::mem::size_of::<SqlTimestampStruct>(),
+        SQL_C_SS_TIME2 => std::mem::size_of::<SqlSsTime2Struct>(),
+        SQL_C_SS_TIMESTAMPOFFSET => std::mem::size_of::<SqlSsTimestampoffsetStruct>(),
+        _ => return None,
+    })
 }
 
 /// The C type a parameter binding effectively names, once the SQL type is known.
@@ -513,6 +547,16 @@ mod tests {
         // Folding is what makes the deprecated spellings pass the HY003 gate;
         // is_valid_c_type itself only accepts the canonical form.
         assert!(is_valid_c_type(canonical_c_type(SQL_C_TIMESTAMP)));
+    }
+
+    #[test]
+    fn only_unambiguous_legacy_timestamp_sql_type_is_canonicalized() {
+        assert_eq!(
+            canonical_parameter_sql_type(SQL_TIMESTAMP),
+            SQL_TYPE_TIMESTAMP
+        );
+        assert_eq!(canonical_parameter_sql_type(9), 9);
+        assert_eq!(canonical_parameter_sql_type(10), 10);
     }
 
     #[test]

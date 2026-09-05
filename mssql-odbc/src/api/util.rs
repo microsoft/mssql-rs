@@ -174,6 +174,212 @@ pub(crate) unsafe fn read_utf16_attr(ptr: *const SqlWChar, byte_length: SqlInteg
     }
 }
 
+fn escape_body(chars: &[char], body_start: usize) -> (String, usize) {
+    let mut depth = 1usize;
+    let mut index = body_start;
+    let mut body = String::new();
+    while index < chars.len() {
+        match chars[index] {
+            quote @ ('\'' | '"' | '[') => {
+                let close = if quote == '[' { ']' } else { quote };
+                body.push(quote);
+                index += 1;
+                while index < chars.len() {
+                    body.push(chars[index]);
+                    if chars[index] == close {
+                        if chars.get(index + 1) == Some(&close) {
+                            body.push(close);
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+            '-' if chars.get(index + 1) == Some(&'-') => {
+                while index < chars.len() && chars[index] != '\n' {
+                    body.push(chars[index]);
+                    index += 1;
+                }
+                continue;
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                body.push('/');
+                body.push('*');
+                index += 2;
+                while index < chars.len() {
+                    if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                        body.push('*');
+                        body.push('/');
+                        index += 2;
+                        break;
+                    }
+                    body.push(chars[index]);
+                    index += 1;
+                }
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (body, index + 1);
+                }
+            }
+            _ => {}
+        }
+        body.push(chars[index]);
+        index += 1;
+    }
+    (body, index)
+}
+
+fn strip_call_parentheses(call: &str) -> String {
+    let call = call.trim();
+    let Some(open) = call.find('(') else {
+        return call.to_string();
+    };
+    let Some(close) = call.rfind(')') else {
+        return call.to_string();
+    };
+    if close < open {
+        return call.to_string();
+    }
+    format!(
+        "{} {}{}",
+        call[..open].trim(),
+        call[open + 1..close].trim(),
+        &call[close + 1..]
+    )
+    .trim_end()
+    .to_string()
+}
+
+/// Translates ODBC scalar, literal, join, and procedure-call escapes to the
+/// T-SQL spelling SQL Server accepts. Quoted text and comments are untouched.
+pub(crate) fn translate_odbc_escapes(sql: &str) -> String {
+    if !sql.contains('{') {
+        return sql.to_string();
+    }
+
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut index = 0usize;
+    let mut open_escapes = 0usize;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        match ch {
+            '\'' | '"' | '[' => {
+                let close = if ch == '[' { ']' } else { ch };
+                out.push(ch);
+                index += 1;
+                while index < chars.len() {
+                    out.push(chars[index]);
+                    if chars[index] == close {
+                        if chars.get(index + 1) == Some(&close) {
+                            out.push(close);
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            '-' if chars.get(index + 1) == Some(&'-') => {
+                while index < chars.len() && chars[index] != '\n' {
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                out.push('/');
+                out.push('*');
+                index += 2;
+                while index < chars.len() {
+                    if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                        out.push('*');
+                        out.push('/');
+                        index += 2;
+                        break;
+                    }
+                    out.push(chars[index]);
+                    index += 1;
+                }
+            }
+            '{' => {
+                let body_start = index + 1;
+                let mut keyword_start = body_start;
+                while chars
+                    .get(keyword_start)
+                    .is_some_and(|candidate| candidate.is_whitespace())
+                {
+                    keyword_start += 1;
+                }
+                let mut keyword_end = keyword_start;
+                while chars
+                    .get(keyword_end)
+                    .is_some_and(|candidate| candidate.is_alphanumeric() || *candidate == '_')
+                {
+                    keyword_end += 1;
+                }
+                let keyword: String = chars[keyword_start..keyword_end].iter().collect();
+                if keyword.eq_ignore_ascii_case("call") {
+                    let (body, next) = escape_body(&chars, body_start);
+                    let after_call = body
+                        .to_ascii_lowercase()
+                        .find("call")
+                        .map(|position| position + "call".len())
+                        .unwrap_or(0);
+                    out.push_str("EXEC ");
+                    out.push_str(&strip_call_parentheses(&body[after_call..]));
+                    index = next;
+                    continue;
+                }
+                if keyword.is_empty() && chars.get(keyword_start) == Some(&'?') {
+                    let (body, next) = escape_body(&chars, body_start);
+                    let after_call = body
+                        .to_ascii_lowercase()
+                        .find("call")
+                        .map(|position| position + "call".len())
+                        .unwrap_or(0);
+                    out.push_str("EXEC ? = ");
+                    out.push_str(&strip_call_parentheses(&body[after_call..]));
+                    index = next;
+                    continue;
+                }
+                if matches!(
+                    keyword.to_ascii_lowercase().as_str(),
+                    "fn" | "oj" | "escape" | "d" | "t" | "ts" | "guid" | "interval" | "limit"
+                ) {
+                    if keyword.eq_ignore_ascii_case("escape") {
+                        out.push_str("ESCAPE");
+                    }
+                    index = keyword_end;
+                    open_escapes += 1;
+                } else {
+                    out.push('{');
+                    index = body_start;
+                }
+            }
+            '}' if open_escapes > 0 => {
+                open_escapes -= 1;
+                index += 1;
+            }
+            _ => {
+                out.push(ch);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Writes a string into a caller's character-attribute buffer following ODBC's
 /// convention for `SQLGetConnectAttr`-family output: `buffer_length` and
 /// `*string_length_ptr` are **byte** counts, the value is NUL-terminated inside
@@ -369,7 +575,7 @@ pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
 mod tests {
     use super::{
         copy_utf16_with_nul, copy_with_nul, read_utf16, read_utf16_attr, read_utf16_long,
-        rewrite_param_markers, write_if_some,
+        rewrite_param_markers, translate_odbc_escapes, write_if_some,
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
 
@@ -378,6 +584,59 @@ mod tests {
         let (out, n) = rewrite_param_markers("SELECT 1");
         assert_eq!(out, "SELECT 1");
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn odbc_call_escape_becomes_exec_without_parentheses() {
+        assert_eq!(
+            translate_odbc_escapes("{CALL dbo.GetProjects(?)}"),
+            "EXEC dbo.GetProjects ?"
+        );
+        assert_eq!(
+            translate_odbc_escapes("{? = call dbo.Total(?, ?)}"),
+            "EXEC ? = dbo.Total ?, ?"
+        );
+    }
+
+    #[test]
+    fn scalar_and_literal_escapes_are_unwrapped() {
+        assert_eq!(
+            translate_odbc_escapes("SELECT {fn UCASE(name)} FROM t"),
+            "SELECT  UCASE(name) FROM t"
+        );
+        assert_eq!(
+            translate_odbc_escapes("SELECT {ts '2024-01-01 00:00:00'}"),
+            "SELECT  '2024-01-01 00:00:00'"
+        );
+        assert_eq!(
+            translate_odbc_escapes("WHERE a LIKE 'x!%' {escape '!'}"),
+            "WHERE a LIKE 'x!%' ESCAPE '!'"
+        );
+    }
+
+    #[test]
+    fn escapes_in_literals_and_unknown_escapes_are_preserved() {
+        assert_eq!(
+            translate_odbc_escapes("SELECT '{CALL nope}'"),
+            "SELECT '{CALL nope}'"
+        );
+        assert_eq!(translate_odbc_escapes("SELECT {json a}"), "SELECT {json a}");
+    }
+
+    #[test]
+    fn escape_translation_ignores_braces_inside_literals_and_comments() {
+        assert_eq!(
+            translate_odbc_escapes("{CALL dbo.p('}', ?)}"),
+            "EXEC dbo.p '}', ?"
+        );
+        assert_eq!(
+            translate_odbc_escapes("SELECT */* {fn NOW()} */ 1"),
+            "SELECT */* {fn NOW()} */ 1"
+        );
+        assert_eq!(
+            translate_odbc_escapes("{CALL dbo.p(/* } */ ?)}"),
+            "EXEC dbo.p /* } */ ?"
+        );
     }
 
     /// The `SQLINTEGER`-width reader must agree with the `SQLSMALLINT` one on
