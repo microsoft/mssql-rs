@@ -623,9 +623,10 @@ impl TypeInfo {
     ///
     /// `length` is the wire-declared length declarator. For streamed/`(max)`
     /// types this is typically `0xFFFF` (the PLP sentinel), matching what the
-    /// parser produces. XML schema info and UDT info are not exposed by this
-    /// constructor; they remain internal to the parser. Returns `Err` if
-    /// `tds_type` is not a partial-length type.
+    /// parser produces. XML schema info and UDT info cannot be supplied through
+    /// this constructor. Parsed UDT metadata is available through
+    /// [`Self::udt_info`]; XML schema info remains internal to the parser.
+    /// Returns `Err` if `tds_type` is not a partial-length type.
     pub fn partial_len(
         tds_type: TdsDataType,
         length: usize,
