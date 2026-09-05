@@ -36,6 +36,9 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
+    /// UTF-8 bytes produced from UTF-16LE input that did not fit in the previous
+    /// `SQL_C_CHAR` buffer. Kept until later calls deliver them.
+    pub(crate) pending_utf8: Vec<u8>,
     /// Incremental decoder for the narrow-text -> `SQL_C_WCHAR` widening path
     /// (`varchar(max)`/`json` delivered as UTF-16LE). `None` for every other
     /// combination.
@@ -92,6 +95,7 @@ impl ActivePlpStream {
             encoding,
             pending_byte: None,
             pending_high_surrogate: None,
+            pending_utf8: Vec::new(),
             narrow_to_wide,
             pending_units: Vec::new(),
             prefetched_wire: Vec::new(),
@@ -186,6 +190,7 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("encoding", &self.encoding)
             .field("pending_byte", &self.pending_byte)
             .field("pending_high_surrogate", &self.pending_high_surrogate)
+            .field("pending_utf8", &self.pending_utf8.len())
             .field("narrow_to_wide", &self.narrow_to_wide.is_some())
             .field("pending_units", &self.pending_units.len())
             .field(

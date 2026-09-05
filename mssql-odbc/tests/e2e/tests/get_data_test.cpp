@@ -1010,6 +1010,27 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
     SQLCloseCursor(stmt_);
 }
 
+// A carried high surrogate can make the next UTF-16LE read emit more UTF-8
+// bytes than its input-only expansion budget. A 7-byte buffer leaves 6 payload
+// bytes: the second read transcodes U+10437 plus U+4F60 to 7 bytes.
+//
+// Benefits-from-mock-tds: force the exact PLP wire chunks and assert that the
+// final UTF-8 tail remains pending after the wire is exhausted.
+TEST_F(GetDataLiveTest, NvarcharMaxToCharSurrogateStraddleRetainsUtf8Tail) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const std::string expected = "A\xF0\x90\x90\xB7\xE4\xBD\xA0";
+    ASSERT_SQL_OK(
+        ExecDirect(
+            "SELECT CAST(N'A' + NCHAR(0xD801) + NCHAR(0xDC37) + NCHAR(0x4F60) AS NVARCHAR(MAX)) "
+            "AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 7));
+
+    SQLCloseCursor(stmt_);
+}
+
 
 // A buffer with room for the terminator but no payload is a length probe, not a
 // caller error. It must report the available length with 01004 and leave the
@@ -1296,37 +1317,20 @@ TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
 // The two shapes either side of the probe boundary, which differ by one byte of
 // payload room.
 //
-// A buffer with payload room too small to carry one whole character cannot make
-// progress: the conservative read sizing rounds it to zero, so returning
-// truncation would let an application looping on an unchanged buffer spin
-// forever. That is HY090, not a probe.
+// A UTF-8 tail buffer lets SQL_C_CHAR make progress one byte at a time without
+// dropping output. A buffer with no payload room remains a probe. The ASCII case
+// runs on the msodbcsql comparison leg because both drivers deliver one byte per
+// call here.
 //
-// A buffer with no payload room at all is a probe, and is answered.
-//
-// msodbcsql instead delivers one payload byte per call for the first shape --
-// 'a' as 0x61, 'e-acute' as 0xE9, CJK as 0x3F ('?') -- because it converts
-// SQL_C_CHAR to the client codepage, and the codepage measured here is
-// single-byte, so every character is one byte (and unrepresentable ones are
-// best-fit away, losing data). mssql-odbc delivers UTF-8, where a character is
-// 1-4 bytes. Matching it needs an unflushed-tail buffer in ActivePlpStream;
-// tracked separately. Hence the skip on the comparison leg.
-TEST_F(GetDataLiveTest, PlpSubMinimalBufferIsRejectedButProbeIsAnswered) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+// Benefits-from-mock-tds: assert that alternate calls drain the UTF-8 tail
+// without consuming more wire data.
+TEST_F(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeIsAnswered) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'abcd' AS NVARCHAR(MAX)), 50) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    // 2 bytes for SQL_C_CHAR: one payload byte once the terminator is reserved,
-    // which cannot hold a complete transcoded character.
-    SQLCHAR tiny[2] = {0xFF, 0xFF};
-    SQLLEN ind = 0;
-    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, tiny, sizeof(tiny), &ind);
-    EXPECT_EQ(SQL_ERROR, rc) << "a buffer that cannot make progress must not report truncation";
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY090");
-
-    // The rejection consumed nothing, so the value still reads back in full.
-    EXPECT_EQ(RepeatToken("abcd", 50), ReadCharDataInChunks(stmt_, 1, 8192));
+    EXPECT_EQ(RepeatToken("abcd", 50), ReadCharDataInChunks(stmt_, 1, 2));
 
     SQLCloseCursor(stmt_);
 
