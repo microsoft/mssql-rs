@@ -4,10 +4,13 @@
 use std::ffi::c_void;
 
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
+    SQL_C_DEFAULT, SQL_PARAM_BIND_BY_COLUMN, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt,
+    SqlULen,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
-use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
+use crate::api::type_rules::{
+    c_type_octet_width, parameter_size_is_precision, resolve_default_c_type,
+};
 use crate::handles::OdbcVersion;
 use crate::handles::desc::{DescRecord, DescState};
 
@@ -80,6 +83,48 @@ impl BoundParam {
             self.octet_length_ptr = self.octet_length_ptr.wrapping_byte_offset(offset);
         }
         self
+    }
+
+    /// Returns the binding displaced to one element of a parameter array.
+    ///
+    /// Column-wise arrays use the C type's fixed width, or `BufferLength` for
+    /// character/binary buffers. Row-wise arrays use the application's row
+    /// stride for every pointer. The common bind offset is applied last.
+    pub(crate) fn at_paramset_row(
+        mut self,
+        row: usize,
+        bind_type: SqlULen,
+        bind_offset: isize,
+    ) -> Self {
+        let (value_stride, length_stride) = if bind_type == SQL_PARAM_BIND_BY_COLUMN {
+            (
+                c_type_octet_width(self.c_type)
+                    .unwrap_or_else(|| self.buffer_length.max(1) as usize),
+                std::mem::size_of::<SqlLen>(),
+            )
+        } else {
+            (bind_type, bind_type)
+        };
+        if !self.parameter_value_ptr.is_null() {
+            self.parameter_value_ptr = self
+                .parameter_value_ptr
+                .wrapping_byte_add(row.wrapping_mul(value_stride));
+        }
+        if !self.strlen_or_ind_ptr.is_null() {
+            self.strlen_or_ind_ptr = self
+                .strlen_or_ind_ptr
+                .cast::<u8>()
+                .wrapping_add(row.wrapping_mul(length_stride))
+                .cast();
+        }
+        if !self.octet_length_ptr.is_null() {
+            self.octet_length_ptr = self
+                .octet_length_ptr
+                .cast::<u8>()
+                .wrapping_add(row.wrapping_mul(length_stride))
+                .cast();
+        }
+        self.with_bind_offset(bind_offset)
     }
 
     /// Writes this binding into the matching APD and IPD records at the same
@@ -232,7 +277,7 @@ impl BoundParam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_PARAM_INPUT, SQL_VARCHAR};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_LONG, SQL_PARAM_INPUT, SQL_VARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
 
     const ODBC_VERSION: OdbcVersion = OdbcVersion::Odbc3_80;
@@ -282,6 +327,44 @@ mod tests {
         let mut buf = [0u8; 32];
         let shifted = param(buf.as_mut_ptr().cast(), std::ptr::null_mut()).with_bind_offset(8);
         assert!(shifted.strlen_or_ind_ptr.is_null());
+    }
+
+    #[test]
+    fn column_wise_param_row_uses_independent_value_and_length_strides() {
+        let mut values = [10_i32, 20, 30];
+        let mut lengths = [0 as SqlLen; 3];
+        let mut p = param(values.as_mut_ptr().cast(), lengths.as_mut_ptr());
+        p.c_type = SQL_C_LONG;
+        p.buffer_length = 0;
+
+        let row = p.at_paramset_row(2, SQL_PARAM_BIND_BY_COLUMN, 0);
+        assert_eq!(
+            row.parameter_value_ptr,
+            unsafe { values.as_mut_ptr().add(2) }.cast()
+        );
+        assert_eq!(row.strlen_or_ind_ptr, unsafe {
+            lengths.as_mut_ptr().add(2)
+        });
+        assert_eq!(row.octet_length_ptr, unsafe { lengths.as_mut_ptr().add(2) });
+    }
+
+    #[test]
+    fn row_wise_param_row_and_bind_offset_compose_in_bytes() {
+        let mut values = [0_u8; 96];
+        let mut lengths = [0_u8; 96];
+        let p = param(values.as_mut_ptr().cast(), lengths.as_mut_ptr().cast());
+
+        let row = p.at_paramset_row(2, 32, 5);
+        assert_eq!(
+            row.parameter_value_ptr,
+            unsafe { values.as_mut_ptr().add(69) }.cast()
+        );
+        assert_eq!(row.strlen_or_ind_ptr.cast::<u8>(), unsafe {
+            lengths.as_mut_ptr().add(69)
+        });
+        assert_eq!(row.octet_length_ptr.cast::<u8>(), unsafe {
+            lengths.as_mut_ptr().add(69)
+        });
     }
 
     /// The overwhelmingly common case, and the one that must stay free.

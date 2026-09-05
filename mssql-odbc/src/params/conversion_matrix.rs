@@ -19,7 +19,7 @@
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT,
-    SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+    SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
     SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_CHAR, SQL_DECIMAL,
     SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC,
     SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_XML,
@@ -45,6 +45,7 @@ const BINARY_SQL_TARGETS: &[SqlSmallInt] = &[SQL_BINARY, SQL_VARBINARY, SQL_LONG
 const INTEGER_SQL_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT];
 
 const DECIMAL_SQL_TARGETS: &[SqlSmallInt] = &[SQL_DECIMAL, SQL_NUMERIC];
+const CHARACTER_DATETIME_SQL_TARGETS: &[SqlSmallInt] = &[SQL_TYPE_TIME, SQL_SS_TIME2];
 
 /// `xml` takes a character payload but declares its own wire type, so it is
 /// listed apart from `CHARACTER_SQL_TARGETS`.
@@ -68,6 +69,7 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             INTEGER_SQL_TARGETS,
             DECIMAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
+            CHARACTER_DATETIME_SQL_TARGETS,
         ],
         // A narrow `sql_variant` payload cannot be serialized until AB#47800.
         SQL_C_WCHAR => &[
@@ -75,12 +77,14 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             INTEGER_SQL_TARGETS,
             DECIMAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
+            CHARACTER_DATETIME_SQL_TARGETS,
             &[SQL_SS_VARIANT],
         ],
         SQL_C_BINARY => &[BINARY_SQL_TARGETS],
         SQL_C_BIT => &[&[SQL_BIT]],
         SQL_C_FLOAT | SQL_C_DOUBLE => &[&[SQL_REAL, SQL_FLOAT, SQL_DOUBLE]],
         SQL_C_GUID => &[&[SQL_GUID]],
+        SQL_C_NUMERIC => &[DECIMAL_SQL_TARGETS],
         SQL_C_TYPE_DATE => &[&[SQL_TYPE_DATE]],
         // `time` and its SS spelling are one wire type, so both C spellings
         // reach both SQL spellings.
@@ -132,12 +136,31 @@ mod tests {
         assert!(!is_supported_conversion(SQL_C_BINARY, SQL_VARCHAR));
     }
 
+    #[test]
+    fn numeric_c_type_reaches_decimal_and_numeric() {
+        assert!(is_supported_conversion(SQL_C_NUMERIC, SQL_DECIMAL));
+        assert!(is_supported_conversion(SQL_C_NUMERIC, SQL_NUMERIC));
+        assert!(!is_supported_conversion(SQL_C_NUMERIC, SQL_INTEGER));
+    }
+
     /// A character buffer parses a numeric literal, so it reaches the integer
     /// SQL types as well as the character ones.
     #[test]
     fn every_character_c_type_reaches_every_integer_sql_type() {
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
             for sql_type in [SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT] {
+                assert!(
+                    is_supported_conversion(c_type, sql_type),
+                    "{c_type} -> {sql_type} should be supported"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_character_c_type_reaches_time_sql_types() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for sql_type in [SQL_TYPE_TIME, SQL_SS_TIME2] {
                 assert!(
                     is_supported_conversion(c_type, sql_type),
                     "{c_type} -> {sql_type} should be supported"

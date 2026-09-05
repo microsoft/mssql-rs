@@ -100,6 +100,10 @@ pub(crate) struct DbcState {
     pub(crate) active_stmt: Option<*mut c_void>,
     /// Active TDS connection, present only when `connection_state == Connected`.
     pub(crate) client: Option<TdsClient>,
+    /// Server endpoint from the successful connection string.
+    pub(crate) server_name: String,
+    /// Login identity sent for the successful connection.
+    pub(crate) user_name: String,
     /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
     /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
     pub(crate) access_token: Option<String>,
@@ -189,6 +193,8 @@ impl std::fmt::Debug for DbcState {
             .field("descriptors", &self.descriptors)
             .field("active_stmt", &self.active_stmt)
             .field("client", &self.client)
+            .field("server_name", &self.server_name)
+            .field("user_name", &self.user_name)
             .field(
                 "access_token",
                 &self.access_token.as_ref().map(|_| "<REDACTED>"),
@@ -225,6 +231,8 @@ impl DbcHandle {
                 descriptors: Vec::new(),
                 active_stmt: None,
                 client: None,
+                server_name: String::new(),
+                user_name: String::new(),
                 access_token: None,
                 vendor_overrides: VendorConnOverrides::default(),
                 effective_vendor_settings: None,

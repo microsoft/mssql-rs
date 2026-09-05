@@ -14,12 +14,21 @@ use mssql_tds::connection::tds_client::{
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, park_dae_client, query_timeout_expired_error, snapshot_bound_params,
+    ParamsWithDae, build_named_params, build_named_params_row, claim_connection,
+    deduct_query_timeout, fail_with_tds, finish_execute, park_dae_client,
+    query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
+use crate::api::close_cursor::sql_free_stmt_close;
+use crate::api::odbc_types::{
+    SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
+    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NEED_DATA,
+    SQL_PARAM_BIND_BY_COLUMN, SQL_PARAM_ERROR, SQL_PARAM_IGNORE, SQL_PARAM_SUCCESS,
+    SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
+    SqlReturn, SqlULen, SqlUSmallInt,
+};
+use crate::api::util::write_if_some;
 use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::{
@@ -104,6 +113,17 @@ enum ExecutionStaging {
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let paramset_size = match stmt.inner.lock() {
+        Ok(state) => state.paramset_size,
+        Err(_) => {
+            error!("SQLExecute: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+    if paramset_size > 1 {
+        return execute_param_array(statement_handle, stmt, paramset_size);
+    }
+
     let dbc = stmt.parent_dbc();
 
     let staging = match stage_execution(stmt) {
@@ -111,6 +131,15 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
         Err(rc) => return rc,
     };
 
+    execute_staged(statement_handle, stmt, dbc, staging)
+}
+
+fn execute_staged(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    dbc: &crate::handles::DbcHandle,
+    staging: ExecutionStaging,
+) -> SqlReturn {
     match staging {
         ExecutionStaging::Ready(Execution {
             named_params,
@@ -321,10 +350,142 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     }
 }
 
+fn execute_param_array(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    paramset_size: SqlULen,
+) -> SqlReturn {
+    let (bind_type, operation_ptr, status_ptr, processed_ptr) = match stmt.inner.lock() {
+        Ok(state) => (
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAM_BIND_TYPE)
+                .unwrap_or(SQL_PARAM_BIND_BY_COLUMN),
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAM_OPERATION_PTR)
+                .unwrap_or(0) as *const SqlUSmallInt,
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAM_STATUS_PTR)
+                .unwrap_or(0) as *mut SqlUSmallInt,
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
+                .unwrap_or(0) as *mut SqlULen,
+        ),
+        Err(_) => {
+            error!("SQLExecute: stmt mutex poisoned while reading parameter-array attributes");
+            return SQL_ERROR;
+        }
+    };
+
+    unsafe {
+        write_if_some(processed_ptr, 0);
+        for row in 0..paramset_size {
+            write_param_status(status_ptr, row, SQL_PARAM_UNUSED);
+        }
+    }
+
+    let dbc = stmt.parent_dbc();
+    let mut worst = SQL_SUCCESS;
+    let mut total_rows = -1_i64;
+
+    for row in 0..paramset_size {
+        unsafe { write_if_some(processed_ptr, row + 1) };
+        if !operation_ptr.is_null()
+            && unsafe { operation_ptr.wrapping_add(row).read_unaligned() } == SQL_PARAM_IGNORE
+        {
+            continue;
+        }
+
+        let staging = match stage_execution_row(stmt, row, bind_type, true) {
+            Ok(staging) => staging,
+            Err(rc) => {
+                unsafe { write_param_status(status_ptr, row, SQL_PARAM_ERROR) };
+                if let Ok(mut state) = stmt.inner.lock() {
+                    state.row_count = total_rows;
+                }
+                return rc;
+            }
+        };
+        let rc = execute_staged(statement_handle, stmt, dbc, staging);
+        let status = match rc {
+            SQL_SUCCESS => SQL_PARAM_SUCCESS,
+            SQL_SUCCESS_WITH_INFO => {
+                worst = SQL_SUCCESS_WITH_INFO;
+                SQL_PARAM_SUCCESS_WITH_INFO
+            }
+            SQL_NEED_DATA | SQL_ERROR | SQL_INVALID_HANDLE => SQL_PARAM_ERROR,
+            _ => SQL_PARAM_ERROR,
+        };
+        unsafe { write_param_status(status_ptr, row, status) };
+        if !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
+            if let Ok(mut state) = stmt.inner.lock() {
+                state.row_count = total_rows;
+            }
+            return if rc == SQL_NEED_DATA { SQL_ERROR } else { rc };
+        }
+
+        if let Ok(state) = stmt.inner.lock()
+            && state.row_count >= 0
+        {
+            total_rows = if total_rows < 0 {
+                state.row_count
+            } else {
+                total_rows.saturating_add(state.row_count)
+            };
+        }
+
+        if row + 1 < paramset_size {
+            let cursor_open = stmt
+                .inner
+                .lock()
+                .map(|state| state.has_state(STMT_STATE_CURSOR_OPEN))
+                .unwrap_or(false);
+            if cursor_open {
+                let close_rc = unsafe { sql_free_stmt_close(statement_handle) };
+                if close_rc == SQL_ERROR || close_rc == SQL_INVALID_HANDLE {
+                    unsafe { write_param_status(status_ptr, row, SQL_PARAM_ERROR) };
+                    return close_rc;
+                }
+                if close_rc == SQL_SUCCESS_WITH_INFO {
+                    worst = SQL_SUCCESS_WITH_INFO;
+                    unsafe { write_param_status(status_ptr, row, SQL_PARAM_SUCCESS_WITH_INFO) };
+                }
+            }
+        }
+    }
+
+    if let Ok(mut state) = stmt.inner.lock() {
+        state.row_count = total_rows;
+        state.pending_row_counts.clear();
+    }
+    worst
+}
+
+/// # Safety
+/// When non-null, `status_ptr` must address an array containing `row + 1`
+/// writable `SqlUSmallInt` elements.
+unsafe fn write_param_status(status_ptr: *mut SqlUSmallInt, row: usize, status: SqlUSmallInt) {
+    if !status_ptr.is_null() {
+        unsafe { write_if_some(status_ptr.wrapping_add(row), status) };
+    }
+}
+
 /// Validates statement state and builds the parameter list under the STMT lock,
 /// setting `EXEC_STARTED` on success. Application value buffers are read here by
 /// reference (no network I/O).
 fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
+    stage_execution_row(stmt, 0, SQL_PARAM_BIND_BY_COLUMN, false)
+}
+
+fn stage_execution_row(
+    stmt: &StmtHandle,
+    row: usize,
+    bind_type: SqlULen,
+    parameter_array: bool,
+) -> Result<ExecutionStaging, SqlReturn> {
     // Snapshotted before the STMT lock below is taken — this crate never
     // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
     // rationale). Not applied to `stmt_state.bound_params` until every
@@ -405,8 +566,17 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
 
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
-    let ParamsWithDae { params, dae_params } =
-        unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
+    let ParamsWithDae { params, dae_params } = if parameter_array {
+        unsafe {
+            build_named_params_row(&mut stmt_state, marker_count, "SQLExecute", row, bind_type)
+        }?
+    } else {
+        unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?
+    };
+    if parameter_array && !dae_params.is_empty() {
+        post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+        return Err(SQL_ERROR);
+    }
 
     // All fallible validation passed: move the prepared plan out (written
     // back after the execute) and take any orphaned handle for piggyback drop.

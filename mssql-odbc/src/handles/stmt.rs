@@ -46,6 +46,10 @@ pub(crate) struct ActivePlpStream {
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
     pub(crate) narrow_to_wide: Option<Decoder>,
+    /// Incremental decoder for narrow non-UTF-8 text delivered as `SQL_C_CHAR`.
+    /// The driver defines that target as UTF-8, so collation bytes must be
+    /// transcoded before they cross the ODBC boundary.
+    pub(crate) narrow_to_utf8: Option<Decoder>,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -55,6 +59,9 @@ pub(crate) struct ActivePlpStream {
     /// having consumed nothing). Holding the surplus here lets a caller ask for
     /// one character at a time without stalling the stream.
     pub(crate) pending_units: Vec<u16>,
+    /// UTF-8 bytes decoded on a previous call that did not fit the caller's
+    /// buffer.
+    pub(crate) pending_bytes: Vec<u8>,
     /// Wire bytes read ahead while the first async read for this value was
     /// already in flight. Later SQLGetData calls consume these without entering
     /// the runtime again.
@@ -93,7 +100,9 @@ impl ActivePlpStream {
             pending_byte: None,
             pending_high_surrogate: None,
             narrow_to_wide,
+            narrow_to_utf8: None,
             pending_units: Vec::new(),
+            pending_bytes: Vec::new(),
             prefetched_wire: Vec::new(),
             prefetched_offset: 0,
             prefetched_total_read_before: 0,
@@ -478,6 +487,8 @@ pub(crate) struct StmtState {
     /// when unset. Read at fetch rather than at bind, so the application can
     /// move the whole rowset by updating the pointed-to value.
     pub(crate) row_bind_offset_ptr: *mut SqlULen,
+    /// Number of parameter-array rows executed by one `SQLExecute`.
+    pub(crate) paramset_size: SqlULen,
     /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
     /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
     /// an explicitly-allocated descriptor associated by
@@ -1249,6 +1260,7 @@ impl StmtHandle {
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
                 row_bind_offset_ptr: std::ptr::null_mut(),
+                paramset_size: 1,
                 active_ard: None,
                 active_apd: None,
                 state_flags: 0,

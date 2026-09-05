@@ -13,12 +13,13 @@ use super::datetime::DateTimeParts;
 use super::param_convert::ParamBuildError;
 use crate::api::odbc_types::{
     SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG,
-    SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
-    SQL_C_SS_VECTOR, SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
-    SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR,
-    SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NTS, SQL_NULL_DATA,
-    SqlDateStruct, SqlGuid, SqlLen, SqlPointer, SqlSmallInt, SqlSsTime2Struct,
-    SqlSsTimestampoffsetStruct, SqlTimeStruct, SqlTimestampStruct,
+    SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2,
+    SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SS_VECTOR, SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TINYINT,
+    SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG,
+    SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM,
+    SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NTS, SQL_NULL_DATA, SqlDateStruct, SqlGuid, SqlLen,
+    SqlNumericStruct, SqlPointer, SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct,
+    SqlTimeStruct, SqlTimestampStruct,
 };
 use crate::api::type_rules::effective_param_c_type;
 use crate::params::BoundParam;
@@ -53,6 +54,8 @@ pub(crate) enum AppValue {
     Double(f64),
     /// `SQL_C_GUID`, in the `SQLGUID` field layout.
     Guid(SqlGuid),
+    /// `SQL_C_NUMERIC`, including its source precision and scale.
+    Numeric(SqlNumericStruct),
     /// Any of the five date/time C structs, normalised onto the same calendar
     /// breakdown the fetch direction fills those structs from.
     DateTime(DateTimeParts),
@@ -184,6 +187,9 @@ pub(crate) unsafe fn read_param_value(
         })),
         SQL_C_GUID => Ok(AppValue::Guid(unsafe {
             (param.parameter_value_ptr as *const SqlGuid).read_unaligned()
+        })),
+        SQL_C_NUMERIC => Ok(AppValue::Numeric(unsafe {
+            (param.parameter_value_ptr as *const SqlNumericStruct).read_unaligned()
         })),
         SQL_C_TYPE_DATE
         | SQL_C_TYPE_TIME

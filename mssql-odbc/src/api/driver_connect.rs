@@ -391,6 +391,7 @@ fn do_connect(
         post_sql_error(state, SQLSTATE_HYC00, 0, message);
         return SQL_ERROR;
     }
+    let connected_user_name = context.user_name.clone();
 
     context.encryption_options = EncryptionOptions {
         trust_server_certificate: params.trust_server_certificate,
@@ -439,6 +440,8 @@ fn do_connect(
     // previous connection string back into its next connection attempt.
     state.effective_vendor_settings =
         Some(effective_vendor_settings(&params, client.is_encrypted()));
+    state.server_name.clone_from(&params.server);
+    state.user_name = connected_user_name;
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
