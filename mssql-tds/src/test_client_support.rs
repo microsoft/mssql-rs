@@ -27,7 +27,9 @@ use crate::connection::transport::network_transport::TransportSslHandler;
 use crate::connection::transport::tds_transport::TdsTransport;
 use crate::core::{CancelHandle, NegotiatedEncryptionSetting, TdsResult};
 use crate::datatypes::row_writer::RowWriter;
-use crate::datatypes::sqldatatypes::{TdsDataType, TypeInfo};
+use crate::datatypes::sqldatatypes::{
+    PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, UdtInfo, UdtInfoInColMetadata,
+};
 use crate::handler::handler_factory::create_test_negotiated_settings_internal;
 use crate::io::reader_writer::{NetworkReader, NetworkWriter};
 use crate::io::token_stream::{
@@ -444,6 +446,31 @@ pub fn udt_column(max_byte_size: u16) -> ColumnMetadata {
         multi_part_name: None,
         crypto_metadata: None,
     }
+}
+
+/// A nullable CLR UDT column with identity metadata from `COLMETADATA`.
+pub fn udt_column_with_metadata(
+    max_byte_size: u16,
+    db_name: &str,
+    schema_name: &str,
+    type_name: &str,
+    assembly_qualified_name: &str,
+) -> ColumnMetadata {
+    let mut column = udt_column(max_byte_size);
+    column.type_info.type_info_variant = TypeInfoVariant::PartialLen(
+        PartialLengthType::Udt,
+        Some(usize::from(max_byte_size)),
+        None,
+        None,
+        Some(UdtInfo::InColMetadata(UdtInfoInColMetadata::new(
+            max_byte_size,
+            db_name.to_string(),
+            schema_name.to_string(),
+            type_name.to_string(),
+            assembly_qualified_name.to_string(),
+        ))),
+    );
+    column
 }
 
 /// Inline integer columns followed by one deferred `nvarchar(max)` column.

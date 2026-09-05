@@ -27,11 +27,12 @@
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   23. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
-//   24. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
-//   25. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
-//   26. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
-//   27. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
+//   23. ClrUdtDescriptorFields             - CLR UDT type, size, and identity fields
+//   24. ClrUdtIdentityFieldsAreEmptyForNonUdtColumns - non-UDT identity fields are empty
+//   25. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   26. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   27. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   28. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
 
 #include "odbc_test_fixture.h"
 
@@ -47,6 +48,18 @@
 #endif
 #ifndef SQL_SS_UDT
 #define SQL_SS_UDT (-151)
+#endif
+#ifndef SQL_CA_SS_UDT_CATALOG_NAME
+#define SQL_CA_SS_UDT_CATALOG_NAME (1218)
+#endif
+#ifndef SQL_CA_SS_UDT_SCHEMA_NAME
+#define SQL_CA_SS_UDT_SCHEMA_NAME (1219)
+#endif
+#ifndef SQL_CA_SS_UDT_TYPE_NAME
+#define SQL_CA_SS_UDT_TYPE_NAME (1220)
+#endif
+#ifndef SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+#define SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME (1221)
 #endif
 
 class ColAttributeLiveTest : public ODBCTest {
@@ -66,6 +79,16 @@ static SQLLEN NumericAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
     SQLRETURN rc = SQLColAttribute(stmt, col, field, nullptr, 0, nullptr, &value);
     EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "field " << field;
     return value;
+}
+
+// Reads a text attribute, asserting the call succeeded.
+static std::string TextAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
+    SQLTCHAR value[512] = {};
+    SQLSMALLINT length = 0;
+    SQLRETURN rc =
+        SQLColAttribute(stmt, col, field, value, sizeof(value), &length, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "field " << field;
+    return ODBCTestUtils::ToNarrow(SqlTString(value));
 }
 
 TEST(ColAttributeTest, NullHandle) {
@@ -127,6 +150,9 @@ TEST_F(ColAttributeLiveTest, ConciseTypePerColumnType) {
     SQLCloseCursor(stmt_);
 }
 
+// Matches retail msodbcsql 18.6.2.1. GetIRDField in
+// Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp copies these four UDT name-pool entries,
+// keeps SQL_DESC_TYPE_NAME as "udt", and returns empty entries for non-UDT columns.
 TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
     ExecDirect("SELECT CAST(NULL AS geography) AS geography_col, "
                "CAST(NULL AS geometry) AS geometry_col, "
@@ -135,11 +161,16 @@ TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
     struct UdtColumn {
         SQLUSMALLINT ordinal;
         SQLLEN size;
+        const char* typeName;
+        const char* assemblyTypeNamePrefix;
     };
     const UdtColumn columns[] = {
-        {1, 0},
-        {2, 0},
-        {3, 892},
+        {1, 0, "geography",
+         "Microsoft.SqlServer.Types.SqlGeography, Microsoft.SqlServer.Types"},
+        {2, 0, "geometry",
+         "Microsoft.SqlServer.Types.SqlGeometry, Microsoft.SqlServer.Types"},
+        {3, 892, "hierarchyid",
+         "Microsoft.SqlServer.Types.SqlHierarchyId, Microsoft.SqlServer.Types"},
     };
 
     for (const auto& column : columns) {
@@ -155,6 +186,34 @@ TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
             << "column " << column.ordinal;
         EXPECT_EQ(0, NumericAttr(stmt_, column.ordinal, SQL_DESC_DISPLAY_SIZE))
             << "column " << column.ordinal;
+        EXPECT_EQ(ODBCTestConfig::Instance().Database(),
+                  TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_CATALOG_NAME))
+            << "column " << column.ordinal;
+        EXPECT_EQ("sys", TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_SCHEMA_NAME))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.typeName,
+                  TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_TYPE_NAME))
+            << "column " << column.ordinal;
+        const std::string assemblyTypeName =
+            TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME);
+        EXPECT_EQ(0u, assemblyTypeName.find(column.assemblyTypeNamePrefix))
+            << "column " << column.ordinal << ": " << assemblyTypeName;
+        EXPECT_EQ("udt", TextAttr(stmt_, column.ordinal, SQL_DESC_TYPE_NAME))
+            << "column " << column.ordinal;
+    }
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeLiveTest, ClrUdtIdentityFieldsAreEmptyForNonUdtColumns) {
+    ExecDirect("SELECT CAST(1 AS int)");
+
+    for (SQLUSMALLINT field : {
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_CATALOG_NAME),
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_SCHEMA_NAME),
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_TYPE_NAME),
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME),
+         }) {
+        EXPECT_EQ("", TextAttr(stmt_, 1, field)) << "field " << field;
     }
     SQLCloseCursor(stmt_);
 }
