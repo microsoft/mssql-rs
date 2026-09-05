@@ -463,6 +463,9 @@ pub(crate) struct StmtState {
     /// Rowset size for block fetches (`SQL_ATTR_ROW_ARRAY_SIZE`). Defaults to 1
     /// (single-row). Consumed by the columnar `SQLFetchScroll` path.
     pub(crate) row_array_size: SqlULen,
+    /// Number of values in each column-wise parameter array. Defaults to 1.
+    /// P1 stores the application contract; P2 consumes it during `SQLExecute`.
+    pub(crate) paramset_size: SqlULen,
     /// Application buffer that receives the count of rows fetched by a block
     /// fetch (`SQL_ATTR_ROWS_FETCHED_PTR`); null when unset. The application
     /// owns this buffer and must keep it valid across the fetch.
@@ -1245,6 +1248,7 @@ impl StmtHandle {
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
                 row_array_size: 1,
+                paramset_size: 1,
                 rows_fetched_ptr: std::ptr::null_mut(),
                 row_status_ptr: std::ptr::null_mut(),
                 row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,

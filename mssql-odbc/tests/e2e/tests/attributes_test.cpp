@@ -66,6 +66,13 @@
 //   44. MaxRowsCutoffLeavesTheCursorOffTheRow          - cap end == natural end
 //   45. MaxRowsBoundsCatalogResultSets                 - the cap reaches SQLTables too
 //   46. ParamBindOffsetShiftsTheBoundBuffers           - the offset is honored
+//   46b.ParamsetSizeDefaultsToOne                      - scalar execution default
+//   46c.ParamsetSizeAcceptsPositiveBoundaries          - no clamp or truncation
+//   46d.ParamsetSizeZeroFailsAndPreservesState         - HY024, no mutation
+//   46e.ParamsetSizeGetSupportsLengthOnlyQuery         - null output is valid
+//   46f.ParamsetSizeIsIsolatedPerStatement             - no handle state bleed
+//   46g.ParamsetSizeSurvivesResetParams                - statement attribute lifetime
+//   46h.ParamsetSizeAboveOneBlocksExecuteUntilP2        - never drop rows silently
 //
 // SQL Server vendor statement attributes (SQL_SOPT_SS_*):
 //   47. VendorStatementAttributeDefaultsMatchMsodbcsql - four defaults are not 0
@@ -87,6 +94,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <vector>
 #include <string>
 
@@ -1327,6 +1335,153 @@ TEST_F(AttributesTest, ParamBindOffsetShiftsTheBoundBuffers) {
     }
 }
 
+// -------------------------------------------------------------------
+// 46b. SQL_ATTR_PARAMSET_SIZE defaults to one. mssql-python relies on
+// resetting to this value before returning from its array-execution path.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamsetSizeDefaultsToOne) {
+    EXPECT_EQ(SQLULEN{1}, GetStmtULen(SQL_ATTR_PARAMSET_SIZE));
+}
+
+// -------------------------------------------------------------------
+// 46c. Exercise positive boundaries and repeated writes so the implementation
+// cannot clamp, truncate, make the first non-default value sticky, or alias the
+// fetch row-array size. SQLULEN max is covered by the direct Rust unit test;
+// Driver Managers may reserve or reject large integer-as-pointer encodings
+// before the driver receives the call.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamsetSizeAcceptsPositiveBoundaries) {
+    const SQLULEN values[] = {
+        SQLULEN{1},
+        SQLULEN{2},
+        SQLULEN{255},
+        SQLULEN{65536},
+        static_cast<SQLULEN>((std::numeric_limits<SQLINTEGER>::max)()),
+        static_cast<SQLULEN>((std::numeric_limits<SQLUINTEGER>::max)()),
+        SQLULEN{1},
+    };
+
+    EXPECT_EQ(SQLULEN{1}, GetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE));
+    for (const SQLULEN value : values) {
+        SCOPED_TRACE(value);
+        EXPECT_EQ(SQL_SUCCESS,
+                  SetStmtULen(SQL_ATTR_PARAMSET_SIZE, value));
+        EXPECT_EQ(value, GetStmtULen(SQL_ATTR_PARAMSET_SIZE));
+        EXPECT_EQ(SQLULEN{1}, GetStmtULen(SQL_ATTR_ROW_ARRAY_SIZE));
+    }
+}
+
+// -------------------------------------------------------------------
+// 46d. Zero is outside the ODBC domain. The failed write must report
+// HY024 and leave the prior valid size intact; a later valid write also
+// proves the error does not poison the statement.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamsetSizeZeroFailsAndPreservesState) {
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 7));
+
+    EXPECT_EQ(SQL_ERROR, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY024");
+    EXPECT_EQ(SQLULEN{7}, GetStmtULen(SQL_ATTR_PARAMSET_SIZE));
+
+    EXPECT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 3));
+    EXPECT_EQ(SQLULEN{3}, GetStmtULen(SQL_ATTR_PARAMSET_SIZE));
+}
+
+// -------------------------------------------------------------------
+// 46e. Integer attribute gets report sizeof(SQLULEN). A null value
+// pointer is a valid length-only query and must not disturb the value.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamsetSizeGetSupportsLengthOnlyQuery) {
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 9));
+
+    SQLINTEGER written = -1;
+    EXPECT_EQ(SQL_SUCCESS,
+              SQLGetStmtAttr(stmt_, SQL_ATTR_PARAMSET_SIZE, nullptr, 0,
+                             &written));
+    EXPECT_EQ(static_cast<SQLINTEGER>(sizeof(SQLULEN)), written);
+    EXPECT_EQ(SQLULEN{9}, GetStmtULen(SQL_ATTR_PARAMSET_SIZE));
+}
+
+// -------------------------------------------------------------------
+// 46f. The size belongs to one statement handle. A second statement on
+// the same connection must retain its own default and writes.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamsetSizeIsIsolatedPerStatement) {
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 11));
+
+    SQLHSTMT other = SQL_NULL_HSTMT;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &other),
+                  SQL_HANDLE_DBC, dbc_);
+
+    SQLULEN value = 0;
+    EXPECT_SQL_OK(SQLGetStmtAttr(other, SQL_ATTR_PARAMSET_SIZE, &value,
+                                 sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(SQLULEN{1}, value);
+    EXPECT_SQL_OK(SQLSetStmtAttr(other, SQL_ATTR_PARAMSET_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(SQLULEN{4}), 0),
+                  SQL_HANDLE_STMT, other);
+    EXPECT_EQ(SQLULEN{11}, GetStmtULen(SQL_ATTR_PARAMSET_SIZE));
+
+    EXPECT_SQL_OK(SQLFreeHandle(SQL_HANDLE_STMT, other),
+                  SQL_HANDLE_DBC, dbc_);
+}
+
+// -------------------------------------------------------------------
+// 46g. SQL_RESET_PARAMS removes bindings, not statement attributes.
+// mssql-python can rebind after cleanup without losing the configured set.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamsetSizeSurvivesResetParams) {
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 13));
+    SQLINTEGER value = 42;
+    SQLLEN indicator = sizeof(value);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, &value, sizeof(value),
+                                   &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQLULEN{13}, GetStmtULen(SQL_ATTR_PARAMSET_SIZE));
+}
+
+// -------------------------------------------------------------------
+// 46h. P1 stores the array contract but AB#47820 owns row execution.
+// Until that lands, prepared and direct execution must fail before sending
+// row zero rather than report success after silently dropping the remaining
+// rows. Reset to one makes the prepared statement retryable.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParamsetSizeAboveOneBlocksExecuteUntilP2) {
+    SqlTString createSql = ODBCTestUtils::ToSqlTStr(
+        "CREATE TABLE #paramset_guard (v int NOT NULL)");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, createSql.data(), SQL_NTS),
+        SQL_HANDLE_STMT, stmt_);
+
+    SqlTString insertSql = ODBCTestUtils::ToSqlTStr(
+        "INSERT INTO #paramset_guard (v) VALUES (?)");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, insertSql.data(), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 42;
+    SQLLEN indicator = sizeof(value);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, &value, sizeof(value),
+                                   &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 2));
+
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 1));
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
+
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 2));
+    EXPECT_EQ(SQL_ERROR, SQLExecDirect(stmt_, insertSql.data(), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 1));
+    EXPECT_EQ(1, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
+}
 
 // -------------------------------------------------------------------
 // Variation 47 - the SQL Server vendor statement attributes have
