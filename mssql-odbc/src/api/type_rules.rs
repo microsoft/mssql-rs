@@ -304,7 +304,7 @@ pub(crate) fn resolve_default_c_type(
     sql_type: SqlSmallInt,
     odbc_version: OdbcVersion,
 ) -> Option<SqlSmallInt> {
-    let is_3_80 = odbc_version == OdbcVersion::Odbc3_80;
+    let is_3_80 = odbc_version.uses_3_80_types();
     Some(match sql_type {
         SQL_CHAR | SQL_VARCHAR | SQL_LONGVARCHAR => SQL_C_CHAR,
         SQL_WCHAR | SQL_WVARCHAR | SQL_WLONGVARCHAR => SQL_C_WCHAR,

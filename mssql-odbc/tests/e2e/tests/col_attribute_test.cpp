@@ -26,12 +26,15 @@
 //   19. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
-//   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   23. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
-//   24. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
-//   25. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
-//   26. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
-//   27. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
+//   22. Odbc2TemporalVariantTypes          - legacy codes and SS binary fallback
+//   23. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
+//   24. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
+//   25. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
+//   26. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
+//   27. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
+//   28. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   29. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   30. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
 
 #include "odbc_test_fixture.h"
 
@@ -48,6 +51,12 @@
 #ifndef SQL_SS_UDT
 #define SQL_SS_UDT (-151)
 #endif
+#ifndef SQL_C_SS_TIME2
+#define SQL_C_SS_TIME2 0x4000
+#endif
+#ifndef SQL_C_SS_TIMESTAMPOFFSET
+#define SQL_C_SS_TIMESTAMPOFFSET 0x4001
+#endif
 
 class ColAttributeLiveTest : public ODBCTest {
 protected:
@@ -60,6 +69,34 @@ protected:
     }
 };
 
+class ColAttributeOdbc3LiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0),
+                      SQL_HANDLE_ENV, env_);
+        Connect();
+    }
+};
+
+class ColAttributeOdbc2LiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC2), 0),
+                      SQL_HANDLE_ENV, env_);
+        Connect();
+    }
+};
+
 // Reads a numeric attribute, asserting the call succeeded.
 static SQLLEN NumericAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
     SQLLEN value = -1;
@@ -67,6 +104,24 @@ static SQLLEN NumericAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
     EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "field " << field;
     return value;
 }
+
+static void ExpectVariantType(SQLHSTMT stmt, SQLUSMALLINT col, SQLLEN expected) {
+    SCOPED_TRACE("column " + std::to_string(col));
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt, col, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt);
+    EXPECT_EQ(expected, NumericAttr(stmt, col, SQL_CA_SS_VARIANT_TYPE));
+}
+
+static constexpr const char* TEMPORAL_VARIANTS_QUERY =
+    "SELECT CAST(CAST('2026-09-03' AS DATE) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:00' AS SMALLDATETIME) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:56.123' AS DATETIME) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:56.1234567' AS DATETIME2(7)) AS SQL_VARIANT),"
+    " CAST(CAST('12:34:56.1234567' AS TIME(7)) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:56.1234567+05:30' AS DATETIMEOFFSET(7))"
+    " AS SQL_VARIANT)";
 
 TEST(ColAttributeTest, NullHandle) {
     SQLLEN value = 0;
@@ -472,6 +527,50 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     SQLCloseCursor(stmt_);
 }
 
+// ODBC 3.8 introduced the SQL Server temporal C types. Applications declaring
+// ODBC 2 or 3 receive the binary fallback for time and datetimeoffset.
+TEST_F(ColAttributeOdbc2LiveTest, Odbc2TemporalVariantTypes) {
+    ExecDirect(TEMPORAL_VARIANTS_QUERY);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
+
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeOdbc3LiveTest, Odbc3TemporalVariantTypes) {
+    ExecDirect(TEMPORAL_VARIANTS_QUERY);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
+
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeLiveTest, Odbc38TemporalVariantTypes) {
+    ExecDirect(TEMPORAL_VARIANTS_QUERY);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_SS_TIME2));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_SS_TIMESTAMPOFFSET));
+
+    SQLCloseCursor(stmt_);
+}
+
 // AB#47537 follow-up: the empty-value case of the zero-length SQL_C_BINARY
 // probe now *consumes* the column (there was nothing left to deliver), so this
 // pins the interaction with variant base-type tracking -- the two live in
@@ -644,17 +743,8 @@ TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
 // until someone answers for it, and this table is where the answer gets pinned
 // against msodbcsql.
 //
-// Deliberately excluded, because the drivers genuinely differ:
-//
-//   * date / smalldatetime / datetime / datetime2 - msodbcsql answers the 2.x
-//     spellings (SQL_C_DATE 9, SQL_C_TIMESTAMP 11), this driver the 3.x ones
-//     (91 / 93). That is the documented canonicalization direction in
-//     api/type_rules.rs, not a defect, and it is covered separately below.
-//   * time / datetimeoffset - both drivers answer SQL_C_SS_TIME2 /
-//     SQL_C_SS_TIMESTAMPOFFSET when the application declares ODBC 3.80, but
-//     msodbcsql falls back to SQL_C_BINARY under plain SQL_OV_ODBC3 while this
-//     driver does not. The fixture's declared version decides the answer, so
-//     the row would assert the fixture rather than the driver.
+// Temporal types are covered separately above because their expected values
+// depend on the declared ODBC version.
 TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
     struct Case {
         const char* label;
@@ -682,40 +772,6 @@ TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
         {"binary", "CAST(0x01 AS BINARY(1))", SQL_C_BINARY},
         {"varbinary", "CAST(0x01 AS VARBINARY(10))", SQL_C_BINARY},
         {"uniqueidentifier", "CAST(NEWID() AS UNIQUEIDENTIFIER)", SQL_C_GUID},
-    };
-
-    for (const Case& c : cases) {
-        SCOPED_TRACE(c.label);
-        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
-        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-
-        SQLCHAR probe = 0;
-        SQLLEN indicator = 0;
-        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
-                      SQL_HANDLE_STMT, stmt_);
-        ASSERT_NE(SQL_NULL_DATA, indicator);
-        EXPECT_EQ(c.expected, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
-
-        SQLCloseCursor(stmt_);
-    }
-}
-
-// The date/time family, which the table above excludes. msodbcsql answers the
-// 2.x spellings here regardless of the declared ODBC version; this driver
-// canonicalizes toward the 3.x ones (api/type_rules.rs). Pinning our side keeps
-// the difference deliberate instead of accidental, so it skips the reference leg.
-TEST_F(ColAttributeLiveTest, VariantDateTimeBaseTypesUseTheThreeXSpellings) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-    struct Case {
-        const char* label;
-        const char* expr;
-        SQLSMALLINT expected;
-    };
-    const Case cases[] = {
-        {"date", "CAST('2023-06-15' AS DATE)", SQL_C_TYPE_DATE},
-        {"smalldatetime", "CAST('2023-06-15 12:00' AS SMALLDATETIME)", SQL_C_TYPE_TIMESTAMP},
-        {"datetime", "CAST('2023-06-15 12:00' AS DATETIME)", SQL_C_TYPE_TIMESTAMP},
-        {"datetime2", "CAST('2023-06-15 12:00' AS DATETIME2)", SQL_C_TYPE_TIMESTAMP},
     };
 
     for (const Case& c : cases) {
