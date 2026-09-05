@@ -3176,6 +3176,30 @@ pub(crate) mod tests {
         )
     }
 
+    fn plp_varbinary_row_context() -> ParserContext {
+        ParserContext::ColumnMetadata(
+            Arc::new(ColMetadataToken {
+                column_count: 1,
+                columns: vec![ColumnMetadata {
+                    user_type: 0,
+                    flags: 0,
+                    type_info: TypeInfo::partial_len(
+                        TdsDataType::BigVarBinary,
+                        usize::from(u16::MAX),
+                        None,
+                    )
+                    .unwrap(),
+                    data_type: TdsDataType::BigVarBinary,
+                    column_name: "payload".to_string(),
+                    multi_part_name: None,
+                    crypto_metadata: None,
+                }],
+                cek_table: vec![],
+            }),
+            None,
+        )
+    }
+
     impl Stream for DuplexStream {
         fn tls_handshake_starting(&mut self) {
             // No-op for duplex streams
@@ -5656,15 +5680,66 @@ pub(crate) mod tests {
     // unguarded one would hang on the very regressions these tests target.
     // ---------------------------------------------------------------------
 
-    /// A DONE token with `status`, framed as a message of its own — the shape
-    /// of an attention acknowledgement on the wire.
-    fn done_token_message(status: u16) -> Vec<u8> {
+    /// A DONE-family token with `status`, framed as a message of its own.
+    fn done_token_message_with_type(token_type: TokenType, status: u16) -> Vec<u8> {
         TestPacketBuilder::new(PacketType::TabularResult)
-            .append_byte(crate::token::tokens::TokenType::Done as u8)
+            .append_byte(token_type as u8)
             .append_u16(status)
             .append_u16(0) // CurCmd, unused by this path
             .append_u64(0) // RowCount
             .build()
+    }
+
+    /// A DONE token with `status`, framed as an attention acknowledgement.
+    fn done_token_message(status: u16) -> Vec<u8> {
+        done_token_message_with_type(TokenType::Done, status)
+    }
+
+    async fn cancel_row_read_after_first_poll(
+        first_packet: Vec<u8>,
+        completion_packet: Vec<u8>,
+        context: &ParserContext,
+        plan: ColumnPolicy,
+    ) -> (TdsResult<RowReadResult>, NetworkTransport) {
+        let column_count = match context {
+            ParserContext::ColumnMetadata(metadata, _) => metadata.columns.len(),
+            _ => panic!("row cancellation requires column metadata"),
+        };
+        let acknowledgement = done_token_message(DoneStatus::ATTN.bits());
+        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&completion_packet).await.unwrap();
+            peer.write_all(&acknowledgement).await.unwrap();
+        });
+
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        let mut writer = DefaultRowWriter::new(column_count);
+        let result = {
+            let mut read = std::pin::pin!(transport.receive_row_into(
+                context,
+                None,
+                Some(&child),
+                plan,
+                &mut writer,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "the row read unexpectedly completed before cancellation"
+            );
+            parent.cancel();
+            timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the interrupted row did not settle")
+        };
+        peer_task.await.unwrap();
+        (result, transport)
     }
 
     /// Encodes one INT4 COLMETADATA token for queued-result drain tests.
@@ -5936,6 +6011,60 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn doneproc_and_doneinproc_can_acknowledge_attention() {
+        enum ExpectedToken {
+            DoneProc,
+            DoneInProc,
+        }
+
+        for (name, token_type, expected) in [
+            ("DONEPROC", TokenType::DoneProc, ExpectedToken::DoneProc),
+            (
+                "DONEINPROC",
+                TokenType::DoneInProc,
+                ExpectedToken::DoneInProc,
+            ),
+        ] {
+            let response = done_token_message_with_type(token_type, DoneStatus::ATTN.bits());
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&response);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} acknowledgement timed out"));
+
+            assert!(
+                matches!(result, Err(OperationCancelledError(_))),
+                "the caller must still see its cancellation, got {result:?}"
+            );
+            assert!(
+                !is_known_dead(&transport),
+                "{name}_ATTN must leave the connection reusable"
+            );
+            let settlement = transport
+                .take_attention_settlement()
+                .expect("the acknowledgement must produce settlement state");
+            match expected {
+                ExpectedToken::DoneProc => {
+                    assert!(matches!(
+                        settlement.tokens.as_slice(),
+                        [Tokens::DoneProc(_)]
+                    ));
+                }
+                ExpectedToken::DoneInProc => {
+                    assert!(matches!(
+                        settlement.tokens.as_slice(),
+                        [Tokens::DoneInProc(_)]
+                    ));
+                }
+            }
+        }
+    }
+
     /// The drain discards whatever the server was still sending and stops at
     /// the acknowledgement — tokens queued behind the ATTENTION must not be
     /// mistaken for it, and must not push the wait past its bound either.
@@ -6040,46 +6169,77 @@ pub(crate) mod tests {
         let second_packet = TestPacketBuilder::new(PacketType::TabularResult)
             .append_bytes(&42_i32.to_le_bytes()[2..])
             .build();
-        let acknowledgement = done_token_message(DoneStatus::ATTN.bits());
-        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
-        peer.write_all(&first_packet).await.unwrap();
-        let mut transport = build_duplex_transport(client_side);
-        let peer_task = tokio::spawn(async move {
-            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
-            peer.read_exact(&mut attention).await.unwrap();
-            assert_eq!(attention[0], PacketType::Attention as u8);
-            peer.write_all(&second_packet).await.unwrap();
-            peer.write_all(&acknowledgement).await.unwrap();
-        });
-
-        let parent = CancelHandle::new();
-        let child = parent.child_handle();
         let context = int4_row_context(1);
-        let mut writer = DefaultRowWriter::new(1);
-        let result = {
-            let mut read = std::pin::pin!(transport.receive_row_into(
-                &context,
-                None,
-                Some(&child),
-                ColumnPolicy::DecodeAll,
-                &mut writer,
-            ));
-            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
-            assert!(
-                first_poll.is_pending(),
-                "the row unexpectedly completed before cancellation"
-            );
-            parent.cancel();
-            timeout(Duration::from_secs(5), read)
-                .await
-                .expect("the interrupted row did not settle")
-        };
-        peer_task.await.unwrap();
+        let (result, transport) = cancel_row_read_after_first_poll(
+            first_packet,
+            second_packet,
+            &context,
+            ColumnPolicy::DecodeAll,
+        )
+        .await;
 
         assert!(matches!(result, Err(OperationCancelledError(_))));
         assert!(
             !is_known_dead(&transport),
             "finishing the in-flight row reached DONE_ATTN and preserved the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_columns_after_a_row_pause() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let second_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&42_i32.to_le_bytes()[2..])
+            .append_i32(43)
+            .build();
+        let context = int4_row_context(2);
+        let (result, transport) = cancel_row_read_after_first_poll(
+            first_packet,
+            second_packet,
+            &context,
+            ColumnPolicy::DecodeOne(0),
+        )
+        .await;
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "the remaining column was discarded before DONE_ATTN"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_a_paused_plp_before_the_acknowledgement() {
+        let payload = b"cancelled PLP payload";
+        let total_length = u64::try_from(payload.len()).unwrap().to_le_bytes();
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&total_length[..4])
+            .build();
+        let second_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&total_length[4..])
+            .append_u32(u32::try_from(payload.len()).unwrap())
+            .append_bytes(payload)
+            .append_u32(0)
+            .build();
+        let context = plp_varbinary_row_context();
+        let (result, transport) = cancel_row_read_after_first_poll(
+            first_packet,
+            second_packet,
+            &context,
+            ColumnPolicy::DecodeOne(0),
+        )
+        .await;
+
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "the PLP payload was discarded before DONE_ATTN"
         );
     }
 }
