@@ -42,6 +42,9 @@ jobs:
       - name: Install nextest
         run: ./.pipeline/scripts/install-coverage-tools-macos.sh
 
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
       - name: Build Rust workspace
         run: cargo build --workspace --frozen --all-targets
 
