@@ -2243,11 +2243,14 @@ pub(crate) fn widen_into_pending(
 
 /// Picks how many UTF-16LE wire bytes to read for the UTF-8 room still free.
 ///
-/// Even, so a read never splits a code unit, and never below two code units so
-/// a surrogate pair (both halves are needed to form one character) can
-/// transcode in a single call. This is only a target: a pair yields a 4-byte
-/// character, so the output can still overrun the room and spill into
-/// `pending_utf8`.
+/// Two wire bytes make one UTF-16 code unit, and a Basic Multilingual Plane
+/// code unit is at most three UTF-8 bytes, so about `room / 3` code units --
+/// two wire bytes each -- is the most that fits. Kept even so a read never
+/// splits a code unit, and never below two code units so a surrogate pair (the
+/// two code units UTF-16 uses for characters outside that plane, such as emoji)
+/// can transcode in one call. Still only a target: a surrogate pair is four
+/// UTF-8 bytes, one past what the `/ 3` sizing assumes, so output can overrun
+/// the room and spill into `pending_utf8`.
 fn utf16le_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
     let remaining = payload_capacity.saturating_sub(pending_utf8_len);
     if remaining == 0 {
