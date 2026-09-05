@@ -1988,6 +1988,273 @@ TEST_F(GetDataLiveTest, WideDecimalColumnKeepsPrecisionForADoubleTarget) {
     SQLCloseCursor(stmt_);
 }
 
+// AB#47815: SQLGetData resolves SQL_C_DEFAULT from the column's SQL type
+// instead of rejecting it with HYC00, so the same placeholder means the same
+// thing whether an application reads a column bound or unbound. msodbcsql keeps
+// that invariant by consulting Sql2CDefault on the GetColData path that serves
+// both.
+//
+// Deliberately uses the two types both drivers resolve identically — int to
+// SQL_C_SLONG and narrow varchar to SQL_C_CHAR — so this runs on the msodbcsql
+// leg too and compares. The deviating types are covered separately below.
+TEST_F(GetDataLiveTest, DefaultTargetResolvesFromTheColumnType) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(4242 AS INT), CAST('hello' AS VARCHAR(16))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER n = 0;
+    SQLLEN nInd = -99;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_DEFAULT, &n, sizeof(n), &nInd),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4242, n);
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLINTEGER)), nInd);
+
+    SQLCHAR text[16] = {};
+    SQLLEN textInd = -99;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_DEFAULT, text, sizeof(text), &textInd),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ("hello", reinterpret_cast<const char*>(text));
+    EXPECT_EQ(5, textInd);
+
+    SQLCloseCursor(stmt_);
+}
+
+// The resolver's two registered deviations from msodbcsql's Sql2CDefault reach
+// SQLGetData as well, because it is the one the bound path already uses: an
+// NVARCHAR column resolves to SQL_C_WCHAR and a uniqueidentifier to SQL_C_GUID,
+// where msodbcsql resolves both to its ANSI SQL_C_CHAR. See
+// mssql-odbc/docs/typed-columnar-fetch-plan.md for the measured msodbcsql
+// values these assertions diverge from.
+//
+// Skipped on the reference leg by construction: asserting a deviation is the
+// point, so comparing it would always report a divergence.
+TEST_F(GetDataLiveTest, DefaultTargetResolvesWideAndGuidToTypedTargets) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(N'one' AS NVARCHAR(8)), "
+                   "CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLWCHAR wide[8] = {};
+    SQLLEN wideInd = -99;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_DEFAULT, wide, sizeof(wide), &wideInd),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLWCHAR one[] = {'o', 'n', 'e', 0};
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(one[i], wide[i]) << "unit " << i;
+    }
+    // Bytes of UTF-16, which is what makes the wide resolution observable: the
+    // narrow default would report 3.
+    EXPECT_EQ(static_cast<SQLLEN>(3 * sizeof(SQLWCHAR)), wideInd);
+
+    SQLGUID guid{};
+    SQLLEN guidInd = -99;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_DEFAULT, &guid, sizeof(guid), &guidInd),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0x01020304u, guid.Data1);
+    EXPECT_EQ(0x0506u, guid.Data2);
+    EXPECT_EQ(0x0708u, guid.Data3);
+    const unsigned char tail[8] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10};
+    EXPECT_EQ(0, std::memcmp(guid.Data4, tail, sizeof(tail)));
+    // sizeof(SQLGUID), not the 36 characters msodbcsql's SQL_C_CHAR would give.
+    EXPECT_EQ(static_cast<SQLLEN>(sizeof(SQLGUID)), guidInd);
+
+    SQLCloseCursor(stmt_);
+}
+
+// A SQL_C_DEFAULT retrieval names no C type, so it carries no width contract:
+// resolving a uniqueidentifier column to SQL_C_GUID must not write
+// sizeof(SQLGUID) into a buffer the application declared as 4 bytes. The
+// placeholder is kept instead and the existing target gate reports HYC00, which
+// is what SQLFetchScroll does with the same shape. The backing array is
+// deliberately larger than the declared length so a regression shows up as
+// bytes written past it rather than as a crash.
+//
+// msodbcsql resolves to SQL_C_CHAR and truncates inside BufferLength, so this
+// asserts a deviation and does not run on the reference leg.
+TEST_F(GetDataLiveTest, DefaultTargetTooNarrowForItsFixedTargetIsRefused) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST('01020304-0506-0708-090A-0B0C0D0E0F10' AS UNIQUEIDENTIFIER)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    unsigned char backing[64];
+    std::memset(backing, 0xEE, sizeof(backing));
+    SQLLEN ind = -99;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_DEFAULT, backing, 4, &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    for (size_t i = 0; i < sizeof(backing); ++i) {
+        EXPECT_EQ(0xEE, backing[i]) << "byte " << i << " was written";
+    }
+
+    // The value stays resident, so a retry naming a wide enough target still
+    // reads it.
+    SQLGUID guid{};
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_DEFAULT, &guid, sizeof(guid), &ind),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(0x01020304u, guid.Data1);
+
+    SQLCloseCursor(stmt_);
+}
+
+// A varbinary column resolves to SQL_C_BINARY, which this path still serves
+// only as the zero-length length probe (AB#47239), so a real read keeps
+// returning HYC00 through the resolved target. That is the same posture the
+// bound path took when it started resolving the placeholder; msodbcsql resolves
+// identically and delivers the bytes, so this does not run on the reference
+// leg.
+//
+// Scoped to a non-PLP varbinary(n) deliberately: a VARBINARY(MAX) refuses the
+// probe too, which the next test pins.
+TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnIsStillUnimplemented) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x4142434445464748 AS VARBINARY(8))"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // The zero-length probe the resolved SQL_C_BINARY does answer. The buffer
+    // is real because the Driver Manager rejects a null TargetValuePtr with
+    // HY009 before the call reaches a driver.
+    SQLCHAR probeBuf[1] = {};
+    SQLLEN probe = -99;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_DEFAULT, probeBuf, 0, &probe),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(8, probe);
+
+    SQLCHAR buf[64] = {};
+    SQLLEN ind = -99;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_DEFAULT, buf, sizeof(buf), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+
+    SQLCloseCursor(stmt_);
+}
+
+// The PLP half of the same story, and the boundary the test above does not
+// cross. A non-NULL VARBINARY(MAX) also resolves to SQL_C_BINARY, but there
+// even the zero-length probe is HYC00: stream_active_plp_chunk admits only
+// SQL_C_CHAR/SQL_C_WCHAR and rejects everything else before it looks at
+// BufferLength, so there is no probe branch to reach. The non-PLP
+// VARBINARY(8) above answers that same probe with a length, so the two spell
+// out where the difference actually lies.
+//
+// Asserted as "the defaulted spelling agrees with the explicit one" rather than
+// against a hardcoded state, because that agreement is what this PR is
+// responsible for; the HYC00 itself is pre-existing and owned by AB#47239,
+// which is expected to turn both into real binary delivery. Each spelling gets
+// its own result set: a PLP column whose stream was begun and then refused
+// cannot be re-read on the same row (the second call reports 07009 from the
+// cursor's forward-only guard, not the target gate), so reusing one row would
+// measure that instead.
+//
+// NULL is deliberately not covered here: it never enters the streaming path
+// (see NullVarbinaryMaxToBinaryTargetReportsNull).
+//
+// msodbcsql delivers the bytes on both, so this does not run on the reference
+// leg.
+TEST_F(GetDataLiveTest, DefaultTargetOnABinaryMaxColumnRefusesEvenTheProbe) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const char* kQuery = "SELECT CAST(0x4142434445464748 AS VARBINARY(MAX))";
+
+    // Resolved from SQL_C_DEFAULT.
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLCHAR probeBuf[1] = {};
+    SQLLEN probe = -99;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_DEFAULT, probeBuf, 0, &probe));
+    const std::string defaulted = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+    SQLCloseCursor(stmt_);
+
+    // The same probe with the C type named explicitly.
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLLEN explicitProbe = -99;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_BINARY, probeBuf, 0, &explicitProbe));
+    const std::string named = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+    SQLCloseCursor(stmt_);
+
+    EXPECT_EQ("HYC00", defaulted) << "a MAX binary column refuses even the probe";
+    EXPECT_EQ(named, defaulted)
+        << "resolving SQL_C_DEFAULT must give the same answer as naming SQL_C_BINARY";
+}
+
+// The placeholder is resolved ahead of the captured/PLP dispatch, so it reaches
+// the streaming path too and stays stable across the continuation calls that
+// re-enter with the same column. A VARCHAR(MAX) resolves to SQL_C_CHAR in both
+// drivers, so this runs on the reference leg and compares.
+//
+// The size is for chunk count, not to force streaming: unlike a bound fetch —
+// where try_read_buffered_column materializes whatever the transport already
+// holds, so a small max column never streams — a paused row read pauses on
+// ColumnMetadata::is_plp() alone (token_stream.rs, `stop_here && meta.is_plp()`),
+// which is a property of the declared type. The buffered fast path this cursor
+// does consult bails out first and unconditionally on the same predicate
+// (decoder.rs `try_decode_buffered`: `if metadata.is_plp() ... return Ok(None)`),
+// so no amount of buffering — and no connection-string packet size — can divert
+// a max column away from the streaming path. Every VARCHAR(MAX) therefore takes
+// it at any size, which PlpColumnUnsupportedCTypeReturnsHyc00 above demonstrates
+// on a three-byte value: it answers HYC00 from the stream's target gate rather
+// than converting the text the way a captured value would.
+TEST_F(GetDataLiveTest, DefaultTargetStreamsAVarcharMaxAcrossChunks) {
+    const size_t kTotal = 9000;
+    ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    std::string assembled;
+    SQLCHAR buf[1024];
+    SQLLEN ind = 0;
+    SQLRETURN rc;
+    int guard = 0;
+    do {
+        rc = SQLGetData(stmt_, 1, SQL_C_DEFAULT, buf, sizeof(buf), &ind);
+        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) << "unexpected rc=" << rc;
+        assembled += std::string(reinterpret_cast<const char*>(buf));
+        ASSERT_LT(++guard, 1000) << "PLP stream did not terminate";
+    } while (rc == SQL_SUCCESS_WITH_INFO);
+
+    EXPECT_GT(guard, 1) << "the value must span more than one call to exercise the continuation";
+    EXPECT_EQ(std::string(kTotal, 'A'), assembled);
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_DEFAULT, buf, sizeof(buf), &ind));
+
+    SQLCloseCursor(stmt_);
+}
+
+// The wide half of the same streaming path: an NVARCHAR(MAX) resolves to
+// SQL_C_WCHAR and is delivered as UTF-16 across chunks, which also exercises
+// the per-stream decoder that widening builds once at stream start. That
+// resolution is the registered deviation — msodbcsql resolves the wide types to
+// its ANSI SQL_C_CHAR — so this does not run on the reference leg. See the
+// preceding test for why any max column reaches the streaming path here.
+TEST_F(GetDataLiveTest, DefaultTargetStreamsAnNvarcharMaxAsWideChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const size_t kTotal = 9000;
+    ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(N'A' AS NVARCHAR(MAX)), 9000)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    std::u16string assembled;
+    SQLWCHAR buf[512];
+    SQLLEN ind = 0;
+    SQLRETURN rc;
+    int guard = 0;
+    do {
+        rc = SQLGetData(stmt_, 1, SQL_C_DEFAULT, buf, sizeof(buf), &ind);
+        ASSERT_TRUE(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) << "unexpected rc=" << rc;
+        for (size_t i = 0; i < sizeof(buf) / sizeof(buf[0]) && buf[i] != 0; ++i) {
+            assembled.push_back(static_cast<char16_t>(buf[i]));
+        }
+        ASSERT_LT(++guard, 1000) << "PLP stream did not terminate";
+    } while (rc == SQL_SUCCESS_WITH_INFO);
+
+    EXPECT_GT(guard, 1) << "the value must span more than one call to exercise the continuation";
+    EXPECT_EQ(kTotal, assembled.size()) << "code units, not the narrow bytes msodbcsql would give";
+    EXPECT_EQ(std::u16string(kTotal, u'A'), assembled);
+
+    SQLCloseCursor(stmt_);
+}
+
 // The underflow half of the `real` range check, on the fetch direction. Runs
 // unskipped on the msodbcsql parity leg, so retail is what pins the answer: a
 // `float` column at 1e-40 read into a `SQL_C_FLOAT` buffer is 22003 there too,

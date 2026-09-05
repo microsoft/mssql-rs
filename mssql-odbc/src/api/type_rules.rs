@@ -393,6 +393,60 @@ mod tests {
         }
     }
 
+    /// The other half of that coupling, and the one with a buffer overrun on
+    /// the far side of it.
+    ///
+    /// Both `SQL_C_DEFAULT` resolvers refuse to resolve a fixed-width target
+    /// the caller's buffer cannot hold, and both ask [`element_stride`] how
+    /// wide that target is by calling it with `buffer_length` 0
+    /// (`get_data::resolve_default_target`,
+    /// `fetch_scroll::resolve_default_bindings`). `element_stride`'s catch-all
+    /// is `_ => buffer_length`, which is 0 there — so a fixed-width C type
+    /// *missing* from its match reports width 0, the `fixed_width > 0` guard
+    /// skips it, and the resolver hands a fixed-width target to a buffer the
+    /// application may have sized smaller.
+    ///
+    /// Nothing else fails in that case: `element_stride`'s own test checks a
+    /// hand-picked subset, so dropping a type from the match leaves every
+    /// behavioral test green. This closes it over the whole mapping rather than
+    /// a list that can go stale — a future row emitting a fixed-width C type
+    /// `element_stride` does not size fails here instead of at an application's
+    /// buffer.
+    ///
+    /// `SQL_C_NUMERIC` is the live example of why this is not hypothetical: it
+    /// is fixed-width and absent from `element_stride`, and is safe today only
+    /// because `SQL_DECIMAL` / `SQL_NUMERIC` map to `SQL_C_CHAR`. That is a
+    /// property of the mapping, not of the guard.
+    ///
+    /// Raised by Saurabh in review of PR #481.
+    #[test]
+    fn every_default_c_type_has_a_width_or_is_app_sized() {
+        use crate::api::fetch_scroll::element_stride;
+
+        // The targets ODBC sizes from the application's `BufferLength`, for
+        // which a 0 width is the correct answer rather than a gap.
+        const APP_SIZED: &[SqlSmallInt] = &[SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY, SQL_C_SS_VECTOR];
+
+        for version in [
+            OdbcVersion::Unset,
+            OdbcVersion::Odbc2,
+            OdbcVersion::Odbc3,
+            OdbcVersion::Odbc3_80,
+        ] {
+            for sql_type in i16::MIN..=i16::MAX {
+                let Some(c_type) = resolve_default_c_type(sql_type, version) else {
+                    continue;
+                };
+                assert!(
+                    APP_SIZED.contains(&c_type) || element_stride(c_type, 0) > 0,
+                    "SQL_C_DEFAULT on SQL type {sql_type} at {version:?} resolves to C type \
+                     {c_type}, which element_stride reports as width 0 without being \
+                     application-sized; the resolvers' narrow-buffer guard cannot see it"
+                );
+            }
+        }
+    }
+
     #[test]
     fn default_c_type_follows_the_sql_type() {
         let v = OdbcVersion::Odbc3_80;

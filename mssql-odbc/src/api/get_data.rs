@@ -8,21 +8,23 @@ use tracing::{debug, error};
 use std::sync::MutexGuard;
 
 use super::odbc_types::{
-    SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT,
-    SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_TYPE_DATE,
-    SQL_C_TYPE_TIMESTAMP, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_DATA,
-    SQL_NO_TOTAL, SQL_NULL_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlDateStruct, SqlGuid,
-    SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlSsTime2Struct,
-    SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlUSmallInt,
+    SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID,
+    SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
+    SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR,
+    SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL, SQL_NULL_DATA, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlDateStruct, SqlGuid, SqlHandle, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlUSmallInt,
 };
 use super::sqlstate::*;
+use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
+use crate::api::fetch_scroll::element_stride;
 use crate::api::odbc_types::SqlWChar;
-use crate::api::type_rules::{canonical_c_type, is_valid_c_type};
+use crate::api::type_rules::{canonical_c_type, is_valid_c_type, resolve_default_c_type};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::{ActivePlpStream, STMT_STATE_CURSOR_OPEN, StmtState};
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
 use mssql_tds::connection::tds_client::{CursorColumn, CursorPoll, PlpChunk};
 use mssql_tds::core::TdsResult;
 use mssql_tds::encoding_rs::{self, Decoder};
@@ -142,6 +144,24 @@ fn sql_get_data_safe(
         "SQLGetData: DM should reject negative buffer_length (HY090)"
     );
 
+    // The declared ODBC version selects the SQL_C_DEFAULT table, so it is only
+    // read for a defaulted retrieval — and before the STMT lock, to preserve
+    // parent-before-child lock ordering (the same order as `bind_param.rs`,
+    // `catalog.rs`, and `fetch_scroll.rs`). Gating costs nothing here, unlike
+    // on the fetch path: the placeholder arrives as a scalar argument rather
+    // than having to be read out of the bindings first, so there is no
+    // lock-order inversion to avoid.
+    let default_odbc_version = if target_type == SQL_C_DEFAULT {
+        let env = stmt.parent_dbc().parent_env();
+        let Ok(env_state) = env.inner.lock() else {
+            error!("SQLGetData: env mutex poisoned");
+            return SQL_ERROR;
+        };
+        Some(env_state.odbc_version)
+    } else {
+        None
+    };
+
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLGetData: stmt mutex poisoned");
         return SQL_ERROR;
@@ -166,10 +186,34 @@ fn sql_get_data_safe(
     // the same TargetType must give the same SQLSTATE whichever way the column
     // is delivered. Each path's own HYC00 check then covers valid target types
     // it cannot deliver yet. msodbcsql draws the same line in `IsValidCType`.
+    //
+    // Known gap: `SQL_ARD_TYPE` (-99) lands here. It is the ODBC spec's other
+    // placeholder `TargetType` for this argument — "use the type already on the
+    // ARD record" — and this driver does not implement it, so it falls through
+    // to `HY003`. That inverts the SQLSTATE: the spec defines `HY003` as
+    // *TargetType* being none of {a valid type, `SQL_C_DEFAULT`,
+    // `SQL_ARD_TYPE`}, so returning it *for* `SQL_ARD_TYPE` reports an
+    // application error for a documented spelling. msodbcsql resolves it itself
+    // in `GetColData` (`Sql/Ntdbms/sqlncli/odbc/sqlcdata.cpp:209`), reading
+    // `fCType` off the column's ARD binding — the same function whose
+    // `Sql2CDefault` call the `SQL_C_DEFAULT` resolution below mirrors — and
+    // reports `07009` for an unbound column. Deliberately not re-spelled to
+    // `HYC00` here: that would make the gap look handled without implementing
+    // it. Implementing it needs the ARD-record lookup, the unbound-column case,
+    // and `SQL_C_NUMERIC` precision/scale from that same binding. Raised in
+    // review of AB#47815; needs its own work item.
     if !is_valid_c_type(canonical_c_type(target_type)) {
         post_diag(&mut stmt_state, ERR_INVALID_C_DATA_TYPE);
         return SQL_ERROR;
     }
+
+    // Resolved once, ahead of every dispatch below, so the captured, PLP, and
+    // continuation paths all see a concrete C type and cannot disagree about
+    // what the placeholder meant for this column.
+    let target_type = match default_odbc_version {
+        Some(version) => resolve_default_target(&stmt_state, col_index, version, buffer_length),
+        None => target_type,
+    };
 
     // Continuation: app is calling SQLGetData again on the same PLP column to
     // get the next chunk from the active wire stream.
@@ -904,6 +948,100 @@ fn finish_get_data(
     // `fetch_scroll.rs`'s zero-row fetch case.
     release_busy_if_row_exhausted(dbc, stmt, statement_handle, client, true);
     rc
+}
+
+/// The C type a `SQL_C_DEFAULT` retrieval of `col_index` names, taken from the
+/// column's own SQL type.
+///
+/// The mapping is [`resolve_default_c_type`], shared with `SQLBindParameter`
+/// and `SQLFetchScroll` so the driver gives one answer to what `SQL_C_DEFAULT`
+/// means however an application reads a column — the invariant msodbcsql keeps
+/// by consulting `Sql2CDefault` on the `GetColData` path that serves both bound
+/// and unbound retrieval. Its two registered deviations (the wide character
+/// types resolve to `SQL_C_WCHAR`, `SQL_GUID` to `SQL_C_GUID`) therefore reach
+/// `SQLGetData` too.
+///
+/// The placeholder is kept in two cases, which the caller's own target gate
+/// then reports as `HYC00` rather than this driver guessing:
+///
+/// - The column's SQL type has no default (`SQL_UNKNOWN_TYPE` from
+///   [`odbc_sql_type`] for a TDS type this driver does not map).
+/// - The resolved target is fixed-width and the `BufferLength` the application
+///   declared cannot hold it. `BufferLength` is otherwise ignored for a
+///   fixed-width target, which is safe when the application *named* that type
+///   and so accepted its width contract; a defaulted retrieval names nothing,
+///   so honouring the C type's width would put the 16 bytes a
+///   `uniqueidentifier` column resolves to into a 4-byte buffer — where
+///   msodbcsql resolves to `SQL_C_CHAR` and stays inside `BufferLength`.
+///
+/// **A NULL is the exception, in both cases.** [`write_captured_column`]
+/// answers NULL from the indicator before it computes `deliverable_target`, so
+/// an unresolved placeholder over a NULL column reports `SQL_NULL_DATA` and
+/// `SQL_SUCCESS` rather than `HYC00`. That is the correct answer and matches
+/// msodbcsql: nothing is written, so a target this driver cannot deliver — and
+/// a buffer too narrow to hold it — are both moot. The refusals above exist to
+/// prevent a *write*, and there is no write to prevent.
+///
+/// `BufferLength` 0 is **not** exempt here, unlike in `SQLFetchScroll`'s
+/// resolver. On a binding, 0 is the documented idiom for a fixed-width target
+/// and makes no width claim; on `SQLGetData` it is *also* how an application
+/// asks for a length without wanting a value written, which is how this file
+/// already reads it for `SQL_C_BINARY` (see `binary_probe`). Honouring the C
+/// type's width on that spelling would write up to 20 bytes into a buffer the
+/// caller declared as holding none, in a process this driver was loaded into.
+/// Refusing costs nothing an application had before: the same call answered
+/// `HYC00` prior to AB#47815.
+///
+/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which neither
+/// delivery path implements yet (AB#47239), so a real read keeps returning
+/// `HYC00` through the resolved target. That matches the posture the bound path
+/// took in AB#47481; msodbcsql resolves identically and delivers the bytes.
+///
+/// **How much the resolved `SQL_C_BINARY` still answers depends on the path**,
+/// so the two are worth stating separately:
+///
+/// - Non-PLP (`varbinary(n)`, `binary(n)`): the zero-length length probe works.
+///   [`write_captured_column`]'s `binary_probe` reports the byte count and
+///   leaves the value resident; only a read with a real buffer is `HYC00`.
+/// - PLP (`varbinary(max)`, `image`): even the probe is `HYC00`.
+///   [`stream_active_plp_chunk`] admits only `SQL_C_CHAR` / `SQL_C_WCHAR` and
+///   rejects everything else before it looks at `buffer_length`, so there is no
+///   probe branch to reach. A NULL is the exception — it never enters the
+///   streaming path at all.
+///
+/// Both are pre-existing for an explicit `SQL_C_BINARY` read; resolution only
+/// makes them reachable without the application naming the C type. The width
+/// check above never fires for either, since `SQL_C_BINARY` is
+/// application-sized and so has no fixed width to test.
+fn resolve_default_target(
+    stmt_state: &StmtState,
+    col_index: usize,
+    odbc_version: OdbcVersion,
+    buffer_length: SqlLen,
+) -> SqlSmallInt {
+    let Some(target_type) = stmt_state
+        .column_metadata
+        .get(col_index - 1)
+        .map(odbc_sql_type)
+        .and_then(|sql_type| resolve_default_c_type(sql_type, odbc_version))
+    else {
+        return SQL_C_DEFAULT;
+    };
+
+    // Zero for a character or binary target, which the application sizes.
+    let fixed_width = element_stride(target_type, 0);
+    if fixed_width > 0 && (buffer_length.max(0) as usize) < fixed_width {
+        error!(
+            col_index,
+            target_type,
+            buffer_length,
+            fixed_width,
+            "SQLGetData: SQL_C_DEFAULT resolved to a fixed-width target the caller's buffer \
+             cannot hold; leaving it unresolved rather than overrunning it"
+        );
+        return SQL_C_DEFAULT;
+    }
+    target_type
 }
 
 fn write_captured_column(
@@ -2570,11 +2708,11 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP};
+    use crate::api::odbc_types::{SQL_C_SLONG, SQL_C_TYPE_TIMESTAMP, SqlSsTime2Struct};
     use crate::api::odbc_types::{SQL_NO_DATA, SQL_NULL_HANDLE};
     use crate::error::diag::DiagRecord;
-    use crate::handles::DbcHandle;
     use crate::handles::stmt::BufferedGetDataRow;
+    use crate::handles::{DbcHandle, EnvHandle};
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::SqlString;
     use mssql_tds::datatypes::sqldatatypes::TdsDataType;
@@ -4458,6 +4596,360 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(out, -2_000_000);
         assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
+    }
+
+    /// Seeds column 1 with `metadata` and an already-captured `value`, for the
+    /// `SQL_C_DEFAULT` tests below, which need a column whose SQL type is
+    /// something other than the `int` [`stmt_with_captured`] describes.
+    fn stmt_with_captured_column(
+        h: &TestHandles,
+        metadata: Vec<mssql_tds::query::metadata::ColumnMetadata>,
+        value: ColumnValues,
+    ) {
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut s = stmt_handle.inner.lock().unwrap();
+        s.set_state(STMT_STATE_CURSOR_OPEN);
+        s.column_metadata = metadata;
+        s.row_positioned = true;
+        s.last_captured = Some((1, value));
+    }
+
+    /// `int_columns(1)` retyped as `column_type` on the wire, so `odbc_sql_type`
+    /// reports the SQL type that column would carry.
+    fn column_of(column_type: TdsDataType) -> Vec<mssql_tds::query::metadata::ColumnMetadata> {
+        let mut metadata = int_columns(1);
+        metadata[0].data_type = column_type;
+        metadata[0].type_info.tds_type = column_type;
+        metadata
+    }
+
+    /// AB#47815: `SQL_C_DEFAULT` resolves from the column's SQL type instead of
+    /// being rejected with `HYC00`, so an `int` column delivers through
+    /// `SQL_C_SLONG` exactly as if the application had named it — the same
+    /// answer `SQLBindCol` + `SQLFetch` gives for the same placeholder.
+    #[test]
+    fn get_data_default_resolves_from_the_column_type() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Int(-2_000_000));
+
+        let mut out: i32 = 0;
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                (&mut out as *mut i32).cast(),
+                std::mem::size_of::<i32>() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(out, -2_000_000);
+        assert_eq!(ind, std::mem::size_of::<i32>() as SqlLen);
+    }
+
+    /// The resolver is shared with `SQLBindParameter` and `SQLFetchScroll`, so
+    /// its registered deviation from msodbcsql's `Sql2CDefault` reaches this
+    /// path too: a wide character column resolves to `SQL_C_WCHAR`, where
+    /// msodbcsql resolves to its ANSI `SQL_C_CHAR`.
+    #[test]
+    fn get_data_default_resolves_a_wide_column_to_wchar() {
+        use mssql_tds::datatypes::sql_string::SqlString;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured_column(
+            &h,
+            column_of(TdsDataType::NVarChar),
+            ColumnValues::String(SqlString::from_utf8_string("hi".into())),
+        );
+
+        let mut out = [0 as SqlWChar; 8];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                out.as_mut_ptr().cast(),
+                std::mem::size_of_val(&out) as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(&out[..2], "hi".encode_utf16().collect::<Vec<_>>());
+        assert_eq!(out[2], 0, "SQL_C_WCHAR delivery is nul-terminated");
+        // UTF-16 bytes, not the two UTF-8 ones SQL_C_CHAR would report.
+        assert_eq!(ind, 4);
+    }
+
+    /// The declared ODBC version has to reach the resolver through
+    /// `SQLGetData`, not just through `resolve_default_c_type` itself.
+    /// `SQL_SS_TIME2` is the mapping that moves with it: `SQL_C_SS_TIME2` at
+    /// 3.8, `SQL_C_BINARY` below it. Hardcoding either version flips one of the
+    /// two assertions below.
+    fn get_data_time_column_as_default(version: OdbcVersion) -> (SqlReturn, SqlSsTime2Struct) {
+        use mssql_tds::datatypes::column_values::SqlTime;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        {
+            let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+            env.inner.lock().unwrap().odbc_version = version;
+        }
+        // 13:45:30.1234567 in 100 ns ticks since midnight.
+        let ticks = (13 * 3600 + 45 * 60 + 30) * 10_000_000 + 1_234_567;
+        stmt_with_captured_column(
+            &h,
+            column_of(TdsDataType::TimeN),
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: ticks,
+                scale: 7,
+            }),
+        );
+
+        let mut out = SqlSsTime2Struct::default();
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                (&mut out as *mut SqlSsTime2Struct).cast(),
+                std::mem::size_of::<SqlSsTime2Struct>() as SqlLen,
+                &mut ind,
+            )
+        };
+        (ret, out)
+    }
+
+    #[test]
+    fn get_data_default_follows_the_declared_odbc_version() {
+        assert_eq!(
+            get_data_time_column_as_default(OdbcVersion::Odbc3_80),
+            (
+                SQL_SUCCESS,
+                SqlSsTime2Struct {
+                    hour: 13,
+                    minute: 45,
+                    second: 30,
+                    fraction: 123_456_700,
+                }
+            ),
+            "3.8 resolves SQL_SS_TIME2 to the typed SQL_C_SS_TIME2"
+        );
+        assert_eq!(
+            get_data_time_column_as_default(OdbcVersion::Odbc3),
+            (SQL_ERROR, SqlSsTime2Struct::default()),
+            "3.0 resolves SQL_SS_TIME2 to SQL_C_BINARY, which is not delivered yet"
+        );
+    }
+
+    /// A column whose TDS type has no ODBC SQL type — and so no default C type —
+    /// keeps the placeholder and reports it through the existing target gate,
+    /// rather than the driver picking something it cannot deliver.
+    #[test]
+    fn get_data_default_without_a_mapping_is_hyc00() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut metadata = column_of(TdsDataType::IntN);
+        // No ODBC integer is three bytes wide, so `odbc_sql_type` reports
+        // SQL_UNKNOWN_TYPE.
+        metadata[0].type_info.length = 3;
+        stmt_with_captured_column(&h, metadata, ColumnValues::Int(7));
+
+        let mut buf = [0u8; 8];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                buf.as_mut_ptr() as SqlPointer,
+                buf.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
+    }
+
+    /// `SQL_C_DEFAULT` names no C type, so it carries no width contract:
+    /// resolving a `uniqueidentifier` column to `SQL_C_GUID` must not write
+    /// `sizeof(SQLGUID)` into a buffer the application declared as 4 bytes.
+    /// `SQLFetchScroll` refuses the same shape. The backing array is
+    /// deliberately larger than the declared length so a regression shows up as
+    /// bytes written past it rather than as a crash.
+    #[test]
+    fn get_data_default_too_narrow_for_its_fixed_target_is_refused() {
+        const DECLARED: SqlLen = 4;
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured_column(
+            &h,
+            column_of(TdsDataType::Guid),
+            ColumnValues::Uuid(uuid::Uuid::from_u128(
+                0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
+            )),
+        );
+
+        let mut backing = [0xEEu8; 64];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                backing.as_mut_ptr() as SqlPointer,
+                DECLARED,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            backing.iter().all(|&b| b == 0xEE),
+            "nothing may be written into a buffer too narrow for the resolved target"
+        );
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
+    }
+
+    /// On `SQLGetData`, `BufferLength` 0 is also how an application asks for a
+    /// length without wanting a value written, so a defaulted retrieval does
+    /// not take it as permission to write the resolved C type's full width —
+    /// unlike a `SQL_C_DEFAULT` *binding*, where 0 is the documented idiom for
+    /// a fixed-width slot. The `SQL_C_BINARY` probe is unaffected: it is
+    /// application-sized and so has no fixed width to test.
+    #[test]
+    fn get_data_default_with_zero_buffer_length_is_refused_for_a_fixed_target() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured_column(
+            &h,
+            column_of(TdsDataType::Guid),
+            ColumnValues::Uuid(uuid::Uuid::from_u128(
+                0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
+            )),
+        );
+
+        let mut out = [0xEEu8; 16];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                out.as_mut_ptr() as SqlPointer,
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(
+            out, [0xEEu8; 16],
+            "nothing may be written under a zero width"
+        );
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
+    }
+
+    /// A NULL escapes both refusals above, because `write_captured_column`
+    /// answers NULL from the indicator before it computes `deliverable_target`.
+    /// The narrow-buffer guard exists to stop a *write*, and a NULL writes
+    /// nothing, so reporting `SQL_NULL_DATA` is correct rather than a hole —
+    /// msodbcsql answers the same way. Uses the shape the guard would otherwise
+    /// refuse (a `uniqueidentifier` resolving to the 16-byte `SQL_C_GUID`,
+    /// declared as 4 bytes) so a regression that moved the NULL branch below
+    /// the gate turns this red.
+    #[test]
+    fn get_data_default_over_a_null_reports_null_even_when_unresolvable() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured_column(&h, column_of(TdsDataType::Guid), ColumnValues::Null);
+
+        let mut out = [0xEEu8; 16];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                out.as_mut_ptr() as SqlPointer,
+                4,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, SQL_NULL_DATA);
+        assert_eq!(
+            out, [0xEEu8; 16],
+            "a NULL leaves a fixed-width buffer untouched"
+        );
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert!(
+            s.diag_records.is_empty(),
+            "a NULL must not raise a diagnostic: {:?}",
+            s.diag_records
+        );
+    }
+
+    /// The zero-length `SQL_C_BINARY` probe still works through the resolved
+    /// target: a `varbinary` column resolves to an application-sized C type, so
+    /// the width check has nothing to refuse. Since AB#47537 the probe reports
+    /// `01004` / `SQL_SUCCESS_WITH_INFO` when bytes are available but none were
+    /// written, so this pins the resolved path agreeing with that rule rather
+    /// than the plain `SQL_SUCCESS` it answered before.
+    #[test]
+    fn get_data_default_on_a_binary_column_answers_the_length_probe() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured_column(
+            &h,
+            column_of(TdsDataType::BigVarBinary),
+            ColumnValues::Bytes(vec![1, 2, 3, 4, 5]),
+        );
+
+        let mut out = [0u8; 8];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                out.as_mut_ptr() as SqlPointer,
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(
+            ret, SQL_SUCCESS_WITH_INFO,
+            "AB#47537: a probe that reports available bytes without writing any \
+             is a truncation, so it warns rather than reporting plain success"
+        );
+        assert_eq!(ind, 5);
+        {
+            let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let s = sh.inner.lock().unwrap();
+            assert_eq!(
+                s.diag_records.last().unwrap().sql_state,
+                WARN_STRING_TRUNCATION.state
+            );
+        }
+
+        // Delivering the bytes for real is still unimplemented (AB#47239).
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_DEFAULT,
+                out.as_mut_ptr() as SqlPointer,
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let s = sh.inner.lock().unwrap();
+        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
     }
 
     /// AB#47507 regression: a NULL value with no indicator must be SQLSTATE
