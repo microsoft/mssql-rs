@@ -1,0 +1,58 @@
+name: macOS ARM64 Experiment
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-arm64-experiment-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  arm64-build-test:
+    if: github.head_ref == 'dev/saurabh/github-macos-arm-test'
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Report runner architecture
+        run: |
+          echo "runner.arch=${{ runner.arch }}"
+          echo "uname -m=$(uname -m)"
+          uname -a
+          sw_vers
+          system_profiler SPHardwareDataType
+
+          test "${{ runner.arch }}" = "ARM64"
+          test "$(uname -m)" = "arm64"
+
+      - name: Report Rust toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          rustup show active-toolchain
+
+      - name: Install nextest
+        run: ./.pipeline/scripts/install-coverage-tools-macos.sh
+
+      - name: Build Rust workspace
+        run: cargo build --workspace --frozen --all-targets
+
+      - name: Generate mock server certificates
+        run: ./scripts/generate_mock_tds_server_certs.sh
+
+      - name: Run non-connectivity tests
+        env:
+          CERT_HOST_NAME: sql1
+          RUST_BACKTRACE: full
+        run: >-
+          cargo nextest run --workspace --frozen --all-targets
+          --no-fail-fast --profile ci --success-output immediate
+          -E 'not test(connectivity)'
