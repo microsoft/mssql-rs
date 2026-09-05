@@ -29,6 +29,10 @@
 //   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
 //   23. ClrUdtDescriptorFields             - CLR UDT type, size, and identity fields
 //   24. ClrUdtIdentityFieldsAreEmptyForNonUdtColumns - non-UDT identity fields are empty
+//   25. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   26. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   27. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   28. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
 
 #include "odbc_test_fixture.h"
 
@@ -527,6 +531,46 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     SQLCloseCursor(stmt_);
 }
 
+// AB#47537 follow-up: the empty-value case of the zero-length SQL_C_BINARY
+// probe now *consumes* the column (there was nothing left to deliver), so this
+// pins the interaction with variant base-type tracking -- the two live in
+// different state (`last_captured` vs `last_variant_base`), and nothing else
+// would catch a future change that cleared both together.
+//
+// This is the exact sequence mssql-python runs on a sql_variant column
+// (`ddbc_bindings.cpp`): zero-length SQL_C_BINARY probe, then
+// SQLColAttribute(SQL_CA_SS_VARIANT_TYPE), then a read using the reported C
+// type. The base type must still be answerable after the probe consumed the
+// value, and the follow-up read must report SQL_NO_DATA rather than handing
+// back a stale value.
+//
+// Measured on both legs: base type SQL_C_BINARY and a SQL_NO_DATA re-read agree
+// exactly. The probe's own return code is the one divergence -- msodbcsql
+// 18.6.2.1 answers SQL_SUCCESS_WITH_INFO/01004 for a variant wrapping an empty
+// value where this driver answers SQL_SUCCESS (a bare empty `varbinary(8)`,
+// with no variant wrapper, is plain SQL_SUCCESS on both). ASSERT_SQL_OK accepts
+// either, so this test asserts the parts that matter without pinning that
+// difference; it is invisible to mssql-python, whose probe is gated on
+// SQL_SUCCEEDED.
+TEST_F(ColAttributeLiveTest, EmptyVariantProbeConsumesValueButKeepsBaseType) {
+    ExecDirect("SELECT CAST(CAST('' AS VARBINARY(8)) AS SQL_VARIANT) AS v");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN indicator = -999;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(0, indicator) << "an empty value reports zero bytes, not SQL_NULL_DATA";
+
+    // The probe consumed the value; the base type must survive it.
+    EXPECT_EQ(SQL_C_BINARY, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    // Nothing remained, so the column is done rather than re-readable.
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator));
+
+    SQLCloseCursor(stmt_);
+}
+
 // A NULL sql_variant is just a zero length on the wire, with no base type or
 // property byte following it. Reading those anyway would consume the next
 // column's bytes, so the column after the variant is what actually proves it.
@@ -586,4 +630,165 @@ TEST_F(ColAttributeLiveTest, VariantTypeBeforeProbeIsSequenceError) {
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
     SQLCloseCursor(stmt_);
+}
+
+// The exact numerics report SQL_C_NUMERIC, which is what tells a caller the
+// value is a decimal rather than a string. mssql-python routes on this answer
+// alone -- SQL_C_CHAR made it hand back `str` instead of `decimal.Decimal`
+// (AB#47702). `money` and `smallmoney` are included because msodbcsql answers
+// SQL_C_NUMERIC for them too, matching the SQL_DECIMAL it reports for a money
+// column, and because they arrive as distinct TDS base types (MONEYN width 8
+// and 4) that the driver maps separately.
+//
+// This compares against msodbcsql: the value is the whole point of the test.
+TEST_F(ColAttributeLiveTest, VariantExactNumericsReportNumeric) {
+    struct Case {
+        const char* label;
+        const char* expr;
+    };
+    const Case cases[] = {
+        {"decimal", "CAST(999.99 AS DECIMAL(18, 4))"},
+        {"numeric", "CAST(888.88 AS NUMERIC(10, 2))"},
+        {"money", "CAST(12.34 AS MONEY)"},
+        {"smallmoney", "CAST(12.34 AS SMALLMONEY)"},
+        // No CAST: SQL Server stores a bare decimal literal as `numeric`.
+        {"implicit numeric", "45.67"},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_NE(SQL_NULL_DATA, indicator);
+        EXPECT_EQ(SQL_C_NUMERIC, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// Reporting SQL_C_NUMERIC describes the value, not the delivery path: the
+// character fetch that mssql-python actually performs after reading the
+// attribute has to keep working, digits intact. Compared against msodbcsql,
+// which renders the same padded form.
+TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
+    ExecDirect("SELECT CAST(CAST(999.99 AS DECIMAL(18, 4)) AS SQL_VARIANT) AS v");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_C_NUMERIC, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+    SQLCHAR text[64] = {0};
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, text, sizeof(text), &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_STREQ("999.9900", reinterpret_cast<const char*>(text));
+
+    SQLCloseCursor(stmt_);
+}
+
+// Every base type whose answer is measured to agree with msodbcsql, in one
+// place. Spot-checking a couple of types is what let the exact-numeric answer
+// (AB#47702) and the `tinyint` signedness answer both survive unnoticed.
+//
+// This list is hand-written, so it does not by itself stop a new base type from
+// going unchecked. What does is `variant_c_type`'s match, which enumerates every
+// `TdsDataType` instead of ending in a `_` arm: adding a type fails to compile
+// until someone answers for it, and this table is where the answer gets pinned
+// against msodbcsql.
+//
+// Deliberately excluded, because the drivers genuinely differ:
+//
+//   * date / smalldatetime / datetime / datetime2 - msodbcsql answers the 2.x
+//     spellings (SQL_C_DATE 9, SQL_C_TIMESTAMP 11), this driver the 3.x ones
+//     (91 / 93). That is the documented canonicalization direction in
+//     api/type_rules.rs, not a defect, and it is covered separately below.
+//   * time / datetimeoffset - both drivers answer SQL_C_SS_TIME2 /
+//     SQL_C_SS_TIMESTAMPOFFSET when the application declares ODBC 3.80, but
+//     msodbcsql falls back to SQL_C_BINARY under plain SQL_OV_ODBC3 while this
+//     driver does not. The fixture's declared version decides the answer, so
+//     the row would assert the fixture rather than the driver.
+TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
+    struct Case {
+        const char* label;
+        const char* expr;
+        SQLSMALLINT expected;
+    };
+    const Case cases[] = {
+        {"bit", "CAST(1 AS BIT)", SQL_C_BIT},
+        // Unsigned: tinyint is 0-255 on the server, so a signed answer would
+        // make a caller read 200 as -56.
+        {"tinyint", "CAST(200 AS TINYINT)", SQL_C_UTINYINT},
+        {"smallint", "CAST(300 AS SMALLINT)", SQL_C_SSHORT},
+        {"int", "CAST(42 AS INT)", SQL_C_SLONG},
+        {"bigint", "CAST(42 AS BIGINT)", SQL_C_SBIGINT},
+        {"real", "CAST(1.5 AS REAL)", SQL_C_FLOAT},
+        {"float", "CAST(1.5 AS FLOAT)", SQL_C_DOUBLE},
+        {"decimal", "CAST(1.5 AS DECIMAL(18, 4))", SQL_C_NUMERIC},
+        {"numeric", "CAST(1.5 AS NUMERIC(10, 2))", SQL_C_NUMERIC},
+        {"money", "CAST(1.5 AS MONEY)", SQL_C_NUMERIC},
+        {"smallmoney", "CAST(1.5 AS SMALLMONEY)", SQL_C_NUMERIC},
+        {"char", "CAST('ab' AS CHAR(2))", SQL_C_CHAR},
+        {"varchar", "CAST('ab' AS VARCHAR(10))", SQL_C_CHAR},
+        {"nchar", "CAST(N'ab' AS NCHAR(2))", SQL_C_WCHAR},
+        {"nvarchar", "CAST(N'ab' AS NVARCHAR(10))", SQL_C_WCHAR},
+        {"binary", "CAST(0x01 AS BINARY(1))", SQL_C_BINARY},
+        {"varbinary", "CAST(0x01 AS VARBINARY(10))", SQL_C_BINARY},
+        {"uniqueidentifier", "CAST(NEWID() AS UNIQUEIDENTIFIER)", SQL_C_GUID},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_NE(SQL_NULL_DATA, indicator);
+        EXPECT_EQ(c.expected, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// The date/time family, which the table above excludes. msodbcsql answers the
+// 2.x spellings here regardless of the declared ODBC version; this driver
+// canonicalizes toward the 3.x ones (api/type_rules.rs). Pinning our side keeps
+// the difference deliberate instead of accidental, so it skips the reference leg.
+TEST_F(ColAttributeLiveTest, VariantDateTimeBaseTypesUseTheThreeXSpellings) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    struct Case {
+        const char* label;
+        const char* expr;
+        SQLSMALLINT expected;
+    };
+    const Case cases[] = {
+        {"date", "CAST('2023-06-15' AS DATE)", SQL_C_TYPE_DATE},
+        {"smalldatetime", "CAST('2023-06-15 12:00' AS SMALLDATETIME)", SQL_C_TYPE_TIMESTAMP},
+        {"datetime", "CAST('2023-06-15 12:00' AS DATETIME)", SQL_C_TYPE_TIMESTAMP},
+        {"datetime2", "CAST('2023-06-15 12:00' AS DATETIME2)", SQL_C_TYPE_TIMESTAMP},
+    };
+
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.label);
+        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+        SQLCHAR probe = 0;
+        SQLLEN indicator = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_NE(SQL_NULL_DATA, indicator);
+        EXPECT_EQ(c.expected, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
+
+        SQLCloseCursor(stmt_);
+    }
 }
