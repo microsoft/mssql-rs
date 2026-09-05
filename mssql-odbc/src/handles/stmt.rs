@@ -36,8 +36,10 @@ pub(crate) struct ActivePlpStream {
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
-    /// UTF-8 bytes produced from UTF-16LE input that did not fit in the previous
-    /// `SQL_C_CHAR` buffer. Kept until later calls deliver them.
+    /// Transcoded UTF-8 that did not fit in the caller's `SQL_C_CHAR` buffer,
+    /// held until later calls deliver it. Output can exceed the buffer because a
+    /// UTF-16 surrogate pair becomes a 4-byte UTF-8 character, so a chunk is
+    /// transcoded whole and only the bytes that fit are copied out.
     pub(crate) pending_utf8: Vec<u8>,
     /// Incremental decoder for the narrow-text -> `SQL_C_WCHAR` widening path
     /// (`varchar(max)`/`json` delivered as UTF-16LE). `None` for every other

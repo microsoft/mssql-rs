@@ -2033,8 +2033,13 @@ fn stream_active_plp_chunk<'a>(
         // writable for one `SqlLen`.
         unsafe { write_if_some(strlen_or_ind_ptr, usable as SqlLen) };
     } else if transcode_utf16_to_utf8 {
-        // NVARCHAR PLP wire bytes are UTF-16LE; transcode to UTF-8 for
-        // SQL_C_CHAR, carrying split input and output across calls.
+        // The wire carries nvarchar as UTF-16; the caller asked for UTF-8
+        // (SQL_C_CHAR). A code unit or a surrogate pair split across a chunk
+        // boundary is carried on the input side (pending_byte /
+        // pending_high_surrogate). Output can overrun too: a surrogate pair
+        // becomes a 4-byte character, so a chunk may transcode to more UTF-8
+        // than the buffer holds. Transcode the whole chunk, copy only what
+        // fits, and keep the rest in pending_utf8 for the next call.
         {
             let Ok(mut ss) = stmt.inner.lock() else {
                 return SQL_ERROR;
@@ -2236,10 +2241,13 @@ pub(crate) fn widen_into_pending(
     out_units.min(pending.len())
 }
 
-/// Chooses an even UTF-16LE wire read size for the available UTF-8 output room.
+/// Picks how many UTF-16LE wire bytes to read for the UTF-8 room still free.
 ///
-/// Two code units are the minimum non-zero read so a surrogate pair can produce
-/// output in one call. Surplus UTF-8 bytes remain in `pending_utf8`.
+/// Even, so a read never splits a code unit, and never below two code units so
+/// a surrogate pair (both halves are needed to form one character) can
+/// transcode in a single call. This is only a target: a pair yields a 4-byte
+/// character, so the output can still overrun the room and spill into
+/// `pending_utf8`.
 fn utf16le_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
     let remaining = payload_capacity.saturating_sub(pending_utf8_len);
     if remaining == 0 {
