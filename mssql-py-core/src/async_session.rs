@@ -30,6 +30,14 @@ pub(crate) struct FetchClaim {
     pub(crate) operation_id: OperationId,
 }
 
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FetchCompletion {
+    Published,
+    CancellationRequested,
+    NoLongerActive,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimError {
     Closing,
@@ -61,10 +69,9 @@ pub(crate) struct ActiveOperation {
     pub(crate) cursor_id: Option<CursorId>,
     pub(crate) operation_id: OperationId,
     pub(crate) phase: OperationPhase,
-    // TODO: Add cursor cancellation that triggers this root handle only when
-    // cursor and operation IDs match. Complete ATTENTION cleanup before marking
-    // the connection reusable or broken.
     pub(crate) cancel_handle: Option<CancelHandle>,
+    /// Prevents a detached fetch from publishing results after its Python awaitable was cancelled.
+    cancel_requested: bool,
 }
 
 /// Mutex-protected connection lifecycle and operation ownership state.
@@ -178,6 +185,7 @@ impl AsyncConnectionState {
             operation_id,
             phase: OperationPhase::Executing,
             cancel_handle: Some(cancel_handle),
+            cancel_requested: false,
         });
 
         let child_handle = state
@@ -211,6 +219,7 @@ impl AsyncConnectionState {
             operation_id,
             phase: OperationPhase::Executing,
             cancel_handle: None,
+            cancel_requested: false,
         });
         Ok(operation_id)
     }
@@ -264,6 +273,7 @@ impl AsyncConnectionState {
             operation_id,
             phase: OperationPhase::Closing,
             cancel_handle: None,
+            cancel_requested: false,
         });
         Ok(CursorCloseClaim {
             operation_id,
@@ -287,18 +297,26 @@ impl AsyncConnectionState {
         }
     }
 
+    /// Publishes a completed fetch only while it still owns an uncancelled read.
+    ///
+    /// Cancellation keeps ownership with the detached worker so it can settle
+    /// ATTENTION. A missing or mismatched operation has already been released and
+    /// needs no further protocol cleanup.
     pub(crate) fn finish_fetch(
         &self,
         operation_id: OperationId,
         result_set_exhausted: bool,
         has_open_batch: bool,
-    ) {
+    ) -> FetchCompletion {
         let mut state = self.lock();
         let Some(active) = state.active_operation.as_mut() else {
-            return;
+            return FetchCompletion::NoLongerActive;
         };
         if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
-            return;
+            return FetchCompletion::NoLongerActive;
+        }
+        if active.cancel_requested {
+            return FetchCompletion::CancellationRequested;
         }
 
         if !result_set_exhausted || has_open_batch {
@@ -306,6 +324,7 @@ impl AsyncConnectionState {
         } else {
             state.active_operation = None;
         }
+        FetchCompletion::Published
     }
 
     pub(crate) fn restore_fetch(&self, operation_id: OperationId) {
@@ -315,6 +334,32 @@ impl AsyncConnectionState {
             && active.phase == OperationPhase::FetchingRow
         {
             active.phase = OperationPhase::Fetching;
+        }
+    }
+
+    /// Requests cancellation for the matching in-flight fetch task exactly once.
+    ///
+    /// Session ownership intentionally remains in `FetchingRow`; releasing it
+    /// here would let another command race with the background ATTENTION drain.
+    pub(crate) fn cancel_fetch(&self, operation_id: OperationId) -> bool {
+        let cancel_handle = {
+            let mut state = self.lock();
+            let Some(active) = state.active_operation.as_mut() else {
+                return false;
+            };
+            if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
+                return false;
+            }
+            active.cancel_requested = true;
+            active.cancel_handle.take()
+        };
+
+        match cancel_handle {
+            Some(cancel_handle) => {
+                cancel_handle.cancel();
+                true
+            }
+            None => false,
         }
     }
 
@@ -370,7 +415,9 @@ impl AsyncConnectionState {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AsyncConnectionState, ClaimError, ConnectionLifecycle, OperationPhase};
+    use super::{
+        AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion, OperationPhase,
+    };
 
     #[test]
     fn allocates_unique_cursor_ids() {
@@ -451,7 +498,10 @@ mod tests {
         assert_eq!(state.claim_fetch(2).unwrap_err(), ClaimError::Busy);
         assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
 
-        state.finish_fetch(fetch.operation_id, false, true);
+        assert_eq!(
+            state.finish_fetch(fetch.operation_id, false, true),
+            FetchCompletion::Published
+        );
         assert_eq!(
             state.lock().active_operation.as_ref().unwrap().phase,
             OperationPhase::Fetching
@@ -465,11 +515,17 @@ mod tests {
         state.finish_execute(execute.operation_id, true);
 
         let current_result_end = state.claim_fetch(1).unwrap();
-        state.finish_fetch(current_result_end.operation_id, true, true);
+        assert_eq!(
+            state.finish_fetch(current_result_end.operation_id, true, true),
+            FetchCompletion::Published
+        );
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
 
         let batch_end = state.claim_fetch(1).unwrap();
-        state.finish_fetch(batch_end.operation_id, true, false);
+        assert_eq!(
+            state.finish_fetch(batch_end.operation_id, true, false),
+            FetchCompletion::Published
+        );
         assert!(state.claim_execute(2).is_ok());
     }
 
@@ -483,6 +539,42 @@ mod tests {
         state.restore_fetch(fetch.operation_id);
 
         assert!(state.claim_fetch(1).is_ok());
+    }
+
+    /// Verifies that cancellation does not release the shared session before
+    /// the detached protocol task reports settlement.
+    #[test]
+    fn fetch_cancellation_keeps_ownership_until_settlement() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+
+        assert!(state.cancel_fetch(fetch.operation_id));
+        assert!(!state.cancel_fetch(fetch.operation_id));
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
+
+        assert_eq!(
+            state.finish_fetch(fetch.operation_id, true, false),
+            FetchCompletion::CancellationRequested
+        );
+        assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
+        state.release_operation(fetch.operation_id);
+        assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn finished_fetch_distinguishes_an_already_released_operation() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+        state.abandon_cursor(1);
+
+        assert_eq!(
+            state.finish_fetch(fetch.operation_id, true, false),
+            FetchCompletion::NoLongerActive
+        );
     }
 
     #[test]

@@ -4,14 +4,16 @@
 //! Asynchronous row fetching for [`crate::async_cursor::PyAsyncCursor`].
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mssql_tds::connection::tds_client::StatementResult;
 use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::error::{Error, SqlInfoMessage};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use tokio::sync::Mutex;
@@ -20,12 +22,15 @@ use tracing::instrument::WithSubscriber;
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::{InternalError, map_tds_error};
-use crate::async_session::{AsyncConnectionState, ClaimError, CursorId, OperationId};
+use crate::async_session::{
+    AsyncConnectionState, ClaimError, CursorId, FetchCompletion, OperationId,
+};
 use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::row_writer::PyRowWriter;
 
 const FETCH_YIELD_INTERVAL: usize = 256;
 const LIST_MATERIALIZE_CHUNK_SIZE: usize = 256;
+const ATTENTION_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
@@ -148,7 +153,7 @@ impl FetchResources {
     }
 }
 
-/// Marks interrupted row reads as protocol-breaking operations.
+/// Settles session ownership when a fetch task completes or fails.
 struct FetchGuard {
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
@@ -173,14 +178,39 @@ impl FetchGuard {
         }
     }
 
-    fn complete(&mut self, result_set_exhausted: bool, has_open_batch: bool) {
-        self.session_state
-            .finish_fetch(self.operation_id, result_set_exhausted, has_open_batch);
-        self.completed = true;
+    /// Publishes the fetch result only if cancellation has not already won.
+    ///
+    /// Only explicit cancellation leaves the guard armed for ATTENTION
+    /// settlement. An operation already released elsewhere needs no cleanup.
+    fn complete(&mut self, result_set_exhausted: bool, has_open_batch: bool) -> FetchCompletion {
+        let completion = self.session_state.finish_fetch(
+            self.operation_id,
+            result_set_exhausted,
+            has_open_batch,
+        );
+        self.completed = completion != FetchCompletion::CancellationRequested;
+        completion
     }
 
-    fn fail(&mut self, has_open_batch: bool) {
-        if has_open_batch {
+    fn complete_without_protocol_cancellation(
+        &mut self,
+        result_set_exhausted: bool,
+        has_open_batch: bool,
+    ) {
+        match self.complete(result_set_exhausted, has_open_batch) {
+            FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+            FetchCompletion::CancellationRequested => {
+                self.fail(false);
+            }
+        }
+    }
+
+    /// Releases session ownership after a failed fetch.
+    ///
+    /// The connection is marked broken only when the protocol task could not
+    /// prove that it reached a reusable TDS boundary.
+    fn fail(&mut self, break_connection: bool) {
+        if break_connection {
             self.session_state.mark_broken();
         }
         self.session_state.release_operation(self.operation_id);
@@ -198,6 +228,55 @@ impl Drop for FetchGuard {
             );
             self.session_state.mark_broken();
             self.session_state.release_operation(self.operation_id);
+        }
+    }
+}
+
+/// Converts cancellation of a Python awaitable into protocol cancellation.
+///
+/// The TDS work runs in a detached Tokio task so dropping the Python-facing
+/// future cannot abandon a parser mid-token. This guard signals that task to
+/// send ATTENTION while leaving it responsible for settling the session.
+struct FetchCancellationGuard {
+    session_state: Arc<AsyncConnectionState>,
+    operation_id: OperationId,
+    operation: &'static str,
+    dispatch: Option<tracing::Dispatch>,
+    completed: bool,
+}
+
+impl FetchCancellationGuard {
+    /// Arms cancellation tracking around the join of a detached fetch task.
+    fn new(
+        session_state: Arc<AsyncConnectionState>,
+        operation_id: OperationId,
+        operation: &'static str,
+        dispatch: Option<tracing::Dispatch>,
+    ) -> Self {
+        Self {
+            session_state,
+            operation_id,
+            operation,
+            dispatch,
+            completed: false,
+        }
+    }
+
+    /// Disarms cancellation after the detached task has finished settling TDS.
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for FetchCancellationGuard {
+    /// Requests ATTENTION when Python stops waiting before settlement finishes.
+    fn drop(&mut self) {
+        if !self.completed && self.session_state.cancel_fetch(self.operation_id) {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::debug!(
+                "PyAsyncCursor::{}: cancelled; ATTENTION settlement continues in the background",
+                self.operation
+            );
         }
     }
 }
@@ -312,9 +391,34 @@ async fn materialize_list_rows(rows: Vec<PyRowWriter>) -> PyResult<Py<PyAny>> {
 }
 
 fn map_materialization_join_error(error: tokio::task::JoinError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(format!(
-        "Failed to materialize fetched rows: {error}"
-    ))
+    PyRuntimeError::new_err(format!("Failed to materialize fetched rows: {error}"))
+}
+
+/// Runs fetch protocol work in a task that outlives its Python awaitable.
+///
+/// Tokio detaches a spawned task when its join handle is dropped. Keeping the
+/// TDS future inside that task preserves parser state long enough to drain
+/// through DONE_ATTN; the surrounding cancellation guard only signals it.
+async fn run_fetch_in_background<F, T>(
+    future: F,
+    session_state: Arc<AsyncConnectionState>,
+    operation_id: OperationId,
+    operation: &'static str,
+    dispatch: Option<tracing::Dispatch>,
+) -> PyResult<T>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut cancellation_guard =
+        FetchCancellationGuard::new(session_state, operation_id, operation, dispatch);
+    let result = tokio::spawn(future).await;
+    cancellation_guard.complete();
+    result.map_err(|error| {
+        PyRuntimeError::new_err(format!(
+            "PyAsyncCursor.{operation} background task failed: {error}"
+        ))
+    })?
 }
 
 async fn fetch_rows_on_client(client: &mut TdsClient, limit: usize) -> Result<FetchBatch, Error> {
@@ -419,7 +523,9 @@ fn fetch<'py>(
         .map_err(map_claim_error)?;
     let operation_id = claim.operation_id;
     let future_state = session_state.clone();
+    let cancellation_state = session_state.clone();
     let guard_dispatch = dispatch.clone();
+    let cancellation_dispatch = dispatch.clone();
     let materialization_dispatch = dispatch.clone();
 
     let future = async move {
@@ -437,16 +543,17 @@ fn fetch<'py>(
         let mut fetch_guard =
             FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
 
-        let (result, info_messages, has_open_batch) = {
+        let (result, info_messages, has_open_batch, connection_dead) = {
             let mut client = client.lock().await;
             let result = fetch_rows_on_client(&mut client, limit).await;
+            let has_open_batch = client.has_open_batch();
             let info_messages = if matches!(result, Err(Error::SqlServerError { .. })) {
                 client.take_info_messages()
             } else {
                 Vec::new()
             };
-            let has_open_batch = client.has_open_batch();
-            (result, info_messages, has_open_batch)
+            let connection_dead = client.is_connection_dead();
+            (result, info_messages, has_open_batch, connection_dead)
         };
         let read_ms = started.elapsed().as_millis();
 
@@ -455,12 +562,34 @@ fn fetch<'py>(
                 let returned = batch.rows.len();
                 let exhausted = batch.exhausted;
                 record_result_set_status(if exhausted { "exhausted" } else { "ready" });
-                fetch_state.set(if batch.exhausted {
+                let fetch_status = if exhausted {
                     FetchStatus::Exhausted
                 } else {
                     FetchStatus::Ready
-                });
-                fetch_guard.complete(batch.exhausted, has_open_batch);
+                };
+                match fetch_guard.complete(batch.exhausted, has_open_batch) {
+                    FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+                    FetchCompletion::CancellationRequested => {
+                        let (has_open_batch, connection_dead) = {
+                            let mut client = client.lock().await;
+                            if client.has_open_batch() {
+                                let _ = client
+                                    .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
+                                    .await;
+                            }
+                            (client.has_open_batch(), client.is_connection_dead())
+                        };
+                        fetch_guard.fail(has_open_batch || connection_dead);
+                        fetch_state.set(FetchStatus::NoResultSet);
+                        return Err(map_fetch_error(
+                            operation,
+                            Error::OperationCancelledError("Fetch was cancelled".to_string()),
+                            Vec::new(),
+                            started.elapsed().as_millis(),
+                        ));
+                    }
+                }
+                fetch_state.set(fetch_status);
                 let materialization_started = Instant::now();
                 let mut materialization_guard =
                     MaterializationGuard::new(operation, materialization_dispatch);
@@ -497,7 +626,7 @@ fn fetch<'py>(
             }
             Err(error) => {
                 record_result_set_status("error");
-                fetch_guard.fail(has_open_batch);
+                fetch_guard.fail(has_open_batch || connection_dead);
                 fetch_state.set(FetchStatus::NoResultSet);
                 Err(map_fetch_error(
                     operation,
@@ -515,6 +644,13 @@ fn fetch<'py>(
             None => future.await,
         }
     };
+    let future = run_fetch_in_background(
+        future,
+        cancellation_state,
+        operation_id,
+        operation,
+        cancellation_dispatch,
+    );
 
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
@@ -562,7 +698,7 @@ fn fetch_buffered<'py>(
         } else {
             FetchStatus::Ready
         });
-        fetch_guard.complete(exhausted, !exhausted || has_next);
+        fetch_guard.complete_without_protocol_cancellation(exhausted, !exhausted || has_next);
         let returned = rows.len();
         let rows = materialize_rows(output, rows).await?;
         let elapsed_ms = started.elapsed().as_millis();
@@ -689,11 +825,13 @@ pub(crate) fn nextset<'py>(
     };
     let operation_id = claim.operation_id;
     let future_state = session_state.clone();
+    let cancellation_state = session_state.clone();
     let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
     let previous_description = description_state.replace(None);
     let future_fetch_state = fetch_state.clone();
     let future_description_state = description_state.clone();
     let guard_dispatch = dispatch.clone();
+    let cancellation_dispatch = dispatch.clone();
 
     let future = async move {
         let started = Instant::now();
@@ -702,19 +840,25 @@ pub(crate) fn nextset<'py>(
         let mut fetch_guard =
             FetchGuard::new(future_state, operation_id, "nextset", guard_dispatch);
 
-        let (result, info_messages, has_open_batch) = {
+        let (result, info_messages, has_open_batch, connection_dead) = {
             let mut client = client.lock().await;
             let result = client.advance().await.map(|result| {
                 let metadata =
                     matches!(result, StatementResult::Rows).then(|| client.get_metadata().clone());
                 (result, metadata)
             });
+            let has_open_batch = client.has_open_batch();
             let info_messages = if matches!(result, Err(Error::SqlServerError { .. })) {
                 client.take_info_messages()
             } else {
                 Vec::new()
             };
-            (result, info_messages, client.has_open_batch())
+            (
+                result,
+                info_messages,
+                has_open_batch,
+                client.is_connection_dead(),
+            )
         };
         let read_ms = started.elapsed().as_millis();
 
@@ -742,12 +886,39 @@ pub(crate) fn nextset<'py>(
                 };
 
                 let materialization_started = Instant::now();
-                match materialize(metadata).await {
+                let materialized = materialize(metadata).await;
+                // Description conversion does not consume a row result. Keep
+                // cursor ownership so a later nextset can drain those rows.
+                match fetch_guard.complete(!has_rows, has_open_batch) {
+                    FetchCompletion::Published | FetchCompletion::NoLongerActive => {}
+                    FetchCompletion::CancellationRequested => {
+                        let (has_open_batch, connection_dead) = {
+                            let mut client = client.lock().await;
+                            if client.has_open_batch() {
+                                let _ = client
+                                    .send_attention_with_timeout(ATTENTION_SETTLEMENT_TIMEOUT)
+                                    .await;
+                            }
+                            (client.has_open_batch(), client.is_connection_dead())
+                        };
+                        fetch_guard.fail(has_open_batch || connection_dead);
+                        future_fetch_state.set(FetchStatus::NoResultSet);
+                        future_description_state.replace(None);
+                        return Err(map_nextset_error(
+                            Error::OperationCancelledError(
+                                "Result-set advance was cancelled".to_string(),
+                            ),
+                            Vec::new(),
+                            started.elapsed().as_millis(),
+                        ));
+                    }
+                }
+
+                match materialized {
                     Ok(description) => {
                         future_description_state.replace(description);
                         future_fetch_state.set(next_fetch_status);
                         rowcount.store(next_rowcount, Ordering::Release);
-                        fetch_guard.complete(!has_rows, has_open_batch);
                         tracing::debug!(
                             "PyAsyncCursor::nextset: completed; has_result={has_result}; has_rows={has_rows}; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}",
                             started.elapsed().as_millis(),
@@ -760,7 +931,6 @@ pub(crate) fn nextset<'py>(
                     }
                     Err(error) => {
                         future_fetch_state.set(FetchStatus::NoResultSet);
-                        fetch_guard.complete(true, has_open_batch);
                         tracing::error!(
                             "PyAsyncCursor::nextset: description materialization failed; column_count={column_count}; elapsed_ms={}; read_ms={read_ms}; materialization_ms={}; error={error}",
                             started.elapsed().as_millis(),
@@ -774,7 +944,7 @@ pub(crate) fn nextset<'py>(
             }
             Err(error) => {
                 record_result_set_status("error");
-                fetch_guard.fail(has_open_batch);
+                fetch_guard.fail(has_open_batch || connection_dead);
                 future_fetch_state.set(FetchStatus::NoResultSet);
                 Err(map_nextset_error(error, info_messages, read_ms))
             }
@@ -787,6 +957,13 @@ pub(crate) fn nextset<'py>(
             None => future.await,
         }
     };
+    let future = run_fetch_in_background(
+        future,
+        cancellation_state,
+        operation_id,
+        "nextset",
+        cancellation_dispatch,
+    );
 
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
@@ -851,7 +1028,7 @@ fn next_buffered_set<'py>(
         } else {
             FetchStatus::Exhausted
         });
-        fetch_guard.complete(true, has_result);
+        fetch_guard.complete_without_protocol_cancellation(true, has_result);
         Ok(has_result)
     };
     let future = in_cursor_operation_span(future, cursor_id, operation_id, "nextset", "advancing");
@@ -883,7 +1060,9 @@ mod tests {
         map_nextset_error,
     };
     use crate::async_fetch::BufferedResults;
-    use crate::async_session::{AsyncConnectionState, ClaimError, ConnectionLifecycle};
+    use crate::async_session::{
+        AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion,
+    };
 
     fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64) {
         let state = Arc::new(AsyncConnectionState::new());
@@ -924,6 +1103,36 @@ mod tests {
 
         assert_eq!(state.lifecycle(), ConnectionLifecycle::Broken);
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Broken);
+    }
+
+    #[test]
+    fn completing_a_fetch_that_no_longer_owns_the_session_disarms_its_guard() {
+        let (state, operation_id) = claimed_fetch();
+        state.release_operation(operation_id);
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
+
+        assert_eq!(guard.complete(false, true), FetchCompletion::NoLongerActive);
+        assert!(guard.completed);
+        drop(guard);
+
+        assert_eq!(state.lifecycle(), ConnectionLifecycle::Open);
+        assert!(state.claim_execute(2).is_ok());
+    }
+
+    #[test]
+    fn cancelled_fetch_keeps_its_guard_armed_until_settlement() {
+        let (state, operation_id) = claimed_fetch();
+        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
+        assert!(state.cancel_fetch(operation_id));
+
+        assert_eq!(
+            guard.complete(false, true),
+            FetchCompletion::CancellationRequested
+        );
+        assert!(!guard.completed);
+
+        guard.fail(false);
+        assert!(state.claim_execute(2).is_ok());
     }
 
     #[test]
