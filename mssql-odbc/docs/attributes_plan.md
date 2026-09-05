@@ -98,11 +98,15 @@ implemented returns `HYC00`.
 
 AB#47819 accepts and preserves every positive `SQL_ATTR_PARAMSET_SIZE` so
 applications can configure the complete parameter-array layout. Until AB#47820
-iterates those rows, `SQLExecute` and `SQLExecDirect` return `HYC00` whenever
-the size exceeds one, before reading application value buffers. The prepared
-path also leaves its plan in place for retry. This is a temporary execution gap,
-not an attribute rejection: reporting success would execute only row zero and
-silently discard the rest of mssql-python's batch.
+iterates those rows, parameterized `SQLExecute` and `SQLExecDirect` calls return
+`HYC00` when the size exceeds one, before reading application value buffers.
+Parameterless statements continue normally because they have no array rows to
+discard. The prepared path also leaves its plan in place for retry. This is a
+temporary execution gap, not an attribute rejection: reporting success for a
+parameterized statement would execute only row zero and silently discard the
+rest of mssql-python's batch. `SQL_ATTR_PARAMS_PROCESSED_PTR` and
+`SQL_ATTR_PARAM_STATUS_PTR` remain stored-only in AB#47819; AB#47820 owns
+writing aggregate and per-row outcomes once row execution exists.
 
 ---
 

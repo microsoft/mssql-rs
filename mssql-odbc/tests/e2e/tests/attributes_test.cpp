@@ -73,6 +73,7 @@
 //   46f.ParamsetSizeIsIsolatedPerStatement             - no handle state bleed
 //   46g.ParamsetSizeSurvivesResetParams                - statement attribute lifetime
 //   46h.ParamsetSizeAboveOneBlocksExecuteUntilP2        - never drop rows silently
+//   46i.ParameterlessStatementsIgnoreParamsetSize       - no array without markers
 //
 // SQL Server vendor statement attributes (SQL_SOPT_SS_*):
 //   47. VendorStatementAttributeDefaultsMatchMsodbcsql - four defaults are not 0
@@ -1481,6 +1482,39 @@ TEST_F(AttributesTest, ParamsetSizeAboveOneBlocksExecuteUntilP2) {
 
     ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 1));
     EXPECT_EQ(1, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
+}
+
+// -------------------------------------------------------------------
+// 46i. PARAMSET_SIZE describes arrays of bound parameter values. A statement
+// with no markers has no array rows to iterate, so a size above one must not
+// turn an otherwise valid prepared or direct statement into HYC00.
+// -------------------------------------------------------------------
+TEST_F(AttributesTest, ParameterlessStatementsIgnoreParamsetSize) {
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 2));
+
+    SqlTString directSql = ODBCTestUtils::ToSqlTStr("SELECT 41");
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, directSql.data(), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER value = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value),
+                             &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(41, value);
+    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+
+    SqlTString preparedSql = ODBCTestUtils::ToSqlTStr("SELECT 42");
+    ASSERT_SQL_OK(SQLPrepare(stmt_, preparedSql.data(), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    value = 0;
+    indicator = 0;
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value),
+                             &indicator),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(42, value);
 }
 
 // -------------------------------------------------------------------

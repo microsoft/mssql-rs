@@ -62,7 +62,6 @@ pub(crate) struct BoundParam {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Returned by the row execution loop in AB#47820.
 pub(crate) enum ParamArrayLayoutError {
-    RowWiseBinding(SqlULen),
     InvalidValueStride {
         c_type: SqlSmallInt,
         buffer_length: SqlLen,
@@ -77,7 +76,7 @@ impl BoundParam {
     /// binding across a buffer without rebinding it. A null pointer stays
     /// null — the offset addresses a buffer that was never supplied, and
     /// offsetting null would turn "no indicator" into a wild pointer.
-    pub(crate) fn with_bind_offset(mut self, offset: isize) -> Self {
+    fn with_bind_offset(mut self, offset: isize) -> Self {
         if offset == 0 {
             return self;
         }
@@ -93,11 +92,13 @@ impl BoundParam {
         self
     }
 
-    /// Returns this column-wise binding positioned at `row` without mutating
-    /// the descriptor-derived snapshot.
+    /// Returns this binding positioned at `row` without mutating the
+    /// descriptor-derived snapshot.
     ///
-    /// The global bind offset is applied first, then the value buffer advances
-    /// by its C-type stride and each indicator buffer by one `SQLLEN` per row.
+    /// The global bind offset applies to every pointer. Column-wise value
+    /// buffers then advance by their C-type stride and indicator buffers by
+    /// one `SQLLEN`; row-wise buffers all advance by the application-supplied
+    /// structure size in `param_bind_type`.
     /// Pointer arithmetic is wrapping because ODBC makes the application
     /// responsible for supplying a live array of the declared shape; wrapping
     /// here avoids a Rust arithmetic panic without weakening that contract.
@@ -108,19 +109,24 @@ impl BoundParam {
         bind_offset: isize,
         param_bind_type: SqlULen,
     ) -> Result<Self, ParamArrayLayoutError> {
-        if param_bind_type != SQL_BIND_BY_COLUMN {
-            return Err(ParamArrayLayoutError::RowWiseBinding(param_bind_type));
-        }
-        let Some(value_stride) = parameter_value_stride(self.c_type, self.buffer_length) else {
-            return Err(ParamArrayLayoutError::InvalidValueStride {
-                c_type: self.c_type,
-                buffer_length: self.buffer_length,
-            });
-        };
-
         let mut positioned = self.with_bind_offset(bind_offset);
+        if row == 0 {
+            return Ok(positioned);
+        }
+        let (value_stride, indicator_stride) = if param_bind_type == SQL_BIND_BY_COLUMN {
+            let Some(value_stride) = parameter_value_stride(self.c_type, self.buffer_length) else {
+                return Err(ParamArrayLayoutError::InvalidValueStride {
+                    c_type: self.c_type,
+                    buffer_length: self.buffer_length,
+                });
+            };
+            (value_stride, std::mem::size_of::<SqlLen>())
+        } else {
+            let row_stride = param_bind_type;
+            (row_stride, row_stride)
+        };
         let value_offset = row.wrapping_mul(value_stride);
-        let indicator_offset = row.wrapping_mul(std::mem::size_of::<SqlLen>());
+        let indicator_offset = row.wrapping_mul(indicator_stride);
         if !positioned.parameter_value_ptr.is_null() {
             positioned.parameter_value_ptr = positioned
                 .parameter_value_ptr
@@ -359,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn array_row_applies_bind_offset_before_variable_width_stride() {
+    fn array_row_combines_bind_offset_with_variable_width_stride() {
         let mut buf = [0u8; 40];
         let mut indicators = [0 as SqlLen; 4];
         let original = param(buf.as_mut_ptr().cast(), indicators.as_mut_ptr());
@@ -518,22 +524,42 @@ mod tests {
     }
 
     #[test]
-    fn array_row_rejects_row_wise_binding() {
-        let err = param(std::ptr::null_mut(), std::ptr::null_mut())
-            .for_row(0, 0, 64)
-            .expect_err("row-wise arrays are outside P1 scope");
-        assert_eq!(err, ParamArrayLayoutError::RowWiseBinding(64));
+    fn array_row_uses_structure_size_for_row_wise_pointers() {
+        let mut storage = [0u8; 96];
+        let value = storage.as_mut_ptr().cast();
+        let indicator = storage.as_mut_ptr().wrapping_add(8).cast();
+        let octet_length = storage.as_mut_ptr().wrapping_add(16).cast();
+        let mut original = param(value, indicator);
+        original.octet_length_ptr = octet_length;
+
+        let positioned = original
+            .for_row(2, 3, 32)
+            .expect("row-wise layout uses the declared structure size");
+
+        assert_eq!(positioned.parameter_value_ptr as usize, value as usize + 67);
+        assert_eq!(
+            positioned.strlen_or_ind_ptr as usize,
+            indicator as usize + 67
+        );
+        assert_eq!(
+            positioned.octet_length_ptr as usize,
+            octet_length as usize + 67
+        );
     }
 
     #[test]
-    fn array_row_rejects_row_wise_layout_before_inspecting_value_stride() {
-        let mut bound = param(std::ptr::null_mut(), std::ptr::null_mut());
+    fn row_wise_layout_does_not_require_a_c_type_stride() {
+        let mut storage = [0u8; 64];
+        let mut bound = param(storage.as_mut_ptr().cast(), std::ptr::null_mut());
         bound.c_type = SQL_C_DEFAULT;
+
+        let positioned = bound
+            .for_row(2, 0, 24)
+            .expect("row-wise layout uses only the structure size");
+
         assert_eq!(
-            bound
-                .for_row(0, 0, 32)
-                .expect_err("row-wise layout is outside P1 scope"),
-            ParamArrayLayoutError::RowWiseBinding(32)
+            positioned.parameter_value_ptr as usize,
+            bound.parameter_value_ptr as usize + 48
         );
     }
 
@@ -543,7 +569,7 @@ mod tests {
         bound.c_type = SQL_C_DEFAULT;
         assert_eq!(
             bound
-                .for_row(0, 0, SQL_BIND_BY_COLUMN)
+                .for_row(1, 0, SQL_BIND_BY_COLUMN)
                 .expect_err("an unresolved C type has no value stride"),
             ParamArrayLayoutError::InvalidValueStride {
                 c_type: SQL_C_DEFAULT,
@@ -558,7 +584,7 @@ mod tests {
         bound.buffer_length = -1;
         assert_eq!(
             bound
-                .for_row(0, 0, SQL_BIND_BY_COLUMN)
+                .for_row(1, 0, SQL_BIND_BY_COLUMN)
                 .expect_err("a negative variable width has no valid array stride"),
             ParamArrayLayoutError::InvalidValueStride {
                 c_type: SQL_C_CHAR,

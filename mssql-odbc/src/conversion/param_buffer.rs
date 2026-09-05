@@ -12,14 +12,14 @@ use std::slice;
 use super::datetime::DateTimeParts;
 use super::param_convert::ParamBuildError;
 use crate::api::odbc_types::{
-    SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG,
-    SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2,
-    SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SS_VECTOR, SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TINYINT,
-    SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG,
-    SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM,
-    SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NTS, SQL_NULL_DATA, SqlDateStruct, SqlGuid, SqlLen,
-    SqlNumericStruct, SqlPointer, SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct,
-    SqlTimeStruct, SqlTimestampStruct,
+    SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID,
+    SQL_C_INTERVAL_MINUTE_TO_SECOND, SQL_C_INTERVAL_YEAR, SQL_C_LONG, SQL_C_NUMERIC, SQL_C_SBIGINT,
+    SQL_C_SHORT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SS_VECTOR,
+    SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
+    SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR,
+    SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NTS, SQL_NULL_DATA,
+    SqlDateStruct, SqlGuid, SqlLen, SqlNumericStruct, SqlPointer, SqlSmallInt, SqlSsTime2Struct,
+    SqlSsTimestampoffsetStruct, SqlTimeStruct, SqlTimestampStruct,
 };
 use crate::api::type_rules::effective_param_c_type;
 use crate::params::BoundParam;
@@ -61,18 +61,19 @@ pub(crate) enum AppValue {
 
 /// Byte stride between consecutive values in a column-wise parameter array.
 ///
-/// ODBC ignores `BufferLength` for fixed-width C types. Character and binary
-/// values use it as the size of one array slot, matching msodbcsql's
+/// ODBC ignores `BufferLength` for most fixed-width C types. Character,
+/// binary, and SQL Server temporal values use it as the size of one array
+/// slot, matching msodbcsql's
 /// `BindOffset` default of `dwOffset = lpbindinfo->cbValueMax`
-/// (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp:2280-2283`). This driver's vector ABI
-/// also uses `BufferLength`: one slot is its contiguous header plus element
-/// payload. Zero deliberately makes every row address the same value buffer; a
-/// negative width has no usable stride. `c_type` must already be resolved from
-/// `SQL_C_DEFAULT` by the binding path.
+/// (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp:2280-2283`). Zero therefore makes
+/// every row address the same value buffer; a negative width has no usable
+/// stride. `SQL_C_SS_VECTOR` is intentionally absent until AB#47790 defines
+/// this driver's application-buffer ABI. `c_type` must already be resolved
+/// from `SQL_C_DEFAULT` by the binding path.
 #[allow(dead_code)] // Consumed by parameter-array execution in AB#47820.
 pub(crate) fn parameter_value_stride(c_type: SqlSmallInt, buffer_length: SqlLen) -> Option<usize> {
     let width = match c_type {
-        SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY | SQL_C_SS_VECTOR => {
+        SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY | SQL_C_SS_TIME2 | SQL_C_SS_TIMESTAMPOFFSET => {
             return usize::try_from(buffer_length).ok();
         }
         SQL_C_BIT | SQL_C_TINYINT | SQL_C_UTINYINT => std::mem::size_of::<u8>(),
@@ -88,10 +89,9 @@ pub(crate) fn parameter_value_stride(c_type: SqlSmallInt, buffer_length: SqlLen)
         SQL_C_TYPE_DATE => std::mem::size_of::<SqlDateStruct>(),
         SQL_C_TYPE_TIME => std::mem::size_of::<SqlTimeStruct>(),
         SQL_C_TYPE_TIMESTAMP => std::mem::size_of::<SqlTimestampStruct>(),
-        SQL_C_SS_TIME2 => std::mem::size_of::<SqlSsTime2Struct>(),
-        SQL_C_SS_TIMESTAMPOFFSET => std::mem::size_of::<SqlSsTimestampoffsetStruct>(),
         SQL_C_GUID => std::mem::size_of::<SqlGuid>(),
         SQL_C_NUMERIC => std::mem::size_of::<SqlNumericStruct>(),
+        SQL_C_INTERVAL_YEAR..=SQL_C_INTERVAL_MINUTE_TO_SECOND => 28,
         _ => return None,
     };
     Some(width)
@@ -422,7 +422,13 @@ mod tests {
 
     #[test]
     fn parameter_array_variable_width_strides_use_buffer_length_bytes() {
-        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY, SQL_C_SS_VECTOR] {
+        for c_type in [
+            SQL_C_CHAR,
+            SQL_C_WCHAR,
+            SQL_C_BINARY,
+            SQL_C_SS_TIME2,
+            SQL_C_SS_TIMESTAMPOFFSET,
+        ] {
             for buffer_length in [0, 1, 7, 2056, 4096] {
                 assert_eq!(
                     parameter_value_stride(c_type, buffer_length),
@@ -438,33 +444,27 @@ mod tests {
     #[test]
     fn parameter_array_fixed_width_strides_ignore_buffer_length() {
         let cases = [
-            (SQL_C_BIT, std::mem::size_of::<u8>()),
-            (SQL_C_STINYINT, std::mem::size_of::<i8>()),
-            (SQL_C_TINYINT, std::mem::size_of::<i8>()),
-            (SQL_C_UTINYINT, std::mem::size_of::<u8>()),
-            (SQL_C_SHORT, std::mem::size_of::<i16>()),
-            (SQL_C_SSHORT, std::mem::size_of::<i16>()),
-            (SQL_C_USHORT, std::mem::size_of::<u16>()),
-            (SQL_C_LONG, std::mem::size_of::<i32>()),
-            (SQL_C_SLONG, std::mem::size_of::<i32>()),
-            (SQL_C_ULONG, std::mem::size_of::<u32>()),
-            (SQL_C_SBIGINT, std::mem::size_of::<i64>()),
-            (SQL_C_UBIGINT, std::mem::size_of::<u64>()),
-            (SQL_C_FLOAT, std::mem::size_of::<f32>()),
-            (SQL_C_DOUBLE, std::mem::size_of::<f64>()),
-            (SQL_C_TYPE_DATE, std::mem::size_of::<SqlDateStruct>()),
-            (SQL_C_TYPE_TIME, std::mem::size_of::<SqlTimeStruct>()),
-            (
-                SQL_C_TYPE_TIMESTAMP,
-                std::mem::size_of::<SqlTimestampStruct>(),
-            ),
-            (SQL_C_SS_TIME2, std::mem::size_of::<SqlSsTime2Struct>()),
-            (
-                SQL_C_SS_TIMESTAMPOFFSET,
-                std::mem::size_of::<SqlSsTimestampoffsetStruct>(),
-            ),
-            (SQL_C_GUID, std::mem::size_of::<SqlGuid>()),
-            (SQL_C_NUMERIC, std::mem::size_of::<SqlNumericStruct>()),
+            (SQL_C_BIT, 1),
+            (SQL_C_STINYINT, 1),
+            (SQL_C_TINYINT, 1),
+            (SQL_C_UTINYINT, 1),
+            (SQL_C_SHORT, 2),
+            (SQL_C_SSHORT, 2),
+            (SQL_C_USHORT, 2),
+            (SQL_C_LONG, 4),
+            (SQL_C_SLONG, 4),
+            (SQL_C_ULONG, 4),
+            (SQL_C_SBIGINT, 8),
+            (SQL_C_UBIGINT, 8),
+            (SQL_C_FLOAT, 4),
+            (SQL_C_DOUBLE, 8),
+            (SQL_C_TYPE_DATE, 6),
+            (SQL_C_TYPE_TIME, 6),
+            (SQL_C_TYPE_TIMESTAMP, 16),
+            (SQL_C_GUID, 16),
+            (SQL_C_NUMERIC, 19),
+            (SQL_C_INTERVAL_YEAR, 28),
+            (SQL_C_INTERVAL_MINUTE_TO_SECOND, 28),
         ];
 
         for (c_type, expected) in cases {
@@ -479,8 +479,21 @@ mod tests {
     }
 
     #[test]
+    fn every_interval_c_type_uses_the_sql_interval_struct_width() {
+        for c_type in SQL_C_INTERVAL_YEAR..=SQL_C_INTERVAL_MINUTE_TO_SECOND {
+            assert_eq!(parameter_value_stride(c_type, 0), Some(28));
+        }
+    }
+
+    #[test]
     fn parameter_array_stride_rejects_unresolved_or_unknown_c_types() {
-        for c_type in [SQL_C_DEFAULT, 0, SqlSmallInt::MIN, SqlSmallInt::MAX] {
+        for c_type in [
+            SQL_C_DEFAULT,
+            SQL_C_SS_VECTOR,
+            0,
+            SqlSmallInt::MIN,
+            SqlSmallInt::MAX,
+        ] {
             assert_eq!(parameter_value_stride(c_type, 8), None, "C type {c_type}");
         }
     }

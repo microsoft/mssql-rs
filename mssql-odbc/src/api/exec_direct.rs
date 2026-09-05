@@ -149,7 +149,8 @@ fn sql_exec_direct_w_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
-        if stmt_state.paramset_size > 1 {
+        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        if marker_count > 0 && stmt_state.paramset_size > 1 {
             error!(
                 paramset_size = stmt_state.paramset_size,
                 "SQLExecDirectW: parameter-array execution is not implemented"
@@ -161,7 +162,6 @@ fn sql_exec_direct_w_safe(
         // Rewrite markers and read the bound parameter buffers before mutating
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
-        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
         let named_params =
             match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
                 Ok(params) => params,
@@ -340,6 +340,22 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
     }
 
+    #[test]
+    fn parameterless_array_execute_reaches_the_connection() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().paramset_size = 2;
+
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".to_string());
+
+        assert_eq!(ret, SQL_ERROR);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
+    }
+
     /// A statement awaiting `SQLPutData` is in the Need Data state, where the
     /// spec calls anything but SQLPutData/SQLParamData/SQLCancel a sequence
     /// error. Without the dedicated guard this falls through to the
@@ -496,7 +512,7 @@ mod tests {
                 .push(crate::error::DiagRecord::new(SQLSTATE_07002, 0, "stale"));
         }
 
-        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT 1".to_string());
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "SELECT ?".to_string());
         assert_eq!(ret, SQL_ERROR);
 
         let state = stmt.inner.lock().unwrap();
