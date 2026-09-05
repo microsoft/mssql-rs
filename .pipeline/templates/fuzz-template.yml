@@ -80,6 +80,21 @@ steps:
         echo "Crash files:"
         find artifacts/${{ parameters.fuzzTarget }} -type f -name "crash-*" -exec basename {} \;
         
+        # Emit crash inputs inline as base64 so they can be reproduced from the
+        # build log alone. The published artifact is not always reachable:
+        # downloads can be auth-restricted and retention expires, after which the
+        # crash filename (a SHA1) is not enough to recreate the input.
+        echo "Crash inputs (base64):"
+        find artifacts/${{ parameters.fuzzTarget }} -type f -name "crash-*" | while read -r CRASH; do
+          SIZE=$(wc -c < "$CRASH")
+          echo "----- $(basename "$CRASH") ($SIZE bytes) -----"
+          if [ "$SIZE" -le 4096 ]; then
+            base64 "$CRASH"
+          else
+            echo "(input larger than 4096 bytes; download the published artifact to reproduce)"
+          fi
+        done
+        
         # Set variable to indicate crashes were found
         echo "##vso[task.setvariable variable=FuzzCrashesFound]true"
       else
