@@ -10,6 +10,7 @@ pub(crate) use dbc::DbcHandle;
 pub(crate) use desc::DescHandle;
 pub(crate) use env::EnvHandle;
 pub(crate) use env::OdbcVersion;
+pub(crate) use env::process_is_shutting_down;
 pub(crate) use stmt::StmtHandle;
 
 use std::collections::HashMap;
