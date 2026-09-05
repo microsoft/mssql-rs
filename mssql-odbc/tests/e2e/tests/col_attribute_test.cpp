@@ -26,12 +26,12 @@
 //   19. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
-//   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   23. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
-//   24. Odbc2TemporalVariantTypes          - legacy codes and SS binary fallback
-//   25. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
-//   26. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
-//   27. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
+//   22. Odbc2TemporalVariantTypes          - legacy codes and SS binary fallback
+//   23. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
+//   24. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
+//   25. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
+//   26. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
+//   27. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
 //   28. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
 //   29. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
 //   30. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
@@ -710,6 +710,7 @@ TEST_F(ColAttributeLiveTest, VariantExactNumericsReportNumeric) {
         SQLCloseCursor(stmt_);
     }
 }
+
 // Reporting SQL_C_NUMERIC describes the value, not the delivery path: the
 // character fetch that mssql-python actually performs after reading the
 // attribute has to keep working, digits intact. Compared against msodbcsql,
@@ -788,4 +789,3 @@ TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
         SQLCloseCursor(stmt_);
     }
 }
-
