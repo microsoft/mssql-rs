@@ -806,7 +806,6 @@ fn fetch_scroll_safe(
     // fetch on the same statement, so the snapshot cannot go stale under us.
     let (
         ard,
-        ard_is_explicit,
         row_array_size,
         rows_fetched_ptr,
         row_status_ptr,
@@ -894,7 +893,6 @@ fn fetch_scroll_safe(
         // "Locking rules": a STMT lock must never be held while acquiring a
         // DESC lock.
         let ard = stmt_state.effective_ard(stmt);
-        let ard_is_explicit = stmt_state.active_ard.is_some();
         // Claiming the statement here is what stops a concurrent SQLBindCol
         // from freeing an application buffer the fill loop is still reading
         // through after this lock is released; the mutating entry points
@@ -907,7 +905,6 @@ fn fetch_scroll_safe(
             == Some(PlpEncoding::Utf16Text);
         (
             ard,
-            ard_is_explicit,
             stmt_state.row_array_size,
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
@@ -927,14 +924,13 @@ fn fetch_scroll_safe(
     // as "nothing bound" would advance the cursor and report success for a
     // rowset the application never actually got the columns it asked for.
     let mut bindings: Vec<ColumnBinding> = {
-        // `ard` can be an explicit descriptor resolved under the STMT lock,
-        // already dropped by now — re-check liveness right before
-        // dereferencing to narrow (not fully close) the race against a
-        // concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` on that same
-        // descriptor.
-        if ard_is_explicit
-            && crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc)
-        {
+        // `ard` was resolved under the STMT lock and may already be dropped by
+        // now — re-check liveness right before dereferencing to narrow (not
+        // fully close) the race against a concurrent
+        // `SQLFreeHandle(SQL_HANDLE_DESC)` on an explicit descriptor, or a
+        // `SQLDisconnect` that frees the statement along with the four
+        // implicit descriptors it owns.
+        if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
             error!("SQLFetchScroll: ard freed concurrently; failing the fetch");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
                 stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
