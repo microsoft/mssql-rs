@@ -699,17 +699,15 @@ Two behaviours are ours to justify rather than copy:
   the ceiling turns that into `22001` at bind here rather than a server error
   one call later - both refuse, only the diagnostic differs
   (`a_variant_payload_past_the_wide_ceiling_is_truncation`).
-  A **narrow** payload cannot reach the wire at all yet, because `mssql-tds`
-  hard-codes the variant's inner context to `NVARCHAR` and
-  sizes it as UTF-16, so five UTF-8 bytes are rejected as exceeding a schema
-  size of two. The matrix therefore admits `SQL_SS_VARIANT` only from
-  `SQL_C_WCHAR`, which leaves the defaulted path short of msodbcsql:
-  `SQL_C_DEFAULT` resolves `SQL_SS_VARIANT` to `SQL_C_CHAR`, so an ordinary
-  defaulted variant binding is `HYC00` at bind rather than executing. Chosen
-  over admitting a pairing that cannot execute, and lifted when AB#47800 lands.
+  A **narrow** payload reaches the wire too (`AB#47800`): `mssql-tds` now
+  resolves the variant's inner base type and byte length from `SqlString`'s
+  own encoding instead of assuming every string is `NVARCHAR`/UTF-16, so the
+  matrix admits `SQL_SS_VARIANT` from `SQL_C_CHAR` as well as `SQL_C_WCHAR`,
+  matching msodbcsql's defaulted path: `SQL_C_DEFAULT` resolves
+  `SQL_SS_VARIANT` to `SQL_C_CHAR`, and an ordinary defaulted variant binding
+  now executes instead of failing `HYC00` at bind.
   `VariantParamWrapsItsInnerType` and
-  `VariantWithNoColumnSizeIsNotAMaxType` are skipped against AB#47800; both
-  pass on msodbcsql.
+  `VariantWithNoColumnSizeIsNotAMaxType` cover it and pass on both legs.
 - **`SQL_C_GUID` resolves from `SQL_GUID`**, per the ODBC 3.x default-C-type
   table; msodbcsql's `rgbTRANSTYPE380` says `SQL_C_CHAR`. The deviation already
   registered for the wide character types.
@@ -799,11 +797,15 @@ role `Convert()`'s dispatch switch plays - not a legality table.
   data-at-execution value in either family (AB#47590).
 - **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
   parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
-- **`mssql-tds` gaps found by P8:** a `sql_variant` cannot carry a `varchar`
-  payload - `get_variant_base_type` and `create_variant_inner_context` assume
-  every `ColumnValues::String` is UTF-16. AB#47800. The other half is closed
-  here: `write_variant_type_info` and `calculate_type_info_length` answered an
-  unhandled base type with `unreachable!` and now return `ProtocolError`.
+- **`mssql-tds` gap found by P8, closed by AB#47800:** a `sql_variant` could not
+  carry a `varchar` payload - `get_variant_base_type` and
+  `create_variant_inner_context` assumed every `ColumnValues::String` was
+  UTF-16. Both now resolve the base type and byte length from `SqlString`'s
+  own encoding, transcoding a narrow value's final wire bytes once and reusing
+  them for every length field and the data write, so a declared length can no
+  longer disagree with what is actually sent. The other half landed with P8
+  itself: `write_variant_type_info` and `calculate_type_info_length` answered
+  an unhandled base type with `unreachable!` and now return `ProtocolError`.
 - **Data-at-exec follow-ups:** `SQLParamData` / `SQLPutData` are implemented for
   both `SQLPrepare` + `SQLExecute` and `SQLExecDirect` (see the
   delivered-features list above and `data-at-execution-streaming.md`), and a

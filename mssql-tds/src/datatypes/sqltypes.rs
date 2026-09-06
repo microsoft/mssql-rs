@@ -1278,7 +1278,7 @@ mod variant_tests {
 
     use crate::{
         datatypes::{
-            sql_string::SqlString,
+            sql_string::{EncodingType, SqlString},
             sqldatatypes::TdsDataType,
             sqltypes::{SQL_VARIANT_MAX_LENGTH, SqlType},
         },
@@ -1363,6 +1363,81 @@ mod variant_tests {
         assert_eq!(cursor.get_u32_le(), 13);
         assert_eq!(cursor.get_u8(), TdsDataType::NVarChar as u8); // base type
         assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+    }
+
+    #[tokio::test]
+    async fn variant_varchar_writes_narrow_base_type_and_length() {
+        let val = SqlString::new(b"Hi".to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // "Hi" narrow = 2 bytes (vs. 4 bytes for the nvarchar/UTF-16 case above).
+        // total_length = 2 + 7(prop) + 2(data) = 11
+        assert_eq!(cursor.get_u32_le(), 11);
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8); // base type: AB#47800
+        assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 2); // max_length: 2 narrow bytes, not halved as if wide
+        assert_eq!(cursor.chunk(), b"Hi");
+    }
+
+    /// The robust fix for AB#47800: a narrow value whose source (UTF-8) and
+    /// wire (collation codepage) byte lengths differ must declare -- and
+    /// send -- the *wire* length, resolved once and reused everywhere,
+    /// rather than a source length recomputed independently in each place
+    /// that needs a length (which is how the original bug manifested: a
+    /// declared length that disagreed with the bytes actually written).
+    ///
+    /// "café" is 5 UTF-8 bytes (the trailing 'é' is 0xC3 0xA9) but 4 bytes
+    /// under Windows-1252 (LCID 0x0409, this test's collation), where 'é' is
+    /// the single byte 0xE9.
+    #[tokio::test]
+    async fn variant_varchar_declares_the_transcoded_length_not_the_source_length() {
+        let val = SqlString::new("café".as_bytes().to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // total_length = 2 + 7(prop) + 4(data): 4 transcoded bytes, not the 5-byte UTF-8 source.
+        assert_eq!(cursor.get_u32_le(), 13);
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8);
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409);
+        assert_eq!(cursor.get_u8(), 52);
+        assert_eq!(cursor.get_u16_le(), 4); // declared length matches the transcoded bytes
+        assert_eq!(cursor.chunk(), &[b'c', b'a', b'f', 0xE9]); // Windows-1252, not UTF-8
+    }
+
+    /// End-to-end proof for the AB#47800 fix: what the serializer now writes
+    /// for a transcoded narrow value is read back correctly by the existing,
+    /// separately-tested sql_variant decoder -- not just shaped the way a
+    /// hand-written byte assertion expects.
+    #[tokio::test]
+    async fn variant_varchar_round_trips_through_the_decoder() {
+        use crate::datatypes::decoder::GenericDecoder;
+
+        let val = SqlString::new("café".as_bytes().to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        // Skip the RPC TYPE_INFO preamble (1-byte type + 4-byte max length)
+        // this crate writes ahead of every SSVARIANT_INSTANCE.
+        let variant_bytes = &bytes[5..];
+
+        let decoder = GenericDecoder::default();
+        let (base, value, used) = decoder
+            .try_decode_buffered_variant(variant_bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(base, Some(TdsDataType::BigVarChar));
+        assert_eq!(used, variant_bytes.len());
+        let crate::datatypes::column_values::ColumnValues::String(decoded) = value else {
+            panic!("expected string variant");
+        };
+        assert_eq!(decoded.to_utf8_string(), "café");
     }
 
     #[tokio::test]

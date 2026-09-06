@@ -68,8 +68,8 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             INTEGER_SQL_TARGETS,
             DECIMAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
+            &[SQL_SS_VARIANT],
         ],
-        // A narrow `sql_variant` payload cannot be serialized until AB#47800.
         SQL_C_WCHAR => &[
             CHARACTER_SQL_TARGETS,
             INTEGER_SQL_TARGETS,
@@ -254,19 +254,16 @@ mod tests {
     }
 
     /// Character C types reach the non-character payloads that can be serialized.
-    /// The narrow `sql_variant` path remains deferred under AB#47800.
     #[test]
     fn a_character_c_type_reaches_the_types_that_default_to_one() {
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
-            for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML] {
+            for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML, SQL_SS_VARIANT] {
                 assert!(
                     is_supported_conversion(c_type, sql_type),
                     "{c_type} -> {sql_type} should be supported"
                 );
             }
         }
-        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_SS_VARIANT));
-        assert!(is_supported_conversion(SQL_C_WCHAR, SQL_SS_VARIANT));
     }
 
     /// The off-diagonal rows are one-way: a character buffer parses a decimal

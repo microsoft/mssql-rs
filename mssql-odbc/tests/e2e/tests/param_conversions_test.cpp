@@ -1219,13 +1219,11 @@ TEST_F(ScalarConversionLiveTest, XmlParamRoundTrips) {
 // sql_variant wraps the inner declaration rather than declaring itself, so the
 // server reports the inner base type.
 //
-// A narrow payload cannot be sent yet: mssql-tds hard-codes the variant's inner
-// context to NVARCHAR and sizes it as UTF-16, so five UTF-8 bytes are rejected
-// as "String length (5 characters) exceeds schema size (2 characters)".
-// msodbcsql passes both assertions today. AB#47800.
+// Narrow and wide both round-trip correctly: mssql-tds resolves the variant's
+// inner base type and byte length from SqlString's own encoding instead of
+// assuming every string is NVARCHAR/UTF-16 (AB#47800). msodbcsql passes both
+// assertions too.
 TEST_F(ScalarConversionLiveTest, VariantParamWrapsItsInnerType) {
-    GTEST_SKIP() << "sql_variant carries no varchar payload yet - AB#47800";
-
     ASSERT_SQL_OK(Prepare(kBaseTypeQuery), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_VARIANT, "hello", 8), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("varchar", ExecuteAndReadBack());
@@ -1238,21 +1236,16 @@ TEST_F(ScalarConversionLiveTest, VariantParamWrapsItsInnerType) {
 
 // sql_variant cannot hold a max type (server error 529), so ColumnSize 0 is read
 // as "unstated" and declared at the non-max ceiling instead of meaning max the
-// way it does for a plain varchar.
-//
-// Blocked on the same narrow-payload gap as VariantParamWrapsItsInnerType,
-// AB#47800.
+// way it does for a plain varchar. Narrow counterpart to
+// AWideVariantIsNeverAMaxType (AB#47800).
 TEST_F(ScalarConversionLiveTest, VariantWithNoColumnSizeIsNotAMaxType) {
-    GTEST_SKIP() << "sql_variant carries no varchar payload yet - AB#47800";
-
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_VARIANT, "hello"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("hello", ExecuteAndReadBack());
 }
 
-// SQL_C_WCHAR -> SQL_SS_VARIANT is the only variant pairing the matrix admits
-// (AB#47800), and it must never declare a max inner type: sql_variant cannot
-// hold one, so the server answers error 529 at execute rather than a state the
+// A variant must never declare a max inner type: sql_variant cannot hold one,
+// so the server answers error 529 at execute rather than a state the
 // application can act on.
 //
 // ColumnSize 0 means "unstated" here, and anything past the wide ceiling is
