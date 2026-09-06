@@ -15,6 +15,7 @@ pub(crate) use stmt::StmtHandle;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use tracing::{debug, trace};
@@ -73,8 +74,56 @@ pub(crate) enum HandleType {
 /// concurrently being freed on another thread right now" — that TOCTOU
 /// window is the pre-existing, wider concurrent-use race this crate
 /// already documents and does not attempt to close here.
-static LIVE_HANDLES: LazyLock<Mutex<HashMap<usize, HandleType>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LIVE_HANDLES: LazyLock<Mutex<LiveHandleMap>> =
+    LazyLock::new(|| Mutex::new(LiveHandleMap::default()));
+
+/// The registry's map type. Keyed by handle address.
+type LiveHandleMap = HashMap<usize, HandleType, BuildHasherDefault<HandleAddrHasher>>;
+
+/// Hasher for the registry's pointer-sized keys.
+///
+/// `HashMap`'s default `SipHash` is there to keep collision behavior safe
+/// when keys are attacker-chosen. These keys are allocator-chosen addresses
+/// that never cross the FFI boundary as input, so that property buys nothing
+/// here, while its cost lands on every `SQLBindCol`, `SQLFetchScroll` and
+/// `SQLFreeStmt(SQL_UNBIND)` — 17 lookups per row for a row-at-a-time bind
+/// cycle, which is the shape `mssql-python`'s `fetchmany()` produces.
+#[derive(Default)]
+struct HandleAddrHasher(u64);
+
+impl Hasher for HandleAddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    /// The only method that runs for a `usize` key. Handle addresses are
+    /// allocator-aligned, so their low bits are near-constant while `HashMap`
+    /// selects a bucket from exactly those bits. This is MurmurHash3's
+    /// `fmix64` finalizer, which is a bijection on `u64` and so cannot
+    /// introduce collisions of its own; measured across heap- and mmap-shaped
+    /// bases at 8-, 16-, 48- and 64-byte strides it fills 41-43 of 64 buckets,
+    /// matching an ideal random hash, where a bare multiply-and-fold drops to
+    /// 24 and the identity to 1.
+    fn write_usize(&mut self, value: usize) {
+        let mut hash = value as u64;
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        hash ^= hash >> 33;
+        self.0 = hash;
+    }
+
+    /// Unreached today: every key is a `usize`. Implemented as FNV-1a's
+    /// byte-wise mixing step rather than left empty or `unreachable!()`, so
+    /// adding a non-integer key later degrades to a slower hash instead of
+    /// collapsing every entry into one bucket or aborting the process.
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+}
 
 /// Locks `LIVE_HANDLES`, recovering the guard even if the mutex is
 /// poisoned. Its critical sections are a single `HashMap` operation each,
@@ -82,7 +131,7 @@ static LIVE_HANDLES: LazyLock<Mutex<HashMap<usize, HandleType>>> =
 /// and leave the map inconsistent, so there is no invariant recovering
 /// could violate here — only a handle-freeing path that would otherwise
 /// break for the rest of the process over a poisoning that can't happen.
-fn live_handles() -> MutexGuard<'static, HashMap<usize, HandleType>> {
+fn live_handles() -> MutexGuard<'static, LiveHandleMap> {
     LIVE_HANDLES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -179,6 +228,35 @@ pub(crate) trait HasObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry is keyed on allocator addresses, whose low bits are
+    /// near-constant under alignment — and those are exactly the bits
+    /// `HashMap` masks to pick a bucket. Replacing `SipHash` to make lookups
+    /// cheaper is only a win if the replacement still spreads them: a hasher
+    /// that funnels every handle into one bucket turns each lookup into a
+    /// linear scan and is slower than what it replaced. Pins distribution
+    /// across the alignments and base addresses real allocations take.
+    #[test]
+    fn handle_addresses_spread_across_hash_buckets() {
+        fn bucket(address: usize) -> u64 {
+            let mut hasher = HandleAddrHasher::default();
+            hasher.write_usize(address);
+            hasher.finish() & 0x3F
+        }
+
+        for base in [0x5600_0000_0000_usize, 0x7F12_3456_0000, 0x1000] {
+            for stride in [8_usize, 16, 48, 64] {
+                let filled = (0..64)
+                    .map(|i| bucket(base + i * stride))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                assert!(
+                    filled >= 32,
+                    "base {base:#x} stride {stride}: only {filled} of 64 buckets used"
+                );
+            }
+        }
+    }
 
     #[test]
     fn handle_is_live_after_alloc_and_not_after_free() {
