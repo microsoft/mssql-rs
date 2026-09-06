@@ -1319,8 +1319,10 @@ TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
 //
 // A UTF-8 tail buffer lets SQL_C_CHAR make progress one byte at a time without
 // dropping output. A buffer with no payload room remains a probe. The ASCII case
-// runs on the msodbcsql comparison leg because both drivers deliver one byte per
-// call here.
+// deliberately keeps SKIP_IF_COMPARING_MSODBCSQL off so the comparison leg
+// (retail msodbcsql 18.6.2.1, SQL_DRIVER_VER 18.06.0002) measures the parity
+// rather than assuming it: both drivers drain a 2-byte SQL_C_CHAR buffer over
+// nvarchar(max) one byte per call, delivering the whole value without loss.
 //
 // Benefits-from-mock-tds: assert that alternate calls drain the UTF-8 tail
 // without consuming more wire data.
