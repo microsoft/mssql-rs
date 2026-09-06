@@ -11,9 +11,11 @@ makes, or by the unfiltered pass-through surface it exposes (§4.10).
 `SQLSetStmtAttrW` L3508, `SQLGetStmtAttrW` L4186).
 
 **Status:** S1–S4, S5a and S6 are shipped. S5b is the only open slice and is
-tracked by AB#47526. Behavior marked *measured* below was observed by running
-the same `mssql-odbc/tests/e2e/tests/attributes_test.cpp` suite against
-msodbcsql18 and against this driver.
+tracked by AB#47526. `SQL_ATTR_PARAMSET_SIZE` array-bound execution (AB#46576)
+is also delivered — see §4.2.3 and the S4 write-up below. Behavior marked
+*measured* below was observed by running the same
+`mssql-odbc/tests/e2e/tests/attributes_test.cpp` suite against msodbcsql18 and
+against this driver.
 
 ---
 
@@ -31,8 +33,7 @@ those attributes drive — that is already split into sibling stories.
 | `{fn}` / `{ts}` / `{call}` translation when NOSCAN is off | AB#46384 ODBC escape sequences |
 | `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` as attributes | **46377** |
 | Descriptor handle semantics behind them | AB#46374 Descriptors |
-| `SQL_ATTR_PARAMSET_SIZE` accept/store | **46377** |
-| Array-bound `executemany` execution | AB#46576 Batch insert |
+| `SQL_ATTR_PARAMSET_SIZE` accept/store, layout, and array-bound execution | **46377** — delivered, closing AB#46576 |
 | `SQL_ATTR_RESET_CONNECTION`, `SQL_ATTR_CONNECTION_DEAD` | AB#47317 (Closed) |
 | `SQL_ATTR_AUTOCOMMIT`, `SQL_ATTR_TXN_ISOLATION` | AB#46379 (Closed) |
 | Connection-string keyword parsing | AB#46372 (Closed) |
@@ -82,13 +83,14 @@ their measured not-implemented diagnostic; an unknown identifier returns `HY092`
 | `SQL_ATTR_ROW_ARRAY_SIZE` | ✅ | ✅ |
 | `SQL_ATTR_ROWS_FETCHED_PTR` | ✅ | ✅ |
 | `SQL_ATTR_ROW_STATUS_PTR` / `ROW_BIND_TYPE` | ✅ | ✅ |
-| `SQL_ATTR_PARAMSET_SIZE` | ✅ | ✅ |
+| `SQL_ATTR_PARAMSET_SIZE` | ✅ **enforced** | ✅ |
 | `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` | ✅ no-op | ✅ |
 | `SQL_ATTR_IMP_ROW_DESC` / `IMP_PARAM_DESC` | — | ✅ |
 | `SQL_ATTR_MAX_ROWS` | ✅ enforced | ✅ |
 | `SQL_ATTR_MAX_LENGTH`, `NOSCAN`, `RETRIEVE_DATA`, `USE_BOOKMARKS` | ✅ | ✅ |
 | `SQL_ATTR_PARAM_BIND_OFFSET_PTR` | ✅ enforced | ✅ |
-| `SQL_ATTR_PARAM_BIND_TYPE`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`, `ROW_BIND_OFFSET_PTR` | ✅ stored | ✅ |
+| `SQL_ATTR_PARAM_BIND_TYPE`, `PARAM_OPERATION_PTR`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR` | ✅ **consumed when `PARAMSET_SIZE > 1`** | ✅ |
+| `SQL_ATTR_ROW_BIND_OFFSET_PTR` | ✅ stored | ✅ |
 | `SQL_ATTR_METADATA_ID` | `SQL_FALSE` ✅; `SQL_TRUE` → `HYC00` | ✅ (`SQL_FALSE`) | identifier mode pending S5b |
 | **`SQL_ATTR_QUERY_TIMEOUT`** | ✅ | ✅ | **delivered by S2** |
 | `SQL_SOPT_SS_*` 1225–1238 | measured per id | measured per id | **delivered by S6** |
@@ -406,8 +408,9 @@ ideal rather than what this driver does.
 | 14 | `ROW_NUMBER` | — | get-only; `24000` unless positioned on a row, else 0 |
 | 15 | `ENABLE_AUTO_IPD` | 0 | stored |
 | 17 | `PARAM_BIND_OFFSET_PTR` | 0 (null) | **enforced**: dereferenced at execute and added to both bound pointers |
-| 16, 18–21, 23–24 | bind/offset/status pointers | 0 | stored |
-| 22 | `PARAMSET_SIZE` | 1 | 1 → success; above 1 → `HYC00` (array binding is a deferred feature) |
+| 16, 23–24 | bookmark/row-offset/row-operation pointers | 0 | stored |
+| 18–21 | `PARAM_BIND_TYPE`, `PARAM_OPERATION_PTR`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR` | 0 | stored; **consumed when `PARAMSET_SIZE > 1`** (below) |
+| 22 | `PARAMSET_SIZE` | 1 | **enforced**: any positive value is stored; 0 → `HY024`. Above 1, `SQLExecute`/`SQLExecDirectW` iterate that many rows of the bound arrays |
 | 10014 | `METADATA_ID` | 0 | `SQL_FALSE` accepted; `SQL_TRUE` → `HYC00` |
 | -1 | `CURSOR_SCROLLABLE` | `SQL_NONSCROLLABLE` | the boolean face of `CURSOR_TYPE` |
 | -2 | `CURSOR_SENSITIVITY` | `SQL_INSENSITIVE` | `SQL_UNSPECIFIED` normalises to insensitive, silently |
@@ -449,6 +452,61 @@ Four findings changed the implementation:
   offset is read once per execution, so an application can walk a buffer by
   writing one `SQLLEN` between executes.
 
+#### `SQL_ATTR_PARAMSET_SIZE` array execution (closes AB#46576)
+
+Originally scoped as accept/store-only here, with array-bound `executemany`
+execution left to a separate story (AB#46576, "Batch insert"). Both landed
+together: storing a value above 1 without consuming it would have accepted
+mssql-python's `executemany` batch and then silently executed only row 0,
+which is worse than the `HYC00` this driver used to answer — so the two were
+never separable in practice, and splitting them would have meant shipping the
+accept path ahead of a rejection every real caller was guaranteed to hit.
+
+**The measured contract:**
+
+- `SQLSetStmtAttrW` stores any positive `SqlULen`; 0 is `HY024` and leaves the
+  previous value in place, mirroring `SQL_ATTR_ROW_ARRAY_SIZE`'s reject-on-zero
+  pattern. `SQLGetStmtAttrW` reports the stored value; the ODBC default is 1.
+- Above 1, `SQLExecute`/`SQLExecDirectW` iterate that many rows out of the
+  bound parameter arrays, one execution per row
+  (`exec_common::execute_param_array_loop`, shared by both entry points).
+  Column-wise arrays (`SQL_ATTR_PARAM_BIND_TYPE` — 0, the default) stride each
+  parameter by its C type's element size, or by `BufferLength` for the
+  character/binary/`SQL_C_NUMERIC` family (`BoundParam::for_row`, mirroring
+  `fetch_scroll::element_stride`'s contract for the symmetric `SQLBindCol`
+  direction); row-wise arrays stride every pointer by
+  `SQL_ATTR_PARAM_BIND_TYPE`'s struct size. `SQL_ATTR_PARAM_BIND_OFFSET_PTR`
+  composes additively on top of either.
+- `SQL_ATTR_PARAM_OPERATION_PTR` skips a row (`SQL_PARAM_IGNORE`) without
+  executing it; `SQL_ATTR_PARAM_STATUS_PTR` reports each row's outcome
+  (`SQL_PARAM_SUCCESS` / `_SUCCESS_WITH_INFO` / `_ERROR` / `_UNUSED`) and
+  `SQL_ATTR_PARAMS_PROCESSED_PTR` counts rows looked at, including one that was
+  skipped or that stopped the array. The array stops at the first row that
+  does not succeed — matching mssql-python, which forwards this call's single
+  `SqlReturn` straight to its own caller with no per-row retry — and
+  `SQLRowCount` reports the sum of every row's own count (msodbcsql's
+  "not available", `-1`, is excluded from the sum rather than corrupting it).
+- A row-returning statement (e.g. `INSERT ... OUTPUT`) leaves its cursor open
+  exactly as a scalar execute does; the array loop closes it before the next
+  row runs, since each row behaves as if `SQLExecute` were called separately
+  and the application never gets a chance to close it itself between rows.
+- A data-at-execution parameter combined with `PARAMSET_SIZE > 1` is rejected
+  with `HYC00` (`ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED`) before any row runs: an
+  array has no way to interleave `SQLPutData` calls per row. Unreachable from
+  mssql-python, whose `executemany` DAE branch never sets `PARAMSET_SIZE` — it
+  loops separate scalar executes instead.
+- A parameterless prepared statement executed with a leftover
+  `PARAMSET_SIZE > 1` runs once rather than `PARAMSET_SIZE` times: there is no
+  array row to walk, and repeating a side-effecting statement nobody asked for
+  is worse than ignoring the leftover attribute.
+
+**Not yet measured against msodbcsql:** MS-TDS supports batching multiple RPC
+calls into one TDS packet (`BatchFlag`, §2.2.6.5); this implementation instead
+sends one RPC per row. Whether msodbcsql does the same or batches at the wire
+level has not been measured, so this is a functional-parity claim (same
+`SQLRowCount`, same per-row status, same stop-on-error behavior) rather than a
+wire-level one.
+
 **Known divergence:** `SQL_ATTR_CURSOR_SCROLLABLE = SQL_SCROLLABLE` succeeds on
 msodbcsql and reports `01S02` here, because scrollable cursors are a deferred
 feature. It is the same single divergence already recorded for
@@ -459,6 +517,7 @@ shared invariant on both drivers and the per-driver state separately.
 `SQL_ATTR_METADATA_ID = SQL_FALSE` succeeds and reads back. `SQL_TRUE` returns
 `HYC00` until S5b wires identifier semantics into catalog matching; silently
 accepting it while forcing pattern mode would return the wrong rows.
+`SQL_ATTR_PARAMSET_SIZE` array execution closes AB#46576 — see above.
 
 **Size:** M. **Depends on:** S1.
 
@@ -732,6 +791,13 @@ the remaining follow-up under AB#47526.
 4. **Parity-sweep cost:** S1's sweep needs a live SQL Server and both drivers
    registered. If `--compare-with-msodbcsql` cannot run in CI, the truth table
    must be captured once and checked in as a fixture.
+5. **`SQL_ATTR_PARAMSET_SIZE` array execution is unmeasured at the wire level.**
+   This driver sends one RPC per row; MS-TDS supports batching multiple RPC
+   calls into a single packet (`BatchFlag`, §2.2.6.5) and msodbcsql may do that
+   instead. The `SQLRowCount`/status/stop-on-error contract is measured against
+   what mssql-python and the ODBC spec require, not against a msodbcsql wire
+   capture — record one before treating per-row semantics as more than
+   functionally equivalent.
 
 ---
 
@@ -742,7 +808,8 @@ now, add a list of what was done & what is pending in this story & create subtas
 for pending attributes."*
 
 - §2 above is the "what is done" list — paste into AB#46377.
-- S1–S4, S5a and S6 are complete.
+- S1–S4, S5a and S6 are complete. `SQL_ATTR_PARAMSET_SIZE` array execution
+  (§4.2.3 / S4, above) closes AB#46576.
 - S5b is the only pending slice and is tracked by AB#47526. Keep AB#46377 active
   only if it is intended to parent that follow-up; otherwise the delivered
   attribute work in this PR is complete.

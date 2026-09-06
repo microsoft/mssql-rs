@@ -20,10 +20,14 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::ird::populate_ird;
 use super::sqlstate::*;
+#[cfg(test)]
+use crate::api::odbc_types::SQL_PARAM_BIND_BY_COLUMN;
 use crate::api::odbc_types::{
-    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_PARAM_ERROR,
+    SQL_PARAM_IGNORE, SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED,
+    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen, SqlUSmallInt,
 };
+use crate::api::util::write_if_some;
 use crate::conversion::param_convert::{
     ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
 };
@@ -602,10 +606,51 @@ pub(super) fn snapshot_bound_params(
 /// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, their readable extents begin at
 /// each bound base plus the pointed-to signed byte offset, which may be
 /// negative, so every allocation must cover that displaced range.
+#[cfg(test)]
 pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
     op: &str,
+) -> Result<ParamsWithDae, SqlReturn> {
+    unsafe { build_named_params_at(stmt_state, marker_count, op, 0, SQL_PARAM_BIND_BY_COLUMN) }
+}
+
+/// [`build_named_params`] for parameter-array row `row` (0-based) of a
+/// `SQL_ATTR_PARAMSET_SIZE > 1` execution — the form `SQLExecute` and
+/// `SQLExecDirectW` call directly for every execution, including the
+/// ordinary scalar case (`row == 0`, `bind_type == SQL_PARAM_BIND_BY_COLUMN`,
+/// where `BoundParam::for_row` is a no-op regardless of `bind_type`).
+/// `bind_type` is `SQL_ATTR_PARAM_BIND_TYPE`, read once by the caller for the
+/// whole array rather than per row, since it cannot change mid-execution.
+///
+/// Each binding is displaced to `row` (see `BoundParam::for_row`) before the
+/// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` shift already documented on
+/// [`build_named_params`] — the two compose additively, so a caller stepping
+/// the whole array with the offset attribute still lands on the right row.
+///
+/// # Safety
+/// Same contract as [`build_named_params`], extended across every row
+/// `0..=row` that a full array execution will visit: each bound parameter's
+/// readable extent must cover its position at every row the array's
+/// `SQL_ATTR_PARAMSET_SIZE` implies, not just this one.
+pub(super) unsafe fn build_named_params_row(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    op: &str,
+    row: usize,
+    bind_type: SqlULen,
+) -> Result<ParamsWithDae, SqlReturn> {
+    unsafe { build_named_params_at(stmt_state, marker_count, op, row, bind_type) }
+}
+
+/// # Safety
+/// Same contract as [`build_named_params`].
+unsafe fn build_named_params_at(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    op: &str,
+    row: usize,
+    bind_type: SqlULen,
 ) -> Result<ParamsWithDae, SqlReturn> {
     use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
 
@@ -621,10 +666,13 @@ pub(super) unsafe fn build_named_params(
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
-        // Applied before anything reads the binding: ODBC shifts the
-        // indicator pointer alongside the value pointer, so the
-        // data-at-execution check below has to see the shifted indicator.
-        let bound_param = bound_param.with_bind_offset(bind_offset);
+        // Row displacement first, then the flat bind-offset shift: applied
+        // before anything reads the binding, since ODBC shifts the indicator
+        // pointer alongside the value pointer and the data-at-execution check
+        // below has to see the shifted indicator.
+        let bound_param = bound_param
+            .for_row(row, bind_type)
+            .with_bind_offset(bind_offset);
 
         let name = format!("@P{}", i + 1);
 
@@ -852,6 +900,140 @@ pub(super) fn finish_execute(
     } else {
         SQL_SUCCESS
     }
+}
+
+/// Writes one element of `SQL_ATTR_PARAM_STATUS_PTR`, if the application
+/// bound one.
+///
+/// # Safety
+/// `status_ptr`, when non-null, must address an array containing `row + 1`
+/// writable `SqlUSmallInt` elements.
+unsafe fn write_param_status(status_ptr: *mut SqlUSmallInt, row: usize, status: SqlUSmallInt) {
+    if !status_ptr.is_null() {
+        unsafe { write_if_some(status_ptr.wrapping_add(row), status) };
+    }
+}
+
+/// Drives `paramset_size` iterations of a `SQL_ATTR_PARAMSET_SIZE > 1`
+/// parameter array, handling the bookkeeping every array-execution entry
+/// point needs identically: `SQL_ATTR_PARAM_OPERATION_PTR` row skips,
+/// `SQL_ATTR_PARAM_STATUS_PTR` / `SQL_ATTR_PARAMS_PROCESSED_PTR` writes,
+/// row-count aggregation across rows, and closing a cursor a row-returning
+/// statement left open before the next row runs (each array row behaves as
+/// if `SQLExecute` were called separately, so nothing else closes it between
+/// rows). Shared by `SQLExecute` and `SQLExecDirectW` so the two stay in
+/// lockstep the same way the rest of this module does.
+///
+/// `execute_row(row)` performs one row's actual execution — staging plus wire
+/// I/O — and returns its `SqlReturn`. It is only called for rows that are
+/// not skipped via `SQL_ATTR_PARAM_OPERATION_PTR`; the caller is responsible
+/// for reading `SQL_ATTR_PARAM_BIND_TYPE` once (it cannot change mid-array)
+/// and threading it into that closure so each row lands on its own bindings.
+///
+/// Stops at the first row that does not report `SQL_SUCCESS` or
+/// `SQL_SUCCESS_WITH_INFO` — matching the ODBC default (no
+/// `SQL_ATTR_PARAM_OPERATION_PTR`-driven continuation past an error) and
+/// mssql-python's own expectation, which forwards this call's single
+/// `SqlReturn` straight to its caller with no row-level retry.
+///
+/// Row counts accumulate only from rows that report one (`>= 0`); a
+/// row-returning statement (SELECT / INSERT ... OUTPUT) reports `-1` per row,
+/// matching msodbcsql's "not available" convention, so summing every row's
+/// count would corrupt a genuine DML total with a stray `-1`. An array whose
+/// every row is row-returning therefore leaves the aggregate at `-1`.
+///
+/// # Safety
+/// `operation_ptr`, when non-null, must be readable for `paramset_size`
+/// `SqlUSmallInt` elements. `status_ptr`, when non-null, must be writable for
+/// the same extent. `processed_ptr`, when non-null, must be writable for one
+/// `SqlULen`.
+pub(super) unsafe fn execute_param_array_loop(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    paramset_size: SqlULen,
+    operation_ptr: *const SqlUSmallInt,
+    status_ptr: *mut SqlUSmallInt,
+    processed_ptr: *mut SqlULen,
+    mut execute_row: impl FnMut(usize) -> SqlReturn,
+) -> SqlReturn {
+    unsafe { write_if_some(processed_ptr, 0) };
+    for row in 0..paramset_size {
+        unsafe { write_param_status(status_ptr, row, SQL_PARAM_UNUSED) };
+    }
+
+    let mut worst = SQL_SUCCESS;
+    let mut total_row_count: i64 = -1;
+
+    for row in 0..paramset_size {
+        unsafe { write_if_some(processed_ptr, row + 1) };
+        if !operation_ptr.is_null()
+            && unsafe { operation_ptr.wrapping_add(row).read_unaligned() } == SQL_PARAM_IGNORE
+        {
+            continue;
+        }
+
+        let rc = execute_row(row);
+        let status = match rc {
+            SQL_SUCCESS => SQL_PARAM_SUCCESS,
+            SQL_SUCCESS_WITH_INFO => {
+                worst = SQL_SUCCESS_WITH_INFO;
+                SQL_PARAM_SUCCESS_WITH_INFO
+            }
+            _ => SQL_PARAM_ERROR,
+        };
+        unsafe { write_param_status(status_ptr, row, status) };
+
+        if let Ok(state) = stmt.inner.lock()
+            && state.row_count >= 0
+        {
+            total_row_count = if total_row_count < 0 {
+                state.row_count
+            } else {
+                total_row_count.saturating_add(state.row_count)
+            };
+        }
+
+        if !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
+            if let Ok(mut state) = stmt.inner.lock() {
+                state.row_count = total_row_count;
+                state.pending_row_counts.clear();
+            }
+            return rc;
+        }
+
+        // Each array row behaves as if SQLExecute were called separately, so
+        // a row-returning statement's cursor must be closed before the next
+        // row's execute — otherwise it fails with 24000, and it's this loop's
+        // job to open exactly the same statement's cursor next, not the
+        // application's.
+        if row + 1 < paramset_size {
+            let cursor_open = stmt
+                .inner
+                .lock()
+                .map(|state| state.has_state(STMT_STATE_CURSOR_OPEN))
+                .unwrap_or(false);
+            if cursor_open {
+                let close_rc =
+                    unsafe { super::close_cursor::sql_free_stmt_close(statement_handle) };
+                if !matches!(close_rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
+                    if let Ok(mut state) = stmt.inner.lock() {
+                        state.row_count = total_row_count;
+                        state.pending_row_counts.clear();
+                    }
+                    return close_rc;
+                }
+                if close_rc == SQL_SUCCESS_WITH_INFO {
+                    worst = SQL_SUCCESS_WITH_INFO;
+                }
+            }
+        }
+    }
+
+    if let Ok(mut state) = stmt.inner.lock() {
+        state.row_count = total_row_count;
+        state.pending_row_counts.clear();
+    }
+    worst
 }
 
 #[cfg(test)]
@@ -1931,5 +2113,251 @@ mod tests {
             ds.active_stmt, None,
             "the connection must be released, or it stays busy forever"
         );
+    }
+
+    mod execute_param_array_loop_tests {
+        use super::*;
+        use crate::api::odbc_types::{
+            SQL_PARAM_ERROR, SQL_PARAM_IGNORE, SQL_PARAM_PROCEED, SQL_PARAM_SUCCESS,
+            SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED, SQL_SUCCESS,
+        };
+
+        /// Every row succeeds and reports a DML-style row count: the
+        /// aggregate must be the sum, matching mssql-python's
+        /// `executemany` rowcount contract (`test_rowcount_executemany`:
+        /// 3 one-row inserts sum to `rowcount == 3`).
+        #[test]
+        fn successful_rows_sum_their_row_counts() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = unsafe {
+                execute_param_array_loop(
+                    stmt,
+                    h.stmt,
+                    3,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    |_row| {
+                        stmt.inner.lock().unwrap().row_count = 1;
+                        SQL_SUCCESS
+                    },
+                )
+            };
+
+            assert_eq!(ret, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 3);
+        }
+
+        /// A row-returning statement reports `-1` per row (msodbcsql's "not
+        /// available" convention); summing it in would corrupt a genuine
+        /// total, so an all-row-returning array must leave the aggregate at
+        /// `-1` rather than at `0` or the row count of the last row.
+        #[test]
+        fn row_returning_rows_leave_the_aggregate_at_not_available() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = unsafe {
+                execute_param_array_loop(
+                    stmt,
+                    h.stmt,
+                    2,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    |_row| {
+                        stmt.inner.lock().unwrap().row_count = -1;
+                        SQL_SUCCESS
+                    },
+                )
+            };
+
+            assert_eq!(ret, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, -1);
+        }
+
+        /// `SQL_ATTR_PARAMS_PROCESSED_PTR` counts up to and including the
+        /// failing row; `SQL_ATTR_PARAM_STATUS_PTR` marks it `SQL_PARAM_ERROR`
+        /// and every row past it `SQL_PARAM_UNUSED` — the array stops rather
+        /// than continuing past an error, matching the ODBC default (no
+        /// `SQL_ATTR_PARAM_OPERATION_PTR`-driven continuation) and
+        /// mssql-python's single-`SqlReturn` expectation.
+        #[test]
+        fn a_failing_row_stops_the_array_and_marks_later_rows_unused() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut status = [SQL_PARAM_SUCCESS; 4];
+            let mut processed: SqlULen = 0;
+
+            let ret = unsafe {
+                execute_param_array_loop(
+                    stmt,
+                    h.stmt,
+                    4,
+                    std::ptr::null(),
+                    status.as_mut_ptr(),
+                    &raw mut processed,
+                    |row| {
+                        if row == 1 {
+                            // Mirrors what real staging does before every
+                            // attempt (`stage_execution_row` resets
+                            // `row_count = -1` before claiming a connection),
+                            // so a row that fails before producing a count
+                            // must not leave a stale value from an earlier
+                            // row behind for the aggregator to misread.
+                            stmt.inner.lock().unwrap().row_count = -1;
+                            return SQL_ERROR;
+                        }
+                        stmt.inner.lock().unwrap().row_count = 1;
+                        SQL_SUCCESS
+                    },
+                )
+            };
+
+            assert_eq!(ret, SQL_ERROR);
+            assert_eq!(processed, 2, "stopped after the failing row (index 1)");
+            assert_eq!(
+                status,
+                [
+                    SQL_PARAM_SUCCESS,
+                    SQL_PARAM_ERROR,
+                    SQL_PARAM_UNUSED,
+                    SQL_PARAM_UNUSED,
+                ]
+            );
+            // Only row 0's count made it into the aggregate before the stop.
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 1);
+        }
+
+        /// `SQL_ATTR_PARAM_OPERATION_PTR` skips a row entirely: it is never
+        /// passed to `execute_row`, its status stays `SQL_PARAM_UNUSED`, and
+        /// `SQL_ATTR_PARAMS_PROCESSED_PTR` still advances past it — the loop
+        /// looked at the row and decided to skip it, which counts as
+        /// processing it.
+        #[test]
+        fn operation_ptr_ignore_skips_a_row_without_executing_it() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let operations = [SQL_PARAM_IGNORE, SQL_PARAM_PROCEED, SQL_PARAM_IGNORE];
+            let mut status = [SQL_PARAM_SUCCESS; 3];
+            let mut processed: SqlULen = 0;
+            let mut executed_rows = Vec::new();
+
+            let ret = unsafe {
+                execute_param_array_loop(
+                    stmt,
+                    h.stmt,
+                    3,
+                    operations.as_ptr(),
+                    status.as_mut_ptr(),
+                    &raw mut processed,
+                    |row| {
+                        executed_rows.push(row);
+                        stmt.inner.lock().unwrap().row_count = 1;
+                        SQL_SUCCESS
+                    },
+                )
+            };
+
+            assert_eq!(ret, SQL_SUCCESS);
+            assert_eq!(executed_rows, vec![1], "only the proceed row runs");
+            assert_eq!(processed, 3);
+            assert_eq!(
+                status,
+                [SQL_PARAM_UNUSED, SQL_PARAM_SUCCESS, SQL_PARAM_UNUSED]
+            );
+            // Only the one executed row's count is in the aggregate.
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 1);
+        }
+
+        /// The overall return is the worst status across rows:
+        /// `SQL_SUCCESS_WITH_INFO` if any row warned and none failed.
+        #[test]
+        fn a_warning_row_promotes_the_overall_return_to_success_with_info() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut status = [SQL_PARAM_SUCCESS; 2];
+
+            let ret = unsafe {
+                execute_param_array_loop(
+                    stmt,
+                    h.stmt,
+                    2,
+                    std::ptr::null(),
+                    status.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    |row| {
+                        stmt.inner.lock().unwrap().row_count = 1;
+                        if row == 0 {
+                            SQL_SUCCESS_WITH_INFO
+                        } else {
+                            SQL_SUCCESS
+                        }
+                    },
+                )
+            };
+
+            assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+            assert_eq!(status, [SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_SUCCESS]);
+        }
+
+        /// Every row starts out `SQL_PARAM_UNUSED` and
+        /// `SQL_ATTR_PARAMS_PROCESSED_PTR` starts at 0 — an application that
+        /// reads these before the loop advances (or after a 0-row array, if
+        /// one were ever passed) must not see stale memory.
+        #[test]
+        fn status_and_processed_are_initialized_before_any_row_runs() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut status = [99u16; 3];
+            let mut processed: SqlULen = 999;
+
+            unsafe {
+                execute_param_array_loop(
+                    stmt,
+                    h.stmt,
+                    3,
+                    std::ptr::null(),
+                    status.as_mut_ptr(),
+                    &raw mut processed,
+                    |_row| {
+                        stmt.inner.lock().unwrap().row_count = 1;
+                        SQL_SUCCESS
+                    },
+                )
+            };
+
+            assert_eq!(processed, 3);
+            assert_eq!(status, [SQL_PARAM_SUCCESS; 3]);
+        }
+
+        /// Null `operation_ptr` / `status_ptr` / `processed_ptr` — the common
+        /// case, matching mssql-python's own executemany, which never sets
+        /// any of the three — must not be dereferenced.
+        #[test]
+        fn null_bookkeeping_pointers_are_never_dereferenced() {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let ret = unsafe {
+                execute_param_array_loop(
+                    stmt,
+                    h.stmt,
+                    5,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    |_row| {
+                        stmt.inner.lock().unwrap().row_count = 2;
+                        SQL_SUCCESS
+                    },
+                )
+            };
+
+            assert_eq!(ret, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 10);
+        }
     }
 }

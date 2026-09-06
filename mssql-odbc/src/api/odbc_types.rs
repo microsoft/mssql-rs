@@ -548,6 +548,28 @@ pub const SQL_ATTR_METADATA_ID: SqlInteger = 10014;
 /// `SQL_ATTR_ROW_BIND_TYPE` value selecting column-wise (array-of-columns)
 /// binding — the mode mssql-python uses.
 pub const SQL_BIND_BY_COLUMN: SqlULen = 0;
+/// `SQL_ATTR_PARAM_BIND_TYPE` value selecting column-wise (array-of-columns)
+/// parameter binding — the mode mssql-python's `executemany` uses. ODBC
+/// headers define this separately from [`SQL_BIND_BY_COLUMN`] even though
+/// both are 0, since they answer the row and parameter attributes
+/// respectively.
+pub const SQL_PARAM_BIND_BY_COLUMN: SqlULen = 0;
+/// `SQL_ATTR_PARAM_OPERATION_PTR` row operation: process this row normally
+/// (the default when the pointer itself is null).
+pub const SQL_PARAM_PROCEED: SqlUSmallInt = 0;
+/// `SQL_ATTR_PARAM_OPERATION_PTR` row operation: skip this row — it is not
+/// sent to the server and its status stays [`SQL_PARAM_UNUSED`].
+pub const SQL_PARAM_IGNORE: SqlUSmallInt = 1;
+/// `SQL_ATTR_PARAM_STATUS_PTR` row outcome: the row executed without warning.
+pub const SQL_PARAM_SUCCESS: SqlUSmallInt = 0;
+/// `SQL_ATTR_PARAM_STATUS_PTR` row outcome: the row executed with a warning
+/// (`SQL_SUCCESS_WITH_INFO`).
+pub const SQL_PARAM_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
+/// `SQL_ATTR_PARAM_STATUS_PTR` row outcome: the row failed.
+pub const SQL_PARAM_ERROR: SqlUSmallInt = 5;
+/// `SQL_ATTR_PARAM_STATUS_PTR` row outcome: never reached, either because an
+/// earlier row failed or because [`SQL_PARAM_IGNORE`] skipped it.
+pub const SQL_PARAM_UNUSED: SqlUSmallInt = 7;
 /// Default `SQL_DESC_ARRAY_SIZE` / `SQL_DESC_ROWSET_SIZE` for a freshly
 /// allocated ARD/APD.
 pub const SQL_ROWSET_SIZE_DEFAULT: SqlULen = 1;

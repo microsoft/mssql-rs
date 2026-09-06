@@ -10,15 +10,17 @@ use std::time::Instant;
 use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, flush_pending_unprepare, park_dae_client, query_timeout_expired_error,
-    snapshot_bound_params,
+    ParamsWithDae, build_named_params_row, claim_connection, deduct_query_timeout,
+    execute_param_array_loop, fail_with_tds, finish_execute, flush_pending_unprepare,
+    park_dae_client, query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
+    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_BIND_BY_COLUMN,
+    SqlHandle, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::error::free_errors;
 use crate::error::post_sql_error;
@@ -106,7 +108,140 @@ fn sql_exec_direct_w_safe(
     debug!(sql = %sql, "SQLExecDirectW: executing");
 
     let dbc = stmt.parent_dbc();
+    let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
 
+    let paramset_size = match stmt.inner.lock() {
+        Ok(state) => state.paramset_size,
+        Err(_) => {
+            error!("SQLExecDirectW: stmt mutex poisoned");
+            return SQL_ERROR;
+        }
+    };
+
+    // See SQLExecute's identical guard (execute.rs): a parameterless
+    // statement has no array rows to walk, so a leftover
+    // SQL_ATTR_PARAMSET_SIZE > 1 runs it exactly once rather than silently
+    // multiplying its side effects.
+    if paramset_size > 1 && marker_count > 0 {
+        return execute_direct_param_array(
+            statement_handle,
+            stmt,
+            dbc,
+            &rewritten_sql,
+            marker_count,
+            paramset_size,
+        );
+    }
+
+    exec_direct_row(
+        statement_handle,
+        stmt,
+        dbc,
+        RowExecution {
+            rewritten_sql: &rewritten_sql,
+            marker_count,
+            row: 0,
+            bind_type: SQL_PARAM_BIND_BY_COLUMN,
+            parameter_array: false,
+        },
+    )
+}
+
+/// Runs `paramset_size` rows of already-rewritten SQL text, one
+/// `SQLExecDirectW` per row (AB#47820) — `SQLExecDirectW`'s equivalent of
+/// `execute.rs`'s `execute_param_array`, sharing the same row-array
+/// bookkeeping (`exec_common::execute_param_array_loop`). Unlike a prepared
+/// statement, there is no server-side handle to carry across rows: each row
+/// independently claims the connection, sends the batch, and finishes.
+fn execute_direct_param_array(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    dbc: &crate::handles::DbcHandle,
+    rewritten_sql: &str,
+    marker_count: usize,
+    paramset_size: SqlULen,
+) -> SqlReturn {
+    let (bind_type, operation_ptr, status_ptr, processed_ptr) = match stmt.inner.lock() {
+        Ok(state) => (
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAM_BIND_TYPE)
+                .unwrap_or(SQL_PARAM_BIND_BY_COLUMN),
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAM_OPERATION_PTR)
+                .unwrap_or(0) as *const SqlUSmallInt,
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAM_STATUS_PTR)
+                .unwrap_or(0) as *mut SqlUSmallInt,
+            state
+                .inert_attrs
+                .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
+                .unwrap_or(0) as *mut SqlULen,
+        ),
+        Err(_) => {
+            error!("SQLExecDirectW: stmt mutex poisoned while reading parameter-array attributes");
+            return SQL_ERROR;
+        }
+    };
+
+    unsafe {
+        execute_param_array_loop(
+            stmt,
+            statement_handle,
+            paramset_size,
+            operation_ptr,
+            status_ptr,
+            processed_ptr,
+            |row| {
+                exec_direct_row(
+                    statement_handle,
+                    stmt,
+                    dbc,
+                    RowExecution {
+                        rewritten_sql,
+                        marker_count,
+                        row,
+                        bind_type,
+                        parameter_array: true,
+                    },
+                )
+            },
+        )
+    }
+}
+
+/// Groups one row's execution parameters so `exec_direct_row` stays within
+/// clippy's argument-count limit; `rewritten_sql` and `marker_count` are the
+/// same for every row of an array, `row` and `bind_type` select which row,
+/// and `parameter_array` gates the data-at-execution rejection.
+struct RowExecution<'a> {
+    rewritten_sql: &'a str,
+    marker_count: usize,
+    row: usize,
+    bind_type: SqlULen,
+    parameter_array: bool,
+}
+
+/// Runs one execution of already-rewritten SQL text: the ordinary scalar
+/// case (`row == 0`, `parameter_array == false`), or one row out of a
+/// `SQL_ATTR_PARAMSET_SIZE > 1` array. `parameter_array` gates the
+/// data-at-execution rejection the same way `execute.rs::stage_execution_row`
+/// does — an array has no way to interleave `SQLPutData` calls per row.
+fn exec_direct_row(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    dbc: &crate::handles::DbcHandle,
+    exec: RowExecution<'_>,
+) -> SqlReturn {
+    let RowExecution {
+        rewritten_sql,
+        marker_count,
+        row,
+        bind_type,
+        parameter_array,
+    } = exec;
     // Snapshotted before the STMT lock below is taken — this crate never
     // holds a STMT lock while acquiring a DESC lock (see bind_col.rs's
     // rationale). Not applied to `stmt_state.bound_params` until the
@@ -129,7 +264,7 @@ fn sql_exec_direct_w_safe(
     };
 
     // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count, query_timeout) = {
+    let (named_params, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -150,15 +285,27 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         }
         stmt_state.bound_params = bound_params;
-        // Rewrite markers and read the bound parameter buffers before mutating
-        // any state, so a binding error (07002 / HYC00) leaves the statement
-        // unchanged.
-        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
-        let named_params =
-            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
-                Ok(params) => params,
-                Err(rc) => return rc,
-            };
+        // Read the bound parameter buffers before mutating any state, so a
+        // binding error (07002 / HYC00) leaves the statement unchanged.
+        let named_params = match unsafe {
+            build_named_params_row(
+                &mut stmt_state,
+                marker_count,
+                "SQLExecDirectW",
+                row,
+                bind_type,
+            )
+        } {
+            Ok(params) => params,
+            Err(rc) => return rc,
+        };
+        if parameter_array && !named_params.dae_params.is_empty() {
+            error!(
+                "SQLExecDirectW: data-at-execution parameters are not supported with SQL_ATTR_PARAMSET_SIZE > 1"
+            );
+            post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+            return SQL_ERROR;
+        }
         // A new execute invalidates prior metadata/context immediately, so a
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -173,12 +320,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (
-            named_params,
-            rewritten_sql,
-            marker_count,
-            stmt_state.query_timeout,
-        )
+        (named_params, stmt_state.query_timeout)
     };
 
     let ParamsWithDae { params, dae_params } = named_params;
@@ -238,10 +380,11 @@ fn sql_exec_direct_w_safe(
 
     // Data-at-execution parameters park the half-written RPC on the statement
     // and hand control to SQLParamData / SQLPutData. There is no prepared plan
-    // to restore afterwards, so `None` is passed for it.
+    // to restore afterwards, so `None` is passed for it. Unreachable when
+    // `parameter_array` is true — rejected above.
     if !dae_params.is_empty() {
         let begin_result = dbc.runtime.block_on(client.begin_sp_executesql(
-            rewritten_sql,
+            rewritten_sql.to_string(),
             params,
             ExecuteOptions::new().timeout_secs(query_timeout),
         ));
@@ -266,13 +409,15 @@ fn sql_exec_direct_w_safe(
     }
 
     // Parameterized text runs via sp_executesql (direct execution, no cached
-    // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
-    // STMT lock is held during I/O. `query_timeout` (already deducted above)
-    // bounds either call; `0` means unlimited, matching the ODBC default.
+    // handle); unparameterized text runs as a plain SQL batch — the two are
+    // byte-identical when there are no markers, so `rewritten_sql` serves
+    // either way. Neither DBC nor STMT lock is held during I/O.
+    // `query_timeout` (already deducted above) bounds either call; `0` means
+    // unlimited, matching the ODBC default.
     let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
         dbc.runtime
             .block_on(client.execute_sp_executesql(
-                rewritten_sql,
+                rewritten_sql.to_string(),
                 params,
                 ExecuteOptions::new().timeout_secs(query_timeout),
             ))
@@ -283,7 +428,10 @@ fn sql_exec_direct_w_safe(
         // individually navigable via SQLMoreResults. finish_execute inspects the
         // resulting client state.
         dbc.runtime
-            .block_on(client.execute(sql, ExecuteOptions::new().timeout_secs(query_timeout)))
+            .block_on(client.execute(
+                rewritten_sql.to_string(),
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ))
             .map(|_| ())
     };
     if let Err(e) = exec_result {
@@ -297,7 +445,12 @@ fn sql_exec_direct_w_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_NTS, SQL_NULL_HANDLE};
+    use crate::api::bind_param::sql_bind_parameter;
+    use crate::api::odbc_types::{
+        SQL_ATTR_PARAMSET_SIZE, SQL_C_CHAR, SQL_C_LONG, SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NTS,
+        SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SQL_VARCHAR, SqlLen, SqlPointer,
+    };
+    use crate::api::set_stmt_attr::sql_set_stmt_attr_w;
     use crate::handles::DescHandle;
     use crate::test_support::TestHandles;
 
@@ -822,5 +975,242 @@ mod tests {
             ss.pending_fetch_info.is_empty(),
             "the previous query's INFO message must not leak onto the new query"
         );
+    }
+
+    /// See `execute.rs`'s identical test: an array has no way to interleave
+    /// `SQLPutData` calls per row, so a data-at-execution binding combined
+    /// with `SQL_ATTR_PARAMSET_SIZE > 1` must be rejected up front rather
+    /// than silently reading only row 0's DAE indicator.
+    #[test]
+    fn array_execute_rejects_data_at_execution_parameters() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+        let bind_ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(bind_ret, SQL_SUCCESS);
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 2 as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+
+        let sql: Vec<u16> = "INSERT INTO t VALUES (?)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED.state
+        );
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    /// A parameterless statement executed with a leftover
+    /// `SQL_ATTR_PARAMSET_SIZE > 1` has no array rows to walk, so it must run
+    /// exactly once — proven by never touching
+    /// `SQL_ATTR_PARAMS_PROCESSED_PTR`, which only the array loop writes.
+    #[test]
+    fn array_size_is_ignored_for_a_parameterless_statement() {
+        let h = TestHandles::with_env_dbc_stmt();
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 5 as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        let mut processed: SqlULen = 999;
+        assert_eq!(
+            unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_PARAMS_PROCESSED_PTR,
+                    (&mut processed as *mut SqlULen).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        // No live connection: a single ordinary execute fails at
+        // claim_connection with 08003, exactly like the non-array case.
+        let sql: Vec<u16> = "SELECT 1"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(
+            processed, 999,
+            "the array loop must never have run for a parameterless statement"
+        );
+    }
+
+    /// The first row of an array claims the connection like any scalar
+    /// execute; with none available it fails with 08003 exactly once, and
+    /// the bookkeeping reflects that only row 0 was attempted.
+    #[test]
+    fn array_execute_disconnected_fails_on_first_row_with_bookkeeping() {
+        use crate::api::odbc_types::{SQL_PARAM_ERROR, SQL_PARAM_UNUSED, SqlUSmallInt};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut values = [1i32, 2, 3];
+        let mut indicators: [SqlLen; 3] = [0; 3];
+        let bind_ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_LONG,
+                SQL_INTEGER,
+                0,
+                0,
+                values.as_mut_ptr().cast(),
+                0,
+                indicators.as_mut_ptr(),
+            )
+        };
+        assert_eq!(bind_ret, SQL_SUCCESS);
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_PARAMSET_SIZE, 3 as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+        let mut status: [SqlUSmallInt; 3] = [SQL_SUCCESS as SqlUSmallInt; 3];
+        assert_eq!(
+            unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_PARAM_STATUS_PTR,
+                    status.as_mut_ptr().cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut processed: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_PARAMS_PROCESSED_PTR,
+                    (&mut processed as *mut SqlULen).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let sql: Vec<u16> = "INSERT INTO t VALUES (?)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) };
+
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state,
+            ERR_CONNECTION_DOES_NOT_EXIST.state
+        );
+        assert_eq!(processed, 1, "only row 0 was attempted");
+        assert_eq!(
+            status,
+            [SQL_PARAM_ERROR, SQL_PARAM_UNUSED, SQL_PARAM_UNUSED]
+        );
+    }
+
+    /// End-to-end proof (scripted `TdsClient`, no live server) that a
+    /// parameter array genuinely runs every row and sums their row counts —
+    /// mirroring mssql-python's `executemany` rowcount contract
+    /// (`test_rowcount_executemany`: 3 one-row inserts sum to `rowcount == 3`).
+    /// Each row is a separate `INSERT` scripted to affect one row, so this
+    /// fails if the array collapses to a single execute or double-counts.
+    #[test]
+    fn array_execute_runs_every_row_and_sums_row_counts() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_tds::test_client_support::{done_no_more_with_count, tds_client_from_tokens};
+
+        const PARAMSET_SIZE: usize = 3;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let client = tds_client_from_tokens(vec![
+            done_no_more_with_count(1),
+            done_no_more_with_count(1),
+            done_no_more_with_count(1),
+        ]);
+        {
+            let mut ds = dbc.inner.lock().unwrap();
+            ds.client = Some(client);
+        }
+
+        let mut values = [1i32, 2, 3];
+        let mut indicators: [SqlLen; PARAMSET_SIZE] = [0; PARAMSET_SIZE];
+        let bind_ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_LONG,
+                SQL_INTEGER,
+                0,
+                0,
+                values.as_mut_ptr().cast(),
+                0,
+                indicators.as_mut_ptr(),
+            )
+        };
+        assert_eq!(bind_ret, SQL_SUCCESS);
+        assert_eq!(
+            unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_PARAMSET_SIZE,
+                    PARAMSET_SIZE as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        let mut processed: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_ATTR_PARAMS_PROCESSED_PTR,
+                    (&mut processed as *mut SqlULen).cast(),
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let ret = sql_exec_direct_w_safe(h.stmt, stmt, "INSERT INTO t VALUES (?)".to_string());
+
+        assert_eq!(
+            ret,
+            SQL_SUCCESS,
+            "diag: {:?}",
+            stmt.inner.lock().unwrap().diag_records
+        );
+        assert_eq!(processed, PARAMSET_SIZE as SqlULen);
+        assert_eq!(stmt.inner.lock().unwrap().row_count, 3);
     }
 }

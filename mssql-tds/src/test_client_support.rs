@@ -524,6 +524,16 @@ pub fn done_no_more() -> ScriptedToken {
     }))
 }
 
+/// A terminal DONE token carrying a row count (e.g. a single-statement DML
+/// batch's affected-row count, with no further statements to follow).
+pub fn done_no_more_with_count(row_count: u64) -> ScriptedToken {
+    ScriptedToken(Tokens::Done(DoneToken {
+        status: DoneStatus::FINAL | DoneStatus::COUNT,
+        cur_cmd: CurrentCommand::Insert,
+        row_count,
+    }))
+}
+
 /// A `RollbackTransaction` ENVCHANGE token — the acknowledgement the server
 /// emits for a Transaction Manager rollback request, clearing the client's
 /// transaction descriptor.

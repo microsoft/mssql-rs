@@ -409,6 +409,13 @@ pub(crate) struct StmtState {
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<BoundParam>>,
+    /// `SQL_ATTR_PARAMSET_SIZE`: number of parameter sets in each column-wise
+    /// or row-wise bound array. `1` (the ODBC default) is ordinary scalar
+    /// execution; a larger value makes `SQLExecute`/`SQLExecDirectW` iterate
+    /// that many rows out of `bound_params`'s arrays, one execution per row,
+    /// aggregating row counts and per-row status the way mssql-python's
+    /// `executemany` expects.
+    pub(crate) paramset_size: SqlULen,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
     /// The drop is deferred to the next point that already holds the TDS client
@@ -1231,6 +1238,7 @@ impl StmtHandle {
                 prepared: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
+                paramset_size: 1,
                 pending_unprepare: None,
                 row_positioned: false,
                 last_captured: None,

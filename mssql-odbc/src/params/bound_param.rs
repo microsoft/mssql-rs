@@ -2,9 +2,12 @@
 // Licensed under the MIT License.
 
 use std::ffi::c_void;
+use std::mem::size_of;
 
+use crate::api::fetch_scroll::element_stride;
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
+    SQL_C_DEFAULT, SQL_PARAM_BIND_BY_COLUMN, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt,
+    SqlULen,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
@@ -78,6 +81,62 @@ impl BoundParam {
         }
         if !self.octet_length_ptr.is_null() {
             self.octet_length_ptr = self.octet_length_ptr.wrapping_byte_offset(offset);
+        }
+        self
+    }
+
+    /// Returns the binding displaced to parameter-array row `row` (0-based),
+    /// for `SQL_ATTR_PARAMSET_SIZE > 1`. Apply [`Self::with_bind_offset`]
+    /// after this — `SQL_ATTR_PARAM_BIND_OFFSET_PTR` shifts every row by the
+    /// same extra amount, on top of the row's own array position.
+    ///
+    /// `bind_type` is `SQL_ATTR_PARAM_BIND_TYPE`:
+    /// [`SQL_PARAM_BIND_BY_COLUMN`] (0) selects column-wise arrays, where each
+    /// parameter's own buffer holds `paramset_size` contiguous values; any
+    /// other value is the row-wise struct size in bytes, where one buffer
+    /// holds `paramset_size` contiguous copies of a struct and every bound
+    /// pointer is a field inside it.
+    ///
+    /// Column-wise: the value buffer advances by this C type's element stride
+    /// ([`element_stride`], shared with the symmetric `SQLBindCol` direction
+    /// in `fetch_scroll.rs`), and the indicator/octet-length buffers advance
+    /// by `sizeof(SQLLEN)` — ODBC keeps those arrays contiguous `SQLLEN`s
+    /// regardless of the value's own width. Row-wise: every pointer advances
+    /// by the same `bind_type` byte count, because all three addresses are
+    /// fields inside one repeated struct.
+    ///
+    /// Row 0 is always the original binding unchanged, regardless of
+    /// `bind_type` — a zero multiplier — so the ordinary scalar-execute path
+    /// (`paramset_size == 1`) can route through this unconditionally without
+    /// behaving any differently than before.
+    pub(crate) fn for_row(mut self, row: usize, bind_type: SqlULen) -> Self {
+        if row == 0 {
+            return self;
+        }
+        let (value_stride, indicator_stride): (usize, usize) =
+            if bind_type == SQL_PARAM_BIND_BY_COLUMN {
+                (
+                    element_stride(self.c_type, self.buffer_length),
+                    size_of::<SqlLen>(),
+                )
+            } else {
+                let row_size = bind_type;
+                (row_size, row_size)
+            };
+        if !self.parameter_value_ptr.is_null() {
+            self.parameter_value_ptr = self
+                .parameter_value_ptr
+                .wrapping_byte_add(row * value_stride);
+        }
+        if !self.strlen_or_ind_ptr.is_null() {
+            self.strlen_or_ind_ptr = self
+                .strlen_or_ind_ptr
+                .wrapping_byte_add(row * indicator_stride);
+        }
+        if !self.octet_length_ptr.is_null() {
+            self.octet_length_ptr = self
+                .octet_length_ptr
+                .wrapping_byte_add(row * indicator_stride);
         }
         self
     }
@@ -298,6 +357,170 @@ mod tests {
         assert_eq!(
             shifted.strlen_or_ind_ptr as usize,
             original.strlen_or_ind_ptr as usize
+        );
+    }
+
+    /// Row 0 must be the original binding, unconditionally: this is what lets
+    /// the ordinary scalar-execute path route through `for_row` without
+    /// changing behavior.
+    #[test]
+    fn for_row_zero_is_unchanged_for_either_bind_type() {
+        let mut buf = [0u8; 32];
+        let mut ind: SqlLen = 4;
+        let original = param(buf.as_mut_ptr().cast(), &raw mut ind);
+        for bind_type in [SQL_PARAM_BIND_BY_COLUMN, 64] {
+            let same = original.for_row(0, bind_type);
+            assert_eq!(
+                same.parameter_value_ptr as usize,
+                original.parameter_value_ptr as usize
+            );
+            assert_eq!(
+                same.strlen_or_ind_ptr as usize,
+                original.strlen_or_ind_ptr as usize
+            );
+        }
+    }
+
+    /// Column-wise: a fixed-width C type strides by its own size, not
+    /// `BufferLength` — mirrors `element_stride`'s contract for `SQLBindCol`.
+    #[test]
+    fn for_row_column_wise_strides_a_fixed_width_c_type_by_its_own_size() {
+        use crate::api::odbc_types::SQL_C_SLONG;
+
+        let mut values = [0i32; 4];
+        let mut indicators = [0 as SqlLen; 4];
+        let base = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_SLONG,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: 0, // ignored for a fixed-width C type
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+        };
+
+        for row in 0..4usize {
+            let shifted = base.for_row(row, SQL_PARAM_BIND_BY_COLUMN);
+            assert_eq!(
+                shifted.parameter_value_ptr as usize,
+                unsafe { values.as_mut_ptr().add(row) } as usize,
+                "row {row} value pointer"
+            );
+            assert_eq!(
+                shifted.strlen_or_ind_ptr as usize,
+                unsafe { indicators.as_mut_ptr().add(row) } as usize,
+                "row {row} indicator pointer"
+            );
+        }
+    }
+
+    /// Column-wise: a character type strides by `BufferLength`, matching how
+    /// `BindParameterArray` (mssql-python) lays out `SQL_C_WCHAR` arrays.
+    #[test]
+    fn for_row_column_wise_strides_a_character_type_by_buffer_length() {
+        const SLOT: usize = 20; // bytes per array element
+        let mut values = [0u8; SLOT * 3];
+        let base = param(values.as_mut_ptr().cast(), std::ptr::null_mut());
+        let base = BoundParam {
+            buffer_length: SLOT as SqlLen,
+            ..base
+        };
+
+        for row in 0..3usize {
+            let shifted = base.for_row(row, SQL_PARAM_BIND_BY_COLUMN);
+            assert_eq!(
+                shifted.parameter_value_ptr as usize,
+                unsafe { values.as_mut_ptr().add(row * SLOT) } as usize,
+                "row {row}"
+            );
+        }
+    }
+
+    /// Row-wise: every pointer — value, indicator, and octet-length —
+    /// advances by the same struct stride, because all three addresses are
+    /// fields inside one repeated row struct.
+    #[test]
+    fn for_row_row_wise_advances_every_pointer_by_the_struct_size() {
+        const ROW_SIZE: usize = 32;
+        let mut buf = [0u8; ROW_SIZE * 3];
+        let value = buf.as_mut_ptr();
+        let indicator = unsafe { value.add(24) }.cast::<SqlLen>();
+        let base = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 8,
+            decimal_digits: 0,
+            parameter_value_ptr: value.cast(),
+            buffer_length: 8,
+            strlen_or_ind_ptr: indicator,
+            octet_length_ptr: indicator,
+        };
+
+        for row in 0..3usize {
+            let shifted = base.for_row(row, ROW_SIZE as SqlULen);
+            assert_eq!(
+                shifted.parameter_value_ptr as usize,
+                unsafe { value.add(row * ROW_SIZE) } as usize,
+                "row {row} value pointer"
+            );
+            assert_eq!(
+                shifted.strlen_or_ind_ptr as usize,
+                unsafe { indicator.byte_add(row * ROW_SIZE) } as usize,
+                "row {row} indicator pointer"
+            );
+        }
+    }
+
+    /// A null pointer must stay null at every row — there is no buffer to
+    /// address, so shifting it would manufacture a wild pointer exactly as
+    /// `with_bind_offset` already guards against.
+    #[test]
+    fn for_row_leaves_null_pointers_null() {
+        let mut values = [0i32; 4];
+        let base = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_SLONG,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        };
+        let shifted = base.for_row(3, SQL_PARAM_BIND_BY_COLUMN);
+        assert!(shifted.strlen_or_ind_ptr.is_null());
+        assert!(shifted.octet_length_ptr.is_null());
+    }
+
+    /// `for_row` and `with_bind_offset` compose additively: the final address
+    /// is the row's array position plus the flat bind offset, regardless of
+    /// which is applied first.
+    #[test]
+    fn for_row_composes_with_bind_offset() {
+        use crate::api::odbc_types::SQL_C_SLONG;
+
+        let mut values = [0i32; 4];
+        let base = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_SLONG,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: std::ptr::null_mut(),
+            octet_length_ptr: std::ptr::null_mut(),
+        };
+        let shifted = base
+            .for_row(2, SQL_PARAM_BIND_BY_COLUMN)
+            .with_bind_offset(4);
+        assert_eq!(
+            shifted.parameter_value_ptr as usize,
+            unsafe { values.as_mut_ptr().add(2) } as usize + 4
         );
     }
 
