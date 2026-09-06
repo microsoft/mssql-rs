@@ -116,7 +116,7 @@ fn sql_bind_col_safe(
     // `free_desc` already walks DBC→STMT in the other direction to reset a
     // freed descriptor's associations, and holding both here in the opposite
     // order would be a classic ABBA deadlock.
-    let (ard, canonical_type) = {
+    let (ard, ard_is_explicit, canonical_type) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLBindCol: stmt mutex poisoned");
             return SQL_ERROR;
@@ -161,8 +161,9 @@ fn sql_bind_col_safe(
         // the column from the row cursor and run validation msodbcsql never reaches.
         if target_value_ptr.is_null() {
             let ard = stmt_state.effective_ard(stmt);
+            let ard_is_explicit = stmt_state.active_ard.is_some();
             drop(stmt_state);
-            let Ok(()) = unbind_ard_column(ard, column_number) else {
+            let Ok(()) = unbind_ard_column(ard, ard_is_explicit, column_number) else {
                 error!("SQLBindCol: ard mutex poisoned; unbind failed");
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     post_sql_error(
@@ -198,7 +199,11 @@ fn sql_bind_col_safe(
             return SQL_ERROR;
         }
 
-        (stmt_state.effective_ard(stmt), canonical_type)
+        (
+            stmt_state.effective_ard(stmt),
+            stmt_state.active_ard.is_some(),
+            canonical_type,
+        )
     };
 
     let binding = ColumnBinding {
@@ -214,7 +219,7 @@ fn sql_bind_col_safe(
         // SQLSetDescFieldW/SQLSetDescRec.
         octet_length_ptr: strlen_or_ind_ptr,
     };
-    let Ok(()) = bind_ard_column(ard, binding) else {
+    let Ok(()) = bind_ard_column(ard, ard_is_explicit, binding) else {
         error!("SQLBindCol: ard mutex poisoned or missing record after growth");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
@@ -245,8 +250,12 @@ fn sql_bind_col_safe(
 /// conversion here is not expected to fail in practice — but this still
 /// reports it as an error rather than panicking or silently truncating to the
 /// wrong record.
-fn bind_ard_column(ard: SqlHandle, binding: ColumnBinding) -> Result<(), ()> {
-    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
+fn bind_ard_column(
+    ard: SqlHandle,
+    ard_is_explicit: bool,
+    binding: ColumnBinding,
+) -> Result<(), ()> {
+    if ard_is_explicit && crate::handles::live_type(ard) != Some(HandleType::Desc) {
         return Err(());
     }
     let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
@@ -275,8 +284,12 @@ fn bind_ard_column(ard: SqlHandle, binding: ColumnBinding) -> Result<(), ()> {
 /// descriptor: reporting `SQL_SUCCESS` here would tell the application an
 /// unbind happened when it didn't, and a stale bound column would keep
 /// writing through a possibly-freed application buffer on the next fetch.
-fn unbind_ard_column(ard: SqlHandle, column_number: SqlUSmallInt) -> Result<(), ()> {
-    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
+fn unbind_ard_column(
+    ard: SqlHandle,
+    ard_is_explicit: bool,
+    column_number: SqlUSmallInt,
+) -> Result<(), ()> {
+    if ard_is_explicit && crate::handles::live_type(ard) != Some(HandleType::Desc) {
         return Err(());
     }
     let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
@@ -318,7 +331,7 @@ pub(crate) unsafe fn sql_free_stmt_unbind(statement_handle: SqlHandle) -> SqlRet
 }
 
 fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {
-    let ard = {
+    let (ard, ard_is_explicit) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFreeStmt(SQL_UNBIND): stmt mutex poisoned");
             return SQL_ERROR;
@@ -329,10 +342,13 @@ fn sql_free_stmt_unbind_safe(stmt: &StmtHandle) -> SqlReturn {
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
         }
-        stmt_state.effective_ard(stmt)
+        (
+            stmt_state.effective_ard(stmt),
+            stmt_state.active_ard.is_some(),
+        )
     };
 
-    if crate::handles::live_type(ard) != Some(HandleType::Desc) {
+    if ard_is_explicit && crate::handles::live_type(ard) != Some(HandleType::Desc) {
         error!("SQLFreeStmt(SQL_UNBIND): ard freed concurrently; unbind failed");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_sql_error(
@@ -890,7 +906,7 @@ mod tests {
             strlen_or_ind_ptr: ptr::null_mut(),
             octet_length_ptr: ptr::null_mut(),
         };
-        assert!(bind_ard_column(explicit_ard, binding).is_err());
+        assert!(bind_ard_column(explicit_ard, true, binding).is_err());
     }
 
     /// Same race, same guard, for `unbind_ard_column`.
@@ -899,6 +915,6 @@ mod tests {
         let mut h = TestHandles::with_env_dbc_stmt();
         let explicit_ard = h.alloc_explicit_desc();
         assert_eq!(h.free_explicit_desc(explicit_ard), SQL_SUCCESS);
-        assert!(unbind_ard_column(explicit_ard, 1).is_err());
+        assert!(unbind_ard_column(explicit_ard, true, 1).is_err());
     }
 }

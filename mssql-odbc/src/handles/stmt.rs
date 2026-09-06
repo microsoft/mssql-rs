@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::error;
 
@@ -19,9 +19,16 @@ use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::datatypes::sql_string::{EncodingType, get_encoding_type};
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlpColumnInfo {
+    pub(crate) wire_encoding: PlpEncoding,
+    pub(crate) text_encoding: Option<EncodingType>,
+}
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
 pub(crate) struct ActivePlpStream {
@@ -334,6 +341,8 @@ pub(crate) struct StmtState {
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// UTF-16 column names built once when result metadata changes.
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
+    /// Bound-fetch metadata for result sets containing PLP columns.
+    pub(crate) plp_columns: Option<Arc<[Option<PlpColumnInfo>]>>,
     /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
     /// fresh carry buffer.
     pub(crate) plp_prefetch_scratch: Vec<u8>,
@@ -1052,12 +1061,35 @@ impl StmtState {
                 .iter()
                 .map(|column| column.column_name.encode_utf16().collect()),
         );
+        self.plp_columns = self
+            .column_metadata
+            .iter()
+            .any(ColumnMetadata::is_plp)
+            .then(|| {
+                self.column_metadata
+                    .iter()
+                    .map(|metadata| {
+                        let wire_encoding = metadata.plp_encoding()?;
+                        let text_encoding = match wire_encoding {
+                            PlpEncoding::Utf16Text => Some(EncodingType::Utf16),
+                            PlpEncoding::Utf8Text => Some(EncodingType::Utf8),
+                            PlpEncoding::SingleByteText => Some(get_encoding_type(metadata)),
+                            PlpEncoding::Binary => None,
+                        };
+                        Some(PlpColumnInfo {
+                            wire_encoding,
+                            text_encoding,
+                        })
+                    })
+                    .collect::<Arc<[_]>>()
+            });
     }
 
     /// Clears result metadata and every cache derived from it.
     pub(crate) fn clear_result_metadata(&mut self) {
         self.column_metadata.clear();
         self.column_names_utf16.clear();
+        self.plp_columns = None;
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -1223,6 +1255,7 @@ impl StmtHandle {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
+                plp_columns: None,
                 plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
