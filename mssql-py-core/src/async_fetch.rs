@@ -30,6 +30,7 @@ use crate::row_writer::PyRowWriter;
 
 const FETCH_YIELD_INTERVAL: usize = 256;
 const LIST_MATERIALIZE_CHUNK_SIZE: usize = 256;
+// Keep in sync with mssql-tds's `ATTENTION_TIMEOUT_SECONDS`.
 const ATTENTION_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Eq, PartialEq)]

@@ -371,17 +371,15 @@ impl AsyncConnectionState {
             {
                 return false;
             }
+            let Some(cancel_handle) = active.cancel_handle.take() else {
+                return false;
+            };
             active.cancel_requested = true;
-            active.cancel_handle.take()
+            cancel_handle
         };
 
-        match cancel_handle {
-            Some(cancel_handle) => {
-                cancel_handle.cancel();
-                true
-            }
-            None => false,
-        }
+        cancel_handle.cancel();
+        true
     }
 
     pub(crate) fn release_operation(&self, operation_id: OperationId) {
@@ -583,6 +581,26 @@ mod tests {
         assert_ne!(first.fetch_id, second.fetch_id);
         assert!(!state.cancel_fetch(first.operation_id, first.fetch_id));
         assert!(state.cancel_fetch(second.operation_id, second.fetch_id));
+    }
+
+    #[test]
+    fn fetch_without_a_cancel_handle_is_not_marked_cancelled() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let fetch = state.claim_fetch(1).unwrap();
+        state
+            .lock()
+            .active_operation
+            .as_mut()
+            .unwrap()
+            .cancel_handle = None;
+
+        assert!(!state.cancel_fetch(fetch.operation_id, fetch.fetch_id));
+        assert_eq!(
+            state.finish_fetch(fetch.operation_id, fetch.fetch_id, false, true),
+            FetchCompletion::Published
+        );
     }
 
     /// Verifies that cancellation does not release the shared session before

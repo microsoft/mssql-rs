@@ -915,22 +915,30 @@ impl TdsClient {
     /// is past the point where a `ResetConnection` ENVCHANGE could still
     /// arrive. ENVCHANGE, INFO, and SESSIONSTATE can legitimately precede or
     /// accompany the acknowledgement; ERROR is treated as inconclusive so the
-    /// server's own diagnostic wins.
+    /// server's own diagnostic wins. DONE_ATTN acknowledges the cancellation,
+    /// not execution of the request that carried RESETCONNECTION.
     fn proves_request_ran(token: &Tokens) -> bool {
-        !matches!(
-            token,
-            Tokens::EnvChange(_) | Tokens::Info(_) | Tokens::SessionState(_) | Tokens::Error(_)
-        )
+        match token {
+            Tokens::EnvChange(_) | Tokens::Info(_) | Tokens::SessionState(_) | Tokens::Error(_) => {
+                false
+            }
+            Tokens::Done(done) | Tokens::DoneInProc(done) | Tokens::DoneProc(done)
+                if done.status.contains(DoneStatus::ATTN) =>
+            {
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Settles reset tracking left over from an earlier request whose response
     /// was abandoned before any verdict could be reached.
     ///
-    /// Cancellation and timeout are the reachable cases. `receive_token`
-    /// answers both by draining to the attention acknowledgement, and that
-    /// drain discards every other token — the `ResetConnection` ENVCHANGE
-    /// included. The carrying request therefore ends with the bit on the wire
-    /// and nothing observed about it.
+    /// Cancellation and timeout are the reachable cases. Their ATTENTION drain
+    /// replays a retained `ResetConnection` ENVCHANGE when one arrived. If the
+    /// drain reaches DONE_ATTN without any token proving the carrying request
+    /// ran, acknowledgement tracking remains outstanding for this boundary to
+    /// settle.
     ///
     /// This runs at the request boundary, before the current request has sent
     /// anything, so a dispatch record or outstanding acknowledgement seen here
@@ -15860,21 +15868,42 @@ mod tests {
         );
     }
 
-    /// Regression: a carrying request whose response is abandoned before any
-    /// token is read — the cancellation/timeout shape, where
-    /// `wait_for_attention_ack` drains to the attention DONE and discards the
-    /// `ResetConnection` ENVCHANGE along with everything else — must not leave
-    /// its suspicion behind for the *next* request to answer for. Doing so would
-    /// mark a healthy connection dead on a token that had nothing to do with the
-    /// reset.
+    #[test]
+    fn attention_ack_does_not_disprove_reset_for_an_interrupted_request() {
+        use crate::connection::transport::network_transport::AttentionSettlement;
+
+        let mut client = create_test_client();
+        client.reset_state = ResetAckState::AwaitingAck;
+        client.recovery_context.session_recovery_negotiated = true;
+
+        assert!(client.apply_attention_settlement(AttentionSettlement {
+            tokens: vec![Tokens::Done(DoneToken {
+                status: DoneStatus::ATTN,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            })],
+            overflowed: false,
+        }));
+        assert!(!client.is_connection_dead());
+        assert!(client.recovery_context.session_recovery_negotiated);
+        assert!(client.reset_pending());
+
+        client.settle_abandoned_reset_verification();
+        assert!(!client.reset_pending());
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Regression: a carrying request whose response is abandoned before a
+    /// reset verdict must not leave its suspicion behind for the *next* request
+    /// to answer for. Doing so would mark a healthy connection dead on a token
+    /// that had nothing to do with the reset.
     #[tokio::test]
     async fn abandoned_carrier_does_not_condemn_the_next_request() {
         let mut client = create_test_client_with_tokens(vec![done_no_more()]);
         client.prepare_reset_connection(false);
 
-        // Send the carrier but never read its response, exactly as the
-        // attention drain leaves things: the bit is on the wire and no token
-        // was ever observed.
+        // Send the carrier but never read its response: the bit is on the wire
+        // and no verdict token was observed.
         client
             .send_query_batch(
                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
@@ -16020,8 +16049,7 @@ mod tests {
         let mut client = create_test_client_with_tokens(vec![done_no_more()]);
         client.prepare_reset_connection(false);
 
-        // Send a carrier but never read its response — the shape the attention
-        // drain leaves behind on cancellation/timeout.
+        // Send a carrier but never read its response, leaving no reset verdict.
         client
             .send_query_batch(
                 "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_string(),
