@@ -1336,7 +1336,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
     use crate::handles::desc::{DescHeader, DescKind};
-    use mssql_tds::test_client_support::int_columns;
+    use mssql_tds::test_client_support::{int_columns, mixed_lob_columns};
 
     fn binding(column_number: SqlUSmallInt, target_type: SqlSmallInt) -> ColumnBinding {
         ColumnBinding {
@@ -1513,6 +1513,37 @@ mod tests {
 
             assert!(s.column_metadata.is_empty());
             assert!(s.column_names_utf16.is_empty());
+        });
+    }
+
+    /// The fill loop reads this cache instead of re-deriving encodings from
+    /// `column_metadata`, so an entry surviving into a later result set would
+    /// silently mis-decode a bound LOB rather than fail. Covers the rebuild,
+    /// the explicit clear, and the non-PLP result set that follows a PLP one —
+    /// that last transition is the one where a stale cache would be consulted.
+    #[test]
+    fn plp_column_cache_does_not_outlive_its_result_set() {
+        with_state(|s| {
+            s.begin_result_set(mixed_lob_columns(2));
+            let cached = s
+                .plp_columns
+                .clone()
+                .expect("the nvarchar(max) column is PLP");
+            assert_eq!(cached.len(), 3);
+            assert!(cached[0].is_none(), "int columns are not PLP");
+            assert_eq!(
+                cached[2].expect("the lob column is PLP").wire_encoding,
+                PlpEncoding::Utf16Text
+            );
+
+            s.clear_result_metadata();
+            assert!(s.plp_columns.is_none());
+
+            s.begin_result_set(int_columns(2));
+            assert!(
+                s.plp_columns.is_none(),
+                "a non-PLP result set must not inherit the previous set's cache"
+            );
         });
     }
 

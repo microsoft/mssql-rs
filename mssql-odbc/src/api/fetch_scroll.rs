@@ -971,6 +971,12 @@ fn fetch_scroll_safe(
                 error!("SQLFetchScroll: env mutex poisoned");
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
                     stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error reading column bindings",
+                    );
                 }
                 return SQL_ERROR;
             };
