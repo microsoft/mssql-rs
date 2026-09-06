@@ -33,7 +33,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
-use crate::handles::{HandleType, OdbcVersion, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
 /// Gets a descriptor field for a result-set column.
 ///
@@ -138,7 +138,7 @@ fn sql_col_attribute_w_safe(
             error!("SQLColAttributeW: env mutex poisoned");
             return SQL_ERROR;
         };
-        uses_3_80_variant_types(env_state.odbc_version)
+        env_state.odbc_version.uses_3_80_types()
     } else {
         false
     };
@@ -535,13 +535,6 @@ fn num_prec_radix(meta: &ColumnMetadata) -> SqlLen {
     }
 }
 
-/// ODBC 3.8 introduced the `SQL_C_SS_*` mappings for variant `time` and
-/// `datetimeoffset`; earlier or unset versions use the binary fallback
-/// (`IS351ORLESSAPP`, `sqlcdesc.cpp:6474`).
-fn uses_3_80_variant_types(odbc_version: OdbcVersion) -> bool {
-    odbc_version.uses_3_80_types()
-}
-
 /// The C type a `sql_variant` value reports for `SQL_CA_SS_VARIANT_TYPE`.
 ///
 /// msodbcsql answers this from its per-row column info, so the value's base type
@@ -719,6 +712,7 @@ mod tests {
         SQL_NULLABLE, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_TYPE_DATE, SQL_TYPE_TIMESTAMP,
     };
     use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_FIELD;
+    use crate::handles::OdbcVersion;
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sqldatatypes::TypeInfo;
     use mssql_tds::test_client_support::{int_columns, udt_column};
@@ -1332,14 +1326,6 @@ mod tests {
             assert_eq!(variant_c_type(*base, false), *before_3_80, "{base:?}");
             assert_eq!(variant_c_type(*base, true), *in_3_80, "{base:?}");
         }
-    }
-
-    #[test]
-    fn only_odbc_3_80_uses_extended_variant_types() {
-        assert!(!uses_3_80_variant_types(OdbcVersion::Unset));
-        assert!(!uses_3_80_variant_types(OdbcVersion::Odbc2));
-        assert!(!uses_3_80_variant_types(OdbcVersion::Odbc3));
-        assert!(uses_3_80_variant_types(OdbcVersion::Odbc3_80));
     }
 
     /// The success path: a variant column whose value has been probed reports

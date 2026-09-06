@@ -296,6 +296,17 @@ mod tests {
             .expect("blocking task should have started");
     }
 
+    /// Guards the gate that `SQL_CA_SS_VARIANT_TYPE` metadata and default
+    /// binding resolution both read: if the two ever disagree, a variant
+    /// column reports a C type the driver will not then accept in a bind.
+    #[test]
+    fn only_odbc_3_80_uses_the_extended_c_types() {
+        assert!(!OdbcVersion::Unset.uses_3_80_types());
+        assert!(!OdbcVersion::Odbc2.uses_3_80_types());
+        assert!(!OdbcVersion::Odbc3.uses_3_80_types());
+        assert!(OdbcVersion::Odbc3_80.uses_3_80_types());
+    }
+
     /// The regression guard for AB#47831. Returning from `SQLFreeHandle(ENV)`
     /// is the host's cue that it may unload the DLL, so a live-process release
     /// must not return while a runtime thread is still executing code from this
