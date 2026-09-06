@@ -1578,8 +1578,7 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSizedColumnIsSingleCall) {
 
 // tests/test_004_cursor.py::test_varbinarymax_insert_fetch_null -- the NULL leg
 // of the varbinary(max) test. A NULL MAX column must report SQL_NULL_DATA on the
-// probe rather than failing; binary *data* delivery is still unimplemented
-// (AB#47239), which is why only the NULL case is covered here.
+// probe rather than failing.
 TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS NVARCHAR(MAX)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
@@ -1596,9 +1595,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn) {
 
 // tests/test_004_cursor.py::test_varbinarymax_insert_fetch_null -- the read that
 // actually failed. mssql-python fetches a nullable varbinary(max) with a real
-// SQL_C_BINARY buffer, not the zero-length probe, so the request reaches the
-// target-type check. Binary *data* delivery is still unimplemented (AB#47239);
-// a NULL carries no data, so it must be answered rather than rejected.
+// SQL_C_BINARY buffer, not the zero-length probe. A NULL carries no data, so it
+// must be answered without touching the buffer.
 //
 // The nonzero buffer is the point of this test: with a zero-length buffer the
 // read is admitted as a length probe and the NULL gate is never consulted.
@@ -1631,8 +1629,7 @@ TEST_F(GetDataLiveTest, NullVarbinaryMaxToBinaryTargetReportsNull) {
 // msodbcsql 18.6.2.1 (SQL_DRIVER_VER 18.06.0002): SQL_SUCCESS_WITH_INFO with
 // 01004 and indicator 9.
 //
-// This only asserts the probe contract; delivering the bytes on the retry is
-// AB#47239.
+// This asserts the probe contract before the retry delivers the bytes.
 TEST_F(GetDataLiveTest, ZeroLengthBinaryProbeReportsTruncationWhenBytesRemain) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST('asdfghjkl' AS BINARY(9)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
@@ -1842,16 +1839,9 @@ TEST_F(GetDataLiveTest, BinaryColumnBesideALobStaysWithinItsBuffer) {
     const SQLRETURN read_rc =
         SQLGetData(stmt_, 1, SQL_C_BINARY, buf.data(), static_cast<SQLLEN>(buf.size()), &read_ind);
 
-    if (SQL_SUCCEEDED(read_rc)) {
-        // Delivering is fine; over-promising is not.
-        EXPECT_LE(read_ind, static_cast<SQLLEN>(buf.size()))
-            << "indicator exceeds the caller's buffer -- the memcpy would run off the end";
-        EXPECT_EQ(9, read_ind);
-    } else {
-        // Binary *data* delivery is still AB#47239, so a refusal is expected
-        // today. Refusing is safe; the crash came from claiming success.
-        EXPECT_EQ(SQL_ERROR, read_rc);
-    }
+    ASSERT_SQL_OK(read_rc, SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(9, read_ind);
+    EXPECT_EQ((std::vector<SQLCHAR>{1, 2, 3, 4, 5, 6, 7, 8, 9}), buf);
 
     // 3. The LOB after it must still decode. A desync left behind by the binary
     //    column would otherwise surface as silent corruption rather than a
@@ -2099,17 +2089,7 @@ TEST_F(GetDataLiveTest, DefaultTargetTooNarrowForItsFixedTargetIsRefused) {
     SQLCloseCursor(stmt_);
 }
 
-// A varbinary column resolves to SQL_C_BINARY, which this path still serves
-// only as the zero-length length probe (AB#47239), so a real read keeps
-// returning HYC00 through the resolved target. That is the same posture the
-// bound path took when it started resolving the placeholder; msodbcsql resolves
-// identically and delivers the bytes, so this does not run on the reference
-// leg.
-//
-// Scoped to a non-PLP varbinary(n) deliberately: a VARBINARY(MAX) refuses the
-// probe too, which the next test pins.
-TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnIsStillUnimplemented) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnDeliversBytes) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x4142434445464748 AS VARBINARY(8))"),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
@@ -2125,58 +2105,38 @@ TEST_F(GetDataLiveTest, DefaultTargetOnABinaryColumnIsStillUnimplemented) {
 
     SQLCHAR buf[64] = {};
     SQLLEN ind = -99;
-    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_DEFAULT, buf, sizeof(buf), &ind));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_DEFAULT, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(8, ind);
+    EXPECT_EQ(0, std::memcmp(buf, "ABCDEFGH", 8));
 
     SQLCloseCursor(stmt_);
 }
 
-// The PLP half of the same story, and the boundary the test above does not
-// cross. A non-NULL VARBINARY(MAX) also resolves to SQL_C_BINARY, but there
-// even the zero-length probe is HYC00: stream_active_plp_chunk admits only
-// SQL_C_CHAR/SQL_C_WCHAR and rejects everything else before it looks at
-// BufferLength, so there is no probe branch to reach. The non-PLP
-// VARBINARY(8) above answers that same probe with a length, so the two spell
-// out where the difference actually lies.
-//
-// Asserted as "the defaulted spelling agrees with the explicit one" rather than
-// against a hardcoded state, because that agreement is what this PR is
-// responsible for; the HYC00 itself is pre-existing and owned by AB#47239,
-// which is expected to turn both into real binary delivery. Each spelling gets
-// its own result set: a PLP column whose stream was begun and then refused
-// cannot be re-read on the same row (the second call reports 07009 from the
-// cursor's forward-only guard, not the target gate), so reusing one row would
-// measure that instead.
-//
-// NULL is deliberately not covered here: it never enters the streaming path
-// (see NullVarbinaryMaxToBinaryTargetReportsNull).
-//
-// msodbcsql delivers the bytes on both, so this does not run on the reference
-// leg.
-TEST_F(GetDataLiveTest, DefaultTargetOnABinaryMaxColumnRefusesEvenTheProbe) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+// The PLP half of the same story verifies that both the explicit and defaulted
+// binary targets support a length probe followed by raw delivery.
+TEST_F(GetDataLiveTest, DefaultAndExplicitBinaryTargetsStreamVarbinaryMax) {
     const char* kQuery = "SELECT CAST(0x4142434445464748 AS VARBINARY(MAX))";
 
-    // Resolved from SQL_C_DEFAULT.
-    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    SQLCHAR probeBuf[1] = {};
-    SQLLEN probe = -99;
-    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_DEFAULT, probeBuf, 0, &probe));
-    const std::string defaulted = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
-    SQLCloseCursor(stmt_);
+    for (SQLSMALLINT target : {SQL_C_DEFAULT, SQL_C_BINARY}) {
+        ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    // The same probe with the C type named explicitly.
-    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-    SQLLEN explicitProbe = -99;
-    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_BINARY, probeBuf, 0, &explicitProbe));
-    const std::string named = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
-    SQLCloseCursor(stmt_);
+        SQLCHAR probeBuf[1] = {};
+        SQLLEN probe = -99;
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+                  SQLGetData(stmt_, 1, target, probeBuf, 0, &probe));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        EXPECT_EQ(8, probe);
 
-    EXPECT_EQ("HYC00", defaulted) << "a MAX binary column refuses even the probe";
-    EXPECT_EQ(named, defaulted)
-        << "resolving SQL_C_DEFAULT must give the same answer as naming SQL_C_BINARY";
+        SQLCHAR buf[8] = {};
+        SQLLEN ind = -99;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, target, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                      stmt_);
+        EXPECT_EQ(8, ind);
+        EXPECT_EQ(0, std::memcmp(buf, "ABCDEFGH", sizeof(buf)));
+        SQLCloseCursor(stmt_);
+    }
 }
 
 // The placeholder is resolved ahead of the captured/PLP dispatch, so it reaches

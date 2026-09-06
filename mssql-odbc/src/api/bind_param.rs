@@ -12,8 +12,8 @@ use crate::api::odbc_types::{
     SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::type_rules::{
-    SqlTypeSupport, canonical_c_type, classify_parameter_sql_type, is_valid_c_type,
-    parameter_column_size_is_valid, resolve_default_c_type,
+    SqlTypeSupport, canonical_c_type, canonical_parameter_sql_type, classify_parameter_sql_type,
+    is_valid_c_type, parameter_column_size_is_valid, resolve_default_c_type,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
@@ -165,6 +165,7 @@ fn sql_bind_parameter_safe(
         // forms so only one form per type reaches validation, conversion, and
         // storage.
         let value_type = canonical_c_type(value_type);
+        let parameter_type = canonical_parameter_sql_type(parameter_type);
 
         // ValueType (C type) and ParameterType (SQL type) must be known type
         // identifiers (HY003 / HY004).

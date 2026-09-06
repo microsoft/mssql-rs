@@ -607,6 +607,30 @@ pub(super) unsafe fn build_named_params(
     marker_count: usize,
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
+    unsafe {
+        build_named_params_row(
+            stmt_state,
+            marker_count,
+            op,
+            0,
+            crate::api::odbc_types::SQL_PARAM_BIND_BY_COLUMN,
+        )
+    }
+}
+
+/// Builds one row from the current parameter bindings.
+///
+/// # Safety
+/// See [`build_named_params`]. The application must additionally provide
+/// `row + 1` elements in every column-wise array, or `row + 1` complete records
+/// for row-wise binding.
+pub(super) unsafe fn build_named_params_row(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    op: &str,
+    row: usize,
+    bind_type: crate::api::odbc_types::SqlULen,
+) -> Result<ParamsWithDae, SqlReturn> {
     use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
 
     let mut params = Vec::with_capacity(marker_count);
@@ -624,7 +648,7 @@ pub(super) unsafe fn build_named_params(
         // Applied before anything reads the binding: ODBC shifts the
         // indicator pointer alongside the value pointer, so the
         // data-at-execution check below has to see the shifted indicator.
-        let bound_param = bound_param.with_bind_offset(bind_offset);
+        let bound_param = bound_param.at_paramset_row(row, bind_type, bind_offset);
 
         let name = format!("@P{}", i + 1);
 

@@ -80,6 +80,7 @@ unsafe fn sql_prepare_w_impl(
     );
 
     let sql = unsafe { read_utf16(statement_text, text_length) };
+    let sql = super::util::translate_odbc_escapes(&sql);
     sql_prepare_w_safe(stmt, sql)
 }
 

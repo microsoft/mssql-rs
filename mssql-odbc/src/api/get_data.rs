@@ -226,6 +226,8 @@ fn sql_get_data_safe(
             active_plp.encoding,
             active_plp.pending_units.len(),
             active_plp.narrow_to_wide.is_some(),
+            active_plp.pending_bytes.len(),
+            active_plp.narrow_to_utf8.is_some(),
         );
         return stream_active_plp_chunk(
             stmt,
@@ -992,27 +994,11 @@ fn finish_get_data(
 /// Refusing costs nothing an application had before: the same call answered
 /// `HYC00` prior to AB#47815.
 ///
-/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which neither
-/// delivery path implements yet (AB#47239), so a real read keeps returning
-/// `HYC00` through the resolved target. That matches the posture the bound path
-/// took in AB#47481; msodbcsql resolves identically and delivers the bytes.
+/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`; matching binary
+/// values are delivered directly on both buffered and PLP paths.
 ///
-/// **How much the resolved `SQL_C_BINARY` still answers depends on the path**,
-/// so the two are worth stating separately:
-///
-/// - Non-PLP (`varbinary(n)`, `binary(n)`): the zero-length length probe works.
-///   [`write_captured_column`]'s `binary_probe` reports the byte count and
-///   leaves the value resident; only a read with a real buffer is `HYC00`.
-/// - PLP (`varbinary(max)`, `image`): even the probe is `HYC00`.
-///   [`stream_active_plp_chunk`] admits only `SQL_C_CHAR` / `SQL_C_WCHAR` and
-///   rejects everything else before it looks at `buffer_length`, so there is no
-///   probe branch to reach. A NULL is the exception — it never enters the
-///   streaming path at all.
-///
-/// Both are pre-existing for an explicit `SQL_C_BINARY` read; resolution only
-/// makes them reachable without the application naming the C type. The width
-/// check above never fires for either, since `SQL_C_BINARY` is
-/// application-sized and so has no fixed width to test.
+/// `SQL_C_BINARY` is application-sized, so the width check above never rejects
+/// a binary column. Both buffered and PLP values are delivered as opaque bytes.
 fn resolve_default_target(
     stmt_state: &StmtState,
     col_index: usize,
@@ -1120,12 +1106,13 @@ fn write_captured_column(
 
     // A zero-length SQL_C_BINARY read is a length probe rather than a data read;
     // mssql-python issues one per sql_variant column to expose the underlying
-    // type to SQLColAttribute, and one per binary column on its Arrow fetch
-    // path. Binary data delivery is still unimplemented (AB#47239).
+    // type to SQLColAttribute, and one per binary column on its Arrow fetch path.
     let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
     let typed_target = is_typed_c_target(target_type);
-    let deliverable_target =
-        typed_target || target_type == SQL_C_CHAR || target_type == SQL_C_WCHAR || binary_probe;
+    let deliverable_target = typed_target
+        || target_type == SQL_C_CHAR
+        || target_type == SQL_C_WCHAR
+        || target_type == SQL_C_BINARY;
 
     // Rejected before the value is borrowed, so it stays resident and the caller
     // can retry with a target this driver does deliver.
@@ -1175,6 +1162,55 @@ fn write_captured_column(
         // Otherwise bytes remain and the value stays resident, so the caller can
         // grow its buffer and read it for real.
         return rc;
+    }
+
+    if target_type == SQL_C_BINARY {
+        let ColumnValues::Bytes(bytes) = value else {
+            post_sql_error(
+                stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Column type conversion not yet implemented",
+            );
+            return SQL_ERROR;
+        };
+        let offset = stmt_state
+            .partial_text_offset
+            .filter(|(c, _)| *c == col_index)
+            .map(|(_, o)| o)
+            .unwrap_or(0)
+            .min(bytes.len());
+        let remaining = &bytes[offset..];
+        let capacity = if target_value_ptr.is_null() {
+            0
+        } else {
+            buffer_length.max(0) as usize
+        };
+        let copied = remaining.len().min(capacity);
+        if copied > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    remaining.as_ptr(),
+                    target_value_ptr.cast::<u8>(),
+                    copied,
+                );
+            }
+        }
+        unsafe {
+            write_if_some(
+                strlen_or_ind_ptr,
+                SqlLen::try_from(remaining.len()).unwrap_or(SqlLen::MAX),
+            );
+        }
+        if copied < remaining.len() {
+            stmt_state.partial_text_offset = Some((col_index, offset + copied));
+            post_diag(stmt_state, WARN_STRING_TRUNCATION);
+            return SQL_SUCCESS_WITH_INFO;
+        }
+        stmt_state.current_row_last_col = col_index;
+        stmt_state.last_captured = None;
+        stmt_state.partial_text_offset = None;
+        return SQL_SUCCESS;
     }
 
     if typed_target {
@@ -1232,9 +1268,8 @@ fn write_captured_column(
     let as_text = match column_value_to_text(value) {
         Ok(t) => t,
         Err(TextError::Malformed) => {
-            // Leave the value resident so the column stays re-readable. There is no
-            // raw-bytes fallback today: SQL_C_BINARY only answers the zero-length
-            // probe, it does not deliver data (AB#47239).
+            // Leave the value resident so the column stays re-readable. A
+            // non-binary source has no raw-byte fallback for SQL_C_BINARY.
             error!("SQLGetData: column payload could not be decoded as text");
             post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
             return SQL_ERROR;
@@ -1603,10 +1638,10 @@ fn stream_active_plp_chunk<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
-    prepared_stream: Option<(PlpEncoding, usize, bool)>,
+    prepared_stream: Option<(PlpEncoding, usize, bool, usize, bool)>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
-    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
+    if !matches!(target_type, SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY) {
         if let Some(mut state) = retained_stmt_state.take() {
             post_sql_error(
                 &mut state,
@@ -1625,16 +1660,20 @@ fn stream_active_plp_chunk<'a>(
         return SQL_ERROR;
     }
 
-    let (plp_encoding, widen_carry_len) = if let Some((encoding, widen_carry_len, widening_ready)) =
-        prepared_stream
+    let (plp_encoding, widen_carry_len, utf8_carry_len) = if let Some((
+        encoding,
+        widen_carry_len,
+        widening_ready,
+        utf8_carry_len,
+        narrow_to_utf8_ready,
+    )) = prepared_stream
     {
         let compatible = match (target_type, encoding) {
             (SQL_C_WCHAR, PlpEncoding::Utf16Text) => true,
             (SQL_C_WCHAR, PlpEncoding::SingleByteText | PlpEncoding::Utf8Text) => widening_ready,
-            (
-                SQL_C_CHAR,
-                PlpEncoding::SingleByteText | PlpEncoding::Utf8Text | PlpEncoding::Utf16Text,
-            ) => true,
+            (SQL_C_CHAR, PlpEncoding::SingleByteText) => narrow_to_utf8_ready,
+            (SQL_C_CHAR, PlpEncoding::Utf8Text | PlpEncoding::Utf16Text) => true,
+            (SQL_C_BINARY, PlpEncoding::Binary) => true,
             _ => false,
         };
         if !compatible {
@@ -1655,7 +1694,7 @@ fn stream_active_plp_chunk<'a>(
             }
             return SQL_ERROR;
         }
-        (Some(encoding), widen_carry_len)
+        (Some(encoding), widen_carry_len, utf8_carry_len)
     } else {
         let mut stmt_state = match retained_stmt_state.take() {
             Some(state) => state,
@@ -1682,26 +1721,34 @@ fn stream_active_plp_chunk<'a>(
             // `get_encoding_type`, which unwraps the collation and would panic
             // on a `json` column (UTF-8 on the wire, no collation) — a panic
             // across the FFI boundary is UB.
+            let narrow_encoding = match encoding {
+                // json is UTF-8 on the wire and carries no collation.
+                PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8),
+                PlpEncoding::SingleByteText => column_meta
+                    .and_then(|m| m.get_collation())
+                    .and_then(|collation| {
+                        if collation.utf8() {
+                            Some(encoding_rs::UTF_8)
+                        } else {
+                            EncodingType::LcidBased(collation).encoding()
+                        }
+                    }),
+                _ => None,
+            };
             let narrow_to_wide = if target_type == SQL_C_WCHAR {
-                let encoder = match encoding {
-                    // json is UTF-8 on the wire and carries no collation.
-                    PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8),
-                    PlpEncoding::SingleByteText => column_meta
-                        .and_then(|m| m.get_collation())
-                        .and_then(|collation| {
-                            if collation.utf8() {
-                                Some(encoding_rs::UTF_8)
-                            } else {
-                                EncodingType::LcidBased(collation).encoding()
-                            }
-                        }),
-                    _ => None,
-                };
-                encoder.map(|e| e.new_decoder_without_bom_handling())
+                narrow_encoding.map(|encoding| encoding.new_decoder_without_bom_handling())
             } else {
                 None
             };
-            stmt_state.active_plp = Some(ActivePlpStream::new(col_index, encoding, narrow_to_wide));
+            let narrow_to_utf8 =
+                if target_type == SQL_C_CHAR && encoding == PlpEncoding::SingleByteText {
+                    narrow_encoding.map(|encoding| encoding.new_decoder_without_bom_handling())
+                } else {
+                    None
+                };
+            let mut stream = ActivePlpStream::new(col_index, encoding, narrow_to_wide);
+            stream.narrow_to_utf8 = narrow_to_utf8;
+            stmt_state.active_plp = Some(stream);
             stmt_state.current_row_last_col = col_index;
         }
 
@@ -1724,9 +1771,6 @@ fn stream_active_plp_chunk<'a>(
         //   SQL_C_WCHAR  <- varchar(max)/json, widened through the column's
         //                   collation (or UTF-8 for json, which has none)
         //   SQL_C_CHAR   <- any of the three, as UTF-8
-        // Binary columns have no delivery path yet and return HYC00
-        // (AB#47239).
-        //
         // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8
         // unconditionally, where msodbcsql converts to the client codepage it
         // derives from the platform -- so the two agree under a UTF-8 locale and
@@ -1736,15 +1780,15 @@ fn stream_active_plp_chunk<'a>(
         // A narrow column can only be widened when its collation resolved to a
         // concrete encoding; without one there is nothing to decode through.
         let widening_ready = stream.is_some_and(|s| s.narrow_to_wide.is_some());
+        let narrow_to_utf8_ready = stream.is_some_and(|s| s.narrow_to_utf8.is_some());
         let compatible = match (target_type, encoding) {
             (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text)) => true,
             (SQL_C_WCHAR, Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)) => {
                 widening_ready
             }
-            (
-                SQL_C_CHAR,
-                Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text | PlpEncoding::Utf16Text),
-            ) => true,
+            (SQL_C_CHAR, Some(PlpEncoding::SingleByteText)) => narrow_to_utf8_ready,
+            (SQL_C_CHAR, Some(PlpEncoding::Utf8Text | PlpEncoding::Utf16Text)) => true,
+            (SQL_C_BINARY, Some(PlpEncoding::Binary)) => true,
             _ => false,
         };
         if !compatible {
@@ -1759,6 +1803,7 @@ fn stream_active_plp_chunk<'a>(
         let stream_state = (
             stream.map(|s| s.encoding),
             stream.map_or(0, |s| s.pending_units.len()),
+            stream.map_or(0, |s| s.pending_bytes.len()),
         );
         retained_stmt_state = Some(stmt_state);
         stream_state
@@ -1766,6 +1811,8 @@ fn stream_active_plp_chunk<'a>(
     let is_unicode_plp = matches!(plp_encoding, Some(PlpEncoding::Utf16Text));
     // SQL_C_CHAR delivery of a UTF-16 PLP column must transcode on the fly.
     let transcode_utf16_to_utf8 = target_type == SQL_C_CHAR && is_unicode_plp;
+    let transcode_narrow_to_utf8 =
+        target_type == SQL_C_CHAR && matches!(plp_encoding, Some(PlpEncoding::SingleByteText));
     // SQL_C_WCHAR delivery of a narrow (codepage or UTF-8) PLP column must
     // widen on the fly. Mirrors the compatibility gate above so the two cannot
     // drift: a Binary column never reaches here.
@@ -1777,10 +1824,10 @@ fn stream_active_plp_chunk<'a>(
 
     // Room the caller left for payload, once the terminator every character
     // target needs is set aside.
-    let terminator_bytes = if target_type == SQL_C_WCHAR {
-        std::mem::size_of::<SqlWChar>()
-    } else {
-        1
+    let terminator_bytes = match target_type {
+        SQL_C_WCHAR => std::mem::size_of::<SqlWChar>(),
+        SQL_C_BINARY => 0,
+        _ => 1,
     };
     let payload_capacity = (buffer_length as usize).saturating_sub(terminator_bytes);
     let widen_out_units = if widen_narrow_to_utf16 {
@@ -1808,6 +1855,14 @@ fn stream_active_plp_chunk<'a>(
             1
         } else {
             widen_out_units.max(4)
+        }
+    } else if transcode_narrow_to_utf8 {
+        if payload_capacity == 0 {
+            0
+        } else if utf8_carry_len >= payload_capacity {
+            1
+        } else {
+            payload_capacity.saturating_sub(utf8_carry_len).max(4)
         }
     } else if target_type == SQL_C_WCHAR {
         // Whole UTF-16 code units only.
@@ -1881,10 +1936,8 @@ fn stream_active_plp_chunk<'a>(
         && matches!(
             (target_type, plp_encoding),
             (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
-                | (
-                    SQL_C_CHAR,
-                    Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
-                )
+                | (SQL_C_BINARY, Some(PlpEncoding::Binary))
+                | (SQL_C_CHAR, Some(PlpEncoding::Utf8Text))
         );
     let mut inline_payload = [0_u8; 256];
     let mut heap_payload = Vec::new();
@@ -2090,7 +2143,7 @@ fn stream_active_plp_chunk<'a>(
         }
     };
 
-    if widen_narrow_to_utf16 || transcode_utf16_to_utf8 {
+    if widen_narrow_to_utf16 || transcode_utf16_to_utf8 || transcode_narrow_to_utf8 {
         drop(retained_stmt_state.take());
     }
 
@@ -2147,6 +2200,57 @@ fn stream_active_plp_chunk<'a>(
             emitted > 0 || reached_end || widen_out_units == 0,
             "narrow PLP widening made no forward progress"
         );
+    } else if transcode_narrow_to_utf8 {
+        let emitted = {
+            let Ok(mut ss) = stmt.inner.lock() else {
+                return SQL_ERROR;
+            };
+            let Some(stream) = ss.active_plp.as_mut() else {
+                error!("SQLGetData: narrow PLP stream vanished mid-call");
+                return SQL_ERROR;
+            };
+            let ActivePlpStream {
+                narrow_to_utf8,
+                pending_bytes,
+                ..
+            } = stream;
+            let Some(decoder) = narrow_to_utf8.as_mut() else {
+                error!("SQLGetData: narrow PLP stream lost its UTF-8 decoder");
+                return SQL_ERROR;
+            };
+            let emit = decode_narrow_into_pending_utf8(
+                decoder,
+                pending_bytes,
+                &payload[..read],
+                reached_end,
+                payload_capacity,
+            );
+            unsafe {
+                copy_with_nul(
+                    target_value_ptr.cast::<u8>(),
+                    buffer_length as usize,
+                    &pending_bytes[..emit],
+                );
+                write_if_some(strlen_or_ind_ptr, emit as SqlLen);
+            }
+            pending_bytes.drain(..emit);
+            emit
+        };
+        debug_assert!(
+            emitted > 0 || reached_end || payload_capacity == 0,
+            "narrow PLP UTF-8 conversion made no forward progress"
+        );
+    } else if target_type == SQL_C_BINARY {
+        if read > 0 && !direct_wire_output && !target_value_ptr.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    target_value_ptr.cast::<u8>(),
+                    read,
+                );
+            }
+        }
+        unsafe { write_if_some(strlen_or_ind_ptr, read as SqlLen) };
     } else if target_type == SQL_C_WCHAR {
         let usable = read & !1;
         let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
@@ -2207,13 +2311,7 @@ fn stream_active_plp_chunk<'a>(
             write_if_some(strlen_or_ind_ptr, utf8_bytes.len() as SqlLen);
         }
     } else {
-        // SQL_C_CHAR delivery of a non-UTF-16 text PLP column: the wire bytes are
-        // copied verbatim. `SingleByteText` and `Utf8Text` have identical bodies
-        // today because there is no codepage conversion on this path yet, but they
-        // are kept as separate arms so the divergence is recorded: `json`
-        // (`Utf8Text`) is UTF-8 and must NOT be folded into whatever codepage
-        // conversion later lands for `varchar(max)` (`SingleByteText`), or
-        // non-ASCII json silently corrupts.
+        // SQL_C_CHAR delivery of UTF-8 text copies the wire bytes verbatim.
         let copy_verbatim = || unsafe {
             if direct_wire_output {
                 target_value_ptr.cast::<u8>().add(read).write_unaligned(0);
@@ -2227,17 +2325,10 @@ fn stream_active_plp_chunk<'a>(
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         };
         match plp_encoding {
-            // varchar(max)/char/text — single-byte / codepage text. Delivered
-            // verbatim today, so a non-UTF-8 server collation yields raw
-            // codepage bytes labelled UTF-8. Conversion attaches here: AB#47566.
-            Some(PlpEncoding::SingleByteText) => copy_verbatim(),
-            // json — UTF-8 on the wire; delivered verbatim to SQL_C_CHAR. Must
-            // stay distinct from SingleByteText (see above).
+            // json and UTF-8-collated varchar(max) are already UTF-8 on the wire.
             Some(PlpEncoding::Utf8Text) => copy_verbatim(),
-            // Utf16Text/Binary/None never reach this branch: the compatibility
-            // gate rejects them or an earlier arm handles them. Assert the
-            // invariant in debug/tests; fall back to a verbatim copy in release
-            // rather than panicking across the FFI boundary (which would be UB).
+            // Every other encoding is handled by an earlier arm or rejected by
+            // the compatibility gate.
             other => {
                 debug_assert!(
                     false,
@@ -2262,12 +2353,12 @@ fn stream_active_plp_chunk<'a>(
     // The wire being exhausted is not the same as the value being delivered: the
     // widening path can still hold decoded units the caller's buffer had no room
     // for. Ending the stream here would drop them and report success.
-    let widen_units_still_held = stmt_state
+    let decoded_output_still_held = stmt_state
         .active_plp
         .as_ref()
-        .is_some_and(|s| !s.pending_units.is_empty());
+        .is_some_and(|s| !s.pending_units.is_empty() || !s.pending_bytes.is_empty());
 
-    if reached_end && !widen_units_still_held {
+    if reached_end && !decoded_output_still_held {
         if let Some(mut stream) = stmt_state.active_plp.take() {
             let buffer = stream.take_prefetch_buffer();
             if buffer.capacity() > stmt_state.plp_prefetch_scratch.capacity() {
@@ -2305,6 +2396,9 @@ fn stream_active_plp_chunk<'a>(
     // The varchar->SQL_C_WCHAR widening falls under the same rule and for the
     // same reason: delivered UTF-16 code units are not wire bytes, so it reports
     // SQL_NO_TOTAL too.
+    // Narrow SQL_C_CHAR delivery reports the concrete wire-byte count. That
+    // preserves the reference driver's countdown for ASCII while non-ASCII
+    // codepage conversion may expand the actual UTF-8 payload.
     let remaining_indicator = if transcode_utf16_to_utf8 || widen_narrow_to_utf16 {
         SQL_NO_TOTAL
     } else if let Some(total) = known_total {
@@ -2372,6 +2466,39 @@ pub(crate) fn widen_into_pending(
         pending.truncate(base + written);
     }
     out_units.min(pending.len())
+}
+
+/// Decodes one narrow-text wire chunk into UTF-8, retaining complete
+/// characters that do not fit the caller's current buffer.
+pub(crate) fn decode_narrow_into_pending_utf8(
+    decoder: &mut Decoder,
+    pending: &mut Vec<u8>,
+    payload: &[u8],
+    reached_end: bool,
+    out_bytes: usize,
+) -> usize {
+    if !(payload.is_empty() && reached_end) {
+        let base = pending.len();
+        let headroom = decoder
+            .max_utf8_buffer_length(payload.len())
+            .unwrap_or_else(|| payload.len().saturating_mul(3).saturating_add(3))
+            .max(3);
+        pending.resize(base + headroom, 0);
+        let (result, _, written, _) =
+            decoder.decode_to_utf8(payload, &mut pending[base..], reached_end);
+        debug_assert_eq!(
+            result,
+            encoding_rs::CoderResult::InputEmpty,
+            "UTF-8 output slice was too short, so input bytes were dropped"
+        );
+        pending.truncate(base + written);
+    }
+
+    let candidate = out_bytes.min(pending.len());
+    match std::str::from_utf8(&pending[..candidate]) {
+        Ok(_) => candidate,
+        Err(error) => error.valid_up_to(),
+    }
 }
 
 /// Transcodes a chunk of UTF-16LE PLP wire bytes to UTF-8 for SQL_C_CHAR
@@ -2460,8 +2587,8 @@ pub(crate) enum TextError {
 /// `true` for the C targets served by the shared conversion core in one call.
 /// Byte count a value would occupy in its `SQL_C_BINARY` form, for the length
 /// probe. `SQL_NO_TOTAL` where the binary encoding is not fixed by the value
-/// alone — this driver does not deliver binary data yet (AB#47239), so there is
-/// no length to promise for those.
+/// alone. Raw binary values are delivered directly; cross-type binary
+/// conversions remain unsupported.
 fn binary_length(value: &ColumnValues) -> SqlLen {
     let len = match value {
         ColumnValues::Bytes(b) => b.len(),
@@ -3280,6 +3407,24 @@ mod tests {
         let emit = widen_into_pending(&mut decoder, &mut pending, b"abc", false, 0);
         assert_eq!(emit, 0);
         assert_eq!(pending, vec![b'a' as u16, b'b' as u16, b'c' as u16]);
+    }
+
+    #[test]
+    fn narrow_codepage_decode_keeps_utf8_characters_whole_across_calls() {
+        let mut decoder = encoding_rs::WINDOWS_1252.new_decoder_without_bom_handling();
+        let mut pending = Vec::new();
+
+        let emit =
+            decode_narrow_into_pending_utf8(&mut decoder, &mut pending, &[0x80, b'A'], true, 2);
+        assert_eq!(emit, 0, "the three-byte euro sign must not be split");
+        assert_eq!(pending, "€A".as_bytes());
+
+        let emit = decode_narrow_into_pending_utf8(&mut decoder, &mut pending, &[], true, 3);
+        assert_eq!(&pending[..emit], "€".as_bytes());
+        pending.drain(..emit);
+
+        let emit = decode_narrow_into_pending_utf8(&mut decoder, &mut pending, &[], true, 3);
+        assert_eq!(&pending[..emit], b"A");
     }
 
     /// Option-returning shim so these tests read the same as before the
@@ -4935,7 +5080,6 @@ mod tests {
             );
         }
 
-        // Delivering the bytes for real is still unimplemented (AB#47239).
         let ret = unsafe {
             sql_get_data(
                 h.stmt,
@@ -4946,10 +5090,68 @@ mod tests {
                 &mut ind,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let s = sh.inner.lock().unwrap();
-        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 5);
+        assert_eq!(&out[..5], &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_DEFAULT,
+                    out.as_mut_ptr() as SqlPointer,
+                    out.len() as SqlLen,
+                    &mut ind,
+                )
+            },
+            SQL_NO_DATA
+        );
+    }
+
+    #[test]
+    fn captured_binary_continues_after_truncation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured_column(
+            &h,
+            column_of(TdsDataType::BigVarBinary),
+            ColumnValues::Bytes(vec![1, 2, 3, 4, 5]),
+        );
+
+        let mut first = [0xCCu8; 2];
+        let mut ind: SqlLen = -99;
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_BINARY,
+                    first.as_mut_ptr() as SqlPointer,
+                    first.len() as SqlLen,
+                    &mut ind,
+                )
+            },
+            SQL_SUCCESS_WITH_INFO
+        );
+        assert_eq!(first, [1, 2]);
+        assert_eq!(ind, 5);
+
+        let mut second = [0xCCu8; 4];
+        assert_eq!(
+            unsafe {
+                sql_get_data(
+                    h.stmt,
+                    1,
+                    SQL_C_BINARY,
+                    second.as_mut_ptr() as SqlPointer,
+                    second.len() as SqlLen,
+                    &mut ind,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(&second[..3], &[3, 4, 5]);
+        assert_eq!(second[3], 0xCC, "binary output has no terminator");
+        assert_eq!(ind, 3);
     }
 
     /// AB#47507 regression: a NULL value with no indicator must be SQLSTATE
@@ -5586,6 +5788,7 @@ mod tests {
         // Recreate the state left after one call returns its current chunk while
         // the read-ahead for the following chunk fails.
         let mut stream = ActivePlpStream::new(1, PlpEncoding::SingleByteText, None);
+        stream.narrow_to_utf8 = Some(encoding_rs::WINDOWS_1252.new_decoder_without_bom_handling());
         stream.set_prefetch_error(mssql_tds::error::Error::Io(std::io::Error::other(
             "deferred PLP prefetch failure",
         )));

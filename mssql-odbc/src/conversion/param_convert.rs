@@ -40,7 +40,7 @@ use crate::api::odbc_types::{
     SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_VECTOR,
     SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME,
     SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
-    SqlGuid, SqlLen, SqlSmallInt, SqlSsVectorLayout,
+    SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INVALID_CHARACTER_VALUE,
@@ -202,6 +202,12 @@ pub(crate) unsafe fn bound_param_to_value(
         (AppValue::WideText(bytes), SqlFamily::Integer) => {
             integer_from_text(param.sql_type, AppText::Utf16(bytes))?
         }
+        (AppValue::NarrowText(bytes), SqlFamily::DateTime) => {
+            return datetime_from_text(param, AppText::Utf8(bytes));
+        }
+        (AppValue::WideText(bytes), SqlFamily::DateTime) => {
+            return datetime_from_text(param, AppText::Utf16(bytes));
+        }
         (AppValue::Bit(v), SqlFamily::Bit) => SqlType::Bit(Some(v)),
         (AppValue::Double(v), SqlFamily::Float) => convert_float_sql(param.sql_type, v)?,
         (AppValue::Float(v), SqlFamily::Float) => convert_real_sql(param.sql_type, v),
@@ -223,6 +229,9 @@ pub(crate) unsafe fn bound_param_to_value(
         }
         (AppValue::WideText(bytes), SqlFamily::Decimal) => {
             return decimal_from_text(param, AppText::Utf16(bytes));
+        }
+        (AppValue::Numeric(numeric), SqlFamily::Decimal) => {
+            return decimal_from_numeric(param, numeric);
         }
         (AppValue::NarrowText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
             SQL_VARCHAR,
@@ -903,7 +912,53 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
             return Ok((decimal_of(param.sql_type, value), Some(metadata)));
         }
     };
+    decimal_from_scaled(param, metadata, mantissa, source_scale)
+}
 
+fn decimal_from_numeric(
+    param: &BoundParam,
+    numeric: SqlNumericStruct,
+) -> Result<TypedValue, ParamBuildError> {
+    if numeric.precision == 0 || numeric.precision > SQL_PREC_NUMERIC as u8 {
+        return Err(ParamBuildError::InvalidParameterSize(usize::from(
+            numeric.precision,
+        )));
+    }
+    if numeric.scale >= 0 && numeric.scale as u8 > numeric.precision {
+        return Err(ParamBuildError::InvalidDecimalDigits(numeric.scale.into()));
+    }
+
+    let magnitude = u128::from_le_bytes(numeric.val);
+    let unsigned =
+        i128::try_from(magnitude).map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+    let mut mantissa = if numeric.sign == 0 && magnitude != 0 {
+        -unsigned
+    } else {
+        unsigned
+    };
+    let source_scale = if numeric.scale < 0 {
+        let exponent = u32::from(numeric.scale.unsigned_abs());
+        let factor = 10i128
+            .checked_pow(exponent)
+            .ok_or(ParamBuildError::Value(ConvError::OutOfRange))?;
+        mantissa = mantissa
+            .checked_mul(factor)
+            .ok_or(ParamBuildError::Value(ConvError::OutOfRange))?;
+        0
+    } else {
+        numeric.scale as u32
+    };
+    let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
+    decimal_from_scaled(param, metadata, mantissa, source_scale)
+}
+
+fn decimal_from_scaled(
+    param: &BoundParam,
+    metadata: RpcTypeMetadata,
+    mantissa: i128,
+    source_scale: u32,
+) -> Result<TypedValue, ParamBuildError> {
+    let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
     let target_scale = u32::from(scale);
     let scaled = if target_scale >= source_scale {
         let factor = 10i128
@@ -1055,6 +1110,68 @@ fn convert_datetime_sql(
         }
         other => Err(ParamBuildError::UnsupportedSqlType(other)),
     }
+}
+
+fn datetime_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
+    if !matches!(param.sql_type, SQL_TYPE_TIME | SQL_SS_TIME2) {
+        return Err(ParamBuildError::ConversionNotImplemented);
+    }
+    let parts = parse_time_text(text.into_string().trim())?;
+    convert_datetime_sql(param.sql_type, param.decimal_digits, parts)
+}
+
+fn parse_time_text(text: &str) -> Result<DateTimeParts, ParamBuildError> {
+    let mut fields = text.split(':');
+    let hour = parse_time_field(fields.next())?;
+    let minute = parse_time_field(fields.next())?;
+    let second_and_fraction = fields.next().ok_or(ParamBuildError::InvalidDateTime)?;
+    if fields.next().is_some() {
+        return Err(ParamBuildError::InvalidDateTime);
+    }
+
+    let mut second_parts = second_and_fraction.split('.');
+    let second = parse_time_field(second_parts.next())?;
+    let fraction = second_parts.next();
+    if second_parts.next().is_some() {
+        return Err(ParamBuildError::InvalidDateTime);
+    }
+
+    let fraction_ns = match fraction {
+        None => 0,
+        Some(digits)
+            if !digits.is_empty()
+                && digits.len() <= 9
+                && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let parsed = digits
+                .parse::<u32>()
+                .map_err(|_| ParamBuildError::InvalidDateTime)?;
+            parsed
+                .checked_mul(10u32.pow(9 - u32::try_from(digits.len()).unwrap_or(9)))
+                .ok_or(ParamBuildError::InvalidDateTime)?
+        }
+        Some(_) => return Err(ParamBuildError::InvalidDateTime),
+    };
+
+    Ok(DateTimeParts {
+        hour,
+        minute,
+        second,
+        fraction_ns,
+        scale: 9,
+        has_time: true,
+        ..DateTimeParts::default()
+    })
+}
+
+fn parse_time_field(field: Option<&str>) -> Result<u16, ParamBuildError> {
+    let value = field.ok_or(ParamBuildError::InvalidDateTime)?;
+    if value.len() != 2 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParamBuildError::InvalidDateTime);
+    }
+    value
+        .parse::<u16>()
+        .map_err(|_| ParamBuildError::InvalidDateTime)
 }
 
 /// Rejects a fraction the declared scale cannot carry. Nothing is rescaled -
@@ -1291,10 +1408,10 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{
         SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG,
-        SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SS_VECTOR,
-        SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
-        SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS,
-        SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
+        SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+        SQL_C_SS_VECTOR, SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
+        SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM,
+        SQL_NO_TOTAL, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
     };
     use crate::params::conversion_matrix::is_supported_conversion;
     use std::ffi::c_void;
@@ -2532,6 +2649,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn numeric_struct_preserves_sign_and_rescales_exactly() {
+        for (sign, expected_positive) in [(1, true), (0, false)] {
+            let mut numeric = SqlNumericStruct {
+                precision: 5,
+                scale: 2,
+                sign,
+                val: 12_345u128.to_le_bytes(),
+            };
+            let mut ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+            let mut p = param(
+                SQL_C_NUMERIC,
+                (&mut numeric as *mut SqlNumericStruct).cast(),
+                &mut ind,
+            );
+            p.sql_type = SQL_NUMERIC;
+            p.column_size = 7;
+            p.decimal_digits = 4;
+
+            let (value, metadata) = unsafe { bound_param_to_value(&p) }.unwrap();
+            assert_eq!(
+                value,
+                SqlType::Numeric(Some(DecimalParts::new(expected_positive, 7, 4, 1_234_500,)))
+            );
+            assert_eq!(
+                metadata,
+                Some(RpcTypeMetadata {
+                    precision: Some(7),
+                    scale: Some(4),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_struct_normalizes_signed_zero_and_rejects_fraction_loss() {
+        let mut zero = SqlNumericStruct {
+            precision: 1,
+            scale: 0,
+            sign: 0,
+            val: 0u128.to_le_bytes(),
+        };
+        let mut ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut p = param(
+            SQL_C_NUMERIC,
+            (&mut zero as *mut SqlNumericStruct).cast(),
+            &mut ind,
+        );
+        p.sql_type = SQL_DECIMAL;
+        p.column_size = 1;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 1, 0, 0)))
+        );
+
+        let mut fractional = SqlNumericStruct {
+            precision: 5,
+            scale: 2,
+            sign: 1,
+            val: 12_345u128.to_le_bytes(),
+        };
+        p.parameter_value_ptr = (&mut fractional as *mut SqlNumericStruct).cast();
+        p.column_size = 5;
+        p.decimal_digits = 1;
+        assert_eq!(
+            unsafe { bound_param_to_value(&p) },
+            Err(ParamBuildError::StringTruncation)
+        );
+    }
+
     /// `SQL_NTS` on a binary parameter falls back to `BufferLength`, which has
     /// no NUL to stop at and so must be a real length.
     #[test]
@@ -2923,6 +3111,83 @@ mod tests {
         p.sql_type = sql_type;
         p.column_size = column_size;
         unsafe { bound_param_to_value(&p) }.map(|(value, _)| value)
+    }
+
+    fn convert_time_char(
+        c_type: SqlSmallInt,
+        sql_type: SqlSmallInt,
+        decimal_digits: SqlSmallInt,
+        text: &str,
+    ) -> Result<TypedValue, ParamBuildError> {
+        let mut narrow: Vec<u8>;
+        let mut wide: Vec<u16>;
+        let (ptr, byte_len) = if c_type == SQL_C_WCHAR {
+            wide = text.encode_utf16().collect();
+            let len = wide.len() * size_of::<u16>();
+            (wide.as_mut_ptr() as *mut c_void, len)
+        } else {
+            narrow = text.as_bytes().to_vec();
+            let len = narrow.len();
+            (narrow.as_mut_ptr() as *mut c_void, len)
+        };
+        let mut ind: SqlLen = byte_len as SqlLen;
+        let mut p = param(c_type, ptr, &mut ind);
+        p.sql_type = sql_type;
+        p.column_size = 16;
+        p.decimal_digits = decimal_digits;
+        unsafe { bound_param_to_value(&p) }
+    }
+
+    #[test]
+    fn character_time_literals_preserve_microseconds() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for sql_type in [SQL_TYPE_TIME, SQL_SS_TIME2] {
+                let (value, metadata) =
+                    convert_time_char(c_type, sql_type, 6, "14:30:15.234567").unwrap();
+                assert_eq!(
+                    value,
+                    SqlType::Time(Some(SqlTime {
+                        time_nanoseconds: 522_152_345_670,
+                        scale: MAX_DATETIME_SCALE,
+                    })),
+                    "c_type {c_type}, sql_type {sql_type}"
+                );
+                assert_eq!(
+                    metadata,
+                    Some(RpcTypeMetadata {
+                        precision: None,
+                        scale: Some(MAX_DATETIME_SCALE),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn character_time_literals_validate_syntax_range_and_scale() {
+        for literal in [
+            "",
+            "1:02:03",
+            "01:2:03",
+            "01:02:3",
+            "24:00:00",
+            "01:60:00",
+            "01:02:60",
+            "01:02:03.",
+            "01:02:03+05:30",
+        ] {
+            assert_eq!(
+                convert_time_char(SQL_C_WCHAR, SQL_TYPE_TIME, 6, literal),
+                Err(ParamBuildError::InvalidDateTime),
+                "{literal:?}"
+            );
+        }
+
+        assert_eq!(
+            convert_time_char(SQL_C_WCHAR, SQL_TYPE_TIME, 6, "01:02:03.2345671"),
+            Err(ParamBuildError::DateTimeFieldOverflow)
+        );
+        assert!(convert_time_char(SQL_C_WCHAR, SQL_TYPE_TIME, 6, "01:02:03.2345670").is_ok());
     }
 
     /// One buffer, six declarations: as with the integer quadrant, the wire type

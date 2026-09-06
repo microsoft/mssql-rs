@@ -20,6 +20,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -1095,16 +1096,9 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxDoesNotSplitASurrogatePair) {
     SQLCloseCursor(stmt_);
 }
 
-// Bound binary delivery is unimplemented for every type, not just the max ones
-// (AB#47239), so this asserts our own answer rather than parity -- msodbcsql
-// delivers it.
-TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-    // Two rows and a trailing scalar: the refused target takes the drain path
-    // rather than the fill loop, so proving the row ended is not enough --
-    // the value after it, and the row after that, have to decode correctly.
+TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxTruncatesAndKeepsRowsSynchronized) {
     ExecDirect(
-        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS lob, n * 11 AS tail "
+        "SELECT n, CAST(REPLICATE('A', 5000) AS VARBINARY(MAX)) AS lob, n * 11 AS tail "
         "FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
 
     SQLINTEGER n = -1;
@@ -1118,13 +1112,22 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
     ASSERT_SQL_OK(SQLBindCol(stmt_, 3, SQL_C_SLONG, &tail, sizeof(tail), &tailInd),
                   SQL_HANDLE_STMT, stmt_);
 
-    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
-    EXPECT_EQ(11, tail) << "the column after a refused LOB must still decode";
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(5000, ind);
+    for (size_t i = 0; i < std::size(buf); ++i) {
+        EXPECT_EQ(0x41, buf[i]) << "first row byte " << i;
+    }
+    EXPECT_EQ(11, tail) << "the column after a truncated LOB must still decode";
 
     // And the next row too: a drain that stopped short would misread it.
-    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    std::fill(std::begin(buf), std::end(buf), 0);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_EQ(2, n);
+    EXPECT_EQ(5000, ind);
+    for (size_t i = 0; i < std::size(buf); ++i) {
+        EXPECT_EQ(0x41, buf[i]) << "second row byte " << i;
+    }
     EXPECT_EQ(22, tail);
 
     EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
@@ -1132,10 +1135,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
     SQLCloseCursor(stmt_);
 }
 
-// The typed-conversion path reaches the same refusal by a different route: a
-// binary PLP column has no source encoding to convert from, so it is drained and
-// refused before any conversion is attempted. Same AB#47239 gap as above, so it
-// likewise asserts our own answer rather than parity.
+// A binary PLP column has no text representation for typed conversion, so it is
+// drained and refused before any conversion is attempted.
 //
 // The value has to exceed what the transport can buffer for a whole column,
 // otherwise `try_read_buffered_column` materializes it and the row takes the

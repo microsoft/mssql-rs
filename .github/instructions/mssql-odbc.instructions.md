@@ -272,18 +272,10 @@ does not grow every time a new msodbcsql build is measured.
     with a truncated value, closer to msodbcsql, is open and untracked.
 11. A `varbinary` / `image` / CLR UDT column bound `SQL_C_DEFAULT` resolves to
     `SQL_C_BINARY` (`describe_col.rs` → `SQL_VARBINARY` / `SQL_LONGVARBINARY` /
-    `SQL_SS_UDT`, then `resolve_default_c_type`), which bound delivery does not
-    implement yet (AB#47239), so it fails per row with `HYC00`. For `varbinary`
-    and `image`, deferred resolution exposes the pre-existing explicit
-    `SQL_C_BINARY` gap without the application naming the C type. A UDT's former
-    `SQL_C_CHAR` default was already unsupported, so the new mapping does not
-    regress observable fetch behavior. msodbcsql resolves all three to
-    `SQL_C_BINARY` and delivers the bytes. `SQLGetData` answers the same way
-    through the resolved target, but how much of the `SQL_C_BINARY` contract
-    survives depends on the path: a non-PLP `varbinary(n)` still answers the
-    zero-length length probe, while a `varbinary(max)` / `image` refuses even
-    that, because `stream_active_plp_chunk` admits only the two character
-    targets before it looks at `BufferLength` (AB#47815).
+    `SQL_SS_UDT`, then `resolve_default_c_type`). Bound fetch and `SQLGetData`
+    deliver matching binary source values without a terminator, including PLP
+    values; truncation reports `01004` and the full source length. Cross-type
+    conversion into `SQL_C_BINARY` remains unsupported.
 12. A zero-length `SQL_C_BINARY` `SQLGetData` on a column whose **source SQL
     type is fixed-length** reports `01004` / `SQL_SUCCESS_WITH_INFO`, where
     msodbcsql reports `22003` / `SQL_ERROR` and leaves the indicator untouched.
@@ -334,8 +326,8 @@ does not grow every time a new msodbcsql build is measured.
     `SQLGetData_ptr(hStmt, i, SQL_C_BINARY, NULL, 0, ...)` gated on
     `SQL_SUCCEEDED`), so matching `22003` would break every integer variant. The
     reported truncation is the important half — it is what stops a caller
-    treating an undelivered value as delivered (AB#47537) — and the exact
-    fixed-width SQLSTATE is left to AB#47239, which reworks binary delivery.
+    treating an undelivered value as delivered (AB#47537). The fixed-source
+    SQLSTATE remains a documented deviation for cross-type binary conversion.
 13. An **empty** (zero-length, non-NULL) value answers that same probe with
     `SQL_SUCCESS` and consumes the column, so a repeat reports `SQL_NO_DATA`;
     a value with bytes still pending stays resident and repeats its `01004`.

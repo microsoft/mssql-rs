@@ -157,12 +157,9 @@ on a different one row in seven, so per-column indicators are checked rather tha
 assumed. Kept deliberately separate from `MAX`/PLP: inline variable width is a
 bound-buffer path, PLP is not.
 
-**No `VARBINARY` column.** `mssql-odbc` implements only the zero-length
-`SQL_C_BINARY` length probe; delivering binary data into a real buffer is still
-`HYC00` (AB#47239, see `mssql-odbc/docs/typed-columnar-fetch-plan.md`), and
-binary-to-character hex is not implemented either. A `VARBINARY` column would
-fail the candidate and baseline legs while the Microsoft leg passed, which is a
-broken comparison rather than a measurement.
+**No `VARBINARY` column.** Raw binary delivery is covered by the ODBC functional
+tests. This workload remains focused on character-width and NULL-handling costs;
+binary-to-character hex conversion is a separate, unsupported conversion.
 
 ### `getdata` — row-at-a-time `SQLGetData`
 

@@ -88,10 +88,8 @@ impl ColumnMetadata {
     ///
     /// This is exhaustive over the PLP type set so a new PLP type can't silently
     /// fall through to a wrong default. Note `json` is UTF-8 on the wire (no
-    /// collation) and is kept distinct from `varchar(max)` single-byte text —
-    /// they only coincide today because the single-byte path is a verbatim copy;
-    /// once codepage conversion lands for `varchar(max)`, folding `json` into it
-    /// would corrupt data.
+    /// collation) and is kept distinct from `varchar(max)` single-byte text so
+    /// consumers can transcode the latter without corrupting JSON.
     pub fn plp_encoding(&self) -> Option<PlpEncoding> {
         if !self.is_plp() {
             return None;

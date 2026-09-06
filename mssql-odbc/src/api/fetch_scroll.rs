@@ -40,21 +40,20 @@ use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
-    TextError, column_value_to_text, convert_typed_c, is_typed_c_target, utf16le_chunk_to_utf8,
-    widen_into_pending,
+    TextError, column_value_to_text, convert_typed_c, decode_narrow_into_pending_utf8,
+    is_typed_c_target, utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
-    SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE, SQL_C_FLOAT,
-    SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
-    SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
-    SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR,
+    SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE,
+    SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+    SQL_C_SSHORT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIMESTAMP, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR,
     SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL, SQL_NULL_DATA, SQL_ROW_ERROR,
     SQL_ROW_NOROW, SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
     SqlDateStruct, SqlGuid, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
     SqlSsTime2Struct, SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlULen, SqlUSmallInt,
     SqlWChar,
 };
-use crate::api::type_rules::resolve_default_c_type;
+use crate::api::type_rules::{c_type_octet_width, resolve_default_c_type};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
@@ -737,13 +736,8 @@ impl RowWriter for BoundRowWriter<'_> {
 /// the result set also stays unresolved, but never reaches delivery: the fill
 /// loop skips it, matching msodbcsql.
 ///
-/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which bound
-/// delivery does not implement yet (AB#47239), so it fails per row with `HYC00`.
-/// That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred resolution
-/// makes it reachable without the application naming the C type. A CLR UDT now
-/// resolves to `SQL_C_BINARY` too, but its former `SQL_C_CHAR` default was
-/// already unsupported, so the mapping change introduces no fetch regression.
-/// msodbcsql resolves all three identically and delivers the bytes.
+/// A `varbinary` / `image` / CLR UDT column resolves to `SQL_C_BINARY`, matching
+/// msodbcsql, and bound delivery copies the opaque bytes without a terminator.
 ///
 /// A resolved fixed-width target is left unresolved as well when the
 /// application declared a `BufferLength` too small to hold it. `BufferLength`
@@ -1572,19 +1566,7 @@ unsafe fn write_row_status(row_status_ptr: *mut SqlUSmallInt, row: SqlULen, stat
 /// 0 if the application sizes it", which is how both `SQL_C_DEFAULT` resolvers
 /// test a resolved fixed-width target against the caller's declared slot.
 pub(crate) fn element_stride(target_type: SqlSmallInt, buffer_length: SqlLen) -> usize {
-    match target_type {
-        SQL_C_BIT | SQL_C_TINYINT | SQL_C_STINYINT | SQL_C_UTINYINT => 1,
-        SQL_C_SSHORT | SQL_C_USHORT => 2,
-        SQL_C_SLONG | SQL_C_ULONG | SQL_C_FLOAT => 4,
-        SQL_C_SBIGINT | SQL_C_UBIGINT | SQL_C_DOUBLE => 8,
-        SQL_C_GUID => 16,
-        SQL_C_TYPE_DATE | SQL_C_TYPE_TIME => 6,
-        SQL_C_TYPE_TIMESTAMP => 16,
-        SQL_C_SS_TIME2 => 12,
-        SQL_C_SS_TIMESTAMPOFFSET => 20,
-        // Character and binary: the application sizes the slot.
-        _ => buffer_length.max(0) as usize,
-    }
+    c_type_octet_width(target_type).unwrap_or_else(|| buffer_length.max(0) as usize)
 }
 
 /// Current value of `SQL_ATTR_ROW_BIND_OFFSET_PTR`, in bytes.
@@ -1774,8 +1756,7 @@ unsafe fn deliver_bound_plp(
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
-    // Same text pairings SQLGetData supports. Bound binary delivery remains
-    // tracked separately under AB#47239.
+    // Same text and binary pairings SQLGetData supports.
     let target = binding.target_type;
     let encoding = column_info.wire_encoding;
     let widen_narrow_to_utf16 = target == SQL_C_WCHAR
@@ -1783,7 +1764,8 @@ unsafe fn deliver_bound_plp(
             encoding,
             PlpEncoding::SingleByteText | PlpEncoding::Utf8Text
         );
-    let mut narrow_decoder = if widen_narrow_to_utf16 {
+    let transcode_narrow_to_utf8 = target == SQL_C_CHAR && encoding == PlpEncoding::SingleByteText;
+    let mut narrow_decoder = if widen_narrow_to_utf16 || transcode_narrow_to_utf8 {
         column_info
             .text_encoding
             .and_then(|encoding| encoding.encoding())
@@ -1791,13 +1773,14 @@ unsafe fn deliver_bound_plp(
     } else {
         None
     };
-    let compatible = matches!(
-        (target, encoding),
+    let compatible = match (target, encoding) {
         (SQL_C_WCHAR, PlpEncoding::Utf16Text)
-            | (SQL_C_CHAR, PlpEncoding::SingleByteText)
-            | (SQL_C_CHAR, PlpEncoding::Utf8Text)
-            | (SQL_C_CHAR, PlpEncoding::Utf16Text)
-    ) || narrow_decoder.is_some();
+        | (SQL_C_CHAR, PlpEncoding::Utf8Text | PlpEncoding::Utf16Text)
+        | (SQL_C_BINARY, PlpEncoding::Binary) => true,
+        (SQL_C_WCHAR, PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
+        | (SQL_C_CHAR, PlpEncoding::SingleByteText) => narrow_decoder.is_some(),
+        _ => false,
+    };
     if !compatible {
         // The stream still has to be consumed, or the next column decodes from
         // the middle of this value. A failure here is the caller's problem, not
@@ -1809,10 +1792,16 @@ unsafe fn deliver_bound_plp(
 
     let transcode_utf16_to_utf8 =
         target == SQL_C_CHAR && matches!(encoding, PlpEncoding::Utf16Text);
+    // Narrow SQL_C_CHAR delivery keeps the source byte count, matching
+    // msodbcsql's concrete indicator for varchar(max).
     let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
     let buf_elements = char_buf_elements(target, stride);
-    // Room for the payload, less the terminator the copy always writes.
-    let capacity_elements = buf_elements.saturating_sub(1);
+    let capacity_elements = if target == SQL_C_BINARY {
+        buf_elements
+    } else {
+        // Character targets reserve one element for the terminator.
+        buf_elements.saturating_sub(1)
+    };
 
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut out_units: Vec<u16> = Vec::new();
@@ -1835,7 +1824,7 @@ unsafe fn deliver_bound_plp(
             continue;
         }
 
-        if let Some(decoder) = narrow_decoder.as_mut() {
+        if widen_narrow_to_utf16 && let Some(decoder) = narrow_decoder.as_mut() {
             decoded_units.clear();
             widen_into_pending(
                 decoder,
@@ -1856,6 +1845,28 @@ unsafe fn deliver_bound_plp(
             out_units.extend_from_slice(&decoded_units[..emit]);
             if emit < decoded_units.len() {
                 truncated = true;
+            }
+        } else if transcode_narrow_to_utf8 && let Some(decoder) = narrow_decoder.as_mut() {
+            let mut decoded = Vec::new();
+            let emit = decode_narrow_into_pending_utf8(
+                decoder,
+                &mut decoded,
+                &scratch[..chunk.read],
+                chunk.reached_end,
+                usize::MAX,
+            );
+            for ch in std::str::from_utf8(&decoded[..emit])
+                .expect("encoding_rs emits valid UTF-8")
+                .chars()
+            {
+                let need = ch.len_utf8();
+                if out_bytes.len() + need <= capacity_elements {
+                    let mut encoded = [0u8; 4];
+                    out_bytes.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+                } else {
+                    truncated = true;
+                    break;
+                }
             }
         } else if target == SQL_C_WCHAR {
             // Whole code units only; an odd tail is carried to the next chunk.
@@ -1940,6 +1951,12 @@ unsafe fn deliver_bound_plp(
 
     if target == SQL_C_WCHAR {
         unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &out_units) };
+    } else if target == SQL_C_BINARY {
+        if !slot.is_null() && !out_bytes.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(out_bytes.as_ptr(), slot, out_bytes.len());
+            }
+        }
     } else {
         unsafe { copy_with_nul(slot, buf_elements, &out_bytes) };
     }
@@ -2127,9 +2144,30 @@ unsafe fn deliver_bound(
         };
     }
 
+    if binding.target_type == SQL_C_BINARY {
+        let ColumnValues::Bytes(bytes) = value else {
+            return RowOutcome::Error(RowIssue::Unsupported);
+        };
+        let full_len = SqlLen::try_from(bytes.len()).unwrap_or(SqlLen::MAX);
+        unsafe { write_if_some(octet_length, full_len) };
+        let copy_len = if slot.is_null() {
+            0
+        } else {
+            bytes.len().min(stride)
+        };
+        if copy_len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, copy_len);
+            }
+        }
+        return if copy_len < bytes.len() {
+            RowOutcome::Info(RowIssue::StringTruncated)
+        } else {
+            RowOutcome::Success
+        };
+    }
+
     if binding.target_type != SQL_C_CHAR && binding.target_type != SQL_C_WCHAR {
-        // SQL_C_BINARY delivery is still unimplemented (AB#47239); anything else
-        // is an unsupported target.
         return RowOutcome::Error(RowIssue::Unsupported);
     }
 
@@ -2207,7 +2245,7 @@ mod tests {
     use super::*;
     use crate::api::bind_col::sql_bind_col;
     use crate::api::odbc_types::{
-        SQL_C_BINARY, SQL_C_SLONG, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR,
+        SQL_C_BINARY, SQL_C_SLONG, SQL_C_TINYINT, SQL_DESC_CONCISE_TYPE, SQL_DESC_DATA_PTR,
         SQL_DESC_INDICATOR_PTR, SQL_DESC_OCTET_LENGTH_PTR, SQL_FETCH_ABSOLUTE, SQL_FETCH_FIRST,
         SQL_FETCH_LAST, SQL_FETCH_PRIOR, SQL_FETCH_RELATIVE, SQL_GUID, SQL_INTEGER, SQL_WVARCHAR,
     };
@@ -3131,7 +3169,7 @@ mod tests {
     /// 3.8 and `SQL_C_BINARY` below it.
     ///
     /// Both versions fail this row -- the mock only carries `int` payloads, and
-    /// bound `SQL_C_BINARY` delivery is unimplemented (AB#47239) -- so the
+    /// integer-to-`SQL_C_BINARY` conversion is unsupported -- so the
     /// resolved target is observed through *which* diagnostic comes back:
     /// `07006` for the typed 3.8 target that cannot take an int, `HYC00` for the
     /// binary 3.0 one this driver does not deliver. Hardcoding either version in
@@ -4394,6 +4432,40 @@ mod tests {
         let outcome = unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Int(42)) };
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(buf[0], 42);
+    }
+
+    #[test]
+    fn bound_binary_delivers_empty_exact_and_truncated_values() {
+        let mut buf = [0xCCu8; 4];
+        let mut ind = [SQL_NULL_DATA; 1];
+        let b = binding(
+            1,
+            SQL_C_BINARY,
+            buf.as_mut_ptr() as SqlPointer,
+            buf.len() as SqlLen,
+            ind.as_mut_ptr(),
+        );
+
+        assert!(matches!(
+            unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Bytes(Vec::new())) },
+            RowOutcome::Success
+        ));
+        assert_eq!(ind[0], 0);
+        assert_eq!(buf, [0xCC; 4], "binary output has no terminator");
+
+        assert!(matches!(
+            unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Bytes(vec![1, 2, 3, 4])) },
+            RowOutcome::Success
+        ));
+        assert_eq!(ind[0], 4);
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        assert!(matches!(
+            unsafe { deliver_bound(&b, 0, 0, &ColumnValues::Bytes(vec![5, 6, 7, 8, 9])) },
+            RowOutcome::Info(RowIssue::StringTruncated)
+        ));
+        assert_eq!(ind[0], 5);
+        assert_eq!(buf, [5, 6, 7, 8]);
     }
 
     /// SQL_ATTR_ROW_BIND_OFFSET_PTR displaces the data and indicator bases by

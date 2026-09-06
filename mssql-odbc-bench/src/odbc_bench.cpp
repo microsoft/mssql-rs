@@ -572,12 +572,9 @@ ColumnSpec make_variant(std::vector<ColumnSpec>& columns, ValueKind kind,
 // The single source of truth for a table's columns: DDL, generator, binding, and
 // validation are all derived from this one list.
 //
-// VARBINARY is deliberately absent. mssql-odbc implements only the zero-length
-// SQL_C_BINARY length probe; binary *delivery* into a real buffer is still
-// HYC00 (AB#47239, `mssql-odbc/docs/typed-columnar-fetch-plan.md`), and
-// binary-to-character hex rendering is not implemented either. Adding a
-// VARBINARY column would fail the candidate and baseline legs while the
-// Microsoft leg passed, which is a broken comparison rather than a measurement.
+// VARBINARY is deliberately absent. Raw binary delivery is covered by the ODBC
+// functional tests; this workload isolates character-width and NULL-handling
+// costs. Binary-to-character hex rendering remains a separate conversion.
 std::vector<ColumnSpec> columns_for(const TableSpec& table) {
     std::vector<ColumnSpec> columns;
     switch (table.shape) {
