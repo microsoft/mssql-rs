@@ -4204,11 +4204,15 @@ impl TdsClient {
     /// The transport must read through DONE_ATTN to realign the wire, but
     /// `TdsClient` still owns transaction, environment, recovery, and reset
     /// acknowledgement state.
-    fn consume_attention_settlement(&mut self) -> bool {
-        let Some(settlement) = self.transport.take_attention_settlement() else {
+    fn apply_attention_settlement(
+        &mut self,
+        settlement: crate::connection::transport::network_transport::AttentionSettlement,
+    ) -> bool {
+        if settlement.overflowed {
+            warn!("ATTENTION settlement state exceeded its retention limit");
+            self.transport.mark_known_dead();
             return false;
-        };
-
+        }
         for token in settlement.tokens {
             if let Err(error) = self
                 .observe_response_token(&token)
@@ -4220,6 +4224,13 @@ impl TdsClient {
             }
         }
         true
+    }
+
+    fn consume_attention_settlement(&mut self) -> bool {
+        let Some(settlement) = self.transport.take_attention_settlement() else {
+            return false;
+        };
+        self.apply_attention_settlement(settlement)
     }
 
     /// Finalizes client state after a read ended through cancellation or timeout.
@@ -10872,6 +10883,7 @@ mod tests {
 
     #[test]
     fn attention_settlement_replays_connection_level_side_effects() {
+        use crate::connection::transport::network_transport::AttentionSettlement;
         use crate::token::tokens::{
             EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, ErrorToken,
             SessionStateToken,
@@ -10879,7 +10891,7 @@ mod tests {
 
         let mut client = create_test_client();
         client.prepared_handles.insert(sid(1), 27);
-        let tokens = [
+        let tokens = vec![
             Tokens::Error(ErrorToken {
                 number: 21,
                 state: 1,
@@ -10901,9 +10913,10 @@ mod tests {
             }),
         ];
 
-        for token in tokens {
-            client.apply_attention_side_effect(token).unwrap();
-        }
+        assert!(client.apply_attention_settlement(AttentionSettlement {
+            tokens,
+            overflowed: false,
+        }));
 
         assert!(client.transport.connection_known_dead());
         assert_eq!(client.info_messages()[0].message, "attention warning");
@@ -10914,6 +10927,19 @@ mod tests {
                 .session_state_table
                 .master_recovery_disabled
         );
+    }
+
+    #[test]
+    fn overflowing_attention_settlement_retires_the_connection() {
+        use crate::connection::transport::network_transport::AttentionSettlement;
+
+        let mut client = create_test_client();
+
+        assert!(!client.apply_attention_settlement(AttentionSettlement {
+            tokens: Vec::new(),
+            overflowed: true,
+        }));
+        assert!(client.transport.connection_known_dead());
     }
 
     #[test]

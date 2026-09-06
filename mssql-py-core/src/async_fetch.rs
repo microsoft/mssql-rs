@@ -23,7 +23,7 @@ use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::{InternalError, map_tds_error};
 use crate::async_session::{
-    AsyncConnectionState, ClaimError, CursorId, FetchCompletion, OperationId,
+    AsyncConnectionState, ClaimError, CursorId, FetchCompletion, FetchId, OperationId,
 };
 use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
 use crate::row_writer::PyRowWriter;
@@ -157,6 +157,7 @@ impl FetchResources {
 struct FetchGuard {
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
+    fetch_id: FetchId,
     operation: &'static str,
     dispatch: Option<tracing::Dispatch>,
     completed: bool,
@@ -166,12 +167,14 @@ impl FetchGuard {
     fn new(
         session_state: Arc<AsyncConnectionState>,
         operation_id: OperationId,
+        fetch_id: FetchId,
         operation: &'static str,
         dispatch: Option<tracing::Dispatch>,
     ) -> Self {
         Self {
             session_state,
             operation_id,
+            fetch_id,
             operation,
             dispatch,
             completed: false,
@@ -185,6 +188,7 @@ impl FetchGuard {
     fn complete(&mut self, result_set_exhausted: bool, has_open_batch: bool) -> FetchCompletion {
         let completion = self.session_state.finish_fetch(
             self.operation_id,
+            self.fetch_id,
             result_set_exhausted,
             has_open_batch,
         );
@@ -240,6 +244,7 @@ impl Drop for FetchGuard {
 struct FetchCancellationGuard {
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
+    fetch_id: FetchId,
     operation: &'static str,
     dispatch: Option<tracing::Dispatch>,
     completed: bool,
@@ -250,12 +255,14 @@ impl FetchCancellationGuard {
     fn new(
         session_state: Arc<AsyncConnectionState>,
         operation_id: OperationId,
+        fetch_id: FetchId,
         operation: &'static str,
         dispatch: Option<tracing::Dispatch>,
     ) -> Self {
         Self {
             session_state,
             operation_id,
+            fetch_id,
             operation,
             dispatch,
             completed: false,
@@ -271,7 +278,11 @@ impl FetchCancellationGuard {
 impl Drop for FetchCancellationGuard {
     /// Requests ATTENTION when Python stops waiting before settlement finishes.
     fn drop(&mut self) {
-        if !self.completed && self.session_state.cancel_fetch(self.operation_id) {
+        if !self.completed
+            && self
+                .session_state
+                .cancel_fetch(self.operation_id, self.fetch_id)
+        {
             let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
             tracing::debug!(
                 "PyAsyncCursor::{}: cancelled; ATTENTION settlement continues in the background",
@@ -403,6 +414,7 @@ async fn run_fetch_in_background<F, T>(
     future: F,
     session_state: Arc<AsyncConnectionState>,
     operation_id: OperationId,
+    fetch_id: FetchId,
     operation: &'static str,
     dispatch: Option<tracing::Dispatch>,
 ) -> PyResult<T>
@@ -411,7 +423,7 @@ where
     T: Send + 'static,
 {
     let mut cancellation_guard =
-        FetchCancellationGuard::new(session_state, operation_id, operation, dispatch);
+        FetchCancellationGuard::new(session_state, operation_id, fetch_id, operation, dispatch);
     let result = tokio::spawn(future).await;
     cancellation_guard.complete();
     result.map_err(|error| {
@@ -522,6 +534,7 @@ fn fetch<'py>(
         .claim_fetch(cursor_id)
         .map_err(map_claim_error)?;
     let operation_id = claim.operation_id;
+    let fetch_id = claim.fetch_id;
     let future_state = session_state.clone();
     let cancellation_state = session_state.clone();
     let guard_dispatch = dispatch.clone();
@@ -540,8 +553,13 @@ fn fetch<'py>(
         // Retain the Python cursor until the row operation settles so its finalizer
         // cannot race the in-flight TDS read.
         let _cursor = cursor;
-        let mut fetch_guard =
-            FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
+        let mut fetch_guard = FetchGuard::new(
+            future_state,
+            operation_id,
+            fetch_id,
+            operation,
+            guard_dispatch,
+        );
 
         let (result, info_messages, has_open_batch, connection_dead) = {
             let mut client = client.lock().await;
@@ -648,6 +666,7 @@ fn fetch<'py>(
         future,
         cancellation_state,
         operation_id,
+        fetch_id,
         operation,
         cancellation_dispatch,
     );
@@ -655,7 +674,7 @@ fn fetch<'py>(
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
-            session_state.restore_fetch(operation_id);
+            session_state.restore_fetch(operation_id, fetch_id);
             Err(error)
         }
     }
@@ -684,14 +703,20 @@ fn fetch_buffered<'py>(
         .claim_fetch(cursor_id)
         .map_err(map_claim_error)?;
     let operation_id = claim.operation_id;
+    let fetch_id = claim.fetch_id;
     let future_state = session_state.clone();
     let guard_dispatch = dispatch.clone();
 
     let future = async move {
         let started = Instant::now();
         let _cursor = cursor;
-        let mut fetch_guard =
-            FetchGuard::new(future_state, operation_id, operation, guard_dispatch);
+        let mut fetch_guard = FetchGuard::new(
+            future_state,
+            operation_id,
+            fetch_id,
+            operation,
+            guard_dispatch,
+        );
         let (rows, exhausted, has_next) = buffered_results.take_rows(limit);
         fetch_state.set(if exhausted {
             FetchStatus::Exhausted
@@ -720,7 +745,7 @@ fn fetch_buffered<'py>(
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
-            session_state.restore_fetch(operation_id);
+            session_state.restore_fetch(operation_id, fetch_id);
             Err(error)
         }
     }
@@ -824,6 +849,7 @@ pub(crate) fn nextset<'py>(
         Err(error) => return Err(map_claim_error(error)),
     };
     let operation_id = claim.operation_id;
+    let fetch_id = claim.fetch_id;
     let future_state = session_state.clone();
     let cancellation_state = session_state.clone();
     let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
@@ -837,8 +863,13 @@ pub(crate) fn nextset<'py>(
         let started = Instant::now();
         tracing::debug!("PyAsyncCursor::nextset: started");
         let _cursor = cursor;
-        let mut fetch_guard =
-            FetchGuard::new(future_state, operation_id, "nextset", guard_dispatch);
+        let mut fetch_guard = FetchGuard::new(
+            future_state,
+            operation_id,
+            fetch_id,
+            "nextset",
+            guard_dispatch,
+        );
 
         let (result, info_messages, has_open_batch, connection_dead) = {
             let mut client = client.lock().await;
@@ -961,6 +992,7 @@ pub(crate) fn nextset<'py>(
         future,
         cancellation_state,
         operation_id,
+        fetch_id,
         "nextset",
         cancellation_dispatch,
     );
@@ -968,7 +1000,7 @@ pub(crate) fn nextset<'py>(
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
-            session_state.restore_fetch(operation_id);
+            session_state.restore_fetch(operation_id, fetch_id);
             fetch_state.set(previous_fetch_status);
             description_state.replace(previous_description);
             Err(error)
@@ -998,6 +1030,7 @@ fn next_buffered_set<'py>(
         .claim_fetch(cursor_id)
         .map_err(map_claim_error)?;
     let operation_id = claim.operation_id;
+    let fetch_id = claim.fetch_id;
     let future_state = session_state.clone();
     let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
     let previous_description = description_state.replace(None);
@@ -1006,8 +1039,13 @@ fn next_buffered_set<'py>(
     let guard_dispatch = dispatch.clone();
 
     let future = async move {
-        let mut fetch_guard =
-            FetchGuard::new(future_state, operation_id, "nextset", guard_dispatch);
+        let mut fetch_guard = FetchGuard::new(
+            future_state,
+            operation_id,
+            fetch_id,
+            "nextset",
+            guard_dispatch,
+        );
         let metadata = buffered_results.advance();
         let has_result = metadata.is_some();
         let description = match materialize(metadata).await {
@@ -1041,7 +1079,7 @@ fn next_buffered_set<'py>(
     match pyo3_async_runtimes::tokio::future_into_py(py, future) {
         Ok(awaitable) => Ok(awaitable),
         Err(error) => {
-            session_state.restore_fetch(operation_id);
+            session_state.restore_fetch(operation_id, fetch_id);
             fetch_state.set(previous_fetch_status);
             description_state.replace(previous_description);
             Err(error)
@@ -1064,12 +1102,12 @@ mod tests {
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion,
     };
 
-    fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64) {
+    fn claimed_fetch() -> (Arc<AsyncConnectionState>, u64, u64) {
         let state = Arc::new(AsyncConnectionState::new());
         let execute = state.claim_execute(1).unwrap();
         state.finish_execute(execute.operation_id, true);
         let fetch = state.claim_fetch(1).unwrap();
-        (state, fetch.operation_id)
+        (state, fetch.operation_id, fetch.fetch_id)
     }
 
     #[test]
@@ -1085,8 +1123,9 @@ mod tests {
 
     #[test]
     fn failed_fetch_releases_reusable_session_without_open_batch() {
-        let (state, operation_id) = claimed_fetch();
-        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
+        let (state, operation_id, fetch_id) = claimed_fetch();
+        let mut guard =
+            FetchGuard::new(Arc::clone(&state), operation_id, fetch_id, "fetchone", None);
 
         guard.fail(false);
 
@@ -1096,8 +1135,9 @@ mod tests {
 
     #[test]
     fn failed_fetch_breaks_session_with_open_batch() {
-        let (state, operation_id) = claimed_fetch();
-        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
+        let (state, operation_id, fetch_id) = claimed_fetch();
+        let mut guard =
+            FetchGuard::new(Arc::clone(&state), operation_id, fetch_id, "fetchone", None);
 
         guard.fail(true);
 
@@ -1107,9 +1147,10 @@ mod tests {
 
     #[test]
     fn completing_a_fetch_that_no_longer_owns_the_session_disarms_its_guard() {
-        let (state, operation_id) = claimed_fetch();
+        let (state, operation_id, fetch_id) = claimed_fetch();
         state.release_operation(operation_id);
-        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
+        let mut guard =
+            FetchGuard::new(Arc::clone(&state), operation_id, fetch_id, "fetchone", None);
 
         assert_eq!(guard.complete(false, true), FetchCompletion::NoLongerActive);
         assert!(guard.completed);
@@ -1121,9 +1162,10 @@ mod tests {
 
     #[test]
     fn cancelled_fetch_keeps_its_guard_armed_until_settlement() {
-        let (state, operation_id) = claimed_fetch();
-        let mut guard = FetchGuard::new(Arc::clone(&state), operation_id, "fetchone", None);
-        assert!(state.cancel_fetch(operation_id));
+        let (state, operation_id, fetch_id) = claimed_fetch();
+        let mut guard =
+            FetchGuard::new(Arc::clone(&state), operation_id, fetch_id, "fetchone", None);
+        assert!(state.cancel_fetch(operation_id, fetch_id));
 
         assert_eq!(
             guard.complete(false, true),

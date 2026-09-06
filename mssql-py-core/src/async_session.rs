@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use mssql_tds::core::CancelHandle;
 
 pub(crate) type CursorId = u64;
+pub(crate) type FetchId = u64;
 pub(crate) type OperationId = u64;
 
 /// Exclusive execute ownership granted for one cursor operation.
@@ -28,6 +29,7 @@ pub(crate) struct CursorCloseClaim {
 #[derive(Debug)]
 pub(crate) struct FetchClaim {
     pub(crate) operation_id: OperationId,
+    pub(crate) fetch_id: FetchId,
 }
 
 #[must_use]
@@ -68,6 +70,7 @@ pub(crate) enum OperationPhase {
 pub(crate) struct ActiveOperation {
     pub(crate) cursor_id: Option<CursorId>,
     pub(crate) operation_id: OperationId,
+    fetch_id: Option<FetchId>,
     pub(crate) phase: OperationPhase,
     pub(crate) cancel_handle: Option<CancelHandle>,
     /// Prevents a detached fetch from publishing results after its Python awaitable was cancelled.
@@ -85,6 +88,7 @@ struct AsyncSessionState {
 #[derive(Debug)]
 pub(crate) struct AsyncConnectionState {
     next_cursor_id: AtomicU64,
+    next_fetch_id: AtomicU64,
     next_operation_id: AtomicU64,
     inner: Mutex<AsyncSessionState>,
 }
@@ -133,6 +137,7 @@ impl AsyncConnectionState {
     pub(crate) fn new() -> Self {
         Self {
             next_cursor_id: AtomicU64::new(1),
+            next_fetch_id: AtomicU64::new(1),
             next_operation_id: AtomicU64::new(1),
             inner: Mutex::new(AsyncSessionState {
                 lifecycle: ConnectionLifecycle::Open,
@@ -183,6 +188,7 @@ impl AsyncConnectionState {
         state.active_operation = Some(ActiveOperation {
             cursor_id: Some(cursor_id),
             operation_id,
+            fetch_id: None,
             phase: OperationPhase::Executing,
             cancel_handle: Some(cancel_handle),
             cancel_requested: false,
@@ -217,6 +223,7 @@ impl AsyncConnectionState {
         state.active_operation = Some(ActiveOperation {
             cursor_id: None,
             operation_id,
+            fetch_id: None,
             phase: OperationPhase::Executing,
             cancel_handle: None,
             cancel_requested: false,
@@ -239,9 +246,12 @@ impl AsyncConnectionState {
         if active.cursor_id != Some(cursor_id) || active.phase != OperationPhase::Fetching {
             return Err(ClaimError::Busy);
         }
+        let fetch_id = self.next_fetch_id.fetch_add(1, Ordering::Relaxed);
         active.phase = OperationPhase::FetchingRow;
+        active.fetch_id = Some(fetch_id);
         Ok(FetchClaim {
             operation_id: active.operation_id,
+            fetch_id,
         })
     }
 
@@ -271,6 +281,7 @@ impl AsyncConnectionState {
         state.active_operation = Some(ActiveOperation {
             cursor_id: Some(cursor_id),
             operation_id,
+            fetch_id: None,
             phase: OperationPhase::Closing,
             cancel_handle: None,
             cancel_requested: false,
@@ -305,6 +316,7 @@ impl AsyncConnectionState {
     pub(crate) fn finish_fetch(
         &self,
         operation_id: OperationId,
+        fetch_id: FetchId,
         result_set_exhausted: bool,
         has_open_batch: bool,
     ) -> FetchCompletion {
@@ -312,13 +324,17 @@ impl AsyncConnectionState {
         let Some(active) = state.active_operation.as_mut() else {
             return FetchCompletion::NoLongerActive;
         };
-        if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
+        if active.operation_id != operation_id
+            || active.fetch_id != Some(fetch_id)
+            || active.phase != OperationPhase::FetchingRow
+        {
             return FetchCompletion::NoLongerActive;
         }
         if active.cancel_requested {
             return FetchCompletion::CancellationRequested;
         }
 
+        active.fetch_id = None;
         if !result_set_exhausted || has_open_batch {
             active.phase = OperationPhase::Fetching;
         } else {
@@ -327,12 +343,14 @@ impl AsyncConnectionState {
         FetchCompletion::Published
     }
 
-    pub(crate) fn restore_fetch(&self, operation_id: OperationId) {
+    pub(crate) fn restore_fetch(&self, operation_id: OperationId, fetch_id: FetchId) {
         let mut state = self.lock();
         if let Some(active) = state.active_operation.as_mut()
             && active.operation_id == operation_id
+            && active.fetch_id == Some(fetch_id)
             && active.phase == OperationPhase::FetchingRow
         {
+            active.fetch_id = None;
             active.phase = OperationPhase::Fetching;
         }
     }
@@ -341,13 +359,16 @@ impl AsyncConnectionState {
     ///
     /// Session ownership intentionally remains in `FetchingRow`; releasing it
     /// here would let another command race with the background ATTENTION drain.
-    pub(crate) fn cancel_fetch(&self, operation_id: OperationId) -> bool {
+    pub(crate) fn cancel_fetch(&self, operation_id: OperationId, fetch_id: FetchId) -> bool {
         let cancel_handle = {
             let mut state = self.lock();
             let Some(active) = state.active_operation.as_mut() else {
                 return false;
             };
-            if active.operation_id != operation_id || active.phase != OperationPhase::FetchingRow {
+            if active.operation_id != operation_id
+                || active.fetch_id != Some(fetch_id)
+                || active.phase != OperationPhase::FetchingRow
+            {
                 return false;
             }
             active.cancel_requested = true;
@@ -499,7 +520,7 @@ mod tests {
         assert_eq!(state.claim_execute(1).unwrap_err(), ClaimError::Busy);
 
         assert_eq!(
-            state.finish_fetch(fetch.operation_id, false, true),
+            state.finish_fetch(fetch.operation_id, fetch.fetch_id, false, true),
             FetchCompletion::Published
         );
         assert_eq!(
@@ -516,14 +537,19 @@ mod tests {
 
         let current_result_end = state.claim_fetch(1).unwrap();
         assert_eq!(
-            state.finish_fetch(current_result_end.operation_id, true, true),
+            state.finish_fetch(
+                current_result_end.operation_id,
+                current_result_end.fetch_id,
+                true,
+                true,
+            ),
             FetchCompletion::Published
         );
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
 
         let batch_end = state.claim_fetch(1).unwrap();
         assert_eq!(
-            state.finish_fetch(batch_end.operation_id, true, false),
+            state.finish_fetch(batch_end.operation_id, batch_end.fetch_id, true, false,),
             FetchCompletion::Published
         );
         assert!(state.claim_execute(2).is_ok());
@@ -536,9 +562,27 @@ mod tests {
         state.finish_execute(execute.operation_id, true);
         let fetch = state.claim_fetch(1).unwrap();
 
-        state.restore_fetch(fetch.operation_id);
+        state.restore_fetch(fetch.operation_id, fetch.fetch_id);
 
         assert!(state.claim_fetch(1).is_ok());
+    }
+
+    #[test]
+    fn stale_fetch_cancellation_cannot_cancel_the_next_fetch() {
+        let state = AsyncConnectionState::new();
+        let execute = state.claim_execute(1).unwrap();
+        state.finish_execute(execute.operation_id, true);
+        let first = state.claim_fetch(1).unwrap();
+        assert_eq!(
+            state.finish_fetch(first.operation_id, first.fetch_id, false, true),
+            FetchCompletion::Published
+        );
+        let second = state.claim_fetch(1).unwrap();
+
+        assert_eq!(first.operation_id, second.operation_id);
+        assert_ne!(first.fetch_id, second.fetch_id);
+        assert!(!state.cancel_fetch(first.operation_id, first.fetch_id));
+        assert!(state.cancel_fetch(second.operation_id, second.fetch_id));
     }
 
     /// Verifies that cancellation does not release the shared session before
@@ -550,12 +594,12 @@ mod tests {
         state.finish_execute(execute.operation_id, true);
         let fetch = state.claim_fetch(1).unwrap();
 
-        assert!(state.cancel_fetch(fetch.operation_id));
-        assert!(!state.cancel_fetch(fetch.operation_id));
+        assert!(state.cancel_fetch(fetch.operation_id, fetch.fetch_id));
+        assert!(!state.cancel_fetch(fetch.operation_id, fetch.fetch_id));
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
 
         assert_eq!(
-            state.finish_fetch(fetch.operation_id, true, false),
+            state.finish_fetch(fetch.operation_id, fetch.fetch_id, true, false),
             FetchCompletion::CancellationRequested
         );
         assert_eq!(state.claim_execute(2).unwrap_err(), ClaimError::Busy);
@@ -572,7 +616,7 @@ mod tests {
         state.abandon_cursor(1);
 
         assert_eq!(
-            state.finish_fetch(fetch.operation_id, true, false),
+            state.finish_fetch(fetch.operation_id, fetch.fetch_id, true, false),
             FetchCompletion::NoLongerActive
         );
     }

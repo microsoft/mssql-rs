@@ -56,15 +56,29 @@ use tracing::{debug, error, event, info, trace, warn};
 /// PLP), and `total_read` is the cumulative payload bytes consumed across all chunks so far.
 type CompleteBufferedPlp = Option<Option<(usize, Option<u64>, usize)>>;
 
+const MAX_ATTENTION_SETTLEMENT_TOKENS: usize = 1024;
+
 /// Client-visible control tokens consumed while draining to DONE_ATTN.
 ///
 /// The transport has to consume these tokens to realign the wire, but the
 /// client still needs them to update transaction, environment, and recovery
 /// state before the connection can be reused.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct AttentionSettlement {
     /// Ordered control tokens to replay through `TdsClient` state handling.
     pub(crate) tokens: Vec<Tokens>,
+    /// The drain completed, but not all state could be retained safely.
+    pub(crate) overflowed: bool,
+}
+
+impl AttentionSettlement {
+    fn push(&mut self, token: Tokens) {
+        if self.tokens.len() < MAX_ATTENTION_SETTLEMENT_TOKENS {
+            self.tokens.push(token);
+        } else {
+            self.overflowed = true;
+        }
+    }
 }
 
 /// Records why a pending parser read stopped before producing its result.
@@ -1699,23 +1713,23 @@ impl NetworkTransport {
             Tokens::Done(done) => {
                 let acknowledged = done.status.contains(DoneStatus::ATTN);
                 context.metadata = None;
-                settlement.tokens.push(Tokens::Done(done));
+                settlement.push(Tokens::Done(done));
                 acknowledged
             }
             Tokens::DoneProc(done) => {
                 let acknowledged = done.status.contains(DoneStatus::ATTN);
                 context.metadata = None;
-                settlement.tokens.push(Tokens::DoneProc(done));
+                settlement.push(Tokens::DoneProc(done));
                 acknowledged
             }
             Tokens::DoneInProc(done) => {
                 let acknowledged = done.status.contains(DoneStatus::ATTN);
                 context.metadata = None;
-                settlement.tokens.push(Tokens::DoneInProc(done));
+                settlement.push(Tokens::DoneInProc(done));
                 acknowledged
             }
             token => {
-                settlement.tokens.push(token);
+                settlement.push(token);
                 false
             }
         }
@@ -1872,7 +1886,7 @@ impl NetworkTransport {
         first_token: Option<Tokens>,
     ) -> TdsResult<AttentionSettlement> {
         let mut context = self.attention_drain_context(parser_context);
-        let mut settlement = AttentionSettlement { tokens: Vec::new() };
+        let mut settlement = AttentionSettlement::default();
 
         if let Some(token) = first_token
             && Self::apply_attention_token(&mut context, &mut settlement, token)
@@ -6162,6 +6176,18 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attention_settlement_stops_retaining_tokens_at_its_limit() {
+        let mut settlement = AttentionSettlement::default();
+
+        for _ in 0..=MAX_ATTENTION_SETTLEMENT_TOKENS {
+            settlement.push(Tokens::TabName);
+        }
+
+        assert_eq!(settlement.tokens.len(), MAX_ATTENTION_SETTLEMENT_TOKENS);
+        assert!(settlement.overflowed);
     }
 
     /// The drain discards whatever the server was still sending and stops at
