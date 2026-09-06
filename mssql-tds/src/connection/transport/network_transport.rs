@@ -3176,28 +3176,29 @@ pub(crate) mod tests {
         )
     }
 
+    fn plp_varbinary_metadata() -> Arc<ColMetadataToken> {
+        Arc::new(ColMetadataToken {
+            column_count: 1,
+            columns: vec![ColumnMetadata {
+                user_type: 0,
+                flags: 0,
+                type_info: TypeInfo::partial_len(
+                    TdsDataType::BigVarBinary,
+                    usize::from(u16::MAX),
+                    None,
+                )
+                .unwrap(),
+                data_type: TdsDataType::BigVarBinary,
+                column_name: "payload".to_string(),
+                multi_part_name: None,
+                crypto_metadata: None,
+            }],
+            cek_table: vec![],
+        })
+    }
+
     fn plp_varbinary_row_context() -> ParserContext {
-        ParserContext::ColumnMetadata(
-            Arc::new(ColMetadataToken {
-                column_count: 1,
-                columns: vec![ColumnMetadata {
-                    user_type: 0,
-                    flags: 0,
-                    type_info: TypeInfo::partial_len(
-                        TdsDataType::BigVarBinary,
-                        usize::from(u16::MAX),
-                        None,
-                    )
-                    .unwrap(),
-                    data_type: TdsDataType::BigVarBinary,
-                    column_name: "payload".to_string(),
-                    multi_part_name: None,
-                    crypto_metadata: None,
-                }],
-                cek_table: vec![],
-            }),
-            None,
-        )
+        ParserContext::ColumnMetadata(plp_varbinary_metadata(), None)
     }
 
     impl Stream for DuplexStream {
@@ -3270,6 +3271,95 @@ pub(crate) mod tests {
     impl Stream for ErroringStream {
         fn tls_handshake_starting(&mut self) {}
         fn tls_handshake_completed(&mut self) {}
+    }
+
+    struct HookTrackingStream {
+        inner: DuplexStream,
+        events: Arc<Mutex<[bool; 4]>>,
+    }
+
+    impl AsyncRead for HookTrackingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for HookTrackingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            this.events.lock().unwrap()[0] = true;
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            this.events.lock().unwrap()[1] = true;
+            Pin::new(&mut this.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Stream for HookTrackingStream {
+        fn tls_handshake_starting(&mut self) {
+            self.events.lock().unwrap()[2] = true;
+        }
+
+        fn tls_handshake_completed(&mut self) {
+            self.events.lock().unwrap()[3] = true;
+        }
+
+        fn channel_binding_token(&self) -> Option<Vec<u8>> {
+            Some(vec![1, 2, 3])
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_stream_forwards_hooks_and_requires_exclusive_extraction() {
+        let (inner, mut peer) = duplex(MAX_BUFFER_SIZE);
+        let events = Arc::new(Mutex::new([false; 4]));
+        let mut stream = SharedStream::new(Box::new(HookTrackingStream {
+            inner,
+            events: Arc::clone(&events),
+        }));
+
+        stream.write_all(b"x").await.unwrap();
+        let mut byte = [0_u8; 1];
+        peer.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, *b"x");
+
+        peer.write_all(b"y").await.unwrap();
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, *b"y");
+
+        stream.flush().await.unwrap();
+        assert_eq!(stream.channel_binding_token(), Some(vec![1, 2, 3]));
+        stream.tls_handshake_starting();
+        stream.tls_handshake_completed();
+        stream.shutdown().await.unwrap();
+        assert_eq!(*events.lock().unwrap(), [true; 4]);
+
+        let outstanding = stream.clone();
+        let error = stream
+            .into_inner()
+            .err()
+            .expect("a shared stream must not be extracted");
+        assert!(matches!(
+            error,
+            crate::error::Error::ImplementationError(message)
+                if message.contains("still holds it")
+        ));
+        drop(outstanding.into_inner().unwrap());
     }
 
     #[tokio::test]
@@ -5695,6 +5785,24 @@ pub(crate) mod tests {
         done_token_message_with_type(TokenType::Done, status)
     }
 
+    async fn transport_responding_after_attention(
+        first_packet: Vec<u8>,
+        completion_packet: Vec<u8>,
+    ) -> (NetworkTransport, tokio::task::JoinHandle<()>) {
+        let acknowledgement = done_token_message(DoneStatus::ATTN.bits());
+        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
+        peer.write_all(&first_packet).await.unwrap();
+        let transport = build_duplex_transport(client_side);
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&completion_packet).await.unwrap();
+            peer.write_all(&acknowledgement).await.unwrap();
+        });
+        (transport, peer_task)
+    }
+
     async fn cancel_row_read_after_first_poll(
         first_packet: Vec<u8>,
         completion_packet: Vec<u8>,
@@ -5705,17 +5813,8 @@ pub(crate) mod tests {
             ParserContext::ColumnMetadata(metadata, _) => metadata.columns.len(),
             _ => panic!("row cancellation requires column metadata"),
         };
-        let acknowledgement = done_token_message(DoneStatus::ATTN.bits());
-        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
-        peer.write_all(&first_packet).await.unwrap();
-        let mut transport = build_duplex_transport(client_side);
-        let peer_task = tokio::spawn(async move {
-            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
-            peer.read_exact(&mut attention).await.unwrap();
-            assert_eq!(attention[0], PacketType::Attention as u8);
-            peer.write_all(&completion_packet).await.unwrap();
-            peer.write_all(&acknowledgement).await.unwrap();
-        });
+        let (mut transport, peer_task) =
+            transport_responding_after_attention(first_packet, completion_packet).await;
 
         let parent = CancelHandle::new();
         let child = parent.child_handle();
@@ -6240,6 +6339,101 @@ pub(crate) mod tests {
         assert!(
             !is_known_dead(&transport),
             "the PLP payload was discarded before DONE_ATTN"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_completes_an_interrupted_nbcrow_header() {
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::NbcRow as u8)
+            .build();
+        let completion_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_byte(0)
+            .append_i32(42)
+            .build();
+        let (mut transport, peer_task) =
+            transport_responding_after_attention(first_packet, completion_packet).await;
+        let context = int4_row_context(1);
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+
+        let result = {
+            let mut read =
+                std::pin::pin!(transport.receive_row_header(&context, None, Some(&child),));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "the NBCROW header unexpectedly completed before cancellation"
+            );
+            parent.cancel();
+            timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the interrupted row header did not settle")
+        };
+
+        peer_task.await.unwrap();
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            !is_known_dead(&transport),
+            "finishing the header and row reached DONE_ATTN"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_an_active_plp_before_the_acknowledgement() {
+        let payload = b"active PLP payload";
+        let metadata = plp_varbinary_metadata();
+        let (plp_stream, _) = PlpColumnStream::try_begin_buffered(
+            &metadata.columns[0],
+            &u64::try_from(payload.len()).unwrap().to_le_bytes(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut plp_state = PlpPauseState {
+            row_pause_state: RowPauseState {
+                next_column_index: 1,
+                metadata,
+                nbc_null_bitmap: None,
+                decryptor: None,
+            },
+            plp_stream: plp_stream.unwrap(),
+        };
+        let completion_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_u32(u32::try_from(payload.len()).unwrap())
+            .append_bytes(payload)
+            .append_u32(0)
+            .build();
+        let (mut transport, peer_task) =
+            transport_responding_after_attention(Vec::new(), completion_packet).await;
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        let mut out = [0_u8; 1];
+
+        let result = {
+            let mut read = std::pin::pin!(transport.read_active_plp_bytes(
+                &mut plp_state,
+                None,
+                Some(&child),
+                &mut out,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "the PLP read unexpectedly completed before cancellation"
+            );
+            parent.cancel();
+            timeout(Duration::from_secs(5), read)
+                .await
+                .expect("the interrupted PLP read did not settle")
+        };
+
+        peer_task.await.unwrap();
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(plp_state.reached_end());
+        assert!(
+            !is_known_dead(&transport),
+            "draining the active PLP reached DONE_ATTN"
         );
     }
 }

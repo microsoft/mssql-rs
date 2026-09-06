@@ -10871,6 +10871,52 @@ mod tests {
     }
 
     #[test]
+    fn attention_settlement_replays_connection_level_side_effects() {
+        use crate::token::tokens::{
+            EnvChangeContainer, EnvChangeToken, EnvChangeTokenSubType, ErrorToken,
+            SessionStateToken,
+        };
+
+        let mut client = create_test_client();
+        client.prepared_handles.insert(sid(1), 27);
+        let tokens = [
+            Tokens::Error(ErrorToken {
+                number: 21,
+                state: 1,
+                severity: FATAL_ERROR_SEVERITY,
+                message: "fatal server error".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            info_token(50_000, 10, "attention warning"),
+            Tokens::EnvChange(EnvChangeToken {
+                sub_type: EnvChangeTokenSubType::ResetConnection,
+                change_type: EnvChangeContainer::from((0u32, 0u32)),
+            }),
+            Tokens::SessionState(SessionStateToken {
+                sequence_number: u32::MAX,
+                status: 0,
+                states: Vec::new(),
+            }),
+        ];
+
+        for token in tokens {
+            client.apply_attention_side_effect(token).unwrap();
+        }
+
+        assert!(client.transport.connection_known_dead());
+        assert_eq!(client.info_messages()[0].message, "attention warning");
+        assert!(client.prepared_handles.is_empty());
+        assert!(
+            client
+                .recovery_context
+                .session_state_table
+                .master_recovery_disabled
+        );
+    }
+
+    #[test]
     fn finalize_return_value_decrypts_null_output() {
         // A NULL encrypted output parameter decrypts to NULL without invoking the
         // cipher.
