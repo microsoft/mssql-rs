@@ -1916,6 +1916,29 @@ mod tests {
         }
     }
 
+    /// A literal with no offset against a `datetimeoffset` target takes
+    /// `+00:00` rather than failing for want of one, matching
+    /// `CAST('2024-05-20 12:34:56' AS datetimeoffset)`. The wall clock is
+    /// already UTC then, so nothing is folded.
+    #[test]
+    fn a_character_datetimeoffset_literal_without_an_offset_defaults_to_utc() {
+        let (value, _) =
+            convert_datetime_text(SQL_C_CHAR, SQL_SS_TIMESTAMPOFFSET, 0, "2024-05-20 12:34:56")
+                .unwrap();
+        match value {
+            SqlType::DateTimeOffset(Some(v)) => {
+                assert_eq!(v.offset, 0);
+                let ticks = 12 * 36_000_000_000u64 + 34 * 600_000_000 + 56 * 10_000_000;
+                assert_eq!(v.datetime2.time.time_nanoseconds, ticks);
+                assert_eq!(
+                    v.datetime2.days,
+                    u32::try_from(days_since_0001_from_civil(2024, 5, 20).unwrap()).unwrap()
+                );
+            }
+            other => panic!("expected DateTimeOffset, got {other:?}"),
+        }
+    }
+
     /// `DecimalDigits` bounds the value even though the declaration is always at
     /// maximum scale, exactly as it does for the struct path.
     #[test]

@@ -1426,6 +1426,28 @@ mod tests {
         assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
     }
 
+    /// The offset bound is on the total, so `+14:30` fails here too even though
+    /// the target never reads the offset back out. AB#47851 moved this rule
+    /// into the shared parser; before that the fetch direction bounded hours
+    /// and minutes independently and converted this literal. No SQL Server
+    /// `datetimeoffset` renders such a value, so only a character column can
+    /// carry one to this path.
+    #[test]
+    fn an_out_of_range_offset_is_rejected_for_non_offset_targets() {
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-01-01 12:34:56+14:30"),
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::InvalidCharacterValue);
+    }
+
     /// Digits that overflow `f64` are out of range, not unparseable text.
     /// `f64::from_str` folds both into `Ok(inf)`, so they have to be split.
     #[test]

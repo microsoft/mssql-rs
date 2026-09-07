@@ -1004,12 +1004,20 @@ TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
 }
 
 // The offset has to survive as an offset rather than being folded into the
-// wall clock and lost.
+// wall clock and lost. A literal that omits one takes +00:00, matching
+// CONVERT(datetimeoffset, '2024-05-20 12:34:56'); the compare leg adjudicates
+// that default against msodbcsql.
 TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralKeepsItsOffset) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56+05:30", 0, 0),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-05-20 12:34:56.0000000 +05:30", ExecuteAndReadBack());
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56", 0, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 12:34:56.0000000 +00:00", ExecuteAndReadBack());
 }
 
 // A date-only literal supplies midnight rather than failing for want of a time.
