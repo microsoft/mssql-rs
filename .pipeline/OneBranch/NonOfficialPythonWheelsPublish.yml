@@ -1,7 +1,7 @@
 #################################################################################
 #                        OneBranch Pipelines - NonOfficial                      #
-# Builds Python wheels from PyO3 bindings across 5 platforms and packages      #
-# them into a NuGet archive published to Azure Artifacts.                      #
+# Builds Python wheels and Rust crates. Packages the wheels into a NuGet       #
+# archive published to Azure Artifacts and retains crates as build artifacts.  #
 # Documentation:  https://aka.ms/obpipelines                                    #
 # Yaml Schema:    https://aka.ms/obpipelines/yaml/schema                        #
 # Retail Tasks:   https://aka.ms/obpipelines/tasks                              #
@@ -76,5 +76,6 @@ extends:
         buildAllTargets: true
         buildPythonWheels: true
         buildOdbcNative: ${{ parameters.buildOdbcNative }}
+        buildRustCrates: true
         isOfficial: false
         publishToFeed: ${{ parameters.publishToFeed }}
