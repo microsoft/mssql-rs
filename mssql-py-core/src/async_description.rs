@@ -58,7 +58,7 @@ pub(crate) async fn materialize(
 }
 
 fn python_type<'py>(py: Python<'py>, metadata: &ColumnMetadata) -> PyResult<Bound<'py, PyType>> {
-    let python_type = match metadata.data_type {
+    let python_type = match metadata.effective_data_type() {
         TdsDataType::Int1
         | TdsDataType::Int2
         | TdsDataType::Int4
@@ -115,12 +115,12 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         return 0;
     }
 
-    match metadata.data_type {
+    match metadata.effective_data_type() {
         TdsDataType::Int1 => 3,
         TdsDataType::Int2 => 5,
         TdsDataType::Int4 => 10,
         TdsDataType::Int8 => 19,
-        TdsDataType::IntN => match metadata.type_info.length {
+        TdsDataType::IntN => match metadata.effective_type_info().length {
             1 => 3,
             2 => 5,
             4 => 10,
@@ -130,7 +130,7 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         TdsDataType::Bit | TdsDataType::BitN => 1,
         TdsDataType::Flt4 => 7,
         TdsDataType::Flt8 => 15,
-        TdsDataType::FltN => match metadata.type_info.length {
+        TdsDataType::FltN => match metadata.effective_type_info().length {
             4 => 7,
             8 => 15,
             _ => 0,
@@ -142,7 +142,7 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         }
         TdsDataType::DateTime => 23,
         TdsDataType::DateTim4 => 16,
-        TdsDataType::DateTimeN => match metadata.type_info.length {
+        TdsDataType::DateTimeN => match metadata.effective_type_info().length {
             8 => 23,
             4 => 16,
             _ => 0,
@@ -163,18 +163,18 @@ fn column_size(metadata: &ColumnMetadata) -> u64 {
         | TdsDataType::Money4
         | TdsDataType::MoneyN => u64::from(metadata.get_precision().unwrap_or(0)),
         TdsDataType::NChar | TdsDataType::NVarChar | TdsDataType::NText => {
-            (metadata.type_info.length / 2) as u64
+            (metadata.effective_type_info().length / 2) as u64
         }
-        _ => metadata.type_info.length as u64,
+        _ => metadata.effective_type_info().length as u64,
     }
 }
 
 fn decimal_digits(metadata: &ColumnMetadata) -> u8 {
-    match metadata.data_type {
+    match metadata.effective_data_type() {
         TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => 4,
         TdsDataType::DateTime => 3,
         TdsDataType::DateTim4 => 0,
-        TdsDataType::DateTimeN => match metadata.type_info.length {
+        TdsDataType::DateTimeN => match metadata.effective_type_info().length {
             8 => 3,
             _ => 0,
         },
