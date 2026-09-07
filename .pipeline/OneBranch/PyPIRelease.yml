@@ -68,59 +68,83 @@ extends:
 
     stages:
     #########################################################################
-    # One stage, two jobs. The stub sdist is prebuilt and committed under
+    # The stub sdist is prebuilt and committed under
     # .pipeline/pypi-stub/dist/, so the pipeline builds nothing: the sealed
-    # OneBranch container has no Python and no outbound network. OneBranch
-    # auto-uploads whatever lands in ob_outputDirectory (no publish task).
+    # OneBranch container has no Python and no outbound network. Dry runs use
+    # the same release job and verification path without invoking ESRP.
     #########################################################################
     - stage: ReleaseStub
       displayName: 'Publish mssql-python-rs stub'
       jobs:
-      #####################################################################
-      # Job 1 (always): verify the committed stub sdist. On a default (dry)
-      # run this is the only job, so a green run proves the pipeline compiles
-      # and the ESRP variable group authorizes, without publishing anything.
-      #####################################################################
-      - job: VerifyStub
-        displayName: 'Verify committed stub sdist'
+      - job: PyPIRelease
+        displayName: 'Verify and publish stub sdist'
+        templateContext:
+          type: releaseJob
+          isProduction: true
         pool:
           type: windows
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
         steps:
+        - checkout: self
+
+        - ${{ if eq(parameters.publishToPyPI, true) }}:
+          - pwsh: |
+              if ("$(Build.SourceBranch)" -ne 'refs/heads/main') {
+                throw 'PyPI publishing is allowed only from refs/heads/main.'
+              }
+            displayName: 'Require main branch for publish'
+
         - pwsh: |
             $ErrorActionPreference = 'Stop'
-            $distDir = "$(Build.SourcesDirectory)/.pipeline/pypi-stub/dist"
-            $sdists = @(Get-ChildItem "$distDir" -Filter 'mssql_python_rs-*.tar.gz' -ErrorAction SilentlyContinue)
-            if ($sdists.Count -ne 1) {
-              Write-Error "Expected exactly one committed stub sdist under $distDir, found $($sdists.Count)."
-              exit 1
-            }
-            $sdists | Format-Table Name, Length
-            # Surface the sdist as a pipeline artifact via ob_outputDirectory.
-            Copy-Item $sdists[0].FullName -Destination "$(Build.ArtifactStagingDirectory)/" -Force
-          displayName: 'Verify committed stub sdist'
+            $sourceRoot = "$(Build.SourcesDirectory)/.pipeline/pypi-stub"
+            $dist = Join-Path $sourceRoot 'dist'
+            $stage = "$(Agent.TempDirectory)/pypi-publish"
+            $extract = "$(Agent.TempDirectory)/pypi-verify"
+            Remove-Item $stage, $extract -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $stage, $extract | Out-Null
 
-      #####################################################################
-      # Job 2 (gated): publish the committed stub sdist to PyPI via ESRP. The
-      # repo is checked out, so ESRP reads the sdist straight from source — no
-      # Python, pip, build, or download needed on the sealed pool. Runs ONLY
-      # when publishToPyPI is true.
-      #####################################################################
-      - ${{ if eq(parameters.publishToPyPI, true) }}:
-        - job: PublishToPyPI
-          displayName: 'ESRP release to PyPI'
-          dependsOn: VerifyStub
-          condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-          templateContext:
-            type: releaseJob
-            isProduction: true
-          pool:
-            type: windows
-          variables:
-            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-            WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
-          steps:
+            $sdists = @(Get-ChildItem $dist -Filter 'mssql_python_rs-*.tar.gz' -File)
+            if ($sdists.Count -ne 1) {
+              throw "Expected exactly one stub sdist, found $($sdists.Count)."
+            }
+
+            tar.exe -xzf $sdists[0].FullName -C $extract
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the stub sdist.' }
+            $archiveRoot = @(Get-ChildItem $extract -Directory)
+            if ($archiveRoot.Count -ne 1) { throw 'Expected one root directory in the stub sdist.' }
+
+            $pyproject = Get-Content (Join-Path $sourceRoot 'pyproject.toml') -Raw
+            $expectedName = [regex]::Match($pyproject, '(?m)^name\s*=\s*"([^"]+)"').Groups[1].Value
+            $expectedVersion = [regex]::Match($pyproject, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+            $init = Get-Content (Join-Path $sourceRoot 'mssql_python_rs/__init__.py') -Raw
+            $initVersion = [regex]::Match($init, '(?m)^__version__\s*=\s*"([^"]+)"').Groups[1].Value
+            if (-not $expectedName -or -not $expectedVersion -or $initVersion -ne $expectedVersion) {
+              throw 'Tracked package name/version metadata is missing or inconsistent.'
+            }
+
+            $pkgInfo = Get-Content (Join-Path $archiveRoot[0].FullName 'PKG-INFO') -Raw
+            $archiveName = [regex]::Match($pkgInfo, '(?m)^Name:\s*(.+)\r?$').Groups[1].Value.Trim()
+            $archiveVersion = [regex]::Match($pkgInfo, '(?m)^Version:\s*(.+)\r?$').Groups[1].Value.Trim()
+            if ($archiveName -ne $expectedName -or $archiveVersion -ne $expectedVersion) {
+              throw "Archive metadata $archiveName $archiveVersion does not match $expectedName $expectedVersion."
+            }
+
+            function Read-Normalized([string] $path) {
+              return (Get-Content $path -Raw).Replace("`r`n", "`n")
+            }
+            $trackedFiles = @('LICENSE', 'README.md', 'pyproject.toml', 'mssql_python_rs/__init__.py')
+            foreach ($relativePath in $trackedFiles) {
+              $tracked = Read-Normalized (Join-Path $sourceRoot $relativePath)
+              $archived = Read-Normalized (Join-Path $archiveRoot[0].FullName $relativePath)
+              if ($tracked -cne $archived) { throw "Archive payload differs from tracked $relativePath." }
+            }
+
+            Copy-Item $sdists[0].FullName $stage
+          displayName: 'Verify and stage stub sdist'
+
+        - ${{ if eq(parameters.publishToPyPI, true) }}:
           # ContentType PyPI: the real publish. The first PyPI publish of
           # mssql-python-rs creates and reserves the project name.
           - task: EsrpRelease@9
@@ -134,7 +158,7 @@ extends:
               Intent: 'PackageDistribution'
               ContentType: 'PyPI'
               ContentSource: 'Folder'
-              FolderLocation: '$(Build.SourcesDirectory)/.pipeline/pypi-stub/dist'
+              FolderLocation: '$(Agent.TempDirectory)/pypi-publish'
               WaitForReleaseCompletion: true
               Owners: '$(owner)'
               Approvers: '$(approver)'
