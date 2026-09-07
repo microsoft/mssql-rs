@@ -385,17 +385,24 @@ pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
 /// Returns `None` when applying the offset falls outside the TDS date range.
 pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateTimeParts> {
     // The wire value is UTC; ODBC returns the local wall clock obtained by
-    // applying the stored offset.
-    let utc_ticks = datetime.datetime2.time.time_nanoseconds as i64
-        + i64::from(datetime.offset) * 60 * 10_000_000;
-    let days = i64::from(datetime.datetime2.days) + utc_ticks.div_euclid(TICKS_PER_DAY);
-    if !(0..=MAX_DAYS_SINCE_0001).contains(&days) {
+    // applying the stored offset. Compute in i128: a corrupt or hostile server
+    // can decode a `time_nanoseconds` far outside a single day, because the TDS
+    // decoder takes the time-field width from the row's length byte and the
+    // scale from the column metadata without cross-checking them, so
+    // `scale_time_value` can inflate a 5-byte value past the i64 range. The
+    // day-range check below then rejects any such unrepresentable value as
+    // `None` instead of overflowing the addition.
+    let ticks_per_day = i128::from(TICKS_PER_DAY);
+    let utc_ticks = i128::from(datetime.datetime2.time.time_nanoseconds)
+        + i128::from(datetime.offset) * 60 * 10_000_000;
+    let days = i128::from(datetime.datetime2.days) + utc_ticks.div_euclid(ticks_per_day);
+    if !(0..=i128::from(MAX_DAYS_SINCE_0001)).contains(&days) {
         return None;
     }
 
-    let (year, month, day) = civil_from_days_since_0001(days);
+    let (year, month, day) = civil_from_days_since_0001(days as i64);
     let (hour, minute, second, fraction_ns) =
-        hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
+        hms_from_ticks_100ns(utc_ticks.rem_euclid(ticks_per_day) as u64);
     Some(DateTimeParts {
         year,
         month,
@@ -529,7 +536,7 @@ fn days_in_month(year: i16, month: u16) -> u16 {
 }
 
 /// Parses `YYYY-MM-DD`.
-fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
+pub(crate) fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
     let mut it = s.split('-');
     let (y, m, d) = (it.next()?, it.next()?, it.next()?);
     if it.next().is_some() || y.len() != 4 {
@@ -561,7 +568,7 @@ fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
 
 /// Parses `HH:MM[:SS[.f{1,9}]]`, returning the components plus the number of
 /// fractional digits supplied (the effective scale).
-fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
+pub(crate) fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
     let mut it = s.split(':');
     let hour_s = it.next()?;
     let minute_s = it.next()?;
@@ -611,7 +618,7 @@ fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
 
 /// Parses the character forms of `date`, `time`, `datetime2` and
 /// `datetimeoffset` into [`DateTimeParts`].
-fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
+pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
     let mut s = text.trim();
     let mut p = DateTimeParts::default();
 
@@ -2279,6 +2286,37 @@ mod tests {
                         },
                     },
                     offset: -60,
+                }),
+                SQL_C_SS_TIMESTAMPOFFSET,
+                (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::Restricted);
+    }
+
+    #[test]
+    fn datetimeoffset_overflowing_time_is_rejected_not_panicked() {
+        use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlDateTimeOffset, SqlTime};
+        // A corrupt/hostile server can decode a `time_nanoseconds` near the i64
+        // ceiling (the decoder derives the time width from the row length byte,
+        // not the column scale). Applying a positive offset used to overflow the
+        // i64 tick addition and panic across the FFI boundary; it must now be
+        // rejected as an out-of-range conversion instead.
+        let mut out = SqlSsTimestampoffsetStruct::default();
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_datetime_c(
+                &ColumnValues::DateTimeOffset(SqlDateTimeOffset {
+                    datetime2: SqlDateTime2 {
+                        days: 0,
+                        time: SqlTime {
+                            time_nanoseconds: i64::MAX as u64,
+                            scale: 7,
+                        },
+                    },
+                    offset: 60,
                 }),
                 SQL_C_SS_TIMESTAMPOFFSET,
                 (&mut out as *mut SqlSsTimestampoffsetStruct).cast(),
