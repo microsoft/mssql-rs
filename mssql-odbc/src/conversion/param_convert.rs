@@ -1876,6 +1876,27 @@ mod tests {
         }
     }
 
+    /// A separator with no time after it names no time, so it is `22018` on
+    /// every target rather than a date-only literal. The time targets rejected
+    /// it on `!has_time` alone; `date` and `timestamp` read the date and
+    /// ignored the dangling separator, which is why this loops over all five.
+    #[test]
+    fn a_dangling_separator_is_22018_for_every_temporal_target() {
+        for sql_type in [
+            SQL_TYPE_DATE,
+            SQL_TYPE_TIME,
+            SQL_SS_TIME2,
+            SQL_TYPE_TIMESTAMP,
+            SQL_SS_TIMESTAMPOFFSET,
+        ] {
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, sql_type, 0, "2024-05-20T").unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "sql_type {sql_type}"
+            );
+        }
+    }
+
     /// Both character C types must reach the same value on every temporal
     /// target; a difference by width would be a defect in the decode.
     #[test]

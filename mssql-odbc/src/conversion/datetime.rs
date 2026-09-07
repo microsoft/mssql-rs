@@ -251,6 +251,10 @@ pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
         s = s[..s.len() - 6].trim_end();
     }
 
+    // An empty right-hand side is left for `parse_time_literal` to reject
+    // rather than filtered out below: dropping it would make a dangling
+    // separator such as `2024-05-20T` parse as a date-only literal and bind
+    // against a date or timestamp target.
     let (date_str, time_str) = match s.split_once(['T', ' ']) {
         Some((d, t)) => (Some(d), Some(t.trim())),
         None if s.contains(':') => (None, Some(s)),
@@ -264,7 +268,7 @@ pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
         p.day = day;
         p.has_date = true;
     }
-    if let Some(t) = time_str.filter(|t| !t.is_empty()) {
+    if let Some(t) = time_str {
         let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
         p.hour = h;
         p.minute = mi;
@@ -438,6 +442,11 @@ mod tests {
             "2024-05-20 12:34:56.1234567890",
             "2024-05-20 12:34:56:78",
             "2024-05-20-01",
+            // A separator with nothing after it names no time. Dropping the
+            // empty right-hand side instead would let these bind against a
+            // date or timestamp target as if the separator were not there.
+            "2024-05-20T",
+            "2024-05-20T   ",
         ] {
             assert_eq!(parse_datetime_literal(bad), None, "{bad:?} was accepted");
         }
