@@ -17,6 +17,7 @@ use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
     finish_execute, park_dae_client, query_timeout_expired_error, snapshot_bound_params,
 };
+use super::param_array::{self, ArrayExec, ParamArray, execute_rows};
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
@@ -101,6 +102,19 @@ struct DaeExecution {
 enum ExecutionStaging {
     Ready(Execution),
     NeedData(DaeExecution),
+    Array(ArrayExecution),
+}
+
+/// Values gathered when `SQL_ATTR_PARAMSET_SIZE` selects more than one
+/// parameter set. The per-row parameter lists are not built here: each row is
+/// converted immediately before it is sent, so an array of `N` rows never holds
+/// `N` converted copies at once.
+struct ArrayExecution {
+    prepared: PreparedPlan,
+    orphaned: Option<StatementId>,
+    query_timeout: u32,
+    marker_count: usize,
+    array: ParamArray,
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
@@ -216,6 +230,69 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             }
 
             finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
+        }
+
+        ExecutionStaging::Array(ArrayExecution {
+            mut prepared,
+            mut orphaned,
+            query_timeout,
+            marker_count,
+            array,
+        }) => {
+            let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
+                Ok(client) => client,
+                Err(rc) => {
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    return rc;
+                }
+            };
+            let started = Instant::now();
+
+            if let Err(e) =
+                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
+            {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.prepared = Some(prepared);
+                    stmt_state.pending_unprepare = orphaned;
+                }
+                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+            }
+
+            // One budget for the whole call: `started` is fixed and every row
+            // is charged the cumulative elapsed time, so a long array cannot
+            // outlive SQL_ATTR_QUERY_TIMEOUT by restarting it per row.
+            let ctx = ArrayExec {
+                dbc,
+                stmt,
+                array: &array,
+                marker_count,
+                budget: query_timeout,
+                started,
+                op: "SQLExecute",
+            };
+            let outcome = unsafe {
+                execute_rows(&ctx, &mut client, |client, params, remaining| {
+                    // The first set prepares (sp_prepexec) and every later set
+                    // reuses the handle it returned (sp_execute), so an N-set
+                    // array costs one prepare, not N.
+                    dbc.runtime.block_on(client.execute_prepared(
+                        &mut prepared.stmt,
+                        params,
+                        &mut orphaned,
+                        ExecuteOptions::new().timeout_secs(remaining),
+                    ))
+                })
+            };
+
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.prepared = Some(prepared);
+                stmt_state.pending_unprepare = orphaned;
+            }
+
+            param_array::finish(dbc, stmt, statement_handle, client, &outcome, "SQLExecute")
         }
 
         ExecutionStaging::NeedData(DaeExecution {
@@ -398,18 +475,10 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         .expect("prepared checked non-None above")
         .marker_count;
 
-    // P1 stores parameter-array layout but does not execute its rows. Refuse
-    // parameterized execution until AB#47820 consumes `paramset_size`;
-    // succeeding here would send only row zero and silently discard the rest
-    // of the batch. Parameterless statements have no array rows to discard.
-    if marker_count > 0 && stmt_state.paramset_size > 1 {
-        error!(
-            paramset_size = stmt_state.paramset_size,
-            "SQLExecute: parameter-array execution is not implemented"
-        );
-        post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
-        return Err(SQL_ERROR);
-    }
+    // A parameter array only means anything to a statement that has parameters;
+    // a parameterless statement has no rows to iterate and executes once.
+    let is_array = marker_count > 0 && stmt_state.paramset_size > 1;
+    let array = ParamArray::from_state(&stmt_state);
 
     // All state-sequencing checks passed: this is a real new execute, so the
     // fresh snapshot now becomes the one `build_named_params` and any DAE
@@ -418,8 +487,15 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
 
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
-    let ParamsWithDae { params, dae_params } =
-        unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
+    // The array path converts each row separately, immediately before sending.
+    let staged_params = if is_array {
+        None
+    } else {
+        // Written before the set is converted, so a binding failure below still
+        // leaves the caller's counter at 1 (msodbcsql parity).
+        param_array::publish_scalar_processed(&stmt_state);
+        Some(unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?)
+    };
 
     // All fallible validation passed: move the prepared plan out (written
     // back after the execute) and take any orphaned handle for piggyback drop.
@@ -435,6 +511,16 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     stmt_state.row_count = -1;
     stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+
+    let Some(ParamsWithDae { params, dae_params }) = staged_params else {
+        return Ok(ExecutionStaging::Array(ArrayExecution {
+            prepared,
+            orphaned,
+            query_timeout,
+            marker_count,
+            array,
+        }));
+    };
 
     if dae_params.is_empty() {
         Ok(ExecutionStaging::Ready(Execution {
@@ -571,8 +657,12 @@ mod tests {
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
+    /// A parameter array is no longer refused up front (AB#47820): it stages
+    /// like any other execute and fails only where a scalar execute would, at
+    /// the connection claim. The prepared plan must survive that failure so the
+    /// array can be retried.
     #[test]
-    fn parameter_array_execute_is_rejected_before_staging() {
+    fn parameter_array_execute_reaches_the_connection_and_stays_retryable() {
         let h = TestHandles::with_env_dbc_stmt();
         set_prepared(h.stmt, "SELECT ?");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
@@ -582,16 +672,35 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
 
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records.len(), 1);
         assert_eq!(
-            state.diag_records[0].sql_state,
-            ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED.state
+            state.diag_records[0].sql_state, ERR_CONNECTION_DOES_NOT_EXIST.state,
+            "the array path must fail at the claim, not with HYC00"
         );
         assert!(
             state.prepared.is_some(),
             "prepared plan must remain retryable"
         );
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    /// Staging an array must not read the application's value buffers: they are
+    /// converted per row, immediately before each row is sent. An unbound
+    /// marker is therefore still 07002, but only once a row is built.
+    #[test]
+    fn array_staging_defers_parameter_conversion() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "SELECT ?");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().paramset_size = 3;
+
+        let staging = stage_execution(stmt).expect("array staging succeeds without bindings");
+        match staging {
+            ExecutionStaging::Array(e) => {
+                assert_eq!(e.marker_count, 1);
+                assert_eq!(e.array.paramset_size, 3);
+            }
+            _ => panic!("expected Array staging"),
+        }
     }
 
     #[test]
@@ -670,6 +779,7 @@ mod tests {
         let (exec_prepared_sql, exec_orphaned) = match staging {
             ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
             ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+            ExecutionStaging::Array(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
         };
         assert_eq!(exec_orphaned, Some(orphan));
         assert_eq!(exec_prepared_sql, "SELECT 1");
@@ -692,6 +802,7 @@ mod tests {
         let (exec_prepared_sql, exec_orphaned) = match staging {
             ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
             ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+            ExecutionStaging::Array(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
         };
         assert_eq!(exec_orphaned, None);
         assert_eq!(exec_prepared_sql, "SELECT 1");
@@ -713,6 +824,7 @@ mod tests {
         let query_timeout = match staging {
             ExecutionStaging::Ready(e) => e.query_timeout,
             ExecutionStaging::NeedData(e) => e.query_timeout,
+            ExecutionStaging::Array(e) => e.query_timeout,
         };
         assert_eq!(query_timeout, 42);
     }
@@ -730,6 +842,7 @@ mod tests {
         let query_timeout = match staging {
             ExecutionStaging::Ready(e) => e.query_timeout,
             ExecutionStaging::NeedData(e) => e.query_timeout,
+            ExecutionStaging::Array(e) => e.query_timeout,
         };
         assert_eq!(query_timeout, 0);
     }
@@ -875,6 +988,7 @@ mod tests {
                 assert_eq!(dae.params.len(), 1, "one param in list");
             }
             ExecutionStaging::Ready(_) => panic!("expected NeedData staging for DAE param"),
+            ExecutionStaging::Array(_) => panic!("expected NeedData staging for DAE param"),
         }
     }
 }

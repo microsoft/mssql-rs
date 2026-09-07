@@ -21,8 +21,8 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_ATTR_PARAM_BIND_TYPE, SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET,
-    SQL_NEED_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
 };
 use crate::conversion::param_convert::{
     ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
@@ -607,6 +607,26 @@ pub(super) unsafe fn build_named_params(
     marker_count: usize,
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
+    unsafe { build_named_params_for_row(stmt_state, marker_count, 0, op) }
+}
+
+/// [`build_named_params`] for one row of a parameter array.
+///
+/// `row` selects the parameter set: every binding is positioned with
+/// [`BoundParam::for_row`], which applies `SQL_ATTR_PARAM_BIND_OFFSET_PTR` once
+/// and then the column-wise or row-wise stride. Row 0 is the scalar case and
+/// needs no stride at all, so a binding whose C type has no defined array
+/// stride only fails once an array actually walks past it.
+///
+/// # Safety
+/// As [`build_named_params`], with each binding's readable extent additionally
+/// displaced by `row` strides.
+pub(super) unsafe fn build_named_params_for_row(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    row: usize,
+    op: &str,
+) -> Result<ParamsWithDae, SqlReturn> {
     use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
 
     let mut params = Vec::with_capacity(marker_count);
@@ -614,10 +634,7 @@ pub(super) unsafe fn build_named_params(
     // Read once per execution: the attribute holds a pointer, and every
     // binding shifts by the same amount.
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-    let param_bind_type = stmt_state
-        .inert_attrs
-        .get(SQL_ATTR_PARAM_BIND_TYPE)
-        .unwrap_or_default();
+    let param_bind_type = stmt_state.inert_attrs.param_bind_type();
 
     for i in 0..marker_count {
         let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
@@ -625,12 +642,20 @@ pub(super) unsafe fn build_named_params(
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
-        // Row zero is the scalar execution path. Positioning it through the
-        // same API as parameter arrays keeps bind-offset ownership in one
-        // place and makes the data-at-execution check see the shifted pointer.
-        let bound_param = bound_param
-            .for_row(0, bind_offset, param_bind_type)
-            .expect("row zero does not require an array stride");
+        // Scalar execution is row zero. Positioning every execution through the
+        // same API keeps bind-offset ownership in one place and makes the
+        // data-at-execution check below see the shifted pointer.
+        let bound_param = match bound_param.for_row(row, bind_offset, param_bind_type) {
+            Ok(positioned) => positioned,
+            Err(e) => {
+                error!(
+                    "{op}: parameter {} has no usable array stride: {e:?}",
+                    i + 1
+                );
+                post_diag(stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                return Err(SQL_ERROR);
+            }
+        };
 
         let name = format!("@P{}", i + 1);
 

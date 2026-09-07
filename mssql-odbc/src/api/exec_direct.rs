@@ -14,6 +14,7 @@ use super::exec_common::{
     finish_execute, flush_pending_unprepare, park_dae_client, query_timeout_expired_error,
     snapshot_bound_params,
 };
+use super::param_array::{self, ArrayExec, ParamArray, execute_rows};
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use super::util::{read_utf16, rewrite_param_markers};
@@ -129,7 +130,7 @@ fn sql_exec_direct_w_safe(
     };
 
     // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count, query_timeout) = {
+    let (named_params, array, rewritten_sql, marker_count, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -150,23 +151,26 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         }
         let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
-        if marker_count > 0 && stmt_state.paramset_size > 1 {
-            error!(
-                paramset_size = stmt_state.paramset_size,
-                "SQLExecDirectW: parameter-array execution is not implemented"
-            );
-            post_diag(&mut stmt_state, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
-            return SQL_ERROR;
-        }
+        // A parameter array only means anything to a statement that has
+        // parameters; a parameterless statement has no rows to iterate.
+        let is_array = marker_count > 0 && stmt_state.paramset_size > 1;
+        let array = ParamArray::from_state(&stmt_state);
         stmt_state.bound_params = bound_params;
         // Rewrite markers and read the bound parameter buffers before mutating
         // any state, so a binding error (07002 / HYC00) leaves the statement
-        // unchanged.
-        let named_params =
+        // unchanged. The array path converts each row immediately before
+        // sending it, so nothing is read here.
+        let named_params = if is_array {
+            None
+        } else {
+            // Written before the set is converted, so a binding failure below
+            // still leaves the caller's counter at 1 (msodbcsql parity).
+            param_array::publish_scalar_processed(&stmt_state);
             match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
-                Ok(params) => params,
+                Ok(params) => Some(params),
                 Err(rc) => return rc,
-            };
+            }
+        };
         // A new execute invalidates prior metadata/context immediately, so a
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -183,13 +187,68 @@ fn sql_exec_direct_w_safe(
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         (
             named_params,
+            array,
             rewritten_sql,
             marker_count,
             stmt_state.query_timeout,
         )
     };
 
-    let ParamsWithDae { params, dae_params } = named_params;
+    // Parameter-array execution: one sp_executesql RPC per parameter set, all
+    // sharing this call's connection claim, transaction, and timeout budget.
+    if named_params.is_none() {
+        let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
+            Ok(client) => client,
+            Err(rc) => return rc,
+        };
+        let started = Instant::now();
+        flush_pending_unprepare(dbc, stmt, &mut client, "SQLExecDirectW", query_timeout);
+
+        let remaining = match deduct_query_timeout(query_timeout, started.elapsed()) {
+            Ok(remaining) => remaining,
+            Err(()) => {
+                return fail_with_tds(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    client,
+                    &query_timeout_expired_error(),
+                );
+            }
+        };
+        if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLExecDirectW", remaining) {
+            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+        }
+
+        let ctx = ArrayExec {
+            dbc,
+            stmt,
+            array: &array,
+            marker_count,
+            budget: query_timeout,
+            started,
+            op: "SQLExecDirectW",
+        };
+        let outcome = unsafe {
+            execute_rows(&ctx, &mut client, |client, params, remaining| {
+                dbc.runtime.block_on(client.execute_sp_executesql(
+                    rewritten_sql.clone(),
+                    params,
+                    ExecuteOptions::new().timeout_secs(remaining),
+                ))
+            })
+        };
+        return param_array::finish(
+            dbc,
+            stmt,
+            statement_handle,
+            client,
+            &outcome,
+            "SQLExecDirectW",
+        );
+    }
+
+    let ParamsWithDae { params, dae_params } = named_params.expect("array path returned above");
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
@@ -518,8 +577,8 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1, "stale record must be cleared");
         assert_eq!(
-            state.diag_records[0].sql_state,
-            ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED.state
+            state.diag_records[0].sql_state, ERR_CONNECTION_DOES_NOT_EXIST.state,
+            "the array path must fail at the claim, not with HYC00"
         );
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }

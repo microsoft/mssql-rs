@@ -72,8 +72,8 @@
 //   46e.ParamsetSizeGetSupportsLengthOnlyQuery         - null output is valid
 //   46f.ParamsetSizeIsIsolatedPerStatement             - no handle state bleed
 //   46g.ParamsetSizeSurvivesResetParams                - statement attribute lifetime
-//   46h.ParamsetSizeAboveOneBlocksExecuteUntilP2        - never drop rows silently
-//   46i.ParameterlessStatementsIgnoreParamsetSize       - no array without markers
+//   46h.ParamsetSizeAboveOneExecutesEverySet           - AB#47820 delivered
+//   46i.ParameterlessStatementsIgnoreParamsetSize      - no array without markers
 //
 // SQL Server vendor statement attributes (SQL_SOPT_SS_*):
 //   47. VendorStatementAttributeDefaultsMatchMsodbcsql - four defaults are not 0
@@ -1445,12 +1445,12 @@ TEST_F(AttributesTest, ParamsetSizeSurvivesResetParams) {
 }
 
 // -------------------------------------------------------------------
-// 46h. P1 stores the array contract but AB#47820 owns row execution.
-// Until that lands, prepared and direct execution must fail before sending
-// row zero rather than report success after silently dropping the remaining
-// rows. Reset to one makes the prepared statement retryable.
+// 46h. AB#47820: the stored array contract is now executed. Both the
+// prepared and the direct entry point must run every parameter set, and
+// dropping back to one set must return the statement to scalar execution.
+// Full parameter-array coverage lives in param_array_test.cpp.
 // -------------------------------------------------------------------
-TEST_F(AttributesTest, ParamsetSizeAboveOneBlocksExecuteUntilP2) {
+TEST_F(AttributesTest, ParamsetSizeAboveOneExecutesEverySet) {
     SqlTString createSql = ODBCTestUtils::ToSqlTStr(
         "CREATE TABLE #paramset_guard (v int NOT NULL)");
     ASSERT_SQL_OK(SQLExecDirect(stmt_, createSql.data(), SQL_NTS),
@@ -1460,28 +1460,26 @@ TEST_F(AttributesTest, ParamsetSizeAboveOneBlocksExecuteUntilP2) {
         "INSERT INTO #paramset_guard (v) VALUES (?)");
     ASSERT_SQL_OK(SQLPrepare(stmt_, insertSql.data(), SQL_NTS),
                   SQL_HANDLE_STMT, stmt_);
-    SQLINTEGER value = 42;
-    SQLLEN indicator = sizeof(value);
+    SQLINTEGER values[2] = {42, 43};
+    SQLLEN indicators[2] = {0, 0};
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
-                                   SQL_INTEGER, 10, 0, &value, sizeof(value),
-                                   &indicator),
+                                   SQL_INTEGER, 10, 0, values, 0, indicators),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 2));
 
-    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
-
-    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 1));
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
-    EXPECT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ(1, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
+    EXPECT_EQ(2, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
 
-    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 2));
-    EXPECT_EQ(SQL_ERROR, SQLExecDirect(stmt_, insertSql.data(), SQL_NTS));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    // The direct path takes the same arrays.
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, insertSql.data(), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
 
+    // Back to scalar: one set, one row.
     ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 1));
-    EXPECT_EQ(1, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
+    ASSERT_SQL_OK(SQLExecDirect(stmt_, insertSql.data(), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(5, ScalarInt("SELECT COUNT(*) FROM #paramset_guard"));
 }
 
 // -------------------------------------------------------------------

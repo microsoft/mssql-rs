@@ -537,8 +537,14 @@ pub(crate) struct StmtState {
     pub(crate) current_command: SqlULen,
 }
 
-/// Statement attributes msodbcsql stores and round-trips without acting on,
-/// paired with the default it reports before any set.
+/// Statement attributes stored in one table, keyed by identifier.
+///
+/// Most are attributes msodbcsql stores and round-trips without acting on,
+/// paired with the default it reports before any set. The parameter-array
+/// group (`SQL_ATTR_PARAM_BIND_OFFSET_PTR`, `PARAM_BIND_TYPE`,
+/// `PARAM_OPERATION_PTR`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`) is
+/// stored here too but *is* acted on — see `api::param_array` — because these
+/// hold application pointers that ODBC reads at execute time, not at set time.
 ///
 /// Every entry was measured against msodbcsql 18 rather than taken from the
 /// ODBC headers, because several defaults are driver choices rather than
@@ -647,6 +653,36 @@ impl InertStmtAttrs {
             return 0;
         }
         unsafe { ptr.read_unaligned() }
+    }
+
+    /// `SQL_ATTR_PARAM_BIND_TYPE`: `SQL_BIND_BY_COLUMN` (0), or the byte size of
+    /// one application row structure for row-wise binding.
+    pub(crate) fn param_bind_type(&self) -> SqlULen {
+        self.get(odbc_types::SQL_ATTR_PARAM_BIND_TYPE).unwrap_or(0)
+    }
+
+    /// `SQL_ATTR_PARAM_STATUS_PTR`: application array receiving one
+    /// `SQL_PARAM_*` outcome per parameter set, or null when unset.
+    ///
+    /// Whether this is null also decides the return code of a partly failed
+    /// parameter-array execute — see `param_array::ArrayOutcome::return_code`.
+    pub(crate) fn param_status_ptr(&self) -> *mut odbc_types::SqlUSmallInt {
+        self.get(odbc_types::SQL_ATTR_PARAM_STATUS_PTR).unwrap_or(0)
+            as *mut odbc_types::SqlUSmallInt
+    }
+
+    /// `SQL_ATTR_PARAMS_PROCESSED_PTR`: single `SQLULEN` receiving the number of
+    /// parameter sets processed, or null when unset.
+    pub(crate) fn params_processed_ptr(&self) -> *mut SqlULen {
+        self.get(odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR)
+            .unwrap_or(0) as *mut SqlULen
+    }
+
+    /// `SQL_ATTR_PARAM_OPERATION_PTR`: application array holding
+    /// `SQL_PARAM_PROCEED` / `SQL_PARAM_IGNORE` per parameter set, or null.
+    pub(crate) fn param_operation_ptr(&self) -> *const odbc_types::SqlUSmallInt {
+        self.get(odbc_types::SQL_ATTR_PARAM_OPERATION_PTR)
+            .unwrap_or(0) as *const odbc_types::SqlUSmallInt
     }
 }
 

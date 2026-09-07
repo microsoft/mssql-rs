@@ -548,6 +548,17 @@ pub const SQL_ATTR_METADATA_ID: SqlInteger = 10014;
 /// `SQL_ATTR_ROW_BIND_TYPE` value selecting column-wise (array-of-columns)
 /// binding — the mode mssql-python uses.
 pub const SQL_BIND_BY_COLUMN: SqlULen = 0;
+
+// Per-row outcomes written to `SQL_ATTR_PARAM_STATUS_PTR`, and the per-row
+// control values read from `SQL_ATTR_PARAM_OPERATION_PTR`. Values taken from the
+// Windows SDK `sqlext.h`; msodbcsql writes the same status codes from
+// `sqlctokn.cpp:2352-2401` and reads `SQL_PARAM_IGNORE` at `sqlccmd.cpp:3218`.
+pub const SQL_PARAM_SUCCESS: SqlUSmallInt = 0;
+pub const SQL_PARAM_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
+pub const SQL_PARAM_ERROR: SqlUSmallInt = 5;
+pub const SQL_PARAM_UNUSED: SqlUSmallInt = 7;
+pub const SQL_PARAM_IGNORE: SqlUSmallInt = 1;
+
 /// Default `SQL_DESC_ARRAY_SIZE` / `SQL_DESC_ROWSET_SIZE` for a freshly
 /// allocated ARD/APD.
 pub const SQL_ROWSET_SIZE_DEFAULT: SqlULen = 1;

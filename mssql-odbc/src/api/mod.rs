@@ -35,6 +35,7 @@ mod ird;
 mod more_results;
 mod num_result_cols;
 pub(crate) mod odbc_types;
+mod param_array;
 mod param_data;
 mod prepare;
 mod put_data;

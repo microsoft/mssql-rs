@@ -88,7 +88,8 @@ their measured not-implemented diagnostic; an unknown identifier returns `HY092`
 | `SQL_ATTR_MAX_ROWS` | ✅ enforced | ✅ |
 | `SQL_ATTR_MAX_LENGTH`, `NOSCAN`, `RETRIEVE_DATA`, `USE_BOOKMARKS` | ✅ | ✅ |
 | `SQL_ATTR_PARAM_BIND_OFFSET_PTR` | ✅ enforced | ✅ |
-| `SQL_ATTR_PARAM_BIND_TYPE`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`, `ROW_BIND_OFFSET_PTR` | ✅ stored | ✅ |
+| `SQL_ATTR_PARAM_BIND_TYPE`, `PARAM_STATUS_PTR`, `PARAMS_PROCESSED_PTR`, `PARAM_OPERATION_PTR` | ✅ enforced | ✅ | parameter arrays, AB#47820 |
+| `SQL_ATTR_ROW_BIND_OFFSET_PTR` | ✅ stored | ✅ |
 | `SQL_ATTR_METADATA_ID` | `SQL_FALSE` ✅; `SQL_TRUE` → `HYC00` | ✅ (`SQL_FALSE`) | identifier mode pending S5b |
 | **`SQL_ATTR_QUERY_TIMEOUT`** | ✅ | ✅ | **delivered by S2** |
 | `SQL_SOPT_SS_*` 1225–1238 | measured per id | measured per id | **delivered by S6** |
@@ -96,17 +97,77 @@ their measured not-implemented diagnostic; an unknown identifier returns `HY092`
 Unknown identifiers return `HY092`; recognized optional behavior that is not
 implemented returns `HYC00`.
 
-AB#47819 accepts and preserves every positive `SQL_ATTR_PARAMSET_SIZE` so
-applications can configure the complete parameter-array layout. Until AB#47820
-iterates those rows, parameterized `SQLExecute` and `SQLExecDirect` calls return
-`HYC00` when the size exceeds one, before reading application value buffers.
-Parameterless statements continue normally because they have no array rows to
-discard. The prepared path also leaves its plan in place for retry. This is a
-temporary execution gap, not an attribute rejection: reporting success for a
-parameterized statement would execute only row zero and silently discard the
-rest of mssql-python's batch. `SQL_ATTR_PARAMS_PROCESSED_PTR` and
-`SQL_ATTR_PARAM_STATUS_PTR` remain stored-only in AB#47819; AB#47820 owns
-writing aggregate and per-row outcomes once row execution exists.
+### Parameter arrays (AB#47819 layout, AB#47820 execution)
+
+`SQL_ATTR_PARAMSET_SIZE` accepts and preserves every positive value, and one
+`SQLExecute` / `SQLExecDirect` now executes every parameter set it selects.
+Delivered surface:
+
+| Attribute | Behaviour |
+|---|---|
+| `SQL_ATTR_PARAMSET_SIZE` | number of parameter sets; `0` → `HY024` |
+| `SQL_ATTR_PARAM_BIND_TYPE` | `SQL_BIND_BY_COLUMN` or a row-structure size |
+| `SQL_ATTR_PARAM_BIND_OFFSET_PTR` | byte offset applied once, before the row stride |
+| `SQL_ATTR_PARAM_OPERATION_PTR` | `SQL_PARAM_IGNORE` skips a set |
+| `SQL_ATTR_PARAM_STATUS_PTR` | per-set `SQL_PARAM_SUCCESS`/`_WITH_INFO`/`_ERROR`/`_UNUSED` |
+| `SQL_ATTR_PARAMS_PROCESSED_PTR` | number of sets walked |
+
+Semantics measured from msodbcsql rather than assumed (citations in
+`src/api/param_array.rs`): a failing set does **not** stop the sets after it;
+a bound `SQL_ATTR_PARAM_STATUS_PTR` downgrades the overall return from
+`SQL_ERROR` to `SQL_SUCCESS_WITH_INFO` because the caller can then see which
+set failed; `SQLRowCount` reports the **sum** of the sets' affected rows;
+ignored sets are reported `SQL_PARAM_UNUSED`. `param_array_test.cpp` asserts
+all of this and passes against both drivers.
+
+#### Deliberate divergences from msodbcsql
+
+| Area | msodbcsql | mssql-odbc | Why |
+|---|---|---|---|
+| Wire shape | all sets in one TDS batch | one prepared RPC per set | AB#47820 scope. Two observable effects: a *client-side* conversion failure in set *N* leaves sets `0..N` already run here, whereas msodbcsql may never send them; and a **batch-aborting** server error (e.g. SQLSTATE `42000` from a float domain error) kills the rest of msodbcsql's batch while here it only kills its own set, so the remaining sets still run. Measured with the NaN port of msodbcsql's `RegressionsODBC` Variation_76: `SQL_ATTR_PARAMS_PROCESSED_PTR` ends at 4 on msodbcsql and 6 here. |
+| Row-returning statements | one result set per set, walked with `SQLMoreResults` | `HYC00` | One RPC per set cannot hold N cursors open. Refusing beats discarding rows silently. Detectable only *after* set 0 has run (no column metadata before the prepare), so `INSERT ... OUTPUT` commits set 0 under autocommit and then reports `HYC00`. Data-at-execution differs: it is caught during conversion and sends nothing. |
+| Data-at-execution + array | `SQL_NEED_DATA`, driven per set | `HYC00` | Measured on 18.6. mssql-python's DAE path already loops rows itself, so this is unreachable from it. |
+| Sets never reached after an abort | left untouched | left untouched | Inherited deliberately. The ODBC spec describes `SQL_PARAM_UNUSED` here; both drivers leave the application's array alone. |
+
+Not a divergence, but worth recording: a **leading `SQL_PARAM_IGNORE`** reports
+`SQL_PARAM_UNUSED` at its own index and still advances the processed count to
+the paramset size, and the processed count includes a failing set. That is what
+msodbcsql's own `TestRowWiseParamArraysPaspAfterIgnore`
+(`MplatNativeTests/gql/paramarray.cpp`) and `RegressionsODBC` Variation_76
+assert. The decisive commit is `63a70fb07` (PR 7183, "Fixes for
+SQL_ATTR_PARAMS_PROCESSED_PTR - handle SQL_PARAM_IGNORE and fix incorrect
+increment incase of failure row."), which moved the `*pRowsProcessed = iRow`
+write ahead of both the `iRow++` and the ignore-skip loop in `OnDone`. PR 6629
+and PR 6882 are earlier steps; reading them alone gives the pre-fix answer.
+Retail **18.6.2.1 predates all three** and shifts every later status down one
+slot, so the shared parity leg skips that case against the installed driver.
+
+`SQL_ATTR_PARAMS_PROCESSED_PTR` is also written for **scalar** execution, where
+it is always `1` (`sqlccmd.cpp:3203` sets `iRowEnd = 1` and `:3212` writes it;
+`:1688`, `:3493`, `:6700` and `deprecate.cpp:2114` cover the paths that skip
+that loop). `executemany` with a single row depends on it.
+
+#### Cost of the one-RPC-per-set wire shape
+
+`mssql-tds` has no RPC batching: `SqlRpc` serialises exactly one call per
+message, and there is no equivalent of msodbcsql's `RPCBATCH_DELIMITER90`
+(`0xFF`, `tds/tds.h:56`). So `PARAMSET_SIZE = N` costs N round trips against
+msodbcsql's one. Measured on **loopback** (1000-row prepared `INSERT`,
+3 runs): msodbcsql 31-45 ms, mssql-odbc 427-502 ms — roughly **12x**, and the
+gap grows linearly with round-trip time since the cost is `N x RTT`.
+
+Accepted for now; latency is not a gating concern for this story. Closing it
+needs three separable pieces, in order: a multi-command `SqlRpc` writer
+(headers once, N x proc+params, `0xFF` between, `0xFE` to discard the last);
+inverting the `mssql-tds` response model from "first error token aborts the
+command" (`tds_client.rs`, `Tokens::Error` in `advance`) to per-sub-result
+outcomes; then a batched path in `param_array.rs`. The row loop stays as the
+fallback for data-at-execution and row-returning statements — msodbcsql keeps
+one for the same reason (`sqlccmd.cpp:6595`). The 4-vs-6 and batch-abort
+divergences above should disappear when that lands.
+
+Not yet delivered for arrays: output and input/output parameters, and
+`SQL_ATTR_PARAM_OPERATION_PTR` interaction with row-returning statements.
 
 ---
 
