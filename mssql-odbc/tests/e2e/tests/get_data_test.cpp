@@ -1329,14 +1329,22 @@ TEST_F(GetDataLiveTest, VarcharMaxAstralToWcharSurrogatePairBuffer) {
 // nvarchar(max) one byte per call, delivering the whole value without loss.
 //
 // Benefits-from-mock-tds: assert that alternate calls drain the UTF-8 tail
-// without consuming more wire data.
+// without consuming more wire data, and that the final call reports the
+// delivered byte count rather than SQL_NO_TOTAL.
 TEST_F(GetDataLiveTest, PlpSubMinimalBufferDrainsWithoutLossAndProbeIsAnswered) {
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'abcd' AS NVARCHAR(MAX)), 50) AS c1"),
         SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
-    EXPECT_EQ(RepeatToken("abcd", 50), ReadCharDataInChunks(stmt_, 1, 2));
+    SQLLEN final_ind = -999;
+    EXPECT_EQ(RepeatToken("abcd", 50),
+              ReadCharDataInChunks(stmt_, 1, 2, &final_ind));
+    // Truncated calls report SQL_NO_TOTAL; the final SQL_SUCCESS call keeps the
+    // delivered byte count instead (finish_get_data leaves the indicator
+    // alone). With a 2-byte buffer that final byte count is one.
+    EXPECT_NE(SQL_NO_TOTAL, final_ind);
+    EXPECT_EQ(1, final_ind);
 
     SQLCloseCursor(stmt_);
 

@@ -2073,6 +2073,14 @@ fn stream_active_plp_chunk<'a>(
                 );
             }
             pending_utf8.drain(..emit);
+            // Forward progress, mirroring the widening branch's guard. The
+            // extra read > 0 term is the UTF-16 difference: a chunk can be a
+            // lone carried high surrogate (the #211 straddle), consuming wire
+            // input while emitting nothing yet -- progress, not a stall.
+            debug_assert!(
+                emit > 0 || read > 0 || reached_end || payload_capacity == 0,
+                "UTF-16 to UTF-8 transcode made no forward progress"
+            );
         };
     } else {
         // SQL_C_CHAR delivery of a non-UTF-16 text PLP column: the wire bytes are
@@ -3154,6 +3162,33 @@ mod tests {
         }
 
         assert_eq!(String::from_utf8(delivered).unwrap(), "你");
+    }
+
+    #[test]
+    fn utf16le_max_read_floors_to_whole_characters() {
+        // (payload_capacity, pending_utf8_len) -> expected wire bytes to read.
+        // Floor sizing bounds a read to whole characters; the sizes not
+        // divisible by three (7, 8191) would read two bytes more under the old
+        // div_ceil, so they pin floor-vs-ceil. The rest pin the .max(4) two-unit
+        // floor and the carry shrinking the room (or filling it, draining only).
+        let cases = [
+            ((1, 0), 4),
+            ((3, 0), 4),
+            ((5, 0), 4),
+            ((6, 0), 4),
+            ((7, 0), 4),       // div_ceil would read 6
+            ((8191, 0), 5460), // div_ceil would read 5462
+            ((10, 4), 4),      // carry shrinks the room to 6
+            ((3, 3), 0),       // carry fills the room: drain only
+            ((3, 5), 0),       // carry over-fills, saturating to no read
+        ];
+        for ((capacity, carry), expected) in cases {
+            assert_eq!(
+                utf16le_max_read(capacity, carry),
+                expected,
+                "utf16le_max_read({capacity}, {carry})"
+            );
+        }
     }
 
     /// A dangling half code unit at true end-of-stream is genuinely malformed
