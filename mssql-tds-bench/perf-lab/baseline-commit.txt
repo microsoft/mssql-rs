@@ -7,4 +7,4 @@
 #
 # Exactly one full 40-character commit SHA on its own line. Lines starting with
 # '#' and blank lines are ignored.
-ecd8d6cb596a0175651f7dee918de01b2e1c1855
+6712b8038c123d8169f1504c9df432303582bded
