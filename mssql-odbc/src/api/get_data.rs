@@ -2249,7 +2249,10 @@ pub(crate) fn widen_into_pending(
 /// characters inside a single returned buffer instead of splitting one across
 /// calls. Never below two code units, so a surrogate pair (the two code units
 /// UTF-16 uses for characters outside that plane, such as emoji) can assemble in
-/// one call even when the room is a byte or two.
+/// one call even when the room is a byte or two. That two-unit floor is also
+/// what makes good on "any SQL_C_CHAR buffer with payload room can make
+/// progress": without it a two- or three-byte buffer would read zero with no
+/// carry to drain and fall into the HY090 no-progress branch.
 ///
 /// `pending_utf8` still absorbs the two shapes that overshoot the room anyway: a
 /// surrogate pair is four UTF-8 bytes, one past the three the `/ 3` floor budgets
@@ -3130,6 +3133,7 @@ mod tests {
         delivered.extend_from_slice(&pending_utf8[..emit]);
         pending_utf8.drain(..emit);
 
+        let mut iterations = 0;
         while !pending_utf8.is_empty() {
             assert_eq!(utf16le_max_read(1, pending_utf8.len()), 0);
             let emit = transcode_utf16le_into_pending(
@@ -3142,6 +3146,11 @@ mod tests {
             );
             delivered.extend_from_slice(&pending_utf8[..emit]);
             pending_utf8.drain(..emit);
+            iterations += 1;
+            assert!(
+                iterations < 10_000,
+                "transcode drain made no forward progress"
+            );
         }
 
         assert_eq!(String::from_utf8(delivered).unwrap(), "你");

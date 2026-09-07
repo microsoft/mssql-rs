@@ -1014,6 +1014,10 @@ TEST_F(GetDataLiveTest, NvarcharMaxToCharChunkedAstralRoundTrip) {
 // bytes than its input-only expansion budget. A 7-byte buffer leaves 6 payload
 // bytes: the second read transcodes U+10437 plus U+4F60 to 7 bytes.
 //
+// The msodbcsql leg is skipped: on Windows it best-fits U+10437 into the client
+// ANSI codepage (which has no representation for it), so a byte-for-byte
+// comparison against our UTF-8 output cannot hold.
+//
 // Benefits-from-mock-tds: force the exact PLP wire chunks and assert that the
 // final UTF-8 tail remains pending after the wire is exhausted.
 TEST_F(GetDataLiveTest, NvarcharMaxToCharSurrogateStraddleRetainsUtf8Tail) {
