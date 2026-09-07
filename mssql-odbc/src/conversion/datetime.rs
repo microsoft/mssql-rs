@@ -124,6 +124,165 @@ pub(crate) fn hms_from_ticks_100ns(ticks: u64) -> (u16, u16, u16, u32) {
     )
 }
 
+/// Parses `YYYY-MM-DD`.
+fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
+    let mut it = s.split('-');
+    let (y, m, d) = (it.next()?, it.next()?, it.next()?);
+    if it.next().is_some() || y.len() != 4 {
+        return None;
+    }
+    // `str::parse` accepts a leading `+`, which would make `+123-01-01` a valid
+    // date; require plain digits.
+    if !y
+        .bytes()
+        .chain(m.bytes())
+        .chain(d.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let year: i16 = y.parse().ok()?;
+    let month: u16 = m.parse().ok()?;
+    let day: u16 = d.parse().ok()?;
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    // Reject impossible days (2023-02-31, or 02-29 outside a leap year) rather
+    // than writing them into a date struct as a successful conversion.
+    if !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+/// Parses `HH:MM[:SS[.f{1,9}]]`, returning the components plus the number of
+/// fractional digits supplied (the effective scale).
+fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
+    let mut it = s.split(':');
+    let hour_s = it.next()?;
+    let minute_s = it.next()?;
+    let sec_part = it.next().unwrap_or("0");
+    if it.next().is_some() {
+        return None;
+    }
+    let (sec_digits, frac_digits) = match sec_part.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (sec_part, ""),
+    };
+    // `str::parse` accepts a leading `+`, which would make `+1:00:00` a valid
+    // time; require plain digits.
+    if !hour_s
+        .bytes()
+        .chain(minute_s.bytes())
+        .chain(sec_digits.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let hour: u16 = hour_s.parse().ok()?;
+    let minute: u16 = minute_s.parse().ok()?;
+    let second: u16 = sec_digits.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    if !frac_digits.is_empty() && !frac_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // `SQL_TIMESTAMP_STRUCT.fraction` is nanoseconds, so a character literal can
+    // carry 9 exact digits; msodbcsql rejects anything longer rather than
+    // truncating it, and a character source has no server-side scale to cap it.
+    if frac_digits.len() > 9 {
+        return None;
+    }
+    let mut nanos: u32 = 0;
+    for i in 0..9 {
+        let digit = frac_digits
+            .as_bytes()
+            .get(i)
+            .map_or(0, |b| u32::from(b - b'0'));
+        nanos = nanos * 10 + digit;
+    }
+    Some((hour, minute, second, nanos, frac_digits.len() as u8))
+}
+
+/// Port of msodbcsql's `IsValidTimezoneOffsetValue` (`dataconv.cpp:118`).
+///
+/// The mixed-sign rules are the non-obvious part: `+5h -30m` is rejected even
+/// though it totals a legal +4:30, because the two components must agree in
+/// sign. Checking only the total would silently accept it.
+pub(crate) fn is_valid_timezone_offset(tz_hour: i16, tz_minute: i16) -> bool {
+    let total = i32::from(tz_hour) * 60 + i32::from(tz_minute);
+    !((tz_hour > 0 && tz_minute < 0)
+        || (tz_hour < 0 && tz_minute > 0)
+        || !(-59..=59).contains(&tz_minute)
+        || total.abs() > 14 * 60)
+}
+
+/// Parses the character forms of `date`, `time`, `datetime2` and
+/// `datetimeoffset` into [`DateTimeParts`].
+///
+/// Shared by both directions so a literal a fetch would accept is one a
+/// parameter binding accepts too.
+pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
+    let mut s = text.trim();
+    let mut p = DateTimeParts::default();
+
+    // A trailing "+HH:MM" / "-HH:MM" is a UTC offset. Match it only in that
+    // exact shape so the hyphens inside a date are never mistaken for one.
+    // Compared as bytes: slicing the `str` would panic when a multi-byte
+    // character straddles the boundary, and the payload is server data.
+    if let Some(tail) = s.len().checked_sub(6).and_then(|i| s.as_bytes().get(i..))
+        && (tail[0] == b'+' || tail[0] == b'-')
+        && tail[3] == b':'
+        && tail[1..3].iter().chain(&tail[4..6]).all(u8::is_ascii_digit)
+    {
+        let sign: i16 = if tail[0] == b'+' { 1 } else { -1 };
+        let hh = i16::from(tail[1] - b'0') * 10 + i16::from(tail[2] - b'0');
+        let mm = i16::from(tail[4] - b'0') * 10 + i16::from(tail[5] - b'0');
+        // Bounding the components separately would admit +14:30, which no
+        // target validates once the offset is parsed.
+        if !is_valid_timezone_offset(sign * hh, sign * mm) {
+            return None;
+        }
+        p.tz_hour = sign * hh;
+        p.tz_minute = sign * mm;
+        p.has_tz = true;
+        // The matched tail is all ASCII, so this boundary is a char boundary.
+        s = s[..s.len() - 6].trim_end();
+    }
+
+    let (date_str, time_str) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (Some(d), Some(t.trim())),
+        None if s.contains(':') => (None, Some(s)),
+        None => (Some(s), None),
+    };
+
+    if let Some(d) = date_str {
+        let (y, m, day) = parse_date_literal(d)?;
+        p.year = y;
+        p.month = m;
+        p.day = day;
+        p.has_date = true;
+    }
+    if let Some(t) = time_str.filter(|t| !t.is_empty()) {
+        let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
+        p.hour = h;
+        p.minute = mi;
+        p.second = sec;
+        p.fraction_ns = frac_ns;
+        p.scale = scale;
+        p.has_time = true;
+    }
+    if !p.has_date && !p.has_time {
+        return None;
+    }
+    // An offset is only meaningful alongside a date and time.
+    if p.has_tz && !(p.has_date && p.has_time) {
+        return None;
+    }
+    Some(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +344,131 @@ mod tests {
             assert!(days_since_0001_from_civil(y, 2, 29).is_some(), "{y}-02-29");
         }
         assert!(days_since_0001_from_civil(1601, 2, 28).is_some());
+    }
+
+    /// The shapes both directions have to accept. Pinned directly now that the
+    /// parameter path shares this parser and not only the fetch path reaches it.
+    #[test]
+    fn the_accepted_literal_shapes_parse() {
+        let date_only = parse_datetime_literal("2024-05-20").unwrap();
+        assert!(date_only.has_date && !date_only.has_time);
+        assert_eq!(
+            (date_only.year, date_only.month, date_only.day),
+            (2024, 5, 20)
+        );
+
+        let time_only = parse_datetime_literal("12:34:56").unwrap();
+        assert!(time_only.has_time && !time_only.has_date);
+        assert_eq!(
+            (time_only.hour, time_only.minute, time_only.second),
+            (12, 34, 56)
+        );
+
+        // Both separators reach the same value.
+        assert_eq!(
+            parse_datetime_literal("2024-05-20 12:34:56"),
+            parse_datetime_literal("2024-05-20T12:34:56")
+        );
+
+        // Seconds are optional; the fraction sets the effective scale.
+        let hhmm = parse_datetime_literal("12:34").unwrap();
+        assert_eq!((hhmm.second, hhmm.fraction_ns, hhmm.scale), (0, 0, 0));
+        let frac = parse_datetime_literal("12:34:56.000000").unwrap();
+        assert_eq!((frac.fraction_ns, frac.scale), (0, 6));
+        let ns = parse_datetime_literal("12:34:56.123456789").unwrap();
+        assert_eq!((ns.fraction_ns, ns.scale), (123_456_789, 9));
+
+        // Surrounding whitespace is not part of the value.
+        assert_eq!(
+            parse_datetime_literal("  2024-05-20  "),
+            parse_datetime_literal("2024-05-20")
+        );
+    }
+
+    #[test]
+    fn an_offset_is_signed_and_bounded() {
+        let plus = parse_datetime_literal("2024-05-20 12:34:56+05:30").unwrap();
+        assert!(plus.has_tz);
+        assert_eq!((plus.tz_hour, plus.tz_minute), (5, 30));
+
+        let minus = parse_datetime_literal("2024-05-20 12:34:56-08:00").unwrap();
+        assert_eq!((minus.tz_hour, minus.tz_minute), (-8, 0));
+
+        // Past the legal range, and an offset with nothing to anchor it.
+        assert_eq!(parse_datetime_literal("2024-05-20 12:34:56+15:00"), None);
+        assert_eq!(parse_datetime_literal("2024-05-20 12:34:56+05:60"), None);
+        assert_eq!(parse_datetime_literal("12:34:56+05:30"), None);
+        assert_eq!(parse_datetime_literal("2024-05-20+05:30"), None);
+    }
+
+    /// The total is what is bounded, not each component. Bounding them
+    /// separately admitted `+14:01`..`+14:59`, which only the
+    /// `SQL_SS_TIMESTAMPOFFSET` target would have caught afterwards - every
+    /// other temporal target discards the offset and would have accepted the
+    /// literal.
+    #[test]
+    fn an_offset_is_bounded_on_the_total() {
+        assert!(parse_datetime_literal("2024-05-20 12:34:56+14:00").is_some());
+        assert!(parse_datetime_literal("2024-05-20 12:34:56-14:00").is_some());
+        for bad in [
+            "2024-05-20 12:34:56+14:01",
+            "2024-05-20 12:34:56+14:30",
+            "2024-05-20 12:34:56+14:59",
+            "2024-05-20 12:34:56-14:01",
+            "2024-05-20 12:34:56-14:30",
+        ] {
+            assert_eq!(parse_datetime_literal(bad), None, "{bad:?} was accepted");
+        }
+    }
+
+    /// A hyphen inside a date must never be read as the offset sign, and a
+    /// leading `+` must not sneak past `str::parse`.
+    #[test]
+    fn malformed_literals_are_rejected() {
+        for bad in [
+            "",
+            "   ",
+            "abc",
+            "2024-05-20 25:00:00",
+            "2024-05-20 12:60:00",
+            "2024-05-20 12:00:60",
+            "2023-02-31",
+            "+123-01-01",
+            "+1:00:00",
+            "2024-05-20 12:34:56.1234567890",
+            "2024-05-20 12:34:56:78",
+            "2024-05-20-01",
+        ] {
+            assert_eq!(parse_datetime_literal(bad), None, "{bad:?} was accepted");
+        }
+    }
+
+    /// Unpadded month/day fields, a seconds-less time, a trailing empty
+    /// fraction and the ISO `T` separator are accepted where msodbcsql's
+    /// fixed-length token grammar refuses them. Deliberate, recorded in
+    /// `docs/parameters_plan.md`, and pinned here so it cannot be dropped by
+    /// accident.
+    ///
+    /// `1:01:01` and `18:01:0` are `22018` rows in msodbcsql's own regression
+    /// table (`KatmaiDatetimeODBC.cpp`); `12:00:00.` reaches its `ECODE_TIME2`
+    /// grammar, whose `'.' NUM(-9)` needs at least one digit; the `T` form was
+    /// measured `22018` on retail 18.6.2.1 via the compare leg.
+    #[test]
+    fn the_permissive_shapes_stay_accepted() {
+        for text in [
+            "2024-5-20",
+            "2023-6-5",
+            "12:34",
+            "2024-5-20 1:2:3",
+            "12:00:00.",
+            "2024-05-20T12:34:56.123",
+        ] {
+            assert!(
+                parse_datetime_literal(text).is_some(),
+                "{text:?} was rejected"
+            );
+        }
+        // The year is still fixed-width, which is what stops `+123-01-01`.
+        assert_eq!(parse_datetime_literal("999-01-01"), None);
     }
 }
