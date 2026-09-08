@@ -145,6 +145,31 @@ class NextVersion(unittest.TestCase):
             resolve.next_version("1.0.0-beta", layout_changed=False)
 
 
+class Organization(unittest.TestCase):
+    def test_the_modern_collection_uri(self):
+        self.assertEqual(resolve.organization("https://dev.azure.com/sqlclientdrivers/"), "sqlclientdrivers")
+
+    def test_the_legacy_collection_uri(self):
+        # This organization is one of these: taking the last path segment gives
+        # the hostname, and the feed URL built from it 404s.
+        self.assertEqual(
+            resolve.organization("https://sqlclientdrivers.visualstudio.com/"),
+            "sqlclientdrivers",
+        )
+
+    def test_a_missing_trailing_slash_is_fine(self):
+        for uri in ("https://dev.azure.com/sqlclientdrivers",
+                    "https://sqlclientdrivers.visualstudio.com"):
+            self.assertEqual(resolve.organization(uri), "sqlclientdrivers", uri)
+
+    def test_a_bare_organization_name_is_accepted(self):
+        self.assertEqual(resolve.organization("sqlclientdrivers"), "sqlclientdrivers")
+
+    def test_something_with_no_organization_in_it_is_an_error(self):
+        with self.assertRaises(RuntimeError):
+            resolve.organization("https://dev.azure.com/")
+
+
 class RequestedVersion(unittest.TestCase):
     def test_the_sentinel_means_derive_it(self):
         # The pipeline passes 'auto' rather than '' because the run panel

@@ -37,6 +37,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,20 +70,40 @@ def resolve_components(bottle, arch, macos_major):
     return components
 
 
+def organization(collection_uri):
+    """Organization name out of either form of System.CollectionUri.
+
+    Older organizations -- this one included -- still hand agents
+    https://<org>.visualstudio.com/ rather than https://dev.azure.com/<org>/,
+    so taking the last path segment yields a hostname and a feed URL that 404s.
+    """
+    parsed = urllib.parse.urlparse(collection_uri.strip().rstrip("/"))
+    host = parsed.netloc or parsed.path
+    if host.endswith(".visualstudio.com"):
+        return host.split(".", 1)[0]
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if not segments:
+        raise RuntimeError(f"cannot read an organization out of {collection_uri!r}")
+    return segments[-1]
+
+
 def published_packages(org_url, project, feed, token):
-    org = org_url.rstrip("/").rsplit("/", 1)[-1]
     url = (
-        f"https://feeds.dev.azure.com/{org}/{project}/_apis/packaging/Feeds/{feed}"
-        f"/packages?protocolType=upack&includeDescription=true&api-version={API_VERSION}"
+        f"https://feeds.dev.azure.com/{organization(org_url)}/{project}"
+        f"/_apis/packaging/Feeds/{feed}/packages"
+        f"?protocolType=upack&includeDescription=true&api-version={API_VERSION}"
     )
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             body = json.load(response)
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"listing feed {project}/{feed} failed: {exc.code} {exc.reason}") from None
+        # The URL matters more than the feed name here: a 404 is equally what
+        # you get from a malformed organization and from an identity that
+        # cannot see the feed.
+        raise RuntimeError(f"GET {url} failed: {exc.code} {exc.reason}") from None
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"listing feed {project}/{feed} failed: {exc}") from None
+        raise RuntimeError(f"GET {url} failed: {exc}") from None
 
     published = {}
     for package in body.get("value", []):
