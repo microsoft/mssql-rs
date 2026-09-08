@@ -78,6 +78,13 @@ parameters:
   type: string
   default: 'public/mssql-rs_Public'
 
+variables:
+# Nothing here is built: the payload is fetched, checksummed and repacked, and
+# the macOS binaries inside it are Homebrew's builds, not ours. CodeQL has no
+# compilation to observe, so the org decorator's injection only adds job time.
+- name: Codeql.SkipTaskAutoInjection
+  value: true
+
 stages:
 - stage: Publish_macOS_Docker_Toolchain
   displayName: 'Publish macOS docker toolchain'
