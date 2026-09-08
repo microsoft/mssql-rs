@@ -110,19 +110,33 @@ stages:
         - imageOverride -equals RUST-UBUSLIM
     steps:
     - checkout: self
+    # Every run-dialog value is passed as an environment variable, never
+    # substituted into the script body: `${{ parameters.x }}` is textual
+    # substitution into shell source before bash sees it, so a value containing
+    # a quote closes the quoting and the rest of it runs as commands. As an
+    # environment value it is data, and the shell never parses it.
     - script: |
         set -euo pipefail
+        args=()
+        for arch in $ARCHITECTURES; do args+=(--arch "$arch"); done
         python3 .pipeline/scripts/resolve-toolchain-version.py \
-          --org '$(System.CollectionUri)' \
-          --feed '${{ parameters.feed }}' \
-          --arch ${{ join(' --arch ', parameters.architectures) }} \
-          --macos-major ${{ parameters.macosMajorFloor }} \
-          --version '${{ parameters.packageVersion }}' \
+          --org "$ORG" \
+          --feed "$FEED" \
+          "${args[@]}" \
+          --macos-major "$MACOS_MAJOR" \
+          --version "$PACKAGE_VERSION" \
           $(forceFlag)
       name: decide
       displayName: 'Compare upstream against the feed'
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        ORG: $(System.CollectionUri)
+        FEED: ${{ parameters.feed }}
+        # Word-split into the array above rather than eval'd, and each value
+        # still has to satisfy the script's own --arch choices.
+        ARCHITECTURES: ${{ join(' ', parameters.architectures) }}
+        MACOS_MAJOR: ${{ parameters.macosMajorFloor }}
+        PACKAGE_VERSION: ${{ parameters.packageVersion }}
 
   - ${{ each arch in parameters.architectures }}:
     - template: templates/macos-toolchain-job.yml

@@ -91,9 +91,14 @@ def published_packages(org_url, project, feed, token):
     # Filtered by name rather than listing the feed: the response is paginated,
     # and a feed with enough packages would push these off the first page and
     # make them look unpublished. Only the two names can match this prefix.
+    #
+    # The project and feed come from a pipeline parameter, so they are quoted
+    # into the path rather than pasted: an unescaped `?` or `&` would otherwise
+    # rewrite the query string this relies on.
     url = (
-        f"https://feeds.dev.azure.com/{organization(org_url)}/{project}"
-        f"/_apis/packaging/Feeds/{feed}/packages"
+        f"https://feeds.dev.azure.com/{urllib.parse.quote(organization(org_url), safe='')}"
+        f"/{urllib.parse.quote(project, safe='')}"
+        f"/_apis/packaging/Feeds/{urllib.parse.quote(feed, safe='')}/packages"
         f"?protocolType=upack&packageNameQuery={PACKAGE_PREFIX}"
         f"&includeDescription=true&api-version={API_VERSION}"
     )
@@ -340,10 +345,6 @@ def main():
     for arch in args.arch:
         emit(f"publish_{arch}", "true" if arch in publish_for else "false")
     emit("shouldPublish", "true" if publish_for else "false")
-    emit("packageVersion", version)
-    return 0
-
-    emit("shouldPublish", "true" if should_publish else "false")
     emit("packageVersion", version)
     return 0
 

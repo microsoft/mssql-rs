@@ -38,10 +38,14 @@ jobs:
   - script: |
       set -euo pipefail
       python3 .pipeline/scripts/build-macos-docker-toolchain.py \
-        --arch ${{ parameters.arch }} \
-        --macos-major ${{ parameters.macosMajorFloor }} \
-        --out "$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}"
+        --arch "$ARCH" \
+        --macos-major "$MACOS_MAJOR" \
+        --out "$PAYLOAD"
     displayName: 'Assemble payload'
+    env:
+      ARCH: ${{ parameters.arch }}
+      MACOS_MAJOR: ${{ parameters.macosMajorFloor }}
+      PAYLOAD: '$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}'
 
   # The description is load-bearing: the next run reads its markers back out of
   # the feed to decide whether anything changed.
