@@ -315,11 +315,11 @@ pub(crate) unsafe fn convert_guid_c(
 
 /// Converts a TDS `date` into normalized calendar fields.
 pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
-    let (year, month, day) = civil_from_days_since_0001(i64::from(date.get_days()));
+    let date = civil_from_days_since_0001(i64::from(date.get_days()));
     DateTimeParts {
-        year,
-        month,
-        day,
+        year: date.year,
+        month: date.month,
+        day: date.day,
         has_date: true,
         ..Default::default()
     }
@@ -327,12 +327,12 @@ pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
 
 /// Converts a TDS `time` into normalized clock fields.
 pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
-    let (hour, minute, second, fraction_ns) = hms_from_ticks_100ns(time.time_nanoseconds);
+    let t = hms_from_ticks_100ns(time.time_nanoseconds);
     DateTimeParts {
-        hour,
-        minute,
-        second,
-        fraction_ns,
+        hour: t.hour,
+        minute: t.minute,
+        second: t.second,
+        fraction_ns: t.fraction_ns,
         scale: time.scale,
         has_time: true,
         ..Default::default()
@@ -341,11 +341,11 @@ pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
 
 /// Converts a TDS `datetime2` into normalized calendar and clock fields.
 pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
-    let (year, month, day) = civil_from_days_since_0001(i64::from(datetime.days));
+    let date = civil_from_days_since_0001(i64::from(datetime.days));
     let mut parts = time_parts(&datetime.time);
-    parts.year = year;
-    parts.month = month;
-    parts.day = day;
+    parts.year = date.year;
+    parts.month = date.month;
+    parts.day = date.day;
     parts.has_date = true;
     parts
 }
@@ -363,17 +363,16 @@ pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateT
         return None;
     }
 
-    let (year, month, day) = civil_from_days_since_0001(days);
-    let (hour, minute, second, fraction_ns) =
-        hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
+    let date = civil_from_days_since_0001(days);
+    let t = hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
     Some(DateTimeParts {
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        fraction_ns,
+        year: date.year,
+        month: date.month,
+        day: date.day,
+        hour: t.hour,
+        minute: t.minute,
+        second: t.second,
+        fraction_ns: t.fraction_ns,
         scale: datetime.datetime2.time.scale,
         tz_hour: datetime.offset / 60,
         tz_minute: datetime.offset % 60,
@@ -393,15 +392,15 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
         ColumnValues::DateTime2(datetime) => return Some(datetime2_parts(datetime)),
         ColumnValues::DateTimeOffset(datetime) => return datetimeoffset_parts(datetime),
         ColumnValues::DateTime(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
             // `datetime` time is counted in 1/300-second ticks since midnight.
             let ticks = u64::from(dt.time);
             let secs = ticks / 300;
             // ODBC exposes the legacy type rounded to millisecond precision.
             let fraction_ms = ((dt.time % 300) * 1_000 + 150) / 300;
-            p.year = y;
-            p.month = m;
-            p.day = day;
+            p.year = date.year;
+            p.month = date.month;
+            p.day = date.day;
             p.hour = (secs / 3600) as u16;
             p.minute = ((secs % 3600) / 60) as u16;
             p.second = (secs % 60) as u16;
@@ -412,10 +411,10 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             p.has_time = true;
         }
         ColumnValues::SmallDateTime(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
-            p.year = y;
-            p.month = m;
-            p.day = day;
+            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            p.year = date.year;
+            p.month = date.month;
+            p.day = date.day;
             p.hour = dt.time / 60;
             p.minute = dt.time % 60;
             p.has_date = true;

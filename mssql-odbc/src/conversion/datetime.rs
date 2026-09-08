@@ -20,6 +20,42 @@ pub(crate) const TICKS_PER_DAY: i64 = 864_000_000_000;
 /// `datetimeoffset` whose offset adjustment would leave the representable range.
 pub(crate) const MAX_DAYS_SINCE_0001: i64 = 3_652_058;
 
+/// A calendar date, shared by the day-number decoder and the `YYYY-MM-DD`
+/// parser so neither hands back an unlabelled triple of same-typed fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CivilDate {
+    /// Proleptic Gregorian year.
+    pub year: i16,
+    /// Calendar month in `1..=12`.
+    pub month: u16,
+    /// Calendar day in `1..=31`.
+    pub day: u16,
+}
+
+/// A wall-clock time of day, carrying no date and no offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimeOfDay {
+    /// Hour in `0..=23`.
+    pub hour: u16,
+    /// Minute in `0..=59`.
+    pub minute: u16,
+    /// Second in `0..=59`.
+    pub second: u16,
+    /// Fractional seconds in nanoseconds.
+    pub fraction_ns: u32,
+}
+
+/// A parsed time literal, paired with the scale that literal itself declared.
+///
+/// The scale is a property of the text, not of the instant, which is why it
+/// sits here rather than on [`TimeOfDay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParsedTime {
+    pub time: TimeOfDay,
+    /// Count of fractional-seconds digits the literal supplied.
+    pub scale: u8,
+}
+
 /// A normalized calendar breakdown shared by every date/time column type, so
 /// each target C struct can be filled from a single representation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,9 +112,9 @@ pub(crate) fn days_in_month(year: i16, month: u16) -> u16 {
     }
 }
 
-/// (year, month, day) from a day count where day 0 = 0001-01-01, using Howard
+/// The calendar date for a day count where day 0 = 0001-01-01, using Howard
 /// Hinnant's `civil_from_days` algorithm rebased from its 1970 epoch.
-pub(crate) fn civil_from_days_since_0001(days_since_0001: i64) -> (i16, u16, u16) {
+pub(crate) fn civil_from_days_since_0001(days_since_0001: i64) -> CivilDate {
     // Hinnant's algorithm works in days since 1970-01-01 with a +719468 shift.
     let z = days_since_0001 - 719_162 + 719_468;
     let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
@@ -90,7 +126,11 @@ pub(crate) fn civil_from_days_since_0001(days_since_0001: i64) -> (i16, u16, u16
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = if m <= 2 { y + 1 } else { y };
-    (year as i16, m as u16, d as u16)
+    CivilDate {
+        year: year as i16,
+        month: m as u16,
+        day: d as u16,
+    }
 }
 
 /// Inverse of [`civil_from_days_since_0001`], for the parameter direction.
@@ -114,23 +154,23 @@ pub(crate) fn days_since_0001_from_civil(year: i16, month: u16, day: u16) -> Opt
     Some(era * 146_097 + doe - 719_468 + 719_162)
 }
 
-/// (hour, minute, second, fraction_ns) from 100-nanosecond ticks since midnight.
+/// The clock fields for a count of 100-nanosecond ticks since midnight.
 ///
 /// `SqlTime::time_nanoseconds` is a misnomer: the decoder normalizes every
 /// fractional-seconds scale to 100 ns ticks, not nanoseconds.
-pub(crate) fn hms_from_ticks_100ns(ticks: u64) -> (u16, u16, u16, u32) {
+pub(crate) fn hms_from_ticks_100ns(ticks: u64) -> TimeOfDay {
     let secs = ticks / 10_000_000;
     let fraction_ns = ((ticks % 10_000_000) * 100) as u32;
-    (
-        (secs / 3600) as u16,
-        ((secs % 3600) / 60) as u16,
-        (secs % 60) as u16,
+    TimeOfDay {
+        hour: (secs / 3600) as u16,
+        minute: ((secs % 3600) / 60) as u16,
+        second: (secs % 60) as u16,
         fraction_ns,
-    )
+    }
 }
 
 /// Parses `YYYY-MM-DD`.
-fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
+fn parse_date_literal(s: &str) -> Option<CivilDate> {
     let mut it = s.split('-');
     let (y, m, d) = (it.next()?, it.next()?, it.next()?);
     if it.next().is_some() || y.len() != 4 {
@@ -157,12 +197,12 @@ fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
     if !(1..=days_in_month(year, month)).contains(&day) {
         return None;
     }
-    Some((year, month, day))
+    Some(CivilDate { year, month, day })
 }
 
 /// Parses `HH:MM[:SS[.f{1,9}]]`, returning the components plus the number of
 /// fractional digits supplied (the effective scale).
-fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
+fn parse_time_literal(s: &str) -> Option<ParsedTime> {
     let mut it = s.split(':');
     let hour_s = it.next()?;
     let minute_s = it.next()?;
@@ -207,7 +247,15 @@ fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
             .map_or(0, |b| u32::from(b - b'0'));
         nanos = nanos * 10 + digit;
     }
-    Some((hour, minute, second, nanos, frac_digits.len() as u8))
+    Some(ParsedTime {
+        time: TimeOfDay {
+            hour,
+            minute,
+            second,
+            fraction_ns: nanos,
+        },
+        scale: frac_digits.len() as u8,
+    })
 }
 
 /// Port of msodbcsql's `IsValidTimezoneOffsetValue` (`dataconv.cpp:118`).
@@ -272,19 +320,19 @@ pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
     };
 
     if let Some(d) = date_str {
-        let (y, m, day) = parse_date_literal(d)?;
-        p.year = y;
-        p.month = m;
-        p.day = day;
+        let date = parse_date_literal(d)?;
+        p.year = date.year;
+        p.month = date.month;
+        p.day = date.day;
         p.has_date = true;
     }
     if let Some(t) = time_str {
-        let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
-        p.hour = h;
-        p.minute = mi;
-        p.second = sec;
-        p.fraction_ns = frac_ns;
-        p.scale = scale;
+        let parsed = parse_time_literal(t)?;
+        p.hour = parsed.time.hour;
+        p.minute = parsed.time.minute;
+        p.second = parsed.time.second;
+        p.fraction_ns = parsed.time.fraction_ns;
+        p.scale = parsed.scale;
         p.has_time = true;
     }
     if !p.has_date && !p.has_time {
@@ -303,11 +351,15 @@ mod tests {
 
     #[test]
     fn civil_anchor_dates() {
-        assert_eq!(civil_from_days_since_0001(0), (1, 1, 1));
-        assert_eq!(civil_from_days_since_0001(693_595), (1900, 1, 1));
-        assert_eq!(civil_from_days_since_0001(730_178), (2000, 2, 29));
-        assert_eq!(civil_from_days_since_0001(738_685), (2023, 6, 15));
-        assert_eq!(civil_from_days_since_0001(3_652_058), (9999, 12, 31));
+        let civil = |days| {
+            let d = civil_from_days_since_0001(days);
+            (d.year, d.month, d.day)
+        };
+        assert_eq!(civil(0), (1, 1, 1));
+        assert_eq!(civil(693_595), (1900, 1, 1));
+        assert_eq!(civil(730_178), (2000, 2, 29));
+        assert_eq!(civil(738_685), (2023, 6, 15));
+        assert_eq!(civil(3_652_058), (9999, 12, 31));
     }
 
     /// The two directions must agree on every representable day, which they can
@@ -322,9 +374,9 @@ mod tests {
             738_685,
             MAX_DAYS_SINCE_0001,
         ] {
-            let (y, m, d) = civil_from_days_since_0001(days);
+            let d = civil_from_days_since_0001(days);
             assert_eq!(
-                days_since_0001_from_civil(y, m, d),
+                days_since_0001_from_civil(d.year, d.month, d.day),
                 Some(days),
                 "day {days}"
             );

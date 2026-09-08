@@ -993,11 +993,11 @@ fn fold_offset_to_utc(p: DateTimeParts) -> Result<DateTimeParts, ParamBuildError
         return Err(invalid);
     }
     let minute_of_day = total_minutes.rem_euclid(1440);
-    let (year, month, day) = civil_from_days_since_0001(utc_days);
+    let date = civil_from_days_since_0001(utc_days);
     Ok(DateTimeParts {
-        year,
-        month,
-        day,
+        year: date.year,
+        month: date.month,
+        day: date.day,
         hour: (minute_of_day / 60) as u16,
         minute: (minute_of_day % 60) as u16,
         tz_hour: 0,
