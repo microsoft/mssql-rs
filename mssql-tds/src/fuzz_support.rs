@@ -947,6 +947,7 @@ impl TdsTransport for MockTransport {
 
     async fn send_attention_with_timeout(
         &mut self,
+        _context: &crate::io::token_stream::ParserContext,
         _timeout: std::time::Duration,
     ) -> TdsResult<bool> {
         Ok(true)

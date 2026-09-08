@@ -23,6 +23,18 @@ pub(crate) enum OdbcVersion {
     Odbc3_80 = 380,
 }
 
+impl OdbcVersion {
+    /// Whether the application declared ODBC 3.8, which gates the SQL Server
+    /// extended C types (`SQL_C_SS_TIME2`, `SQL_C_SS_TIMESTAMPOFFSET`).
+    ///
+    /// Default binding resolution and `SQL_CA_SS_VARIANT_TYPE` metadata must
+    /// answer this the same way, so both read it here rather than spelling the
+    /// comparison out separately (`IS351ORLESSAPP`, `sqlcdesc.cpp:6474`).
+    pub(crate) fn uses_3_80_types(self) -> bool {
+        self == OdbcVersion::Odbc3_80
+    }
+}
+
 impl TryFrom<u32> for OdbcVersion {
     type Error = ();
 
@@ -282,6 +294,17 @@ mod tests {
         started_rx
             .recv_timeout(SETTLE)
             .expect("blocking task should have started");
+    }
+
+    /// Guards the gate that `SQL_CA_SS_VARIANT_TYPE` metadata and default
+    /// binding resolution both read: if the two ever disagree, a variant
+    /// column reports a C type the driver will not then accept in a bind.
+    #[test]
+    fn only_odbc_3_80_uses_the_extended_c_types() {
+        assert!(!OdbcVersion::Unset.uses_3_80_types());
+        assert!(!OdbcVersion::Odbc2.uses_3_80_types());
+        assert!(!OdbcVersion::Odbc3.uses_3_80_types());
+        assert!(OdbcVersion::Odbc3_80.uses_3_80_types());
     }
 
     /// The regression guard for AB#47831. Returning from `SQLFreeHandle(ENV)`

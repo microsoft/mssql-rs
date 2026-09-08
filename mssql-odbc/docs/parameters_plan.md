@@ -152,6 +152,12 @@ transparent reconnects.
   wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
   / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
   `execute_test.cpp`.
+  AB#47851 puts the temporal SQL targets in exactly this set: a character C
+  type streamed against `date`/`time`/`datetime2`/`datetimeoffset` was
+  refused at bind before, and is refused at execute now, with the same
+  `HYC00`. Nothing about the streamed path changed -- a temporal wire value
+  is fixed-length, so it could never have been chunked -- only the call that
+  reports it. Pinned by `cross_family_dae_is_rejected` in `param_convert.rs`.
 
 ## `mssql-tds` prepared API
 
@@ -775,6 +781,71 @@ msodbcsql does not route its fetch path through `fValidConversion` either,
 because `SQLBindCol` cannot know a column's SQL type at bind time. The
 `is_*_c_target` helpers in `fetch_convert.rs` are converter routing - the same
 role `Convert()`'s dispatch switch plays - not a legality table.
+
+### Character C type to a temporal `ParameterType` (AB#47851)
+
+`SQL_C_CHAR` / `SQL_C_WCHAR` reach all five temporal SQL types. The literal is
+parsed by `datetime::parse_datetime_literal`, shared with fetch, and then run
+through the same `convert_datetime_sql` the struct path uses.
+
+Consequences worth knowing before extending this:
+
+- **A failed cast is `22018`, not `22007`.** `ERR_INVALID_DATETIME_FORMAT`
+  (`22007`) is for a C *struct* naming no real instant. `datetime_from_text`
+  remaps it, so a character buffer missing the component its target needs -
+  time-only into `datetime2`, date-only into `time` - reports `22018`. That is
+  msodbcsql's answer too: every post-parse failure in `ParseDateTime` sets
+  `CVT_CAST_ERROR`, which is `IDS_22_005` (`sqlcprot.h:956`). `22008` is not
+  remapped: a dropped component is an overflow, not a parse failure.
+- **A `time` target silently drops the date**, while a `date` target reports
+  `22008` for a non-zero time. The asymmetry is deliberate and pinned by
+  `a_timestamp_literal_into_a_time_target_drops_the_date`.
+- **The offset is bounded on its total**, via `is_valid_timezone_offset` (the
+  `IsValidTimezoneOffsetValue` port), not per component. Bounding hours and
+  minutes separately admitted `+14:30`.
+
+- **A valid offset is folded into the value and cleared** for every target that
+  is not `datetimeoffset`, so `2024-05-20 12:34:56+05:30` binds as the
+  `07:04:56` UTC it denotes rather than the local wall clock. msodbcsql does
+  this inside `ParseDateTime` (`sqlccnvt.cpp:4820-4849`), calling
+  `ConvertOffsetToUTC` on the `TOSERVER` direction and then zeroing
+  `timezone_hour`/`timezone_minute`; the guard is explicitly *not* a
+  `datetimeoffset` target. The divergence at
+  `typed-columnar-fetch-plan.md:102` does not apply here - that row is the
+  `TODRIVER` arm, which calls `ConvertOffsetToLocal` and would make the result
+  depend on the client time zone. Folding happens before the target's own
+  rules, so an offset can move a value onto another day, and can push a
+  midnight literal off midnight and make a `date` target report `22008`.
+
+One open item, new surface rather than new behaviour - the parser has always
+been this permissive, but until AB#47851 only fetch could reach it, and fetch
+consumes server-rendered text that never takes these shapes:
+
+- **`YYYY/MM/DD` and the ODBC escape literals** (`{d '...'}`, `{ts '...'}`) are
+  `22018` here. Tracked by AB#47246, which is not direction-scoped - the fix is
+  in the shared `parse_datetime_literal`, so it closes both directions at once.
+  The parameter side is what makes it worth doing: the server never renders
+  either shape, but an application can bind one, and `{ts '...'}` appears in
+  msodbcsql's own test data. This is the one direction where msodbcsql is
+  *more* permissive, so it is an app-compat gap rather than harmless tolerance.
+
+Three measured divergences the other way, all verified against the msodbcsql
+source:
+
+- The ISO `T` separator is accepted here and `22018` on retail msodbcsql
+  18.6.2.1 (measured on the compare leg).
+  `CharTimestampAcceptsTheIsoSeparator` carries
+  `SKIP_IF_COMPARING_MSODBCSQL()`.
+- Unpadded fields (`1:01:01`, `18:01:0`) and a trailing empty fraction
+  (`12:00:00.`) are accepted here; the first two are `22018` rows in
+  msodbcsql's own regression table (`KatmaiDatetimeODBC.cpp`) and the third
+  reaches its `ECODE_TIME2` grammar, whose `'.' NUM(-9)` needs at least one
+  digit. Pinned by `the_permissive_shapes_stay_accepted`; deliberately excluded
+  from `MsodbcsqlBadTimeLiteralsAreRejectedAlike`.
+- A time-only literal into a timestamp target is `22018` here; msodbcsql fills
+  the **current local date** and succeeds (`sqlccnvt.cpp:4776-4798`). Needs a
+  platform-specific local-date helper, tracked by AB#47247.
+  `ATimeOnlyLiteralAgainstATimestampTargetIs22018` carries the skip.
 
 ## Remaining work
 

@@ -560,20 +560,35 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
 // SQLPutData"). Both drivers agree the pairing cannot stream through -- they
 // just detect it one call apart -- so the parity run stays skipped rather
 // than comparing error codes that differ by construction.
+//
+// The temporal targets join the same set with AB#47851: a temporal wire value
+// is fixed-length, so it could never have been chunked, and only the call that
+// reports the refusal moved.
 TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
-    for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
+    const struct {
+        SQLSMALLINT c_type;
+        SQLSMALLINT sql_type;
+    } cases[] = {
+        {SQL_C_CHAR, SQL_INTEGER},
+        {SQL_C_WCHAR, SQL_INTEGER},
+        {SQL_C_CHAR, SQL_TYPE_DATE},
+        {SQL_C_WCHAR, SQL_TYPE_TIMESTAMP},
+    };
+
+    for (const auto& c : cases) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
         SQLLEN ind = SQL_DATA_AT_EXEC;
         SQLCHAR token = 0;
         // The bind itself is accepted - that is the change from before.
-        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c_type, SQL_INTEGER,
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c.c_type, c.sql_type,
                                        0, 0, &token, 0, &ind),
                       SQL_HANDLE_STMT, stmt_);
 
-        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << "c type " << c_type;
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_))
+            << "c type " << c.c_type << " sql type " << c.sql_type;
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
         ResetParams();
     }
@@ -919,6 +934,366 @@ TEST_F(ScalarConversionLiveTest, DateParamRoundTrips) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 23)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindFixed(SQL_C_TYPE_DATE, SQL_TYPE_DATE, date), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-02-29", ExecuteAndReadBack());
+}
+
+// ---------------------------------------------------------------------------
+// Character C type -> temporal ParameterType (AB#47851).
+//
+// mssql-python binds a datetime.time as isoformat text against SQL_TYPE_TIME
+// rather than as a SQL_C_TYPE_TIME struct, so its inserts ride on this row.
+// Every case here was HYC00 at bind time before AB#47851.
+// ---------------------------------------------------------------------------
+
+// A character buffer declares the type the application named, exactly as the
+// struct rows above do - the literal chooses the value, never the declaration.
+TEST_F(ScalarConversionLiveTest, CharParamDeclaresTheTemporalParameterType) {
+    struct Case {
+        SQLSMALLINT sql_type;
+        const char* text;
+        const char* base_type;
+    };
+    for (const Case& c : {Case{SQL_TYPE_DATE, "2024-05-20", "date"},
+                          Case{SQL_TYPE_TIME, "12:34:56", "time"},
+                          Case{SQL_SS_TIME2, "12:34:56", "time"},
+                          Case{SQL_TYPE_TIMESTAMP, "2024-05-20 12:34:56", "datetime2"},
+                          Case{SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56+05:30",
+                               "datetimeoffset"}}) {
+        ASSERT_SQL_OK(Prepare(kBaseTypeQuery), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(c.sql_type, c.text, 0, 7), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(c.base_type, ExecuteAndReadBack()) << c.text;
+        ResetParams();
+    }
+}
+
+// The exact shape mssql-python sends: isoformat text with microsecond
+// precision, ColumnSize 16 and DecimalDigits 6. The declaration is still at
+// maximum scale, so seven digits come back.
+TEST_F(ScalarConversionLiveTest, CharTimeLiteralRoundTrips) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, "12:34:56.000000", 16, 6), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12:34:56.0000000", ExecuteAndReadBack());
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, "12:34:56.123456", 16, 6), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12:34:56.1234560", ExecuteAndReadBack());
+}
+
+// The wide arm of datetime_from_text. Every other case here binds SQL_C_CHAR,
+// so without this the UTF-16 decode is unexercised end to end.
+TEST_F(ScalarConversionLiveTest, WideCharTimeLiteralRoundTrips) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindWide(SQL_TYPE_TIME, "12:34:56.000000", 16, 6), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12:34:56.0000000", ExecuteAndReadBack());
+}
+
+TEST_F(ScalarConversionLiveTest, CharDateLiteralRoundTrips) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 23)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-02-29"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-02-29", ExecuteAndReadBack());
+}
+
+// The space separator is the form msodbcsql and this driver agree on, so it
+// runs on both legs of the parity run.
+TEST_F(ScalarConversionLiveTest, CharTimestampLiteralRoundTrips) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20 12:34:56.123", 0, 3),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 12:34:56.1230000", ExecuteAndReadBack());
+}
+
+// The ISO `T` separator is accepted here and 22018 on msodbcsql, whose
+// fixed-length token grammar admits only the space form. Measured on the
+// compare leg against retail 18.6.2.1 (pinned by `msodbcsqlVersion`).
+//
+// Pre-existing and deliberate: the parser is shared with fetch, and the same
+// permissiveness covers `HH:MM` without seconds and unpadded fields like
+// `2023-6-5`. Narrowing it is AB#47246, not this PR.
+TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20T12:34:56.123", 0, 3),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 12:34:56.1230000", ExecuteAndReadBack());
+}
+
+// The offset has to survive as an offset rather than being folded into the
+// wall clock and lost. A literal that omits one takes +00:00, matching
+// CONVERT(datetimeoffset, '2024-05-20 12:34:56'); the compare leg adjudicates
+// that default against msodbcsql.
+TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralKeepsItsOffset) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56+05:30", 0, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 12:34:56.0000000 +05:30", ExecuteAndReadBack());
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56", 0, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 12:34:56.0000000 +00:00", ExecuteAndReadBack());
+}
+
+// A date-only literal supplies midnight rather than failing for want of a time.
+TEST_F(ScalarConversionLiveTest, CharDateOnlyLiteralFillsATimestampAtMidnight) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 00:00:00.0000000", ExecuteAndReadBack());
+}
+
+TEST_F(ScalarConversionLiveTest, UnparseableTemporalLiteralIs22018) {
+    for (const char* text : {"abc", "25:00:00", "2023-02-31", "2024-05-20 12:60:00"}) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, text), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << text;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+        ResetParams();
+    }
+}
+
+// The wide arm's error path. Every other failure case binds SQL_C_CHAR, so
+// without this only the success side of the UTF-16 decode is covered.
+TEST_F(ScalarConversionLiveTest, WideCharUnparseableTemporalLiteralIs22018) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindWide(SQL_TYPE_TIME, "not a time"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+}
+
+// A literal missing the component the target needs is a failed cast, not a
+// malformed struct: 22018. msodbcsql's `CVT_CAST_ERROR` is `IDS_22_005`
+// (`sqlcprot.h:956`), and its own regression table expects 22018 for
+// `1999-11-11` bound to a `time` target (`KatmaiDatetimeODBC.cpp`).
+TEST_F(ScalarConversionLiveTest, ADateOnlyLiteralAgainstATimeTargetIs22018) {
+    for (SQLSMALLINT sql_type : {SQL_TYPE_TIME, SQL_SS_TIME2}) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(sql_type, "2024-05-20", 0, 7), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << sql_type;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+        ResetParams();
+    }
+}
+
+// msodbcsql fills the *current local date* and succeeds here (`ParseDateTime`,
+// `sqlccnvt.cpp:4776-4798`); that needs a platform-specific local-date helper.
+// AB#47247.
+TEST_F(ScalarConversionLiveTest, ATimeOnlyLiteralAgainstATimestampTargetIs22018) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    for (SQLSMALLINT sql_type : {SQL_TYPE_TIMESTAMP, SQL_SS_TIMESTAMPOFFSET}) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(sql_type, "12:34:56", 0, 7), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << sql_type;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+        ResetParams();
+    }
+}
+
+// Ported from msodbcsql's BAD_PARAMETER table for a string bound to a `time`
+// column (`KatmaiDatetimeODBC.cpp`). Every row below is one both drivers answer
+// 22018 for, so they run on both legs.
+//
+// `1:01:01` and `18:01:0` are excluded: that table expects 22018 and this
+// driver accepts them - the unpadded-field permissiveness pinned by the
+// `the_permissive_shapes_stay_accepted` unit test.
+TEST_F(ScalarConversionLiveTest, MsodbcsqlBadTimeLiteralsAreRejectedAlike) {
+    for (const char* text : {"www:a9:3e",
+                             "-11:01:21",
+                             "24:00:00",
+                             "24:01:01",
+                             "32768:01:01",
+                             "1e8:01:01",
+                             "e8:01:01",
+                             "01:01:01.0000000000",
+                             "12:00:00.....",
+                             "12:00:00:",
+                             "10:12:59 +00:00",
+                             "1800-02-02 13:59:59.0000000000 +03:00"}) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, text, 16, 7), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << text;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+        ResetParams();
+    }
+}
+
+// The same table's 22008 rows: a fraction the declared scale cannot carry.
+TEST_F(ScalarConversionLiveTest, MsodbcsqlOverPreciseTimeLiteralsAre22008) {
+    for (const char* text : {"23:59:59.222", "23:59:59.0000001", "01:01:01.1"}) {
+        ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, text, 8, 0), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << text;
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22008");
+        ResetParams();
+    }
+}
+
+// A full timestamp into a `time` target keeps the time and drops the date
+// silently. Pinned because the asymmetry with the `date` target, which reports
+// 22008 for a non-zero time, reads like a bug. Parity: msodbcsql's
+// SQL_TIME2_MAPPED arm has no date check (`sqlccnvt.cpp:4482-4497`).
+TEST_F(ScalarConversionLiveTest, ACharTimestampLiteralIntoATimeTargetDropsTheDate) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, "2024-05-20 12:34:56", 16, 7), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("12:34:56.0000000", ExecuteAndReadBack());
+}
+
+// A valid offset is folded into the value for every target that is not
+// datetimeoffset, then cleared - msodbcsql does this inside ParseDateTime
+// (`sqlccnvt.cpp:4820-4849`), calling ConvertOffsetToUTC on the TOSERVER
+// direction. Keeping the local wall clock would send a different instant than
+// the caller wrote, with no diagnostic.
+TEST_F(ScalarConversionLiveTest, AValidOffsetIsFoldedToUtcForNonOffsetTargets) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20 12:34:56+05:30", 0, 7),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 07:04:56.0000000", ExecuteAndReadBack());
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, "2024-05-20 12:34:56+05:30", 16, 7),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("07:04:56.0000000", ExecuteAndReadBack());
+    ResetParams();
+
+    // A minute-bearing offset, taken from msodbcsql's own sample data
+    // (`TCODBC_CTypeExtensions.cpp`: "... +12:13"), so the minute arithmetic is
+    // exercised rather than only whole and half hours.
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2009-01-20 12:12:12+12:13", 0, 7),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2009-01-19 23:59:12.0000000", ExecuteAndReadBack());
+}
+
+// The fold crosses a date boundary, which the discarded-offset reading could
+// never produce.
+TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanCrossADateBoundary) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20 01:00:00+05:30", 0, 7),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-19 19:30:00.0000000", ExecuteAndReadBack());
+    ResetParams();
+
+    // Both ends of the representable range: the fold pushes the value off it,
+    // so there is no datetime2 to send. Left unskipped deliberately, so the
+    // compare leg adjudicates the SQLSTATE against retail rather than the
+    // driver only agreeing with its own unit test.
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "0001-01-01 00:00:00+05:30"),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "9999-12-31 23:59:59-05:30"),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+}
+
+// The fold runs *before* the target's own rules, so an offset that moves a
+// midnight literal off midnight leaves a time the `date` target cannot carry.
+// The zero-offset case shows the fold, not the literal, is responsible.
+TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanMakeADateTargetOverflow) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-05-20 00:00:00+05:30"), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22008");
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 23)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-05-20 00:00:00+00:00"), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("2024-05-20", ExecuteAndReadBack());
+    ResetParams();
+
+    // 18:30 - (-05:30) is 24:00, so the fold lands on midnight the *next* day
+    // and the date target carries it. The only case here where the fold
+    // increments the day.
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 23)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-05-20 18:30:00-05:30"), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("2024-05-21", ExecuteAndReadBack());
+}
+
+// The offset bound is on the total, so +14:30 is as invalid as +15:00. It has
+// to fail the literal for every temporal target, not only the one that reads
+// the offset back out, or malformed text would convert silently on the rest.
+//
+// This covers only *invalid* offsets. A **valid** offset is folded into the
+// value instead - see AValidOffsetIsFoldedToUtcForNonOffsetTargets.
+TEST_F(ScalarConversionLiveTest, AnOutOfRangeOffsetLiteralIs22018ForEveryTarget) {
+    for (SQLSMALLINT sql_type : {SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_SS_TIME2,
+                                 SQL_TYPE_TIMESTAMP, SQL_SS_TIMESTAMPOFFSET}) {
+        for (const char* text : {"2024-05-20 00:00:00+14:30", "2024-05-20 00:00:00+15:00"}) {
+            ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(BindNarrow(sql_type, text, 0, 7), SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << sql_type << " " << text;
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+            ResetParams();
+        }
+    }
+
+    // The boundary itself is legal and keeps its offset.
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56+14:00", 0, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20 12:34:56.0000000 +14:00", ExecuteAndReadBack());
+}
+
+// A parsed literal is still bound by the target's own rules: the date target
+// drops nothing silently, and DecimalDigits still bounds the fraction.
+TEST_F(ScalarConversionLiveTest, ACharLiteralStillObeysTheTargetRules) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-05-20 12:00:00"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22008");
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIME, "12:34:56.1234567", 16, 3), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22008");
+    ResetParams();
+
+    // Midnight drops nothing, so the date target takes it.
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?, 23)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_DATE, "2024-05-20 00:00:00"), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("2024-05-20", ExecuteAndReadBack());
+}
+
+// The failure mssql-python actually hit: several parameters in one statement,
+// with the temporal one bound as text. A per-parameter test cannot catch a
+// binding that only fails alongside others.
+TEST_F(ScalarConversionLiveTest, ATemporalTextParamBindsAlongsideOtherParameters) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), CONCAT(CONVERT(VARCHAR(16), ?), '|', "
+                          "CONVERT(VARCHAR(32), ?), '|', CONVERT(VARCHAR(16), ?)))"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER id = 42;
+    SQLLEN id_ind = sizeof(id);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &id, 0, &id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    std::string time_text = "12:34:56.000000";
+    std::vector<SQLCHAR> time_buf(time_text.begin(), time_text.end());
+    SQLLEN time_ind = static_cast<SQLLEN>(time_buf.size());
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_TYPE_TIME, 16, 6,
+                                   time_buf.data(), time_ind, &time_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLDOUBLE dbl = 1.5;
+    SQLLEN dbl_ind = sizeof(dbl);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE, 0, 0,
+                                   &dbl, 0, &dbl_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ("42|12:34:56.0000000|1.5", ExecuteAndReadBack());
 }
 
 // ValidateDateStruct (sqlccnvt.cpp:8821) answers CVT_DT_ERROR = IDS_22_007_00.

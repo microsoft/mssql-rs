@@ -6,7 +6,7 @@
 
 use crate::core::TdsResult;
 use crate::io::reader_writer::NetworkWriter;
-use crate::io::token_stream::TdsTokenStreamReader;
+use crate::io::token_stream::{ParserContext, TdsTokenStreamReader};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -37,7 +37,8 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// This should cleanly shut down any underlying network connections.
     async fn close_transport(&mut self) -> TdsResult<()>;
 
-    /// Send an attention packet and wait for acknowledgment with a timeout.
+    /// Send an attention packet and drain the response to its acknowledgment
+    /// with a timeout.
     ///
     /// This method implements the attention sending flow:
     /// 1. Send MT_ATTN (0x06) packet to the server
@@ -46,6 +47,9 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     ///
     /// # Arguments
     ///
+    /// * `context` - Parser state needed to decode row tokens left in the
+    ///   cancelled response. Rows do not carry their own metadata, so the drain
+    ///   cannot safely reach DONE_ATTN without it.
     /// * `timeout` - Maximum time for the whole flow, covering the send as well
     ///   as the wait. Writing the packet can itself stall on a peer that has
     ///   stopped reading, so implementations must not leave the send unbounded.
@@ -63,7 +67,11 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// it as the answer to a different request. Implementations must mark such
     /// a connection dead rather than let it be reused, which is why callers may
     /// ignore the return value.
-    async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
+    async fn send_attention_with_timeout(
+        &mut self,
+        context: &ParserContext,
+        timeout: Duration,
+    ) -> TdsResult<bool>;
 
     /// Probe whether the underlying connection is dead via a non-blocking socket
     /// poll. Returns `true` if dead, `false` if alive or unknown.

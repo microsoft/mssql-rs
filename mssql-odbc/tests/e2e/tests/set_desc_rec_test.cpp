@@ -14,7 +14,6 @@
 //      SQL_CODE_TIMESTAMP resolves SQL_DESC_CONCISE_TYPE to SQL_TYPE_TIMESTAMP
 //   6. EquivalentToSetDescFieldSequence - one SQLSetDescRec call and the
 //      equivalent sequence of SQLSetDescFieldW calls produce the same record
-//      (disabled - AB#47811)
 //   7. BindsAParameterUsableForExecute - a parameter bound purely through
 //      SQLSetDescRec (never SQLBindParameter) executes correctly — the
 //      strongest form of AB#47437's "descriptor-field and convenience bind
@@ -68,6 +67,13 @@ protected:
         EXPECT_SQL_OK(rc, SQL_HANDLE_DESC, hdesc);
         return value;
     }
+
+    SQLLEN GetLen(SQLHDESC hdesc, SQLSMALLINT record, SQLSMALLINT field) {
+        SQLLEN value = -1;
+        SQLRETURN rc = SQLGetDescFieldW(hdesc, record, field, &value, sizeof(value), nullptr);
+        EXPECT_SQL_OK(rc, SQL_HANDLE_DESC, hdesc);
+        return value;
+    }
 };
 
 TEST_F(SetDescRecLiveTest, CannotModifyIrd) {
@@ -116,12 +122,10 @@ TEST_F(SetDescRecLiveTest, DatetimeSubTypeResolvesConciseType) {
 }
 
 TEST_F(SetDescRecLiveTest, EquivalentToSetDescFieldSequence) {
-    // Disabled: this test crashes the whole binary on both drivers, so every
-    // descriptor test after it is skipped too. SQL_DESC_OCTET_LENGTH below is a
-    // SQLLEN field read through GetSmallInt, and SQLGetDescField ignores
-    // BufferLength for fixed-size attributes - the driver writes 8 bytes into a
-    // 2-byte stack slot. Fix and re-enable are AB#47811.
-    GTEST_SKIP() << "crashes on a wrong-width SQL_DESC_OCTET_LENGTH read - AB#47811";
+    // SQL_DESC_OCTET_LENGTH is a SQLLEN field, so it must be read through
+    // GetLen: SQLGetDescField ignores BufferLength for fixed-size attributes
+    // and writes the full 8 bytes, which a 2-byte GetSmallInt slot would
+    // smash the stack with (AB#47811).
 
     // Two independent statements, each with its own implicit APD — comparing
     // against the *same* APD twice would let the second write sequence
@@ -166,8 +170,8 @@ TEST_F(SetDescRecLiveTest, EquivalentToSetDescFieldSequence) {
 
     EXPECT_EQ(GetSmallInt(via_rec, 1, SQL_DESC_CONCISE_TYPE),
               GetSmallInt(via_field, 1, SQL_DESC_CONCISE_TYPE));
-    EXPECT_EQ(GetSmallInt(via_rec, 1, SQL_DESC_OCTET_LENGTH),
-              GetSmallInt(via_field, 1, SQL_DESC_OCTET_LENGTH));
+    EXPECT_EQ(GetLen(via_rec, 1, SQL_DESC_OCTET_LENGTH),
+              GetLen(via_field, 1, SQL_DESC_OCTET_LENGTH));
 
     EXPECT_SQL_OK(SQLFreeHandle(SQL_HANDLE_STMT, stmt2), SQL_HANDLE_STMT, stmt2);
 }

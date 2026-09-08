@@ -225,6 +225,7 @@ fn sql_get_data_safe(
         let prepared_stream = (
             active_plp.encoding,
             active_plp.pending_units.len(),
+            active_plp.pending_utf8.len(),
             active_plp.narrow_to_wide.is_some(),
         );
         return stream_active_plp_chunk(
@@ -1603,7 +1604,7 @@ fn stream_active_plp_chunk<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
-    prepared_stream: Option<(PlpEncoding, usize, bool)>,
+    prepared_stream: Option<(PlpEncoding, usize, usize, bool)>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
@@ -1625,8 +1626,12 @@ fn stream_active_plp_chunk<'a>(
         return SQL_ERROR;
     }
 
-    let (plp_encoding, widen_carry_len) = if let Some((encoding, widen_carry_len, widening_ready)) =
-        prepared_stream
+    let (plp_encoding, widen_carry_len, utf8_carry_len) = if let Some((
+        encoding,
+        widen_carry_len,
+        utf8_carry_len,
+        widening_ready,
+    )) = prepared_stream
     {
         let compatible = match (target_type, encoding) {
             (SQL_C_WCHAR, PlpEncoding::Utf16Text) => true,
@@ -1655,7 +1660,7 @@ fn stream_active_plp_chunk<'a>(
             }
             return SQL_ERROR;
         }
-        (Some(encoding), widen_carry_len)
+        (Some(encoding), widen_carry_len, utf8_carry_len)
     } else {
         let mut stmt_state = match retained_stmt_state.take() {
             Some(state) => state,
@@ -1759,6 +1764,7 @@ fn stream_active_plp_chunk<'a>(
         let stream_state = (
             stream.map(|s| s.encoding),
             stream.map_or(0, |s| s.pending_units.len()),
+            stream.map_or(0, |s| s.pending_utf8.len()),
         );
         retained_stmt_state = Some(stmt_state);
         stream_state
@@ -1813,12 +1819,7 @@ fn stream_active_plp_chunk<'a>(
         // Whole UTF-16 code units only.
         payload_capacity & !1
     } else if transcode_utf16_to_utf8 {
-        // One BMP UTF-16 code unit expands to at most 3 UTF-8 bytes, so read at
-        // most (cap / 3) code units per chunk. Keeping the byte count even means
-        // a code unit is never split mid-read; surrogate pairs that straddle a
-        // chunk boundary are carried explicitly. This conservative sizing
-        // guarantees the transcoded output always fits the caller's buffer.
-        ((payload_capacity / 3) * 2) & !1
+        utf16le_max_read(payload_capacity, utf8_carry_len)
     } else {
         payload_capacity
     };
@@ -1832,18 +1833,10 @@ fn stream_active_plp_chunk<'a>(
     // available and 01004 are reported as usual. msodbcsql answers this shape
     // the same way.
     //
-    // Payload room too small to carry one whole character is a different case:
-    // the buffer is not a probe, and the conservative sizing above cannot use
-    // the room it has, so every retry would report truncation without
-    // consuming anything and an application looping on an unchanged buffer
-    // would never terminate. That stays HY090.
-    //
-    // Reached by a SQL_C_CHAR buffer of 2-3 bytes transcoding from UTF-16,
-    // where one character needs up to 3, and by a SQL_C_WCHAR buffer of 1 or 3
-    // bytes: one cannot hold even the terminator, the other has a spare byte
-    // that no whole code unit fits in. msodbcsql instead delivers one byte per
-    // call here; matching that needs an unflushed-tail buffer in
-    // `ActivePlpStream` and is tracked separately.
+    // Payload room too small to carry one whole wide character is a different
+    // case: a SQL_C_WCHAR buffer of 1 or 3 bytes cannot make progress and is
+    // rejected with HY090. UTF-8 output has a byte carry, so any SQL_C_CHAR
+    // buffer with payload room can make progress.
     //
     // A probe is exactly two shapes: a zero-length buffer, and one sized for
     // the terminator alone. Everything else that cannot make progress is an
@@ -1854,6 +1847,8 @@ fn stream_active_plp_chunk<'a>(
     let is_length_probe = buffer_length == 0 || buffer_length as usize == terminator_bytes;
     let makes_no_progress = if widen_narrow_to_utf16 {
         widen_out_units == 0
+    } else if transcode_utf16_to_utf8 {
+        max_read == 0 && utf8_carry_len == 0
     } else {
         max_read == 0
     };
@@ -2176,36 +2171,55 @@ fn stream_active_plp_chunk<'a>(
         // writable for one `SqlLen`.
         unsafe { write_if_some(strlen_or_ind_ptr, usable as SqlLen) };
     } else if transcode_utf16_to_utf8 {
-        // NVARCHAR PLP wire bytes are UTF-16LE; transcode to UTF-8 for
-        // SQL_C_CHAR, carrying a split code unit or surrogate pair across the
-        // chunk boundary so the value is never corrupted.
-        let utf8 = {
+        // The wire carries nvarchar as UTF-16; the caller asked for UTF-8
+        // (SQL_C_CHAR). A code unit or a surrogate pair split across a chunk
+        // boundary is carried on the input side (pending_byte /
+        // pending_high_surrogate). Output can overrun too: a surrogate pair
+        // becomes a 4-byte character, so a chunk may transcode to more UTF-8
+        // than the buffer holds. Transcode the whole chunk, copy only what
+        // fits, and keep the rest in pending_utf8 for the next call.
+        {
             let Ok(mut ss) = stmt.inner.lock() else {
                 return SQL_ERROR;
             };
             let Some(stream) = ss.active_plp.as_mut() else {
                 return SQL_ERROR;
             };
-            utf16le_chunk_to_utf8(
+            let ActivePlpStream {
+                pending_byte,
+                pending_high_surrogate,
+                pending_utf8,
+                ..
+            } = stream;
+            let emit = transcode_utf16le_into_pending(
                 &payload[..read],
                 reached_end,
-                &mut stream.pending_byte,
-                &mut stream.pending_high_surrogate,
-            )
+                pending_byte,
+                pending_high_surrogate,
+                pending_utf8,
+                payload_capacity,
+            );
+            unsafe {
+                copy_with_nul(
+                    target_value_ptr as *mut u8,
+                    buffer_length as usize,
+                    &pending_utf8[..emit],
+                );
+                write_if_some(
+                    strlen_or_ind_ptr,
+                    SqlLen::try_from(emit).unwrap_or(SqlLen::MAX),
+                );
+            }
+            pending_utf8.drain(..emit);
+            // Forward progress, mirroring the widening branch's guard. The
+            // extra read > 0 term is the UTF-16 difference: a chunk can be a
+            // lone carried high surrogate (the #211 straddle), consuming wire
+            // input while emitting nothing yet -- progress, not a stall.
+            debug_assert!(
+                emit > 0 || read > 0 || reached_end || payload_capacity == 0,
+                "UTF-16 to UTF-8 transcode made no forward progress"
+            );
         };
-        let utf8_bytes = utf8.as_bytes();
-        let truncated = unsafe {
-            copy_with_nul(
-                target_value_ptr as *mut u8,
-                buffer_length as usize,
-                utf8_bytes,
-            )
-        };
-        // Conservative max_read sizing guarantees the transcoded chunk fits.
-        debug_assert!(!truncated, "transcoded PLP chunk overflowed caller buffer");
-        unsafe {
-            write_if_some(strlen_or_ind_ptr, utf8_bytes.len() as SqlLen);
-        }
     } else {
         // SQL_C_CHAR delivery of a non-UTF-16 text PLP column: the wire bytes are
         // copied verbatim. `SingleByteText` and `Utf8Text` have identical bodies
@@ -2259,15 +2273,14 @@ fn stream_active_plp_chunk<'a>(
         }
     };
 
-    // The wire being exhausted is not the same as the value being delivered: the
-    // widening path can still hold decoded units the caller's buffer had no room
-    // for. Ending the stream here would drop them and report success.
-    let widen_units_still_held = stmt_state
+    // The wire being exhausted is not the same as the value being delivered:
+    // converted output can remain after the caller's buffer fills.
+    let converted_data_still_held = stmt_state
         .active_plp
         .as_ref()
-        .is_some_and(|s| !s.pending_units.is_empty());
+        .is_some_and(|s| !s.pending_units.is_empty() || !s.pending_utf8.is_empty());
 
-    if reached_end && !widen_units_still_held {
+    if reached_end && !converted_data_still_held {
         if let Some(mut stream) = stmt_state.active_plp.take() {
             let buffer = stream.take_prefetch_buffer();
             if buffer.capacity() > stmt_state.plp_prefetch_scratch.capacity() {
@@ -2372,6 +2385,45 @@ pub(crate) fn widen_into_pending(
         pending.truncate(base + written);
     }
     out_units.min(pending.len())
+}
+
+/// Picks how many UTF-16LE wire bytes to read for the UTF-8 room still free.
+///
+/// Two wire bytes make one UTF-16 code unit, and a Basic Multilingual Plane
+/// code unit is at most three UTF-8 bytes, so `room / 3` code units (floored,
+/// two wire bytes each) is the most whose output still fits -- which keeps whole
+/// characters inside a single returned buffer instead of splitting one across
+/// calls. Never below two code units, so a surrogate pair (the two code units
+/// UTF-16 uses for characters outside that plane, such as emoji) can assemble in
+/// one call even when the room is a byte or two. That two-unit floor is also
+/// what makes good on "any SQL_C_CHAR buffer with payload room can make
+/// progress": without it a two- or three-byte buffer would read zero with no
+/// carry to drain and fall into the HY090 no-progress branch.
+///
+/// `pending_utf8` still absorbs the two shapes that overshoot the room anyway: a
+/// surrogate pair is four UTF-8 bytes, one past the three the `/ 3` floor budgets
+/// per unit, and the two-unit floor over-reads any room under six bytes.
+fn utf16le_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
+    let remaining = payload_capacity.saturating_sub(pending_utf8_len);
+    if remaining == 0 {
+        0
+    } else {
+        (remaining / 3).saturating_mul(2).max(4)
+    }
+}
+
+/// Appends one transcoded UTF-16LE chunk and returns the UTF-8 prefix that fits.
+fn transcode_utf16le_into_pending(
+    new_bytes: &[u8],
+    reached_end: bool,
+    pending_byte: &mut Option<u8>,
+    pending_high_surrogate: &mut Option<u16>,
+    pending_utf8: &mut Vec<u8>,
+    out_bytes: usize,
+) -> usize {
+    let utf8 = utf16le_chunk_to_utf8(new_bytes, reached_end, pending_byte, pending_high_surrogate);
+    pending_utf8.extend_from_slice(utf8.as_bytes());
+    out_bytes.min(pending_utf8.len())
 }
 
 /// Transcodes a chunk of UTF-16LE PLP wire bytes to UTF-8 for SQL_C_CHAR
@@ -3152,6 +3204,129 @@ mod tests {
         let second = utf16le_chunk_to_utf8(low, true, &mut pb, &mut ph);
         assert_eq!(second, "😀");
         assert!(pb.is_none() && ph.is_none());
+    }
+
+    #[test]
+    fn utf16_transcode_retains_surrogate_straddle_overflow() {
+        let wire = utf16le("A\u{10437}你");
+        let mut pending_byte = None;
+        let mut pending_high = None;
+        let mut pending_utf8 = Vec::new();
+        let mut delivered = Vec::new();
+        let payload_capacity = 6;
+
+        let first_read = utf16le_max_read(payload_capacity, pending_utf8.len());
+        assert_eq!(first_read, 4);
+        let first_emit = transcode_utf16le_into_pending(
+            &wire[..first_read],
+            false,
+            &mut pending_byte,
+            &mut pending_high,
+            &mut pending_utf8,
+            payload_capacity,
+        );
+        delivered.extend_from_slice(&pending_utf8[..first_emit]);
+        pending_utf8.drain(..first_emit);
+        assert_eq!(delivered, b"A");
+
+        let second_read = utf16le_max_read(payload_capacity, pending_utf8.len());
+        assert_eq!(second_read, 4);
+        let second_emit = transcode_utf16le_into_pending(
+            &wire[first_read..first_read + second_read],
+            true,
+            &mut pending_byte,
+            &mut pending_high,
+            &mut pending_utf8,
+            payload_capacity,
+        );
+        assert_eq!(pending_utf8.len(), 7);
+        assert_eq!(second_emit, payload_capacity);
+        delivered.extend_from_slice(&pending_utf8[..second_emit]);
+        pending_utf8.drain(..second_emit);
+        assert_eq!(pending_utf8.len(), 1);
+
+        let final_emit = transcode_utf16le_into_pending(
+            &[],
+            true,
+            &mut pending_byte,
+            &mut pending_high,
+            &mut pending_utf8,
+            payload_capacity,
+        );
+        delivered.extend_from_slice(&pending_utf8[..final_emit]);
+        pending_utf8.drain(..final_emit);
+
+        assert_eq!(String::from_utf8(delivered).unwrap(), "A\u{10437}你");
+        assert!(pending_utf8.is_empty());
+    }
+
+    #[test]
+    fn utf16_transcode_drains_multibyte_output_one_byte_at_a_time() {
+        let wire = utf16le("你");
+        let mut pending_byte = None;
+        let mut pending_high = None;
+        let mut pending_utf8 = Vec::new();
+        let mut delivered = Vec::new();
+
+        let emit = transcode_utf16le_into_pending(
+            &wire,
+            true,
+            &mut pending_byte,
+            &mut pending_high,
+            &mut pending_utf8,
+            1,
+        );
+        delivered.extend_from_slice(&pending_utf8[..emit]);
+        pending_utf8.drain(..emit);
+
+        let mut iterations = 0;
+        while !pending_utf8.is_empty() {
+            assert_eq!(utf16le_max_read(1, pending_utf8.len()), 0);
+            let emit = transcode_utf16le_into_pending(
+                &[],
+                true,
+                &mut pending_byte,
+                &mut pending_high,
+                &mut pending_utf8,
+                1,
+            );
+            delivered.extend_from_slice(&pending_utf8[..emit]);
+            pending_utf8.drain(..emit);
+            iterations += 1;
+            assert!(
+                iterations < 10_000,
+                "transcode drain made no forward progress"
+            );
+        }
+
+        assert_eq!(String::from_utf8(delivered).unwrap(), "你");
+    }
+
+    #[test]
+    fn utf16le_max_read_floors_to_whole_characters() {
+        // (payload_capacity, pending_utf8_len) -> expected wire bytes to read.
+        // Floor sizing bounds a read to whole characters; the sizes not
+        // divisible by three (7, 8191) would read two bytes more under the old
+        // div_ceil, so they pin floor-vs-ceil. The rest pin the .max(4) two-unit
+        // floor and the carry shrinking the room (or filling it, draining only).
+        let cases = [
+            ((1, 0), 4),
+            ((3, 0), 4),
+            ((5, 0), 4),
+            ((6, 0), 4),
+            ((7, 0), 4),       // div_ceil would read 6
+            ((8191, 0), 5460), // div_ceil would read 5462
+            ((10, 4), 4),      // carry shrinks the room to 6
+            ((3, 3), 0),       // carry fills the room: drain only
+            ((3, 5), 0),       // carry over-fills, saturating to no read
+        ];
+        for ((capacity, carry), expected) in cases {
+            assert_eq!(
+                utf16le_max_read(capacity, carry),
+                expected,
+                "utf16le_max_read({capacity}, {carry})"
+            );
+        }
     }
 
     /// A dangling half code unit at true end-of-stream is genuinely malformed

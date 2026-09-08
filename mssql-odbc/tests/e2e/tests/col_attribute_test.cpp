@@ -26,12 +26,16 @@
 //   19. NameTruncationReturnsInfo         - short buffer → SUCCESS_WITH_INFO + 01004
 //   20. VariantTypeOnNonVariantColumn     - HY113
 //   21. VariantUnderlyingTypeAfterProbe   - probe then SQL_CA_SS_VARIANT_TYPE
-//   22. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
-//   23. ClrUdtDescriptorFields             - CLR UDT type and size-bearing fields
-//   24. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
-//   25. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
-//   26. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
-//   27. VariantDateTimeBaseTypesUseTheThreeXSpellings - the deliberate 2.x/3.x difference
+//   22. Odbc2TemporalVariantTypes          - legacy codes and SS binary fallback
+//   23. Odbc3TemporalVariantTypes          - legacy codes and SS binary fallback
+//   24. Odbc38TemporalVariantTypes         - legacy codes and SS extended types
+//   25. EmptyVariantProbeConsumesValueButKeepsBaseType - base type survives the probe
+//   26. VariantTypeBeforeProbeIsSequenceError - attribute before the value is read
+//   27. ClrUdtDescriptorFields             - CLR UDT type, size, and identity fields
+//   28. ClrUdtIdentityFieldsAreEmptyForNonUdtColumns - non-UDT identity fields are empty
+//   29. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
+//   30. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
+//   31. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
 
 #include "odbc_test_fixture.h"
 
@@ -48,6 +52,24 @@
 #ifndef SQL_SS_UDT
 #define SQL_SS_UDT (-151)
 #endif
+#ifndef SQL_CA_SS_UDT_CATALOG_NAME
+#define SQL_CA_SS_UDT_CATALOG_NAME (1218)
+#endif
+#ifndef SQL_CA_SS_UDT_SCHEMA_NAME
+#define SQL_CA_SS_UDT_SCHEMA_NAME (1219)
+#endif
+#ifndef SQL_CA_SS_UDT_TYPE_NAME
+#define SQL_CA_SS_UDT_TYPE_NAME (1220)
+#endif
+#ifndef SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME
+#define SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME (1221)
+#endif
+#ifndef SQL_C_SS_TIME2
+#define SQL_C_SS_TIME2 0x4000
+#endif
+#ifndef SQL_C_SS_TIMESTAMPOFFSET
+#define SQL_C_SS_TIMESTAMPOFFSET 0x4001
+#endif
 
 class ColAttributeLiveTest : public ODBCTest {
 protected:
@@ -60,6 +82,34 @@ protected:
     }
 };
 
+class ColAttributeOdbc3LiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0),
+                      SQL_HANDLE_ENV, env_);
+        Connect();
+    }
+};
+
+class ColAttributeOdbc2LiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured - set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        ASSERT_SQL_OK(SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION,
+                                    reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC2), 0),
+                      SQL_HANDLE_ENV, env_);
+        Connect();
+    }
+};
+
 // Reads a numeric attribute, asserting the call succeeded.
 static SQLLEN NumericAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
     SQLLEN value = -1;
@@ -67,6 +117,34 @@ static SQLLEN NumericAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
     EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "field " << field;
     return value;
 }
+
+// Reads a text attribute, asserting the call succeeded.
+static std::string TextAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field) {
+    SQLTCHAR value[512] = {};
+    SQLSMALLINT length = 0;
+    SQLRETURN rc =
+        SQLColAttribute(stmt, col, field, value, sizeof(value), &length, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "field " << field;
+    return ODBCTestUtils::ToNarrow(SqlTString(value));
+}
+
+static void ExpectVariantType(SQLHSTMT stmt, SQLUSMALLINT col, SQLLEN expected) {
+    SCOPED_TRACE("column " + std::to_string(col));
+    SQLCHAR probe = 0;
+    SQLLEN indicator = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt, col, SQL_C_BINARY, &probe, 0, &indicator),
+                  SQL_HANDLE_STMT, stmt);
+    EXPECT_EQ(expected, NumericAttr(stmt, col, SQL_CA_SS_VARIANT_TYPE));
+}
+
+static constexpr const char* TEMPORAL_VARIANTS_QUERY =
+    "SELECT CAST(CAST('2026-09-03' AS DATE) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:00' AS SMALLDATETIME) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:56.123' AS DATETIME) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:56.1234567' AS DATETIME2(7)) AS SQL_VARIANT),"
+    " CAST(CAST('12:34:56.1234567' AS TIME(7)) AS SQL_VARIANT),"
+    " CAST(CAST('2026-09-03T12:34:56.1234567+05:30' AS DATETIMEOFFSET(7))"
+    " AS SQL_VARIANT)";
 
 TEST(ColAttributeTest, NullHandle) {
     SQLLEN value = 0;
@@ -127,6 +205,9 @@ TEST_F(ColAttributeLiveTest, ConciseTypePerColumnType) {
     SQLCloseCursor(stmt_);
 }
 
+// Matches retail msodbcsql 18.6.2.1. GetIRDField in
+// Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp copies these four UDT name-pool entries,
+// keeps SQL_DESC_TYPE_NAME as "udt", and returns empty entries for non-UDT columns.
 TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
     ExecDirect("SELECT CAST(NULL AS geography) AS geography_col, "
                "CAST(NULL AS geometry) AS geometry_col, "
@@ -135,11 +216,16 @@ TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
     struct UdtColumn {
         SQLUSMALLINT ordinal;
         SQLLEN size;
+        const char* typeName;
+        const char* assemblyTypeNamePrefix;
     };
     const UdtColumn columns[] = {
-        {1, 0},
-        {2, 0},
-        {3, 892},
+        {1, 0, "geography",
+         "Microsoft.SqlServer.Types.SqlGeography, Microsoft.SqlServer.Types"},
+        {2, 0, "geometry",
+         "Microsoft.SqlServer.Types.SqlGeometry, Microsoft.SqlServer.Types"},
+        {3, 892, "hierarchyid",
+         "Microsoft.SqlServer.Types.SqlHierarchyId, Microsoft.SqlServer.Types"},
     };
 
     for (const auto& column : columns) {
@@ -155,6 +241,34 @@ TEST_F(ColAttributeLiveTest, ClrUdtDescriptorFields) {
             << "column " << column.ordinal;
         EXPECT_EQ(0, NumericAttr(stmt_, column.ordinal, SQL_DESC_DISPLAY_SIZE))
             << "column " << column.ordinal;
+        EXPECT_EQ(ODBCTestConfig::Instance().Database(),
+                  TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_CATALOG_NAME))
+            << "column " << column.ordinal;
+        EXPECT_EQ("sys", TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_SCHEMA_NAME))
+            << "column " << column.ordinal;
+        EXPECT_EQ(column.typeName,
+                  TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_TYPE_NAME))
+            << "column " << column.ordinal;
+        const std::string assemblyTypeName =
+            TextAttr(stmt_, column.ordinal, SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME);
+        EXPECT_EQ(0u, assemblyTypeName.find(column.assemblyTypeNamePrefix))
+            << "column " << column.ordinal << ": " << assemblyTypeName;
+        EXPECT_EQ("udt", TextAttr(stmt_, column.ordinal, SQL_DESC_TYPE_NAME))
+            << "column " << column.ordinal;
+    }
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeLiveTest, ClrUdtIdentityFieldsAreEmptyForNonUdtColumns) {
+    ExecDirect("SELECT CAST(1 AS int)");
+
+    for (SQLUSMALLINT field : {
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_CATALOG_NAME),
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_SCHEMA_NAME),
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_TYPE_NAME),
+             static_cast<SQLUSMALLINT>(SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME),
+         }) {
+        EXPECT_EQ("", TextAttr(stmt_, 1, field)) << "field " << field;
     }
     SQLCloseCursor(stmt_);
 }
@@ -472,6 +586,50 @@ TEST_F(ColAttributeLiveTest, VariantUnderlyingTypeAfterProbe) {
     SQLCloseCursor(stmt_);
 }
 
+// ODBC 3.8 introduced the SQL Server temporal C types. Applications declaring
+// ODBC 2 or 3 receive the binary fallback for time and datetimeoffset.
+TEST_F(ColAttributeOdbc2LiveTest, Odbc2TemporalVariantTypes) {
+    ExecDirect(TEMPORAL_VARIANTS_QUERY);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
+
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeOdbc3LiveTest, Odbc3TemporalVariantTypes) {
+    ExecDirect(TEMPORAL_VARIANTS_QUERY);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_BINARY));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_BINARY));
+
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(ColAttributeLiveTest, Odbc38TemporalVariantTypes) {
+    ExecDirect(TEMPORAL_VARIANTS_QUERY);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 1, SQL_C_DATE));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 2, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 3, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 4, SQL_C_TIMESTAMP));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 5, SQL_C_SS_TIME2));
+    ASSERT_NO_FATAL_FAILURE(ExpectVariantType(stmt_, 6, SQL_C_SS_TIMESTAMPOFFSET));
+
+    SQLCloseCursor(stmt_);
+}
+
 // AB#47537 follow-up: the empty-value case of the zero-length SQL_C_BINARY
 // probe now *consumes* the column (there was nothing left to deliver), so this
 // pins the interaction with variant base-type tracking -- the two live in
@@ -644,17 +802,8 @@ TEST_F(ColAttributeLiveTest, VariantDecimalStillDeliversAsCharacter) {
 // until someone answers for it, and this table is where the answer gets pinned
 // against msodbcsql.
 //
-// Deliberately excluded, because the drivers genuinely differ:
-//
-//   * date / smalldatetime / datetime / datetime2 - msodbcsql answers the 2.x
-//     spellings (SQL_C_DATE 9, SQL_C_TIMESTAMP 11), this driver the 3.x ones
-//     (91 / 93). That is the documented canonicalization direction in
-//     api/type_rules.rs, not a defect, and it is covered separately below.
-//   * time / datetimeoffset - both drivers answer SQL_C_SS_TIME2 /
-//     SQL_C_SS_TIMESTAMPOFFSET when the application declares ODBC 3.80, but
-//     msodbcsql falls back to SQL_C_BINARY under plain SQL_OV_ODBC3 while this
-//     driver does not. The fixture's declared version decides the answer, so
-//     the row would assert the fixture rather than the driver.
+// Temporal types are covered separately above because their expected values
+// depend on the declared ODBC version.
 TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
     struct Case {
         const char* label;
@@ -682,40 +831,6 @@ TEST_F(ColAttributeLiveTest, VariantBaseTypesMatchMsodbcsql) {
         {"binary", "CAST(0x01 AS BINARY(1))", SQL_C_BINARY},
         {"varbinary", "CAST(0x01 AS VARBINARY(10))", SQL_C_BINARY},
         {"uniqueidentifier", "CAST(NEWID() AS UNIQUEIDENTIFIER)", SQL_C_GUID},
-    };
-
-    for (const Case& c : cases) {
-        SCOPED_TRACE(c.label);
-        ExecDirect(std::string("SELECT CAST(") + c.expr + " AS SQL_VARIANT) AS v");
-        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-
-        SQLCHAR probe = 0;
-        SQLLEN indicator = 0;
-        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, &probe, 0, &indicator),
-                      SQL_HANDLE_STMT, stmt_);
-        ASSERT_NE(SQL_NULL_DATA, indicator);
-        EXPECT_EQ(c.expected, NumericAttr(stmt_, 1, SQL_CA_SS_VARIANT_TYPE));
-
-        SQLCloseCursor(stmt_);
-    }
-}
-
-// The date/time family, which the table above excludes. msodbcsql answers the
-// 2.x spellings here regardless of the declared ODBC version; this driver
-// canonicalizes toward the 3.x ones (api/type_rules.rs). Pinning our side keeps
-// the difference deliberate instead of accidental, so it skips the reference leg.
-TEST_F(ColAttributeLiveTest, VariantDateTimeBaseTypesUseTheThreeXSpellings) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-    struct Case {
-        const char* label;
-        const char* expr;
-        SQLSMALLINT expected;
-    };
-    const Case cases[] = {
-        {"date", "CAST('2023-06-15' AS DATE)", SQL_C_TYPE_DATE},
-        {"smalldatetime", "CAST('2023-06-15 12:00' AS SMALLDATETIME)", SQL_C_TYPE_TIMESTAMP},
-        {"datetime", "CAST('2023-06-15 12:00' AS DATETIME)", SQL_C_TYPE_TIMESTAMP},
-        {"datetime2", "CAST('2023-06-15 12:00' AS DATETIME2)", SQL_C_TYPE_TIMESTAMP},
     };
 
     for (const Case& c : cases) {
