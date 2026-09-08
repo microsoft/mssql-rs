@@ -71,6 +71,9 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryChunksWithARemainingCount) {
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     EXPECT_EQ(1, ind);
     EXPECT_EQ(0x09, buf[0]);
+
+    // Drained: the value is gone, so asking again is SQL_NO_DATA.
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     SQLCloseCursor(stmt_);
 }
 
@@ -123,6 +126,9 @@ TEST_F(BinaryFetchLiveTest, VarbinaryMaxChunksAcrossCalls) {
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     EXPECT_EQ(2, ind);
     EXPECT_EQ(0x41, buf[0]);
+
+    // Drained: the stream is exhausted, so asking again is SQL_NO_DATA.
+    EXPECT_EQ(SQL_NO_DATA, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     SQLCloseCursor(stmt_);
 }
 
@@ -231,5 +237,40 @@ TEST_F(BinaryFetchLiveTest, FixedWidthKindsAreStillRefused) {
     SQLLEN ind = 0;
     EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    SQLCloseCursor(stmt_);
+}
+
+// ---------------------------------------------------------------------------
+// Binary is not text, even when the column is. A bound SQL_C_BINARY read of a
+// UTF-8 encoded PLP column shares the accumulator with the character targets,
+// and those trim a truncated tail back to a whole UTF-8 character. Doing that
+// to a binary caller silently drops bytes it asked for verbatim.
+// ---------------------------------------------------------------------------
+
+TEST_F(BinaryFetchLiveTest, ABoundBinaryReadOfAUtf8ColumnKeepsTheTruncatedTail) {
+    // Every character is 2 bytes, so an odd-sized buffer must split one. The
+    // whole slot is payload: character trimming would give back 8, not 9.
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(N'[\"' + REPLICATE(NCHAR(233), 40) + N'\"]' AS JSON) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+
+    unsigned char buf[9] = {};
+    SQLLEN ind = -99;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+
+    // A streamed value whose total the server never declares: both drivers
+    // report SQL_NO_TOTAL rather than a count.
+    EXPECT_EQ(SQL_NO_TOTAL, ind);
+    EXPECT_EQ('[', buf[0]);
+    EXPECT_EQ('"', buf[1]);
+    // buf[2..] is the UTF-8 for U+00E9: 0xC3 0xA9 repeating. The last byte of
+    // the slot lands mid-character and must survive.
+    for (size_t i = 2; i < sizeof(buf); ++i) {
+        EXPECT_EQ((i % 2 == 0) ? 0xC3 : 0xA9, buf[i]) << "byte " << i << " must not be trimmed";
+    }
+
+    SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }

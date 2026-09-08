@@ -1102,8 +1102,12 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
     // Two rows and a trailing scalar: a bound LOB is drained into the caller's
     // buffer, and the value after it -- and the row after that -- still have to
     // decode, which is what a mis-sized drain would break.
+    //
+    // 1,100,000 bytes, not a few thousand: a value small enough to arrive inside
+    // the already-buffered wire bytes is materialized and delivered by the bound
+    // non-PLP path, which would leave deliver_bound_plp untested.
     ExecDirect(
-        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS lob, n * 11 AS tail "
+        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 1100000) AS lob, n * 11 AS tail "
         "FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
 
     SQLINTEGER n = -1;
@@ -1120,8 +1124,11 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
     // The LOB does not fit, so the row truncates and reports the full length.
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_EQ(1, n);
-    EXPECT_EQ(5000, ind) << "the untruncated byte count";
-    EXPECT_EQ(0x41, buf[0]);
+    EXPECT_EQ(1100000, ind) << "the untruncated byte count";
+    // Every byte of the slot is payload: a terminator would cost the last one.
+    for (size_t i = 0; i < sizeof(buf); ++i) {
+        EXPECT_EQ(0x41, buf[i]) << "byte " << i << " of the bound binary slot";
+    }
     EXPECT_EQ(11, tail) << "the column after the LOB must still decode";
 
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));

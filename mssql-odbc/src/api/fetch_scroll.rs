@@ -1903,7 +1903,9 @@ unsafe fn deliver_bound_plp(
                     break;
                 }
             }
-        } else if matches!(encoding, PlpEncoding::Utf8Text) {
+        } else if target != SQL_C_BINARY && matches!(encoding, PlpEncoding::Utf8Text) {
+            // Binary is excluded: `trim_partial_utf8` would drop a truncated tail
+            // that a binary caller asked for verbatim.
             for b in &scratch[..chunk.read] {
                 if out_bytes.len() < capacity_elements {
                     out_bytes.push(*b);
@@ -2136,12 +2138,12 @@ unsafe fn deliver_bound(
     }
 
     if binding.target_type == SQL_C_BINARY {
-        // Binary is not a string: no terminator, and the indicator carries the
-        // untruncated byte count exactly as the character targets do.
+        // Binary is not a string: no terminator, and the untruncated byte count
+        // goes to `octet_length` exactly as the character targets do.
         let Some(bytes) = column_value_to_bytes(value) else {
             return RowOutcome::Error(RowIssue::Unsupported);
         };
-        unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+        unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         let take = bytes.len().min(stride);
         if take > 0 {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, take) };
@@ -4183,6 +4185,41 @@ mod tests {
         assert!(matches!(outcome, RowOutcome::Success));
         assert_eq!(ind[1], SQL_NULL_DATA);
         assert_eq!(buf[1], 7, "a NULL must not disturb the data slot");
+    }
+
+    /// `SQLBindCol` points both descriptor fields at one location, so a test
+    /// using it cannot tell which one a delivery wrote. Bound through the
+    /// descriptor API they are separate: per the ODBC "Deferred Fields" spec the
+    /// returned length belongs on `SQL_DESC_OCTET_LENGTH_PTR`, and the indicator
+    /// carries only NULL status. Binary has to agree with the character targets
+    /// on that, which is what this pins.
+    #[test]
+    fn bound_binary_reports_its_length_on_octet_length_not_the_indicator() {
+        let mut buf = [0u8; 4];
+        let mut ind = [-99 as SqlLen; 1];
+        let mut octet = [-99 as SqlLen; 1];
+        let b = ColumnBinding {
+            column_number: 1,
+            target_type: SQL_C_BINARY,
+            target_value_ptr: buf.as_mut_ptr() as SqlPointer,
+            buffer_length: 4,
+            strlen_or_ind_ptr: ind.as_mut_ptr(),
+            octet_length_ptr: octet.as_mut_ptr(),
+        };
+
+        let value = ColumnValues::Bytes(vec![1, 2, 3, 4, 5, 6]);
+        let outcome = unsafe { deliver_bound(&b, 0, 0, &value) };
+
+        assert!(matches!(
+            outcome,
+            RowOutcome::Info(RowIssue::StringTruncated)
+        ));
+        assert_eq!(octet[0], 6, "the untruncated byte count");
+        assert_eq!(
+            ind[0], 0,
+            "the indicator is only cleared of a stale NULL, never given the length"
+        );
+        assert_eq!(buf, [1, 2, 3, 4]);
     }
 
     /// A bound column gets one shot at a fixed buffer, so an over-long value is
