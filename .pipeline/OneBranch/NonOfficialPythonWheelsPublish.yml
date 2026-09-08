@@ -34,7 +34,7 @@ parameters:
 - name: buildOdbcNative
   displayName: 'Also build mssql-odbc native driver'
   type: boolean
-  default: false
+  default: true
 
 variables:
   CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]  # For onebranch.pipeline.version task

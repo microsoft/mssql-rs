@@ -1,0 +1,111 @@
+"""Tests for final mssql-python-rs wheel validation."""
+
+from __future__ import annotations
+
+import subprocess
+import zipfile
+from pathlib import Path
+
+_VALIDATOR = (
+    Path(__file__).parents[1]
+    / ".pipeline"
+    / "scripts"
+    / "verify-python-wheels.ps1"
+)
+
+_LIBS = "mssql_py_core/libs"
+_PLATFORM_DRIVERS = {
+    "win_amd64": (f"{_LIBS}/windows/x64/mssqlodbc.dll",),
+    "win_arm64": (f"{_LIBS}/windows/arm64/mssqlodbc.dll",),
+    "linux_x86_64": (f"{_LIBS}/linux/glibc/x86_64/lib/mssqlodbc.so",),
+    "linux_aarch64": (f"{_LIBS}/linux/glibc/arm64/lib/mssqlodbc.so",),
+    "musllinux_1_2_x86_64": (f"{_LIBS}/linux/musl/x86_64/lib/mssqlodbc.so",),
+    "musllinux_1_2_aarch64": (f"{_LIBS}/linux/musl/arm64/lib/mssqlodbc.so",),
+    "macosx_15_0_universal2": (
+        f"{_LIBS}/macos/x86_64/lib/mssqlodbc.dylib",
+        f"{_LIBS}/macos/arm64/lib/mssqlodbc.dylib",
+    ),
+}
+
+
+def write_wheel(
+    directory: Path,
+    platform: str,
+    *,
+    distribution: str = "mssql_python_rs",
+    include_odbc: bool = True,
+) -> Path:
+    wheel_path = directory / f"{distribution}-0.1.0-cp313-cp313-{platform}.whl"
+    with zipfile.ZipFile(wheel_path, "w") as wheel:
+        wheel.writestr(
+            "mssql_python_rs-0.1.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: mssql-python-rs\nVersion: 0.1.0\n",
+        )
+        wheel.writestr("mssql_py_core/__init__.py", "")
+        if include_odbc:
+            for driver in _PLATFORM_DRIVERS[platform]:
+                wheel.writestr(driver, b"driver")
+    return wheel_path
+
+
+def run_validator(
+    wheels_dir: Path,
+    expected_count: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(_VALIDATOR),
+            "-WheelsDir",
+            str(wheels_dir),
+            "-ExpectedName",
+            "mssql-python-rs",
+            "-ExpectedVersion",
+            "0.1.0",
+            "-ExpectedCount",
+            str(expected_count),
+            "-RequireOdbc",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_validator_accepts_all_platform_payloads(tmp_path: Path) -> None:
+    for platform in _PLATFORM_DRIVERS:
+        write_wheel(tmp_path, platform)
+
+    result = run_validator(tmp_path, len(_PLATFORM_DRIVERS))
+
+    assert result.returncode == 0, result.stderr
+    assert "Validated 7 mssql-python-rs wheels" in result.stdout
+
+
+def test_validator_rejects_missing_odbc_driver(tmp_path: Path) -> None:
+    write_wheel(tmp_path, "win_amd64", include_odbc=False)
+
+    result = run_validator(tmp_path, 1)
+
+    assert result.returncode != 0
+    assert "missing ODBC driver" in result.stderr
+
+
+def test_validator_rejects_legacy_filename(tmp_path: Path) -> None:
+    write_wheel(tmp_path, "win_amd64", distribution="mssql_py_core")
+
+    result = run_validator(tmp_path, 1)
+
+    assert result.returncode != 0
+    assert "expected filename prefix" in result.stderr
+
+
+def test_validator_rejects_incomplete_matrix(tmp_path: Path) -> None:
+    write_wheel(tmp_path, "win_amd64")
+
+    result = run_validator(tmp_path, 34)
+
+    assert result.returncode != 0
+    assert "Expected 34 wheels, found 1" in result.stderr

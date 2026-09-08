@@ -158,14 +158,21 @@ extends:
             $wheels | Copy-Item -Destination $wheelsDir -Force
             Write-Host "Collected $($wheels.Count) wheels"
 
+            & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
+              -WheelsDir $wheelsDir `
+              -ExpectedName "mssql-python-rs" `
+              -ExpectedVersion "0.1.0" `
+              -ExpectedCount 34 `
+              -RequireOdbc
+
             # Create .nuspec
             $nuspecContent = @"
             <?xml version="1.0"?>
             <package>
               <metadata>
-                <id>mssql-py-core-wheels</id>
+                <id>mssql-python-rs-wheels</id>
                 <version>$packageVersion</version>
-                <description>Python wheels for mssql-py-core (official release). Commit: $shortSha. Build: $(resources.pipeline.officialBuild.runID)</description>
+                <description>Python wheels containing the mssql-python-rs TDS core and ODBC driver. Commit: $shortSha. Build: $(resources.pipeline.officialBuild.runID)</description>
                 <authors>SqlClientDrivers</authors>
               </metadata>
               <files>
@@ -174,7 +181,7 @@ extends:
             </package>
             "@
 
-            $nuspecPath = "$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec"
+            $nuspecPath = "$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec"
             $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
             Write-Host "Created nuspec: $nuspecPath"
           displayName: 'Prepare release NuGet package'
@@ -183,7 +190,7 @@ extends:
           displayName: 'Create NuGet package'
           inputs:
             command: pack
-            packagesToPack: '$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec'
+            packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
             packDestination: '$(ob_outputDirectory)/packages'
             basePath: '$(Build.StagingDirectory)'
 
