@@ -91,6 +91,30 @@ def verify_macho(path, arch):
         raise RuntimeError(f"{path}: built for {wrong}, expected {arch}")
 
 
+def verify_every_macho(root, arch):
+    """Check every Mach-O in the payload, not just the entry points.
+
+    lima ships helpers under libexec/ and extra CLIs in bin/, and a bottle
+    resolved for the wrong platform would put a mixed-architecture helper in
+    the payload that only fails once a macOS job runs it. Files that are not
+    Mach-O -- scripts, templates, the guest image -- are skipped by magic.
+    """
+    checked = 0
+    for directory, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                continue
+            with open(path, "rb") as handle:
+                magic = handle.read(4)
+            if magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe") or magic == b"\xca\xfe\xba\xbe":
+                verify_macho(path, arch)
+                checked += 1
+    if not checked:
+        raise RuntimeError(f"{root}: no Mach-O binaries found; the payload cannot be right")
+    return checked
+
+
 def image_entry(colima_binary, arch):
     """Read colima's embedded (arch, runtime) -> image URL + sha512 table."""
     with open(colima_binary, "rb") as handle:
@@ -188,7 +212,8 @@ def main():
 
     for name in ("docker", "colima", "limactl"):
         verify_macho(os.path.join(bin_dir, name), args.arch)
-    print(f"verified {args.arch} Mach-O binaries")
+    checked = verify_every_macho(args.out, args.arch)
+    print(f"verified {checked} {args.arch} Mach-O binaries")
 
     # limactl resolves the guest agent relative to its own location, so its
     # absence is a boot failure on the agent rather than a build failure here.

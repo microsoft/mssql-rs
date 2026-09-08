@@ -210,15 +210,20 @@ def decide(state, override=None, force=False):
     not exist for that package yet.
     """
     versions = {arch: s["version"] for arch, s in state.items()}
-    behind = [arch for arch, v in versions.items() if v is not None]
-    leader = max((versions[a] for a in behind), default=None, key=version_key)
-    lagging = {arch for arch, v in versions.items() if v is not None and v != leader}
+    leader = max(
+        (v for v in versions.values() if v is not None), default=None, key=version_key
+    )
+    # Absent counts as lagging, not just behind: a first publish that uploaded
+    # one architecture and failed on the other leaves the second with no
+    # version at all, and bumping past the leader strands it exactly the same.
+    lagging = {arch for arch, v in versions.items() if v != leader}
 
     # Repair first: with a partial publish outstanding, a laggard's contents
     # differing from *its* version is the symptom, not a reason to bump past the
     # version it is missing. Only sound while the leader is itself current --
     # otherwise that version predates upstream and nobody should join it.
-    if lagging and not override and all(state[a]["current"] for a in state if a not in lagging):
+    if leader and lagging and not override \
+            and all(state[a]["current"] for a in state if a not in lagging):
         return leader, lagging, [
             f"partial publish: {', '.join(sorted(lagging))} never reached {leader}",
         ]
@@ -230,10 +235,16 @@ def decide(state, override=None, force=False):
         elif not state[arch]["current"]:
             reasons.append(f"- {arch}: differs from {versions[arch]}")
 
-    if not reasons and not force:
+    # An explicit version is itself the reason to publish: asking for a number
+    # and getting nothing published would be a silent no-op.
+    if not reasons and not force and not override:
         return next_version(leader, layout_changed=False), set(), []
     if not reasons:
-        reasons = ["nothing changed upstream, but a publish was forced"]
+        reasons = [
+            f"nothing changed upstream, but {override} was asked for explicitly"
+            if override
+            else "nothing changed upstream, but a publish was forced"
+        ]
     else:
         reasons.insert(0, "republishing because:")
 

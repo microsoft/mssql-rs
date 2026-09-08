@@ -224,6 +224,19 @@ class Decision(unittest.TestCase):
         self.assertEqual(publish, {"arm64"})
         self.assertIn("partial publish", reasons[0])
 
+    def test_a_partial_FIRST_publish_is_repaired_too(self):
+        # The laggard has no version at all rather than an older one. Treating
+        # only "behind" as lagging left this to the normal path, which bumped
+        # to 0.2.0 and stranded 0.1.0 as x86_64-only.
+        state = {
+            "x86_64": self.arch("0.1.0"),
+            "arm64": self.arch(None, current=False, layout_stale=True),
+        }
+        version, publish, reasons = resolve.decide(state)
+        self.assertEqual(version, "0.1.0")
+        self.assertEqual(publish, {"arm64"})
+        self.assertIn("partial publish", reasons[0])
+
     def test_a_laggard_is_not_dragged_onto_a_version_that_predates_upstream(self):
         # Both are behind upstream, so 0.1.1 is not what should ship; that is a
         # normal bump for both, not a repair.
@@ -254,6 +267,14 @@ class Decision(unittest.TestCase):
         self.assertEqual(version, "0.1.1")
         self.assertEqual(publish, {"x86_64", "arm64"})
         self.assertIn("forced", reasons[0])
+
+    def test_an_explicit_version_publishes_even_when_nothing_changed(self):
+        # Asking for a specific number and getting a run that publishes nothing
+        # is a silent no-op; the request is itself the reason to publish.
+        version, publish, reasons = resolve.decide(self.both(version="0.1.0"), override="1.0.0")
+        self.assertEqual(version, "1.0.0")
+        self.assertEqual(publish, {"x86_64", "arm64"})
+        self.assertIn("1.0.0", reasons[0])
 
 
 class RequestedVersion(unittest.TestCase):
