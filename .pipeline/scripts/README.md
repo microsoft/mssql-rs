@@ -87,44 +87,34 @@ coreutils `timeout`, so long-running commands are bounded by running them in the
 background and killing them on overrun. Returns 124 on timeout.
 
 ### start-colima-macos.sh
-Installs Docker + Colima on a hosted macOS agent and boots the VM, retrying on
-the transient lima hostagent boot failures seen in ~3% of runs. VM size stays at
-the long-standing 4 GiB / 4 CPU.
+Boots a Colima VM on a hosted macOS agent from the packaged toolchain, retrying
+on the transient lima hostagent boot failures seen in ~3% of runs. VM size stays
+at the long-standing 4 GiB / 4 CPU.
 
-In CI the toolchain comes from our own feed: `TOOLCHAIN_DIR` points at a payload
-downloaded by `.pipeline/templates/macos-docker-steps.yml`, and the script puts
-its `bin/` on PATH and copies the guest image into
+Nothing is installed or downloaded here. `TOOLCHAIN_DIR` points at a payload
+fetched by `.pipeline/templates/macos-docker-steps.yml`; the script puts its
+`bin/` on PATH and copies the guest image into
 `~/Library/Caches/colima/caches/<cache_filename>`, which is where colima looks
-for it by sha256 of the URL it would otherwise download from. So a CI run
-contacts neither Homebrew nor github.com. The executable bit is restored on the
-way in because Universal Packages do not preserve POSIX modes.
+for it by sha256 of the URL it would otherwise download from. So a run contacts
+neither Homebrew nor ghcr.io nor github.com. The executable bit is restored on
+the way in because Universal Packages do not preserve POSIX modes.
 
-Without `TOOLCHAIN_DIR` — a developer running this directly, or CI if the
-download step is ever removed — it installs from Homebrew as before. The docker
-CLI is installed with `brew install --force-bottle`, which uses Homebrew's
-bottle when one exists for the platform and *fails* rather than falling back to
-a source build. When it fails, `install-brew-bottle.py` installs the newest
-version that *is* bottled for this platform, taken straight from Homebrew's own
-registry. As of 29.8.0 there is no Intel macOS bottle, so a bare `brew install
-docker` compiles the CLI and builds Go to do it: measured over 147 runs, the
-bottled path took 29s median and failed 1% of the time, the source-build path
-took 441s median (774s max) and failed 36%. `colima` and `lima` are still
-bottled on Intel and install normally.
+`TOOLCHAIN_DIR` is required, and a payload missing its manifest, any of
+`bin/{docker,colima,limactl}`, or its guest image fails the step by name. There
+is deliberately no Homebrew fallback: it would reintroduce the dependency this
+exists to remove, and a path that only runs when the primary breaks is a path
+nothing ever exercises.
 
-The whole install phase (`brew update`, `colima`, the docker CLI) is bounded by
-`INSTALL_TIMEOUT_SECONDS` so a slow install fails here with a message rather than
-surfacing as an opaque step timeout. Each `colima start` is bounded by
-`COLIMA_START_TIMEOUT_SECONDS` so a wedged boot still reaches the delete/retry
-path rather than running until the pipeline step timeout. That bound sits above
-the slowest healthy boot observed (509s over 113 runs in 2026-08; re-measured
-2026-09 at max 453s over 123 runs) — the real failures give up within seconds, so
-a shorter bound would only kill slow-but-healthy boots. `COLIMA_BUDGET_SECONDS`
-then caps the retries as a whole.
+Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
+boot still reaches the delete/retry path rather than running until the pipeline
+step timeout. That bound sits above the slowest healthy boot observed (509s over
+113 runs in 2026-08; re-measured 2026-09 at max 453s over 123 runs) — the real
+failures give up within seconds, so a shorter bound would only kill
+slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps the retries as a whole.
 
-**Environment overrides:** `COLIMA_CPU`, `COLIMA_MEMORY`, `COLIMA_DISK`,
-`COLIMA_START_ATTEMPTS` (3), `COLIMA_START_TIMEOUT_SECONDS` (540),
-`COLIMA_BUDGET_SECONDS` (480), `INSTALL_TIMEOUT_SECONDS` (300),
-`DOCKER_CLI_DIR`, `TOOLCHAIN_DIR`.
+**Environment overrides:** `TOOLCHAIN_DIR` (required), `COLIMA_CPU`,
+`COLIMA_MEMORY`, `COLIMA_DISK`, `COLIMA_START_ATTEMPTS` (3),
+`COLIMA_START_TIMEOUT_SECONDS` (540), `COLIMA_BUDGET_SECONDS` (480).
 
 ### build-macos-docker-toolchain.py
 Assembles the macOS docker toolchain payload for one architecture: the install
@@ -194,10 +184,11 @@ fails if the built payload disagrees with what was resolved, which means a
 release landed mid-run. Covered by `test_resolve_toolchain_version.py`.
 
 ### install-brew-bottle.py
-Installs the newest Homebrew bottle of a formula that exists for the running
-platform, by reading Homebrew's OCI registry on ghcr.io directly. Used as the
-docker CLI fallback above, and generic enough to cover `colima` or `lima` if they
-lose their Intel bottles too.
+Installs the newest Homebrew bottle of a formula that exists for a given
+platform, by reading Homebrew's OCI registry on ghcr.io directly — no `brew`, no
+taps, no local Homebrew state. `build-macos-docker-toolchain.py` uses it to
+assemble the toolchain payload, cross-building both macOS architectures from
+Linux.
 
 Bottles are content-addressed, so the download is verified against the digest the
 registry advertises rather than a checksum vendored here. Bottles built for an

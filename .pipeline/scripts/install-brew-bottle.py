@@ -5,11 +5,14 @@
 """Install the newest Homebrew bottle of a formula that exists for this platform.
 
 Homebrew publishes bottles as OCI artifacts on ghcr.io, readable anonymously.
-When `brew install --force-bottle` fails because the *current* formula version
-has no bottle for the running platform (docker 29.8.0 ships arm64 macOS and
-Linux only), the previous version usually still does. This walks the registry
-newest-first, finds a version bottled for this platform, and extracts its
-binaries.
+That is the only thing this needs: no `brew`, no taps, no local Homebrew state.
+It walks the registry newest-first, finds a version bottled for the requested
+platform, and extracts it — which matters because the current version is not
+always bottled everywhere (docker 29.8.0 ships arm64 macOS and Linux only, so
+Intel resolves to 29.7.2-1).
+
+Used by build-macos-docker-toolchain.py to assemble the macOS docker toolchain
+payload, cross-building both architectures from Linux via BOTTLE_ARCH_OVERRIDE.
 
 The bottle blob is content-addressed: the layer digest is its SHA-256, so the
 download is verified against the digest the registry advertises rather than a
