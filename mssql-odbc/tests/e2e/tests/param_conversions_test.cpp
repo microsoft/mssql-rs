@@ -673,25 +673,24 @@ protected:
 
     SQLRETURN BindNumeric(SQLSMALLINT sql_type, SQLULEN target_precision,
                           SQLSMALLINT target_scale, SQLSMALLINT source_precision,
-                          SQLSMALLINT source_scale, bool positive, unsigned __int64 magnitude) {
+                          SQLSMALLINT source_scale, bool positive, std::uint64_t magnitude) {
         return BindNumericRaw(sql_type, target_precision, target_scale, source_precision,
-                      source_scale, positive ? 1 : 0, magnitude, 0);
-        }
+                              source_scale, positive ? 1 : 0, magnitude, 0);
+    }
 
-        SQLRETURN BindNumericRaw(SQLSMALLINT sql_type, SQLULEN target_precision,
-                     SQLSMALLINT target_scale, SQLSMALLINT source_precision,
-                     SQLSMALLINT source_scale, SQLCHAR sign,
-                     unsigned __int64 magnitude_low,
-                                 unsigned __int64 magnitude_high,
-                                 SQLCHAR embedded_precision = 1,
-                                 SQLSCHAR embedded_scale = 0) {
+    SQLRETURN BindNumericRaw(SQLSMALLINT sql_type, SQLULEN target_precision,
+                             SQLSMALLINT target_scale, SQLSMALLINT source_precision,
+                             SQLSMALLINT source_scale, SQLCHAR sign,
+                             std::uint64_t magnitude_low, std::uint64_t magnitude_high,
+                             SQLCHAR embedded_precision = 1,
+                             SQLSCHAR embedded_scale = 0) {
         SQL_NUMERIC_STRUCT value = {};
-            value.precision = embedded_precision;
-            value.scale = embedded_scale;
+        value.precision = embedded_precision;
+        value.scale = embedded_scale;
         value.sign = sign;
         std::memcpy(value.val, &magnitude_low, sizeof(magnitude_low));
         std::memcpy(value.val + sizeof(magnitude_low), &magnitude_high,
-                sizeof(magnitude_high));
+                    sizeof(magnitude_high));
         std::memcpy(storage_, &value, sizeof(value));
 
         SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, sql_type,
@@ -979,9 +978,9 @@ TEST_F(ScalarConversionLiveTest, NumericStructMatchingMetadataKeepsEmbeddedMetad
 }
 
 TEST_F(ScalarConversionLiveTest, NumericStructPrecision38Boundaries) {
-    constexpr unsigned __int64 kMaxLow = 0x098A223FFFFFFFFF;
-    constexpr unsigned __int64 kMaxHigh = 0x4B3B4CA85A86C47A;
-    constexpr unsigned __int64 kOverflowLow = 0x098A224000000000;
+    constexpr std::uint64_t kMaxLow = 0x098A223FFFFFFFFF;
+    constexpr std::uint64_t kMaxHigh = 0x4B3B4CA85A86C47A;
+    constexpr std::uint64_t kOverflowLow = 0x098A224000000000;
 
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 38, 0, 38, 0, 1, kMaxLow, kMaxHigh, 38, 0),
