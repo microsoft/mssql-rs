@@ -61,6 +61,38 @@ protected:
                                 static_cast<SQLLEN>(store.size()), &ind);
     }
 
+    SQLRETURN BindNumeric(SQLUSMALLINT param, SQL_NUMERIC_STRUCT& value,
+                          SQLULEN target_precision,
+                          SQLSMALLINT target_scale,
+                          SQLSMALLINT source_precision,
+                          SQLSMALLINT source_scale) {
+        SQLRETURN rc = SQLBindParameter(
+            stmt_, param, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL,
+            target_precision, target_scale, &value, 0, nullptr);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+
+        SQLHDESC apd = SQL_NULL_HDESC;
+        rc = SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+        rc = SQLSetDescFieldW(
+            apd, param, SQL_DESC_PRECISION,
+            reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(source_precision)), 0);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+        rc = SQLSetDescFieldW(
+            apd, param, SQL_DESC_SCALE,
+            reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(source_scale)), 0);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+        return SQLSetDescFieldW(apd, param, SQL_DESC_DATA_PTR, &value, 0);
+    }
+
     // Read column 1 of the current row as a narrow string.
     std::string GetColumnChar(SQLUSMALLINT col, SQLLEN* ind_out = nullptr) {
         SQLCHAR buf[512] = {0};
@@ -165,6 +197,42 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("abcd", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(PrepareExecuteLiveTest, NumericTruncationIsNotReportedAfterDataAtExecution) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQL_NUMERIC_STRUCT numeric = {};
+    numeric.precision = 3;
+    numeric.scale = 2;
+    numeric.sign = 1;
+    numeric.val[0] = 155;
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+
+    ASSERT_SQL_OK(BindNumeric(1, numeric, 10, 1, 3, 2),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN rc = SQLExecute(stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, rc)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&streamed_token, value_ptr);
+    const char chunk[] = "tail";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 4),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLParamData(stmt_, &value_ptr));
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1.5:tail", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
@@ -633,6 +701,40 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundPara
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("abBcdD", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationIsNotReportedAfterDataAtExecution) {
+    SQL_NUMERIC_STRUCT numeric = {};
+    numeric.precision = 3;
+    numeric.scale = 2;
+    numeric.sign = 1;
+    numeric.val[0] = 155;
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+
+    ASSERT_SQL_OK(BindNumeric(1, numeric, 10, 1, 3, 2),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN rc =
+        ExecDirect("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v");
+    ASSERT_EQ(SQL_NEED_DATA, rc)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&streamed_token, value_ptr);
+    const char chunk[] = "tail";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 4),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLParamData(stmt_, &value_ptr));
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1.5:tail", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 

@@ -40,6 +40,8 @@ pub(crate) struct BoundParam {
     pub(crate) column_size: SqlULen,
     /// Decimal digits (scale) as passed by the application.
     pub(crate) decimal_digits: SqlSmallInt,
+    pub(crate) app_precision: SqlSmallInt,
+    pub(crate) app_scale: SqlSmallInt,
     /// Pointer to the application's value buffer (read at execute time).
     pub(crate) parameter_value_ptr: *mut c_void,
     /// Length in bytes of the application value buffer.
@@ -199,6 +201,8 @@ impl BoundParam {
             sql_type,
             column_size,
             decimal_digits,
+            app_precision: apd_record.precision,
+            app_scale: apd_record.scale,
             parameter_value_ptr: apd_record.data_ptr,
             buffer_length: apd_record.octet_length,
             strlen_or_ind_ptr: apd_record.indicator_ptr as *mut SqlLen,
@@ -244,6 +248,8 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 8,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
             parameter_value_ptr: value,
             buffer_length: 8,
             strlen_or_ind_ptr: ind,
@@ -349,6 +355,8 @@ mod tests {
             sql_type: crate::api::odbc_types::SQL_TYPE_TIMESTAMP,
             column_size: 27,
             decimal_digits: 7,
+            app_precision: 0,
+            app_scale: 0,
             parameter_value_ptr: buf.as_mut_ptr().cast(),
             buffer_length: 8,
             strlen_or_ind_ptr: &raw mut ind,
@@ -403,6 +411,30 @@ mod tests {
         assert!(bound.parameter_value_ptr.is_null());
         assert_eq!(bound.c_type, SQL_C_CHAR);
         assert_eq!(bound.sql_type, SQL_VARCHAR);
+    }
+
+    #[test]
+    fn from_records_keeps_numeric_source_and_target_metadata_distinct() {
+        let mut value = crate::api::odbc_types::SqlNumericStruct::default();
+        let apd_record = DescRecord {
+            concise_type: crate::api::odbc_types::SQL_C_NUMERIC,
+            precision: 7,
+            scale: 2,
+            data_ptr: (&raw mut value).cast(),
+            ..DescRecord::default_for(DescKind::AppParam)
+        };
+        let ipd_record = DescRecord {
+            concise_type: crate::api::odbc_types::SQL_DECIMAL,
+            parameter_type: SQL_PARAM_INPUT,
+            precision: 12,
+            scale: 4,
+            ..DescRecord::default_for(DescKind::ImpParam)
+        };
+
+        let bound = BoundParam::from_records(&apd_record, Some(&ipd_record), ODBC_VERSION)
+            .expect("numeric param is bound");
+        assert_eq!((bound.app_precision, bound.app_scale), (7, 2));
+        assert_eq!((bound.column_size, bound.decimal_digits), (12, 4));
     }
 
     /// `SQL_C_DEFAULT` is a valid value `SQLSetDescFieldW`/`SQLSetDescRec` can

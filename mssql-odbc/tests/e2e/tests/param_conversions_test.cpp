@@ -671,6 +671,60 @@ protected:
                                 decimal_digits, wvals_.data(), indicator_, &indicator_);
     }
 
+    SQLRETURN BindNumeric(SQLSMALLINT sql_type, SQLULEN target_precision,
+                          SQLSMALLINT target_scale, SQLSMALLINT source_precision,
+                          SQLSMALLINT source_scale, bool positive, unsigned __int64 magnitude) {
+        return BindNumericRaw(sql_type, target_precision, target_scale, source_precision,
+                      source_scale, positive ? 1 : 0, magnitude, 0);
+        }
+
+        SQLRETURN BindNumericRaw(SQLSMALLINT sql_type, SQLULEN target_precision,
+                     SQLSMALLINT target_scale, SQLSMALLINT source_precision,
+                     SQLSMALLINT source_scale, SQLCHAR sign,
+                     unsigned __int64 magnitude_low,
+                                 unsigned __int64 magnitude_high,
+                                 SQLCHAR embedded_precision = 1,
+                                 SQLSCHAR embedded_scale = 0) {
+        SQL_NUMERIC_STRUCT value = {};
+            value.precision = embedded_precision;
+            value.scale = embedded_scale;
+        value.sign = sign;
+        std::memcpy(value.val, &magnitude_low, sizeof(magnitude_low));
+        std::memcpy(value.val + sizeof(magnitude_low), &magnitude_high,
+                sizeof(magnitude_high));
+        std::memcpy(storage_, &value, sizeof(value));
+
+        SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, sql_type,
+                                        target_precision, target_scale, storage_, 0, nullptr);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+
+        SQLHDESC apd = SQL_NULL_HDESC;
+        rc = SQLGetStmtAttrW(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+        rc = SQLSetDescFieldW(apd, 1, SQL_DESC_TYPE,
+                              reinterpret_cast<SQLPOINTER>(SQL_C_NUMERIC), 0);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+        rc = SQLSetDescFieldW(
+            apd, 1, SQL_DESC_PRECISION,
+            reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(source_precision)), 0);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+        rc = SQLSetDescFieldW(
+            apd, 1, SQL_DESC_SCALE,
+            reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(source_scale)), 0);
+        if (!SQL_SUCCEEDED(rc)) {
+            return rc;
+        }
+        return SQLSetDescFieldW(apd, 1, SQL_DESC_DATA_PTR, storage_, 0);
+    }
+
     std::string GetColumnChar(SQLUSMALLINT col = 1) {
         SQLCHAR buf[512] = {0};
         SQLLEN ind = 0;
@@ -892,6 +946,100 @@ TEST_F(ScalarConversionLiveTest, DecimalFractionPastTheScaleIsDroppedOnlyWhenZer
 TEST_F(ScalarConversionLiveTest, DecimalPastItsDeclaredPrecisionIs22003) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_DECIMAL, "1000", 3, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructUsesApdPrecisionAndScale) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 8, 3, 5, 2, true, 12345), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("123.450", ExecuteAndReadBack());
+
+    ResetParams();
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_NUMERIC, 8, 3, 5, 2, false, 12345), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("-123.450", ExecuteAndReadBack());
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructNegativeApdScaleMultipliesTheMagnitude) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 6, 0, 5, -1, true, 123), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("1230", ExecuteAndReadBack());
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructMatchingMetadataKeepsEmbeddedMetadata) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 5, 2, 5, 2, true, 12345), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructPrecision38Boundaries) {
+    constexpr unsigned __int64 kMaxLow = 0x098A223FFFFFFFFF;
+    constexpr unsigned __int64 kMaxHigh = 0x4B3B4CA85A86C47A;
+    constexpr unsigned __int64 kOverflowLow = 0x098A224000000000;
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 38, 0, 38, 0, 1, kMaxLow, kMaxHigh, 38, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("99999999999999999999999999999999999999", ExecuteAndReadBack());
+
+    ResetParams();
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        BindNumericRaw(SQL_DECIMAL, 38, 0, 38, 0, 1, kOverflowLow, kMaxHigh, 38, 0),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructAnyNonzeroSignIsPositive) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 8, 3, 5, 2, 2, 12345, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("123.450", ExecuteAndReadBack());
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructSignedZeroAtMaximumScaleIsZero) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 38, 38, 38, 38, 0, 0, 0, 38, 38),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("0.00000000000000000000000000000000000000", ExecuteAndReadBack());
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructDropsOnlyFractionalDigits) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 5, 1, 5, 3, true, 1500), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("1.5", ExecuteAndReadBack());
+
+    ResetParams();
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 5, 1, 5, 3, true, 1550), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("1.5", GetColumnChar());
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructTruncatedNegativeFractionBecomesPositiveZero) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 5, 1, 2, 2, false, 4), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("0.0", GetColumnChar());
+}
+
+TEST_F(ScalarConversionLiveTest, NumericStructPastTargetPrecisionIs22003) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 3, 0, 4, 0, true, 1000), SQL_HANDLE_STMT,
+                  stmt_);
     EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
 }

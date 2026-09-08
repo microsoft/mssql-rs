@@ -514,8 +514,8 @@ pub(super) fn set_precision(
 }
 
 /// `SQL_DESC_SCALE` write. Same `SQL_C_NUMERIC` consistency bound as
-/// [`set_precision`]: scale must be non-negative and `<= precision`
-/// (`sqlcdesc.cpp:11391-11394`).
+/// [`set_precision`]: scale must be `<= precision`
+/// (`sqlcdesc.cpp:11391-11394`). Negative scales are valid.
 pub(super) fn set_scale(
     state: &mut DescState,
     record_number: SqlSmallInt,
@@ -530,7 +530,7 @@ pub(super) fn set_scale(
         .record(record_number)
         .map(|r| (r.concise_type, r.precision));
     if let Some((SQL_C_NUMERIC, precision)) = record_info
-        && (scale < 0 || scale > precision)
+        && scale > precision
     {
         error!(
             scale,
@@ -578,7 +578,7 @@ pub(super) fn set_data_ptr(
         .record(record_number)
         .map(|r| (r.concise_type, r.precision, r.scale));
     if let Some((SQL_C_NUMERIC, precision, scale)) = record_info
-        && (!(1..=SQL_PREC_NUMERIC).contains(&precision) || scale < 0 || scale > precision)
+        && (!(1..=SQL_PREC_NUMERIC).contains(&precision) || scale > precision)
     {
         error!(
             precision,
@@ -1151,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn set_desc_field_numeric_scale_exceeding_precision_returns_hy094() {
+    fn set_desc_field_numeric_scale_may_be_negative_but_not_exceed_precision() {
         let h = TestHandles::with_env_dbc_stmt();
         unsafe {
             sql_set_desc_field_w(
@@ -1171,6 +1171,60 @@ mod tests {
 
         let ret =
             unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, (-1isize) as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.apd(), 1, SQL_DESC_SCALE), -1);
+    }
+
+    #[test]
+    fn set_desc_field_numeric_scale_may_equal_precision() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_C_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, 5isize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.apd(), 1, SQL_DESC_SCALE), 5);
+    }
+
+    #[test]
+    fn set_desc_field_data_ptr_catches_precision_lowered_below_scale() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_C_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+        unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, 5isize as SqlPointer, 0) };
+
+        let ret = unsafe {
+            sql_set_desc_field_w(h.apd(), 1, SQL_DESC_PRECISION, 4isize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let mut numeric_buf = SqlNumericStruct::default();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_DATA_PTR,
+                &mut numeric_buf as *mut SqlNumericStruct as SqlPointer,
+                0,
+            )
+        };
         assert_eq!(ret, SQL_ERROR);
         assert_last_diag(&desc_diags(h.apd()), ERR_INVALID_PRECISION_OR_SCALE);
     }

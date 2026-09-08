@@ -19,7 +19,7 @@
 
 use crate::api::odbc_types::{
     SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT,
-    SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+    SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_NUMERIC, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
     SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR, SQL_CHAR, SQL_DECIMAL,
     SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NUMERIC,
     SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_XML,
@@ -91,6 +91,7 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
         SQL_C_BIT => &[&[SQL_BIT]],
         SQL_C_FLOAT | SQL_C_DOUBLE => &[&[SQL_REAL, SQL_FLOAT, SQL_DOUBLE]],
         SQL_C_GUID => &[&[SQL_GUID]],
+        SQL_C_NUMERIC => &[DECIMAL_SQL_TARGETS],
         SQL_C_TYPE_DATE => &[&[SQL_TYPE_DATE]],
         // `time` and its SS spelling are one wire type, so both C spellings
         // reach both SQL spellings.
@@ -267,6 +268,7 @@ mod tests {
             (SQL_C_FLOAT, &[SQL_REAL, SQL_FLOAT, SQL_DOUBLE]),
             (SQL_C_DOUBLE, &[SQL_REAL, SQL_FLOAT, SQL_DOUBLE]),
             (SQL_C_GUID, &[SQL_GUID]),
+            (SQL_C_NUMERIC, &[SQL_DECIMAL, SQL_NUMERIC]),
             (SQL_C_TYPE_DATE, &[SQL_TYPE_DATE]),
             (SQL_C_TYPE_TIME, &[SQL_TYPE_TIME, SQL_SS_TIME2]),
             (SQL_C_SS_TIME2, &[SQL_TYPE_TIME, SQL_SS_TIME2]),
@@ -300,10 +302,9 @@ mod tests {
         assert!(is_supported_conversion(SQL_C_WCHAR, SQL_SS_VARIANT));
     }
 
-    /// The off-diagonal rows are one-way: a character buffer parses a decimal
-    /// literal, but nothing else formats itself as one.
+    /// Unrelated scalar and binary C types do not reach these payloads.
     #[test]
-    fn only_a_character_c_type_reaches_decimal_xml_or_variant() {
+    fn unrelated_c_types_do_not_reach_decimal_xml_or_variant() {
         for c_type in [
             SQL_C_BIT,
             SQL_C_DOUBLE,
