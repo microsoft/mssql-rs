@@ -128,8 +128,15 @@ fn unwind_dae_inner(
 /// `SQLParamData` clears prior statement errors on its own entry
 /// (`sqlccmd.cpp:6818`), which is why this warning must not be deferred there.
 ///
+/// `trailing_truncated` is the mirror image: a truncation ordinally *after*
+/// the first DAE parameter, which the same loop has not reached yet at this
+/// point and only discovers when it resumes scanning during the `SQLParamData`
+/// call that completes the sequence. Parked on the sequence
+/// ([`DaeState::trailing_truncated`]) rather than posted here.
+///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn park_dae_client(
     stmt: &StmtHandle,
     client: TdsClient,
@@ -137,6 +144,7 @@ pub(super) fn park_dae_client(
     orphaned: Option<StatementId>,
     dae_params: Vec<DaeParam>,
     fractional_truncated: bool,
+    trailing_truncated: bool,
     op: &str,
 ) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -145,7 +153,13 @@ pub(super) fn park_dae_client(
         error!("{op}: stmt mutex poisoned while parking DAE client");
         return SQL_ERROR;
     };
-    stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    stmt_state.dae = Some(DaeState::new(
+        client,
+        prepared,
+        orphaned,
+        dae_params,
+        trailing_truncated,
+    ));
     if fractional_truncated {
         post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
     }
@@ -510,7 +524,16 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
+    /// A truncation among the non-DAE parameters ordinally before the first
+    /// DAE parameter (or, when there is no DAE parameter at all, anywhere).
+    /// Posted immediately by [`park_dae_client`] / `finish_execute_with_param_warning`.
     pub(super) fractional_truncated: bool,
+    /// A truncation among the non-DAE parameters ordinally at or after the
+    /// first DAE parameter. msodbcsql's RPC loop has not scanned these yet at
+    /// the initial `SQLExecute`/`SQLExecDirect`, so the warning must wait for
+    /// the `SQLParamData` call that completes the sequence — see
+    /// [`crate::handles::stmt::DaeState::trailing_truncated`].
+    pub(super) trailing_truncated: bool,
 }
 
 /// The byte total an application declared with `SQL_LEN_DATA_AT_EXEC(n)`, or
@@ -628,6 +651,7 @@ pub(super) unsafe fn build_named_params(
     let mut params = Vec::with_capacity(marker_count);
     let mut dae_params = Vec::new();
     let mut fractional_truncated = false;
+    let mut trailing_truncated = false;
     // Read once per execution: the attribute holds a pointer, and every
     // binding shifts by the same amount.
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
@@ -686,7 +710,19 @@ pub(super) unsafe fn build_named_params(
         } else {
             match unsafe { bound_param_to_rpc(name, &bound_param) } {
                 Ok((param, outcome)) => {
-                    fractional_truncated |= outcome == ConvOk::Truncated;
+                    if outcome == ConvOk::Truncated {
+                        // A truncation ordinally at or after the first DAE
+                        // parameter falls in msodbcsql's not-yet-scanned
+                        // segment (`AddRPCUserParameters` breaks at the first
+                        // streamed parameter), so it can't be posted until the
+                        // completing `SQLParamData` call — see
+                        // `DaeState::trailing_truncated`.
+                        if dae_params.is_empty() {
+                            fractional_truncated = true;
+                        } else {
+                            trailing_truncated = true;
+                        }
+                    }
                     params.push(param);
                 }
                 Err(ParamBuildError::InvalidLength(len)) => {
@@ -711,6 +747,7 @@ pub(super) unsafe fn build_named_params(
         params,
         dae_params,
         fractional_truncated,
+        trailing_truncated,
     })
 }
 
@@ -1167,6 +1204,7 @@ mod tests {
             None,
             Vec::new(),
             true,
+            false,
             "SQLExecute",
         );
 
@@ -1748,6 +1786,77 @@ mod tests {
         );
     }
 
+    /// A truncated `SQL_C_NUMERIC` parameter *before* the first DAE parameter
+    /// falls in msodbcsql's already-scanned segment, so its `01S07` is posted
+    /// immediately (`fractional_truncated`); see
+    /// `park_dae_client_posts_numeric_fractional_truncation_before_param_data`.
+    /// The reverse ordering exercised here — the truncation *after* the first
+    /// DAE parameter — instead lands in `trailing_truncated`, deferred to the
+    /// `SQLParamData` call that completes the sequence (`param_data.rs`'s
+    /// `Complete` branch), because msodbcsql's own per-parameter loop hasn't
+    /// scanned that far yet when the initiating call returns `SQL_NEED_DATA`.
+    #[test]
+    fn build_named_params_truncation_after_first_dae_param_is_deferred() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        // 123.45 rescaled to scale 1 drops the trailing "5" (`Truncated`)
+        // without overflowing `decimal(5,1)`'s magnitude bound.
+        let mut numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 2,
+            sign: 1,
+            val: {
+                let mut v = [0u8; 16];
+                v[..2].copy_from_slice(&12345u16.to_le_bytes());
+                v
+            },
+        };
+        let mut numeric_ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_NUMERIC,
+            sql_type: SQL_DECIMAL,
+            column_size: 5,
+            decimal_digits: 1,
+            app_precision: 38,
+            app_scale: 2,
+            parameter_value_ptr: (&mut numeric as *mut SqlNumericStruct).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut numeric_ind as *mut SqlLen,
+            octet_length_ptr: &mut numeric_ind as *mut SqlLen,
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        assert_eq!(built.dae_params.len(), 1);
+        assert!(
+            !built.fractional_truncated,
+            "the truncation is ordinally after the DAE param, not before it"
+        );
+        assert!(
+            built.trailing_truncated,
+            "a truncation after the first DAE param must be deferred, not lost"
+        );
+    }
+
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
     /// `SQLParamData` enforces; `SQL_DATA_AT_EXEC` promises nothing.
     #[test]
@@ -2022,6 +2131,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                false,
                 false,
                 "test",
             ),

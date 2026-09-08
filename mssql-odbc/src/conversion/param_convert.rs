@@ -929,11 +929,19 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
         }
     };
 
-    let (value, outcome) =
-        decimal_from_scaled(mantissa, i64::from(source_scale), precision, scale)?;
+    // Truncation is checked before the precision/magnitude bound below, not
+    // after: `sqlccnvt.cpp:7823` sets `CVT_FRACT_TRUNC` and returns without
+    // ever reaching the whole-number overflow check, so a dropped fractional
+    // digit is always `22001` here, even when the truncated result would also
+    // overflow `precision`. `decimal_from_numeric` does not get this early
+    // return - its source is `SQL_C_NUMERIC`, not `SQL_C_CHAR`/`SQL_C_WCHAR`,
+    // so `CVT_FRACT_TRUNC` is never rewritten to `22001` for it
+    // (`sqlcfunc.cpp:3348`) and the overflow check applies unconditionally.
+    let (scaled, outcome) = rescale_mantissa(mantissa, i64::from(source_scale), scale)?;
     if outcome == ConvOk::Truncated {
         return Err(ParamBuildError::StringTruncation);
     }
+    let value = decimal_from_magnitude(scaled, precision, scale)?;
     Ok((decimal_of(param.sql_type, value), Some(metadata)))
 }
 
@@ -974,17 +982,23 @@ fn decimal_from_numeric(
         magnitude
     };
     let source_scale = i64::from(param.app_scale);
-    let (value, outcome) = decimal_from_scaled(mantissa, source_scale, precision, scale)?;
+    let (scaled, outcome) = rescale_mantissa(mantissa, source_scale, scale)?;
+    let value = decimal_from_magnitude(scaled, precision, scale)?;
     Ok(((decimal_of(param.sql_type, value), Some(metadata)), outcome))
 }
 
-fn decimal_from_scaled(
+/// Rescales `mantissa` from `source_scale` to `target_scale`, reporting
+/// [`ConvOk::Truncated`] when a scale-down drops a non-zero digit. Callers
+/// decide what a truncated result means for their SQLSTATE: `decimal_from_text`
+/// treats it as a hard `22001` before ever checking precision, while
+/// `decimal_from_numeric` lets the precision check in [`decimal_from_magnitude`]
+/// run regardless.
+fn rescale_mantissa(
     mantissa: i128,
     source_scale: i64,
-    precision: u8,
-    scale: u8,
-) -> Result<(DecimalParts, ConvOk), ParamBuildError> {
-    let target_scale = i64::from(scale);
+    target_scale: u8,
+) -> Result<(i128, ConvOk), ParamBuildError> {
+    let target_scale = i64::from(target_scale);
     let mut outcome = ConvOk::Exact;
     let scaled = if target_scale >= source_scale {
         let exponent = u32::try_from(target_scale - source_scale)
@@ -1017,15 +1031,21 @@ fn decimal_from_scaled(
             }
         }
     };
+    Ok((scaled, outcome))
+}
 
+/// The precision check has to run on the digit count, not on the mantissa
+/// width: `decimal(3,0)` cannot hold 1000 even though the mantissa is tiny.
+fn decimal_from_magnitude(
+    scaled: i128,
+    precision: u8,
+    scale: u8,
+) -> Result<DecimalParts, ParamBuildError> {
     let magnitude = scaled.unsigned_abs();
-    // The precision check has to run on the digit count, not on the mantissa
-    // width: `decimal(3,0)` cannot hold 1000 even though the mantissa is tiny.
     if magnitude >= 10u128.pow(u32::from(precision)) {
         return Err(ParamBuildError::Value(ConvError::OutOfRange));
     }
-    let value = DecimalParts::new(scaled >= 0, precision, scale, magnitude);
-    Ok((value, outcome))
+    Ok(DecimalParts::new(scaled >= 0, precision, scale, magnitude))
 }
 
 fn decimal_of(sql_type: SqlSmallInt, value: DecimalParts) -> SqlType {
@@ -1852,6 +1872,22 @@ mod tests {
 
         let trailing_zeros = format!("0.1{}", "0".repeat(39));
         assert!(convert_decimal(SQL_DECIMAL, 38, 1, &trailing_zeros).is_ok());
+    }
+
+    /// A dropped fractional digit is `22001` even when the truncated result
+    /// would also overflow `precision`: `sqlccnvt.cpp:7823` sets
+    /// `CVT_FRACT_TRUNC` and returns immediately, never reaching the
+    /// whole-number overflow check below it. `"1234.55"` into `decimal(3,1)`
+    /// drops the trailing `5` (non-zero) before the rescaled `1234.5` ever
+    /// gets compared against `10^3`.
+    #[test]
+    fn a_dropped_fraction_is_22001_even_when_the_result_also_overflows() {
+        let err = convert_decimal(SQL_DECIMAL, 3, 1, "1234.55").unwrap_err();
+        assert_eq!(err.diag().state, *b"22001");
+
+        // Without the dropped fraction, the same overflow is `22003`.
+        let err = convert_decimal(SQL_DECIMAL, 3, 1, "1234.5").unwrap_err();
+        assert_eq!(err.diag().state, *b"22003");
     }
 
     /// Trailing fraction zeros must not push a literal onto the `f64` path.

@@ -30,7 +30,9 @@ use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::{StatementResult, StreamedParamStatus};
 
-use super::exec_common::{abort_dae_with_diag, fail_with_tds, finish_execute, return_client_idle};
+use super::exec_common::{
+    abort_dae_with_diag, fail_with_tds, finish_execute_with_param_warning, return_client_idle,
+};
 use super::sqlstate::*;
 use super::util::write_if_some;
 use crate::api::odbc_types::{
@@ -293,7 +295,7 @@ fn sql_param_data_safe(
             // but unprepared, and a concurrent SQLExecute would report 07002
             // instead of re-running the plan. `SQLExecDirect` parks no plan, so
             // a `None` plan is legitimate there.
-            let was_prepared = {
+            let (was_prepared, trailing_truncated) = {
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned on completion");
                     return_client_idle(dbc, statement_handle, client);
@@ -303,10 +305,11 @@ fn sql_param_data_safe(
                     stmt_state.dae.is_some(),
                     "SQLParamData: DAE sequence vanished before completion"
                 );
+                let trailing_truncated = stmt_state.dae_trailing_truncated();
                 let parked = stmt_state.take_dae();
                 debug_assert!(parked.is_none(), "the client is checked out by this call");
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-                stmt_state.prepared.is_some()
+                (stmt_state.prepared.is_some(), trailing_truncated)
             };
 
             // Same contract as the non-streaming `SQLExecute` arm: a prepared
@@ -325,7 +328,14 @@ fn sql_param_data_safe(
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
-            finish_execute(dbc, stmt, statement_handle, client, "SQLParamData")
+            finish_execute_with_param_warning(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                "SQLParamData",
+                trailing_truncated,
+            )
         }
 
         Err(e) => {

@@ -241,6 +241,57 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationIsReportedBeforeDataAtExecutionB
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+// Mirror of NumericTruncationIsReportedBeforeDataAtExecutionButNotAfter with
+// the ordinals swapped: the streamed parameter comes first, the truncated
+// numeric second. msodbcsql's per-parameter RPC loop (AddRPCUserParameters)
+// has not scanned the second parameter yet when SQLExecute returns
+// SQL_NEED_DATA, so it cannot post 01S07 there -- it only reaches the
+// truncated value while resuming the scan inside the completing
+// SQLParamData call, which is where the warning must surface instead. A
+// premature post at SQLExecute would be silently discarded anyway:
+// SQLParamData clears prior statement diagnostics on entry (sqlccmd.cpp:6818).
+TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsReportedAtCompletion) {
+    ASSERT_SQL_OK(Prepare("SELECT ? + ':' + CONVERT(VARCHAR(32), ?) AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQL_NUMERIC_STRUCT numeric = {};
+    numeric.precision = 3;
+    numeric.scale = 2;
+    numeric.sign = 1;
+    numeric.val[0] = 155;
+    ASSERT_SQL_OK(BindNumeric(2, numeric, 10, 1, 3, 2), SQL_HANDLE_STMT, stmt_);
+
+    SQLRETURN rc = SQLExecute(stmt_);
+    ASSERT_EQ(SQL_NEED_DATA, rc)
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    // Not observable yet: the truncation is ordinally after the streamed
+    // parameter, so it hasn't been scanned at this point.
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&streamed_token, value_ptr);
+    const char chunk[] = "head";
+    ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 4),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // The completing call must not lose the warning to SQLParamData's own
+    // entry-time diagnostics reset.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLParamData(stmt_, &value_ptr));
+    EXPECT_EQ("01S07", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("head:1.5", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // Two streamed parameters drive the SQLParamData loop the way applications
 // actually write it: SQLParamData reports SQL_NEED_DATA once per streamed
 // parameter, handing back that parameter's ParameterValuePtr as the token, and

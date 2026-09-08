@@ -185,6 +185,7 @@ fn sql_exec_direct_w_safe(
         params,
         dae_params,
         fractional_truncated,
+        trailing_truncated,
     } = named_params;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
@@ -273,6 +274,7 @@ fn sql_exec_direct_w_safe(
                 None,
                 dae_params,
                 fractional_truncated,
+                trailing_truncated,
                 "SQLExecDirectW",
             ),
             Err(e) => {
