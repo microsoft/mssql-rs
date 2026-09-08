@@ -94,7 +94,10 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryProbeReportsRemainingBytesWithoutConsumin
     EXPECT_EQ(9, ind);
     EXPECT_EQ(0, std::memcmp(buf, "\x01\x02\x03\x04", 4));
 
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, nullptr, 0, &ind));
+    // A real buffer even at length 0: the Driver Manager rejects a null
+    // TargetValuePtr with HY009 before the call reaches the driver.
+    SQLCHAR probeBuf[1] = {};
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, probeBuf, 0, &ind));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
     EXPECT_EQ(5, ind);
 
@@ -105,6 +108,28 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryProbeReportsRemainingBytesWithoutConsumin
     EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
     EXPECT_EQ(1, ind);
     EXPECT_EQ(0x09, buf[0]);
+    SQLCloseCursor(stmt_);
+}
+
+// The PLP half of the same rule. This path computes its remainder from the
+// stream rather than from `remaining_binary_length`, so it needs its own case.
+TEST_F(BinaryFetchLiveTest, StreamedBinaryProbeReportsRemainingBytesWithoutConsumingThem) {
+    FetchOne("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))");
+    AssertColumnSqlType(SQL_VARBINARY);
+
+    unsigned char buf[4] = {};
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(10, ind);
+
+    SQLCHAR probeBuf[1] = {};
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, probeBuf, 0, &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(6, ind);
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(6, ind);
+    EXPECT_EQ(0x41, buf[0]);
     SQLCloseCursor(stmt_);
 }
 

@@ -287,6 +287,12 @@ fn sql_get_data_safe(
     if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
         row.discard_before(col_index - 1);
         let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
+        // No partial-read offset to subtract here, unlike `write_captured_column`:
+        // a binary continuation leaves the value in `last_captured`, so it takes
+        // the `already_captured` branch above and never reaches this site. Any
+        // offset still set for this column belongs to a text continuation and is
+        // not in bytes.
+        //
         // Length and base type are lifted out of the row before any
         // `stmt_state` mutation, so the row borrow ends here.
         let probe = if binary_probe {
@@ -2600,31 +2606,6 @@ fn remaining_binary_length(value: &ColumnValues, offset: usize) -> SqlLen {
     length.saturating_sub(SqlLen::try_from(offset).unwrap_or(SqlLen::MAX))
 }
 
-/// Answers a zero-length `SQL_C_BINARY` length probe: writes the indicator and
-/// says whether the probe delivered the whole value.
-///
-/// **Both probe sites must route through this.** `SQLGetData` answers the probe
-/// in two places — the buffered fast path in `sql_get_data_safe` and
-/// `write_captured_column` — and they have already drifted apart once: the
-/// buffered path kept returning a bare `SQL_SUCCESS` after the captured path was
-/// fixed, which silently reopened AB#47537 on the exact shape that first hit it.
-/// The two blocks sit ~750 lines apart in different functions, so nothing about
-/// a textual merge or a unit test on one of them catches the other.
-///
-/// The return code carries the disposition, so callers must not re-derive it:
-/// - `SQL_SUCCESS` — nothing was left behind, the value is fully delivered, and
-///   the caller must mark the column consumed so a repeat reports
-///   `SQL_NO_DATA`.
-/// - `SQL_SUCCESS_WITH_INFO` (with `01004`) — bytes remain, so the value must
-///   stay resident for the caller to grow its buffer and re-read.
-///
-/// Reporting plain success while bytes remain is the AB#47537 crash: it tells
-/// the application its buffer holds the value, and mssql-python then copies
-/// `indicator` bytes out of the zero-length buffer it passed. `SQL_NO_TOTAL`
-/// counts as bytes remaining — the count is merely unknown.
-///
-/// # Safety
-/// `strlen_or_ind_ptr` must be null or valid for one `SqlLen` write.
 /// Delivers a captured column as `SQL_C_BINARY`, chunking across calls.
 ///
 /// The contract is the one msodbcsql answers, measured against 18.6: the
@@ -2703,10 +2684,31 @@ unsafe fn deliver_captured_binary(
     SQL_SUCCESS
 }
 
+/// Answers a zero-length `SQL_C_BINARY` length probe: writes the indicator and
+/// says whether the probe delivered the whole value.
+///
+/// **Both probe sites must route through this.** `SQLGetData` answers the probe
+/// in two places — the buffered fast path in `sql_get_data_safe` and
+/// `write_captured_column` — and they have already drifted apart once: the
+/// buffered path kept returning a bare `SQL_SUCCESS` after the captured path was
+/// fixed, which silently reopened AB#47537 on the exact shape that first hit it.
+/// The two blocks sit ~750 lines apart in different functions, so nothing about
+/// a textual merge or a unit test on one of them catches the other.
+///
+/// The return code carries the disposition, so callers must not re-derive it:
+/// - `SQL_SUCCESS` — nothing was left behind, the value is fully delivered, and
+///   the caller must mark the column consumed so a repeat reports
+///   `SQL_NO_DATA`.
+/// - `SQL_SUCCESS_WITH_INFO` (with `01004`) — bytes remain, so the value must
+///   stay resident for the caller to grow its buffer and re-read.
+///
+/// Reporting plain success while bytes remain is the AB#47537 crash: it tells
+/// the application its buffer holds the value, and mssql-python then copies
+/// `indicator` bytes out of the zero-length buffer it passed. `SQL_NO_TOTAL`
+/// counts as bytes remaining — the count is merely unknown.
 ///
 /// # Safety
-///
-/// `strlen_or_ind_ptr` must be null or point to a writable `SqlLen`.
+/// `strlen_or_ind_ptr` must be null or valid for one `SqlLen` write.
 unsafe fn answer_binary_probe(
     stmt_state: &mut StmtState,
     available: SqlLen,
