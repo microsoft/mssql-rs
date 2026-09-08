@@ -3919,8 +3919,16 @@ mod serializer_tests {
     /// unreachable in practice (every `ColumnValues::String` inside a
     /// `sql_variant` already carries a collation by the time it gets here,
     /// see `sqltypes.rs`), but not guaranteed to agree by anything in this
-    /// file alone. 'é' (U+00E9) needs CP1252 -- not a Latin-1 pass-through --
-    /// to prove the *same* collation both declared it and encoded it.
+    /// file alone.
+    ///
+    /// '€' (U+20AC), not 'é': CP1252 and the old Latin-1-pass-through
+    /// fallback (`encode_narrow_for_wire`'s `None` arm: any char `<= 0xFF`
+    /// passes through, else `?`) agree on every codepoint `<= 0xFF`,
+    /// including 'é' (U+00E9) -- so a test built on 'é' passes identically
+    /// whether or not the two defaults actually share one constant, proving
+    /// nothing. '€' is `> 0xFF` -- the fallback maps it to `b'?'`
+    /// (`0x3F`) -- but CP1252 still represents it, at byte `0x80`, so only
+    /// this codepoint actually discriminates the fix from the bug it pins.
     #[test]
     fn variant_varchar_no_collation_uses_the_same_default_for_declaration_and_encoding() {
         let mut mock = MockNetworkWriter::new(128);
@@ -3929,7 +3937,7 @@ mod serializer_tests {
         ctx.max_size = 8016;
         ctx.collation = None;
         let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
-            "é".as_bytes().to_vec(),
+            "€".as_bytes().to_vec(),
             crate::datatypes::sql_string::EncodingType::Utf8,
         ));
         block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
@@ -3940,7 +3948,7 @@ mod serializer_tests {
         assert_eq!(u32::from_le_bytes([p[6], p[7], p[8], p[9]]), 0x00000409); // collation.info
         assert_eq!(p[10], 52); // collation.sort_id
         assert_eq!(u16::from_le_bytes([p[11], p[12]]), 1); // max_length = 1 encoded byte
-        assert_eq!(p[13], 0xE9); // CP1252 'é', not a Latin-1-fallback '?'
+        assert_eq!(p[13], 0x80); // CP1252 '€', not a Latin-1-fallback '?' (0x3F)
     }
 
     /// A TDS type the variant writers do not handle must be an error, never a
