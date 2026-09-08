@@ -32,6 +32,13 @@ protected:
         ASSERT_SQL_OK(ExecDirect(sql), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     }
+    void AssertColumnSqlType(SQLSMALLINT expected) {
+        SQLSMALLINT actual = 0;
+        ASSERT_SQL_OK(SQLDescribeCol(stmt_, 1, nullptr, 0, nullptr, &actual, nullptr, nullptr,
+                                     nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(expected, actual);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +84,30 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryChunksWithARemainingCount) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(BinaryFetchLiveTest, FixedBinaryProbeReportsRemainingBytesWithoutConsumingThem) {
+    FetchOne("SELECT CAST(0x010203040506070809 AS BINARY(9))");
+
+    unsigned char buf[4] = {};
+    SQLLEN ind = 0;
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(9, ind);
+    EXPECT_EQ(0, std::memcmp(buf, "\x01\x02\x03\x04", 4));
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, nullptr, 0, &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(5, ind);
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(5, ind);
+    EXPECT_EQ(0, std::memcmp(buf, "\x05\x06\x07\x08", 4));
+
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(1, ind);
+    EXPECT_EQ(0x09, buf[0]);
+    SQLCloseCursor(stmt_);
+}
+
 TEST_F(BinaryFetchLiveTest, EmptyVarbinaryReportsZeroLength) {
     FetchOne("SELECT CAST(0x AS VARBINARY(20))");
 
@@ -96,7 +127,8 @@ TEST_F(BinaryFetchLiveTest, EmptyVarbinaryReportsZeroLength) {
 // ---------------------------------------------------------------------------
 
 TEST_F(BinaryFetchLiveTest, VarbinaryMaxDeliversWholeValue) {
-    FetchOne("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10)");
+    FetchOne("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))");
+    AssertColumnSqlType(SQL_VARBINARY);
 
     unsigned char buf[64] = {};
     SQLLEN ind = 0;
@@ -111,7 +143,8 @@ TEST_F(BinaryFetchLiveTest, VarbinaryMaxDeliversWholeValue) {
 // the first chunk and the resumed chunk are admitted by two separate gates, so
 // a read could start and then be refused half way through.
 TEST_F(BinaryFetchLiveTest, VarbinaryMaxChunksAcrossCalls) {
-    FetchOne("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10)");
+    FetchOne("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))");
+    AssertColumnSqlType(SQL_VARBINARY);
 
     unsigned char buf[4] = {};
     SQLLEN ind = 0;
@@ -207,8 +240,10 @@ TEST_F(BinaryFetchLiveTest, BoundBinaryTruncatesWithTheFullLength) {
 }
 
 TEST_F(BinaryFetchLiveTest, BoundVarbinaryMaxDeliversWholeValue) {
-    ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10)"),
-                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10) AS VARBINARY(MAX))"),
+        SQL_HANDLE_STMT, stmt_);
+    AssertColumnSqlType(SQL_VARBINARY);
 
     unsigned char buf[64] = {};
     SQLLEN ind = 0;

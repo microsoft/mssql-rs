@@ -1107,8 +1107,13 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
     // the already-buffered wire bytes is materialized and delivered by the bound
     // non-PLP path, which would leave deliver_bound_plp untested.
     ExecDirect(
-        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 1100000) AS lob, n * 11 AS tail "
+        "SELECT n, CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 1100000) AS VARBINARY(MAX)) "
+        "AS lob, n * 11 AS tail "
         "FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
+    SQLSMALLINT lobType = 0;
+    ASSERT_SQL_OK(SQLDescribeCol(stmt_, 2, nullptr, 0, nullptr, &lobType, nullptr, nullptr, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_VARBINARY, lobType);
 
     SQLINTEGER n = -1;
     unsigned char buf[32] = {};

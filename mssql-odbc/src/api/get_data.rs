@@ -1158,7 +1158,12 @@ fn write_captured_column(
         // `SQLGetData(SQL_C_BINARY, NULL, 0)` with `SQL_SUCCESS_WITH_INFO` /
         // `01004` / indicator 9, while an empty `varbinary` answers
         // `SQL_SUCCESS` and reports `SQL_NO_DATA` on a repeat.
-        let available = binary_length(value);
+        let offset = stmt_state
+            .partial_text_offset
+            .filter(|(column, _)| *column == col_index)
+            .map(|(_, offset)| offset)
+            .unwrap_or(0);
+        let available = remaining_binary_length(value, offset);
         // SAFETY: `strlen_or_ind_ptr` is null or valid for one `SqlLen` write
         // per the SQLGetData contract.
         let rc = unsafe { answer_binary_probe(stmt_state, available, strlen_or_ind_ptr) };
@@ -2585,6 +2590,14 @@ fn binary_length(value: &ColumnValues) -> SqlLen {
         _ => return SQL_NO_TOTAL,
     };
     SqlLen::try_from(len).unwrap_or(SqlLen::MAX)
+}
+
+fn remaining_binary_length(value: &ColumnValues, offset: usize) -> SqlLen {
+    let length = binary_length(value);
+    if length == SQL_NO_TOTAL || column_value_to_bytes(value).is_none() {
+        return length;
+    }
+    length.saturating_sub(SqlLen::try_from(offset).unwrap_or(SqlLen::MAX))
 }
 
 /// Answers a zero-length `SQL_C_BINARY` length probe: writes the indicator and
@@ -4393,6 +4406,19 @@ mod tests {
     }
 
     #[test]
+    fn remaining_binary_length_applies_offsets_only_to_deliverable_bytes() {
+        assert_eq!(
+            remaining_binary_length(&ColumnValues::Bytes(vec![1, 2, 3, 4, 5]), 2),
+            3
+        );
+        assert_eq!(remaining_binary_length(&ColumnValues::Int(1), 2), 4);
+        assert_eq!(
+            remaining_binary_length(&ColumnValues::Null, 2),
+            SQL_NO_TOTAL
+        );
+    }
+
+    #[test]
     fn complete_buffered_strings_copy_only_for_matching_full_buffers() {
         use mssql_tds::datatypes::sql_string::SqlString;
 
@@ -4741,6 +4767,61 @@ mod tests {
             unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert_eq!(ind, 9);
+    }
+
+    #[test]
+    fn get_data_binary_probe_after_a_partial_read_reports_remaining_bytes() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Bytes(b"asdfghjkl".to_vec()));
+
+        let mut out = [0_u8; 4];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                out.as_mut_ptr().cast(),
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 9);
+        assert_eq!(&out, b"asdf");
+
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 5);
+
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                out.as_mut_ptr().cast(),
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 5);
+        assert_eq!(&out, b"ghjk");
+
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                out.as_mut_ptr().cast(),
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 1);
+        assert_eq!(out[0], b'l');
     }
 
     /// `SQL_NO_TOTAL` is a third case, distinct from both a byte count and
