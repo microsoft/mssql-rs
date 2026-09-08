@@ -32,42 +32,109 @@ COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-480}
 # 1% of the time, while agents that built 29.8.0 took 441s median (774s max) and
 # failed 36% — the build alone exhausted the step timeout.
 #
-# `--force-bottle` makes brew fail rather than fall back to source. When it does
-# fail, install-brew-bottle.py takes the newest version that *is* bottled for
-# this platform straight from Homebrew's registry, so there is no version to pin
-# by hand and no third-party download. Both paths therefore install exactly what
-# Homebrew would have, and this self-heals once the current version is bottled
-# again — which on arm64 it already is.
+# `--force-bottle` makes brew refuse to build the *requested* formula from
+# source, but Homebrew dropping bottle support for Intel macOS entirely
+# (September 2026) exposed a gap that assumption doesn't cover: brew still
+# resolves and starts fetching source for docker's *build dependencies* (go,
+# go-md2man) before it gets around to reporting "docker has no bottle", so the
+# attempt can hang well past that error on a platform with no bottles at all.
+# Bounded separately and tightly so that hang is cut short well before it could
+# exhaust the whole install budget, falling through instead to the fallback
+# below, which doesn't invoke brew and isn't subject to this at all. No
+# measured p95/max for this one, unlike the other limits in this file: a
+# healthy-but-slow bottled install that this cuts off still lands on the
+# fallback and still installs docker, just slower, so the failure mode of
+# sizing this wrong is "occasionally takes the slower path", not a stuck step.
+#
+# When it does fail (or is cut short), install-brew-bottle.py takes the newest
+# version that *is* bottled for this platform straight from Homebrew's
+# registry, so there is no version to pin by hand and no third-party download.
+# Both paths therefore install exactly what Homebrew would have, and this
+# self-heals once the current version is bottled again — which on arm64 it
+# already is.
 DOCKER_CLI_DIR=${DOCKER_CLI_DIR:-$HOME/.docker-cli/bin}
+DOCKER_BOTTLE_TIMEOUT_SECONDS=${DOCKER_BOTTLE_TIMEOUT_SECONDS:-90}
 # Bounded so a slow install fails here with a message rather than silently
 # consuming the step budget and surfacing as an opaque "task has timed out".
 INSTALL_TIMEOUT_SECONDS=${INSTALL_TIMEOUT_SECONDS:-300}
 
-install_tooling() {
-  # `set -e` is suppressed inside a function called from a conditional, so every
-  # prerequisite has to report failure explicitly or a broken brew would look
-  # like a successful install and only surface as a confusing colima failure.
-  brew update || return 1
-  brew install colima || return 1
-
-  if brew install --force-bottle docker; then
-    return 0
-  fi
-  echo "##[warning]No docker CLI bottle for the current version on this platform; falling back to the newest bottled version"
-  python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR" || return 1
-}
-
 # A leftover directory would make the "did we fall back?" check below lie.
 rm -rf "$DOCKER_CLI_DIR"
 
-install_status=0
-run_bounded "$INSTALL_TIMEOUT_SECONDS" install_tooling || install_status=$?
-if [ "$install_status" -eq 124 ]; then
-  echo "##[error]Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
+# Every install step is bounded directly by run_bounded here, one call each,
+# none nested inside another. run_bounded's timeout path signals the bounded
+# command's *own* process group (`set -m` gives it one), specifically so a
+# hang doesn't leave a grandchild alive holding the task's stdout after the
+# bound fires. Wrapping this whole sequence in one more, outer run_bounded --
+# as an earlier version of this script did, backgrounding the function that
+# contains these calls -- would put that function in its own group and each
+# command it bounds in a *further* nested group of its own: if the outer
+# bound fired while a command was still inside its own inner bound, the outer
+# kill would reach the function's group but not the nested command's, leaving
+# exactly the orphan this helper exists to prevent. Flat, single-level bounds
+# don't have that failure mode: whichever bound owns a command is the only
+# one that can ever signal it.
+install_deadline=$(( $(date +%s) + INSTALL_TIMEOUT_SECONDS ))
+
+fail_install() {
+  echo "##[error]$1"
   exit 1
-elif [ "$install_status" -ne 0 ]; then
-  echo "##[error]Installing colima and the docker CLI failed (exit $install_status)"
-  exit 1
+}
+
+# Whatever remains of the overall install budget, capped at $1 when given
+# and smaller, or 0 once the budget is exhausted. Never calls fail_install
+# itself: every caller reads this through a plain `$(...)` command
+# substitution, where an `exit` only ends that subshell, not the script --
+# so the 0 case has to be checked, and failed, by the caller instead.
+budget_limit() {
+  local cap=${1:-}
+  local left=$((install_deadline - $(date +%s)))
+  [ "$left" -gt 0 ] || left=0
+  if [ -n "$cap" ] && [ "$cap" -lt "$left" ]; then
+    echo "$cap"
+  else
+    echo "$left"
+  fi
+}
+
+# Bounds "$@" by whatever remains of the overall install budget, failing the
+# step immediately -- rather than letting a later step start against an
+# already-exhausted or barely-alive budget -- on timeout or a non-zero exit.
+run_install_step() {
+  local limit
+  limit=$(budget_limit)
+  if [ "$limit" -eq 0 ]; then
+    fail_install "Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
+  fi
+  # Not `run_bounded ... ; local status=$?`: under `set -e`, a non-zero
+  # exit from a plain (untested) command aborts the script on the spot,
+  # before this function ever reaches the `local` line to capture it. `||`
+  # is a test, so it's the only way to observe the real code here.
+  local status=0
+  run_bounded "$limit" "$@" || status=$?
+  if [ "$status" -eq 124 ]; then
+    fail_install "Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
+  elif [ "$status" -ne 0 ]; then
+    fail_install "Installing colima and the docker CLI failed (exit $status)"
+  fi
+}
+
+run_install_step brew update
+run_install_step brew install colima
+
+# The docker-bottle attempt is the one step allowed to fail without ending
+# the job: that failure is the expected, handled path into the fallback, not
+# an install error. It is also the only step that needs a cap tighter than
+# the overall budget (DOCKER_BOTTLE_TIMEOUT_SECONDS), which is why it can't
+# go through run_install_step: that helper treats any non-zero exit as
+# fatal.
+bottle_limit=$(budget_limit "$DOCKER_BOTTLE_TIMEOUT_SECONDS")
+if [ "$bottle_limit" -eq 0 ]; then
+  fail_install "Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
+fi
+if ! run_bounded "$bottle_limit" brew install --force-bottle docker; then
+  echo "##[warning]No docker CLI bottle for the current version on this platform (or the attempt ran past ${bottle_limit}s); falling back to the newest bottled version"
+  run_install_step python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR"
 fi
 
 # Only the fallback populates DOCKER_CLI_DIR; brew's own docker is already on PATH.
