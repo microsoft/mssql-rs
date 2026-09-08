@@ -2126,17 +2126,24 @@ mod tests {
             other => panic!("expected DateTime2, got {other:?}"),
         }
 
-        // A fold that leaves the representable range is a failed cast.
-        assert_eq!(
-            convert_datetime_text(
-                SQL_C_CHAR,
-                SQL_TYPE_TIMESTAMP,
-                0,
-                "0001-01-01 00:00:00+05:30"
-            )
-            .unwrap_err(),
-            ParamBuildError::Value(ConvError::InvalidCharacterValue)
-        );
+        // A fold that leaves the representable range is a failed cast, at
+        // either end of it. `SQL_TYPE_TIME` discards the date, so it is the
+        // only target where the fold's own range guard — rather than the
+        // target's date conversion — is what rejects the value.
+        for target in [SQL_TYPE_TIMESTAMP, SQL_TYPE_TIME] {
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, target, 0, "9999-12-31 23:59:59-05:30")
+                    .unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "{target}"
+            );
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, target, 0, "0001-01-01 00:00:00+05:30")
+                    .unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "{target}"
+            );
+        }
     }
 
     /// Folding runs before the target's own rules, so an offset that moves a

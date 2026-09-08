@@ -1174,6 +1174,24 @@ TEST_F(ScalarConversionLiveTest, FoldingAnOffsetCanCrossADateBoundary) {
     ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "2024-05-20 01:00:00+05:30", 0, 7),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-05-19 19:30:00.0000000", ExecuteAndReadBack());
+    ResetParams();
+
+    // Both ends of the representable range: the fold pushes the value off it,
+    // so there is no datetime2 to send. Left unskipped deliberately, so the
+    // compare leg adjudicates the SQLSTATE against retail rather than the
+    // driver only agreeing with its own unit test.
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "0001-01-01 00:00:00+05:30"),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
+    ResetParams();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNarrow(SQL_TYPE_TIMESTAMP, "9999-12-31 23:59:59-05:30"),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22018");
 }
 
 // The fold runs *before* the target's own rules, so an offset that moves a
