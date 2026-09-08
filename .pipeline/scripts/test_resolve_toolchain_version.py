@@ -144,6 +144,16 @@ class NextVersion(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             resolve.next_version("1.0.0-beta", layout_changed=False)
 
+    def test_ordering_a_published_prerelease_fails_cleanly(self):
+        # A hand-published prerelease on the feed used to reach int() and give
+        # a ValueError traceback rather than something anyone could act on.
+        state = {
+            "x86_64": {"version": "1.0.0-rc1", "current": False, "layout_stale": False},
+            "arm64": {"version": "0.1.0", "current": False, "layout_stale": False},
+        }
+        with self.assertRaises(RuntimeError):
+            resolve.decide(state)
+
 
 class Organization(unittest.TestCase):
     def test_the_modern_collection_uri(self):

@@ -83,6 +83,10 @@ def _get(url, token=None, accept=None, binary=False, attempts=3):
 
 
 def anonymous_token(formula):
+    # The name is pasted into registry URLs below, so it has to look like a
+    # formula and not like more path or query.
+    if not re.match(r"^[a-z0-9][a-z0-9._+-]*$", formula):
+        raise RuntimeError(f"{formula!r} is not a Homebrew formula name")
     scope = f"repository:{REPO_PREFIX}/{formula}:pull"
     data, _ = _get(f"{REGISTRY}/token?service=ghcr.io&scope={scope}")
     return data["token"]
@@ -298,7 +302,10 @@ def extract_prefix(blob, formula, version, dest_root):
                     continue
                 with open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
-                os.chmod(target, member.mode or 0o644)
+                # Masked, not honoured: the archive should not get to ask for
+                # setuid, setgid, sticky or group/other write on a file being
+                # unpacked onto the agent.
+                os.chmod(target, (member.mode or 0o644) & 0o755)
             extracted.append(relative)
     if not extracted:
         raise RuntimeError(f"bottle for {formula} {version} extracted nothing")

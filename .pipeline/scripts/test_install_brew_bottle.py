@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import stat
 import tarfile
 import tempfile
 import unittest
@@ -281,6 +282,22 @@ class PrefixExtraction(unittest.TestCase):
         ])
         self.assertEqual(self.on_disk(), ["bin/docker", "bin/sibling"])
 
+    def test_the_archive_cannot_ask_for_setuid(self):
+        blob = make_bottle([("docker/29.7.2/bin/docker", True)])
+        # Rewrite the member's mode: tarfile keeps whatever the archive says.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(blob)) as src, \
+                tarfile.open(fileobj=buf, mode="w:gz") as out:
+            for member in src.getmembers():
+                member.mode = 0o4777
+                out.addfile(member, src.extractfile(member))
+        bottle.extract_prefix(buf.getvalue(), "docker", "29.7.2", self.root)
+        mode = os.stat(os.path.join(self.root, "bin/docker")).st_mode
+        self.assertFalse(mode & stat.S_ISUID, "setuid survived extraction")
+        self.assertFalse(mode & stat.S_ISGID, "setgid survived extraction")
+        self.assertFalse(mode & stat.S_IWOTH, "world-writable survived extraction")
+        self.assertTrue(mode & stat.S_IXUSR, "the executable bit should survive")
+
     def test_a_symlink_climbing_out_through_a_subdirectory_is_refused(self):
         # No leading `../`, so a prefix test on the linkname alone accepts it,
         # and a later member written through the link lands outside the prefix.
@@ -303,6 +320,14 @@ class PrefixExtraction(unittest.TestCase):
         self.assertEqual(
             self.on_disk(), ["bin/limactl", "bin/limactl-alias", "share/lima/link"]
         )
+
+
+class FormulaNames(unittest.TestCase):
+    def test_a_name_that_is_really_more_url_is_refused(self):
+        # The name is pasted into registry URLs.
+        for name in ("../../evil", "docker/../other", "docker?tag=x", "", "Docker"):
+            with self.assertRaises(RuntimeError, msg=name):
+                bottle.anonymous_token(name)
 
 
 if __name__ == "__main__":

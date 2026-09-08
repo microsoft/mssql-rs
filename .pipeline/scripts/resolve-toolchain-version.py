@@ -170,23 +170,29 @@ def requested_version(raw):
     return value
 
 
+def version_key(version):
+    """Sortable form of an X.Y.Z version, refusing anything else.
+
+    Published versions come off the feed, where a hand-published prerelease is
+    possible; ordering one with a bare int() gives a traceback rather than a
+    failure anyone can act on.
+    """
+    parsed = re.match(r"^(\d+)\.(\d+)\.(\d+)$", version)
+    if not parsed:
+        raise RuntimeError(
+            f"published version {version!r} is not X.Y.Z, so versions cannot be "
+            f"ordered; pass an explicit --version"
+        )
+    return [int(part) for part in parsed.groups()]
+
+
 def next_version(latest, layout_changed):
     if latest is None:
         return "0.1.0"
-    parsed = re.match(r"^(\d+)\.(\d+)\.(\d+)$", latest)
-    if not parsed:
-        raise RuntimeError(
-            f"published version {latest!r} is not X.Y.Z, so the next one cannot be "
-            f"derived; pass an explicit --version"
-        )
-    major, minor, patch = (int(part) for part in parsed.groups())
+    major, minor, patch = version_key(latest)
     if layout_changed:
         return f"{major}.{minor + 1}.0"
     return f"{major}.{minor}.{patch + 1}"
-
-
-def version_key(version):
-    return [int(part) for part in version.split(".")]
 
 
 def decide(state, override=None, force=False):

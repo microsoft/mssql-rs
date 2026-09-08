@@ -44,7 +44,21 @@ fail() {
 }
 
 manifest_field() {
-  python3 -c "import json,sys;print(json.load(open(sys.argv[1]))$1)" "$TOOLCHAIN_DIR/manifest.json"
+  python3 -c 'import json, sys
+value = json.load(open(sys.argv[1]))
+for key in sys.argv[2:]:
+    value = value[key]
+print(value)' "$TOOLCHAIN_DIR/manifest.json" "$@"
+}
+
+# Manifest values that become paths are checked rather than trusted. The
+# payload is ours, but "it came from our feed" is not the same as "it is
+# well-formed", and these are joined onto a directory.
+plain_name() {
+  case "$1" in
+    "" | . | .. | */* | *[!A-Za-z0-9._-]*)
+      fail "toolchain manifest gave $2 as '$1', which is not a plain file name" ;;
+  esac
 }
 
 # Puts the packaged toolchain on PATH and seeds colima's image cache. Nothing
@@ -74,14 +88,18 @@ install_from_package() {
   # otherwise download it from, so seeding it under that name is what keeps the
   # ~350 MB fetch from github.com out of the job.
   local cache_dir="$HOME/Library/Caches/colima/caches"
-  local cached image
-  cached="$cache_dir/$(manifest_field "['image']['cache_filename']")"
-  image="$TOOLCHAIN_DIR/image/$(manifest_field "['image']['filename']")"
+  local cache_name image_name cached image
+  cache_name=$(manifest_field image cache_filename)
+  image_name=$(manifest_field image filename)
+  plain_name "$cache_name" "image.cache_filename"
+  plain_name "$image_name" "image.filename"
+  cached="$cache_dir/$cache_name"
+  image="$TOOLCHAIN_DIR/image/$image_name"
   [ -f "$image" ] || fail "toolchain payload has no guest image at $image"
   mkdir -p "$cache_dir"
   [ -f "$cached" ] || cp "$image" "$cached"
 
-  echo "toolchain: $(manifest_field "['arch']") payload, layout $(manifest_field "['payload_format']"), id $(manifest_field "['identity']")"
+  echo "toolchain: $(manifest_field arch) payload, layout $(manifest_field payload_format), id $(manifest_field identity)"
   echo "guest image seeded at $cached ($(du -h "$cached" | cut -f1))"
 }
 
