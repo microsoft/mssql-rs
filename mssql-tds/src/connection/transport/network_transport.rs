@@ -1704,8 +1704,11 @@ impl NetworkTransport {
 
     /// Advances drain metadata and records client-visible control tokens.
     ///
-    /// Returns true only for a final DONE-family ATTN, the boundary that proves
-    /// the stream can serve another request.
+    /// Returns true only for a final DONE-family ATTN. [MS-TDS: DONE] defines
+    /// `DONE_MORE` as non-final with subsequent data streams to follow; stopping
+    /// there would leave those streams unread rather than realign the connection.
+    ///
+    /// [MS-TDS: DONE]: https://learn.microsoft.com/openspecs/windows_protocols/ms-tds/3c06f110-98bd-4d5b-b836-b1ba66452cb7
     fn apply_attention_token(
         context: &mut AttentionDrainContext,
         settlement: &mut AttentionSettlement,

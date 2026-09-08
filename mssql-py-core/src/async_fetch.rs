@@ -48,6 +48,8 @@ struct FetchPublicationHook {
 }
 
 #[cfg(debug_assertions)]
+// Process-global test seam: callers must ensure no unrelated fetch can reach
+// publication while it is armed.
 static FETCH_PUBLICATION_HOOK: StdMutex<FetchPublicationHook> =
     StdMutex::new(FetchPublicationHook {
         pause: None,
@@ -369,6 +371,8 @@ impl Drop for FetchCancellationGuard {
                 .session_state
                 .cancel_fetch(self.operation_id, self.fetch_id)
         {
+            #[cfg(debug_assertions)]
+            release_fetch_publication_pause();
             let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
             tracing::debug!(
                 "PyAsyncCursor::{}: cancelled; ATTENTION settlement continues in the background",
@@ -1183,14 +1187,13 @@ mod tests {
 
     use mssql_tds::error::Error;
 
+    #[cfg(debug_assertions)]
+    use super::{
+        FetchCancellationGuard, arm_fetch_publication_pause, pause_fetch_publication_if_armed,
+    };
     use super::{
         FetchGuard, MaterializationGuard, map_fetch_error, map_materialization_join_error,
         map_nextset_error,
-    };
-    #[cfg(debug_assertions)]
-    use super::{
-        arm_fetch_publication_pause, pause_fetch_publication_if_armed,
-        release_fetch_publication_pause,
     };
     use crate::async_fetch::BufferedResults;
     use crate::async_session::{
@@ -1218,14 +1221,28 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn fetch_publication_test_hook_blocks_until_released() {
+    async fn fetch_cancellation_releases_publication_pause_after_recording_the_request() {
+        let (state, operation_id, fetch_id) = claimed_fetch();
         let entered = arm_fetch_publication_pause().unwrap();
         let paused = tokio::spawn(pause_fetch_publication_if_armed());
         entered.await.unwrap();
 
         assert!(!paused.is_finished());
-        release_fetch_publication_pause();
+        drop(FetchCancellationGuard::new(
+            Arc::clone(&state),
+            operation_id,
+            fetch_id,
+            "fetchone",
+            None,
+        ));
         paused.await.unwrap();
+
+        let mut fetch_guard = FetchGuard::new(state, operation_id, fetch_id, "fetchone", None);
+        assert_eq!(
+            fetch_guard.complete(false, true),
+            FetchCompletion::CancellationRequested
+        );
+        fetch_guard.fail(false);
     }
 
     #[test]

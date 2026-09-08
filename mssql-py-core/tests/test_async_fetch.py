@@ -838,7 +838,6 @@ def test_fetchone_cancellation_before_publication_resynchronizes_connection(
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            mssql_py_core._release_fetch_publication_pause()
 
             probe = conn.cursor()
             await execute_after_cancellation_settles(probe, "SELECT 3")
