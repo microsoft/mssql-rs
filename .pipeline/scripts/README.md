@@ -150,6 +150,37 @@ instead of shipping.
 bottles built for an older macOS run on newer hosts, so this is a compatibility
 floor rather than a target.
 
+### resolve-toolchain-version.py
+Decides whether the toolchain needs republishing, and at what version, so nobody
+has to read the feed and pick a number. The payload is a derived artifact — its
+bytes are a function of the three bottles, the macOS floor they are selected for,
+and `PAYLOAD_FORMAT` — so `payload_identity()` digests exactly those inputs and
+the decision falls out of comparing that digest with what is already published.
+
+Nothing is downloaded to decide. Bottle versions and digests come from registry
+metadata, and the published side is read back out of the package description,
+where publishing records it as `[layout:N id:...]`. The guest image is
+deliberately not part of the identity: colima carries the image URL and checksum
+in its own binary, so the colima bottle digest already covers it.
+
+A scheduled run that finds upstream unmoved publishes nothing, which keeps the
+version history a record of upstream movement rather than of the schedule
+firing. Otherwise the version is derived: a patch bump for an upstream release,
+a minor bump when `PAYLOAD_FORMAT` changed, since consumers resolving paths into
+the tree may have to change with it.
+
+The decision is made once for every architecture rather than per package, so a
+given version always means the same build produced all of them — worth more than
+skipping the occasional unchanged republish.
+
+**Usage:** `resolve-toolchain-version.py --org <url> --feed <project/feed> --arch
+x86_64 --arch arm64 --macos-major 14 [--version X.Y.Z] [--force]`, reading
+`SYSTEM_ACCESSTOKEN`; emits `shouldPublish`, `packageVersion` and
+`identity_<arch>` as pipeline output variables. `--describe <manifest.json>
+--expect-identity <id>` is the publish side: it composes the description and
+fails if the built payload disagrees with what was resolved, which means a
+release landed mid-run. Covered by `test_resolve_toolchain_version.py`.
+
 ### install-brew-bottle.py
 Installs the newest Homebrew bottle of a formula that exists for the running
 platform, by reading Homebrew's OCI registry on ghcr.io directly. Used as the

@@ -7,8 +7,6 @@ parameters:
   values:
   - x86_64
   - arm64
-- name: packageVersion
-  type: string
 - name: macosMajorFloor
   type: number
 - name: dryRun
@@ -19,7 +17,14 @@ parameters:
 jobs:
 - job: Build_${{ parameters.arch }}
   displayName: 'Build and publish ${{ parameters.arch }}'
+  dependsOn: Decide
+  # Nothing moved upstream means nothing to build; the run succeeds having done
+  # the one useful thing, which was checking.
+  condition: and(succeeded(), eq(dependencies.Decide.outputs['decide.shouldPublish'], 'true'))
   timeoutInMinutes: 30
+  variables:
+    packageVersion: $[ dependencies.Decide.outputs['decide.packageVersion'] ]
+    payloadIdentity: $[ dependencies.Decide.outputs['decide.identity_${{ parameters.arch }}'] ]
   # Downloads, verifies and repacks ~400 MB; nothing is compiled, so the cheap
   # util pool is enough.
   pool:
@@ -37,14 +42,21 @@ jobs:
         --out "$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}"
     displayName: 'Assemble payload'
 
+  # The description is load-bearing: the next run reads its markers back out of
+  # the feed to decide whether anything changed.
   - script: |
       set -euo pipefail
-      payload="$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}"
       echo "##[group]manifest.json"
-      cat "$payload/manifest.json"
+      cat "$PAYLOAD/manifest.json"
       echo "##[endgroup]"
-      echo "payload size: $(du -sh "$payload" | cut -f1)"
-    displayName: 'Show manifest'
+      echo "payload size: $(du -sh "$PAYLOAD" | cut -f1)"
+      python3 .pipeline/scripts/resolve-toolchain-version.py \
+        --describe "$PAYLOAD/manifest.json" \
+        --expect-identity "$RESOLVED_IDENTITY"
+    displayName: 'Check the payload against the decision and describe it'
+    env:
+      PAYLOAD: '$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}'
+      RESOLVED_IDENTITY: '$(payloadIdentity)'
 
   # Published even on a dry run: the manifest is the record of what a given
   # package version actually contains.
@@ -56,7 +68,7 @@ jobs:
 
   - ${{ if eq(parameters.dryRun, false) }}:
     - task: UniversalPackages@0
-      displayName: 'Publish macos-docker-toolchain-${{ parameters.arch }} ${{ parameters.packageVersion }}'
+      displayName: 'Publish macos-docker-toolchain-${{ parameters.arch }} $(packageVersion)'
       inputs:
         command: publish
         publishDirectory: '$(Build.ArtifactStagingDirectory)/${{ parameters.arch }}'
@@ -64,5 +76,5 @@ jobs:
         vstsFeedPublish: '${{ parameters.feed }}'
         vstsFeedPackagePublish: 'macos-docker-toolchain-${{ parameters.arch }}'
         versionOption: 'custom'
-        versionPublish: '${{ parameters.packageVersion }}'
-        packagePublishDescription: 'docker CLI, colima, lima and colima guest image for macOS ${{ parameters.arch }}'
+        versionPublish: '$(packageVersion)'
+        packagePublishDescription: '$(packageDescription)'

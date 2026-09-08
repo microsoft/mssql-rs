@@ -36,11 +36,37 @@ FORMULAE = ("docker", "colima", "lima")
 ARCH_TO_COLIMA = {"x86_64": "amd64", "arm64": "arm64"}
 MACHO_MAGIC_64 = 0xFEEDFACF
 MACHO_CPU_TYPE = {"x86_64": 0x01000007, "arm64": 0x0100000C}
+# Where files land in the payload. Bump when the tree moves, so consumers that
+# resolve paths into it can tell, and so a republish is triggered for a change
+# the component versions below cannot show.
+PAYLOAD_FORMAT = 2
 # Bottles built for an older macOS run on newer hosts, so target the oldest
 # release we might schedule on and stay compatible with everything above it.
 DEFAULT_MACOS_MAJOR = 14
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def payload_identity(components, macos_major, payload_format=PAYLOAD_FORMAT):
+    """Digest of everything that decides the payload's bytes.
+
+    The guest image is deliberately absent: colima carries the image URL and
+    checksum in its own binary, so the colima bottle digest already covers it.
+
+    resolve-toolchain-version.py calls this with versions read from the
+    registry, before anything is downloaded, to compare against a published
+    package. Keep it a pure function of these inputs or that comparison drifts.
+    """
+    key = {
+        "payload_format": payload_format,
+        "macos_major_floor": macos_major,
+        "components": {
+            name: [components[name]["version"], components[name]["bottle_digest"]]
+            for name in sorted(components)
+        },
+    }
+    canonical = json.dumps(key, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
 def load_bottle_helper():
@@ -174,6 +200,8 @@ def main():
     manifest = {
         "arch": args.arch,
         "macos_major_floor": args.macos_major,
+        "payload_format": PAYLOAD_FORMAT,
+        "identity": payload_identity(components, args.macos_major),
         "components": components,
         "image": {
             **entry,

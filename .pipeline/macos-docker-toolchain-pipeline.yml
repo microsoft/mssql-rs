@@ -8,8 +8,11 @@
 # timing out Test MacOS. Colima also downloads a ~350 MB guest image from a
 # personal GitHub repo on every run, which has independently failed on DNS.
 #
-# Manual trigger by design: bumping the toolchain should be a deliberate act with
-# a reviewed version, not something an agent's Homebrew state decides.
+# Runs on a schedule so upstream releases land within a couple of weeks, and
+# decides for itself whether there is anything to publish: resolve-toolchain-
+# version.py compares the bottles upstream has now against what the feed already
+# carries, and a run that finds nothing moved publishes nothing. That keeps the
+# version history a record of upstream movement rather than of the schedule.
 #
 # The build runs on Linux -- it only fetches, verifies and repacks; nothing in
 # the payload is executed here. build-macos-docker-toolchain.py checks the Mach-O
@@ -19,15 +22,32 @@
 trigger: none
 pr: none
 
+schedules:
+# The point is to notice upstream moving, which leaves no trace in this repo, so
+# `always` is required -- without it a scheduled run is skipped whenever the
+# branch has not changed, which is precisely the case this exists to cover.
+- cron: '0 9 1,16 * *'
+  displayName: 'Twice monthly upstream refresh (1st and 16th, 09:00 UTC)'
+  branches:
+    include:
+    - main
+  always: true
+
 parameters:
-# Versioning is about the payload, not the tools inside it -- manifest.json is
-# the record of which docker/colima/lima/image versions a package contains:
-#   MAJOR  the directory layout changed, so consumers must change with it
-#   MINOR  component versions changed (a colima or docker bump)
-#   PATCH  same components, rebuilt
+# Normally left empty: the version is derived from what is already published.
+#   PATCH  an upstream docker/colima/lima release, same payload layout
+#   MINOR  the layout changed (PAYLOAD_FORMAT in build-macos-docker-toolchain.py),
+#          so consumers resolving paths into the tree may have to change with it
+# Set this only to force a specific number, e.g. a deliberate 1.0.0.
 - name: packageVersion
-  displayName: 'Package version, e.g. 1.2.0 (SemVer, immutable once published)'
+  displayName: 'Package version override (leave empty to derive it)'
   type: string
+  default: ''
+
+- name: forcePublish
+  displayName: 'Publish even if nothing changed upstream'
+  type: boolean
+  default: false
 
 - name: publishX64
   displayName: 'Publish x86_64 package'
@@ -60,11 +80,45 @@ stages:
 - stage: Publish_macOS_Docker_Toolchain
   displayName: 'Publish macOS docker toolchain'
   jobs:
+  # Resolves both architectures before anything is downloaded, so an unchanged
+  # upstream costs a few HTTP calls instead of two 430 MB builds. One decision
+  # covers every architecture, so a given version always means the same run
+  # produced all of them.
+  - job: Decide
+    displayName: 'Decide whether to publish, and at what version'
+    timeoutInMinutes: 10
+    variables:
+    # A dry run should always build something to look at, so it forces too.
+    - ${{ if or(eq(parameters.forcePublish, true), eq(parameters.dryRun, true)) }}:
+      - name: forceFlag
+        value: '--force'
+    - ${{ else }}:
+      - name: forceFlag
+        value: ''
+    pool:
+      name: RUST-UTIL-WUS3
+      demands:
+        - imageOverride -equals RUST-UBUSLIM
+    steps:
+    - checkout: self
+    - script: |
+        set -euo pipefail
+        python3 .pipeline/scripts/resolve-toolchain-version.py \
+          --org '$(System.CollectionUri)' \
+          --feed '${{ parameters.feed }}' \
+          --arch x86_64 --arch arm64 \
+          --macos-major ${{ parameters.macosMajorFloor }} \
+          --version '${{ parameters.packageVersion }}' \
+          $(forceFlag)
+      name: decide
+      displayName: 'Compare upstream against the feed'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
   - ${{ if eq(parameters.publishX64, true) }}:
     - template: templates/macos-toolchain-job.yml
       parameters:
         arch: x86_64
-        packageVersion: ${{ parameters.packageVersion }}
         macosMajorFloor: ${{ parameters.macosMajorFloor }}
         dryRun: ${{ parameters.dryRun }}
         feed: ${{ parameters.feed }}
@@ -73,7 +127,6 @@ stages:
     - template: templates/macos-toolchain-job.yml
       parameters:
         arch: arm64
-        packageVersion: ${{ parameters.packageVersion }}
         macosMajorFloor: ${{ parameters.macosMajorFloor }}
         dryRun: ${{ parameters.dryRun }}
         feed: ${{ parameters.feed }}
