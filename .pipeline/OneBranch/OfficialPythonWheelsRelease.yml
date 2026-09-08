@@ -158,10 +158,16 @@ extends:
             $wheels | Copy-Item -Destination $wheelsDir -Force
             Write-Host "Collected $($wheels.Count) wheels"
 
+            $pyprojectToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/pyproject.toml" -Raw
+            if ($pyprojectToml -match '(?ms)^\[project\]\s*$.*?^version\s*=\s*"([^"]+)"') {
+              $pythonVersion = $Matches[1]
+            } else {
+              throw "Could not extract [project].version from mssql-py-core/pyproject.toml"
+            }
             & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
               -WheelsDir $wheelsDir `
               -ExpectedName "mssql-python-rs" `
-              -ExpectedVersion "0.1.0" `
+              -ExpectedVersion $pythonVersion `
               -ExpectedCount 34 `
               -RequireOdbc:$true
 

@@ -451,10 +451,16 @@ stages:
 
       - pwsh: |
           $requireOdbc = "${{ parameters.buildOdbcNative }}" -eq "True"
+          $pyprojectToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/pyproject.toml" -Raw
+          if ($pyprojectToml -match '(?ms)^\[project\]\s*$.*?^version\s*=\s*"([^"]+)"') {
+            $pythonVersion = $Matches[1]
+          } else {
+            throw "Could not extract [project].version from mssql-py-core/pyproject.toml"
+          }
           & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
             -WheelsDir "$(Build.StagingDirectory)/wheels" `
             -ExpectedName "mssql-python-rs" `
-            -ExpectedVersion "0.1.0" `
+            -ExpectedVersion $pythonVersion `
             -ExpectedCount 34 `
             -RequireOdbc:$requireOdbc
         displayName: 'Validate wheel metadata and ODBC payloads'
@@ -509,6 +515,12 @@ stages:
           Write-Host "Build reason: $buildReason | Official: $isOfficial"
           Write-Host "##vso[task.setvariable variable=nugetVersion]$packageVersion"
 
+          $packageContents = if ("${{ parameters.buildOdbcNative }}" -eq "True") {
+            "the mssql-python-rs TDS core and ODBC driver"
+          } else {
+            "the mssql-python-rs TDS core"
+          }
+
           # Create .nuspec
           $nuspecContent = @"
           <?xml version="1.0"?>
@@ -516,7 +528,7 @@ stages:
             <metadata>
               <id>mssql-python-rs-wheels</id>
               <version>$packageVersion</version>
-              <description>Python wheels containing the mssql-python-rs TDS core and ODBC driver. Commit: $shortSha. Build: $(Build.BuildNumber)</description>
+              <description>Python wheels containing $packageContents. Commit: $shortSha. Build: $(Build.BuildNumber)</description>
               <authors>SqlClientDrivers</authors>
             </metadata>
             <files>
