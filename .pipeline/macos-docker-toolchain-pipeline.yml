@@ -34,15 +34,17 @@ schedules:
   always: true
 
 parameters:
-# Normally left empty: the version is derived from what is already published.
+# Normally left at 'auto': the version is derived from what is already published.
 #   PATCH  an upstream docker/colima/lima release, same payload layout
 #   MINOR  the layout changed (PAYLOAD_FORMAT in build-macos-docker-toolchain.py),
 #          so consumers resolving paths into the tree may have to change with it
-# Set this only to force a specific number, e.g. a deliberate 1.0.0.
+# Override with an explicit X.Y.Z only to force a specific number, e.g. a
+# deliberate 1.0.0. A sentinel rather than an empty default because the run
+# panel refuses to queue with a blank string parameter.
 - name: packageVersion
-  displayName: 'Package version override (leave empty to derive it)'
+  displayName: "Package version ('auto' derives it from the feed)"
   type: string
-  default: ''
+  default: 'auto'
 
 - name: forcePublish
   displayName: 'Publish even if nothing changed upstream'

@@ -145,5 +145,29 @@ class NextVersion(unittest.TestCase):
             resolve.next_version("1.0.0-beta", layout_changed=False)
 
 
+class RequestedVersion(unittest.TestCase):
+    def test_the_sentinel_means_derive_it(self):
+        # The pipeline passes 'auto' rather than '' because the run panel
+        # refuses to queue with a blank string parameter.
+        self.assertIsNone(resolve.requested_version("auto"))
+
+    def test_the_sentinel_is_not_case_or_space_sensitive(self):
+        for raw in (" auto ", "AUTO", "Auto"):
+            self.assertIsNone(resolve.requested_version(raw), raw)
+
+    def test_an_empty_value_still_means_derive_it(self):
+        for raw in ("", "   ", None):
+            self.assertIsNone(resolve.requested_version(raw), repr(raw))
+
+    def test_an_explicit_version_is_taken_as_given(self):
+        self.assertEqual(resolve.requested_version(" 1.0.0 "), "1.0.0")
+
+    def test_a_typo_is_refused_rather_than_published(self):
+        # Packages are immutable, so a bad override burns the number.
+        for raw in ("1.0", "v1.0.0", "1.0.0-rc1", "latest"):
+            with self.assertRaises(RuntimeError, msg=raw):
+                resolve.requested_version(raw)
+
+
 if __name__ == "__main__":
     unittest.main()

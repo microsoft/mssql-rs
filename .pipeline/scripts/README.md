@@ -174,9 +174,11 @@ given version always means the same build produced all of them — worth more th
 skipping the occasional unchanged republish.
 
 **Usage:** `resolve-toolchain-version.py --org <url> --feed <project/feed> --arch
-x86_64 --arch arm64 --macos-major 14 [--version X.Y.Z] [--force]`, reading
+x86_64 --arch arm64 --macos-major 14 [--version X.Y.Z|auto] [--force]`, reading
 `SYSTEM_ACCESSTOKEN`; emits `shouldPublish`, `packageVersion` and
-`identity_<arch>` as pipeline output variables. `--describe <manifest.json>
+`identity_<arch>` as pipeline output variables. `--version auto` is the normal
+case — a sentinel rather than an empty string because the run panel refuses to
+queue with a blank string parameter. `--describe <manifest.json>
 --expect-identity <id>` is the publish side: it composes the description and
 fails if the built payload disagrees with what was resolved, which means a
 release landed mid-run. Covered by `test_resolve_toolchain_version.py`.
