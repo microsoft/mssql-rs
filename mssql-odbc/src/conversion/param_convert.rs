@@ -1051,9 +1051,15 @@ fn convert_datetime_sql(
 
     match sql_type {
         SQL_TYPE_DATE => {
-            // Unreachable through the API: the conversion matrix has no
-            // `SQL_C_TYPE_TIMESTAMP` -> `SQL_TYPE_DATE` row, so no binding can
-            // carry a time here yet (AB#47790). msodbcsql accepts the pairing.
+            // A character literal reaches this arm as of AB#47851: the matrix
+            // now has `SQL_C_CHAR`/`SQL_C_WCHAR` -> `SQL_TYPE_DATE`, so
+            // `2024-05-20 12:00:00` arrives here carrying a time and must be
+            // rejected rather than silently truncated to the date. The state
+            // is measured against retail on the compare leg
+            // (`ACharLiteralStillObeysTheTargetRules`,
+            // `FoldingAnOffsetCanMakeADateTargetOverflow`), not just asserted
+            // here. Still no `SQL_C_TYPE_TIMESTAMP` -> `SQL_TYPE_DATE` row,
+            // which msodbcsql accepts and this driver does not (AB#47790).
             if p.has_time && ((p.hour | p.minute | p.second) != 0 || p.fraction_ns != 0) {
                 return Err(truncated);
             }
