@@ -1278,7 +1278,7 @@ mod variant_tests {
 
     use crate::{
         datatypes::{
-            sql_string::SqlString,
+            sql_string::{EncodingType, SqlString},
             sqldatatypes::TdsDataType,
             sqltypes::{SQL_VARIANT_MAX_LENGTH, SqlType},
         },
@@ -1363,6 +1363,214 @@ mod variant_tests {
         assert_eq!(cursor.get_u32_le(), 13);
         assert_eq!(cursor.get_u8(), TdsDataType::NVarChar as u8); // base type
         assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+    }
+
+    /// `DelayedSet` means "encoding not yet known", not "narrow": `mssql-js`
+    /// uses it for both widths (`ffidatatypes.rs:435-443` for `NVarchar`,
+    /// `:449` for `Varchar`), so no encoding-tag heuristic can be right for it
+    /// in general. Landing it in the wide arm here is the defensible default
+    /// regardless: `mssql-js` rejects `SsVariant` outright today, so neither
+    /// pairing is reachable through this function, and `serialize_string`'s
+    /// NVARCHAR arm already honours a pre-encoded wide payload unchanged via
+    /// `as_raw_wire_bytes`, so treating it as wide risks nothing a real
+    /// caller could hit. Classifying it as narrow by negating `Utf16` rather
+    /// than matching the encodings that are actually narrow would instead
+    /// misclassify it as narrow every time, retagging a wide payload
+    /// `BigVarChar` without transcoding it -- corrupting the value on the
+    /// wire while changing not one data byte, which a length-based check
+    /// would not catch. Regression test for that classification bug.
+    #[tokio::test]
+    async fn variant_delayedset_string_is_treated_as_wide() {
+        let wide_hi: Vec<u8> = "Hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let val = SqlString::new(wide_hi.clone(), EncodingType::DelayedSet);
+        let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::NVarchar(
+            Some(val),
+            10,
+        ))))
+        .await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // Same shape as the plain-UTF-16 "Hi" case above: total_length = 2 + 7(prop) + 4(data) = 13
+        assert_eq!(cursor.get_u32_le(), 13);
+        assert_eq!(cursor.get_u8(), TdsDataType::NVarChar as u8); // base type stays wide, not BigVarChar
+        assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 4); // max_length: the 4 raw UTF-16LE bytes
+        assert_eq!(cursor.chunk(), &wide_hi[..]); // payload is untouched, not re-transcoded
+    }
+
+    /// `LcidBased` bytes are already encoded to the collation's codepage --
+    /// typically by the fetch/decode path reading a non-UTF8-collation narrow
+    /// variant column back (`decode_seven_propbyte_variant`) -- so
+    /// `resolve_narrow_wire_bytes` must pass them through unchanged via its
+    /// `as_raw_wire_bytes` fast path rather than re-encoding. Covers that
+    /// fast path directly: `DelayedSet` no longer reaches it after the fix
+    /// above, so `LcidBased` is the only remaining narrow encoding that does.
+    #[tokio::test]
+    async fn variant_lcidbased_string_bytes_pass_through_unchanged() {
+        let collation = SqlCollation {
+            info: 0x00000409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        // Pre-encoded Windows-1252 bytes for "café": the trailing 'é' is
+        // already the single byte 0xE9, not the two-byte UTF-8 sequence.
+        let val = SqlString::new(
+            vec![b'c', b'a', b'f', 0xE9],
+            EncodingType::LcidBased(collation),
+        );
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        assert_eq!(cursor.get_u32_le(), 13); // total_length = 2 + 7(prop) + 4(data)
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8); // narrow base type
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 4); // max_length: the 4 raw bytes, unchanged
+        assert_eq!(cursor.chunk(), &[b'c', b'a', b'f', 0xE9]); // pass-through, not re-transcoded
+    }
+
+    #[tokio::test]
+    async fn variant_varchar_writes_narrow_base_type_and_length() {
+        let val = SqlString::new(b"Hi".to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // "Hi" narrow = 2 bytes (vs. 4 bytes for the nvarchar/UTF-16 case above).
+        // total_length = 2 + 7(prop) + 2(data) = 11
+        assert_eq!(cursor.get_u32_le(), 11);
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8); // base type: AB#47800
+        assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 2); // max_length: 2 narrow bytes, not halved as if wide
+        assert_eq!(cursor.chunk(), b"Hi");
+    }
+
+    /// The one narrow shape the tests above don't reach: an empty payload.
+    /// `MaxLength = 0` on a `BIGVARCHARTYPE` follows directly from the same
+    /// `wMaxLen = cbSrc` rule msodbcsql uses (`odbc/sqlcmisc.cpp:7594`), and
+    /// `main` already declared 0 the same way for an empty *wide* payload, but
+    /// no existing test -- unit or the two un-skipped E2E cases -- exercises
+    /// it on the narrow leg.
+    #[tokio::test]
+    async fn variant_varchar_empty_payload_declares_zero_length() {
+        let val = SqlString::new(Vec::new(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        assert_eq!(cursor.get_u32_le(), 9); // total_length = 2 + 7(prop) + 0(data)
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8);
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409);
+        assert_eq!(cursor.get_u8(), 52);
+        assert_eq!(cursor.get_u16_le(), 0); // max_length = 0, not "unstated"/max
+        assert!(cursor.chunk().is_empty());
+    }
+
+    /// A narrow value's transcoded byte length can exceed its declared `n` in
+    /// ways the ODBC-side bind-time clamp (`variant_column_size` /
+    /// `trim_blank_overflow` in `mssql-odbc`) does not catch, because that
+    /// clamp measures source units, not the collation-transcoded result --
+    /// the same pre-existing gap `trim_blank_overflow` already documents for
+    /// plain `varchar` (AB#47584), now also reachable through `sql_variant`.
+    /// The wire-level 8000-byte cap this function enforces is still the
+    /// backstop that refuses an over-large narrow variant -- just later, and
+    /// with a different error shape (`UsageError` here vs. ODBC's `22001` at
+    /// bind for the wide leg, where `SQL_PREC_NCHAR * 2` is an exact byte
+    /// bound and the bind-time clamp alone suffices).
+    ///
+    /// 2000 repetitions of U+65E5 (3 UTF-8 bytes each = 6000 source bytes,
+    /// under the 8000-byte declared ceiling) each expand to an 8-byte NCR
+    /// escape (`&#26085;`) under a non-UTF-8 collation that cannot represent
+    /// it, totalling 16000 bytes -- twice the cap. Pinned so this drifts only
+    /// on a deliberate change, per the PR discussion.
+    #[tokio::test]
+    async fn variant_varchar_expansion_past_the_byte_cap_is_a_usage_error() {
+        let val = SqlString::new("日".repeat(2000).into_bytes(), EncodingType::Utf8);
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(
+            PacketType::TabularResult,
+            &mut mock_reader_writer,
+            None,
+            None,
+        );
+        let result = SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
+            .serialize(&mut packet_writer, &default_collation(), None)
+            .await;
+        match result {
+            Err(Error::UsageError(msg)) => assert!(
+                msg.contains("16000"),
+                "expected the message to cite the expanded 16000-byte size, got: {msg}"
+            ),
+            other => panic!("expected UsageError, got {other:?}"),
+        }
+    }
+
+    /// The robust fix for AB#47800: a narrow value whose source (UTF-8) and
+    /// wire (collation codepage) byte lengths differ must declare -- and
+    /// send -- the *wire* length, resolved once and reused everywhere,
+    /// rather than a source length recomputed independently in each place
+    /// that needs a length (which is how the original bug manifested: a
+    /// declared length that disagreed with the bytes actually written).
+    ///
+    /// "café" is 5 UTF-8 bytes (the trailing 'é' is 0xC3 0xA9) but 4 bytes
+    /// under Windows-1252 (LCID 0x0409, this test's collation), where 'é' is
+    /// the single byte 0xE9.
+    #[tokio::test]
+    async fn variant_varchar_declares_the_transcoded_length_not_the_source_length() {
+        let val = SqlString::new("café".as_bytes().to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // total_length = 2 + 7(prop) + 4(data): 4 transcoded bytes, not the 5-byte UTF-8 source.
+        assert_eq!(cursor.get_u32_le(), 13);
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8);
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409);
+        assert_eq!(cursor.get_u8(), 52);
+        assert_eq!(cursor.get_u16_le(), 4); // declared length matches the transcoded bytes
+        assert_eq!(cursor.chunk(), &[b'c', b'a', b'f', 0xE9]); // Windows-1252, not UTF-8
+    }
+
+    /// End-to-end proof for the AB#47800 fix: what the serializer now writes
+    /// for a transcoded narrow value is read back correctly by the existing,
+    /// separately-tested sql_variant decoder -- not just shaped the way a
+    /// hand-written byte assertion expects.
+    #[tokio::test]
+    async fn variant_varchar_round_trips_through_the_decoder() {
+        use crate::datatypes::decoder::GenericDecoder;
+
+        let val = SqlString::new("café".as_bytes().to_vec(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        // Skip the RPC TYPE_INFO preamble (1-byte type + 4-byte max length)
+        // this crate writes ahead of every SSVARIANT_INSTANCE.
+        let variant_bytes = &bytes[5..];
+
+        let decoder = GenericDecoder::default();
+        let (base, value, used) = decoder
+            .try_decode_buffered_variant(variant_bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(base, Some(TdsDataType::BigVarChar));
+        assert_eq!(used, variant_bytes.len());
+        let crate::datatypes::column_values::ColumnValues::String(decoded) = value else {
+            panic!("expected string variant");
+        };
+        assert_eq!(decoded.to_utf8_string(), "café");
     }
 
     #[tokio::test]
