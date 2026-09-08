@@ -1365,6 +1365,38 @@ mod variant_tests {
         assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
     }
 
+    /// `DelayedSet` means "encoding not yet known", not "narrow": the bytes
+    /// carried today are always pre-encoded UTF-16LE (`mssql-js` pairs exactly
+    /// `NVarchar` + `DelayedSet`, `ffidatatypes.rs:449`), and
+    /// `serialize_string`'s NVARCHAR arm already honours that via
+    /// `as_raw_wire_bytes`. Classifying it as narrow by negating `Utf16`
+    /// rather than matching the encodings that are actually narrow would
+    /// retag this same UTF-16LE payload `BigVarChar` without transcoding it
+    /// -- corrupting the value on the wire while changing not one data byte,
+    /// which a length-based check would not catch. Regression test for that
+    /// classification bug.
+    #[tokio::test]
+    async fn variant_delayedset_string_is_treated_as_wide() {
+        let wide_hi: Vec<u8> = "Hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let val = SqlString::new(wide_hi.clone(), EncodingType::DelayedSet);
+        let bytes = serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::NVarchar(
+            Some(val),
+            10,
+        ))))
+        .await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        // Same shape as the plain-UTF-16 "Hi" case above: total_length = 2 + 7(prop) + 4(data) = 13
+        assert_eq!(cursor.get_u32_le(), 13);
+        assert_eq!(cursor.get_u8(), TdsDataType::NVarChar as u8); // base type stays wide, not BigVarChar
+        assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 4); // max_length: the 4 raw UTF-16LE bytes
+        assert_eq!(cursor.chunk(), &wide_hi[..]); // payload is untouched, not re-transcoded
+    }
+
     #[tokio::test]
     async fn variant_varchar_writes_narrow_base_type_and_length() {
         let val = SqlString::new(b"Hi".to_vec(), EncodingType::Utf8);
