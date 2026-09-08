@@ -41,6 +41,20 @@ const CHAR: u8 = TdsDataType::BigChar as u8; // 0xAF
 const TEXT: u8 = TdsDataType::Text as u8; // 0x23
 const SQL_VARIANT: u8 = TdsDataType::SsVariant as u8; // 0x62
 
+/// Collation a `sql_variant`'s inner string declares and is encoded under
+/// when no collation is otherwise known: US English / SQL_Latin1_General_CP1_CI_AS
+/// (LCID 1033). Shared by [`TdsValueSerializer::write_type_info_bytes`] and
+/// [`TdsValueSerializer::resolve_narrow_wire_bytes`] so the declared
+/// `VARIANT_PROPERTIES` collation and the collation the narrow payload is
+/// actually transcoded under can never independently drift apart in this
+/// no-collation case.
+const DEFAULT_VARIANT_COLLATION: SqlCollation = SqlCollation {
+    info: 0x00000409, // LCID 1033 (US English)
+    lcid_language_id: 0x0409,
+    col_flags: 0,
+    sort_id: 52, // SQL_Latin1_General_CP1_CI_AS
+};
+
 // TDS type byte constant for binary types
 const IMAGE: u8 = TdsDataType::Image as u8; // 0x22
 
@@ -1569,11 +1583,10 @@ impl TdsValueSerializer {
     /// Deliberately does not special-case a UTF-8-aware collation the way
     /// [`encode_narrow`] does -- changing that here would alter
     /// `serialize_string`'s already-shipped behaviour, which is out of scope;
-    /// tracked separately under AB#47590. [`Self::resolve_narrow_wire_bytes`]
-    /// -- the only other caller -- uses this solely for its own no-collation
-    /// fallback and calls [`encode_narrow`] directly whenever a collation is
-    /// known, since the `sql_variant` narrow path is new and has no such
-    /// behaviour to preserve.
+    /// tracked separately under AB#47590. This is `serialize_string`'s helper
+    /// only: [`Self::resolve_narrow_wire_bytes`] always resolves a concrete
+    /// collation (see [`DEFAULT_VARIANT_COLLATION`]) and calls [`encode_narrow`]
+    /// directly, so it never reaches this function's own no-collation case.
     fn encode_narrow_for_wire(text: &str, collation: Option<SqlCollation>) -> Vec<u8> {
         let Some(collation) = collation else {
             return text
@@ -1623,15 +1636,18 @@ impl TdsValueSerializer {
     /// computed from the pre-transcoding source, bytes written from a
     /// separate re-encode).
     ///
-    /// Unlike [`Self::encode_narrow_for_wire`] -- kept unchanged so as not to
-    /// alter `Self::serialize_string`'s already-shipped `VARCHAR | CHAR |
-    /// TEXT` behaviour -- this calls the public, collation-aware
-    /// [`encode_narrow`] whenever a collation is known, so a UTF-8-aware
-    /// collation gets correct UTF-8 wire bytes here. This variant path is new
-    /// with this PR, so there is no pre-existing behaviour on a
-    /// UTF-8-collation database to preserve. Falls back to
-    /// `encode_narrow_for_wire`'s Latin-1-like mapping only when no collation
-    /// is known at all, matching that function's own no-collation case.
+    /// Always resolves to a concrete collation -- [`DEFAULT_VARIANT_COLLATION`]
+    /// when none is known -- and calls the public, collation-aware
+    /// [`encode_narrow`], so a UTF-8-aware collation gets correct UTF-8 wire
+    /// bytes here (this variant path is new with this PR, so there is no
+    /// pre-existing behaviour on a UTF-8-collation database to preserve), and
+    /// the no-collation case encodes under the exact same default
+    /// [`write_type_info_bytes`] declares, rather than the different
+    /// Latin-1-like mapping [`Self::encode_narrow_for_wire`] uses for its own
+    /// no-collation case -- unreachable today (every `ColumnValues::String`
+    /// inside a `sql_variant` already carries `Some(collation)`, see
+    /// `sqltypes.rs`'s `to_column_value_and_context` arms), but not by
+    /// anything this layer enforces on its own.
     fn resolve_narrow_wire_bytes(
         value: &SqlString,
         collation: Option<SqlCollation>,
@@ -1640,11 +1656,8 @@ impl TdsValueSerializer {
             return Cow::Borrowed(raw);
         }
         let text = value.to_utf8_string();
-        let bytes = match collation {
-            Some(collation) => encode_narrow(&text, collation),
-            None => Self::encode_narrow_for_wire(&text, None),
-        };
-        Cow::Owned(bytes)
+        let collation = collation.unwrap_or(DEFAULT_VARIANT_COLLATION);
+        Cow::Owned(encode_narrow(&text, collation))
     }
 
     /// Helper to serialize a UTF-8 string as UTF-16LE for NVARCHAR/NCHAR types.
@@ -1870,14 +1883,19 @@ impl TdsValueSerializer {
         // AB#47800 (declared length computed from the pre-transcoding source,
         // actual bytes written from a separate, later re-encode).
         //
-        // Matched by encoding, not by negating Utf16: DelayedSet bytes are
-        // already pre-encoded UTF-16LE wire bytes for a base type this layer
-        // cannot see (mssql-js pairs it with NVarchar, ffidatatypes.rs:449;
-        // serialize_string's NVARCHAR arm already honours it via
-        // as_raw_wire_bytes). `!matches!(.., Utf16)` would misclassify that
-        // wide payload as narrow and retag it BigVarChar without transcoding
-        // it, corrupting the value on the wire without changing a single data
-        // byte. get_variant_base_type below must stay in lockstep with this.
+        // Matched by encoding, not by negating Utf16: DelayedSet means
+        // "encoding not yet known", not "narrow" -- mssql-js uses it for both
+        // widths (ffidatatypes.rs:435-443 for NVarchar, :449 for Varchar), so
+        // no encoding-tag heuristic can be right for it in general. Landing it
+        // in the wide arm here is the defensible default regardless: mssql-js
+        // rejects SsVariant outright today, so neither pairing is reachable
+        // through this function, and NVARCHAR's arm already honours
+        // as_raw_wire_bytes unchanged, so treating it as wide risks nothing a
+        // real caller could hit. `!matches!(.., Utf16)` would instead
+        // misclassify it as narrow every time and retag it BigVarChar without
+        // transcoding it, corrupting the value on the wire without changing a
+        // single data byte, which is strictly worse. get_variant_base_type
+        // below must stay in lockstep with this.
         let resolved_narrow: Option<Cow<'_, [u8]>> = match value {
             ColumnValues::String(s)
                 if matches!(
@@ -2164,15 +2182,11 @@ impl TdsValueSerializer {
             // narrow (BigVarChar) and wide (NVarChar): both declare the same
             // shape, only the byte contents -- and thus max_length -- differ.
             x if x == TdsDataType::NVarChar as u8 || x == TdsDataType::BigVarChar as u8 => {
-                // Get collation from context or use SQL_Latin1_General_CP1_CI_AS as default
-                // This is the most common SQL Server collation for US English
-                // TODO: Check which collation ODBC/.NET uses by default
-                let collation = ctx.collation.unwrap_or(SqlCollation {
-                    info: 0x00000409, // LCID 1033 (US English)
-                    lcid_language_id: 0x0409,
-                    col_flags: 0,
-                    sort_id: 52, // SQL_Latin1_General_CP1_CI_AS
-                });
+                // Falls back to DEFAULT_VARIANT_COLLATION when the context
+                // carries none, shared with resolve_narrow_wire_bytes's own
+                // no-collation case so the declared collation and the one the
+                // narrow payload is actually encoded under cannot disagree.
+                let collation = ctx.collation.unwrap_or(DEFAULT_VARIANT_COLLATION);
 
                 // Write collation (5 bytes): info (4 bytes) + sort_id (1 byte)
                 writer.write_u32_async(collation.info).await?;
@@ -2254,10 +2268,12 @@ impl TdsValueSerializer {
             // String types: narrow (VARCHAR) and wide (NVARCHAR) both arrive as
             // ColumnValues::String; only SqlString's encoding says which one
             // this is. Matched by encoding, not by negating Utf16: DelayedSet
-            // carries pre-encoded UTF-16LE wire bytes (see the matching guard
-            // in serialize_as_variant's resolved_narrow), so it must land in
-            // the wide arm alongside Utf16, not be swept into narrow by a
-            // catch-all `else`. Keep this in lockstep with that guard.
+            // means "encoding not yet known" (mssql-js uses it for both
+            // widths), so it lands in the wide arm alongside Utf16 as the
+            // defensible default rather than being swept into narrow by a
+            // catch-all `else` -- see the matching guard in
+            // serialize_as_variant's resolved_narrow for why. Keep this in
+            // lockstep with that guard.
             ColumnValues::String(s) => {
                 if matches!(
                     s.encoding_type(),
@@ -3893,6 +3909,38 @@ mod serializer_tests {
         assert_eq!(p[5], 0x07); // prop_len = 7
         assert_eq!(u16::from_le_bytes([p[11], p[12]]), 5); // max_length = 5 UTF-8 bytes
         assert_eq!(&p[13..18], "café".as_bytes());
+    }
+
+    /// The collation defaulted when none is known must be the same one used
+    /// to declare `VARIANT_PROPERTIES` and the one the narrow payload is
+    /// actually encoded under -- these were two independently-chosen
+    /// "no collation" defaults before (`write_type_info_bytes`'s CP1252
+    /// literal vs. `encode_narrow_for_wire`'s plain Latin-1-like mapping),
+    /// unreachable in practice (every `ColumnValues::String` inside a
+    /// `sql_variant` already carries a collation by the time it gets here,
+    /// see `sqltypes.rs`), but not guaranteed to agree by anything in this
+    /// file alone. 'é' (U+00E9) needs CP1252 -- not a Latin-1 pass-through --
+    /// to prove the *same* collation both declared it and encoded it.
+    #[test]
+    fn variant_varchar_no_collation_uses_the_same_default_for_declaration_and_encoding() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 8016;
+        ctx.collation = None;
+        let val = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            "é".as_bytes().to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        block_on(TdsValueSerializer::serialize_value(&mut w, &val, &ctx)).unwrap();
+        let p = payload(&w);
+        assert_eq!(&p[0..4], &10u32.to_le_bytes()); // total_length = 2 + 7(prop) + 1(data)
+        assert_eq!(p[4], 0xA7); // BIGVARCHAR
+        assert_eq!(p[5], 0x07);
+        assert_eq!(u32::from_le_bytes([p[6], p[7], p[8], p[9]]), 0x00000409); // collation.info
+        assert_eq!(p[10], 52); // collation.sort_id
+        assert_eq!(u16::from_le_bytes([p[11], p[12]]), 1); // max_length = 1 encoded byte
+        assert_eq!(p[13], 0xE9); // CP1252 'é', not a Latin-1-fallback '?'
     }
 
     /// A TDS type the variant writers do not handle must be an error, never a

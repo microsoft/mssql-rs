@@ -1365,16 +1365,20 @@ mod variant_tests {
         assert_eq!(cursor.get_u8(), 7); // prop_len = 7 (collation[5] + max_len[2])
     }
 
-    /// `DelayedSet` means "encoding not yet known", not "narrow": the bytes
-    /// carried today are always pre-encoded UTF-16LE (`mssql-js` pairs exactly
-    /// `NVarchar` + `DelayedSet`, `ffidatatypes.rs:449`), and
-    /// `serialize_string`'s NVARCHAR arm already honours that via
-    /// `as_raw_wire_bytes`. Classifying it as narrow by negating `Utf16`
-    /// rather than matching the encodings that are actually narrow would
-    /// retag this same UTF-16LE payload `BigVarChar` without transcoding it
-    /// -- corrupting the value on the wire while changing not one data byte,
-    /// which a length-based check would not catch. Regression test for that
-    /// classification bug.
+    /// `DelayedSet` means "encoding not yet known", not "narrow": `mssql-js`
+    /// uses it for both widths (`ffidatatypes.rs:435-443` for `NVarchar`,
+    /// `:449` for `Varchar`), so no encoding-tag heuristic can be right for it
+    /// in general. Landing it in the wide arm here is the defensible default
+    /// regardless: `mssql-js` rejects `SsVariant` outright today, so neither
+    /// pairing is reachable through this function, and `serialize_string`'s
+    /// NVARCHAR arm already honours a pre-encoded wide payload unchanged via
+    /// `as_raw_wire_bytes`, so treating it as wide risks nothing a real
+    /// caller could hit. Classifying it as narrow by negating `Utf16` rather
+    /// than matching the encodings that are actually narrow would instead
+    /// misclassify it as narrow every time, retagging a wide payload
+    /// `BigVarChar` without transcoding it -- corrupting the value on the
+    /// wire while changing not one data byte, which a length-based check
+    /// would not catch. Regression test for that classification bug.
     #[tokio::test]
     async fn variant_delayedset_string_is_treated_as_wide() {
         let wide_hi: Vec<u8> = "Hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -1449,6 +1453,68 @@ mod variant_tests {
         assert_eq!(cursor.get_u8(), 52); // collation.sort_id
         assert_eq!(cursor.get_u16_le(), 2); // max_length: 2 narrow bytes, not halved as if wide
         assert_eq!(cursor.chunk(), b"Hi");
+    }
+
+    /// The one narrow shape the tests above don't reach: an empty payload.
+    /// `MaxLength = 0` on a `BIGVARCHARTYPE` follows directly from the same
+    /// `wMaxLen = cbSrc` rule msodbcsql uses (`odbc/sqlcmisc.cpp:7594`), and
+    /// `main` already declared 0 the same way for an empty *wide* payload, but
+    /// no existing test -- unit or the two un-skipped E2E cases -- exercises
+    /// it on the narrow leg.
+    #[tokio::test]
+    async fn variant_varchar_empty_payload_declares_zero_length() {
+        let val = SqlString::new(Vec::new(), EncodingType::Utf8);
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        assert_eq!(cursor.get_u32_le(), 9); // total_length = 2 + 7(prop) + 0(data)
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8);
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409);
+        assert_eq!(cursor.get_u8(), 52);
+        assert_eq!(cursor.get_u16_le(), 0); // max_length = 0, not "unstated"/max
+        assert!(cursor.chunk().is_empty());
+    }
+
+    /// A narrow value's transcoded byte length can exceed its declared `n` in
+    /// ways the ODBC-side bind-time clamp (`variant_column_size` /
+    /// `trim_blank_overflow` in `mssql-odbc`) does not catch, because that
+    /// clamp measures source units, not the collation-transcoded result --
+    /// the same pre-existing gap `trim_blank_overflow` already documents for
+    /// plain `varchar` (AB#47584), now also reachable through `sql_variant`.
+    /// The wire-level 8000-byte cap this function enforces is still the
+    /// backstop that refuses an over-large narrow variant -- just later, and
+    /// with a different error shape (`UsageError` here vs. ODBC's `22001` at
+    /// bind for the wide leg, where `SQL_PREC_NCHAR * 2` is an exact byte
+    /// bound and the bind-time clamp alone suffices).
+    ///
+    /// 2000 repetitions of U+65E5 (3 UTF-8 bytes each = 6000 source bytes,
+    /// under the 8000-byte declared ceiling) each expand to an 8-byte NCR
+    /// escape (`&#26085;`) under a non-UTF-8 collation that cannot represent
+    /// it, totalling 16000 bytes -- twice the cap. Pinned so this drifts only
+    /// on a deliberate change, per the PR discussion.
+    #[tokio::test]
+    async fn variant_varchar_expansion_past_the_byte_cap_is_a_usage_error() {
+        let val = SqlString::new("日".repeat(2000).into_bytes(), EncodingType::Utf8);
+        let mut mock_reader_writer = MockNetworkWriter::new(4096);
+        let mut packet_writer = PacketWriter::new(
+            PacketType::TabularResult,
+            &mut mock_reader_writer,
+            None,
+            None,
+        );
+        let result = SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
+            .serialize(&mut packet_writer, &default_collation(), None)
+            .await;
+        match result {
+            Err(Error::UsageError(msg)) => assert!(
+                msg.contains("16000"),
+                "expected the message to cite the expanded 16000-byte size, got: {msg}"
+            ),
+            other => panic!("expected UsageError, got {other:?}"),
+        }
     }
 
     /// The robust fix for AB#47800: a narrow value whose source (UTF-8) and
