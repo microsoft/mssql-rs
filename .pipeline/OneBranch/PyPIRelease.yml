@@ -14,7 +14,7 @@
 #                                                                               #
 # Manual trigger only. `publishToPyPI` defaults to false: a default run is a    #
 # dry run that verifies and stages the committed sdist with NO publish. Flip it  #
-# to true only for a deliberate publish from `main`.                             #
+# to true only for a deliberate publish from `stable`.                           #
 #                                                                               #
 # Reuses the shared 'ESRP Federated Creds (AME)' variable group (same AKV cert  #
 # / ESRP creds mssql-python publishes with).                                    #
@@ -91,10 +91,10 @@ extends:
 
         - ${{ if eq(parameters.publishToPyPI, true) }}:
           - pwsh: |
-              if ("$(Build.SourceBranch)" -ne 'refs/heads/main') {
-                throw 'PyPI publishing is allowed only from refs/heads/main.'
+              if ("$(Build.SourceBranch)" -ne 'refs/heads/stable') {
+                throw 'PyPI publishing is allowed only from refs/heads/stable.'
               }
-            displayName: 'Require main branch for publish'
+            displayName: 'Require stable branch for publish'
 
         - pwsh: |
             $ErrorActionPreference = 'Stop'
