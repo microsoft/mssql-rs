@@ -814,6 +814,49 @@ def test_cancelled_fetchone_resynchronizes_connection(client_context):
 
 
 @pytest.mark.integration
+def test_fetchone_cancellation_before_publication_resynchronizes_connection(
+    client_context,
+):
+    """Cancellation after row decoding wins before fetch state is published."""
+    if not hasattr(mssql_py_core, "_arm_fetch_publication_pause"):
+        pytest.skip("requires a debug build with fetch publication test hooks")
+
+    async def run():
+        conn = await connect(client_context)
+        task = None
+        try:
+            cursor = conn.cursor()
+            await cursor.execute(
+                "SELECT value FROM (VALUES (1), (2)) AS source(value) ORDER BY value",
+                use_prepare=False,
+            )
+
+            paused = mssql_py_core._arm_fetch_publication_pause()
+            task = asyncio.ensure_future(cursor.fetchone())
+            await asyncio.wait_for(paused, timeout=5)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            mssql_py_core._release_fetch_publication_pause()
+
+            probe = conn.cursor()
+            await execute_after_cancellation_settles(probe, "SELECT 3")
+            assert await probe.fetchone() == (3,)
+        finally:
+            mssql_py_core._release_fetch_publication_pause()
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            await conn.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_nextset_surfaces_statement_without_rows(client_context):
     async def run():
         conn = await connect(client_context)

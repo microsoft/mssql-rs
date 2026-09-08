@@ -4217,7 +4217,13 @@ impl TdsClient {
         settlement: crate::connection::transport::network_transport::AttentionSettlement,
     ) -> bool {
         if settlement.overflowed {
-            warn!("ATTENTION settlement state exceeded its retention limit");
+            // Replaying only a prefix of ENVCHANGE/SESSIONSTATE could expose
+            // client state that no longer matches the server. Fail closed even
+            // though the wire itself reached DONE_ATTN.
+            warn!(
+                retained_tokens = settlement.retained_token_count(),
+                "ATTENTION settlement state exceeded its retention limit"
+            );
             self.transport.mark_known_dead();
             return false;
         }

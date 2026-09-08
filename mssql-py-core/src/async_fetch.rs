@@ -17,6 +17,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use tokio::sync::Mutex;
+#[cfg(debug_assertions)]
+use tokio::sync::oneshot;
 use tracing::instrument::WithSubscriber;
 
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
@@ -30,8 +32,91 @@ use crate::row_writer::PyRowWriter;
 
 const FETCH_YIELD_INTERVAL: usize = 256;
 const LIST_MATERIALIZE_CHUNK_SIZE: usize = 256;
-// Keep in sync with mssql-tds's `ATTENTION_TIMEOUT_SECONDS`.
+// Keep in sync with mssql-tds's shared five-second send/parser/drain budget.
 const ATTENTION_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(debug_assertions)]
+struct FetchPublicationPause {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(debug_assertions)]
+struct FetchPublicationHook {
+    pause: Option<FetchPublicationPause>,
+    release: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(debug_assertions)]
+static FETCH_PUBLICATION_HOOK: StdMutex<FetchPublicationHook> =
+    StdMutex::new(FetchPublicationHook {
+        pause: None,
+        release: None,
+    });
+
+#[cfg(debug_assertions)]
+fn lock_fetch_publication_hook() -> StdMutexGuard<'static, FetchPublicationHook> {
+    FETCH_PUBLICATION_HOOK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(debug_assertions)]
+fn arm_fetch_publication_pause() -> PyResult<oneshot::Receiver<()>> {
+    let mut hook = lock_fetch_publication_hook();
+    if hook.pause.is_some() || hook.release.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "Fetch publication pause is already armed",
+        ));
+    }
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    hook.pause = Some(FetchPublicationPause {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    hook.release = Some(release_tx);
+    Ok(entered_rx)
+}
+
+#[cfg(debug_assertions)]
+async fn pause_fetch_publication_if_armed() {
+    let pause = lock_fetch_publication_hook().pause.take();
+    if let Some(FetchPublicationPause { entered, release }) = pause {
+        let _ = entered.send(());
+        let _ = release.await;
+    }
+}
+
+#[cfg(debug_assertions)]
+fn release_fetch_publication_pause() {
+    let (pending_pause, release) = {
+        let mut hook = lock_fetch_publication_hook();
+        (hook.pause.take(), hook.release.take())
+    };
+    drop(pending_pause);
+    if let Some(release) = release {
+        let _ = release.send(());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _arm_fetch_publication_pause<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    let entered = arm_fetch_publication_pause()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        entered.await.map_err(|_| {
+            PyRuntimeError::new_err("Fetch publication pause was released before it was reached")
+        })
+    })
+}
+
+#[cfg(debug_assertions)]
+#[pyfunction]
+pub(crate) fn _release_fetch_publication_pause() {
+    release_fetch_publication_pause();
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
@@ -575,6 +660,10 @@ fn fetch<'py>(
             (result, info_messages, has_open_batch, connection_dead)
         };
         let read_ms = started.elapsed().as_millis();
+        #[cfg(debug_assertions)]
+        if result.is_ok() {
+            pause_fetch_publication_if_armed().await;
+        }
 
         match result {
             Ok(batch) => {
@@ -1098,6 +1187,11 @@ mod tests {
         FetchGuard, MaterializationGuard, map_fetch_error, map_materialization_join_error,
         map_nextset_error,
     };
+    #[cfg(debug_assertions)]
+    use super::{
+        arm_fetch_publication_pause, pause_fetch_publication_if_armed,
+        release_fetch_publication_pause,
+    };
     use crate::async_fetch::BufferedResults;
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, FetchCompletion,
@@ -1120,6 +1214,18 @@ mod tests {
         assert!(rows.is_empty());
         assert!(exhausted);
         assert!(!has_next);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn fetch_publication_test_hook_blocks_until_released() {
+        let entered = arm_fetch_publication_pause().unwrap();
+        let paused = tokio::spawn(pause_fetch_publication_if_armed());
+        entered.await.unwrap();
+
+        assert!(!paused.is_finished());
+        release_fetch_publication_pause();
+        paused.await.unwrap();
     }
 
     #[test]

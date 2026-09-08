@@ -79,6 +79,10 @@ impl AttentionSettlement {
             self.overflowed = true;
         }
     }
+
+    pub(crate) fn retained_token_count(&self) -> usize {
+        self.tokens.len()
+    }
 }
 
 /// Records why a pending parser read stopped before producing its result.
@@ -1689,6 +1693,9 @@ impl NetworkTransport {
                 column_encryption_supported: *enabled,
             },
             ParserContext::None(()) => AttentionDrainContext {
+                // None is reserved for DONE-only responses. Any path that may
+                // encounter COLMETADATA must supply its encryption setting,
+                // which also refreshes this cache before later DONE-only reads.
                 metadata: None,
                 column_encryption_supported: self.column_encryption_supported,
             },
@@ -1697,8 +1704,8 @@ impl NetworkTransport {
 
     /// Advances drain metadata and records client-visible control tokens.
     ///
-    /// Returns true only for DONE_ATTN, the boundary that proves the stream can
-    /// serve another request.
+    /// Returns true only for a final DONE-family ATTN, the boundary that proves
+    /// the stream can serve another request.
     fn apply_attention_token(
         context: &mut AttentionDrainContext,
         settlement: &mut AttentionSettlement,
@@ -1711,19 +1718,19 @@ impl NetworkTransport {
             }
             Tokens::Row(_) => false,
             Tokens::Done(done) => {
-                let acknowledged = done.status.contains(DoneStatus::ATTN);
+                let acknowledged = done.status.contains(DoneStatus::ATTN) && !done.has_more();
                 context.metadata = None;
                 settlement.push(Tokens::Done(done));
                 acknowledged
             }
             Tokens::DoneProc(done) => {
-                let acknowledged = done.status.contains(DoneStatus::ATTN);
+                let acknowledged = done.status.contains(DoneStatus::ATTN) && !done.has_more();
                 context.metadata = None;
                 settlement.push(Tokens::DoneProc(done));
                 acknowledged
             }
             Tokens::DoneInProc(done) => {
-                let acknowledged = done.status.contains(DoneStatus::ATTN);
+                let acknowledged = done.status.contains(DoneStatus::ATTN) && !done.has_more();
                 context.metadata = None;
                 settlement.push(Tokens::DoneInProc(done));
                 acknowledged
@@ -6125,19 +6132,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn doneproc_and_doneinproc_can_acknowledge_attention() {
-        enum ExpectedToken {
-            DoneProc,
-            DoneInProc,
-        }
-
-        for (name, token_type, expected) in [
-            ("DONEPROC", TokenType::DoneProc, ExpectedToken::DoneProc),
-            (
-                "DONEINPROC",
-                TokenType::DoneInProc,
-                ExpectedToken::DoneInProc,
-            ),
+    async fn all_final_done_family_tokens_can_acknowledge_attention() {
+        for (name, token_type) in [
+            ("DONE", TokenType::Done),
+            ("DONEPROC", TokenType::DoneProc),
+            ("DONEINPROC", TokenType::DoneInProc),
         ] {
             let response = done_token_message_with_type(token_type, DoneStatus::ATTN.bits());
             let (mut transport, _written) =
@@ -6148,33 +6147,48 @@ pub(crate) mod tests {
                 transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
             )
             .await
-            .unwrap_or_else(|_| panic!("{name} acknowledgement timed out"));
+            .expect("a final DONE-family acknowledgement timed out");
 
-            assert!(
-                matches!(result, Err(OperationCancelledError(_))),
-                "the caller must still see its cancellation, got {result:?}"
-            );
+            assert!(matches!(result, Err(OperationCancelledError(_))));
             assert!(
                 !is_known_dead(&transport),
                 "{name}_ATTN must leave the connection reusable"
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn done_more_cannot_acknowledge_attention() {
+        for (name, token_type) in [
+            ("DONE", TokenType::Done),
+            ("DONEPROC", TokenType::DoneProc),
+            ("DONEINPROC", TokenType::DoneInProc),
+        ] {
+            let mut response = done_token_message_with_type(
+                token_type,
+                (DoneStatus::ATTN | DoneStatus::MORE).bits(),
+            );
+            response.extend_from_slice(&done_token_message(DoneStatus::ATTN.bits()));
+            let (mut transport, _written) =
+                create_network_transport_with_live_peer_capturing_writes(&response);
+
+            let result = timeout(
+                Duration::from_secs(600),
+                transport.receive_token(&ParserContext::None(()), None, Some(&cancelled_handle())),
+            )
+            .await
+            .expect("the drain stopped at a DONE_MORE token");
+
+            assert!(matches!(result, Err(OperationCancelledError(_))));
+            assert!(!is_known_dead(&transport));
             let settlement = transport
                 .take_attention_settlement()
-                .expect("the acknowledgement must produce settlement state");
-            match expected {
-                ExpectedToken::DoneProc => {
-                    assert!(matches!(
-                        settlement.tokens.as_slice(),
-                        [Tokens::DoneProc(_)]
-                    ));
-                }
-                ExpectedToken::DoneInProc => {
-                    assert!(matches!(
-                        settlement.tokens.as_slice(),
-                        [Tokens::DoneInProc(_)]
-                    ));
-                }
-            }
+                .expect("the final acknowledgement must produce settlement state");
+            assert_eq!(
+                settlement.tokens.len(),
+                2,
+                "{name}_ATTN_MORE terminated the drain early"
+            );
         }
     }
 
@@ -6307,6 +6321,64 @@ pub(crate) mod tests {
         assert!(
             !is_known_dead(&transport),
             "finishing the in-flight row reached DONE_ATTN and preserved the connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attention_timeout_while_draining_after_a_partial_row_retires_the_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let first_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .continuation()
+            .append_byte(TokenType::Row as u8)
+            .append_bytes(&42_i32.to_le_bytes()[..2])
+            .build();
+        let completion_packet = TestPacketBuilder::new(PacketType::TabularResult)
+            .append_bytes(&42_i32.to_le_bytes()[2..])
+            .build();
+        let (client_side, mut peer) = duplex(MAX_BUFFER_SIZE);
+        peer.write_all(&first_packet).await.unwrap();
+        let mut transport = build_duplex_transport(client_side);
+        let row_completed = Arc::new(AtomicBool::new(false));
+        let peer_row_completed = Arc::clone(&row_completed);
+        let peer_task = tokio::spawn(async move {
+            let mut attention = [0_u8; PacketWriter::PACKET_HEADER_SIZE];
+            peer.read_exact(&mut attention).await.unwrap();
+            assert_eq!(attention[0], PacketType::Attention as u8);
+            peer.write_all(&completion_packet).await.unwrap();
+            peer_row_completed.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+        });
+
+        let parent = CancelHandle::new();
+        let child = parent.child_handle();
+        let context = int4_row_context(1);
+        let mut writer = DefaultRowWriter::new(1);
+        let result = {
+            let mut read = std::pin::pin!(transport.receive_row_into(
+                &context,
+                None,
+                Some(&child),
+                ColumnPolicy::DecodeAll,
+                &mut writer,
+            ));
+            let first_poll = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await;
+            assert!(first_poll.is_pending());
+            parent.cancel();
+            timeout(Duration::from_secs(600), read)
+                .await
+                .expect("the shared ATTENTION deadline did not bound the drain")
+        };
+
+        peer_task.abort();
+        assert!(
+            row_completed.load(Ordering::Acquire),
+            "the peer must finish the interrupted row before withholding DONE_ATTN"
+        );
+        assert!(matches!(result, Err(OperationCancelledError(_))));
+        assert!(
+            is_known_dead(&transport),
+            "a mid-drain timeout must retire the unsynchronized connection"
         );
     }
 
