@@ -38,8 +38,13 @@ pub(crate) struct DateTimeParts {
     pub second: u16,
     /// Fractional seconds in nanoseconds.
     pub fraction_ns: u32,
-    /// Declared fractional-seconds scale (0-7) of the source column. Character
-    /// rendering pads to exactly this many digits, matching msodbcsql.
+    /// Fractional-seconds scale. For a fetched value this is the source
+    /// column's declared scale (0-7), which character rendering pads to
+    /// exactly, matching msodbcsql. A value parsed from a literal instead
+    /// carries that literal's own digit count, which
+    /// `parse_time_literal` bounds at 9 rather than 7 -- so do not treat
+    /// this as an index into a 7-digit string. `format_datetime_parts` is
+    /// the only renderer and clamps with `.min(frac.len())`.
     pub scale: u8,
     /// Signed timezone hour component.
     pub tz_hour: i16,
