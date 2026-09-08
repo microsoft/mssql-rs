@@ -1397,6 +1397,41 @@ mod variant_tests {
         assert_eq!(cursor.chunk(), &wide_hi[..]); // payload is untouched, not re-transcoded
     }
 
+    /// `LcidBased` bytes are already encoded to the collation's codepage --
+    /// typically by the fetch/decode path reading a non-UTF8-collation narrow
+    /// variant column back (`decode_seven_propbyte_variant`) -- so
+    /// `resolve_narrow_wire_bytes` must pass them through unchanged via its
+    /// `as_raw_wire_bytes` fast path rather than re-encoding. Covers that
+    /// fast path directly: `DelayedSet` no longer reaches it after the fix
+    /// above, so `LcidBased` is the only remaining narrow encoding that does.
+    #[tokio::test]
+    async fn variant_lcidbased_string_bytes_pass_through_unchanged() {
+        let collation = SqlCollation {
+            info: 0x00000409,
+            lcid_language_id: 0x0409,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        // Pre-encoded Windows-1252 bytes for "café": the trailing 'é' is
+        // already the single byte 0xE9, not the two-byte UTF-8 sequence.
+        let val = SqlString::new(
+            vec![b'c', b'a', b'f', 0xE9],
+            EncodingType::LcidBased(collation),
+        );
+        let bytes =
+            serialize_to_bytes(&SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 10)))).await;
+        let mut cursor = Cursor::new(bytes);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        assert_eq!(cursor.get_u32_le(), 13); // total_length = 2 + 7(prop) + 4(data)
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8); // narrow base type
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0x0000_0409); // collation.info
+        assert_eq!(cursor.get_u8(), 52); // collation.sort_id
+        assert_eq!(cursor.get_u16_le(), 4); // max_length: the 4 raw bytes, unchanged
+        assert_eq!(cursor.chunk(), &[b'c', b'a', b'f', 0xE9]); // pass-through, not re-transcoded
+    }
+
     #[tokio::test]
     async fn variant_varchar_writes_narrow_base_type_and_length() {
         let val = SqlString::new(b"Hi".to_vec(), EncodingType::Utf8);
