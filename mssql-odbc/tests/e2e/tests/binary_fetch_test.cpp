@@ -1,0 +1,235 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// binary_fetch_test.cpp  –  SQL_C_BINARY result delivery (AB#47239).
+//
+// Every expectation here was measured against msodbcsql 18 before being
+// asserted. The indicator rule is the part worth stating: it carries the bytes
+// remaining *before* the call, not the bytes written, so a chunked read sees a
+// decreasing count and the final chunk still reports what it delivered.
+//
+// Binary carries no terminator, so the whole buffer is payload -- which is why
+// these do not reuse the character-target helpers.
+
+#include "odbc_test_fixture.h"
+
+#include <cstring>
+#include <string>
+#include <vector>
+
+class BinaryFetchLiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        Connect();
+    }
+    SQLRETURN ExecDirect(const std::string& sql) {
+        SqlTString s = ODBCTestUtils::ToSqlTStr(sql);
+        return SQLExecDirect(stmt_, const_cast<SQLTCHAR*>(s.c_str()), SQL_NTS);
+    }
+    void FetchOne(const std::string& sql) {
+        ASSERT_SQL_OK(ExecDirect(sql), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Fixed-length binary, whole and chunked.
+// ---------------------------------------------------------------------------
+
+TEST_F(BinaryFetchLiveTest, FixedBinaryDeliversWholeValue) {
+    FetchOne("SELECT CAST(0x010203040506070809 AS BINARY(9))");
+
+    unsigned char buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(9, ind);
+    const unsigned char expected[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    EXPECT_EQ(0, std::memcmp(buf, expected, sizeof(expected)));
+    SQLCloseCursor(stmt_);
+}
+
+// The indicator counts down because it reports what was left before each call,
+// not what the call delivered.
+TEST_F(BinaryFetchLiveTest, FixedBinaryChunksWithARemainingCount) {
+    FetchOne("SELECT CAST(0x010203040506070809 AS BINARY(9))");
+
+    unsigned char buf[4] = {};
+    SQLLEN ind = 0;
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(9, ind) << "bytes remaining before the first call";
+    EXPECT_EQ(0, std::memcmp(buf, "\x01\x02\x03\x04", 4));
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(5, ind);
+    EXPECT_EQ(0, std::memcmp(buf, "\x05\x06\x07\x08", 4));
+
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(1, ind);
+    EXPECT_EQ(0x09, buf[0]);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, EmptyVarbinaryReportsZeroLength) {
+    FetchOne("SELECT CAST(0x AS VARBINARY(20))");
+
+    unsigned char buf[8];
+    std::memset(buf, 0xEE, sizeof(buf));
+    SQLLEN ind = -1;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(0, ind);
+    EXPECT_EQ(0xEE, buf[0]) << "an empty value must not disturb the buffer";
+    SQLCloseCursor(stmt_);
+}
+
+// ---------------------------------------------------------------------------
+// PLP: varbinary(max) and the UDT types, which arrive as a wire stream rather
+// than a materialized value.
+// ---------------------------------------------------------------------------
+
+TEST_F(BinaryFetchLiveTest, VarbinaryMaxDeliversWholeValue) {
+    FetchOne("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10)");
+
+    unsigned char buf[64] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(10, ind);
+    for (int i = 0; i < 10; ++i) EXPECT_EQ(0x41, buf[i]) << "byte " << i;
+    SQLCloseCursor(stmt_);
+}
+
+// The chunked stream is the case that regressed twice while this was built:
+// the first chunk and the resumed chunk are admitted by two separate gates, so
+// a read could start and then be refused half way through.
+TEST_F(BinaryFetchLiveTest, VarbinaryMaxChunksAcrossCalls) {
+    FetchOne("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10)");
+
+    unsigned char buf[4] = {};
+    SQLLEN ind = 0;
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(10, ind);
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(6, ind);
+
+    EXPECT_EQ(SQL_SUCCESS, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_EQ(2, ind);
+    EXPECT_EQ(0x41, buf[0]);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, HierarchyidDeliversItsWireBytes) {
+    FetchOne("SELECT CAST(hierarchyid::Parse('/1/2/') AS hierarchyid)");
+
+    unsigned char buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(2, ind);
+    EXPECT_EQ(0x5B, buf[0]);
+    EXPECT_EQ(0x40, buf[1]);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, GeometryDeliversItsWireBytes) {
+    FetchOne("SELECT geometry::Point(1, 2, 0)");
+
+    unsigned char buf[64] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(22, ind) << "SRID 0 point, well-known binary";
+    SQLCloseCursor(stmt_);
+}
+
+// A character column read as binary yields its wire bytes, not its text.
+TEST_F(BinaryFetchLiveTest, NvarcharAsBinaryYieldsUtf16WireBytes) {
+    FetchOne("SELECT CAST('hi' AS NVARCHAR(10))");
+
+    unsigned char buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(4, ind);
+    const unsigned char expected[4] = {0x68, 0x00, 0x69, 0x00};
+    EXPECT_EQ(0, std::memcmp(buf, expected, sizeof(expected)));
+    SQLCloseCursor(stmt_);
+}
+
+// ---------------------------------------------------------------------------
+// Bound delivery. mssql-python's block fetch binds binary columns, so this is
+// the path its arrow reader drives.
+// ---------------------------------------------------------------------------
+
+TEST_F(BinaryFetchLiveTest, BoundBinaryDeliversWholeValue) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x010203040506070809 AS BINARY(9))"), SQL_HANDLE_STMT,
+                  stmt_);
+
+    unsigned char buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(9, ind);
+    const unsigned char expected[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    EXPECT_EQ(0, std::memcmp(buf, expected, sizeof(expected)));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, BoundBinaryTruncatesWithTheFullLength) {
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x010203040506070809 AS BINARY(9))"), SQL_HANDLE_STMT,
+                  stmt_);
+
+    unsigned char buf[4] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_EQ(9, ind) << "the untruncated length, as the character targets report";
+    EXPECT_EQ(0, std::memcmp(buf, "\x01\x02\x03\x04", 4));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, BoundVarbinaryMaxDeliversWholeValue) {
+    ASSERT_SQL_OK(ExecDirect("SELECT REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 10)"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    unsigned char buf[64] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(10, ind);
+    for (int i = 0; i < 10; ++i) EXPECT_EQ(0x41, buf[i]) << "byte " << i;
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// ---------------------------------------------------------------------------
+// Still deliberately refused. msodbcsql converts the fixed-width kinds to
+// binary, and does so inconsistently -- int and money give wire bytes, date
+// gives the 6-byte SQL_DATE_STRUCT, decimal is refused with 22003. Rather than
+// guess that table, those keep answering HYC00 until each is measured. This
+// pins the boundary so the gap is visible rather than assumed closed.
+// ---------------------------------------------------------------------------
+
+TEST_F(BinaryFetchLiveTest, FixedWidthKindsAreStillRefused) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    FetchOne("SELECT CAST(258 AS INT)");
+
+    unsigned char buf[16] = {};
+    SQLLEN ind = 0;
+    EXPECT_EQ(SQL_ERROR, SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    SQLCloseCursor(stmt_);
+}

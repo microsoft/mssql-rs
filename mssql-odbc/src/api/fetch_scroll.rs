@@ -40,19 +40,19 @@ use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
-    TextError, column_value_to_text, convert_typed_c, is_typed_c_target, utf16le_chunk_to_utf8,
-    widen_into_pending,
+    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, is_typed_c_target,
+    utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
-    SQL_BIND_BY_COLUMN, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE, SQL_C_FLOAT,
-    SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT,
-    SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
-    SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_ERROR,
-    SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL, SQL_NULL_DATA, SQL_ROW_ERROR,
-    SQL_ROW_NOROW, SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SqlDateStruct, SqlGuid, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
-    SqlSsTime2Struct, SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlULen, SqlUSmallInt,
-    SqlWChar,
+    SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE,
+    SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+    SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
+    SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR,
+    SQL_ERROR, SQL_FETCH_NEXT, SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_TOTAL, SQL_NULL_DATA,
+    SQL_ROW_ERROR, SQL_ROW_NOROW, SQL_ROW_SUCCESS, SQL_ROW_SUCCESS_WITH_INFO, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlDateStruct, SqlGuid, SqlHandle, SqlLen, SqlPointer, SqlReturn,
+    SqlSmallInt, SqlSsTime2Struct, SqlSsTimestampoffsetStruct, SqlTimestampStruct, SqlULen,
+    SqlUSmallInt, SqlWChar,
 };
 use crate::api::type_rules::resolve_default_c_type;
 use crate::api::util::{copy_with_nul, write_if_some};
@@ -737,13 +737,10 @@ impl RowWriter for BoundRowWriter<'_> {
 /// the result set also stays unresolved, but never reaches delivery: the fill
 /// loop skips it, matching msodbcsql.
 ///
-/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which bound
-/// delivery does not implement yet (AB#47239), so it fails per row with `HYC00`.
-/// That is pre-existing for an explicit `SQL_C_BINARY` bind; deferred resolution
-/// makes it reachable without the application naming the C type. A CLR UDT now
-/// resolves to `SQL_C_BINARY` too, but its former `SQL_C_CHAR` default was
-/// already unsupported, so the mapping change introduces no fetch regression.
-/// msodbcsql resolves all three identically and delivers the bytes.
+/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, and bound delivery
+/// now writes the bytes (AB#47239), truncating with `01004` when the bound buffer
+/// is shorter than the value. A CLR UDT resolves to `SQL_C_BINARY` too and is
+/// delivered the same way. msodbcsql resolves all three identically.
 ///
 /// A resolved fixed-width target is left unresolved as well when the
 /// application declared a `BufferLength` too small to hold it. `BufferLength`
@@ -1774,8 +1771,7 @@ unsafe fn deliver_bound_plp(
     let slot =
         unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
 
-    // Same text pairings SQLGetData supports. Bound binary delivery remains
-    // tracked separately under AB#47239.
+    // Same pairings SQLGetData supports, binary included (AB#47239).
     let target = binding.target_type;
     let encoding = column_info.wire_encoding;
     let widen_narrow_to_utf16 = target == SQL_C_WCHAR
@@ -1797,6 +1793,8 @@ unsafe fn deliver_bound_plp(
             | (SQL_C_CHAR, PlpEncoding::SingleByteText)
             | (SQL_C_CHAR, PlpEncoding::Utf8Text)
             | (SQL_C_CHAR, PlpEncoding::Utf16Text)
+            // Binary delivers the wire bytes whatever the column holds.
+            | (SQL_C_BINARY, _)
     ) || narrow_decoder.is_some();
     if !compatible {
         // The stream still has to be consumed, or the next column decodes from
@@ -1811,8 +1809,13 @@ unsafe fn deliver_bound_plp(
         target == SQL_C_CHAR && matches!(encoding, PlpEncoding::Utf16Text);
     let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
     let buf_elements = char_buf_elements(target, stride);
-    // Room for the payload, less the terminator the copy always writes.
-    let capacity_elements = buf_elements.saturating_sub(1);
+    // Room for the payload. Character targets always write a terminator; binary
+    // is not a string, so the whole slot is payload.
+    let capacity_elements = if target == SQL_C_BINARY {
+        stride
+    } else {
+        buf_elements.saturating_sub(1)
+    };
 
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut out_units: Vec<u16> = Vec::new();
@@ -1940,6 +1943,11 @@ unsafe fn deliver_bound_plp(
 
     if target == SQL_C_WCHAR {
         unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &out_units) };
+    } else if target == SQL_C_BINARY {
+        // No terminator: the accumulator was already capped at the slot size.
+        if !out_bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(out_bytes.as_ptr(), slot, out_bytes.len()) };
+        }
     } else {
         unsafe { copy_with_nul(slot, buf_elements, &out_bytes) };
     }
@@ -2127,9 +2135,25 @@ unsafe fn deliver_bound(
         };
     }
 
+    if binding.target_type == SQL_C_BINARY {
+        // Binary is not a string: no terminator, and the indicator carries the
+        // untruncated byte count exactly as the character targets do.
+        let Some(bytes) = column_value_to_bytes(value) else {
+            return RowOutcome::Error(RowIssue::Unsupported);
+        };
+        unsafe { write_if_some(indicator, bytes.len() as SqlLen) };
+        let take = bytes.len().min(stride);
+        if take > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, take) };
+        }
+        return if take < bytes.len() {
+            RowOutcome::Info(RowIssue::StringTruncated)
+        } else {
+            RowOutcome::Success
+        };
+    }
+
     if binding.target_type != SQL_C_CHAR && binding.target_type != SQL_C_WCHAR {
-        // SQL_C_BINARY delivery is still unimplemented (AB#47239); anything else
-        // is an unsupported target.
         return RowOutcome::Error(RowIssue::Unsupported);
     }
 
@@ -3130,11 +3154,11 @@ mod tests {
     /// is the only mapping that moves with it, defaulting to `SQL_C_SS_TIME2` at
     /// 3.8 and `SQL_C_BINARY` below it.
     ///
-    /// Both versions fail this row -- the mock only carries `int` payloads, and
-    /// bound `SQL_C_BINARY` delivery is unimplemented (AB#47239) -- so the
-    /// resolved target is observed through *which* diagnostic comes back:
-    /// `07006` for the typed 3.8 target that cannot take an int, `HYC00` for the
-    /// binary 3.0 one this driver does not deliver. Hardcoding either version in
+    /// Both versions fail this row -- the mock only carries `int` payloads, which
+    /// `column_value_to_bytes` refuses because an integer has no byte form fixed by
+    /// the value alone -- so the resolved target is observed through *which*
+    /// diagnostic comes back: `07006` for the typed 3.8 target that cannot take an
+    /// int, `HYC00` for the binary 3.0 one. Hardcoding either version in
     /// `fetch_scroll_safe` flips one of these and fails the test.
     fn fetch_time_column_row_state(version: OdbcVersion) -> (SqlReturn, [u8; 5]) {
         let h = TestHandles::with_env_dbc_stmt();
