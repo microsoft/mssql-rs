@@ -117,7 +117,8 @@ fn unwind_dae_inner(
 /// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
 /// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
 /// `active_stmt` set, so the connection stays busy for the duration.
-/// msodbcsql does not retain pre-stream conversion warnings for `SQLParamData`.
+/// msodbcsql's `SQLParamData` clears prior statement errors on entry
+/// (`sqlccmd.cpp:6818`), including pre-stream conversion warnings.
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.

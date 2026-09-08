@@ -942,6 +942,9 @@ fn decimal_from_numeric(
     source: SqlNumericStruct,
 ) -> Result<(TypedValue, ConvOk), ParamBuildError> {
     let magnitude = u128::from_le_bytes(source.val);
+    // msodbcsql's FastDescribeRPCParam copies a matching non-NULL
+    // SQL_NUMERIC_STRUCT whole, including its wire precision and scale
+    // (`sqlcmisc.cpp:7014`).
     if usize::try_from(param.app_precision) == Ok(param.column_size)
         && param.app_scale == param.decimal_digits
     {
