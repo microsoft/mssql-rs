@@ -251,6 +251,12 @@ def extract_prefix(blob, formula, version, dest_root):
     lima is not self-contained in bin/: limactl reaches for
     ../share/lima/lima-guestagent.* and ../libexec/lima/*, so a bin-only copy
     produces a lima that cannot boot a VM.
+
+    Files at the prefix root are per-formula metadata (LICENSE, NOTICE,
+    README.md, sbom.spdx.json, ...) and every formula ships its own, so a
+    merged prefix would keep only whichever was extracted last. Those go to
+    metadata/<formula>/ instead; everything functional lives in a subdirectory
+    and merges as-is.
     """
     base, _ = ref_parts(version)
     root = f"{formula}/{base}/"
@@ -266,6 +272,8 @@ def extract_prefix(blob, formula, version, dest_root):
             relative = name[len(root):]
             if relative.startswith(".brew/"):
                 continue
+            if "/" not in relative:
+                relative = f"metadata/{formula}/{relative}"
             target = os.path.join(dest_root, relative)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             if member.issym():

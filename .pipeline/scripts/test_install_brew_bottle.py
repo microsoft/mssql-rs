@@ -189,5 +189,80 @@ class Extraction(unittest.TestCase):
             self.extract([("docker/29.7.2/README.md", True)])
 
 
+class PrefixExtraction(unittest.TestCase):
+    """extract_prefix merges several bottles into one relocatable prefix."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def extract(self, formula, version, entries):
+        return bottle.extract_prefix(make_bottle(entries), formula, version, self.root)
+
+    def on_disk(self):
+        return sorted(
+            str(p.relative_to(self.root))
+            for p in Path(self.root).rglob("*")
+            if p.is_file() or p.is_symlink()
+        )
+
+    def test_root_metadata_is_namespaced_per_formula(self):
+        # Every formula ships its own LICENSE/sbom at the prefix root; merging
+        # them flat would keep only the last one extracted.
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/LICENSE", True),
+            ("docker/29.7.2/sbom.spdx.json", True),
+        ])
+        self.extract("lima", "2.2.0", [
+            ("lima/2.2.0/LICENSE", True),
+            ("lima/2.2.0/sbom.spdx.json", True),
+        ])
+        self.assertEqual(self.on_disk(), [
+            "metadata/docker/LICENSE",
+            "metadata/docker/sbom.spdx.json",
+            "metadata/lima/LICENSE",
+            "metadata/lima/sbom.spdx.json",
+        ])
+
+    def test_functional_content_still_merges_into_a_shared_prefix(self):
+        # limactl resolves ../share/lima relative to its own bin/, so the
+        # subdirectories must merge rather than be namespaced.
+        self.extract("docker", "29.7.2", [("docker/29.7.2/bin/docker", True)])
+        self.extract("lima", "2.2.0", [
+            ("lima/2.2.0/bin/limactl", True),
+            ("lima/2.2.0/share/lima/lima-guestagent.Linux-x86_64.gz", True),
+            ("lima/2.2.0/libexec/lima/lima-driver-vz", True),
+        ])
+        self.assertEqual(self.on_disk(), [
+            "bin/docker",
+            "bin/limactl",
+            "libexec/lima/lima-driver-vz",
+            "share/lima/lima-guestagent.Linux-x86_64.gz",
+        ])
+
+    def test_brew_bookkeeping_is_not_shipped(self):
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/.brew/docker.rb", True),
+            ("docker/29.7.2/bin/docker", True),
+        ])
+        self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_revision_tag_reads_the_unrevised_cellar_directory(self):
+        self.extract("docker", "29.7.2-1", [("docker/29.7.2/bin/docker", True)])
+        self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_traversal_outside_the_prefix_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            self.extract("docker", "29.7.2", [("docker/29.7.2/bin/../../../evil", True)])
+        self.assertEqual(self.on_disk(), [])
+
+    def test_symlink_escaping_the_prefix_is_refused(self):
+        # make_bottle points its symlinks at ../elsewhere.
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/bin/docker", True),
+            ("docker/29.7.2/bin/escape", False),
+        ])
+        self.assertEqual(self.on_disk(), ["bin/docker"])
+
+
 if __name__ == "__main__":
     unittest.main()
