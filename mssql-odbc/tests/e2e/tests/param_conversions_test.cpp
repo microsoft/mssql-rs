@@ -560,20 +560,35 @@ TEST_F(CrossConversionLiveTest, WideDecimalLiteralReportsTruncation) {
 // SQLPutData"). Both drivers agree the pairing cannot stream through -- they
 // just detect it one call apart -- so the parity run stays skipped rather
 // than comparing error codes that differ by construction.
+//
+// The temporal targets join the same set with AB#47851: a temporal wire value
+// is fixed-length, so it could never have been chunked, and only the call that
+// reports the refusal moved.
 TEST_F(CrossConversionLiveTest, CrossFamilyDataAtExecutionIsRejectedAtExecute) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
-    for (SQLSMALLINT c_type : {SQL_C_CHAR, SQL_C_WCHAR}) {
+    const struct {
+        SQLSMALLINT c_type;
+        SQLSMALLINT sql_type;
+    } cases[] = {
+        {SQL_C_CHAR, SQL_INTEGER},
+        {SQL_C_WCHAR, SQL_INTEGER},
+        {SQL_C_CHAR, SQL_TYPE_DATE},
+        {SQL_C_WCHAR, SQL_TYPE_TIMESTAMP},
+    };
+
+    for (const auto& c : cases) {
         ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
 
         SQLLEN ind = SQL_DATA_AT_EXEC;
         SQLCHAR token = 0;
         // The bind itself is accepted - that is the change from before.
-        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c_type, SQL_INTEGER,
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, c.c_type, c.sql_type,
                                        0, 0, &token, 0, &ind),
                       SQL_HANDLE_STMT, stmt_);
 
-        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_)) << "c type " << c_type;
+        EXPECT_EQ(SQL_ERROR, SQLExecute(stmt_))
+            << "c type " << c.c_type << " sql type " << c.sql_type;
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
         ResetParams();
     }

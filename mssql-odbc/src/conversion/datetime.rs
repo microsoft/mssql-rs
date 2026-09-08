@@ -210,6 +210,11 @@ fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
 /// The mixed-sign rules are the non-obvious part: `+5h -30m` is rejected even
 /// though it totals a legal +4:30, because the two components must agree in
 /// sign. Checking only the total would silently accept it.
+///
+/// Those arms are reachable only from the `SQL_C_SS_TIMESTAMPOFFSET` struct
+/// path, where the caller supplies each component independently.
+/// `parse_datetime_literal` applies one sign to both, so its tests
+/// (`an_offset_is_bounded_on_the_total`) exercise the total bound only.
 pub(crate) fn is_valid_timezone_offset(tz_hour: i16, tz_minute: i16) -> bool {
     let total = i32::from(tz_hour) * 60 + i32::from(tz_minute);
     !((tz_hour > 0 && tz_minute < 0)

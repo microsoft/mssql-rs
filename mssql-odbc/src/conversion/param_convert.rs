@@ -3076,6 +3076,14 @@ mod tests {
             (SQL_C_WCHAR, SQL_SS_XML),
             (SQL_C_CHAR, SQL_DECIMAL),
             (SQL_C_WCHAR, SQL_SS_VARIANT),
+            // And again for the temporal targets this change makes bindable:
+            // a streamed literal is still refused, only now at execute rather
+            // than at `SQLBindParameter`.
+            (SQL_C_CHAR, SQL_TYPE_DATE),
+            (SQL_C_CHAR, SQL_TYPE_TIME),
+            (SQL_C_WCHAR, SQL_SS_TIME2),
+            (SQL_C_WCHAR, SQL_TYPE_TIMESTAMP),
+            (SQL_C_CHAR, SQL_SS_TIMESTAMPOFFSET),
         ] {
             let err = dae_placeholder_type(c_type, sql_type).unwrap_err();
             assert_eq!(

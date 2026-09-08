@@ -152,6 +152,12 @@ transparent reconnects.
   wideness-mismatch fix, `NarrowCTypeAgainstWideSqlTypeDataAtExecutionTranscodes`
   / `WideCTypeAgainstNarrowSqlTypeDataAtExecutionTranscodes` in
   `execute_test.cpp`.
+  AB#47851 puts the temporal SQL targets in exactly this set: a character C
+  type streamed against `date`/`time`/`datetime2`/`datetimeoffset` was
+  refused at bind before, and is refused at execute now, with the same
+  `HYC00`. Nothing about the streamed path changed -- a temporal wire value
+  is fixed-length, so it could never have been chunked -- only the call that
+  reports it. Pinned by `cross_family_dae_is_rejected` in `param_convert.rs`.
 
 ## `mssql-tds` prepared API
 
