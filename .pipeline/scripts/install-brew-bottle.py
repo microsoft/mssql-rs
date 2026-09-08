@@ -280,7 +280,14 @@ def extract_prefix(blob, formula, version, dest_root):
             target = os.path.join(dest_root, relative)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             if member.issym():
-                if os.path.isabs(member.linkname) or member.linkname.startswith("../"):
+                # Where the link would land, relative to dest_root. Testing the
+                # linkname for a leading `../` is not enough: `a/../../outside`
+                # has none and still escapes, and a later member writing
+                # through the link would follow it out of the prefix.
+                landing = os.path.normpath(
+                    os.path.join(os.path.dirname(relative), member.linkname)
+                )
+                if os.path.isabs(member.linkname) or landing.split("/")[0] == "..":
                     continue
                 if os.path.lexists(target):
                     os.unlink(target)

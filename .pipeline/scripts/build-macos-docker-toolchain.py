@@ -105,10 +105,17 @@ def image_entry(colima_binary, arch):
             f"colima binary has no docker image entry for {arch}; "
             "the embedded image table may have changed format"
         )
+    # This name becomes a path under the payload, and it is read out of a
+    # downloaded binary, so it gets treated as data rather than trusted.
+    filename = match.group(4).decode()
+    if filename in ("", ".", "..") or os.path.basename(filename) != filename:
+        raise RuntimeError(
+            f"colima's image table gave {filename!r}, which is not a plain file name"
+        )
     return {
         "url": match.group(2).decode(),
         "sha512": match.group(3).decode(),
-        "filename": match.group(4).decode(),
+        "filename": filename,
     }
 
 

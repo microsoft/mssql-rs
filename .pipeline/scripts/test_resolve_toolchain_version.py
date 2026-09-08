@@ -170,6 +170,82 @@ class Organization(unittest.TestCase):
             resolve.organization("https://dev.azure.com/")
 
 
+class Decision(unittest.TestCase):
+    """Which architectures publish, and at what version."""
+
+    def arch(self, version, current=True, layout_stale=False):
+        return {"version": version, "current": current, "layout_stale": layout_stale}
+
+    def both(self, **kwargs):
+        return {"x86_64": self.arch(**kwargs), "arm64": self.arch(**kwargs)}
+
+    def test_an_unchanged_feed_publishes_nothing(self):
+        _, publish, reasons = resolve.decide(self.both(version="0.1.0"))
+        self.assertEqual(publish, set())
+        self.assertEqual(reasons, [])
+
+    def test_an_upstream_bump_moves_every_architecture_together(self):
+        version, publish, _ = resolve.decide(self.both(version="0.1.0", current=False))
+        self.assertEqual(version, "0.1.1")
+        self.assertEqual(publish, {"x86_64", "arm64"})
+
+    def test_one_architecture_drifting_still_republishes_both(self):
+        # A version has to mean the same build produced both, so the unchanged
+        # architecture comes along rather than being left a version behind.
+        state = {"x86_64": self.arch("0.1.0", current=False), "arm64": self.arch("0.1.0")}
+        version, publish, _ = resolve.decide(state)
+        self.assertEqual(version, "0.1.1")
+        self.assertEqual(publish, {"x86_64", "arm64"})
+
+    def test_a_layout_change_is_the_minor_bump(self):
+        version, _, _ = resolve.decide(self.both(version="0.1.3", current=False, layout_stale=True))
+        self.assertEqual(version, "0.2.0")
+
+    def test_a_partial_publish_is_repaired_at_the_version_it_missed(self):
+        # x86_64 uploaded 0.1.1 and arm64's upload failed. Bumping to 0.1.2
+        # would strand 0.1.1 as x86_64-only forever, since packages are
+        # immutable and a consumer pinning it would 404 on arm64.
+        state = {
+            "x86_64": self.arch("0.1.1"),
+            "arm64": self.arch("0.1.0", current=False),
+        }
+        version, publish, reasons = resolve.decide(state)
+        self.assertEqual(version, "0.1.1")
+        self.assertEqual(publish, {"arm64"})
+        self.assertIn("partial publish", reasons[0])
+
+    def test_a_laggard_is_not_dragged_onto_a_version_that_predates_upstream(self):
+        # Both are behind upstream, so 0.1.1 is not what should ship; that is a
+        # normal bump for both, not a repair.
+        state = {
+            "x86_64": self.arch("0.1.1", current=False),
+            "arm64": self.arch("0.1.0", current=False),
+        }
+        version, publish, _ = resolve.decide(state)
+        self.assertEqual(version, "0.1.2")
+        self.assertEqual(publish, {"x86_64", "arm64"})
+
+    def test_an_explicit_override_wins_over_a_repair(self):
+        state = {
+            "x86_64": self.arch("0.1.1"),
+            "arm64": self.arch("0.1.0", current=False),
+        }
+        version, publish, _ = resolve.decide(state, override="2.0.0")
+        self.assertEqual(version, "2.0.0")
+        self.assertEqual(publish, {"x86_64", "arm64"})
+
+    def test_a_first_publish_covers_every_architecture(self):
+        version, publish, _ = resolve.decide(self.both(version=None, current=False, layout_stale=True))
+        self.assertEqual(version, "0.1.0")
+        self.assertEqual(publish, {"x86_64", "arm64"})
+
+    def test_forcing_republishes_everything_unchanged(self):
+        version, publish, reasons = resolve.decide(self.both(version="0.1.0"), force=True)
+        self.assertEqual(version, "0.1.1")
+        self.assertEqual(publish, {"x86_64", "arm64"})
+        self.assertIn("forced", reasons[0])
+
+
 class RequestedVersion(unittest.TestCase):
     def test_the_sentinel_means_derive_it(self):
         # The pipeline passes 'auto' rather than '' because the run panel

@@ -141,11 +141,20 @@ class HostRanking(unittest.TestCase):
 
 
 def make_bottle(entries):
-    """A gzipped tar of `(name, is_file)` members, as the registry serves them."""
+    """A gzipped tar of `(name, is_file)` members, as the registry serves them.
+
+    A member may also be `(name, 'symlink', linkname)` to aim a link precisely.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name, is_file in entries:
-            if is_file:
+        for entry in entries:
+            name, kind = entry[0], entry[1]
+            if kind == "symlink":
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.SYMTYPE
+                info.linkname = entry[2]
+                tar.addfile(info)
+            elif kind:
                 payload = b"#!/bin/sh\n"
                 info = tarfile.TarInfo(name)
                 info.size = len(payload)
@@ -255,13 +264,45 @@ class PrefixExtraction(unittest.TestCase):
             self.extract("docker", "29.7.2", [("docker/29.7.2/bin/../../../evil", True)])
         self.assertEqual(self.on_disk(), [])
 
-    def test_symlink_escaping_the_prefix_is_refused(self):
-        # make_bottle points its symlinks at ../elsewhere.
+    def test_an_absolute_symlink_is_refused(self):
         self.extract("docker", "29.7.2", [
             ("docker/29.7.2/bin/docker", True),
-            ("docker/29.7.2/bin/escape", False),
+            ("docker/29.7.2/bin/escape", "symlink", "/etc/passwd"),
         ])
         self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_a_relative_symlink_that_lands_back_inside_is_kept(self):
+        # `../elsewhere` from bin/ resolves to <prefix>/elsewhere, which is in
+        # the prefix. Judging the linkname by its leading `../` would refuse a
+        # link that never leaves.
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/bin/docker", True),
+            ("docker/29.7.2/bin/sibling", "symlink", "../elsewhere"),
+        ])
+        self.assertEqual(self.on_disk(), ["bin/docker", "bin/sibling"])
+
+    def test_a_symlink_climbing_out_through_a_subdirectory_is_refused(self):
+        # No leading `../`, so a prefix test on the linkname alone accepts it,
+        # and a later member written through the link lands outside the prefix.
+        for linkname in ("a/../../../outside", "./../../outside", "bin/../../.."):
+            with self.subTest(linkname=linkname):
+                self.setUp()
+                self.extract("docker", "29.7.2", [
+                    ("docker/29.7.2/bin/docker", True),
+                    ("docker/29.7.2/bin/escape", "symlink", linkname),
+                ])
+                self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_a_symlink_staying_inside_the_prefix_is_kept(self):
+        # lima ships these, so refusing every symlink is not an option.
+        self.extract("lima", "2.2.0", [
+            ("lima/2.2.0/bin/limactl", True),
+            ("lima/2.2.0/bin/nested/../limactl-alias", "symlink", "limactl"),
+            ("lima/2.2.0/share/lima/link", "symlink", "../../bin/limactl"),
+        ])
+        self.assertEqual(
+            self.on_disk(), ["bin/limactl", "bin/limactl-alias", "share/lima/link"]
+        )
 
 
 if __name__ == "__main__":

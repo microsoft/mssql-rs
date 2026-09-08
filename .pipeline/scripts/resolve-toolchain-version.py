@@ -88,10 +88,14 @@ def organization(collection_uri):
 
 
 def published_packages(org_url, project, feed, token):
+    # Filtered by name rather than listing the feed: the response is paginated,
+    # and a feed with enough packages would push these off the first page and
+    # make them look unpublished. Only the two names can match this prefix.
     url = (
         f"https://feeds.dev.azure.com/{organization(org_url)}/{project}"
         f"/_apis/packaging/Feeds/{feed}/packages"
-        f"?protocolType=upack&includeDescription=true&api-version={API_VERSION}"
+        f"?protocolType=upack&packageNameQuery={PACKAGE_PREFIX}"
+        f"&includeDescription=true&api-version={API_VERSION}"
     )
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
@@ -176,6 +180,59 @@ def next_version(latest, layout_changed):
     return f"{major}.{minor}.{patch + 1}"
 
 
+def version_key(version):
+    return [int(part) for part in version.split(".")]
+
+
+def decide(state, override=None, force=False):
+    """(version, architectures to publish, reasons) from each architecture's state.
+
+    `state[arch]` is the published version (None if absent), whether that
+    published package already matches upstream, and whether its layout is stale.
+
+    A version is meant to mean the same build produced every architecture, so
+    the normal path publishes all of them together at a version that exists for
+    none. Publishing is not atomic across packages though: a failure after the
+    first upload leaves one architecture behind at a version the other already
+    has. That is repaired rather than papered over -- the laggard is published
+    at the version the others reached, which is legal precisely because it does
+    not exist for that package yet.
+    """
+    versions = {arch: s["version"] for arch, s in state.items()}
+    behind = [arch for arch, v in versions.items() if v is not None]
+    leader = max((versions[a] for a in behind), default=None, key=version_key)
+    lagging = {arch for arch, v in versions.items() if v is not None and v != leader}
+
+    # Repair first: with a partial publish outstanding, a laggard's contents
+    # differing from *its* version is the symptom, not a reason to bump past the
+    # version it is missing. Only sound while the leader is itself current --
+    # otherwise that version predates upstream and nobody should join it.
+    if lagging and not override and all(state[a]["current"] for a in state if a not in lagging):
+        return leader, lagging, [
+            f"partial publish: {', '.join(sorted(lagging))} never reached {leader}",
+        ]
+
+    reasons = []
+    for arch in sorted(state):
+        if versions[arch] is None:
+            reasons.append(f"- {arch}: not published yet")
+        elif not state[arch]["current"]:
+            reasons.append(f"- {arch}: differs from {versions[arch]}")
+
+    if not reasons and not force:
+        return next_version(leader, layout_changed=False), set(), []
+    if not reasons:
+        reasons = ["nothing changed upstream, but a publish was forced"]
+    else:
+        reasons.insert(0, "republishing because:")
+
+    # A version nobody holds yet, so every architecture can take it. A stale or
+    # absent layout is the minor bump: consumers resolving paths into the tree
+    # may have to move with it, where a component bump leaves the tree alone.
+    layout_changed = any(s["layout_stale"] for s in state.values())
+    return override or next_version(leader, layout_changed), set(state), reasons
+
+
 def emit(name, value):
     print(f"##vso[task.setvariable variable={name};isOutput=true]{value}")
 
@@ -246,10 +303,7 @@ def main():
     bottle = load("install-brew-bottle.py")
     published = published_packages(args.org, project, feed, token)
 
-    changed = []
-    latest_versions = []
-    layout_changed = False
-
+    state = {}
     for arch in args.arch:
         package = PACKAGE_PREFIX + arch
         components = resolve_components(bottle, arch, args.macos_major)
@@ -260,40 +314,34 @@ def main():
         summary = ", ".join(f"{n} {components[n]['version']}" for n in sorted(components))
         print(f"\n{package}")
         print(f"  upstream now : {summary} (layout {builder.PAYLOAD_FORMAT}, id {identity})")
-
         if version is None:
             print("  published    : nothing yet")
-            changed.append(f"{arch}: not published yet")
-            layout_changed = True
-            continue
+        else:
+            print(f"  published    : {version} (layout {layout}, id {published_identity})")
+        state[arch] = {
+            "version": version,
+            "layout_stale": version is None or layout != builder.PAYLOAD_FORMAT,
+            "current": version is not None
+            and layout == builder.PAYLOAD_FORMAT
+            and published_identity == identity,
+        }
 
-        print(f"  published    : {version} (layout {layout}, id {published_identity})")
-        latest_versions.append(version)
-        if layout != builder.PAYLOAD_FORMAT:
-            layout_changed = True
-            changed.append(f"{arch}: payload layout {layout} -> {builder.PAYLOAD_FORMAT}")
-        if published_identity != identity:
-            changed.append(f"{arch}: contents differ from {version}")
-
-    # One decision for every architecture, so a given version means the same
-    # build produced all of them -- worth more than skipping the odd republish.
-    should_publish = bool(changed) or args.force
-    version = override or next_version(
-        max(latest_versions, default=None, key=lambda v: [int(p) for p in v.split(".")]),
-        layout_changed,
-    )
+    version, publish_for, reasons = decide(state, override, args.force)
 
     print("\n" + "=" * 62)
-    if changed:
-        print("republishing because:")
-        for reason in changed:
-            print(f"  - {reason}")
-    elif args.force:
-        print("nothing changed upstream, but a publish was forced")
+    for reason in reasons:
+        print(f"  {reason}")
+    if publish_for:
+        print(f"publishing {', '.join(sorted(publish_for))} as {version}"
+              + (" (explicit override)" if override else ""))
     else:
         print("nothing changed upstream; leaving the feed alone")
-    if should_publish:
-        print(f"version: {version}" + (" (explicit override)" if override else ""))
+
+    for arch in args.arch:
+        emit(f"publish_{arch}", "true" if arch in publish_for else "false")
+    emit("shouldPublish", "true" if publish_for else "false")
+    emit("packageVersion", version)
+    return 0
 
     emit("shouldPublish", "true" if should_publish else "false")
     emit("packageVersion", version)

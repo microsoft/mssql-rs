@@ -51,15 +51,13 @@ parameters:
   type: boolean
   default: false
 
-- name: publishX64
-  displayName: 'Publish x86_64 package'
-  type: boolean
-  default: true
-
-- name: publishArm64
-  displayName: 'Publish arm64 package'
-  type: boolean
-  default: true
+# The architectures a version covers, deliberately a set rather than a toggle
+# each: they publish together or not at all.
+- name: architectures
+  type: object
+  default:
+  - x86_64
+  - arm64
 
 - name: dryRun
   displayName: 'Dry run (build and inspect, do not publish)'
@@ -92,7 +90,9 @@ stages:
   # Resolves both architectures before anything is downloaded, so an unchanged
   # upstream costs a few HTTP calls instead of two 430 MB builds. One decision
   # covers every architecture, so a given version always means the same run
-  # produced all of them.
+  # produced all of them -- which is also why there is no per-architecture
+  # publish toggle: skipping one would publish a version that exists for the
+  # other alone, and packages are immutable, so it could never be completed.
   - job: Decide
     displayName: 'Decide whether to publish, and at what version'
     timeoutInMinutes: 10
@@ -115,7 +115,7 @@ stages:
         python3 .pipeline/scripts/resolve-toolchain-version.py \
           --org '$(System.CollectionUri)' \
           --feed '${{ parameters.feed }}' \
-          --arch x86_64 --arch arm64 \
+          --arch ${{ join(' --arch ', parameters.architectures) }} \
           --macos-major ${{ parameters.macosMajorFloor }} \
           --version '${{ parameters.packageVersion }}' \
           $(forceFlag)
@@ -124,18 +124,10 @@ stages:
       env:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
-  - ${{ if eq(parameters.publishX64, true) }}:
+  - ${{ each arch in parameters.architectures }}:
     - template: templates/macos-toolchain-job.yml
       parameters:
-        arch: x86_64
-        macosMajorFloor: ${{ parameters.macosMajorFloor }}
-        dryRun: ${{ parameters.dryRun }}
-        feed: ${{ parameters.feed }}
-
-  - ${{ if eq(parameters.publishArm64, true) }}:
-    - template: templates/macos-toolchain-job.yml
-      parameters:
-        arch: arm64
+        arch: ${{ arch }}
         macosMajorFloor: ${{ parameters.macosMajorFloor }}
         dryRun: ${{ parameters.dryRun }}
         feed: ${{ parameters.feed }}

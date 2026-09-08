@@ -18,9 +18,10 @@ jobs:
 - job: Build_${{ parameters.arch }}
   displayName: 'Build and publish ${{ parameters.arch }}'
   dependsOn: Decide
-  # Nothing moved upstream means nothing to build; the run succeeds having done
-  # the one useful thing, which was checking.
-  condition: and(succeeded(), eq(dependencies.Decide.outputs['decide.shouldPublish'], 'true'))
+  # Per architecture rather than one flag for the stage: normally these move
+  # together, but a partial publish leaves one behind and only that one is
+  # rebuilt to catch it up.
+  condition: and(succeeded(), eq(dependencies.Decide.outputs['decide.publish_${{ parameters.arch }}'], 'true'))
   timeoutInMinutes: 30
   variables:
     packageVersion: $[ dependencies.Decide.outputs['decide.packageVersion'] ]
