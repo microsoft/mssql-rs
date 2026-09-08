@@ -32,13 +32,25 @@ COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-480}
 # 1% of the time, while agents that built 29.8.0 took 441s median (774s max) and
 # failed 36% — the build alone exhausted the step timeout.
 #
-# `--force-bottle` makes brew fail rather than fall back to source. When it does
-# fail, install-brew-bottle.py takes the newest version that *is* bottled for
-# this platform straight from Homebrew's registry, so there is no version to pin
-# by hand and no third-party download. Both paths therefore install exactly what
-# Homebrew would have, and this self-heals once the current version is bottled
-# again — which on arm64 it already is.
+# `--force-bottle` makes brew refuse to build the *requested* formula from
+# source, but Homebrew dropping bottle support for Intel macOS entirely
+# (September 2026) exposed a gap that assumption doesn't cover: brew still
+# resolves and starts fetching source for docker's *build dependencies* (go,
+# go-md2man) before it gets around to reporting "docker has no bottle", so the
+# attempt can hang well past that error on a platform with no bottles at all.
+# Bounded separately and tightly so that hang is cut short at a small multiple
+# of the 29s bottled-success baseline rather than being allowed to eat the
+# whole install budget before falling through to the fallback below, which
+# doesn't invoke brew and isn't subject to this at all.
+#
+# When it does fail (or is cut short), install-brew-bottle.py takes the newest
+# version that *is* bottled for this platform straight from Homebrew's
+# registry, so there is no version to pin by hand and no third-party download.
+# Both paths therefore install exactly what Homebrew would have, and this
+# self-heals once the current version is bottled again — which on arm64 it
+# already is.
 DOCKER_CLI_DIR=${DOCKER_CLI_DIR:-$HOME/.docker-cli/bin}
+DOCKER_BOTTLE_TIMEOUT_SECONDS=${DOCKER_BOTTLE_TIMEOUT_SECONDS:-90}
 # Bounded so a slow install fails here with a message rather than silently
 # consuming the step budget and surfacing as an opaque "task has timed out".
 INSTALL_TIMEOUT_SECONDS=${INSTALL_TIMEOUT_SECONDS:-300}
@@ -50,10 +62,10 @@ install_tooling() {
   brew update || return 1
   brew install colima || return 1
 
-  if brew install --force-bottle docker; then
+  if run_bounded "$DOCKER_BOTTLE_TIMEOUT_SECONDS" brew install --force-bottle docker; then
     return 0
   fi
-  echo "##[warning]No docker CLI bottle for the current version on this platform; falling back to the newest bottled version"
+  echo "##[warning]No docker CLI bottle for the current version on this platform (or the attempt ran past ${DOCKER_BOTTLE_TIMEOUT_SECONDS}s); falling back to the newest bottled version"
   python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR" || return 1
 }
 
