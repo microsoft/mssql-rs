@@ -76,30 +76,35 @@ rm -rf "$DOCKER_CLI_DIR"
 # one that can ever signal it.
 install_deadline=$(( $(date +%s) + INSTALL_TIMEOUT_SECONDS ))
 
-remaining_install_budget() {
-  local left=$((install_deadline - $(date +%s)))
-  [ "$left" -gt 0 ] && echo "$left" || echo 0
-}
-
 fail_install() {
   echo "##[error]$1"
   exit 1
 }
 
-# Bounds "$@" by whatever remains of the overall install budget (capped at
-# $1 if given and smaller), failing the step immediately -- rather than
-# letting a later step start against an already-exhausted or barely-alive
-# budget -- on timeout or a non-zero exit.
+# Whatever remains of the overall install budget, capped at $1 when given
+# and smaller, or 0 once the budget is exhausted. Never calls fail_install
+# itself: every caller reads this through a plain `$(...)` command
+# substitution, where an `exit` only ends that subshell, not the script --
+# so the 0 case has to be checked, and failed, by the caller instead.
+budget_limit() {
+  local cap=${1:-}
+  local left=$((install_deadline - $(date +%s)))
+  [ "$left" -gt 0 ] || left=0
+  if [ -n "$cap" ] && [ "$cap" -lt "$left" ]; then
+    echo "$cap"
+  else
+    echo "$left"
+  fi
+}
+
+# Bounds "$@" by whatever remains of the overall install budget, failing the
+# step immediately -- rather than letting a later step start against an
+# already-exhausted or barely-alive budget -- on timeout or a non-zero exit.
 run_install_step() {
-  local cap=$1
-  shift
   local limit
-  limit=$(remaining_install_budget)
+  limit=$(budget_limit)
   if [ "$limit" -eq 0 ]; then
     fail_install "Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
-  fi
-  if [ -n "$cap" ] && [ "$cap" -lt "$limit" ]; then
-    limit=$cap
   fi
   # Not `run_bounded ... ; local status=$?`: under `set -e`, a non-zero
   # exit from a plain (untested) command aborts the script on the spot,
@@ -114,23 +119,22 @@ run_install_step() {
   fi
 }
 
-run_install_step "" brew update
-run_install_step "" brew install colima
+run_install_step brew update
+run_install_step brew install colima
 
 # The docker-bottle attempt is the one step allowed to fail without ending
 # the job: that failure is the expected, handled path into the fallback, not
-# an install error. Still capped by whatever remains of the overall budget,
-# same as every other step.
-bottle_limit=$(remaining_install_budget)
+# an install error. It is also the only step that needs a cap tighter than
+# the overall budget (DOCKER_BOTTLE_TIMEOUT_SECONDS), which is why it can't
+# go through run_install_step: that helper treats any non-zero exit as
+# fatal.
+bottle_limit=$(budget_limit "$DOCKER_BOTTLE_TIMEOUT_SECONDS")
 if [ "$bottle_limit" -eq 0 ]; then
   fail_install "Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
 fi
-if [ "$DOCKER_BOTTLE_TIMEOUT_SECONDS" -lt "$bottle_limit" ]; then
-  bottle_limit=$DOCKER_BOTTLE_TIMEOUT_SECONDS
-fi
 if ! run_bounded "$bottle_limit" brew install --force-bottle docker; then
   echo "##[warning]No docker CLI bottle for the current version on this platform (or the attempt ran past ${bottle_limit}s); falling back to the newest bottled version"
-  run_install_step "" python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR"
+  run_install_step python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR"
 fi
 
 # Only the fallback populates DOCKER_CLI_DIR; brew's own docker is already on PATH.

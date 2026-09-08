@@ -2626,6 +2626,10 @@ mod tests {
             (SQL_C_WCHAR, SQL_SS_XML),
             (SQL_C_CHAR, SQL_DECIMAL),
             (SQL_C_WCHAR, SQL_SS_VARIANT),
+            // SQL_C_CHAR -> SQL_SS_VARIANT is the pairing AB#47800 itself
+            // opens: the refusal here is what that pairing's HYC00 moves to
+            // (from bind_param.rs, since the conversion matrix now admits it).
+            (SQL_C_CHAR, SQL_SS_VARIANT),
         ] {
             let err = dae_placeholder_type(c_type, sql_type).unwrap_err();
             assert_eq!(
