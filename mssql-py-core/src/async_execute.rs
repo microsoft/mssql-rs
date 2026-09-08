@@ -3,8 +3,10 @@
 
 //! Asynchronous command execution for [`crate::async_cursor::PyAsyncCursor`].
 
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
@@ -14,19 +16,51 @@ use mssql_tds::error::{Error, SqlInfoMessage};
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::message::transaction_management::TransactionIsolationLevel;
 use mssql_tds::query::metadata::ColumnMetadata;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
 use tokio::sync::Mutex;
 use tracing::instrument::WithSubscriber;
 
 use crate::async_cursor::{PyAsyncCursor, map_claim_error};
 use crate::async_description::{DescriptionState, materialize};
 use crate::async_errors::{InternalError, map_tds_error};
-use crate::async_fetch::{FetchState, FetchStatus};
-use crate::async_parameters::{ParameterMetadata, bind_parameters, parse_input_sizes};
-use crate::async_session::{AsyncConnectionState, CursorId, ExecuteClaim, SessionOperationGuard};
+use crate::async_fetch::{BufferedResults, BufferedRowSet, FetchState, FetchStatus};
+use crate::async_parameters::{
+    ParameterBindingPlan, ParameterMetadata, bind_parameters, parse_input_sizes,
+};
+use crate::async_session::{
+    AsyncConnectionState, CursorId, ExecuteClaim, OperationId, SessionOperationGuard,
+};
 use crate::async_tracing::{in_cursor_operation_span, record_result_set_status};
+use crate::row_writer::PyRowWriter;
 use crate::types::ParameterHint;
+
+const EXECUTEMANY_PREFLIGHT_CHUNK_SIZE: usize = 256;
+const EXECUTEMANY_EXECUTION_YIELD_INTERVAL: usize = 256;
+const EXECUTEMANY_BUFFER_YIELD_INTERVAL: usize = 256;
+
+async fn yield_at_interval(completed: usize, interval: usize, phase: &'static str) {
+    if completed.is_multiple_of(interval) {
+        tracing::trace!(
+            phase,
+            completed,
+            "PyAsyncCursor::executemany: yielding at {phase} interval; completed={completed}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+fn get_or_create_binding_plan<'a>(
+    plan: &'a mut Option<ParameterBindingPlan>,
+    operation: &str,
+    named: bool,
+) -> PyResult<&'a ParameterBindingPlan> {
+    if plan.is_none() {
+        *plan = Some(ParameterBindingPlan::new(operation, named)?);
+    }
+    Ok(plan.as_ref().expect("binding plan was initialized"))
+}
 
 /// Cursor-local state for prepared execution and deferred handle cleanup.
 #[derive(Default)]
@@ -85,14 +119,29 @@ fn should_replace_prepared_statement(
         || state.parameter_signature != parameter_signature
 }
 
-struct ExecuteRequest {
-    operation: String,
+struct ExecuteRequest<'a> {
+    operation: Cow<'a, str>,
     rpc_parameters: Vec<RpcParameter>,
     parameter_signature: Vec<ParameterMetadata>,
     use_prepare: bool,
     reset_cursor: bool,
     timeout: u32,
     autocommit: bool,
+    drain_previous: bool,
+}
+
+fn rowcount_from_rows_affected(rows_affected: Option<u64>) -> i64 {
+    rows_affected
+        .and_then(|count| i64::try_from(count).ok())
+        .unwrap_or(-1)
+}
+
+fn accumulate_rowcount(total: &mut Option<i64>, count: i64) {
+    if count < 0 {
+        *total = None;
+    } else if let Some(current) = *total {
+        *total = current.checked_add(count);
+    }
 }
 
 pub(crate) struct ExecuteResources {
@@ -106,8 +155,11 @@ pub(crate) struct ExecuteResources {
     input_sizes: Option<Vec<ParameterHint>>,
     input_sizes_generation: u64,
     cleanup_required: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     fetch_state: Arc<FetchState>,
     description_state: Arc<DescriptionState>,
+    rowcount: Arc<AtomicI64>,
+    buffered_results: Arc<BufferedResults>,
 }
 
 impl ExecuteResources {
@@ -123,8 +175,11 @@ impl ExecuteResources {
         input_sizes: Option<Vec<ParameterHint>>,
         input_sizes_generation: u64,
         cleanup_required: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
         fetch_state: Arc<FetchState>,
         description_state: Arc<DescriptionState>,
+        rowcount: Arc<AtomicI64>,
+        buffered_results: Arc<BufferedResults>,
     ) -> Self {
         Self {
             client,
@@ -137,21 +192,24 @@ impl ExecuteResources {
             input_sizes,
             input_sizes_generation,
             cleanup_required,
+            closed,
             fetch_state,
             description_state,
+            rowcount,
+            buffered_results,
         }
     }
 }
 
 enum ExecuteOutcome {
-    NoRows,
-    TerminalNoRows,
+    NoRows(i64),
+    TerminalNoRows(i64),
     Rows(Vec<ColumnMetadata>),
 }
 
 impl ExecuteOutcome {
     fn has_open_batch(&self) -> bool {
-        !matches!(self, Self::TerminalNoRows)
+        !matches!(self, Self::TerminalNoRows(_))
     }
 
     fn has_rows(&self) -> bool {
@@ -160,16 +218,23 @@ impl ExecuteOutcome {
 
     fn fetch_status(&self) -> FetchStatus {
         match self {
-            Self::NoRows => FetchStatus::NoResultSet,
-            Self::TerminalNoRows => FetchStatus::TerminalNoRows,
+            Self::NoRows(_) => FetchStatus::NoResultSet,
+            Self::TerminalNoRows(_) => FetchStatus::TerminalNoRows,
             Self::Rows(_) => FetchStatus::Ready,
         }
     }
 
     fn result_set_status(&self) -> &'static str {
         match self {
-            Self::NoRows | Self::TerminalNoRows => "no_rows",
+            Self::NoRows(_) | Self::TerminalNoRows(_) => "no_rows",
             Self::Rows(_) => "rows",
+        }
+    }
+
+    fn rowcount(&self) -> i64 {
+        match self {
+            Self::NoRows(rowcount) | Self::TerminalNoRows(rowcount) => *rowcount,
+            Self::Rows(_) => -1,
         }
     }
 }
@@ -201,7 +266,7 @@ async fn execute_on_client(
     client: &mut TdsClient,
     prepared_state: &Mutex<PreparedState>,
     claim: &ExecuteClaim,
-    request: ExecuteRequest,
+    request: ExecuteRequest<'_>,
 ) -> Result<ExecuteOutcome, ExecuteFailure> {
     let ExecuteRequest {
         operation,
@@ -211,9 +276,10 @@ async fn execute_on_client(
         reset_cursor,
         timeout,
         autocommit,
+        drain_previous,
     } = request;
 
-    if claim.drain_previous {
+    if drain_previous {
         client.close_query().await?;
     }
     let options = ExecuteOptions {
@@ -222,12 +288,12 @@ async fn execute_on_client(
         ..Default::default()
     };
     if !autocommit && !client.has_active_transaction() {
-        // TODO(mssql-tds): Add an options-aware begin_transaction API that applies
-        // reconnect timeout accounting and cancellation, and records whether the
-        // transaction-manager request reached the wire. Until then, any BEGIN
-        // failure must conservatively poison the session.
         client
-            .begin_transaction(TransactionIsolationLevel::ReadCommitted, None)
+            .begin_transaction_with_options(
+                TransactionIsolationLevel::ReadCommitted,
+                None,
+                options.clone(),
+            )
             .await
             .map_err(ExecuteFailure::broken)?;
     }
@@ -238,7 +304,7 @@ async fn execute_on_client(
         let mut state = prepared_state.lock().await;
         let replace_statement = should_replace_prepared_statement(
             &state,
-            &operation,
+            operation.as_ref(),
             &parameter_signature,
             reset_cursor,
         );
@@ -248,7 +314,7 @@ async fn execute_on_client(
             {
                 state.orphaned = Some(statement_id);
             }
-            state.statement = Some(PreparedStatement::new(operation));
+            state.statement = Some(PreparedStatement::new(operation.into_owned()));
             state.parameter_signature = parameter_signature;
         }
         let PreparedState {
@@ -267,17 +333,338 @@ async fn execute_on_client(
             )
             .await?
     } else if rpc_parameters.is_empty() {
-        client.execute(operation, options).await?
+        client.execute(operation.into_owned(), options).await?
     } else {
         client
-            .execute_sp_executesql(operation, rpc_parameters, options)
+            .execute_sp_executesql(operation.into_owned(), rpc_parameters, options)
             .await?
     };
     Ok(match first {
         StatementResult::Rows => ExecuteOutcome::Rows(client.get_metadata().clone()),
-        StatementResult::NoRows { .. } if client.has_open_batch() => ExecuteOutcome::NoRows,
-        StatementResult::NoRows { .. } | StatementResult::End => ExecuteOutcome::TerminalNoRows,
+        StatementResult::NoRows { rows_affected } if client.has_open_batch() => {
+            ExecuteOutcome::NoRows(rowcount_from_rows_affected(rows_affected))
+        }
+        StatementResult::NoRows { rows_affected } => {
+            ExecuteOutcome::TerminalNoRows(rowcount_from_rows_affected(rows_affected))
+        }
+        StatementResult::End => ExecuteOutcome::TerminalNoRows(-1),
     })
+}
+
+struct ExecuteManyRequest {
+    operation: String,
+    parameter_sets: Vec<BoundParameterSet>,
+    use_prepare: bool,
+    timeout: u32,
+    autocommit: bool,
+}
+
+type BoundParameterSet = (Vec<RpcParameter>, Vec<ParameterMetadata>);
+
+struct ExecuteManyFailure {
+    failure: ExecuteFailure,
+    row_index: usize,
+}
+
+struct ExecuteManyBindingState {
+    operation: String,
+    iterator: Py<PyIterator>,
+    hints: Option<Vec<ParameterHint>>,
+    parameter_sets: Vec<BoundParameterSet>,
+    plan: Option<ParameterBindingPlan>,
+    named: Option<bool>,
+}
+
+struct ExecuteManyPreflightGuard {
+    cursor_id: CursorId,
+    dispatch: Option<tracing::Dispatch>,
+    completed: bool,
+}
+
+impl ExecuteManyPreflightGuard {
+    fn new(cursor_id: CursorId, dispatch: Option<tracing::Dispatch>) -> Self {
+        Self {
+            cursor_id,
+            dispatch,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ExecuteManyPreflightGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::warn!(
+                cursor_id = self.cursor_id,
+                "PyAsyncCursor::executemany: interrupted during parameter preflight; cursor_id={}; connection remains usable",
+                self.cursor_id
+            );
+        }
+    }
+}
+
+struct ExecuteManyInterruptionGuard {
+    cursor_id: CursorId,
+    operation_id: OperationId,
+    phase: &'static str,
+    dispatch: Option<tracing::Dispatch>,
+    completed: bool,
+}
+
+impl ExecuteManyInterruptionGuard {
+    fn new(
+        cursor_id: CursorId,
+        operation_id: OperationId,
+        dispatch: Option<tracing::Dispatch>,
+    ) -> Self {
+        Self {
+            cursor_id,
+            operation_id,
+            phase: "execution",
+            dispatch,
+            completed: false,
+        }
+    }
+
+    fn set_phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ExecuteManyInterruptionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _guard = self.dispatch.as_ref().map(tracing::dispatcher::set_default);
+            tracing::warn!(
+                cursor_id = self.cursor_id,
+                operation_id = self.operation_id,
+                phase = self.phase,
+                "PyAsyncCursor::executemany: interrupted; cursor_id={}; operation_id={}; phase={}; connection marked broken",
+                self.cursor_id,
+                self.operation_id,
+                self.phase
+            );
+        }
+    }
+}
+
+async fn execute_many_on_client(
+    client: &mut TdsClient,
+    prepared_state: &Mutex<PreparedState>,
+    claim: &ExecuteClaim,
+    request: ExecuteManyRequest,
+) -> Result<(i64, VecDeque<BufferedRowSet>), ExecuteManyFailure> {
+    let ExecuteManyRequest {
+        operation,
+        parameter_sets,
+        use_prepare,
+        timeout,
+        autocommit,
+    } = request;
+    let mut total = Some(0_i64);
+    let mut results = VecDeque::new();
+
+    if parameter_sets.is_empty() && claim.drain_previous {
+        client
+            .close_query()
+            .await
+            .map_err(ExecuteFailure::broken)
+            .map_err(|failure| ExecuteManyFailure {
+                failure,
+                row_index: 0,
+            })?;
+    }
+
+    for (row_index, (rpc_parameters, parameter_signature)) in parameter_sets.into_iter().enumerate()
+    {
+        let outcome = execute_on_client(
+            client,
+            prepared_state,
+            claim,
+            ExecuteRequest {
+                operation: Cow::Borrowed(&operation),
+                rpc_parameters,
+                parameter_signature,
+                use_prepare,
+                reset_cursor: row_index == 0,
+                timeout,
+                autocommit,
+                drain_previous: row_index == 0 && claim.drain_previous,
+            },
+        )
+        .await
+        .map_err(|failure| ExecuteManyFailure { failure, row_index })?;
+        match outcome {
+            ExecuteOutcome::Rows(metadata) => {
+                results.push_back(
+                    read_buffered_row_set(client, metadata)
+                        .await
+                        .map_err(|failure| ExecuteManyFailure { failure, row_index })?,
+                );
+            }
+            ExecuteOutcome::NoRows(count) | ExecuteOutcome::TerminalNoRows(count) => {
+                accumulate_rowcount(&mut total, count);
+            }
+        }
+
+        while client.has_open_batch() {
+            let next = client
+                .advance()
+                .await
+                .map_err(ExecuteFailure::from)
+                .map_err(|failure| ExecuteManyFailure { failure, row_index })?;
+            match next {
+                StatementResult::Rows => {
+                    let metadata = client.get_metadata().clone();
+                    results.push_back(
+                        read_buffered_row_set(client, metadata)
+                            .await
+                            .map_err(|failure| ExecuteManyFailure { failure, row_index })?,
+                    );
+                }
+                StatementResult::NoRows { rows_affected } => {
+                    let count = rowcount_from_rows_affected(rows_affected);
+                    accumulate_rowcount(&mut total, count);
+                }
+                StatementResult::End => break,
+            }
+        }
+        client.take_dml_result_counts();
+        yield_at_interval(
+            row_index + 1,
+            EXECUTEMANY_EXECUTION_YIELD_INTERVAL,
+            "execution",
+        )
+        .await;
+    }
+
+    Ok((
+        if results.is_empty() {
+            total.unwrap_or(-1)
+        } else {
+            -1
+        },
+        results,
+    ))
+}
+
+async fn read_buffered_row_set(
+    client: &mut TdsClient,
+    metadata: Vec<ColumnMetadata>,
+) -> Result<BufferedRowSet, ExecuteFailure> {
+    let mut rows = VecDeque::new();
+    loop {
+        let mut writer = PyRowWriter::new(metadata.len());
+        if !client.next_row_into(&mut writer).await? {
+            break;
+        }
+        rows.push_back(writer);
+        yield_at_interval(
+            rows.len(),
+            EXECUTEMANY_BUFFER_YIELD_INTERVAL,
+            "result_buffering",
+        )
+        .await;
+    }
+    Ok(BufferedRowSet { metadata, rows })
+}
+
+async fn bind_parameter_sets(
+    operation: String,
+    seq_of_parameters: Py<PyAny>,
+    hints: Option<Vec<ParameterHint>>,
+) -> PyResult<(String, Vec<BoundParameterSet>)> {
+    let iterator = Python::attach(|py| {
+        seq_of_parameters
+            .bind(py)
+            .try_iter()
+            .map(Bound::<PyIterator>::unbind)
+    })?;
+    let mut state = ExecuteManyBindingState {
+        operation,
+        iterator,
+        hints,
+        parameter_sets: Vec::new(),
+        plan: None,
+        named: None,
+    };
+    loop {
+        let (next_state, exhausted) = tokio::task::spawn_blocking(move || {
+            Python::attach(|py| bind_parameter_chunk(py, state))
+        })
+        .await
+        .map_err(|error| {
+            PyRuntimeError::new_err(format!(
+                "ExecuteMany parameter binding task failed: {error}"
+            ))
+        })??;
+        state = next_state;
+        if exhausted {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let ExecuteManyBindingState {
+        operation,
+        parameter_sets,
+        plan,
+        ..
+    } = state;
+    Ok((
+        plan.map_or_else(|| operation, |plan| plan.operation().to_string()),
+        parameter_sets,
+    ))
+}
+
+fn bind_parameter_chunk(
+    py: Python<'_>,
+    mut state: ExecuteManyBindingState,
+) -> PyResult<(ExecuteManyBindingState, bool)> {
+    let mut iterator = state.iterator.bind(py).clone();
+    for _ in 0..EXECUTEMANY_PREFLIGHT_CHUNK_SIZE {
+        let Some(row) = iterator.next() else {
+            return Ok((state, true));
+        };
+        let row = row?;
+        let row_index = state.parameter_sets.len();
+        let row_is_named = row.cast::<PyDict>().is_ok();
+        let row_is_positional = row.cast::<PyTuple>().is_ok()
+            || row.cast::<PyList>().is_ok()
+            || row.get_type().name()? == "Row";
+        if !row_is_named && !row_is_positional {
+            return Err(PyTypeError::new_err(format!(
+                "executemany parameter row {row_index} must be a tuple, list, Row, or dict"
+            )));
+        }
+        if state.named.is_some_and(|named| named != row_is_named) {
+            return Err(PyTypeError::new_err(format!(
+                "Mixed parameter types in executemany at row {row_index}"
+            )));
+        }
+        state.named = Some(row_is_named);
+
+        let plan = get_or_create_binding_plan(&mut state.plan, &state.operation, row_is_named)?;
+        let parameter_set = plan
+            .bind_row(&row, state.hints.as_deref())
+            .map_err(|error| {
+                if error.is_instance_of::<PyTypeError>(py) {
+                    PyTypeError::new_err(format!("executemany parameter row {row_index}: {error}"))
+                } else {
+                    error
+                }
+            })?;
+        state.parameter_sets.push(parameter_set);
+    }
+    Ok((state, false))
 }
 
 fn map_execute_error(error: Error, info_messages: Vec<SqlInfoMessage>) -> PyErr {
@@ -294,6 +681,15 @@ pub(crate) fn set_input_sizes(
     sizes: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     cursor.replace_input_sizes(parse_input_sizes(sizes)?)
+}
+
+fn consume_input_sizes(cursor: &Py<PyAsyncCursor>, generation: u64) {
+    Python::attach(|py| {
+        let mut cursor = cursor.borrow_mut(py);
+        if cursor.input_sizes_generation() == generation {
+            cursor.clear_input_sizes();
+        }
+    });
 }
 
 pub(crate) fn execute<'py>(
@@ -316,33 +712,36 @@ pub(crate) fn execute<'py>(
         input_sizes,
         input_sizes_generation,
         cleanup_required,
+        closed: _,
         fetch_state,
         description_state,
+        rowcount,
+        buffered_results,
     } = resources;
-    // TODO(async execute preflight): Parameter normalization and Python-to-TDS
-    // conversion currently run synchronously under the GIL before the awaitable is
-    // returned. Bound or chunk large parameter/TVP conversion so execute does not
-    // block the caller's event-loop thread during preflight.
     let (operation, rpc_parameters, parameter_signature) =
         bind_parameters(operation, parameters, input_sizes.as_deref())?;
+    let claim = session_state
+        .claim_execute(cursor_id)
+        .map_err(map_claim_error)?;
     let request = ExecuteRequest {
-        operation,
+        operation: Cow::Owned(operation),
         rpc_parameters,
         parameter_signature,
         use_prepare,
         reset_cursor,
         timeout,
         autocommit,
+        drain_previous: claim.drain_previous,
     };
-    let claim = session_state
-        .claim_execute(cursor_id)
-        .map_err(map_claim_error)?;
     let operation_id = claim.operation_id;
     let future_state = session_state.clone();
     let previous_fetch_status = fetch_state.replace(FetchStatus::NoResultSet);
     let future_fetch_state = fetch_state.clone();
     let previous_description = description_state.replace(None);
     let future_description_state = description_state.clone();
+    let previous_rowcount = rowcount.swap(-1, Ordering::AcqRel);
+    let previous_buffered_results = buffered_results.replace(VecDeque::new());
+    let future_rowcount = rowcount.clone();
 
     let future = async move {
         let mut operation_guard = SessionOperationGuard::new(future_state, operation_id);
@@ -374,6 +773,7 @@ pub(crate) fn execute<'py>(
 
         match result {
             Ok(outcome) => {
+                future_rowcount.store(outcome.rowcount(), Ordering::Release);
                 let has_open_batch = outcome.has_open_batch();
                 let has_result_set = outcome.has_rows();
                 let fetch_status = outcome.fetch_status();
@@ -381,15 +781,10 @@ pub(crate) fn execute<'py>(
                 operation_guard.finish_execute(has_open_batch);
                 let metadata = match outcome {
                     ExecuteOutcome::Rows(metadata) => Some(metadata),
-                    ExecuteOutcome::NoRows | ExecuteOutcome::TerminalNoRows => None,
+                    ExecuteOutcome::NoRows(_) | ExecuteOutcome::TerminalNoRows(_) => None,
                 };
                 let column_count = metadata.as_ref().map_or(0, Vec::len);
-                Python::attach(|py| {
-                    let mut cursor_ref = cursor.borrow_mut(py);
-                    if cursor_ref.input_sizes_generation() == input_sizes_generation {
-                        cursor_ref.clear_input_sizes();
-                    }
-                });
+                consume_input_sizes(&cursor, input_sizes_generation);
                 let description_started = Instant::now();
                 let description = materialize(metadata).await.map_err(|error| {
                     tracing::error!(
@@ -429,20 +824,256 @@ pub(crate) fn execute<'py>(
             session_state.release_operation(operation_id);
             fetch_state.set(previous_fetch_status);
             description_state.replace(previous_description);
+            rowcount.store(previous_rowcount, Ordering::Release);
+            buffered_results.replace(previous_buffered_results);
             Err(error)
         }
     }
 }
 
+pub(crate) fn executemany<'py>(
+    cursor: Py<PyAsyncCursor>,
+    py: Python<'py>,
+    operation: String,
+    seq_of_parameters: &Bound<'_, PyAny>,
+    use_prepare: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let resources = cursor.borrow(py).execute_resources()?;
+    let ExecuteResources {
+        client,
+        dispatch,
+        prepared_state,
+        autocommit,
+        session_state,
+        cursor_id,
+        timeout,
+        input_sizes,
+        input_sizes_generation,
+        cleanup_required,
+        closed,
+        fetch_state,
+        description_state,
+        rowcount,
+        buffered_results,
+    } = resources;
+    let seq_of_parameters = seq_of_parameters.clone().unbind();
+    let trace_dispatch = dispatch.clone();
+
+    let future = async move {
+        let started = Instant::now();
+        let preflight_started = Instant::now();
+        let mut preflight_guard = ExecuteManyPreflightGuard::new(cursor_id, trace_dispatch.clone());
+        tracing::debug!(
+            cursor_id,
+            "PyAsyncCursor::executemany: parameter preflight started; cursor_id={cursor_id}"
+        );
+        let preflight = bind_parameter_sets(operation, seq_of_parameters, input_sizes).await;
+        let preflight_ms = preflight_started.elapsed().as_millis();
+        let (operation, parameter_sets) = match preflight {
+            Ok(bound) => {
+                preflight_guard.complete();
+                bound
+            }
+            Err(error) => {
+                preflight_guard.complete();
+                tracing::error!(
+                    cursor_id,
+                    preflight_ms,
+                    error = %error,
+                    "PyAsyncCursor::executemany: parameter preflight failed; cursor_id={cursor_id}; preflight_ms={preflight_ms}; error={error}"
+                );
+                return Err(error);
+            }
+        };
+        let parameter_count = parameter_sets.first().map_or(0, |set| set.0.len());
+        let batch_count = parameter_sets.len();
+        tracing::debug!(
+            cursor_id,
+            batch_count,
+            parameter_count,
+            preflight_ms,
+            "PyAsyncCursor::executemany: parameter preflight completed; cursor_id={cursor_id}; batch_count={batch_count}; parameter_count={parameter_count}; preflight_ms={preflight_ms}"
+        );
+        let request = ExecuteManyRequest {
+            operation,
+            parameter_sets,
+            use_prepare,
+            timeout,
+            autocommit,
+        };
+        if closed.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("Cursor is closed"));
+        }
+        let claim = session_state
+            .claim_execute(cursor_id)
+            .map_err(map_claim_error)?;
+        let operation_id = claim.operation_id;
+        let execution = async move {
+            fetch_state.set(FetchStatus::NoResultSet);
+            description_state.replace(None);
+            rowcount.store(-1, Ordering::Release);
+            buffered_results.replace(VecDeque::new());
+            let mut operation_guard =
+                SessionOperationGuard::new(session_state.clone(), operation_id);
+            let mut interruption_guard =
+                ExecuteManyInterruptionGuard::new(cursor_id, operation_id, trace_dispatch);
+            cleanup_required.store(true, Ordering::Release);
+            tracing::info!(
+                batch_count,
+                parameter_count,
+                use_prepare,
+                preflight_ms,
+                "PyAsyncCursor::executemany: executing parameter rows; batch_count={batch_count}; parameter_count={parameter_count}; use_prepare={use_prepare}; preflight_ms={preflight_ms}"
+            );
+
+            let execution_started = Instant::now();
+            let (result, info_messages, has_open_batch) = {
+                let mut client = client.lock().await;
+                let result =
+                    execute_many_on_client(&mut client, &prepared_state, &claim, request).await;
+                let info_messages = if result.is_err() {
+                    client.take_info_messages()
+                } else {
+                    Vec::new()
+                };
+                let has_open_batch = client.has_open_batch();
+                (result, info_messages, has_open_batch)
+            };
+            let execution_ms = execution_started.elapsed().as_millis();
+
+            match result {
+                Ok((total_rows_affected, results)) => {
+                    let produced_rows = !results.is_empty();
+                    let result_set_count = results.len();
+                    let buffered_row_count = results
+                        .iter()
+                        .map(|result| result.rows.len())
+                        .sum::<usize>();
+                    let total_rows_affected = if batch_count == 0 {
+                        0
+                    } else {
+                        total_rows_affected
+                    };
+                    let metadata = results.front().map(|result| result.metadata.clone());
+                    interruption_guard.set_phase("description_materialization");
+                    let description_started = Instant::now();
+                    let description = match materialize(metadata).await {
+                        Ok(description) => description,
+                        Err(error) => {
+                            let description_materialization_ms =
+                                description_started.elapsed().as_millis();
+                            record_result_set_status("error");
+                            tracing::error!(
+                                batch_count,
+                                result_set_count,
+                                buffered_row_count,
+                                preflight_ms,
+                                execution_ms,
+                                description_materialization_ms,
+                                error = %error,
+                                "PyAsyncCursor::executemany: cursor description materialization failed; batch_count={batch_count}; result_set_count={result_set_count}; buffered_row_count={buffered_row_count}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; description_materialization_ms={description_materialization_ms}; error={error}"
+                            );
+                            operation_guard.settle(false);
+                            interruption_guard.complete();
+                            return Err(InternalError::new_err(format!(
+                                "ExecuteMany completed but cursor description materialization failed: {error}"
+                            )));
+                        }
+                    };
+                    let description_materialization_ms = description_started.elapsed().as_millis();
+                    buffered_results.replace(results);
+                    description_state.replace(description);
+                    fetch_state.set(if produced_rows {
+                        FetchStatus::Ready
+                    } else if batch_count > 0 {
+                        FetchStatus::TerminalNoRows
+                    } else {
+                        FetchStatus::NoResultSet
+                    });
+                    rowcount.store(total_rows_affected, Ordering::Release);
+                    operation_guard.finish_execute(produced_rows);
+                    interruption_guard.complete();
+                    // Empty input dispatches no operation, so preserve hints for the next execution.
+                    if batch_count > 0 {
+                        consume_input_sizes(&cursor, input_sizes_generation);
+                    }
+                    record_result_set_status(if produced_rows {
+                        "rows_drained"
+                    } else {
+                        "no_rows"
+                    });
+                    let elapsed_ms = started.elapsed().as_millis();
+                    tracing::info!(
+                        batch_count,
+                        total_rows_affected,
+                        produced_rows,
+                        result_set_count,
+                        buffered_row_count,
+                        preflight_ms,
+                        execution_ms,
+                        description_materialization_ms,
+                        elapsed_ms,
+                        "PyAsyncCursor::executemany: completed; batch_count={batch_count}; total_rows_affected={total_rows_affected}; produced_rows={produced_rows}; result_set_count={result_set_count}; buffered_row_count={buffered_row_count}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; description_materialization_ms={description_materialization_ms}; elapsed_ms={elapsed_ms}"
+                    );
+                    Ok(cursor)
+                }
+                Err(error) => {
+                    record_result_set_status("error");
+                    let connection_marked_broken = error.failure.break_connection || has_open_batch;
+                    operation_guard.settle(connection_marked_broken);
+                    interruption_guard.complete();
+                    let elapsed_ms = started.elapsed().as_millis();
+                    tracing::error!(
+                        failed_row_index = error.row_index,
+                        connection_marked_broken,
+                        preflight_ms,
+                        execution_ms,
+                        elapsed_ms,
+                        error = %error.failure.error,
+                        "PyAsyncCursor::executemany: failed; failed_row_index={}; connection_marked_broken={connection_marked_broken}; preflight_ms={preflight_ms}; execution_ms={execution_ms}; elapsed_ms={elapsed_ms}; error={}",
+                        error.row_index,
+                        error.failure.error
+                    );
+                    let error = map_tds_error(
+                        &format!(
+                            "PyAsyncCursor.executemany failed while executing parameter row {}",
+                            error.row_index
+                        ),
+                        error.failure.error,
+                        info_messages,
+                    );
+                    fetch_state.set(FetchStatus::NoResultSet);
+                    description_state.replace(None);
+                    rowcount.store(-1, Ordering::Release);
+                    buffered_results.replace(VecDeque::new());
+                    Err(error)
+                }
+            }
+        };
+        in_cursor_operation_span(execution, cursor_id, operation_id, "executemany", "pending").await
+    };
+    let future = async move {
+        match dispatch {
+            Some(dispatch) => future.with_subscriber(dispatch).await,
+            None => future.await,
+        }
+    };
+
+    pyo3_async_runtimes::tokio::future_into_py(py, future)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use mssql_tds::connection::tds_client::PreparedStatement;
     use mssql_tds::error::Error;
 
     use super::{
-        ExecuteFailure, ParameterMetadata, PreparedState, should_replace_prepared_statement,
+        EXECUTEMANY_BUFFER_YIELD_INTERVAL, EXECUTEMANY_EXECUTION_YIELD_INTERVAL, ExecuteFailure,
+        ParameterMetadata, PreparedState, accumulate_rowcount, get_or_create_binding_plan,
+        rowcount_from_rows_affected, should_replace_prepared_statement, yield_at_interval,
     };
     use crate::async_session::{
         AsyncConnectionState, ClaimError, ConnectionLifecycle, SessionOperationGuard,
@@ -454,6 +1085,69 @@ mod tests {
             parameter_signature: signature,
             orphaned: None,
         }
+    }
+
+    async fn assert_yields_at_boundary(interval: usize) {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            ticker_ticks.fetch_add(1, Ordering::Release);
+        });
+
+        yield_at_interval(interval - 1, interval, "test").await;
+        assert_eq!(ticks.load(Ordering::Acquire), 0);
+
+        yield_at_interval(interval, interval, "test").await;
+        assert_eq!(ticks.load(Ordering::Acquire), 1);
+        ticker.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executemany_yields_at_execution_and_buffer_boundaries() {
+        assert_yields_at_boundary(EXECUTEMANY_EXECUTION_YIELD_INTERVAL).await;
+        assert_yields_at_boundary(EXECUTEMANY_BUFFER_YIELD_INTERVAL).await;
+    }
+
+    #[test]
+    fn executemany_reuses_parameter_binding_plan() {
+        let mut plan = None;
+        let first = get_or_create_binding_plan(&mut plan, "SELECT ?", false).unwrap() as *const _;
+
+        let reused =
+            get_or_create_binding_plan(&mut plan, "SELECT %(value)s", false).unwrap() as *const _;
+
+        assert_eq!(first, reused);
+    }
+
+    #[test]
+    fn rows_affected_overflow_is_unknown() {
+        assert_eq!(rowcount_from_rows_affected(None), -1);
+        assert_eq!(rowcount_from_rows_affected(Some(i64::MAX as u64)), i64::MAX);
+        assert_eq!(rowcount_from_rows_affected(Some(i64::MAX as u64 + 1)), -1);
+        assert_eq!(rowcount_from_rows_affected(Some(u64::MAX)), -1);
+    }
+
+    #[test]
+    fn unknown_rowcount_latches_the_aggregate() {
+        let mut total = Some(0_i64);
+        accumulate_rowcount(&mut total, 2);
+        assert_eq!(total, Some(2));
+
+        accumulate_rowcount(&mut total, -1);
+        assert_eq!(total, None);
+
+        accumulate_rowcount(&mut total, 5);
+        assert_eq!(total, None);
+    }
+
+    #[test]
+    fn rowcount_aggregate_overflow_is_unknown() {
+        let mut total = Some(i64::MAX - 1);
+        accumulate_rowcount(&mut total, 5);
+        assert_eq!(total, None);
+
+        accumulate_rowcount(&mut total, 1);
+        assert_eq!(total, None);
     }
 
     #[test]

@@ -1837,7 +1837,7 @@ impl TdsValueSerializer {
         let base_type = Self::get_variant_base_type(value)?;
 
         // Calculate property byte length using shared function
-        let prop_len = Self::calculate_type_info_length(base_type, value);
+        let prop_len = Self::calculate_type_info_length(base_type, value)?;
 
         // Calculate the data size without actually serializing (to avoid creating temp writer)
         let data_size = Self::calculate_value_size(value)?;
@@ -1965,8 +1965,8 @@ impl TdsValueSerializer {
     /// - 7 bytes: String types (collation[5] + max_length[2])
     ///
     /// This function is shared between sql_variant serialization and COLMETADATA encoding.
-    fn calculate_type_info_length(tds_type: u8, _value: &ColumnValues) -> u8 {
-        match tds_type {
+    fn calculate_type_info_length(tds_type: u8, _value: &ColumnValues) -> TdsResult<u8> {
+        Ok(match tds_type {
             // Fixed-length types: 0 property bytes (type code defines everything)
             x if x == TdsDataType::Int1 as u8
                 || x == TdsDataType::Int2 as u8
@@ -2009,9 +2009,15 @@ impl TdsValueSerializer {
                 7
             }
 
-            // All valid types from get_variant_base_type are handled above
-            _ => unreachable!("Invalid TDS type 0x{:02X} for sql_variant", tds_type),
-        }
+            // Every type `get_variant_base_type` can return is handled above. A
+            // new one reaching here would otherwise desynchronise the declared
+            // prop-byte count from what `write_type_info_bytes` emits.
+            _ => {
+                return Err(Error::ProtocolError(format!(
+                    "no sql_variant TYPE_INFO length for TDS type 0x{tds_type:02X}"
+                )));
+            }
+        })
     }
 
     /// Write TYPE_INFO bytes for a sql_variant value to the packet writer.
@@ -2108,8 +2114,12 @@ impl TdsValueSerializer {
                 writer.write_u16_async(max_length).await?;
             }
 
-            // All valid types from get_variant_base_type are handled above
-            _ => unreachable!("Invalid TDS type 0x{:02X} for sql_variant", tds_type),
+            // Every type `get_variant_base_type` can return is handled above.
+            _ => {
+                return Err(Error::ProtocolError(format!(
+                    "no sql_variant TYPE_INFO writer for TDS type 0x{tds_type:02X}"
+                )));
+            }
         }
 
         Ok(())
@@ -3741,6 +3751,57 @@ mod serializer_tests {
         assert_eq!(&p[0..4], &13u32.to_le_bytes());
         assert_eq!(p[4], 0xE7); // NVARCHAR
         assert_eq!(p[5], 0x07); // prop_len = 7
+    }
+
+    /// A TDS type the variant writers do not handle must be an error, never a
+    /// panic: these run behind an `extern "C"` ODBC boundary, where unwinding is
+    /// undefined and an abort takes the host process with it. 0xFF is not a
+    /// value `get_variant_base_type` can return, so this is only reachable if
+    /// the two ever drift apart - which is exactly when it must not abort.
+    #[test]
+    fn an_unhandled_variant_base_type_errors_rather_than_panicking() {
+        let value = ColumnValues::Int(42);
+        assert!(TdsValueSerializer::calculate_type_info_length(0xFF, &value).is_err());
+
+        let mut mock = MockNetworkWriter::new(64);
+        let mut w = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let ctx = nullable_ctx(0x62);
+        assert!(
+            block_on(TdsValueSerializer::write_type_info_bytes(
+                &mut w, 0xFF, &value, &ctx
+            ))
+            .is_err()
+        );
+    }
+
+    /// Every base type `get_variant_base_type` produces must be accepted by both
+    /// writers, which is the invariant the removed `unreachable!` was asserting.
+    #[test]
+    fn every_variant_base_type_has_a_type_info_length() {
+        use crate::datatypes::decoder::DecimalParts;
+        let values = [
+            ColumnValues::TinyInt(1),
+            ColumnValues::SmallInt(1),
+            ColumnValues::Int(1),
+            ColumnValues::BigInt(1),
+            ColumnValues::Real(1.0),
+            ColumnValues::Float(1.0),
+            ColumnValues::Bit(true),
+            ColumnValues::Decimal(DecimalParts::new(true, 10, 2, 1)),
+            ColumnValues::Uuid(uuid::Uuid::nil()),
+            ColumnValues::Bytes(vec![1]),
+            ColumnValues::String(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                "a".to_string(),
+            )),
+        ];
+        for value in &values {
+            let base = TdsValueSerializer::get_variant_base_type(value)
+                .unwrap_or_else(|e| panic!("no base type for {value:?}: {e:?}"));
+            assert!(
+                TdsValueSerializer::calculate_type_info_length(base, value).is_ok(),
+                "no TYPE_INFO length for {value:?} (base 0x{base:02X})"
+            );
+        }
     }
 }
 

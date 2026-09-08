@@ -37,6 +37,7 @@ pub(crate) enum NumericSource {
         negative: bool,
         int_part: i128,
         fraction_dropped: bool,
+        fractional_precision: u32,
     },
     Float(f64),
 }
@@ -121,10 +122,22 @@ fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
     {
         return None;
     }
-    let mantissa: i128 = format!("{int_digits}{frac_digits}").parse().ok()?;
+    // Trailing fraction zeros carry no value but do consume mantissa digits, so
+    // dropping them keeps literals exact that would otherwise overflow an `i128`
+    // and fall through to `parse_wide_decimal` - where the value reaches the wire
+    // as an `f64` and loses digits with no diagnostic. `"1.50"` and `"1.5"` are
+    // the same number, so nothing that parses today answers differently.
+    let frac_digits = frac_digits.trim_end_matches('0');
+    let digits = format!("{int_digits}{frac_digits}");
+    // `".000"` trims to no digits at all, but it is still the number zero.
+    let mantissa: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     Some(NumericSource::Scaled {
         mantissa: if negative { -mantissa } else { mantissa },
-        scale: frac_digits.len() as u32,
+        scale: u32::try_from(frac_digits.len()).unwrap_or(u32::MAX),
     })
 }
 
@@ -132,6 +145,49 @@ fn parse_decimal_literal(text: &str) -> Option<NumericSource> {
 /// as [`ConvError::OutOfRange`] rather than wrapping.
 pub(crate) fn narrow_i128<T: TryFrom<i128>>(v: i128) -> Result<T, ConvError> {
     T::try_from(v).map_err(|_| ConvError::OutOfRange)
+}
+
+/// Narrows a 64-bit source to `real`, for either direction.
+///
+/// One function because msodbcsql has one arm: `SQL_C_FLOAT` and `SQL_REAL` are
+/// both `7`, so `case SQL_C_FLOAT` (`sqlccnvt.cpp:5519`) serves a `real`
+/// parameter and a `SQL_C_FLOAT` fetch buffer alike - the same identifier
+/// collision that makes [`parse_numeric_text`] shared. Its rule is symmetric:
+///
+/// ```cpp
+/// if (Temp > FLT_MAX || Temp < -FLT_MAX ||
+///     (Temp > 0.0 && Temp < FLT_MIN) ||
+///     (Temp < 0.0 && Temp > -FLT_MIN))
+///     Error = CVT_PREC;            // IDS_22_003
+/// ```
+///
+/// So a non-zero magnitude *below* `f32::MIN_POSITIVE` is `22003` rather than a
+/// silent flush to zero - the half that is easy to miss.
+///
+/// Only a genuine narrowing may reach here. A 32-bit source is already `real`,
+/// and retail 18.6.2.1 sends its subnormals in both directions rather than
+/// rejecting them, so `SQL_C_FLOAT` params take [`convert_real_sql`] and `real`
+/// columns are copied. Widening such a source to `f64` and arriving here would
+/// turn an exactly representable value into `22003`.
+///
+/// The fetch direction is pinned against retail by
+/// `FloatTargetRejectsUnderflowAsWellAsOverflow` (`get_data_test.cpp`), which
+/// runs unskipped on the msodbcsql parity leg: a `float` column below
+/// `FLT_MIN` read into a `SQL_C_FLOAT` buffer is `22003` there as well.
+///
+/// The comparisons are left to reproduce the C semantics on their own rather
+/// than being guarded by a finiteness check. `Temp` is a `DOUBLE`
+/// (`sqlccnvt.cpp:5327`) and `FLT_MAX` promotes to one, so `+INF > FLT_MAX`
+/// holds and an infinity is `22003`; a NaN compares false four times and
+/// passes. Zero passes on the `Temp > 0.0` / `Temp < 0.0` guards.
+///
+/// [`convert_real_sql`]: crate::conversion::param_convert
+pub(crate) fn narrow_f64_to_f32(v: f64) -> Result<f32, ConvError> {
+    let magnitude = v.abs();
+    if magnitude > f64::from(f32::MAX) || (v != 0.0 && magnitude < f64::from(f32::MIN_POSITIVE)) {
+        return Err(ConvError::OutOfRange);
+    }
+    Ok(v as f32)
 }
 
 /// Interprets text as a number, for either direction (fetch & params).
@@ -239,12 +295,56 @@ fn parse_wide_decimal(text: &str) -> Option<NumericSource> {
         negative,
         int_part: if negative { -int_part } else { int_part },
         fraction_dropped: frac_digits.bytes().any(|b| b != b'0'),
+        fractional_precision: u32::try_from(frac_digits.trim_end_matches('0').len())
+            .unwrap_or(u32::MAX),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `real` range check is symmetric, and both directions get the same
+    /// answer because they call this one function. Fetch used to check only the
+    /// overflow half, so a magnitude below `FLT_MIN` was written through `v as
+    /// f32`: exact for a subnormal, and flushed to zero only below roughly
+    /// `1.4e-45`. Either way it was silent where msodbcsql answers `22003`.
+    #[test]
+    fn the_real_range_check_is_symmetric() {
+        for v in [1e39f64, -1e39, 1e-40, -1e-40] {
+            assert_eq!(
+                narrow_f64_to_f32(v),
+                Err(ConvError::OutOfRange),
+                "value {v}"
+            );
+        }
+
+        // The boundaries themselves are representable, and zero is not
+        // underflow: msodbcsql guards the underflow arms with `Temp > 0.0` /
+        // `Temp < 0.0` (`sqlccnvt.cpp:5520`).
+        for v in [
+            0.0f64,
+            -0.0,
+            f64::from(f32::MAX),
+            f64::from(f32::MIN_POSITIVE),
+            -f64::from(f32::MIN_POSITIVE),
+        ] {
+            assert!(narrow_f64_to_f32(v).is_ok(), "value {v}");
+        }
+    }
+
+    /// An infinity exceeds `FLT_MAX` and is rejected; a NaN compares false
+    /// against every bound and passes. Both fall out of the comparisons rather
+    /// than being special-cased, which is what msodbcsql does.
+    #[test]
+    fn an_infinity_is_out_of_range_but_a_nan_is_not() {
+        assert_eq!(narrow_f64_to_f32(f64::INFINITY), Err(ConvError::OutOfRange));
+        assert_eq!(
+            narrow_f64_to_f32(f64::NEG_INFINITY),
+            Err(ConvError::OutOfRange)
+        );
+        assert!(narrow_f64_to_f32(f64::NAN).unwrap().is_nan());
+    }
 
     #[test]
     fn plain_decimal_literals_parse_exactly() {
@@ -276,6 +376,36 @@ mod tests {
             Some(NumericSource::Scaled {
                 mantissa: -1,
                 scale: 2
+            })
+        );
+    }
+
+    /// Trailing fraction zeros are dropped so they cannot consume mantissa
+    /// digits and push an otherwise exact literal onto the wide-decimal path,
+    /// where only the `f64` approximation survives. `".000"` trims to nothing
+    /// at all and is still zero.
+    #[test]
+    fn trailing_fraction_zeros_do_not_cost_mantissa_digits() {
+        assert_eq!(
+            parse_decimal_literal("1.50"),
+            Some(NumericSource::Scaled {
+                mantissa: 15,
+                scale: 1
+            })
+        );
+        let wide = format!("{}.00", "1".repeat(38));
+        assert_eq!(
+            parse_decimal_literal(&wide),
+            Some(NumericSource::Scaled {
+                mantissa: "1".repeat(38).parse().unwrap(),
+                scale: 0
+            })
+        );
+        assert_eq!(
+            parse_decimal_literal(".000"),
+            Some(NumericSource::Scaled {
+                mantissa: 0,
+                scale: 0
             })
         );
     }

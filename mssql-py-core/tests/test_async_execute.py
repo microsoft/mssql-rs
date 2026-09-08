@@ -661,6 +661,35 @@ def test_setinputsizes_preserves_temporal_scale(
     asyncio.run(run())
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("use_prepare", [True, False])
+def test_setinputsizes_datetime_hint_preserves_aware_wall_clock(
+    client_context, use_prepare
+):
+    async def run():
+        conn = await connect(client_context)
+        try:
+            cursor = conn.cursor()
+            cursor.setinputsizes([(93, 0, 7)])  # SQL_TYPE_TIMESTAMP
+            value = datetime.datetime(
+                2024,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                tzinfo=datetime.timezone(datetime.timedelta(hours=14)),
+            )
+            await cursor.execute("SELECT CAST(? AS datetime2(7))", value, use_prepare=use_prepare)
+
+            assert await cursor.fetchone() == (value.replace(tzinfo=None),)
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("use_prepare", [True, False])
 @pytest.mark.parametrize("offset_seconds", [30, -30])
 def test_execute_rejects_sub_minute_datetimeoffset(

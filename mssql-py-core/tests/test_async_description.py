@@ -240,7 +240,7 @@ def test_description_vector_type_and_scale_match_fetched_value(client_context):
 
 
 @pytest.mark.integration
-def test_description_survives_fetch_empty_result_exhaustion_and_close(client_context):
+def test_description_survives_exhaustion_and_is_cleared_on_close(client_context):
     async def run():
         conn = await connect(client_context)
         cursor = conn.cursor()
@@ -262,7 +262,7 @@ def test_description_survives_fetch_empty_result_exhaustion_and_close(client_con
             assert await cursor.fetchone() is None
             assert cursor.description == description
             await cursor.close()
-            assert cursor.description == description
+            assert cursor.description is None
         finally:
             await conn.close()
 

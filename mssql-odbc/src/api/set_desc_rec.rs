@@ -290,6 +290,22 @@ mod tests {
         value
     }
 
+    fn get_len(handle: SqlHandle, record: SqlSmallInt, field: SqlSmallInt) -> SqlLen {
+        let mut value: SqlLen = -1;
+        let ret = unsafe {
+            sql_get_desc_field_w(
+                handle,
+                record,
+                field,
+                &mut value as *mut SqlLen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS, "GET failed reading back field {field}");
+        value
+    }
+
     #[test]
     fn null_handle_returns_invalid_handle() {
         let ret = unsafe {
@@ -409,10 +425,7 @@ mod tests {
             get_small_int(h.ard(), 1, SQL_DESC_CONCISE_TYPE as SqlSmallInt),
             canonical_c_type_i32()
         );
-        assert_eq!(
-            get_small_int(h.ard(), 1, SQL_DESC_OCTET_LENGTH as SqlSmallInt),
-            4
-        );
+        assert_eq!(get_len(h.ard(), 1, SQL_DESC_OCTET_LENGTH as SqlSmallInt), 4);
         let mut data_ptr: SqlPointer = ptr::null_mut();
         unsafe {
             sql_get_desc_field_w(

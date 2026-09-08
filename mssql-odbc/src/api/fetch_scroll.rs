@@ -56,9 +56,10 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::resolve_default_c_type;
 use crate::api::util::{copy_with_nul, write_if_some};
+use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
-    DateTimeParts, date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
+    date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::OdbcVersion;
@@ -1566,7 +1567,11 @@ unsafe fn write_row_status(row_status_ptr: *mut SqlUSmallInt, row: SqlULen, stat
 /// ODBC ignores `BufferLength` for a fixed-width target — an application may
 /// legitimately pass anything, including 0 — so the stride there comes from the
 /// C type. Only the character and binary targets are sized by the application.
-fn element_stride(target_type: SqlSmallInt, buffer_length: SqlLen) -> usize {
+///
+/// Called with `buffer_length` 0 it reads as "the width this C type writes, or
+/// 0 if the application sizes it", which is how both `SQL_C_DEFAULT` resolvers
+/// test a resolved fixed-width target against the caller's declared slot.
+pub(crate) fn element_stride(target_type: SqlSmallInt, buffer_length: SqlLen) -> usize {
     match target_type {
         SQL_C_BIT | SQL_C_TINYINT | SQL_C_STINYINT | SQL_C_UTINYINT => 1,
         SQL_C_SSHORT | SQL_C_USHORT => 2,

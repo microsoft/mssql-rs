@@ -169,6 +169,8 @@ def test_module_exposes_pyasynccursor():
     """PyAsyncCursor is registered on the extension module."""
     assert hasattr(mssql_py_core, "PyAsyncCursor")
     assert hasattr(mssql_py_core.PyAsyncCursor, "setinputsizes")
+    assert hasattr(mssql_py_core.PyAsyncCursor, "executemany")
+    assert hasattr(mssql_py_core.PyAsyncCursor, "rowcount")
     assert hasattr(mssql_py_core.PyAsyncCursor, "close")
     assert hasattr(mssql_py_core, "TableValuedParameter")
     assert mssql_py_core.SQL_XML == 241

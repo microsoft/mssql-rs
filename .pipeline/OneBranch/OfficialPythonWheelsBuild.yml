@@ -50,4 +50,5 @@ extends:
       parameters:
         buildAllTargets: true
         buildPythonWheels: true
+        buildOdbcNative: true
         isOfficial: true

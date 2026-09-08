@@ -255,13 +255,7 @@ TEST_F(DescribeParamLiveTest, DescribesMaxLengthParameters) {
 
 // A described decimal must be re-declared with the same precision and scale, or
 // the first non-NULL value bound from that description would be truncated.
-//
-// Disabled because every bind is checked against the conversion matrix,
-// defaulted ones included: `SQL_DECIMAL` resolves to `SQL_C_CHAR`, which the
-// matrix pairs only with the character SQL types, so the bind is rejected with
-// HYC00. Re-enable when decimal conversions land (AB#47500) - this test also
-// guards the scale-0 wire-metadata regression, so it should come back with them.
-TEST_F(DescribeParamLiveTest, DISABLED_DescribedDecimalRoundTripsPrecisionAndScale) {
+TEST_F(DescribeParamLiveTest, DescribedDecimalRoundTripsPrecisionAndScale) {
     ASSERT_SQL_OK(Prepare("SELECT ISNULL(?, CAST(1.5 AS DECIMAL(12,3)))"),
                   SQL_HANDLE_STMT, stmt_);
 

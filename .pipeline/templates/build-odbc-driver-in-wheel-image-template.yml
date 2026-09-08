@@ -1,0 +1,33 @@
+# Build ONLY the mssql-odbc driver inside a given wheel-build container image so
+# the driver's libc floor matches the wheel it is injected into. Unlike
+# build-odbc-template.yml this skips the C++ gtest e2e build (not needed for the
+# injected driver) and runs in the manylinux_2_34 / musllinux_1_2 image rather
+# than ubuntu / alpine. CI (non-PR) only.
+
+parameters:
+  # Wheel-build container image to build the driver in (matches the wheel).
+  - name: image
+    type: string
+  # 'glibc' or 'musl' - musl needs a C toolchain added at runtime.
+  - name: libc
+    type: string
+  # Human-readable suffix for the step display name, e.g. 'glibc Linux x64'.
+  - name: displaySuffix
+    type: string
+
+steps:
+  - script: |
+      set -e
+      bash .pipeline/scripts/docker-cargo-run.sh --rm \
+        -v "$PWD:/workspace" \
+        -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+        -v "$HOME/.cargo/git:/root/.cargo/git" \
+        -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        -w /workspace \
+        ${{ parameters.image }} \
+        sh /workspace/scripts/build-odbc-driver-only.sh ${{ parameters.libc }}
+    displayName: 'Build ODBC driver in wheel image (${{ parameters.displaySuffix }})'
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    env:
+      CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+      CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)

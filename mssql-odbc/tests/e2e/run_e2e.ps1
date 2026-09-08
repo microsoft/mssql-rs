@@ -295,13 +295,14 @@ function Restore-Registration {
 
 # Run the (already-built) ctest suite, writing JUnit XML to $JunitName inside
 # the build dir. Returns ctest's exit code without aborting the script.
-function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName) {
+function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName, [string]$RustDriverDll) {
     Write-Host ""
     Write-Host "=== Running e2e tests against $Label ==="
     Write-Host "ODBC_TEST_DRIVER=$DriverName"
     Push-Location (Join-Path $ScriptDir "build")
     $prevTarget = $env:ODBC_TEST_TARGET
     $prevDriver = $env:ODBC_TEST_DRIVER
+    $prevDll = $env:MSSQL_ODBC_DLL
     try {
         $ctestArgs = @('--output-on-failure', '-C', 'Debug', '--output-junit', $JunitName)
         if ($Retries -gt 0) {
@@ -317,6 +318,17 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
         # ODBC_TEST_DRIVER selects the driver by name in the connection string.
         $env:ODBC_TEST_TARGET = $Label
         $env:ODBC_TEST_DRIVER = $DriverName
+        # dll_unload_stress_test loads the driver directly with LoadLibrary to
+        # exercise free-then-unload (AB#47831), so it needs a path rather than a
+        # registered name and skips without one. Set only for the Rust leg: the
+        # runtime whose teardown it guards is ours, so pointing it at the
+        # reference driver would test nothing. Skipping on the msodbcsql leg is
+        # parity-neutral — parity_report.py classifies a SKIP on either side as
+        # "skipped (not compared)".
+        $env:MSSQL_ODBC_DLL = $RustDriverDll
+        if ($RustDriverDll) {
+            Write-Host "MSSQL_ODBC_DLL=$RustDriverDll"
+        }
         # Stream ctest output to the host so only the exit code is returned
         # from this function (an uncaptured pipeline would be returned too).
         ctest @ctestArgs | Out-Host
@@ -324,6 +336,7 @@ function Invoke-CtestRun([string]$Label, [string]$JunitName, [string]$DriverName
     } finally {
         $env:ODBC_TEST_TARGET = $prevTarget
         $env:ODBC_TEST_DRIVER = $prevDriver
+        $env:MSSQL_ODBC_DLL = $prevDll
         Pop-Location
     }
 }
@@ -698,7 +711,7 @@ try {
 
     # Run 1: the Rust driver, registered under its own name.
     Register-RustDriver $DriverPath
-    $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml" $RustDriverName
+    $RustExit = Invoke-CtestRun "mssql-odbc" "junit-mssql-odbc.xml" $RustDriverName $DriverPath
     Assert-TestsExecuted $RustJunit "mssql-odbc"
 
     # Report on the instrumented mssql-odbc leg before the (uninstrumented)

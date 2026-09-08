@@ -434,10 +434,12 @@ pub const SQL_C_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
 pub const SQL_INTERVAL_YEAR: SqlSmallInt = 101;
 pub const SQL_INTERVAL_MINUTE_TO_SECOND: SqlSmallInt = 113;
 
-// SQLColAttribute field identifier for the underlying type of a `sql_variant`
-// column (msodbcsql: `SQL_CA_SS_BASE + 15`). Required by mssql-python's
-// sql_variant probe.
+// SQL Server-specific SQLColAttribute field identifiers.
 pub const SQL_CA_SS_VARIANT_TYPE: SqlUSmallInt = 1215;
+pub const SQL_CA_SS_UDT_CATALOG_NAME: SqlUSmallInt = 1218;
+pub const SQL_CA_SS_UDT_SCHEMA_NAME: SqlUSmallInt = 1219;
+pub const SQL_CA_SS_UDT_TYPE_NAME: SqlUSmallInt = 1220;
+pub const SQL_CA_SS_UDT_ASSEMBLY_TYPE_NAME: SqlUSmallInt = 1221;
 
 // ---- SQLColAttribute field identifiers --------------------------------------
 // The low-numbered ids are the ODBC 3.x descriptor fields that double as the

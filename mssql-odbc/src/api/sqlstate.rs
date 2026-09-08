@@ -27,6 +27,8 @@ pub(crate) const SQLSTATE_08S01: [u8; 5] = *b"08S01";
 pub(crate) const SQLSTATE_22001: [u8; 5] = *b"22001";
 pub(crate) const SQLSTATE_22002: [u8; 5] = *b"22002";
 pub(crate) const SQLSTATE_22003: [u8; 5] = *b"22003";
+pub(crate) const SQLSTATE_22007: [u8; 5] = *b"22007";
+pub(crate) const SQLSTATE_22008: [u8; 5] = *b"22008";
 pub(crate) const SQLSTATE_22018: [u8; 5] = *b"22018";
 pub(crate) const SQLSTATE_22026: [u8; 5] = *b"22026";
 pub(crate) const SQLSTATE_24000: [u8; 5] = *b"24000";
@@ -234,6 +236,23 @@ pub(crate) const ERR_NUMERIC_OUT_OF_RANGE: DiagMsg = DiagMsg {
 pub(crate) const ERR_INVALID_CHARACTER_VALUE: DiagMsg = DiagMsg {
     state: SQLSTATE_22018,
     text: "Invalid character value for cast specification",
+};
+/// A date/time C struct that names no real instant - month 13, 31 February, a
+/// year outside `0001`..`9999`, or an out-of-range time or UTC offset.
+pub(crate) const ERR_INVALID_DATETIME_FORMAT: DiagMsg = DiagMsg {
+    state: SQLSTATE_22007,
+    text: "Invalid datetime format",
+};
+/// A fraction dropped by a temporal target's declared scale. Retail 18.6.2.1
+/// answers this state for `time`, `datetime2` and `datetimeoffset` alike.
+///
+/// `ParamToSQLType` (`sqlcfunc.cpp:3350`) reads as a split - this state for the
+/// timestamp family, `22001` otherwise - but that gate is the legacy datetime
+/// arm and is not what these targets reach; see `convert_datetime_sql`. Do not
+/// re-derive the split from source.
+pub(crate) const ERR_DATETIME_FIELD_OVERFLOW: DiagMsg = DiagMsg {
+    state: SQLSTATE_22008,
+    text: "Datetime field overflow",
 };
 pub(crate) const ERR_DAE_LENGTH_MISMATCH: DiagMsg = DiagMsg {
     state: SQLSTATE_22026,

@@ -91,16 +91,54 @@ Installs Docker + Colima on a hosted macOS agent and boots the VM, retrying on
 the transient lima hostagent boot failures seen in ~3% of runs. VM size stays at
 the long-standing 4 GiB / 4 CPU.
 
-Each `colima start` is bounded by `COLIMA_START_TIMEOUT_SECONDS` so a wedged
-boot still reaches the delete/retry path rather than running until the pipeline
-step timeout. That bound sits above the slowest healthy boot observed over 113
-runs (509s; p95 366s) — the real failures give up within seconds, so a shorter
-bound would only kill slow-but-healthy boots. `COLIMA_BUDGET_SECONDS` then caps
-the retries as a whole.
+The docker CLI is installed with `brew install --force-bottle`, which uses
+Homebrew's bottle when one exists for the platform and *fails* rather than
+falling back to a source build. When it fails, `install-brew-bottle.py` installs
+the newest version that *is* bottled for this platform, taken straight from
+Homebrew's own registry. As of 29.8.0 there is no Intel macOS bottle, so a bare
+`brew install docker` compiles the CLI and builds Go to do it: measured over 147
+runs, the bottled path took 29s median and failed 1% of the time, the
+source-build path took 441s median (774s max) and failed 36%. `colima` and
+`lima` are still bottled on Intel and install normally.
+
+The whole install phase (`brew update`, `colima`, the docker CLI) is bounded by
+`INSTALL_TIMEOUT_SECONDS` so a slow install fails here with a message rather than
+surfacing as an opaque step timeout. Each `colima start` is bounded by
+`COLIMA_START_TIMEOUT_SECONDS` so a wedged boot still reaches the delete/retry
+path rather than running until the pipeline step timeout. That bound sits above
+the slowest healthy boot observed (509s over 113 runs in 2026-08; re-measured
+2026-09 at max 453s over 123 runs) — the real failures give up within seconds, so
+a shorter bound would only kill slow-but-healthy boots. `COLIMA_BUDGET_SECONDS`
+then caps the retries as a whole.
 
 **Environment overrides:** `COLIMA_CPU`, `COLIMA_MEMORY`, `COLIMA_DISK`,
 `COLIMA_START_ATTEMPTS` (3), `COLIMA_START_TIMEOUT_SECONDS` (540),
-`COLIMA_BUDGET_SECONDS` (480).
+`COLIMA_BUDGET_SECONDS` (480), `INSTALL_TIMEOUT_SECONDS` (300),
+`DOCKER_CLI_DIR`.
+
+### install-brew-bottle.py
+Installs the newest Homebrew bottle of a formula that exists for the running
+platform, by reading Homebrew's OCI registry on ghcr.io directly. Used as the
+docker CLI fallback above, and generic enough to cover `colima` or `lima` if they
+lose their Intel bottles too.
+
+Bottles are content-addressed, so the download is verified against the digest the
+registry advertises rather than a checksum vendored here. Bottles built for an
+older macOS are accepted (they run on newer hosts) but never a newer one; a macOS
+major the script doesn't recognize is an error rather than a guess, because
+guessing means handing the agent a binary it can't run. Formulas bottled `:all`
+are not selected — the CLIs installed here aren't, and taking one blindly is
+worse than reporting no match.
+
+Homebrew spells a formula revision two ways: the registry tag is `29.7.2-1` but
+the ref names inside it read `29.7.2.<platform>.1`, so the two are matched
+separately. Only the newest `MAX_VERSIONS_SCANNED` (15) versions are examined —
+each costs a registry round-trip, and this keeps a no-match failure from eating
+the caller's install budget before it reports.
+
+**Usage:** `install-brew-bottle.py <formula> <dest-bin-dir>`; prints the resolved
+version. Test overrides: `BOTTLE_ARCH_OVERRIDE`, `BOTTLE_MACOS_MAJOR_OVERRIDE`.
+Covered by `test_install_brew_bottle.py`.
 
 ### start-sql-server-macos.sh
 Starts the SQL Server test container inside the Colima VM. Retries the image

@@ -533,10 +533,11 @@ ColumnSpec make_lob_text(std::vector<ColumnSpec>& columns, bool wide,
     return column;
 }
 
-// Build one sql_variant column. Only base types whose SQL_CA_SS_VARIANT_TYPE
-// answer is unambiguous are used: mssql-odbc deliberately reports SQL_C_CHAR
-// where msodbcsql reports SQL_C_NUMERIC for decimal/money variants, and a
-// benchmark that depended on that difference would not be the same work on both.
+// Build one sql_variant column. The exact numerics are no longer excluded for a
+// parity reason: since AB#47702 both drivers answer SQL_C_NUMERIC for
+// decimal/money variants, which `variant_read_c_type` folds onto SQL_C_CHAR on
+// either driver. The column set is left as-is so existing baselines stay
+// comparable.
 ColumnSpec make_variant(std::vector<ColumnSpec>& columns, ValueKind kind,
                         std::uint64_t null_phase) {
     ColumnSpec column;
@@ -1143,6 +1144,15 @@ void require_succeeded(SQLRETURN rc, const char* operation, SQLHSTMT stmt) {
 //
 // SQL_C_WCHAR folds to SQL_C_CHAR deliberately: mssql-python does the same,
 // because requesting SQL_C_WCHAR after the binary probe fails on unixODBC.
+//
+// The date and timestamp arms accept both the 2.x and 3.x spellings for a
+// concrete reason, not for symmetry: measured against msodbcsql18 18.06.0001, a
+// date variant answers SQL_C_DATE (9) and the datetime family SQL_C_TIMESTAMP
+// (11), while mssql-odbc answers SQL_C_TYPE_DATE (91) / SQL_C_TYPE_TIMESTAMP
+// (93). Accepting only the 3.x form would bind a typed fetch on one driver and
+// a character fetch on the other, which is precisely the asymmetry this fold
+// exists to prevent. Unreachable today - `make_variant` builds no temporal
+// column - but the trap is removed rather than left for whoever adds one.
 SQLSMALLINT variant_read_c_type(SQLLEN reported) {
     switch (reported) {
         case SQL_C_BIT:
@@ -1169,8 +1179,10 @@ SQLSMALLINT variant_read_c_type(SQLLEN reported) {
         case SQL_C_GUID:
             return SQL_C_GUID;
         case SQL_C_TYPE_DATE:
+        case SQL_C_DATE:
             return SQL_C_TYPE_DATE;
         case SQL_C_TYPE_TIMESTAMP:
+        case SQL_C_TIMESTAMP:
             return SQL_C_TYPE_TIMESTAMP;
         default:
             return SQL_C_CHAR;

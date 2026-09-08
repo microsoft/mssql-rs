@@ -3,7 +3,7 @@
 // conversion: SQL_C_BINARY bound against binary, varbinary and image.
 //
 // Character parameters live in param_char_conversions_test.cpp and the
-// cross-family quadrants in param_cross_conversions_test.cpp.
+// cross-family quadrants in param_conversions_test.cpp.
 //
 // Values are read back through server-side CONVERT(..., 2) as hex text rather
 // than SQLGetData with SQL_C_BINARY, which this driver does not implement yet
