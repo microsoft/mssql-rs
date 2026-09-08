@@ -230,12 +230,12 @@ extends:
             value: '$(Build.ArtifactStagingDirectory)'
           steps:
           - download: officialBuild
-            artifact: 'drop_Build_RustCrates_rust_crates'
+            artifact: 'drop_Build_RustCrates'
             displayName: 'Download Rust crate artifacts'
 
           - pwsh: >
               .pipeline/scripts/validate-crate-release-artifact.ps1
-              -ArtifactDirectory '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates_rust_crates'
+              -ArtifactDirectory '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates'
             displayName: 'Validate Rust crate release artifact'
 
           - ${{ if eq(parameters.publishMssqlTds, true) }}:
@@ -268,7 +268,7 @@ extends:
                 intent: 'PackageDistribution'
                 contenttype: 'Rust'
                 contentsource: 'Folder'
-                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates_rust_crates\mssql-tds'
+                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates\mssql-tds'
                 waitforreleasecompletion: true
                 owners: '$(owner)'
                 approvers: '$(approver)'
@@ -304,7 +304,7 @@ extends:
                 intent: 'PackageDistribution'
                 contenttype: 'Rust'
                 contentsource: 'Folder'
-                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates_rust_crates\mssql-mock-tds'
+                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates\mssql-mock-tds'
                 waitforreleasecompletion: true
                 owners: '$(owner)'
                 approvers: '$(approver)'

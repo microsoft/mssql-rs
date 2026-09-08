@@ -99,7 +99,7 @@ stages:
         displayName: 'Publish Rust crate artifacts'
         inputs:
           targetPath: '$(ob_outputDirectory)\rust-crates'
-          artifact: 'drop_Build_RustCrates_rust_crates'
+          artifact: 'drop_Build_RustCrates'
           publishLocation: 'pipeline'
 
   #########################################################################
