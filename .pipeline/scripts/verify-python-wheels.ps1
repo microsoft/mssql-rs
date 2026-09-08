@@ -55,6 +55,30 @@ function Get-ExpectedOdbcMembers {
     }
 }
 
+function Get-ExpectedWheelNames {
+    param([string]$Prefix, [string]$Version)
+
+    $pythonTags = 'cp310', 'cp311', 'cp312', 'cp313', 'cp314'
+    $platforms = @(
+        'win_amd64',
+        'linux_x86_64',
+        'linux_aarch64',
+        'musllinux_1_2_x86_64',
+        'musllinux_1_2_aarch64',
+        'macosx_15_0_universal2'
+    )
+
+    $expected = foreach ($pythonTag in $pythonTags) {
+        foreach ($platform in $platforms) {
+            "$Prefix-$Version-$pythonTag-$pythonTag-$platform.whl"
+        }
+    }
+    foreach ($pythonTag in $pythonTags | Where-Object { $_ -ne 'cp310' }) {
+        "$Prefix-$Version-$pythonTag-$pythonTag-win_arm64.whl"
+    }
+    return @($expected)
+}
+
 $wheels = @(Get-ChildItem -Path $WheelsDir -Filter '*.whl' -File)
 if ($wheels.Count -ne $ExpectedCount) {
     throw "Expected $ExpectedCount wheels, found $($wheels.Count)"
@@ -63,6 +87,13 @@ if ($wheels.Count -ne $ExpectedCount) {
 $canonicalExpectedName = ConvertTo-CanonicalName $ExpectedName
 $filenamePrefix = $ExpectedName.Replace('-', '_')
 $expectedFilenamePrefix = "$filenamePrefix-$ExpectedVersion-"
+$expectedWheelNames = @(Get-ExpectedWheelNames $filenamePrefix $ExpectedVersion)
+$actualWheelNames = @($wheels | ForEach-Object { $_.Name })
+$missingWheels = @($expectedWheelNames | Where-Object { $actualWheelNames -notcontains $_ })
+$unexpectedWheels = @($actualWheelNames | Where-Object { $expectedWheelNames -notcontains $_ })
+if ($missingWheels.Count -gt 0 -or $unexpectedWheels.Count -gt 0) {
+    throw "Wheel matrix mismatch. Missing: $($missingWheels -join ', '); Unexpected: $($unexpectedWheels -join ', ')"
+}
 
 foreach ($wheel in $wheels) {
     if (-not $wheel.Name.StartsWith($expectedFilenamePrefix)) {

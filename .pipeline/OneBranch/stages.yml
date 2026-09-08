@@ -450,12 +450,13 @@ stages:
         displayName: 'List collected wheels'
 
       - pwsh: |
+          $requireOdbc = "${{ parameters.buildOdbcNative }}" -eq "True"
           & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
             -WheelsDir "$(Build.StagingDirectory)/wheels" `
             -ExpectedName "mssql-python-rs" `
             -ExpectedVersion "0.1.0" `
             -ExpectedCount 34 `
-            -RequireOdbc
+            -RequireOdbc:$requireOdbc
         displayName: 'Validate wheel metadata and ODBC payloads'
 
       - pwsh: |

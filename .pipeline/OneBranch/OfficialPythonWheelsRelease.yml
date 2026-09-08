@@ -163,7 +163,7 @@ extends:
               -ExpectedName "mssql-python-rs" `
               -ExpectedVersion "0.1.0" `
               -ExpectedCount 34 `
-              -RequireOdbc
+              -RequireOdbc:$true
 
             # Create .nuspec
             $nuspecContent = @"
