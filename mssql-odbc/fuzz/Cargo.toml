@@ -64,3 +64,10 @@ path = "fuzz_targets/fuzz_bound_param.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_ffi_execute"
+path = "fuzz_targets/fuzz_ffi_execute.rs"
+test = false
+doc = false
+bench = false

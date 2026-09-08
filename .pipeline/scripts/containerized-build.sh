@@ -48,5 +48,6 @@ if [ "$IS_PR_BUILD" = "true" ]; then
   rustup toolchain install nightly --profile minimal
   echo '==> Checking fuzz targets compile...'
   RUSTFLAGS="--cfg fuzzing" cargo +nightly check --manifest-path mssql-tds/fuzz/Cargo.toml
+  RUSTFLAGS="--cfg fuzzing" cargo +nightly check --manifest-path mssql-odbc/fuzz/Cargo.toml
   echo '==> Fuzz build check passed.'
 fi

@@ -12,14 +12,20 @@
 //! particular result.
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DOUBLE, SQL_C_FLOAT,
-    SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TYPE_DATE,
-    SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT,
-    SQL_C_UTINYINT, SQL_C_WCHAR, SQL_CHAR, SQL_INTEGER, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_INPUT,
-    SQL_SMALLINT, SQL_TINYINT, SQL_VARBINARY, SQL_VARCHAR, SQL_WVARCHAR, SqlInteger, SqlLen,
-    SqlPointer, SqlSmallInt, SqlULen, SqlWChar,
+    SQL_ATTR_ODBC_VERSION, SQL_BIGINT, SQL_BINARY, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR,
+    SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SSHORT,
+    SQL_C_STINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT,
+    SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_CHAR, SQL_HANDLE_DBC,
+    SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_INTEGER, SQL_NTS, SQL_NULL_DATA, SQL_NULL_HANDLE,
+    SQL_OV_ODBC3_80, SQL_PARAM_INPUT, SQL_SMALLINT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_TINYINT, SQL_VARBINARY, SQL_VARCHAR, SQL_WVARCHAR, SqlHandle, SqlInteger, SqlLen,
+    SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
 use crate::api::util::{read_utf16, read_utf16_attr, read_utf16_long};
+use crate::api::{
+    SQLAllocHandle, SQLExecDirectW, SQLFetch, SQLFreeHandle, SQLGetData, SQLNumResultCols,
+    SQLSetEnvAttr,
+};
 use crate::connection::connection_string_parser::parse_connection_string;
 use crate::conversion::fetch_convert::{
     convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, is_float_c_target,
@@ -27,6 +33,8 @@ use crate::conversion::fetch_convert::{
 };
 use crate::conversion::numeric::{narrow_i128, parse_numeric_text};
 use crate::conversion::param_convert::{bound_param_to_value, transcode_dae_bytes};
+use crate::handles::dbc::ConnectionState;
+use crate::handles::{DbcHandle, handle_from_raw};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
@@ -34,6 +42,7 @@ use mssql_tds::datatypes::column_values::{
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+use mssql_tds::fuzz_support::{FuzzPacketReader, create_fuzz_tds_client};
 use mssql_tds::token::tokens::SqlCollation;
 use std::ffi::c_void;
 
@@ -381,4 +390,120 @@ pub fn fuzz_bound_param(data: &[u8]) {
         octet_length_ptr: ind_ptr,
     };
     let _ = unsafe { bound_param_to_value(&param) };
+}
+
+/// The `SQL_C_*` targets `fuzz_ffi_execute` retrieves each column as. Spans the
+/// fixed-width numeric/temporal writers and the variable-length character and
+/// binary paths, so `SQLGetData`'s length/truncation bookkeeping is exercised
+/// alongside the value conversion.
+const FFI_GETDATA_TARGETS: [SqlSmallInt; 6] = [
+    SQL_C_SLONG,
+    SQL_C_DOUBLE,
+    SQL_C_CHAR,
+    SQL_C_WCHAR,
+    SQL_C_BINARY,
+    SQL_C_TYPE_TIMESTAMP,
+];
+
+/// Drive the real ODBC result path end to end — `SQLExecDirectW` → `SQLFetch` →
+/// `SQLGetData` — over a fuzzer-controlled TDS response stream.
+///
+/// A fresh ENV+DBC is built per call through the crate's own handle allocators,
+/// then an in-memory `TdsClient` reading `data` (via `mssql-tds`'s
+/// [`create_fuzz_tds_client`]) is installed as the connection — the same seam
+/// [`crate::test_support::connect_mock_server`] uses, minus the socket. The
+/// driver then executes a fixed batch (the text is irrelevant; the mock
+/// transport replays `data` as the server's answer regardless) and walks every
+/// row and column, so the fuzzer explores the whole COLMETADATA → ROW → convert
+/// pipeline the way a hostile or corrupt server would feed it.
+///
+/// This crosses the `extern "C"` boundary the shipped driver exposes. Each
+/// `SQL*` body is wrapped in `ffi_entry!`, which converts a Rust panic into
+/// `SQL_ERROR` so it never unwinds into C; a genuine memory error is still
+/// caught by the sanitizer, an unbounded read by the timeout, and a runaway
+/// allocation by the RSS limit. Fresh handles per call keep every crash
+/// reproducible from a single input rather than depending on residue from an
+/// earlier one.
+pub fn fuzz_ffi_execute(data: &[u8]) {
+    if data.len() > 4096 {
+        return;
+    }
+    let Some((&getdata_sel, server_bytes)) = data.split_first() else {
+        return;
+    };
+    let target_type = FFI_GETDATA_TARGETS[getdata_sel as usize % FFI_GETDATA_TARGETS.len()];
+
+    let mut env: SqlHandle = SQL_NULL_HANDLE;
+    if unsafe { SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &mut env) } != SQL_SUCCESS {
+        return;
+    }
+    unsafe {
+        SQLSetEnvAttr(
+            env,
+            SQL_ATTR_ODBC_VERSION,
+            SQL_OV_ODBC3_80 as usize as SqlPointer,
+            0 as SqlInteger,
+        );
+    }
+
+    let mut dbc: SqlHandle = SQL_NULL_HANDLE;
+    if unsafe { SQLAllocHandle(SQL_HANDLE_DBC, env, &mut dbc) } == SQL_SUCCESS {
+        install_fuzz_client(dbc, server_bytes);
+        run_exec_fetch(dbc, target_type);
+        unsafe { SQLFreeHandle(SQL_HANDLE_DBC, dbc) };
+    }
+    unsafe { SQLFreeHandle(SQL_HANDLE_ENV, env) };
+}
+
+/// Installs an in-memory, already-connected `TdsClient` over `server_bytes` on
+/// `dbc`, so the execute path reads its response from the fuzz input instead of
+/// a socket.
+fn install_fuzz_client(dbc: SqlHandle, server_bytes: &[u8]) {
+    let client = create_fuzz_tds_client(FuzzPacketReader::from_data(server_bytes), 4096);
+    let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
+    let mut state = dbc_ref.inner.lock().unwrap();
+    state.client = Some(client);
+    state.connection_state = ConnectionState::Connected;
+}
+
+/// Allocates a statement, executes a fixed batch, and drains every row/column
+/// through `SQLGetData`. Row and column counts are capped so a fuzzed
+/// COLMETADATA can't turn one input into an unbounded walk; the mock transport
+/// EOFs when `server_bytes` runs out, which ends the fetch loop on its own.
+fn run_exec_fetch(dbc: SqlHandle, target_type: SqlSmallInt) {
+    let mut stmt: SqlHandle = SQL_NULL_HANDLE;
+    if unsafe { SQLAllocHandle(SQL_HANDLE_STMT, dbc, &mut stmt) } != SQL_SUCCESS {
+        return;
+    }
+
+    let query: Vec<SqlWChar> = "SELECT 1".encode_utf16().collect();
+    let rc = unsafe { SQLExecDirectW(stmt, query.as_ptr(), query.len() as SqlSmallInt) };
+    if rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO {
+        let mut ncols: SqlSmallInt = 0;
+        if unsafe { SQLNumResultCols(stmt, &mut ncols) } == SQL_SUCCESS {
+            let cols = ncols.clamp(0, 64) as SqlUSmallInt;
+            let mut buf = [0u8; 256];
+            for _ in 0..128 {
+                let fetch_rc = unsafe { SQLFetch(stmt) };
+                if fetch_rc != SQL_SUCCESS && fetch_rc != SQL_SUCCESS_WITH_INFO {
+                    break;
+                }
+                for col in 1..=cols {
+                    let mut ind: SqlLen = 0;
+                    let _ = unsafe {
+                        SQLGetData(
+                            stmt,
+                            col,
+                            target_type,
+                            buf.as_mut_ptr() as SqlPointer,
+                            buf.len() as SqlLen,
+                            &mut ind,
+                        )
+                    };
+                }
+            }
+        }
+    }
+
+    unsafe { SQLFreeHandle(SQL_HANDLE_STMT, stmt) };
 }
