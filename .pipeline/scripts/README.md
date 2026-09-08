@@ -130,6 +130,11 @@ The whole prefix is packaged, not just `bin/`: `limactl` resolves
 a bin-only payload yields a lima that cannot boot a VM. The build fails if the
 guest agent is missing rather than shipping one that would.
 
+The three prefixes merge into one tree, so each formula's `LICENSE`, `NOTICE`,
+`README.md` and `sbom.spdx.json` — all of which sit at the prefix root — go to
+`metadata/<formula>/`. Merged flat they would overwrite each other and leave the
+payload describing itself as whichever formula was extracted last.
+
 The guest image is not hard-coded. colima embeds a table of
 `<arch> <runtime> <url> <sha512> <filename>` for the image release it expects, so
 both the image and the checksum to verify it against are read out of the binary
