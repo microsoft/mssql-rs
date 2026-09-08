@@ -31,6 +31,7 @@ def write_wheel(
     python_tag: str = "cp313",
     distribution: str = "mssql_python_rs",
     include_odbc: bool = True,
+    uppercase_odbc: bool = False,
 ) -> Path:
     wheel_path = directory / f"{distribution}-0.1.0-{python_tag}-{python_tag}-{platform}.whl"
     with zipfile.ZipFile(wheel_path, "w") as wheel:
@@ -41,6 +42,8 @@ def write_wheel(
         wheel.writestr("mssql_py_core/__init__.py", "")
         if include_odbc:
             for driver in _PLATFORM_DRIVERS[platform]:
+                if uppercase_odbc:
+                    driver = driver.upper()
                 wheel.writestr(driver, b"driver")
     return wheel_path
 
@@ -107,6 +110,19 @@ def test_validator_rejects_missing_odbc_driver(tmp_path: Path) -> None:
     assert "missing ODBC driver" in result.stderr
 
 
+def test_validator_rejects_wrong_case_odbc_driver(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    linux_wheel = next(wheel for wheel in wheels if "cp310-cp310-linux_x86_64" in wheel.name)
+    linux_wheel.unlink()
+    write_wheel(tmp_path, "linux_x86_64", python_tag="cp310", uppercase_odbc=True)
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "missing ODBC driver" in result.stderr
+    assert "mssqlodbc.so" in result.stderr
+
+
 def test_validator_allows_matrix_without_odbc_when_not_required(tmp_path: Path) -> None:
     wheels = write_wheel_matrix(tmp_path)
     for wheel_path in wheels:
@@ -152,3 +168,15 @@ def test_validator_rejects_same_count_with_unexpected_wheel(tmp_path: Path) -> N
     assert "Wheel matrix mismatch" in result.stderr
     assert "cp310-cp310-win_amd64" in result.stderr
     assert "cp400-cp400-win_amd64" in result.stderr
+
+
+def test_validator_rejects_wrong_case_wheel_filename(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    linux_wheel = next(wheel for wheel in wheels if "cp310-cp310-linux_x86_64" in wheel.name)
+    uppercase_name = linux_wheel.name.replace("linux", "LINUX")
+    linux_wheel.rename(linux_wheel.with_name(uppercase_name))
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Wheel matrix mismatch" in result.stderr

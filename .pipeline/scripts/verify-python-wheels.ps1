@@ -85,8 +85,8 @@ if ($wheels.Count -ne $expectedWheelNames.Count) {
     throw "Expected $($expectedWheelNames.Count) wheels, found $($wheels.Count)"
 }
 $actualWheelNames = @($wheels | ForEach-Object { $_.Name })
-$missingWheels = @($expectedWheelNames | Where-Object { $actualWheelNames -notcontains $_ })
-$unexpectedWheels = @($actualWheelNames | Where-Object { $expectedWheelNames -notcontains $_ })
+$missingWheels = @($expectedWheelNames | Where-Object { $actualWheelNames -cnotcontains $_ })
+$unexpectedWheels = @($actualWheelNames | Where-Object { $expectedWheelNames -cnotcontains $_ })
 if ($missingWheels.Count -gt 0 -or $unexpectedWheels.Count -gt 0) {
     throw "Wheel matrix mismatch. Missing: $($missingWheels -join ', '); Unexpected: $($unexpectedWheels -join ', ')"
 }
@@ -133,7 +133,7 @@ foreach ($wheel in $wheels) {
 
         if ($RequireOdbc) {
             foreach ($expectedMember in Get-ExpectedOdbcMembers $wheel.Name) {
-                if ($members -notcontains $expectedMember) {
+                if ($members -cnotcontains $expectedMember) {
                     throw "$($wheel.Name): missing ODBC driver: $expectedMember"
                 }
             }

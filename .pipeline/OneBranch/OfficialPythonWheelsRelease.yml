@@ -185,11 +185,7 @@ extends:
             $wheels | Copy-Item -Destination $wheelsDir -Force
             Write-Host "Collected $($wheels.Count) wheels"
 
-            $validatorPath = Join-Path "$(Build.StagingDirectory)" "verify-python-wheels.ps1"
-            $validator = Get-BuildSourceFile ".pipeline/scripts/verify-python-wheels.ps1"
-            [System.IO.File]::WriteAllText($validatorPath, $validator)
-
-            & $validatorPath `
+            & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
               -WheelsDir $wheelsDir `
               -ExpectedName $distributionName `
               -ExpectedVersion $pythonVersion `
