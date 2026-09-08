@@ -62,7 +62,6 @@ def write_wheel_matrix(directory: Path) -> list[Path]:
 
 def run_validator(
     wheels_dir: Path,
-    expected_count: int,
     *,
     require_odbc: bool = True,
 ) -> subprocess.CompletedProcess[str]:
@@ -77,8 +76,6 @@ def run_validator(
         "mssql-python-rs",
         "-ExpectedVersion",
         "0.1.0",
-        "-ExpectedCount",
-        str(expected_count),
     ]
     if require_odbc:
         command.append("-RequireOdbc")
@@ -91,9 +88,9 @@ def run_validator(
 
 
 def test_validator_accepts_expected_wheel_matrix(tmp_path: Path) -> None:
-    wheels = write_wheel_matrix(tmp_path)
+    write_wheel_matrix(tmp_path)
 
-    result = run_validator(tmp_path, len(wheels))
+    result = run_validator(tmp_path)
 
     assert result.returncode == 0, result.stderr
     assert "Validated 34 mssql-python-rs wheels" in result.stdout
@@ -104,7 +101,7 @@ def test_validator_rejects_missing_odbc_driver(tmp_path: Path) -> None:
     wheels[0].unlink()
     write_wheel(tmp_path, "win_amd64", python_tag="cp310", include_odbc=False)
 
-    result = run_validator(tmp_path, 34)
+    result = run_validator(tmp_path)
 
     assert result.returncode != 0
     assert "missing ODBC driver" in result.stderr
@@ -118,7 +115,7 @@ def test_validator_allows_matrix_without_odbc_when_not_required(tmp_path: Path) 
         python_tag = wheel_path.name.split("-")[2]
         write_wheel(tmp_path, platform, python_tag=python_tag, include_odbc=False)
 
-    result = run_validator(tmp_path, 34, require_odbc=False)
+    result = run_validator(tmp_path, require_odbc=False)
 
     assert result.returncode == 0, result.stderr
 
@@ -128,7 +125,7 @@ def test_validator_rejects_legacy_filename(tmp_path: Path) -> None:
     wheels[0].unlink()
     write_wheel(tmp_path, "win_amd64", python_tag="cp310", distribution="mssql_py_core")
 
-    result = run_validator(tmp_path, 34)
+    result = run_validator(tmp_path)
 
     assert result.returncode != 0
     assert "Wheel matrix mismatch" in result.stderr
@@ -138,7 +135,7 @@ def test_validator_rejects_legacy_filename(tmp_path: Path) -> None:
 def test_validator_rejects_incomplete_matrix(tmp_path: Path) -> None:
     write_wheel(tmp_path, "win_amd64")
 
-    result = run_validator(tmp_path, 34)
+    result = run_validator(tmp_path)
 
     assert result.returncode != 0
     assert "Expected 34 wheels, found 1" in result.stderr
@@ -149,7 +146,7 @@ def test_validator_rejects_same_count_with_unexpected_wheel(tmp_path: Path) -> N
     wheels[0].unlink()
     write_wheel(tmp_path, "win_amd64", python_tag="cp400")
 
-    result = run_validator(tmp_path, 34)
+    result = run_validator(tmp_path)
 
     assert result.returncode != 0
     assert "Wheel matrix mismatch" in result.stderr

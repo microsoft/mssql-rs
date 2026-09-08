@@ -8,9 +8,6 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExpectedVersion,
 
-    [Parameter(Mandatory = $true)]
-    [int]$ExpectedCount,
-
     [switch]$RequireOdbc
 )
 
@@ -79,15 +76,14 @@ function Get-ExpectedWheelNames {
     return @($expected)
 }
 
-$wheels = @(Get-ChildItem -Path $WheelsDir -Filter '*.whl' -File)
-if ($wheels.Count -ne $ExpectedCount) {
-    throw "Expected $ExpectedCount wheels, found $($wheels.Count)"
-}
-
 $canonicalExpectedName = ConvertTo-CanonicalName $ExpectedName
 $filenamePrefix = $ExpectedName.Replace('-', '_')
 $expectedFilenamePrefix = "$filenamePrefix-$ExpectedVersion-"
 $expectedWheelNames = @(Get-ExpectedWheelNames $filenamePrefix $ExpectedVersion)
+$wheels = @(Get-ChildItem -Path $WheelsDir -Filter '*.whl' -File)
+if ($wheels.Count -ne $expectedWheelNames.Count) {
+    throw "Expected $($expectedWheelNames.Count) wheels, found $($wheels.Count)"
+}
 $actualWheelNames = @($wheels | ForEach-Object { $_.Name })
 $missingWheels = @($expectedWheelNames | Where-Object { $actualWheelNames -notcontains $_ })
 $unexpectedWheels = @($actualWheelNames | Where-Object { $expectedWheelNames -notcontains $_ })

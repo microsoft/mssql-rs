@@ -32,8 +32,8 @@ PyPI: mssql-python
 |---|---|---|---|---|---|
 | Windows x64 (`win_amd64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Windows ARM64 (`win_arm64`) | — | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc x64 (`manylinux_2_28_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc ARM64 (`manylinux_2_28_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc x64 (`linux_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc ARM64 (`linux_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Linux musl x64 (`musllinux_1_2_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Linux musl ARM64 (`musllinux_1_2_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | macOS universal2 (`macosx_15_0_universal2`) | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -284,8 +284,8 @@ mssql-python-rs-wheels.0.1.10.nupkg
 ├── mssql-python-rs-wheels.nuspec
 └── wheels/
   ├── mssql_python_rs-0.1.0-cp310-cp310-win_amd64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_x86_64.whl
-  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_aarch64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-linux_x86_64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-linux_aarch64.whl
   ├── mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_x86_64.whl
   ├── mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_aarch64.whl
   ├── mssql_python_rs-0.1.0-cp310-cp310-macosx_15_0_universal2.whl

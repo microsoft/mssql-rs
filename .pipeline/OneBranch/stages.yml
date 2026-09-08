@@ -461,7 +461,6 @@ stages:
             -WheelsDir "$(Build.StagingDirectory)/wheels" `
             -ExpectedName "mssql-python-rs" `
             -ExpectedVersion $pythonVersion `
-            -ExpectedCount 34 `
             -RequireOdbc:$requireOdbc
         displayName: 'Validate wheel metadata and ODBC payloads'
 
