@@ -91,15 +91,25 @@ Installs Docker + Colima on a hosted macOS agent and boots the VM, retrying on
 the transient lima hostagent boot failures seen in ~3% of runs. VM size stays at
 the long-standing 4 GiB / 4 CPU.
 
-The docker CLI is installed with `brew install --force-bottle`, which uses
-Homebrew's bottle when one exists for the platform and *fails* rather than
-falling back to a source build. When it fails, `install-brew-bottle.py` installs
-the newest version that *is* bottled for this platform, taken straight from
-Homebrew's own registry. As of 29.8.0 there is no Intel macOS bottle, so a bare
-`brew install docker` compiles the CLI and builds Go to do it: measured over 147
-runs, the bottled path took 29s median and failed 1% of the time, the
-source-build path took 441s median (774s max) and failed 36%. `colima` and
-`lima` are still bottled on Intel and install normally.
+In CI the toolchain comes from our own feed: `TOOLCHAIN_DIR` points at a payload
+downloaded by `.pipeline/templates/macos-docker-steps.yml`, and the script puts
+its `bin/` on PATH and copies the guest image into
+`~/Library/Caches/colima/caches/<cache_filename>`, which is where colima looks
+for it by sha256 of the URL it would otherwise download from. So a CI run
+contacts neither Homebrew nor github.com. The executable bit is restored on the
+way in because Universal Packages do not preserve POSIX modes.
+
+Without `TOOLCHAIN_DIR` — a developer running this directly, or CI if the
+download step is ever removed — it installs from Homebrew as before. The docker
+CLI is installed with `brew install --force-bottle`, which uses Homebrew's
+bottle when one exists for the platform and *fails* rather than falling back to
+a source build. When it fails, `install-brew-bottle.py` installs the newest
+version that *is* bottled for this platform, taken straight from Homebrew's own
+registry. As of 29.8.0 there is no Intel macOS bottle, so a bare `brew install
+docker` compiles the CLI and builds Go to do it: measured over 147 runs, the
+bottled path took 29s median and failed 1% of the time, the source-build path
+took 441s median (774s max) and failed 36%. `colima` and `lima` are still
+bottled on Intel and install normally.
 
 The whole install phase (`brew update`, `colima`, the docker CLI) is bounded by
 `INSTALL_TIMEOUT_SECONDS` so a slow install fails here with a message rather than
@@ -114,7 +124,7 @@ then caps the retries as a whole.
 **Environment overrides:** `COLIMA_CPU`, `COLIMA_MEMORY`, `COLIMA_DISK`,
 `COLIMA_START_ATTEMPTS` (3), `COLIMA_START_TIMEOUT_SECONDS` (540),
 `COLIMA_BUDGET_SECONDS` (480), `INSTALL_TIMEOUT_SECONDS` (300),
-`DOCKER_CLI_DIR`.
+`DOCKER_CLI_DIR`, `TOOLCHAIN_DIR`.
 
 ### build-macos-docker-toolchain.py
 Assembles the macOS docker toolchain payload for one architecture: the install

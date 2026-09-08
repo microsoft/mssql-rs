@@ -57,6 +57,12 @@ DOCKER_BOTTLE_TIMEOUT_SECONDS=${DOCKER_BOTTLE_TIMEOUT_SECONDS:-90}
 # Bounded so a slow install fails here with a message rather than silently
 # consuming the step budget and surfacing as an opaque "task has timed out".
 INSTALL_TIMEOUT_SECONDS=${INSTALL_TIMEOUT_SECONDS:-300}
+# A payload from our own feed, published by
+# .pipeline/macos-docker-toolchain-pipeline.yml. When set, none of the Homebrew
+# reasoning above applies: the toolchain is already resolved, verified and
+# pinned, so the job reaches nothing but Azure Artifacts. The brew path below
+# stays for runs that do not have one, such as a developer running this script.
+TOOLCHAIN_DIR=${TOOLCHAIN_DIR:-}
 
 # A leftover directory would make the "did we fall back?" check below lie.
 rm -rf "$DOCKER_CLI_DIR"
@@ -119,31 +125,69 @@ run_install_step() {
   fi
 }
 
-run_install_step brew update
-run_install_step brew install colima
+manifest_field() {
+  python3 -c "import json,sys;print(json.load(open(sys.argv[1]))$1)" "$TOOLCHAIN_DIR/manifest.json"
+}
 
-# The docker-bottle attempt is the one step allowed to fail without ending
-# the job: that failure is the expected, handled path into the fallback, not
-# an install error. It is also the only step that needs a cap tighter than
-# the overall budget (DOCKER_BOTTLE_TIMEOUT_SECONDS), which is why it can't
-# go through run_install_step: that helper treats any non-zero exit as
-# fatal.
-bottle_limit=$(budget_limit "$DOCKER_BOTTLE_TIMEOUT_SECONDS")
-if [ "$bottle_limit" -eq 0 ]; then
-  fail_install "Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
-fi
-if ! run_bounded "$bottle_limit" brew install --force-bottle docker; then
-  echo "##[warning]No docker CLI bottle for the current version on this platform (or the attempt ran past ${bottle_limit}s); falling back to the newest bottled version"
-  run_install_step python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR"
+# Puts the packaged toolchain on PATH and seeds colima's image cache, so
+# neither Homebrew nor github.com is contacted. Nothing here is bounded: it is
+# local file work against a payload the agent already has.
+install_from_package() {
+  [ -f "$TOOLCHAIN_DIR/manifest.json" ] \
+    || fail_install "no manifest.json in the toolchain payload at $TOOLCHAIN_DIR"
+
+  # Universal Packages do not carry POSIX modes, so the executable bit does not
+  # survive the round trip through the feed.
+  chmod -R +x "$TOOLCHAIN_DIR/bin" "$TOOLCHAIN_DIR/libexec" 2>/dev/null || true
+  export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+  echo "##vso[task.prependpath]$TOOLCHAIN_DIR/bin"
+
+  # colima looks the guest image up in this cache by sha256 of the URL it would
+  # otherwise download it from, so seeding it under that name is what keeps the
+  # ~350 MB fetch from github.com out of the job.
+  local cache_dir="$HOME/Library/Caches/colima/caches"
+  local cached image
+  cached="$cache_dir/$(manifest_field "['image']['cache_filename']")"
+  image="$TOOLCHAIN_DIR/image/$(manifest_field "['image']['filename']")"
+  [ -f "$image" ] || fail_install "toolchain payload has no guest image at $image"
+  mkdir -p "$cache_dir"
+  [ -f "$cached" ] || cp "$image" "$cached"
+
+  echo "toolchain: $(manifest_field "['arch']") payload, layout $(manifest_field "['payload_format']"), id $(manifest_field "['identity']")"
+  echo "guest image seeded at $cached ($(du -h "$cached" | cut -f1))"
+}
+
+if [ -n "$TOOLCHAIN_DIR" ]; then
+  install_from_package
+else
+  run_install_step brew update
+  run_install_step brew install colima
+
+  # The docker-bottle attempt is the one step allowed to fail without ending
+  # the job: that failure is the expected, handled path into the fallback, not
+  # an install error. It is also the only step that needs a cap tighter than
+  # the overall budget (DOCKER_BOTTLE_TIMEOUT_SECONDS), which is why it can't
+  # go through run_install_step: that helper treats any non-zero exit as
+  # fatal.
+  bottle_limit=$(budget_limit "$DOCKER_BOTTLE_TIMEOUT_SECONDS")
+  if [ "$bottle_limit" -eq 0 ]; then
+    fail_install "Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
+  fi
+  if ! run_bounded "$bottle_limit" brew install --force-bottle docker; then
+    echo "##[warning]No docker CLI bottle for the current version on this platform (or the attempt ran past ${bottle_limit}s); falling back to the newest bottled version"
+    run_install_step python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR"
+  fi
+
+  # Only the fallback populates DOCKER_CLI_DIR; brew's own docker is already on PATH.
+  # prependpath only affects later steps, so also fix PATH for this one.
+  if [ -x "$DOCKER_CLI_DIR/docker" ]; then
+    export PATH="$DOCKER_CLI_DIR:$PATH"
+    echo "##vso[task.prependpath]$DOCKER_CLI_DIR"
+  fi
 fi
 
-# Only the fallback populates DOCKER_CLI_DIR; brew's own docker is already on PATH.
-# prependpath only affects later steps, so also fix PATH for this one.
-if [ -x "$DOCKER_CLI_DIR/docker" ]; then
-  export PATH="$DOCKER_CLI_DIR:$PATH"
-  echo "##vso[task.prependpath]$DOCKER_CLI_DIR"
-fi
 docker --version
+colima version | head -1
 
 start_time=$(date +%s)
 deadline=$((start_time + COLIMA_BUDGET_SECONDS))

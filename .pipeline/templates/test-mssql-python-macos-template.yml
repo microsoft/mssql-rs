@@ -97,11 +97,7 @@ steps:
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
 # ── 4. Start Docker via Colima ───────────────────────────────────────────────
-# timeoutInMinutes backstops the scripts' own wall-clock budgets: the macOS job
-# caps at 60 minutes and SQL setup must not be what exhausts it.
-- script: bash .pipeline/scripts/start-colima-macos.sh
-  displayName: 'Install and start Colima-based Docker'
-  timeoutInMinutes: 15
+- template: macos-docker-steps.yml
 
 # ── 5. Start SQL Server (no TLS certs) ──────────────────────────────────────
 - script: bash .pipeline/scripts/start-sql-server-macos.sh
