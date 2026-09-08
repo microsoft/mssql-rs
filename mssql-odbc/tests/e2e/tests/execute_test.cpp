@@ -200,7 +200,7 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, NumericTruncationIsNotReportedAfterDataAtExecution) {
+TEST_F(PrepareExecuteLiveTest, NumericTruncationIsReportedBeforeDataAtExecutionButNotAfter) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -222,6 +222,11 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationIsNotReportedAfterDataAtExecutio
     SQLRETURN rc = SQLExecute(stmt_);
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    // msodbcsql's per-parameter RPC loop posts a truncated non-DAE parameter's
+    // 01S07 warning as it is processed, then keeps scanning and returns
+    // SQL_NEED_DATA once it reaches the streamed parameter -- so the warning
+    // is observable immediately here, before SQLParamData is ever called.
+    EXPECT_EQ("01S07", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
     ASSERT_EQ(&streamed_token, value_ptr);
@@ -704,7 +709,7 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundPara
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationIsNotReportedAfterDataAtExecution) {
+TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationIsReportedBeforeDataAtExecutionButNotAfter) {
     SQL_NUMERIC_STRUCT numeric = {};
     numeric.precision = 3;
     numeric.scale = 2;
@@ -724,6 +729,7 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationIsNotReportedAfterData
         ExecDirect("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v");
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("01S07", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
     ASSERT_EQ(&streamed_token, value_ptr);

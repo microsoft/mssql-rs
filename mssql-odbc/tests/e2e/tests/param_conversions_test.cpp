@@ -977,6 +977,61 @@ TEST_F(ScalarConversionLiveTest, NumericStructMatchingMetadataKeepsEmbeddedMetad
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
 }
 
+// A bare SQLBindParameter with no follow-up SQLSetDescFieldW call at all must
+// still land the APD on msodbcsql's real SetTypeDefaults default for
+// SQL_C_NUMERIC -- (SQL_PREC_NUMERIC, 0), i.e. (38, 0) -- not (0, 0)
+// (sqlcdesc.cpp:2883 `SetADRecBP` -> `SetTypeDefaults`, sqlcdesc.cpp:12344's
+// `case SQL_NUMERIC`). Binding straight into a full-width NUMERIC(38,0)
+// column then matches that default on both drivers, so the fast path
+// (FastDescribeRPCParam, sqlcmisc.cpp:7014) forwards the struct's own
+// embedded precision/scale verbatim rather than the (0, 0) this driver used
+// to fall back to, which forced a wrong rescale-from-scale-0 read of the
+// struct.
+TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesTheStructsOwnScale) {
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 5;
+    value.scale = 3;
+    value.sign = 1;
+    std::uint64_t magnitude = 12345;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 38, 0,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("12.345", ExecuteAndReadBack());
+}
+
+// A rebind (same ordinal, same statement, no intervening SQL_RESET_PARAMS)
+// must not let a bare SQLBindParameter inherit APD precision/scale left by a
+// prior, differently-shaped binding: msodbcsql's SetADRecBP resets the whole
+// APD record via SetTypeDefaults on every SQLBindParameter call, never just
+// the first. The first bind here explicitly sets APD precision/scale to
+// (10, 2) via SQLSetDescFieldW -- a value that would coincidentally match
+// the second bind's NUMERIC(10,2) target if it leaked forward, wrongly
+// forcing the fast path. The second bind embeds a deliberately wrong
+// precision/scale (15, 9) in the struct itself, which the correct slow path
+// must ignore in favor of the freshly-reset APD scale (0).
+TEST_F(ScalarConversionLiveTest, NumericRebindDoesNotInheritAPreviousBindsStaleApdScale) {
+    ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 10, 2, 10, 2, true, 12345), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ("123.45", ExecuteAndReadBack());
+
+    SQL_NUMERIC_STRUCT value = {};
+    value.precision = 15;
+    value.scale = 9;
+    value.sign = 1;
+    std::uint64_t magnitude = 100;
+    std::memcpy(value.val, &magnitude, sizeof(magnitude));
+    std::memcpy(storage_, &value, sizeof(value));
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 10, 2,
+                                   storage_, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("100.00", ExecuteAndReadBack());
+}
+
 TEST_F(ScalarConversionLiveTest, NumericStructPrecision38Boundaries) {
     constexpr std::uint64_t kMaxLow = 0x098A223FFFFFFFFF;
     constexpr std::uint64_t kMaxHigh = 0x4B3B4CA85A86C47A;

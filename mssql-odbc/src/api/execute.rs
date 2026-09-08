@@ -325,6 +325,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     Some(prepared),
                     orphaned,
                     dae_params,
+                    fractional_truncated,
                     "SQLExecute",
                 ),
                 Err(e) => {

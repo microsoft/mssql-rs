@@ -117,8 +117,16 @@ fn unwind_dae_inner(
 /// Parks the streaming client on the statement so `SQLParamData` / `SQLPutData`
 /// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
 /// `active_stmt` set, so the connection stays busy for the duration.
-/// msodbcsql's `SQLParamData` clears prior statement errors on entry
-/// (`sqlccmd.cpp:6818`), including pre-stream conversion warnings.
+///
+/// `fractional_truncated` posts `01S07` immediately, before returning
+/// `SQL_NEED_DATA`: msodbcsql's per-parameter RPC loop (`AddRPCUserParameters`,
+/// `sqlccmd.cpp:9870-9910`) posts a truncated non-DAE parameter's warning via
+/// `PostSQLError2` as it's processed, then keeps scanning and breaks out with
+/// `SQL_NEED_DATA` once it reaches a streamed parameter — so the diagnostic is
+/// already on the handle the instant the initiating call returns, observable by
+/// `SQLGetDiagRec` before the application ever calls `SQLParamData`.
+/// `SQLParamData` clears prior statement errors on its own entry
+/// (`sqlccmd.cpp:6818`), which is why this warning must not be deferred there.
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
@@ -128,6 +136,7 @@ pub(super) fn park_dae_client(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     dae_params: Vec<DaeParam>,
+    fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -137,6 +146,9 @@ pub(super) fn park_dae_client(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
     SQL_NEED_DATA
 }
 
@@ -1132,6 +1144,38 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
     }
 
+    /// msodbcsql posts a truncated non-DAE parameter's warning as soon as its
+    /// per-parameter RPC loop processes it (`sqlccmd.cpp:9328-9334`), before it
+    /// reaches the streamed parameter that makes the same call return
+    /// `SQL_NEED_DATA` — so the diagnostic is observable immediately, without
+    /// ever calling `SQLParamData`. Deferring the warning to `finish_execute`
+    /// (reachable only from `SQLParamData` on this path) would lose it for the
+    /// entire window between the two calls.
+    #[test]
+    fn park_dae_client_posts_numeric_fractional_truncation_before_param_data() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let rc = park_dae_client(
+            stmt,
+            tds_client_from_tokens(Vec::new()),
+            None,
+            None,
+            Vec::new(),
+            true,
+            "SQLExecute",
+        );
+
+        assert_eq!(rc, SQL_NEED_DATA);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+    }
+
     /// Builds a scripted client positioned on a row-returning result (empty
     /// metadata; column data is irrelevant to `release_busy_if_row_exhausted`,
     /// which only peeks past it), then injects it as the busy client owning
@@ -1978,6 +2022,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                false,
                 "test",
             ),
             crate::api::odbc_types::SQL_NEED_DATA

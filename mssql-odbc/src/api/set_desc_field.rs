@@ -325,7 +325,7 @@ fn set_record_field(
             })
         }
         SQL_DESC_PRECISION => set_precision(state, record_number, value_ptr),
-        SQL_DESC_SCALE => set_scale(state, record_number, value_ptr),
+        SQL_DESC_SCALE => set_scale(state, kind, record_number, value_ptr),
         SQL_DESC_NAME => set_name(state, record_number, value_ptr, buffer_length),
         SQL_DESC_UNNAMED => set_unnamed(state, record_number, value_ptr),
         SQL_DESC_PARAMETER_TYPE => set_parameter_type(state, record_number, value_ptr),
@@ -515,9 +515,19 @@ pub(super) fn set_precision(
 
 /// `SQL_DESC_SCALE` write. Same `SQL_C_NUMERIC` consistency bound as
 /// [`set_precision`]: scale must be `<= precision`
-/// (`sqlcdesc.cpp:11391-11394`). Negative scales are valid.
+/// (`sqlcdesc.cpp:11391-11394`). Negative scales are valid only on an
+/// application descriptor (ARD/APD/AD): msodbcsql's `CheckADDescRecConsistency`
+/// bounds only the upper end for `SQL_C_NUMERIC` (`sqlcdesc.cpp:11391-11394`).
+/// `SQL_C_NUMERIC` and `SQL_NUMERIC` share the same numeric value (`2`), so an
+/// IPD record's SQL type can equal this same constant; there msodbcsql's
+/// separate `CheckSqlPrecScale<FALSE>` (`sqlcdesc.cpp:11511-11536`) compares
+/// the scale as unsigned, which rejects any negative value outright for a 3.x
+/// app. Reusing the AD-only allowance for an IPD record would let a bound
+/// `SQL_NUMERIC` parameter accept a negative `SQL_DESC_SCALE` that msodbcsql
+/// (and the RPC wire format) would never allow.
 pub(super) fn set_scale(
     state: &mut DescState,
+    kind: DescKind,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,
 ) -> SqlReturn {
@@ -526,11 +536,12 @@ pub(super) fn set_scale(
         return SQL_ERROR;
     };
 
+    let is_application = kind.is_application();
     let record_info = state
         .record(record_number)
         .map(|r| (r.concise_type, r.precision));
     if let Some((SQL_C_NUMERIC, precision)) = record_info
-        && scale > precision
+        && (scale > precision || (!is_application && scale < 0))
     {
         error!(
             scale,
@@ -694,7 +705,8 @@ mod tests {
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
         SQL_ATTR_APP_PARAM_DESC, SQL_C_LONG, SQL_C_WCHAR, SQL_INTEGER, SQL_INTERVAL_YEAR,
-        SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_TYPE_DATE, SqlNumericStruct,
+        SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC, SQL_TYPE_DATE,
+        SqlNumericStruct,
     };
     use crate::api::set_stmt_attr::sql_get_stmt_attr_w;
     use crate::error::diag::DiagRecord;
@@ -1173,6 +1185,38 @@ mod tests {
             unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, (-1isize) as SqlPointer, 0) };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(get_small_int(h.apd(), 1, SQL_DESC_SCALE), -1);
+    }
+
+    /// `SQL_C_NUMERIC` and `SQL_NUMERIC` share the same value (`2`), so an IPD
+    /// record's SQL type can equal the same constant `set_scale` gates its
+    /// application-descriptor allowance on. msodbcsql rejects a negative
+    /// `SQL_DESC_SCALE` on an IPD `SQL_NUMERIC` record unconditionally
+    /// (`CheckSqlPrecScale<FALSE>` reinterprets the scale as unsigned,
+    /// `sqlcdesc.cpp:11527-11533`) — only the application-descriptor path
+    /// (`CheckADDescRecConsistency`) allows it.
+    #[test]
+    fn set_desc_field_ipd_numeric_scale_may_not_be_negative() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, (-1isize) as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_PRECISION_OR_SCALE);
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, 3isize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.ipd(), 1, SQL_DESC_SCALE), 3);
     }
 
     #[test]

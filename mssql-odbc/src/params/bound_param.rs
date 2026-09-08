@@ -4,7 +4,8 @@
 use std::ffi::c_void;
 
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_PARAM_INPUT, SqlLen, SqlPointer, SqlSmallInt, SqlULen,
+    SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_PARAM_INPUT, SQL_PREC_NUMERIC, SqlLen, SqlPointer,
+    SqlSmallInt, SqlULen,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
@@ -90,12 +91,32 @@ impl BoundParam {
     /// `SQLBindParameter`, which unconditionally writes both `SetADRec` (APD)
     /// and `SetIPDRec` (IPD) on every call, so a rebind fully overwrites the
     /// IPD's `length`/`precision`/`scale` rather than leaving fields from a
-    /// previous, differently-shaped binding behind. The APD's own
-    /// `length`/`precision`/`scale` are left untouched here, unlike
-    /// msodbcsql's `SetADRecBP`, which resets them to `SetTypeDefaults`'s
-    /// C-type-keyed defaults on every call — tracked as a known, narrow
-    /// (metadata-introspection-only) gap in
-    /// [#470](https://github.com/microsoft/mssql-rs/issues/470).
+    /// previous, differently-shaped binding behind.
+    ///
+    /// msodbcsql's `SetADRecBP` also `ZeroMemory`s the whole APD record and
+    /// re-applies `SetTypeDefaults`'s C-type-keyed defaults on every call
+    /// (`sqlcdesc.cpp:2883`); for `SQL_C_NUMERIC` that default is
+    /// `(SQL_PREC_NUMERIC, 0)` (`sqlcdesc.cpp:12344`,
+    /// `case SQL_NUMERIC: pGenDescRec->cbPrecision = SQL_PREC_NUMERIC;
+    /// pGenDescRec->ibScale = 0;` — `SQL_C_NUMERIC` and `SQL_NUMERIC` share
+    /// the same integer value). This driver only tracks the (execution-
+    /// critical, per `decimal_from_numeric`) precision/scale pair for that one
+    /// C type, so the reset below is scoped to it; every other C type's APD
+    /// precision/scale stays at whatever `DescRecord::default_for` seeded
+    /// (`0, 0`), which is harmless because nothing reads them. Without this
+    /// reset, a `SQL_C_NUMERIC` bind that never calls `SQLSetDescFieldW` left
+    /// `app_precision`/`app_scale` at `(0, 0)` instead of msodbcsql's real
+    /// `(38, 0)` — silently forcing the slow (rescale) path even for the
+    /// common "bind straight into a `NUMERIC(38,0)` column" case msodbcsql
+    /// fast-paths, and, once the struct's own scale is nonzero, treating it
+    /// as scale `0` in that slow path and corrupting the value. Resetting on
+    /// every call (not just the first) also closes the APD half of the
+    /// rebind-staleness gap this comment used to track as
+    /// [#470](https://github.com/microsoft/mssql-rs/issues/470); the ARD
+    /// half (`SQLBindCol`, `handles::stmt::ColumnBinding::write_to_record`)
+    /// is unaffected by this SQL_C_NUMERIC-input-parameter-scoped fix and
+    /// still tracks the general gap there.
+    ///
     /// `SQL_DESC_INDICATOR_PTR` and `SQL_DESC_OCTET_LENGTH_PTR`
     /// both receive the same pointer here — `SQLBindParameter`'s one
     /// `StrLen_or_IndPtr` argument feeds both descriptor fields at once,
@@ -114,6 +135,10 @@ impl BoundParam {
         apd_record.octet_length = self.buffer_length;
         apd_record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
         apd_record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
+        if self.c_type == SQL_C_NUMERIC {
+            apd_record.precision = SQL_PREC_NUMERIC;
+            apd_record.scale = 0;
+        }
 
         ipd_record.parameter_type = self.input_output_type;
         ipd_record.concise_type = self.sql_type;
@@ -337,6 +362,45 @@ mod tests {
         assert_eq!(ipd_record.concise_type, SQL_VARCHAR);
         assert_eq!(ipd_record.length, 8);
         assert_eq!(ipd_record.precision, 0);
+    }
+
+    /// `SQLBindParameter(..., SQL_C_NUMERIC, ...)` with no follow-up
+    /// `SQLSetDescFieldW` call must land the APD on msodbcsql's real
+    /// `SetTypeDefaults` default — `(SQL_PREC_NUMERIC, 0)`, i.e. `(38, 0)` —
+    /// not `(0, 0)`. Before this reset, a fresh bind into a `NUMERIC(38, 0)`
+    /// column wrongly mismatched that default and took the slow (rescale)
+    /// path where msodbcsql fast-paths, and misread a struct with a nonzero
+    /// scale as scale `0` once there.
+    #[test]
+    fn write_to_records_resets_numeric_apd_precision_and_scale_to_msodbcsql_default() {
+        let mut value = crate::api::odbc_types::SqlNumericStruct::default();
+        let mut ind: SqlLen = std::mem::size_of_val(&value) as SqlLen;
+        let bound = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_NUMERIC,
+            sql_type: crate::api::odbc_types::SQL_DECIMAL,
+            column_size: 38,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            parameter_value_ptr: (&raw mut value).cast(),
+            buffer_length: ind,
+            strlen_or_ind_ptr: &raw mut ind,
+            octet_length_ptr: &raw mut ind,
+        };
+        // Seed the record with stale values from a prior, differently-shaped
+        // binding to also prove the reset happens on every call, not just
+        // the first.
+        let mut apd_record = DescRecord {
+            precision: 7,
+            scale: 2,
+            ..DescRecord::default_for(DescKind::AppParam)
+        };
+        let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
+        bound.write_to_records(&mut apd_record, &mut ipd_record);
+
+        assert_eq!(apd_record.precision, SQL_PREC_NUMERIC);
+        assert_eq!(apd_record.scale, 0);
     }
 
     /// Per ODBC's "Decimal Digits" appendix, `DecimalDigits` for the whole
