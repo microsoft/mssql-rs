@@ -566,10 +566,11 @@ fn finish_parameter_array(
 ) -> SqlReturn {
     let mut failed_sets = client_side_failures;
     let mut had_info = false;
+    let complete = result.complete;
     let total_rows = result
         .total_rows_affected()
         .unwrap_or(SQL_NO_ROWCOUNT_TOTAL);
-    let processed = if result.complete {
+    let processed = if complete {
         outputs.paramset_size
     } else {
         result
@@ -620,6 +621,17 @@ fn finish_parameter_array(
             write_param_status(outputs.param_status_ptr, row.row_index, status);
         }
     }
+    if !complete {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_01000,
+            0,
+            format!(
+                "Batched RPC reported {processed} of {} parameter sets; the rest kept SQL_PARAM_UNUSED",
+                outputs.paramset_size
+            ),
+        );
+    }
     post_tds_info_messages(&mut stmt_state, &info_messages);
     stmt_state.row_count = total_rows;
     stmt_state.clear_exhaustion_state();
@@ -643,13 +655,18 @@ fn finish_parameter_array(
     // SQL_ERROR - its downgrade has no such branch. Total *client-side* failure
     // is still SQL_ERROR, but that is decided by the caller, because nothing
     // reached the wire and no set ran.
+    // A short batch is reported rather than rejected, so the sets the server did
+    // report keep their statuses and count. msodbcsql returns SQL_SUCCESS here -
+    // it never compares the reported count against SQL_ATTR_PARAMSET_SIZE
+    // (sqlctokn.cpp OnDone) - and leaves the unreported statuses untouched
+    // because it has no SQL_PARAM_UNUSED pre-fill. AB#47945.
     if failed_sets > 0 {
         if outputs.param_status_ptr.is_null() {
             SQL_ERROR
         } else {
             SQL_SUCCESS_WITH_INFO
         }
-    } else if had_info || !info_messages.is_empty() {
+    } else if !complete || had_info || !info_messages.is_empty() {
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS

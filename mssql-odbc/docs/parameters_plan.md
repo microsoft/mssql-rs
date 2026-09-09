@@ -888,6 +888,14 @@ work items. Not restated here.
 | 5 | output / `InputOutput` parameters | refused at `SQLBindParameter` | driver-wide gap, not array-specific |
 | 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | AB#47790 |
 | 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | AB#47945 |
+| 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS` | AB#47945 |
+
+Divergence 8 is defence-in-depth, not a live bug: no server behaviour is known
+to produce it. msodbcsql cannot report it because it never compares the reported
+count against `PARAMSET_SIZE` - `OnDone` in `sqlctokn.cpp` advances its row index
+only as DONE tokens arrive - and it has no `SQL_PARAM_UNUSED` pre-fill, so its
+unreported status entries keep whatever the application left in the buffer. Read
+from source; not measured, because neither driver can be driven into the state.
 
 Divergence 7 is new surface rather than new behaviour. ODBC defines
 `SQL_ATTR_PARAMSET_SIZE` as an alias for the APD header's

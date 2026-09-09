@@ -1824,20 +1824,6 @@ impl TdsClient {
         self.current_result_set_has_been_read_till_end = true;
         self.current_metadata = None;
 
-        // The one thing that legitimately shortens a batch is a server error
-        // that aborted the rest, and that error arrives on the last set the
-        // server did report. Short with no such error is unexplained: the
-        // caller would otherwise see SQL_SUCCESS over sets the server never
-        // reported, with their statuses left at the SQL_PARAM_UNUSED pre-fill.
-        // The socket is synchronised - the stream ended at a final DONE - so
-        // the connection is not marked dead, only this execution fails.
-        if !complete && results.last().is_none_or(|row| row.errors.is_empty()) {
-            return Err(crate::error::Error::ProtocolError(format!(
-                "Batched RPC reported {} of {expected_rows} commands with no error to explain the rest",
-                results.len()
-            )));
-        }
-
         let result = PreparedBatchResult {
             rows: results,
             complete,
@@ -14370,24 +14356,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_batch_rejects_a_short_reply_with_no_error_to_explain_it() {
+    async fn prepared_batch_reports_a_short_reply_with_no_error_to_explain_it() {
         // Two commands sent, one reported, and the stream ends cleanly with no
-        // server error. Nothing accounts for the missing set, so reporting it
-        // as a successful batch would hand the caller SQL_SUCCESS over a set
-        // the server never spoke about.
+        // server error. The shortfall is carried on `complete` so the ODBC
+        // layer can report it while keeping the set the server did report.
         let tokens = vec![batch_done_in_proc(1), batch_done_proc(false, false)];
         let (mut client, _) = create_capturing_client(tokens);
         let statement_id = client.register_prepared_handle_for_test(42);
         let rows = vec![Ok((0, Vec::new())), Ok((1, Vec::new()))];
 
-        let error = client
+        let result = client
             .execute_sp_execute_batch_for_test(statement_id, rows)
             .await
-            .expect_err("an unexplained short batch is a protocol error");
-        assert!(
-            error.to_string().contains("reported 1 of 2 commands"),
-            "unexpected error: {error}"
-        );
+            .expect("a short batch is reported, not rejected");
+        assert!(!result.complete, "one of two commands reported");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].row_index, 0);
         assert!(
             !client.is_connection_dead(),
             "the stream ended at a final DONE, so the socket is still usable"
