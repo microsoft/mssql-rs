@@ -96,13 +96,16 @@ extends:
 
         - ${{ if eq(parameters.publishToPyPI, true) }}:
           - pwsh: |
-              if ("$(Build.SourceBranch)" -ne 'refs/heads/stable') {
+              if ($env:RELEASE_SOURCE_BRANCH -ne 'refs/heads/stable') {
                 throw 'PyPI publishing is allowed only from refs/heads/stable.'
               }
-              if ("$(resources.pipeline.officialBuild.sourceBranch)" -ne 'refs/heads/stable') {
+              if ($env:OFFICIAL_BUILD_SOURCE_BRANCH -ne 'refs/heads/stable') {
                 throw 'PyPI publishing requires an Official Build produced from refs/heads/stable.'
               }
             displayName: 'Require stable branch for publish'
+            env:
+              RELEASE_SOURCE_BRANCH: $(Build.SourceBranch)
+              OFFICIAL_BUILD_SOURCE_BRANCH: $(resources.pipeline.officialBuild.sourceBranch)
 
         - pwsh: |
             $ErrorActionPreference = 'Stop'
@@ -117,8 +120,14 @@ extends:
               throw "Official Build artifacts not found: $artifactRoot"
             }
 
-            $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
-            $sourceBranch = "$(resources.pipeline.officialBuild.sourceBranch)"
+            $commitSha = $env:OFFICIAL_BUILD_SOURCE_COMMIT
+            $sourceBranch = $env:OFFICIAL_BUILD_SOURCE_BRANCH
+            if ($commitSha -notmatch '^[0-9a-fA-F]{40}$') {
+              throw "Selected build commit is not a full Git SHA: $commitSha"
+            }
+            if ([string]::IsNullOrWhiteSpace($sourceBranch)) {
+              throw 'Selected build source branch is empty.'
+            }
             git -C $repoRoot fetch origin $sourceBranch
             if ($LASTEXITCODE -ne 0) {
               throw "Could not fetch selected build branch $sourceBranch"
@@ -180,6 +189,9 @@ extends:
             Write-Host "Selected source commit: $commitSha"
             Write-Host "Staged $($wheels.Count) $distributionName $distributionVersion wheels unchanged."
           displayName: 'Verify and stage official wheels'
+          env:
+            OFFICIAL_BUILD_SOURCE_COMMIT: $(resources.pipeline.officialBuild.sourceCommit)
+            OFFICIAL_BUILD_SOURCE_BRANCH: $(resources.pipeline.officialBuild.sourceBranch)
 
         - ${{ if eq(parameters.publishToPyPI, true) }}:
           - task: EsrpRelease@9
