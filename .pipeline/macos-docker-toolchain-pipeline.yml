@@ -1,0 +1,147 @@
+# Publishes the macOS docker toolchain (docker CLI, colima, lima and the guest
+# disk image colima boots) as a Universal Package per architecture, so macOS CI
+# jobs install it from our own feed instead of reaching Homebrew, ghcr.io and
+# github.com at job time.
+#
+# Background: Homebrew stopped bottling the docker CLI for Intel macOS at 29.8.0,
+# so `brew install docker` began source-building it (and Go with it, ~8 min),
+# timing out Test MacOS. Colima also downloads a ~350 MB guest image from a
+# personal GitHub repo on every run, which has independently failed on DNS.
+#
+# Runs on a schedule so upstream releases land within a couple of weeks, and
+# decides for itself whether there is anything to publish: resolve-toolchain-
+# version.py compares the bottles upstream has now against what the feed already
+# carries, and a run that finds nothing moved publishes nothing. That keeps the
+# version history a record of upstream movement rather than of the schedule.
+#
+# The build runs on Linux -- it only fetches, verifies and repacks; nothing in
+# the payload is executed here. build-macos-docker-toolchain.py checks the Mach-O
+# architecture of every binary it packs, so a mis-resolved bottle fails the build
+# rather than shipping.
+
+trigger: none
+pr: none
+
+schedules:
+# The point is to notice upstream moving, which leaves no trace in this repo, so
+# `always` is required -- without it a scheduled run is skipped whenever the
+# branch has not changed, which is precisely the case this exists to cover.
+- cron: '0 9 1,16 * *'
+  displayName: 'Twice monthly upstream refresh (1st and 16th, 09:00 UTC)'
+  branches:
+    include:
+    - main
+  always: true
+
+parameters:
+# Normally left at 'auto': the version is derived from what is already published.
+#   PATCH  an upstream docker/colima/lima release, same payload layout
+#   MINOR  the layout changed (PAYLOAD_FORMAT in build-macos-docker-toolchain.py),
+#          so consumers resolving paths into the tree may have to change with it
+# Override with an explicit X.Y.Z only to force a specific number, e.g. a
+# deliberate 1.0.0. A sentinel rather than an empty default because the run
+# panel refuses to queue with a blank string parameter.
+- name: packageVersion
+  displayName: "Package version ('auto' derives it from the feed)"
+  type: string
+  default: 'auto'
+
+- name: forcePublish
+  displayName: 'Publish even if nothing changed upstream'
+  type: boolean
+  default: false
+
+# The architectures a version covers, deliberately a set rather than a toggle
+# each: they publish together or not at all.
+- name: architectures
+  type: object
+  default:
+  - x86_64
+  - arm64
+
+- name: dryRun
+  displayName: 'Dry run (build and inspect, do not publish)'
+  type: boolean
+  default: false
+
+- name: macosMajorFloor
+  displayName: 'Oldest macOS major version the payload must run on'
+  type: number
+  default: 14
+
+# A parameter rather than a variable: the job template consumes it at compile
+# time, where runtime variables are not available.
+- name: feed
+  displayName: 'Azure Artifacts feed to publish to'
+  type: string
+  default: 'public/mssql-rs_Public'
+
+variables:
+# Nothing here is built: the payload is fetched, checksummed and repacked, and
+# the macOS binaries inside it are Homebrew's builds, not ours. CodeQL has no
+# compilation to observe, so the org decorator's injection only adds job time.
+- name: Codeql.SkipTaskAutoInjection
+  value: true
+
+stages:
+- stage: Publish_macOS_Docker_Toolchain
+  displayName: 'Publish macOS docker toolchain'
+  jobs:
+  # Resolves both architectures before anything is downloaded, so an unchanged
+  # upstream costs a few HTTP calls instead of two 430 MB builds. One decision
+  # covers every architecture, so a given version always means the same run
+  # produced all of them -- which is also why there is no per-architecture
+  # publish toggle: skipping one would publish a version that exists for the
+  # other alone, and packages are immutable, so it could never be completed.
+  - job: Decide
+    displayName: 'Decide whether to publish, and at what version'
+    timeoutInMinutes: 10
+    variables:
+    # A dry run should always build something to look at, so it forces too.
+    - ${{ if or(eq(parameters.forcePublish, true), eq(parameters.dryRun, true)) }}:
+      - name: forceFlag
+        value: '--force'
+    - ${{ else }}:
+      - name: forceFlag
+        value: ''
+    pool:
+      name: RUST-UTIL-WUS3
+      demands:
+        - imageOverride -equals RUST-UBUSLIM
+    steps:
+    - checkout: self
+    # Every run-dialog value is passed as an environment variable, never
+    # substituted into the script body: `${{ parameters.x }}` is textual
+    # substitution into shell source before bash sees it, so a value containing
+    # a quote closes the quoting and the rest of it runs as commands. As an
+    # environment value it is data, and the shell never parses it.
+    - script: |
+        set -euo pipefail
+        args=()
+        for arch in $ARCHITECTURES; do args+=(--arch "$arch"); done
+        python3 .pipeline/scripts/resolve-toolchain-version.py \
+          --org "$ORG" \
+          --feed "$FEED" \
+          "${args[@]}" \
+          --macos-major "$MACOS_MAJOR" \
+          --version "$PACKAGE_VERSION" \
+          $(forceFlag)
+      name: decide
+      displayName: 'Compare upstream against the feed'
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+        ORG: $(System.CollectionUri)
+        FEED: ${{ parameters.feed }}
+        # Word-split into the array above rather than eval'd, and each value
+        # still has to satisfy the script's own --arch choices.
+        ARCHITECTURES: ${{ join(' ', parameters.architectures) }}
+        MACOS_MAJOR: ${{ parameters.macosMajorFloor }}
+        PACKAGE_VERSION: ${{ parameters.packageVersion }}
+
+  - ${{ each arch in parameters.architectures }}:
+    - template: templates/macos-toolchain-job.yml
+      parameters:
+        arch: ${{ arch }}
+        macosMajorFloor: ${{ parameters.macosMajorFloor }}
+        dryRun: ${{ parameters.dryRun }}
+        feed: ${{ parameters.feed }}
