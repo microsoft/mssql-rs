@@ -1010,13 +1010,18 @@ TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesTh
 // the first. The first bind here explicitly sets APD precision/scale to
 // (10, 2) via SQLSetDescFieldW -- a value that would coincidentally match
 // the second bind's NUMERIC(10,2) target if it leaked forward, wrongly
-// forcing the fast path. The second bind embeds a deliberately wrong
+// forcing the fast path. That APD also matches this first bind's own
+// NUMERIC(10,2) column, so it legitimately takes the fast path too -- the
+// embedded struct's own precision/scale (10, 2) must actually describe
+// 123.45 for that fast path to round-trip correctly, unlike
+// NumericStructMatchingMetadataKeepsEmbeddedMetadata's deliberately-mismatched
+// embedded metadata. The second bind embeds a deliberately wrong
 // precision/scale (15, 9) in the struct itself, which the correct slow path
 // must ignore in favor of the freshly-reset APD scale (0).
 TEST_F(ScalarConversionLiveTest, NumericRebindDoesNotInheritAPreviousBindsStaleApdScale) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?)"), SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(BindNumeric(SQL_DECIMAL, 10, 2, 10, 2, true, 12345), SQL_HANDLE_STMT,
-                  stmt_);
+    ASSERT_SQL_OK(BindNumericRaw(SQL_DECIMAL, 10, 2, 10, 2, 1, 12345, 0, 10, 2),
+                  SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("123.45", ExecuteAndReadBack());
 
     SQL_NUMERIC_STRUCT value = {};
