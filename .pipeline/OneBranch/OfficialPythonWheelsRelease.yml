@@ -45,7 +45,7 @@ parameters:
     default: false
 
   - name: tagRelease
-    displayName: 'Create git tag and release branch'
+    displayName: 'Create mssql-py-core git tag and release branch'
     type: boolean
     default: false  # Safety: default to false
 
@@ -327,17 +327,12 @@ extends:
               displayName: 'Verify mssql-mock-tds on crates.io'
 
     ###########################################################################
-    # Stage 3: Tag the source commit and create release branch
+    # Stage 3: Tag the mssql-py-core release source
     ###########################################################################
-    - ${{ if and(eq(parameters.tagRelease, true), ne(parameters.validateCratesOnly, true)) }}:
+    - ${{ if eq(parameters.tagRelease, true) }}:
       - stage: Tag
-        displayName: 'Tag Release and Create Branch'
-        ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true)) }}:
-          dependsOn:
-          - Release
-          - ReleaseCrates
-        ${{ else }}:
-          dependsOn: Release
+        displayName: 'Tag mssql-py-core Release'
+        dependsOn: Release
         jobs:
         - job: TagAndBranch
           displayName: 'Git tag + release branch'

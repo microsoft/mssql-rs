@@ -57,17 +57,16 @@ function Set-PackageVersion {
         throw "No [package] section found in $Path"
     }
 
-    $versionMatches = [regex]::Matches($packageSection.Value, '(?m)^version\s*=\s*"[^"]+"')
+    $versionMatches = [regex]::Matches($packageSection.Value, '(?m)^(version\s*=\s*)"[^"]+"')
     if ($versionMatches.Count -ne 1) {
         throw "Expected one package version in ${Path}, found $($versionMatches.Count)"
     }
 
-    $updatedSection = [regex]::Replace(
-        $packageSection.Value,
-        '(?m)^(version\s*=\s*)"[^"]+"',
-        "`${1}`"$Version`"",
-        1
-    )
+    $versionMatch = $versionMatches[0]
+    $replacement = $versionMatch.Groups[1].Value + "`"$Version`""
+    $updatedSection = $packageSection.Value.Substring(0, $versionMatch.Index) +
+        $replacement +
+        $packageSection.Value.Substring($versionMatch.Index + $versionMatch.Length)
 
     return $Content.Substring(0, $packageSection.Index) +
         $updatedSection +

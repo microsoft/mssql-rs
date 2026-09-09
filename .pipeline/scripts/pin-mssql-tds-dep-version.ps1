@@ -84,9 +84,9 @@ foreach ($entry in @(
     }
     else {
         $replacement = "{ $key = `"$value`", ".Replace('$', '$$')
-        $dependency = [regex]::Replace(
+        $openBracePattern = [regex]'\{\s*'
+        $dependency = $openBracePattern.Replace(
             $dependency,
-            '\{\s*',
             $replacement,
             1
         )
