@@ -429,10 +429,11 @@ static PARAM_SQL_TYPES: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
 /// `SqlSsTimestampoffsetStruct`); that padding also guarantees a NUL terminator
 /// for the `SQL_NTS` scans, so every in-bounds contract `read_param_value`
 /// documents holds and a crash reflects a real conversion defect, not
-/// harness-induced UB. The indicator spans the valid lengths plus
-/// `read_indicator`'s rejection markers (data-at-execution, default-parameter,
-/// and negative lengths), all of which are refused before the value buffer is
-/// read, so they stay in-bounds by construction.
+/// harness-induced UB. The indicator spans the valid lengths plus the
+/// out-of-range markers: the data-at-execution and default-parameter markers
+/// are refused before the value buffer is read, while a plain negative length
+/// is refused only for the character/binary C types and otherwise falls through
+/// to a fixed-width struct read that the padding keeps in-bounds.
 pub fn fuzz_bound_param(data: &[u8]) {
     let mut cur = ByteCursor::new(data);
     let c_type = PARAM_C_TYPES[(cur.u8() as usize) % PARAM_C_TYPES.len()];
@@ -455,10 +456,13 @@ pub fn fuzz_bound_param(data: &[u8]) {
         1 => SQL_NTS as SqlLen,
         2 => fuzz_len,
         3 => fuzz_len / 2,
-        // The remaining arms reach `read_indicator`'s rejection paths, each of
-        // which returns before the value buffer is read: an unstaged
-        // data-at-execution indicator (both spellings), a default-parameter
-        // marker, and a plain negative length.
+        // The remaining arms exercise `read_indicator`'s out-of-range markers.
+        // Arms 4-6 return before the value buffer is read: an unstaged
+        // data-at-execution indicator (both spellings) and a default-parameter
+        // marker. Arm 7's plain negative length is only refused for the
+        // character/binary C types; for the fixed-width ones `read_indicator`
+        // ignores it and falls through to a struct read the 32-byte padding
+        // keeps in-bounds.
         4 => SQL_DATA_AT_EXEC,
         5 => SQL_LEN_DATA_AT_EXEC_OFFSET - (fuzz_len & 0x3f),
         6 => SQL_DEFAULT_PARAM,
