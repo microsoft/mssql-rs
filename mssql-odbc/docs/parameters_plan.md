@@ -857,7 +857,13 @@ accept/store contract itself belongs to AB#46377 and is documented in
 - **Batching.** One RPC per set in a single request, separated by
   `RPC_BATCH_DELIMITER` (`0xff`), drained set by set (`execute_prepared_batch`,
   `drain_prepared_batch`). 1000-row prepared `INSERT` over loopback: 21.2 ms
-  batched, 204.2 ms looped, 22.4 ms for msodbcsql.
+  batched, 204.2 ms looped, 22.4 ms for msodbcsql. `mssql-odbc-bench`'s
+  `executemany` scenario (`kParameterArrayRows` in `odbc_bench.cpp`) measures a
+  single fixed shape - 2,000 rows, 3 narrow fixed-width columns - and that is
+  the only regime the parity numbers above cover. Small array sizes (2-10 rows,
+  a different per-call-overhead ratio) and wide or LOB-column rows are
+  unmeasured; treat parity claims as scoped to the measured shape until those
+  are added.
 - **Binding.** Column-wise and row-wise (`SQL_ATTR_PARAM_BIND_TYPE`) layouts and
   `SQL_ATTR_PARAM_BIND_OFFSET_PTR` are all honoured.
 - **Reporting.** `SQL_ATTR_PARAMS_PROCESSED_PTR` counts sets reached,

@@ -111,6 +111,8 @@ pub(crate) fn parameter_value_stride(c_type: SqlSmallInt, buffer_length: SqlLen)
         SQL_C_TYPE_TIMESTAMP => std::mem::size_of::<SqlTimestampStruct>(),
         SQL_C_GUID => std::mem::size_of::<SqlGuid>(),
         SQL_C_NUMERIC => std::mem::size_of::<SqlNumericStruct>(),
+        // sizeof(SQL_INTERVAL_STRUCT): 4-byte interval_type + 2-byte interval_sign
+        // + 2-byte pad + 20-byte SQL_DAY_SECOND_STRUCT union member.
         SQL_C_INTERVAL_YEAR..=SQL_C_INTERVAL_MINUTE_TO_SECOND => 28,
         _ => return None,
     };
