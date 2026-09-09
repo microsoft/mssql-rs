@@ -2944,14 +2944,24 @@ fn strip_sub_one_leading_zero(s: String) -> String {
     }
 }
 
+/// One byte as its two upper-case hex characters.
+pub(crate) fn hex_pair(byte: u8) -> [u8; 2] {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    [
+        DIGITS[usize::from(byte >> 4)],
+        DIGITS[usize::from(byte & 0x0F)],
+    ]
+}
+
 /// Upper-case hex, two characters per byte and no `0x` prefix, matching what
 /// msodbcsql renders for a binary column read as characters.
 fn bytes_to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        // Infallible into a String.
-        let _ = write!(out, "{b:02X}");
+        let pair = hex_pair(*b);
+        // ASCII hex digits are valid UTF-8.
+        out.push(char::from(pair[0]));
+        out.push(char::from(pair[1]));
     }
     out
 }

@@ -277,6 +277,45 @@ TEST_F(BinToCharLiveTest, GeometryRendersItsWireBytesAsHex) {
     SQLCloseCursor(stmt_);
 }
 
+// Bound delivery must not depend on how big the value happens to be. A small
+// varbinary(max) arrives buffered and goes through deliver_bound; a large one
+// streams through deliver_bound_plp. Both have to render hex.
+TEST_F(BinToCharLiveTest, BoundVarbinaryMaxRendersHexWhetherBufferedOrStreamed) {
+    struct Case {
+        const char* repeat;
+        SQLLEN expectedIndicator;
+        SQLRETURN expectedRc;
+        size_t expectedChars;
+    };
+    // 10 bytes is buffered; 1,100,000 crosses into the streaming path, where the
+    // 65-byte buffer takes 64 characters and the terminator.
+    const Case cases[] = {{"10", 20, SQL_SUCCESS, 20},
+                          {"1100000", 2200000, SQL_SUCCESS_WITH_INFO, 64}};
+
+    for (const auto& c : cases) {
+        const std::string sql = std::string("SELECT CAST(REPLICATE(CAST(0xAB AS VARBINARY(MAX)), ") +
+                                c.repeat + ") AS VARBINARY(MAX))";
+        ASSERT_SQL_OK(ExecDirect(sql), SQL_HANDLE_STMT, stmt_);
+
+        char buf[65];
+        std::memset(buf, 0x7E, sizeof(buf));
+        SQLLEN ind = -1;
+        ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                      stmt_);
+        const SQLRETURN fetchRc = SQLFetch(stmt_);
+        EXPECT_EQ(c.expectedRc, fetchRc)
+            << "repeat " << c.repeat << " state "
+            << ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(c.expectedIndicator, ind) << "repeat " << c.repeat;
+        std::string expected;
+        while (expected.size() < c.expectedChars) expected += "AB";
+        EXPECT_EQ(expected, std::string(buf)) << "repeat " << c.repeat;
+
+        SQLFreeStmt(stmt_, SQL_UNBIND);
+        SQLCloseCursor(stmt_);
+    }
+}
+
 // A uniqueidentifier is not hex-rendered: it has its own string form, which the
 // driver already produced before this change.
 TEST_F(BinToCharLiveTest, UniqueidentifierKeepsItsGuidRendering) {
