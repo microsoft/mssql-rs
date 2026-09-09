@@ -1,4 +1,4 @@
-# mssql-py-core Release Management
+# mssql-python-rs Release Management
 
 How changes in `mssql-rs` (Rust) flow to `mssql-python` (Python) through the wheel build and NuGet publishing pipeline.
 
@@ -11,7 +11,7 @@ mssql-rs repo (Rust)
 └── .pipeline/OneBranch/ ← Builds wheels, packages into NuGet
 
         │  builds 34 wheels (5 Python × 7 platforms)
-        │  packages into NuGet: mssql-py-core-wheels
+        │  packages into NuGet: mssql-python-rs-wheels
         ▼
 
 Azure Artifacts feed: mssql-rs/mssql-rs
@@ -32,8 +32,8 @@ PyPI: mssql-python
 |---|---|---|---|---|---|
 | Windows x64 (`win_amd64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Windows ARM64 (`win_arm64`) | — | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc x64 (`manylinux_2_28_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc ARM64 (`manylinux_2_28_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc x64 (`linux_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc ARM64 (`linux_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Linux musl x64 (`musllinux_1_2_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Linux musl ARM64 (`musllinux_1_2_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | macOS universal2 (`macosx_15_0_universal2`) | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -44,7 +44,12 @@ PyPI: mssql-python
 
 ## Version Scheme
 
-The NuGet package version is derived from `mssql-py-core/Cargo.toml` with a prerelease suffix:
+The Rust crate and NuGet transport package share the version from
+`mssql-py-core/Cargo.toml`. The `mssql-python-rs` Python distribution has an
+independent version in `mssql-py-core/pyproject.toml`. For example, NuGet
+`mssql-python-rs-wheels 0.1.10` can contain `mssql_python_rs-0.1.0-*.whl`.
+
+The NuGet prerelease suffix depends on the build type:
 
 | Build Type | Version Format | Example |
 |---|---|---|
@@ -71,7 +76,7 @@ NuGet SemVer 2.0 ordering: `dev` < `nightly` < release (no suffix).
 3. Publish stage:
    - Extracts version from mssql-py-core/Cargo.toml (e.g., 0.2.0)
    - Appends -nightly.YYYYMMDD suffix
-   - Packs wheels into NuGet: mssql-py-core-wheels.0.2.0-nightly.20260217
+  - Packs wheels into NuGet: mssql-python-rs-wheels.0.2.0-nightly.20260217
    - OneBranch auto-publishes to mssql-rs/mssql-rs feed
 4. mssql-python CI (next run) picks up the latest nightly
 ```
@@ -82,13 +87,13 @@ In its pipeline or `pyproject.toml` build script, `mssql-python` references the 
 
 ```
 # Download latest nightly wheels NuGet
-nuget install mssql-py-core-wheels -Version 0.2.0-nightly.* -Source mssql-rs/mssql-rs -Prerelease
+nuget install mssql-python-rs-wheels -Version 0.2.0-nightly.* -Source mssql-rs/mssql-rs -Prerelease
 ```
 
 Or pin a specific nightly:
 
 ```
-nuget install mssql-py-core-wheels -Version 0.2.0-nightly.20260217 -Source mssql-rs/mssql-rs
+nuget install mssql-python-rs-wheels -Version 0.2.0-nightly.20260217 -Source mssql-rs/mssql-rs
 ```
 
 ### Key properties
@@ -109,7 +114,7 @@ nuget install mssql-py-core-wheels -Version 0.2.0-nightly.20260217 -Source mssql
 1. Developer merges PR to main or development
 2. CI trigger fires immediately
 3. Pipeline builds 34 wheels
-4. Publish stage produces: mssql-py-core-wheels.0.2.0-dev.20260217.140071
+4. Publish stage produces: mssql-python-rs-wheels.0.2.0-dev.20260217.140071
    (BuildId ensures uniqueness even with multiple merges per day)
 5. Developer tells mssql-python to use this specific version
 ```
@@ -119,7 +124,7 @@ nuget install mssql-py-core-wheels -Version 0.2.0-nightly.20260217 -Source mssql
 ```
 1. Developer triggers pipeline manually from any branch
 2. Pipeline builds 34 wheels
-3. Publish stage produces: mssql-py-core-wheels.0.2.0-dev.20260217.140095
+3. Publish stage produces: mssql-python-rs-wheels.0.2.0-dev.20260217.140095
 4. Developer uses this version in mssql-python for testing
 ```
 
@@ -130,7 +135,7 @@ nuget install mssql-py-core-wheels -Version 0.2.0-nightly.20260217 -Source mssql
 
 ```powershell
 # Download the specific dev wheels
-nuget install mssql-py-core-wheels -Version 0.2.0-dev.20260217.140071 -Source mssql-rs/mssql-rs
+nuget install mssql-python-rs-wheels -Version 0.2.0-dev.20260217.140071 -Source mssql-rs/mssql-rs
 # Extract wheels and run mssql-python tests against them
 ```
 
@@ -145,7 +150,7 @@ nuget install mssql-py-core-wheels -Version 0.2.0-dev.20260217.140071 -Source ms
 
 ---
 
-## Scenario 3: Upgrading mssql-python to a New mssql-py-core Version
+## Scenario 3: Upgrading mssql-python to a New Native Package Version
 
 **Purpose**: When `mssql-python` needs to adopt a new version of the native core (e.g., new features, bug fixes).
 
@@ -155,8 +160,8 @@ nuget install mssql-py-core-wheels -Version 0.2.0-dev.20260217.140071 -Source ms
 2. **Bump version** in `mssql-py-core/Cargo.toml` (and `mssql-tds/Cargo.toml` if changed)
    - First code change in a sprint bumps the version
    - Subsequent changes in the same sprint do NOT bump again
-3. **Merge PR** — CI produces `mssql-py-core-wheels.0.2.1-dev.YYYYMMDD.BuildId`
-4. **Nightly** picks it up: `mssql-py-core-wheels.0.2.1-nightly.YYYYMMDD`
+3. **Merge PR** — CI produces `mssql-python-rs-wheels.0.2.1-dev.YYYYMMDD.BuildId`
+4. **Nightly** picks it up: `mssql-python-rs-wheels.0.2.1-nightly.YYYYMMDD`
 
 ### Steps in mssql-python
 
@@ -169,7 +174,7 @@ nuget install mssql-py-core-wheels -Version 0.2.0-dev.20260217.140071 -Source ms
     command: restore
     # Update from 0.2.0 to 0.2.1 (or use -nightly.* for latest)
     restoreSource: mssql-rs/mssql-rs
-    packages: mssql-py-core-wheels@0.2.1-nightly.*
+    packages: mssql-python-rs-wheels@0.2.1-nightly.*
 ```
 
 2. **Update any Python-side bindings** if the native API changed (new functions, changed signatures)
@@ -194,7 +199,7 @@ Week 2:
   mssql-python: tests against 0.2.1-nightly.20260310 ✅
 
 Sprint end:
-  mssql-rs: Official release → mssql-py-core-wheels.0.2.1 (clean)
+  mssql-rs: Official release → mssql-python-rs-wheels.0.2.1 (clean)
   mssql-python: pins to 0.2.1 release, does its own release
 ```
 
@@ -202,7 +207,7 @@ Sprint end:
 
 ## Scenario 4: Release Activities
 
-**Purpose**: Produce a production-quality, signed, immutable release of `mssql-py-core-wheels`.
+**Purpose**: Produce a production-quality, signed, immutable release of `mssql-python-rs-wheels`.
 
 ### Pre-release checklist (mssql-rs)
 
@@ -214,7 +219,7 @@ Sprint end:
 ### Release build
 
 1. **Trigger the Official pipeline manually** with `isOfficial: true`
-   - This produces a clean semver NuGet: `mssql-py-core-wheels.0.2.1`
+  - This produces a clean semver NuGet: `mssql-python-rs-wheels.0.2.1`
    - OneBranch runs full SDL scanning (BinSkim, Clippy, AV)
    - Package is published to `mssql-rs/mssql-rs` feed
 
@@ -234,7 +239,7 @@ git push origin release/0.2.1
 
 ### Post-release in mssql-python
 
-1. Update NuGet reference to the clean release version: `mssql-py-core-wheels@0.2.1`
+1. Update NuGet reference to the clean release version: `mssql-python-rs-wheels@0.2.1`
 2. Run full test suite
 3. Update `mssql-python` version (e.g., bump to `1.4.0`)
 4. Publish to PyPI
@@ -249,7 +254,7 @@ main            ──●──●──●──●──  (sprint 43 work cont
 release/0.2.1   ───────●── cherry-pick fix
                        │
                        └── bump to 0.2.2, trigger Official pipeline
-                           → mssql-py-core-wheels.0.2.2
+                           → mssql-python-rs-wheels.0.2.2
                            → tag v0.2.2
 ```
 
@@ -275,19 +280,19 @@ Steps:
 ## NuGet Package Structure
 
 ```
-mssql-py-core-wheels.0.2.1.nupkg
-├── mssql-py-core-wheels.nuspec
+mssql-python-rs-wheels.0.1.10.nupkg
+├── mssql-python-rs-wheels.nuspec
 └── wheels/
-    ├── mssql_py_core-0.2.1-cp310-cp310-win_amd64.whl
-    ├── mssql_py_core-0.2.1-cp310-cp310-manylinux_2_28_x86_64.whl
-    ├── mssql_py_core-0.2.1-cp310-cp310-manylinux_2_28_aarch64.whl
-    ├── mssql_py_core-0.2.1-cp310-cp310-musllinux_1_2_x86_64.whl
-    ├── mssql_py_core-0.2.1-cp310-cp310-musllinux_1_2_aarch64.whl
-    ├── mssql_py_core-0.2.1-cp310-cp310-macosx_15_0_universal2.whl
-    ├── mssql_py_core-0.2.1-cp311-cp311-win_amd64.whl
-    ├── mssql_py_core-0.2.1-cp311-cp311-win_arm64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-win_amd64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-linux_x86_64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-linux_aarch64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_x86_64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_aarch64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-macosx_15_0_universal2.whl
+  ├── mssql_python_rs-0.1.0-cp311-cp311-win_amd64.whl
+  ├── mssql_python_rs-0.1.0-cp311-cp311-win_arm64.whl
     ├── ... (34 wheels total)
-    └── mssql_py_core-0.2.1-cp314-cp314-macosx_15_0_universal2.whl
+  └── mssql_python_rs-0.1.0-cp314-cp314-macosx_15_0_universal2.whl
 ```
 
 ## Traceability
@@ -297,8 +302,8 @@ Every NuGet package description includes:
 - Azure DevOps build number
 
 ```
-mssql-py-core-wheels 0.2.1
-Description: Python wheels for mssql-py-core across all platforms. Commit: a1b2c3d4. Build: 20260217.1
+mssql-python-rs-wheels 0.1.10
+Description: Python wheels containing the mssql-python-rs TDS core and ODBC driver. Commit: a1b2c3d4. Build: 20260217.1
 ```
 
 This creates: **NuGet version → git tag → exact source commit → pipeline run with logs**.

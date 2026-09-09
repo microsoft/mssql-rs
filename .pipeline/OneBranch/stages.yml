@@ -450,6 +450,21 @@ stages:
         displayName: 'List collected wheels'
 
       - pwsh: |
+          $requireOdbc = "${{ parameters.buildOdbcNative }}" -eq "True"
+          $pyprojectToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/pyproject.toml" -Raw
+          if ($pyprojectToml -match '(?ms)^\[project\]\s*$.*?^version\s*=\s*"([^"]+)"') {
+            $pythonVersion = $Matches[1]
+          } else {
+            throw "Could not extract [project].version from mssql-py-core/pyproject.toml"
+          }
+          & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
+            -WheelsDir "$(Build.StagingDirectory)/wheels" `
+            -ExpectedName "mssql-python-rs" `
+            -ExpectedVersion $pythonVersion `
+            -RequireOdbc:$requireOdbc
+        displayName: 'Validate wheel metadata and ODBC payloads'
+
+      - pwsh: |
           $ErrorActionPreference = 'Stop'
 
           # Extract version from mssql-py-core/Cargo.toml
@@ -499,14 +514,20 @@ stages:
           Write-Host "Build reason: $buildReason | Official: $isOfficial"
           Write-Host "##vso[task.setvariable variable=nugetVersion]$packageVersion"
 
+          $packageContents = if ("${{ parameters.buildOdbcNative }}" -eq "True") {
+            "the mssql-python-rs TDS core and ODBC driver"
+          } else {
+            "the mssql-python-rs TDS core"
+          }
+
           # Create .nuspec
           $nuspecContent = @"
           <?xml version="1.0"?>
           <package>
             <metadata>
-              <id>mssql-py-core-wheels</id>
+              <id>mssql-python-rs-wheels</id>
               <version>$packageVersion</version>
-              <description>Python wheels for mssql-py-core across all platforms. Commit: $shortSha. Build: $(Build.BuildNumber)</description>
+              <description>Python wheels containing $packageContents. Commit: $shortSha. Build: $(Build.BuildNumber)</description>
               <authors>SqlClientDrivers</authors>
             </metadata>
             <files>
@@ -515,7 +536,7 @@ stages:
           </package>
           "@
 
-          $nuspecPath = "$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec"
+          $nuspecPath = "$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec"
           $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
           Write-Host "Created nuspec at $nuspecPath"
         displayName: 'Generate NuGet package metadata'
@@ -524,7 +545,7 @@ stages:
         displayName: 'Create NuGet package'
         inputs:
           command: pack
-          packagesToPack: '$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec'
+          packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
           packDestination: '$(ob_outputDirectory)/packages'
           basePath: '$(Build.StagingDirectory)'
 
