@@ -200,7 +200,7 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, NumericTruncationIsReportedBeforeDataAtExecutionButNotAfter) {
+TEST_F(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsNotReported) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -222,11 +222,7 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationIsReportedBeforeDataAtExecutionB
     SQLRETURN rc = SQLExecute(stmt_);
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-    // msodbcsql's per-parameter RPC loop posts a truncated non-DAE parameter's
-    // 01S07 warning as it is processed, then keeps scanning and returns
-    // SQL_NEED_DATA once it reaches the streamed parameter -- so the warning
-    // is observable immediately here, before SQLParamData is ever called.
-    EXPECT_EQ("01S07", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
     ASSERT_EQ(&streamed_token, value_ptr);
@@ -241,16 +237,7 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationIsReportedBeforeDataAtExecutionB
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-// Mirror of NumericTruncationIsReportedBeforeDataAtExecutionButNotAfter with
-// the ordinals swapped: the streamed parameter comes first, the truncated
-// numeric second. msodbcsql's per-parameter RPC loop (AddRPCUserParameters)
-// has not scanned the second parameter yet when SQLExecute returns
-// SQL_NEED_DATA, so it cannot post 01S07 there -- it only reaches the
-// truncated value while resuming the scan inside the completing
-// SQLParamData call, which is where the warning must surface instead. A
-// premature post at SQLExecute would be silently discarded anyway:
-// SQLParamData clears prior statement diagnostics on entry (sqlccmd.cpp:6818).
-TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsReportedAtCompletion) {
+TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsNotReported) {
     ASSERT_SQL_OK(Prepare("SELECT ? + ':' + CONVERT(VARCHAR(32), ?) AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -271,8 +258,6 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsReportedAt
     SQLRETURN rc = SQLExecute(stmt_);
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-    // Not observable yet: the truncation is ordinally after the streamed
-    // parameter, so it hasn't been scanned at this point.
     EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 
     SQLPOINTER value_ptr = nullptr;
@@ -282,10 +267,8 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsReportedAt
     ASSERT_SQL_OK(SQLPutData(stmt_, const_cast<char*>(chunk), 4),
                   SQL_HANDLE_STMT, stmt_);
 
-    // The completing call must not lose the warning to SQLParamData's own
-    // entry-time diagnostics reset.
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLParamData(stmt_, &value_ptr));
-    EXPECT_EQ("01S07", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+    EXPECT_EQ(SQL_SUCCESS, SQLParamData(stmt_, &value_ptr));
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("head:1.5", GetColumnChar(1));
@@ -760,7 +743,7 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundPara
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
-TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationIsReportedBeforeDataAtExecutionButNotAfter) {
+TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationBeforeDataAtExecutionIsNotReported) {
     SQL_NUMERIC_STRUCT numeric = {};
     numeric.precision = 3;
     numeric.scale = 2;
@@ -780,7 +763,7 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationIsReportedBeforeDataAt
         ExecDirect("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v");
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("01S07", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
     ASSERT_EQ(&streamed_token, value_ptr);

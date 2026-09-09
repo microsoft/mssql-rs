@@ -737,21 +737,6 @@ pub(crate) struct DaeState {
     pub(crate) cursor: Option<usize>,
     /// Progress on the parameter named by `cursor`.
     pub(crate) progress: DaeProgress,
-    /// A non-DAE parameter ordinally after the first DAE parameter had a
-    /// fractional digit dropped rescaling it onto its declared scale.
-    ///
-    /// msodbcsql's per-parameter RPC loop (`AddRPCUserParameters`) breaks at
-    /// the first streamed parameter and does not resume scanning past it until
-    /// the `SQLParamData` call that finishes the sequence, so a truncation
-    /// found only after that point cannot be posted at the initial
-    /// `SQLExecute`/`SQLExecDirect` the way a truncation found before the first
-    /// DAE parameter is (`park_dae_client`'s `fractional_truncated` posts
-    /// that half immediately). This flag carries the deferred half across the
-    /// whole streaming sequence so the completing `SQLParamData` call can post
-    /// it — `SQLParamData` clears prior statement diagnostics on entry, so
-    /// posting it any earlier would just have it wiped before the application
-    /// ever sees it.
-    pub(crate) trailing_truncated: bool,
 }
 
 impl DaeState {
@@ -760,7 +745,6 @@ impl DaeState {
         prepared: Option<PreparedPlan>,
         orphaned: Option<StatementId>,
         params: Vec<DaeParam>,
-        trailing_truncated: bool,
     ) -> Self {
         Self {
             client: Some(client),
@@ -770,7 +754,6 @@ impl DaeState {
             params,
             cursor: None,
             progress: DaeProgress::default(),
-            trailing_truncated,
         }
     }
 
@@ -812,8 +795,7 @@ impl DaeState {
     }
 
     /// Builds a sequence with no parked client, for tests that exercise the
-    /// validation paths reached before any network write. `trailing_truncated`
-    /// defaults to `false`.
+    /// validation paths reached before any network write.
     #[cfg(test)]
     pub(crate) fn for_test(params: Vec<DaeParam>, cursor: Option<usize>) -> Self {
         Self {
@@ -824,7 +806,6 @@ impl DaeState {
             params,
             cursor,
             progress: DaeProgress::default(),
-            trailing_truncated: false,
         }
     }
 
@@ -1170,14 +1151,6 @@ impl StmtState {
         self.prepared = dae.prepared;
         self.pending_unprepare = dae.orphaned;
         dae.client
-    }
-
-    /// Whether a non-DAE parameter after the first DAE parameter had a
-    /// fractional digit truncated, deferred for the completing `SQLParamData`
-    /// call to post. Read this before [`Self::take_dae`], which discards it
-    /// along with the rest of the sequence.
-    pub(crate) fn dae_trailing_truncated(&self) -> bool {
-        self.dae.as_ref().is_some_and(|dae| dae.trailing_truncated)
     }
 
     /// `true` while the statement is in the ODBC "Need Data" state, suspended

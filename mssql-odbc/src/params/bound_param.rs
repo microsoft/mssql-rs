@@ -132,6 +132,7 @@ impl BoundParam {
         apd_record.concise_type = self.c_type;
         apd_record.datetime_interval_code = datetime_interval_code_for(self.c_type);
         apd_record.data_ptr = self.parameter_value_ptr;
+        apd_record.data_bound = true;
         apd_record.octet_length = self.buffer_length;
         apd_record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
         apd_record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
@@ -171,24 +172,18 @@ impl BoundParam {
     }
 
     /// Reconstructs the binding an APD/IPD record pair represents, or `None`
-    /// when the record was never touched: `DescRecord::default_for` pairs a
-    /// growth placeholder's `SQL_C_DEFAULT` concise type with a null
-    /// `SQL_DESC_DATA_PTR`, and that pairing is the actual "unbound" signal.
+    /// when no application value binding is active.
     ///
     /// `SQL_C_DEFAULT` alone cannot mean "unbound": it is also a valid value
     /// `SQLSetDescFieldW`/`SQLSetDescRec` can write to `SQL_DESC_CONCISE_TYPE`
     /// intentionally, asking the driver to resolve the C type from the
     /// paired IPD's SQL type at execute time, exactly as
     /// `sql_bind_parameter_safe` resolves it before ever writing to the APD.
-    /// A non-null `data_ptr` alongside `SQL_C_DEFAULT` means exactly that
-    /// case, so it is resolved here the same way, via
-    /// [`resolve_default_c_type`], rather than reported as unbound.
+    /// An active binding with `SQL_C_DEFAULT` is resolved here via
+    /// [`resolve_default_c_type`].
     ///
-    /// Unlike `ColumnBinding::from_record`'s ARD-side null-`SQL_DESC_DATA_PTR`
-    /// check, a parameter record cannot key "unbound" *only* off a null value
-    /// pointer: `SQLBindParameter` legitimately accepts a null
-    /// `ParameterValuePtr` for a data-at-execution parameter, so that would
-    /// misreport every DAE binding as unbound.
+    /// `data_bound` is separate from `data_ptr` because `SQLBindParameter`
+    /// legitimately accepts a null `ParameterValuePtr` for DAE parameters.
     ///
     /// A missing IPD record (an APD-only binding set up through
     /// `SQLSetDescFieldW` without ever touching IPD) defaults to
@@ -199,7 +194,7 @@ impl BoundParam {
         ipd_record: Option<&DescRecord>,
         odbc_version: OdbcVersion,
     ) -> Option<Self> {
-        if apd_record.concise_type == SQL_C_DEFAULT && apd_record.data_ptr.is_null() {
+        if !apd_record.data_bound {
             return None;
         }
         let (input_output_type, sql_type, column_size, decimal_digits) = match ipd_record {
@@ -454,15 +449,14 @@ mod tests {
     /// `ParameterValuePtr` — `SQLBindParameter` returns the pointer value
     /// itself via `SQLParamData` to identify which parameter needs data
     /// next, and passing null is common when the app just wants the ordinal.
-    /// Keying "unbound" off a null value pointer (the ARD/`ColumnBinding`
-    /// convention) would misreport every such binding as unbound; this must
-    /// key off `concise_type` instead, exactly like the sibling
-    /// growth-placeholder case above.
+    /// Keying "unbound" off a null value pointer would misreport every such
+    /// binding as unbound; `data_bound` preserves the distinction.
     #[test]
     fn from_records_treats_a_null_value_pointer_as_bound_when_a_real_c_type_is_set() {
         let apd_record = DescRecord {
             concise_type: SQL_C_CHAR,
             data_ptr: std::ptr::null_mut(),
+            data_bound: true,
             ..DescRecord::default_for(DescKind::AppParam)
         };
         let ipd_record = DescRecord {
@@ -478,6 +472,20 @@ mod tests {
     }
 
     #[test]
+    fn from_records_ignores_stale_dae_pointers_after_unbind() {
+        let mut stale_indicator = crate::api::odbc_types::SQL_DATA_AT_EXEC;
+        let apd_record = DescRecord {
+            concise_type: crate::api::odbc_types::SQL_C_NUMERIC,
+            indicator_ptr: (&raw mut stale_indicator).cast(),
+            octet_length_ptr: (&raw mut stale_indicator).cast(),
+            data_bound: false,
+            ..DescRecord::default_for(DescKind::AppParam)
+        };
+
+        assert!(BoundParam::from_records(&apd_record, None, ODBC_VERSION).is_none());
+    }
+
+    #[test]
     fn from_records_keeps_numeric_source_and_target_metadata_distinct() {
         let mut value = crate::api::odbc_types::SqlNumericStruct::default();
         let apd_record = DescRecord {
@@ -485,6 +493,7 @@ mod tests {
             precision: 7,
             scale: 2,
             data_ptr: (&raw mut value).cast(),
+            data_bound: true,
             ..DescRecord::default_for(DescKind::AppParam)
         };
         let ipd_record = DescRecord {
@@ -513,6 +522,7 @@ mod tests {
         let apd_record = DescRecord {
             concise_type: SQL_C_DEFAULT,
             data_ptr: &raw mut buf as SqlPointer,
+            data_bound: true,
             ..DescRecord::default_for(DescKind::AppParam)
         };
         let ipd_record = DescRecord {
@@ -539,6 +549,7 @@ mod tests {
             data_ptr: buf.as_mut_ptr().cast(),
             indicator_ptr: (&raw mut indicator).cast(),
             octet_length_ptr: (&raw mut octet_length).cast(),
+            data_bound: true,
             ..DescRecord::default_for(DescKind::AppParam)
         };
         let bound = BoundParam::from_records(&apd_record, None, ODBC_VERSION)

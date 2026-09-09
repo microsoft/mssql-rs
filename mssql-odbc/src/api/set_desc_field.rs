@@ -442,6 +442,14 @@ pub(super) fn set_type(
     write_record_field(state, record_number, |r| {
         r.concise_type = resolved;
         r.datetime_interval_code = datetime_interval_code_for(resolved);
+        if kind.is_application() {
+            r.data_ptr = std::ptr::null_mut();
+            r.data_bound = false;
+            if resolved == SQL_C_NUMERIC {
+                r.precision = SQL_PREC_NUMERIC;
+                r.scale = 0;
+            }
+        }
         r.explicitly_bound = true;
     })
 }
@@ -599,7 +607,10 @@ pub(super) fn set_data_ptr(
         post_diag(state, ERR_INVALID_PRECISION_OR_SCALE);
         return SQL_ERROR;
     }
-    write_record_field(state, record_number, |r| r.data_ptr = value_ptr)
+    write_record_field(state, record_number, |r| {
+        r.data_ptr = value_ptr;
+        r.data_bound = true;
+    })
 }
 
 /// `SQL_DESC_NAME` write (IPD only — the only kind `classify_field` marks
@@ -860,6 +871,57 @@ mod tests {
             data_ptr,
             &mut numeric_buf as *mut SqlNumericStruct as SqlPointer
         );
+    }
+
+    #[test]
+    fn changing_apd_type_to_numeric_resets_defaults_and_unbinds_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut old_value = 7i32;
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_LONG as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_DATA_PTR,
+                    &mut old_value as *mut i32 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        let state = desc.inner.lock().unwrap();
+        let record = state.record(1).unwrap();
+        assert!(record.data_ptr.is_null());
+        assert!(!record.data_bound);
+        assert_eq!(record.precision, SQL_PREC_NUMERIC);
+        assert_eq!(record.scale, 0);
     }
 
     #[test]
@@ -1294,14 +1356,8 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
     }
 
-    /// Regression: `set_precision`/`set_scale` only validate against the
-    /// type stored *at the time each is written*. An out-of-range precision
-    /// set while the type is still something else (so the numeric bound
-    /// didn't apply yet), followed by changing the type to `SQL_C_NUMERIC`,
-    /// must still be caught — matching msodbcsql's final consistency check
-    /// at bind time — rather than silently accepted.
     #[test]
-    fn set_desc_field_data_ptr_catches_precision_set_before_type_became_numeric() {
+    fn changing_type_to_numeric_replaces_stale_precision() {
         let h = TestHandles::with_env_dbc_stmt();
         // Precision 39 is out of range only once the type becomes SQL_C_NUMERIC.
         unsafe {
@@ -1338,8 +1394,11 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-        assert_last_diag(&desc_diags(h.apd()), ERR_INVALID_PRECISION_OR_SCALE);
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(
+            get_small_int(h.apd(), 1, SQL_DESC_PRECISION),
+            SQL_PREC_NUMERIC
+        );
     }
 
     #[test]

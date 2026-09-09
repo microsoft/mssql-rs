@@ -91,6 +91,30 @@ TEST_F(SetDescFieldLiveTest, MssqlPythonNumericParameterSequence) {
     EXPECT_EQ(static_cast<void*>(&numeric_buf), data_ptr);
 }
 
+TEST_F(SetDescFieldLiveTest, ChangingTypeToNumericResetsDefaultsAndUnbindsData) {
+    SQLHDESC hdesc = AppParamDesc();
+    SQLINTEGER old_value = 7;
+    ASSERT_SQL_OK(
+        SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
+                         reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(SQL_C_LONG)), 0),
+        SQL_HANDLE_DESC, hdesc);
+    ASSERT_SQL_OK(SQLSetDescFieldW(hdesc, 1, SQL_DESC_DATA_PTR, &old_value, 0),
+                  SQL_HANDLE_DESC, hdesc);
+
+    ASSERT_SQL_OK(
+        SQLSetDescFieldW(hdesc, 1, SQL_DESC_TYPE,
+                         reinterpret_cast<SQLPOINTER>(static_cast<SQLLEN>(SQL_C_NUMERIC)), 0),
+        SQL_HANDLE_DESC, hdesc);
+
+    SQLPOINTER data_ptr = &old_value;
+    ASSERT_SQL_OK(
+        SQLGetDescFieldW(hdesc, 1, SQL_DESC_DATA_PTR, &data_ptr, sizeof(data_ptr), nullptr),
+        SQL_HANDLE_DESC, hdesc);
+    EXPECT_EQ(nullptr, data_ptr);
+    EXPECT_EQ(38, GetSmallInt(hdesc, 1, SQL_DESC_PRECISION));
+    EXPECT_EQ(0, GetSmallInt(hdesc, 1, SQL_DESC_SCALE));
+}
+
 TEST_F(SetDescFieldLiveTest, CountGrowsAndShrinks) {
     SQLHDESC hdesc = AppParamDesc();
     ASSERT_SQL_OK(SQLSetDescFieldW(hdesc, 0, SQL_DESC_COUNT,

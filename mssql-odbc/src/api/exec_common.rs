@@ -118,22 +118,6 @@ fn unwind_dae_inner(
 /// can drive the sequence, and enters the ODBC "Need Data" state. The DBC keeps
 /// `active_stmt` set, so the connection stays busy for the duration.
 ///
-/// `fractional_truncated` posts `01S07` immediately, before returning
-/// `SQL_NEED_DATA`: msodbcsql's per-parameter RPC loop (`AddRPCUserParameters`,
-/// `sqlccmd.cpp:9870-9910`) posts a truncated non-DAE parameter's warning via
-/// `PostSQLError2` as it's processed, then keeps scanning and breaks out with
-/// `SQL_NEED_DATA` once it reaches a streamed parameter — so the diagnostic is
-/// already on the handle the instant the initiating call returns, observable by
-/// `SQLGetDiagRec` before the application ever calls `SQLParamData`.
-/// `SQLParamData` clears prior statement errors on its own entry
-/// (`sqlccmd.cpp:6818`), which is why this warning must not be deferred there.
-///
-/// `trailing_truncated` is the mirror image: a truncation ordinally *after*
-/// the first DAE parameter, which the same loop has not reached yet at this
-/// point and only discovers when it resumes scanning during the `SQLParamData`
-/// call that completes the sequence. Parked on the sequence
-/// ([`DaeState::trailing_truncated`]) rather than posted here.
-///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
 #[allow(clippy::too_many_arguments)]
@@ -143,8 +127,6 @@ pub(super) fn park_dae_client(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     dae_params: Vec<DaeParam>,
-    fractional_truncated: bool,
-    trailing_truncated: bool,
     op: &str,
 ) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -153,16 +135,7 @@ pub(super) fn park_dae_client(
         error!("{op}: stmt mutex poisoned while parking DAE client");
         return SQL_ERROR;
     };
-    stmt_state.dae = Some(DaeState::new(
-        client,
-        prepared,
-        orphaned,
-        dae_params,
-        trailing_truncated,
-    ));
-    if fractional_truncated {
-        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
-    }
+    stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
     SQL_NEED_DATA
 }
 
@@ -524,16 +497,8 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
-    /// A truncation among the non-DAE parameters ordinally before the first
-    /// DAE parameter (or, when there is no DAE parameter at all, anywhere).
-    /// Posted immediately by [`park_dae_client`] / `finish_execute_with_param_warning`.
+    /// Whether any non-DAE parameter lost fractional digits during conversion.
     pub(super) fractional_truncated: bool,
-    /// A truncation among the non-DAE parameters ordinally at or after the
-    /// first DAE parameter. msodbcsql's RPC loop has not scanned these yet at
-    /// the initial `SQLExecute`/`SQLExecDirect`, so the warning must wait for
-    /// the `SQLParamData` call that completes the sequence — see
-    /// [`crate::handles::stmt::DaeState::trailing_truncated`].
-    pub(super) trailing_truncated: bool,
 }
 
 /// The byte total an application declared with `SQL_LEN_DATA_AT_EXEC(n)`, or
@@ -651,7 +616,6 @@ pub(super) unsafe fn build_named_params(
     let mut params = Vec::with_capacity(marker_count);
     let mut dae_params = Vec::new();
     let mut fractional_truncated = false;
-    let mut trailing_truncated = false;
     // Read once per execution: the attribute holds a pointer, and every
     // binding shifts by the same amount.
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
@@ -711,17 +675,7 @@ pub(super) unsafe fn build_named_params(
             match unsafe { bound_param_to_rpc(name, &bound_param) } {
                 Ok((param, outcome)) => {
                     if outcome == ConvOk::Truncated {
-                        // A truncation ordinally at or after the first DAE
-                        // parameter falls in msodbcsql's not-yet-scanned
-                        // segment (`AddRPCUserParameters` breaks at the first
-                        // streamed parameter), so it can't be posted until the
-                        // completing `SQLParamData` call — see
-                        // `DaeState::trailing_truncated`.
-                        if dae_params.is_empty() {
-                            fractional_truncated = true;
-                        } else {
-                            trailing_truncated = true;
-                        }
+                        fractional_truncated = true;
                     }
                     params.push(param);
                 }
@@ -747,7 +701,6 @@ pub(super) unsafe fn build_named_params(
         params,
         dae_params,
         fractional_truncated,
-        trailing_truncated,
     })
 }
 
@@ -1181,15 +1134,8 @@ mod tests {
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
     }
 
-    /// msodbcsql posts a truncated non-DAE parameter's warning as soon as its
-    /// per-parameter RPC loop processes it (`sqlccmd.cpp:9328-9334`), before it
-    /// reaches the streamed parameter that makes the same call return
-    /// `SQL_NEED_DATA` — so the diagnostic is observable immediately, without
-    /// ever calling `SQLParamData`. Deferring the warning to `finish_execute`
-    /// (reachable only from `SQLParamData` on this path) would lose it for the
-    /// entire window between the two calls.
     #[test]
-    fn park_dae_client_posts_numeric_fractional_truncation_before_param_data() {
+    fn park_dae_client_drops_numeric_fractional_truncation() {
         use crate::test_support::TestHandles;
         use mssql_tds::test_client_support::tds_client_from_tokens;
 
@@ -1203,15 +1149,12 @@ mod tests {
             None,
             None,
             Vec::new(),
-            true,
-            false,
             "SQLExecute",
         );
 
         assert_eq!(rc, SQL_NEED_DATA);
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records.len(), 1);
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+        assert!(state.diag_records.is_empty());
     }
 
     /// Builds a scripted client positioned on a row-returning result (empty
@@ -1786,17 +1729,8 @@ mod tests {
         );
     }
 
-    /// A truncated `SQL_C_NUMERIC` parameter *before* the first DAE parameter
-    /// falls in msodbcsql's already-scanned segment, so its `01S07` is posted
-    /// immediately (`fractional_truncated`); see
-    /// `park_dae_client_posts_numeric_fractional_truncation_before_param_data`.
-    /// The reverse ordering exercised here — the truncation *after* the first
-    /// DAE parameter — instead lands in `trailing_truncated`, deferred to the
-    /// `SQLParamData` call that completes the sequence (`param_data.rs`'s
-    /// `Complete` branch), because msodbcsql's own per-parameter loop hasn't
-    /// scanned that far yet when the initiating call returns `SQL_NEED_DATA`.
     #[test]
-    fn build_named_params_truncation_after_first_dae_param_is_deferred() {
+    fn build_named_params_tracks_truncation_after_first_dae_param() {
         use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -1847,14 +1781,7 @@ mod tests {
 
         let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
         assert_eq!(built.dae_params.len(), 1);
-        assert!(
-            !built.fractional_truncated,
-            "the truncation is ordinally after the DAE param, not before it"
-        );
-        assert!(
-            built.trailing_truncated,
-            "a truncation after the first DAE param must be deferred, not lost"
-        );
+        assert!(built.fractional_truncated);
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
@@ -2131,8 +2058,6 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
-                false,
-                false,
                 "test",
             ),
             crate::api::odbc_types::SQL_NEED_DATA

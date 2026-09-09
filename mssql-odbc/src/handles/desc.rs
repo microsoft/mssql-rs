@@ -216,6 +216,9 @@ pub(crate) struct DescRecord {
     pub(crate) indicator_ptr: SqlPointer,
     /// `SQL_DESC_OCTET_LENGTH_PTR`. ARD/APD only. Opaque, see `data_ptr`.
     pub(crate) octet_length_ptr: SqlPointer,
+    /// Whether an application value binding has been established for this
+    /// record. Unlike `data_ptr`, this remains true for a null DAE token.
+    pub(crate) data_bound: bool,
     /// IPD only: set when the application has itself written this record's
     /// type/size (`SQL_DESC_CONCISE_TYPE`/`TYPE`, `DATETIME_INTERVAL_CODE`,
     /// `LENGTH`, `OCTET_LENGTH`, `PRECISION` or `SCALE`) via
@@ -258,6 +261,7 @@ impl DescRecord {
             data_ptr: std::ptr::null_mut(),
             indicator_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
+            data_bound: false,
             explicitly_bound: false,
         }
     }

@@ -977,17 +977,9 @@ TEST_F(ScalarConversionLiveTest, NumericStructMatchingMetadataKeepsEmbeddedMetad
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "42000");
 }
 
-// A bare SQLBindParameter with no follow-up SQLSetDescFieldW call at all must
-// still land the APD on msodbcsql's real SetTypeDefaults default for
-// SQL_C_NUMERIC -- (SQL_PREC_NUMERIC, 0), i.e. (38, 0) -- not (0, 0)
-// (sqlcdesc.cpp:2883 `SetADRecBP` -> `SetTypeDefaults`, sqlcdesc.cpp:12344's
-// `case SQL_NUMERIC`). Binding straight into a full-width NUMERIC(38,0)
-// column then matches that default on both drivers, so the fast path
-// (FastDescribeRPCParam, sqlcmisc.cpp:7014) forwards the struct's own
-// embedded precision/scale verbatim rather than the (0, 0) this driver used
-// to fall back to, which forced a wrong rescale-from-scale-0 read of the
-// struct.
-TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesTheStructsOwnScale) {
+// The default APD metadata (38, 0) matches this target and preserves the
+// struct's embedded metadata before SQL Server converts the value to scale 0.
+TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesDefaultApdScale) {
     SQL_NUMERIC_STRUCT value = {};
     value.precision = 5;
     value.scale = 3;
@@ -1000,7 +992,7 @@ TEST_F(ScalarConversionLiveTest, NumericStructWithoutDescriptorFieldWritesUsesTh
     ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_NUMERIC, SQL_DECIMAL, 38, 0,
                                    storage_, 0, nullptr),
                   SQL_HANDLE_STMT, stmt_);
-    EXPECT_EQ("12.345", ExecuteAndReadBack());
+    EXPECT_EQ("12", ExecuteAndReadBack());
 }
 
 // A rebind (same ordinal, same statement, no intervening SQL_RESET_PARAMS)

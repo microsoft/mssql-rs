@@ -185,7 +185,6 @@ fn sql_exec_direct_w_safe(
         params,
         dae_params,
         fractional_truncated,
-        trailing_truncated,
     } = named_params;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
@@ -267,16 +266,9 @@ fn sql_exec_direct_w_safe(
                     fractional_truncated,
                 )
             }
-            Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
-                stmt,
-                client,
-                None,
-                None,
-                dae_params,
-                fractional_truncated,
-                trailing_truncated,
-                "SQLExecDirectW",
-            ),
+            Ok(StreamedParamStatus::NeedData { .. }) => {
+                park_dae_client(stmt, client, None, None, dae_params, "SQLExecDirectW")
+            }
             Err(e) => {
                 error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
                 fail_with_tds(dbc, stmt, statement_handle, client, &e)

@@ -94,7 +94,6 @@ struct DaeExecution {
     /// The streamed parameters, in original parameter order.
     dae_params: Vec<DaeParam>,
     fractional_truncated: bool,
-    trailing_truncated: bool,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
     /// `SQL_ATTR_QUERY_TIMEOUT` in effect for this statement, in seconds; `0`
@@ -234,7 +233,6 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             params,
             dae_params,
             fractional_truncated,
-            trailing_truncated,
             mut prepared,
             mut orphaned,
             query_timeout,
@@ -327,8 +325,6 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     Some(prepared),
                     orphaned,
                     dae_params,
-                    fractional_truncated,
-                    trailing_truncated,
                     "SQLExecute",
                 ),
                 Err(e) => {
@@ -432,7 +428,6 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         params,
         dae_params,
         fractional_truncated,
-        trailing_truncated,
     } = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
     // All fallible validation passed: move the prepared plan out (written
@@ -463,7 +458,6 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             params,
             dae_params,
             fractional_truncated,
-            trailing_truncated,
             prepared,
             orphaned,
             query_timeout,

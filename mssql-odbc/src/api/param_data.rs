@@ -295,7 +295,7 @@ fn sql_param_data_safe(
             // but unprepared, and a concurrent SQLExecute would report 07002
             // instead of re-running the plan. `SQLExecDirect` parks no plan, so
             // a `None` plan is legitimate there.
-            let (was_prepared, trailing_truncated) = {
+            let was_prepared = {
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned on completion");
                     return_client_idle(dbc, statement_handle, client);
@@ -305,11 +305,10 @@ fn sql_param_data_safe(
                     stmt_state.dae.is_some(),
                     "SQLParamData: DAE sequence vanished before completion"
                 );
-                let trailing_truncated = stmt_state.dae_trailing_truncated();
                 let parked = stmt_state.take_dae();
                 debug_assert!(parked.is_none(), "the client is checked out by this call");
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-                (stmt_state.prepared.is_some(), trailing_truncated)
+                stmt_state.prepared.is_some()
             };
 
             // Same contract as the non-streaming `SQLExecute` arm: a prepared
@@ -334,7 +333,7 @@ fn sql_param_data_safe(
                 statement_handle,
                 client,
                 "SQLParamData",
-                trailing_truncated,
+                false,
             )
         }
 
