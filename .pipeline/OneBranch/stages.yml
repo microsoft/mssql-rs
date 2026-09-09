@@ -72,7 +72,6 @@ stages:
           - imageOverride -equals RUST-W22-SQL25
       variables:
         ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-        CARGO_TARGET_DIR: C:\cargo_target_dir
       steps:
       - template: /.pipeline/templates/cargo-authenticate-template.yml
         parameters:

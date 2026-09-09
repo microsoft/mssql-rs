@@ -40,7 +40,7 @@ parameters:
     default: false  # Safety: default to false to prevent accidental releases
 
   - name: validateCratesOnly
-    displayName: 'Validate Rust crate artifacts without publishing'
+    displayName: 'Validate selected Rust crates without publishing'
     type: boolean
     default: false
 
@@ -245,7 +245,7 @@ extends:
               -ArtifactDirectory '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates'
             displayName: 'Validate Rust crate release artifact'
 
-          - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.validateCratesOnly, true)) }}:
+          - ${{ if eq(parameters.publishMssqlTds, true) }}:
             - pwsh: >
                 .pipeline/scripts/test-cratesio-package.ps1
                 -CrateName 'mssql-tds'
@@ -254,7 +254,7 @@ extends:
                 -MaxAttempts 1
               displayName: 'Preflight mssql-tds version'
 
-          - ${{ if or(eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
+          - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
             - pwsh: >
                 .pipeline/scripts/test-cratesio-package.ps1
                 -CrateName 'mssql-mock-tds'
@@ -263,7 +263,7 @@ extends:
                 -MaxAttempts 1
               displayName: 'Preflight mssql-mock-tds version'
 
-          - ${{ if eq(parameters.publishMssqlTds, true) }}:
+          - ${{ if and(eq(parameters.publishMssqlTds, true), ne(parameters.validateCratesOnly, true)) }}:
             - task: EsrpRelease@12
               displayName: 'Publish mssql-tds to crates.io'
               inputs:
@@ -299,7 +299,7 @@ extends:
                 -MaxAttempts 1
               displayName: 'Verify mssql-tds dependency is published'
 
-          - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
+          - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.validateCratesOnly, true)) }}:
             - task: EsrpRelease@12
               displayName: 'Publish mssql-mock-tds to crates.io'
               inputs:
