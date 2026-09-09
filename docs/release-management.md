@@ -311,7 +311,9 @@ mssql-python-rs-wheels 0.1.0
 Description: Python wheels containing the mssql-python-rs TDS core and ODBC driver. Commit: a1b2c3d4. Build: 20260217.1
 ```
 
-This creates: **NuGet version → git tag → exact source commit → pipeline run with logs**.
+This creates: **NuGet version → package description → source commit and pipeline run with logs**.
+When `tagRelease` is enabled, the separate Cargo-versioned tag and release branch provide
+additional source traceability for `mssql-py-core`; a NuGet release does not require that tag.
 
 ## Feed Retention Guidelines
 
