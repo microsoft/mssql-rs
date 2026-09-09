@@ -1,8 +1,8 @@
 #################################################################################
 #                        OneBranch Pipelines - Official Release                 #
-# Downloads NuGet wheel artifacts from the Official Build pipeline and         #
-# publishes them to Azure Artifacts. Also tags the source commit and           #
-# creates a release branch.                                                     #
+# Downloads artifacts from the Official Build pipeline, publishes the wheel    #
+# NuGet package to Azure Artifacts, and can publish Rust crates to crates.io.   #
+# It can also tag the source commit and create a release branch.                #
 #                                                                               #
 # This pipeline does NOT build anything — it consumes artifacts produced by    #
 # OfficialBuild.yml.                                                            #
@@ -29,8 +29,23 @@ parameters:
     type: boolean
     default: false  # Safety: default to false to prevent accidental releases
 
+  - name: publishMssqlTds
+    displayName: 'Publish mssql-tds to crates.io'
+    type: boolean
+    default: false  # Safety: default to false to prevent accidental releases
+
+  - name: publishMssqlMockTds
+    displayName: 'Publish mssql-mock-tds to crates.io'
+    type: boolean
+    default: false  # Safety: default to false to prevent accidental releases
+
+  - name: validateCratesOnly
+    displayName: 'Validate selected Rust crates without publishing'
+    type: boolean
+    default: false
+
   - name: tagRelease
-    displayName: 'Create git tag and release branch'
+    displayName: 'Create mssql-py-core git tag and release branch'
     type: boolean
     default: false  # Safety: default to false
 
@@ -233,11 +248,123 @@ extends:
           displayName: 'Verify NuGet package'
 
     ###########################################################################
-    # Stage 2: Tag the source commit and create release branch
+    # Stage 2: Publish Rust crates through ESRP
+    ###########################################################################
+    - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
+      - stage: ReleaseCrates
+        displayName: 'Release Rust Crates'
+        dependsOn: Release
+        jobs:
+        - job: PublishRustCrates
+          displayName: 'Publish Rust crates to crates.io'
+          templateContext:
+            type: releaseJob
+            isProduction: true
+          pool:
+            type: windows
+          variables:
+          - group: 'ESRP Federated Creds (AME)'
+          - name: ob_outputDirectory
+            value: '$(Build.ArtifactStagingDirectory)'
+          steps:
+          - checkout: self
+
+          - download: officialBuild
+            artifact: 'drop_Build_RustCrates'
+            displayName: 'Download Rust crate artifacts'
+
+          - pwsh: >
+              .pipeline/scripts/validate-crate-release-artifact.ps1
+              -ArtifactDirectory '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates'
+            displayName: 'Validate Rust crate release artifact'
+
+          - ${{ if eq(parameters.publishMssqlTds, true) }}:
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-tds'
+                -Version '$(mssqlTdsCrateVersion)'
+                -ExpectedState Absent
+                -MaxAttempts 1
+              displayName: 'Preflight mssql-tds version'
+
+          - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-mock-tds'
+                -Version '$(mssqlMockTdsCrateVersion)'
+                -ExpectedState Absent
+                -MaxAttempts 1
+              displayName: 'Preflight mssql-mock-tds version'
+
+          - ${{ if and(eq(parameters.publishMssqlTds, true), ne(parameters.validateCratesOnly, true)) }}:
+            - task: EsrpRelease@12
+              displayName: 'Publish mssql-tds to crates.io'
+              inputs:
+                connectedservicename: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
+                usemanagedidentity: true
+                keyvaultname: '$(AuthAKVName)'
+                signcertname: '$(AuthSignCertName)'
+                clientid: '$(EsrpClientId)'
+                intent: 'PackageDistribution'
+                contenttype: 'Rust'
+                contentsource: 'Folder'
+                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates\mssql-tds'
+                waitforreleasecompletion: true
+                owners: '$(owner)'
+                approvers: '$(approver)'
+                serviceendpointurl: 'https://api.esrp.microsoft.com'
+                mainpublisher: 'ESRPRELPACMAN'
+                domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
+
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-tds'
+                -Version '$(mssqlTdsCrateVersion)'
+                -ExpectedState Available
+              displayName: 'Wait for mssql-tds on crates.io'
+
+          - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.publishMssqlTds, true)) }}:
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-tds'
+                -Version '$(mssqlTdsCrateVersion)'
+                -ExpectedState Available
+                -MaxAttempts 1
+              displayName: 'Verify mssql-tds dependency is published'
+
+          - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.validateCratesOnly, true)) }}:
+            - task: EsrpRelease@12
+              displayName: 'Publish mssql-mock-tds to crates.io'
+              inputs:
+                connectedservicename: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
+                usemanagedidentity: true
+                keyvaultname: '$(AuthAKVName)'
+                signcertname: '$(AuthSignCertName)'
+                clientid: '$(EsrpClientId)'
+                intent: 'PackageDistribution'
+                contenttype: 'Rust'
+                contentsource: 'Folder'
+                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates\mssql-mock-tds'
+                waitforreleasecompletion: true
+                owners: '$(owner)'
+                approvers: '$(approver)'
+                serviceendpointurl: 'https://api.esrp.microsoft.com'
+                mainpublisher: 'ESRPRELPACMAN'
+                domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
+
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-mock-tds'
+                -Version '$(mssqlMockTdsCrateVersion)'
+                -ExpectedState Available
+              displayName: 'Verify mssql-mock-tds on crates.io'
+
+    ###########################################################################
+    # Stage 3: Tag the mssql-py-core release source
     ###########################################################################
     - ${{ if eq(parameters.tagRelease, true) }}:
       - stage: Tag
-        displayName: 'Tag Release and Create Branch'
+        displayName: 'Tag mssql-py-core Release'
         dependsOn: Release
         jobs:
         - job: TagAndBranch

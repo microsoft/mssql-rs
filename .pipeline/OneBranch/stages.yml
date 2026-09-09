@@ -37,10 +37,15 @@ parameters:
   default: false
   displayName: 'Also build mssql-odbc native driver'
 
+- name: buildRustCrates
+  type: boolean
+  default: false
+  displayName: 'Create publishable Rust crate artifacts'
+
 - name: isOfficial
   type: boolean
   default: false
-  displayName: 'Official pipeline (clean release on manual trigger)'
+  displayName: 'Official pipeline (clean release versions)'
 
 - name: publishToFeed
   type: boolean
@@ -53,6 +58,49 @@ stages:
 #############################################################################
 - stage: Build
   jobs:
+  #########################################################################
+  # Publishable Rust crates
+  #########################################################################
+  - ${{ if eq(parameters.buildRustCrates, true) }}:
+    - job: RustCrates
+      displayName: 'Package Rust crates'
+      pool:
+        type: windows
+        isCustom: true
+        name: RUST-X64-WUS3
+        demands:
+          - imageOverride -equals RUST-W22-SQL25
+      variables:
+        ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+      steps:
+      - template: /.pipeline/templates/cargo-authenticate-template.yml
+        parameters:
+          osType: Windows
+      - template: /.pipeline/templates/install-dependencies.yml
+        parameters:
+          osType: Windows
+          skipPythonSetup: true
+          skipRustupInstall: false
+          enableJsDeps: false
+      - pwsh: >
+          .pipeline/scripts/stamp-crate-versions.ps1
+          -BuildReason '$(Build.Reason)'
+          -BuildId '$(Build.BuildId)'
+          -IsOfficial '${{ parameters.isOfficial }}'
+        displayName: 'Stamp Rust crate versions'
+      - pwsh: >
+          .pipeline/scripts/package-rust-crates.ps1
+          -OutputDirectory '$(ob_outputDirectory)\rust-crates'
+          -TargetDirectory '$(Agent.TempDirectory)\rust-crate-target'
+          -Version '$(crateVersion)'
+        displayName: 'Create Rust crate artifacts'
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Rust crate artifacts'
+        inputs:
+          targetPath: '$(ob_outputDirectory)\rust-crates'
+          artifact: 'drop_Build_RustCrates'
+          publishLocation: 'pipeline'
+
   #########################################################################
   # Windows x64
   #########################################################################

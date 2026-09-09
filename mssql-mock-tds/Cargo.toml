@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Mock TDS server library and CLI for testing SQL Server clients"
 license = "MIT"
+license-file = "../LICENSE"
+repository = "https://github.com/microsoft/mssql-rs"
 
 [lints]
 workspace = true
@@ -21,7 +23,7 @@ default = []
 vendored-openssl = ["openssl/vendored"]
 
 [dependencies]
-mssql-tds = { path = "../mssql-tds", default-features = false }
+mssql-tds = { path = "../mssql-tds", version = "0.1.0", default-features = false }
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["full"] }
 bytes = "1.11.0"
