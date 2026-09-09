@@ -33,8 +33,8 @@ use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 /// `SQL_MAX_TABLE_NAME_LEN` alike.
 const MAX_IDENTIFIER_LEN: u16 = 128;
 
-/// `SQL_MAX_STATEMENT_LEN`, in bytes (msodbcsql18 reports the same 512 KB).
-const MAX_STATEMENT_LEN: u32 = 512 * 1024;
+const DEFAULT_PACKET_SIZE: u32 = 4096;
+const MAX_SQL_BLOCKS: u32 = 128;
 
 /// `SQL_KEYWORDS`: SQL Server reserved words that are *not* in the ODBC
 /// interoperable list, which is the only thing ODBC asks this to report.
@@ -320,7 +320,11 @@ fn sql_get_info_w_safe(
         SQL_MAX_COLUMN_NAME_LEN | SQL_MAX_SCHEMA_NAME_LEN | SQL_MAX_TABLE_NAME_LEN => {
             write_u16(info_value_ptr, MAX_IDENTIFIER_LEN, string_length_ptr)
         }
-        SQL_MAX_STATEMENT_LEN => write_u32(info_value_ptr, MAX_STATEMENT_LEN, string_length_ptr),
+        SQL_MAX_STATEMENT_LEN => write_u32(
+            info_value_ptr,
+            max_statement_len(state.client.as_ref().map(|client| client.packet_size())),
+            string_length_ptr,
+        ),
         SQL_NUMERIC_FUNCTIONS
         | SQL_STRING_FUNCTIONS
         | SQL_SYSTEM_FUNCTIONS
@@ -339,6 +343,9 @@ fn sql_get_info_w_safe(
                 "Y",
             )
         }
+        // msodbcsql queries DATABASEPROPERTYEX and caches the answer. This
+        // driver has no internal metadata-query facility yet, so exact
+        // read-only-database parity is deferred to AB#47996.
         SQL_DATA_SOURCE_READ_ONLY => write_wide_str(
             &mut state,
             info_value_ptr,
@@ -352,6 +359,10 @@ fn sql_get_info_w_safe(
             SQL_ERROR
         }
     }
+}
+
+fn max_statement_len(packet_size: Option<u32>) -> u32 {
+    MAX_SQL_BLOCKS * packet_size.unwrap_or(DEFAULT_PACKET_SIZE)
 }
 
 fn write_u16(
@@ -497,9 +508,9 @@ mod tests {
             (SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CB_CLOSE),
             (SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_CB_CLOSE),
             (SQL_TXN_CAPABLE, SQL_TC_ALL),
-            (SQL_MAX_COLUMN_NAME_LEN, MAX_IDENTIFIER_LEN),
-            (SQL_MAX_SCHEMA_NAME_LEN, MAX_IDENTIFIER_LEN),
-            (SQL_MAX_TABLE_NAME_LEN, MAX_IDENTIFIER_LEN),
+            (SQL_MAX_COLUMN_NAME_LEN, 128),
+            (SQL_MAX_SCHEMA_NAME_LEN, 128),
+            (SQL_MAX_TABLE_NAME_LEN, 128),
         ] {
             let (rc, val, len) = get_u16(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -518,7 +529,7 @@ mod tests {
             (SQL_DEFAULT_TXN_ISOLATION, SQL_TXN_READ_COMMITTED),
             (SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT),
             (SQL_SQL_CONFORMANCE, SQL_SC_SQL92_ENTRY),
-            (SQL_MAX_STATEMENT_LEN, MAX_STATEMENT_LEN),
+            (SQL_MAX_STATEMENT_LEN, 512 * 1024),
             (SQL_NUMERIC_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_STRING_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_SYSTEM_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
@@ -529,6 +540,14 @@ mod tests {
             assert_eq!(val, expected, "info_type {info_type}");
             assert_eq!(len, 4, "info_type {info_type}");
         }
+    }
+
+    #[test]
+    fn max_statement_len_tracks_negotiated_packet_size() {
+        assert_eq!(max_statement_len(None), 512 * 1024);
+        assert_eq!(max_statement_len(Some(4096)), 512 * 1024);
+        assert_eq!(max_statement_len(Some(8192)), 1024 * 1024);
+        assert_eq!(max_statement_len(Some(32768)), 4 * 1024 * 1024);
     }
 
     #[test]
