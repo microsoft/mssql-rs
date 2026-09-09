@@ -69,9 +69,18 @@ protected:
 // Identity strings
 // ===================================================================
 
-// SQL_SERVER_NAME is the name the server reports for itself, which is what
-// @@SERVERNAME returns — not the host in the connection string.
-TEST_F(GetInfoLiveTest, ServerNameMatchesAtAtServerName) {
+// SQL_SERVER_NAME is the name the server reports for itself, taken from the
+// ServerName field of the INFO tokens sent at login.
+//
+// Deliberately NOT compared against @@SERVERNAME. The two differ on a host that
+// was renamed after SQL Server was installed, because @@SERVERNAME keeps the
+// name recorded at setup until sp_dropserver/sp_addserver is run while the
+// token carries the running instance's actual name. The Windows CI agent is
+// exactly that case -- SQL_SERVER_NAME reported "4fdcda98c000000" against
+// @@SERVERNAME "hvyuptkn" -- and retail msodbcsql18 reported the same pair, so
+// equality is not a property of either driver. Cross-driver agreement on the
+// value is covered by the --compare-with-msodbcsql parity run.
+TEST_F(GetInfoLiveTest, ServerNameIsReportedAndStable) {
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
     std::string serverName = GetInfoString(dbc_, SQL_SERVER_NAME, &rc, &len);
@@ -79,14 +88,12 @@ TEST_F(GetInfoLiveTest, ServerNameMatchesAtAtServerName) {
     EXPECT_FALSE(serverName.empty()) << "SQL_SERVER_NAME must not be empty";
     EXPECT_EQ(static_cast<SQLSMALLINT>(serverName.size() * sizeof(SQLTCHAR)), len);
 
-    ExecDirect("SELECT CONVERT(NVARCHAR(128), @@SERVERNAME)");
-    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-    SQLTCHAR buf[256] = {};
-    SQLLEN ind = 0;
-    ASSERT_TRUE(SQL_SUCCEEDED(
-        SQLGetData(stmt_, 1, SQL_C_TCHAR, buf, sizeof(buf), &ind)));
-    EXPECT_EQ(ODBCTestUtils::ToNarrow(SqlTString(buf)), serverName);
-    SQLCloseCursor(stmt_);
+    // Cached connection state, so repeated reads must not drift.
+    SQLSMALLINT len2 = -1;
+    std::string again = GetInfoString(dbc_, SQL_SERVER_NAME, &rc, &len2);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(serverName, again);
+    EXPECT_EQ(len, len2);
 }
 
 // SQL_USER_NAME must be answerable; the value differs by design (see below).
@@ -105,7 +112,11 @@ TEST_F(GetInfoLiveTest, UserNameIsReported) {
     // query mid-session, so it reports the login instead. Both are non-empty
     // for SQL authentication; integrated and token authentication legitimately
     // yield an empty string.
-    if (ODBCTestConfig::Instance().HasCredentials()) {
+    //
+    // ODBC_TEST_CONNSTR ignores ODBC_TEST_UID, so a stale UID in the environment
+    // says nothing about how the connection actually authenticated.
+    const ODBCTestConfig& cfg = ODBCTestConfig::Instance();
+    if (!cfg.HasConnStr() && cfg.HasCredentials()) {
         EXPECT_FALSE(userName.empty());
     }
 }
@@ -115,8 +126,15 @@ TEST_F(GetInfoLiveTest, DataSourceNameMatchesConnectionMethod) {
     SQLRETURN rc = SQL_ERROR;
     std::string dsn = GetInfoString(dbc_, SQL_DATA_SOURCE_NAME, &rc, nullptr);
     ASSERT_TRUE(SQL_SUCCEEDED(rc));
-    if (ODBCTestConfig::Instance().HasDSN()) {
-        EXPECT_EQ(ODBCTestConfig::Instance().DSN(), dsn);
+
+    const ODBCTestConfig& cfg = ODBCTestConfig::Instance();
+    // A full override ignores ODBC_TEST_DSN and may name a DSN of its own, so
+    // neither branch below describes the connection that was actually made.
+    if (cfg.HasConnStr()) {
+        GTEST_SKIP() << "ODBC_TEST_CONNSTR overrides ODBC_TEST_DSN";
+    }
+    if (cfg.HasDSN()) {
+        EXPECT_EQ(cfg.DSN(), dsn);
     } else {
         EXPECT_TRUE(dsn.empty()) << "DSN-less connection reported '" << dsn << "'";
     }
@@ -247,7 +265,12 @@ TEST_F(GetInfoLiveTest, WorksWithAnOpenCursorAndLeavesItUsable) {
 
 // An identifier this driver does not implement stays an error rather than
 // silently returning a zeroed buffer.
+//
+// mssql-odbc-specific. Retail msodbcsql18 rejects 65000 with HY096 on Linux but
+// answers SQL_SUCCESS on Windows (observed in ADO build 173877), so the parity
+// leg cannot share an assertion that is about this driver's own contract.
 TEST_F(GetInfoLiveTest, UnknownInfoTypeIsRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     SQLUINTEGER value = 0;
     SQLSMALLINT len = -1;
     SQLRETURN rc = SQLGetInfo(dbc_, 65000, &value, sizeof(value), &len);
