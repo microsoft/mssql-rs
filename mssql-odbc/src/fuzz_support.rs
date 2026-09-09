@@ -16,8 +16,9 @@ use crate::api::odbc_types::{
     SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG,
     SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SSHORT, SQL_C_STINYINT, SQL_C_TIME,
     SQL_C_TIMESTAMP, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
-    SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_HANDLE_DBC,
-    SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_NTS, SQL_NULL_DATA, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
+    SQL_C_UBIGINT, SQL_C_ULONG, SQL_C_USHORT, SQL_C_UTINYINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC,
+    SQL_DEFAULT_PARAM, SQL_HANDLE_DBC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
+    SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NTS, SQL_NULL_DATA, SQL_NULL_HANDLE, SQL_OV_ODBC3_80,
     SQL_PARAM_INPUT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_VARCHAR, SQL_WVARCHAR, SqlHandle,
     SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
@@ -29,17 +30,15 @@ use crate::api::{
 use crate::connection::connection_string_parser::parse_connection_string;
 use crate::conversion::datetime::{parse_date_literal, parse_datetime_literal, parse_time_literal};
 use crate::conversion::fetch_convert::{
-    convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, is_datetime_c_target,
-    is_float_c_target, is_integer_c_target,
+    convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, is_float_c_target,
+    is_integer_c_target, is_typed_c_target,
 };
 use crate::conversion::numeric::{narrow_i128, parse_numeric_text};
 use crate::conversion::param_convert::{bound_param_to_value, transcode_dae_bytes};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, handle_from_raw};
 use crate::params::BoundParam;
-use crate::params::conversion_matrix::{
-    BINARY_SQL_TARGETS, CHARACTER_SQL_TARGETS, INTEGER_SQL_TARGETS,
-};
+use crate::params::conversion_matrix::is_supported_conversion;
 use mssql_tds::datatypes::column_values::{
     ColumnValues, SqlDate, SqlDateTime, SqlDateTime2, SqlDateTimeOffset, SqlMoney,
     SqlSmallDateTime, SqlSmallMoney, SqlTime,
@@ -318,20 +317,14 @@ const FETCH_TARGET_CANDIDATES: [SqlSmallInt; 24] = [
     SQL_C_NUMERIC,
 ];
 
-/// Exactly the targets `get_data::convert_typed_c` hands to a fixed-width
-/// converter, spelled with the same predicates it routes on.
-fn routes_fixed_width_fetch(target: SqlSmallInt) -> bool {
-    is_integer_c_target(target)
-        || is_float_c_target(target)
-        || target == SQL_C_GUID
-        || is_datetime_c_target(target)
-}
-
-/// The routed fixed-width targets, derived once from [`FETCH_TARGET_CANDIDATES`].
+/// The routed fixed-width targets, derived once from [`FETCH_TARGET_CANDIDATES`]
+/// through the production predicate [`is_typed_c_target`] that `SQLGetData`
+/// gates `convert_typed_c` on, so the fuzzed set can't drift from what the
+/// driver actually routes.
 static ROUTED_FETCH_TARGETS: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
     FETCH_TARGET_CANDIDATES
         .into_iter()
-        .filter(|&t| routes_fixed_width_fetch(t))
+        .filter(|&t| is_typed_c_target(t))
         .collect()
 });
 
@@ -347,11 +340,12 @@ static FFI_GETDATA_TARGETS: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
 
 /// Drive the result-fetch conversion matrix: a decoded column value written to
 /// a fixed-width `SQL_C_*` target. Mirrors `get_data::convert_typed_c`'s routing
-/// (integer / float / GUID / datetime) without needing the private `get_data`
-/// module. The 64-byte target overtops every fixed C struct (the widest is the
-/// 16-byte timestamp / GUID), and `write_fixed` writes unaligned, so the plain
-/// `[u8]` backing is a valid write target. Hunts for arithmetic panics in the
-/// numeric narrowing and the calendar/clock extraction math.
+/// (integer / float / GUID / datetime) by reusing the same `is_typed_c_target`
+/// predicate `SQLGetData` routes on. The 64-byte target overtops every fixed C
+/// struct (the widest is the 20-byte `SqlSsTimestampoffsetStruct`), and
+/// `write_fixed` writes unaligned, so the plain `[u8]` backing is a valid write
+/// target. Hunts for arithmetic panics in the numeric narrowing and the
+/// calendar/clock extraction math.
 pub fn fuzz_fetch_convert(data: &[u8]) {
     let mut cur = ByteCursor::new(data);
     let target = ROUTED_FETCH_TARGETS[(cur.u8() as usize) % ROUTED_FETCH_TARGETS.len()];
@@ -374,15 +368,25 @@ pub fn fuzz_fetch_convert(data: &[u8]) {
     }
 }
 
-/// Every C type `params::conversion_matrix` has a row for: the character and
-/// binary buffers plus every `type_rules::is_integer_c_type` variant, including
-/// the legacy `SQL_C_TINYINT`/`SQL_C_SHORT`/`SQL_C_LONG` spellings. `sql_type`
-/// is drawn independently, so unsupported pairings still exercise the bind-time
-/// rejection path.
-const PARAM_C_TYPES: [SqlSmallInt; 14] = [
+/// Every C type `params::conversion_matrix::is_supported_conversion` has a row
+/// for: the character and binary buffers, the scalar bit/float/GUID spellings,
+/// all five date/time C structs, and every `type_rules::is_integer_c_type`
+/// variant (including the legacy `SQL_C_TINYINT`/`SQL_C_SHORT`/`SQL_C_LONG`
+/// spellings). `sql_type` is drawn independently, so unsupported pairings still
+/// exercise the bind-time rejection path.
+const PARAM_C_TYPES: [SqlSmallInt; 23] = [
     SQL_C_CHAR,
     SQL_C_WCHAR,
     SQL_C_BINARY,
+    SQL_C_BIT,
+    SQL_C_FLOAT,
+    SQL_C_DOUBLE,
+    SQL_C_GUID,
+    SQL_C_TYPE_DATE,
+    SQL_C_TYPE_TIME,
+    SQL_C_SS_TIME2,
+    SQL_C_TYPE_TIMESTAMP,
+    SQL_C_SS_TIMESTAMPOFFSET,
     SQL_C_STINYINT,
     SQL_C_TINYINT,
     SQL_C_UTINYINT,
@@ -397,26 +401,33 @@ const PARAM_C_TYPES: [SqlSmallInt; 14] = [
 ];
 
 /// Every SQL target `params::conversion_matrix::is_supported_conversion` can
-/// reach, taken straight from the matrix's own target rows so the fuzzed set
-/// follows the implemented conversions instead of a hand-copied list.
+/// reach from a fuzzed C type, derived by scanning the predicate itself rather
+/// than a hand-copied list, so a newly implemented conversion is fuzzed the
+/// moment the matrix accepts it. `sql_type` is still drawn independently in
+/// `fuzz_bound_param`, so unsupported pairings keep exercising the rejection
+/// path.
 static PARAM_SQL_TYPES: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
-    [
-        CHARACTER_SQL_TARGETS,
-        BINARY_SQL_TARGETS,
-        INTEGER_SQL_TARGETS,
-    ]
-    .concat()
+    (SqlSmallInt::MIN..=SqlSmallInt::MAX)
+        .filter(|&sql_type| {
+            PARAM_C_TYPES
+                .iter()
+                .any(|&c_type| is_supported_conversion(c_type, sql_type))
+        })
+        .collect()
 });
 
 /// Drive the bind-parameter read + convert path (`bound_param_to_value`) that
 /// `SQLExecute` runs over an application's value and indicator buffers.
 ///
-/// The value buffer is the fuzz input plus eight trailing zero bytes; that
-/// padding guarantees a NUL terminator for the `SQL_NTS` scans and at least
-/// eight readable bytes for the fixed-width integer reads, so every in-bounds
-/// contract `read_param_value` documents holds and a crash reflects a real
-/// conversion defect, not harness-induced UB. The indicator is confined to
-/// values that keep the read inside the buffer.
+/// The value buffer is the fuzz input plus trailing zero padding wide enough to
+/// cover the widest fixed-width C target the matrix routes (the 20-byte
+/// `SqlSsTimestampoffsetStruct`); that padding also guarantees a NUL terminator
+/// for the `SQL_NTS` scans, so every in-bounds contract `read_param_value`
+/// documents holds and a crash reflects a real conversion defect, not
+/// harness-induced UB. The indicator spans the valid lengths plus
+/// `read_indicator`'s rejection markers (data-at-execution, default-parameter,
+/// and negative lengths), all of which are refused before the value buffer is
+/// read, so they stay in-bounds by construction.
 pub fn fuzz_bound_param(data: &[u8]) {
     let mut cur = ByteCursor::new(data);
     let c_type = PARAM_C_TYPES[(cur.u8() as usize) % PARAM_C_TYPES.len()];
@@ -427,13 +438,26 @@ pub fn fuzz_bound_param(data: &[u8]) {
 
     let mut value_buf = cur.rest();
     let fuzz_len = value_buf.len() as SqlLen;
-    value_buf.extend_from_slice(&[0u8; 8]);
+    // Pad past the widest fixed-width C target the matrix now routes -- the
+    // 20-byte `SqlSsTimestampoffsetStruct` -- so a struct read from a short fuzz
+    // input stays inside the allocation, the same way a conforming application
+    // sizes its buffer to the C type. Also guarantees a NUL terminator for the
+    // `SQL_NTS` scans and eight readable bytes for the integer reads.
+    value_buf.extend_from_slice(&[0u8; 32]);
 
-    let mut ind: SqlLen = match ind_mode % 4 {
+    let mut ind: SqlLen = match ind_mode % 8 {
         0 => SQL_NULL_DATA,
         1 => SQL_NTS as SqlLen,
         2 => fuzz_len,
-        _ => fuzz_len / 2,
+        3 => fuzz_len / 2,
+        // The remaining arms reach `read_indicator`'s rejection paths, each of
+        // which returns before the value buffer is read: an unstaged
+        // data-at-execution indicator (both spellings), a default-parameter
+        // marker, and a plain negative length.
+        4 => SQL_DATA_AT_EXEC,
+        5 => SQL_LEN_DATA_AT_EXEC_OFFSET - (fuzz_len & 0x3f),
+        6 => SQL_DEFAULT_PARAM,
+        _ => -6 - (fuzz_len & 0x3f),
     };
     let ind_ptr = &mut ind as *mut SqlLen;
     let value_ptr = value_buf.as_mut_ptr() as *mut c_void;
@@ -508,7 +532,9 @@ pub fn fuzz_ffi_execute(data: &[u8]) {
 fn install_fuzz_client(dbc: SqlHandle, server_bytes: &[u8]) {
     let client = create_fuzz_tds_client(FuzzPacketReader::from_data(server_bytes), 4096);
     let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(dbc) };
-    let mut state = dbc_ref.inner.lock().unwrap();
+    let Ok(mut state) = dbc_ref.inner.lock() else {
+        return;
+    };
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
 }

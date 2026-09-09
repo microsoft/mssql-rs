@@ -28,7 +28,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::type_rules::is_integer_c_type;
 
-pub(crate) const CHARACTER_SQL_TARGETS: &[SqlSmallInt] = &[
+const CHARACTER_SQL_TARGETS: &[SqlSmallInt] = &[
     SQL_CHAR,
     SQL_VARCHAR,
     SQL_LONGVARCHAR,
@@ -37,14 +37,12 @@ pub(crate) const CHARACTER_SQL_TARGETS: &[SqlSmallInt] = &[
     SQL_WLONGVARCHAR,
 ];
 
-pub(crate) const BINARY_SQL_TARGETS: &[SqlSmallInt] =
-    &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY];
+const BINARY_SQL_TARGETS: &[SqlSmallInt] = &[SQL_BINARY, SQL_VARBINARY, SQL_LONGVARBINARY];
 
 /// Width is not part of legality: a value that does not fit the target is a
 /// runtime `22003`, not a rejected binding, so `SQL_TINYINT` stays reachable
 /// from every integer and character C type.
-pub(crate) const INTEGER_SQL_TARGETS: &[SqlSmallInt] =
-    &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT];
+const INTEGER_SQL_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INTEGER, SQL_BIGINT];
 
 const DECIMAL_SQL_TARGETS: &[SqlSmallInt] = &[SQL_DECIMAL, SQL_NUMERIC];
 

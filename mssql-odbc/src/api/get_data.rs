@@ -33,7 +33,7 @@ use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
     convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, date_parts,
     datetime2_parts, datetimeoffset_parts, extract_datetime_parts, format_datetime_parts,
-    is_datetime_c_target, is_float_c_target, is_integer_c_target, money_scaled, sql_string_to_text,
+    is_float_c_target, is_integer_c_target, is_typed_c_target, money_scaled, sql_string_to_text,
     time_parts,
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -2566,13 +2566,6 @@ unsafe fn answer_binary_probe(
     }
     post_diag(stmt_state, WARN_STRING_TRUNCATION);
     SQL_SUCCESS_WITH_INFO
-}
-
-pub(crate) fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
-    is_integer_c_target(target_type)
-        || is_float_c_target(target_type)
-        || target_type == SQL_C_GUID
-        || is_datetime_c_target(target_type)
 }
 
 /// Routes a captured value to the matching converter.
