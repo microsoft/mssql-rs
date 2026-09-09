@@ -41,16 +41,18 @@ pub(crate) struct ActivePlpStream {
     /// UTF-16 surrogate pair becomes a 4-byte UTF-8 character, so a chunk is
     /// transcoded whole and only the bytes that fit are copied out.
     pub(crate) pending_utf8: Vec<u8>,
-    /// Incremental decoder for the narrow-text -> `SQL_C_WCHAR` widening path
-    /// (`varchar(max)`/`json` delivered as UTF-16LE). `None` for every other
-    /// combination.
+    /// Incremental decoder for a narrow-text PLP column that has to be
+    /// converted on the way out: to UTF-16LE for `SQL_C_WCHAR`
+    /// (`varchar(max)`/`json`), or to UTF-8 for `SQL_C_CHAR` under a non-UTF-8
+    /// collation (AB#47566). `None` when the wire bytes are already in the
+    /// target's encoding and can be copied verbatim.
     ///
     /// A decoder rather than a byte carry because the column's codepage can be
     /// multi-byte (`lcid_to_encoding` reaches SHIFT_JIS, GBK, BIG5, EUC-KR and
     /// UTF-8), so a chunk boundary can split one character across two reads.
     /// `encoding_rs::Decoder` already holds that partial sequence internally,
     /// which keeps the boundary rule in one place instead of one per codepage.
-    pub(crate) narrow_to_wide: Option<Decoder>,
+    pub(crate) narrow_decoder: Option<Decoder>,
     /// Code units already decoded on a previous call that did not fit the
     /// caller's buffer, delivered before any further wire bytes.
     ///
@@ -90,7 +92,7 @@ impl ActivePlpStream {
     pub(crate) fn new(
         column: usize,
         encoding: PlpEncoding,
-        narrow_to_wide: Option<Decoder>,
+        narrow_decoder: Option<Decoder>,
     ) -> Self {
         Self {
             column,
@@ -98,7 +100,7 @@ impl ActivePlpStream {
             pending_byte: None,
             pending_high_surrogate: None,
             pending_utf8: Vec::new(),
-            narrow_to_wide,
+            narrow_decoder,
             pending_units: Vec::new(),
             prefetched_wire: Vec::new(),
             prefetched_offset: 0,
@@ -193,7 +195,7 @@ impl std::fmt::Debug for ActivePlpStream {
             .field("pending_byte", &self.pending_byte)
             .field("pending_high_surrogate", &self.pending_high_surrogate)
             .field("pending_utf8", &self.pending_utf8.len())
-            .field("narrow_to_wide", &self.narrow_to_wide.is_some())
+            .field("narrow_decoder", &self.narrow_decoder.is_some())
             .field("pending_units", &self.pending_units.len())
             .field(
                 "prefetched_wire_remaining",

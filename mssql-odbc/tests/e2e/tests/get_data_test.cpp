@@ -1094,6 +1094,112 @@ TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip) {
     SQLCloseCursor(stmt_);
 }
 
+// The regression this conversion exists for: AB#47875, where mssql-python's
+// test_varchar_cp1252_lob_with_collation received raw CP1252 bytes and its
+// strict UTF-8 decode fell back to returning `bytes`.
+//
+// SQL_C_CHAR output is UTF-8, so a CP1252 varchar(max) must be decoded through
+// the column's collation on the way out. CP1252 is single-byte, so a verbatim
+// copy delivers the correct character *count* with the wrong bytes -- which is
+// how the defect stayed hidden. Asserting the UTF-8 spelling is what catches it.
+//
+// Deliberately NOT skipped on the msodbcsql leg: both drivers deliver UTF-8 for
+// SQL_C_CHAR on Linux, so they must agree here. That is the whole point of this
+// test.
+TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip) {
+    // UTF-8 spelling of "café René señor Müller Größe naïve " -- what a caller
+    // asking for SQL_C_CHAR must receive.
+    const std::string token = "caf\xC3\xA9 Ren\xC3\xA9 se\xC3\xB1or M\xC3\xBCller "
+                              "Gr\xC3\xB6\xC3\x9F"
+                              "e na\xC3\xAF"
+                              "ve ";
+    const std::string expected = RepeatToken(token, 250);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Ren' + NCHAR(0xE9) "
+                   "+ N' se' + NCHAR(0xF1) + N'or M' + NCHAR(0xFC) + N'ller "
+                   "Gr' + NCHAR(0xF6) + NCHAR(0xDF) + N'e na' + NCHAR(0xEF) + N've ' "
+                   "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 250) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    const std::string got = ReadCharDataInChunks(stmt_, 1, 61);
+    EXPECT_EQ(expected, got);
+    EXPECT_GT(got.size(), 250u * 35u) << "UTF-8 must be longer than the CP1252 wire bytes";
+
+    SQLCloseCursor(stmt_);
+}
+
+// The pinning case for the chunk-boundary carry on the SQL_C_CHAR path. Under a
+// Chinese_PRC collation the wire is GBK, two bytes per CJK character, and a
+// buffer sized to make the driver read an odd number of wire bytes splits one
+// across most calls. Each half must be rejoined rather than become U+FFFD.
+//
+// Skipped on the msodbcsql leg for the same reason its SQL_C_WCHAR twin is:
+// msodbcsql on Linux converts through the client locale, which under a UTF-8
+// locale best-fits every CJK character to '?'. The disagreement is about the
+// conversion, not the chunking.
+TEST_F(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+                              "abc";  // 你好世界abc
+    const std::string expected = RepeatToken(token, 400);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) "
+                   "+ NCHAR(0x754C) + N'abc' "
+                   "COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 29));
+
+    SQLCloseCursor(stmt_);
+}
+
+// Chunking must be invisible on the SQL_C_CHAR path too: the same column read
+// in one call and in many must produce the same value. A buffer of 7 is the
+// tightest interesting size -- decoding expands, so the driver's read has to be
+// sized down from the caller's capacity or output overruns every call.
+TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkSizeDoesNotChangeValue) {
+    const char* kQuery =
+        "SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Gr' + NCHAR(0xF6) + NCHAR(0xDF) "
+        "+ N'e na' + NCHAR(0xEF) + N've ' "
+        "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1";
+
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string one_shot = ReadCharDataInChunks(stmt_, 1, 65536);
+    SQLCloseCursor(stmt_);
+
+    for (size_t buf_size : {7u, 16u, 33u, 1024u}) {
+        ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(one_shot, ReadCharDataInChunks(stmt_, 1, buf_size))
+            << "buffer size " << buf_size;
+        SQLCloseCursor(stmt_);
+    }
+
+    EXPECT_FALSE(one_shot.empty());
+}
+
+// A UTF-8 collation is already in the target encoding, so it must stay on the
+// verbatim path and NOT be decoded a second time. Double-converting would
+// mangle every non-ASCII character.
+TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted) {
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
+                              "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
+    const std::string expected = RepeatToken(token, 300);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + N'caf' "
+                   "+ NCHAR(0xE9) + NCHAR(0xD83D) + NCHAR(0xDE00) "
+                   "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 300) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 30));
+
+    SQLCloseCursor(stmt_);
+}
+
 // The widening decodes through the column's own collation, so a non-ASCII
 // CP1252 value must come back as the original characters and not as raw bytes
 // zero-extended into code units. A 26-byte buffer delivers 12 characters per

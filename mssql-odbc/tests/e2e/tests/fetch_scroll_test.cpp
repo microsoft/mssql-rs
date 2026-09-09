@@ -830,6 +830,85 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening) {
     SQLCloseCursor(stmt_);
 }
 
+// SQL_C_CHAR output is UTF-8, so a CP1252 varchar(max) must be decoded through
+// the column's collation on the bound path exactly as on the SQLGetData path
+// (AB#47566). A verbatim copy delivers the raw 0xE9 here, which is not valid
+// UTF-8 -- the same defect AB#47875 caught through mssql-python, one file over.
+//
+// Not skipped on the msodbcsql leg: both drivers deliver UTF-8 for SQL_C_CHAR
+// on Linux, so they must agree.
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
+    ExecDirect(
+        "SELECT CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)) AS c1");
+
+    SQLCHAR buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_STREQ("\xC3\xA9", reinterpret_cast<const char*>(buf));
+    EXPECT_EQ(2, ind) << "one character, two UTF-8 bytes";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// A value long enough to arrive in several PLP wire chunks, under a DBCS
+// collation where each CJK character is two wire bytes. The decoder has to
+// carry a character split across a wire chunk boundary; without the carry each
+// half becomes U+FFFD and the slot fills with replacement characters.
+//
+// Skipped on the msodbcsql leg for the same reason its SQLGetData twin is:
+// msodbcsql on Linux converts through the client locale and best-fits every CJK
+// character to '?' under a UTF-8 locale.
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect(
+        "SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) + NCHAR(0x754C) "
+        "COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 3000) AS c1");
+
+    // 3000 repetitions of 4 CJK characters: 24000 wire bytes, 36000 UTF-8.
+    std::vector<SQLCHAR> buf(64 * 1024, 0);
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 1, SQL_C_CHAR, buf.data(), static_cast<SQLLEN>(buf.size()), &ind),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C";  // 你好世界
+    std::string expected;
+    expected.reserve(token.size() * 3000);
+    for (int i = 0; i < 3000; ++i) {
+        expected += token;
+    }
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf.data())));
+    EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
+    EXPECT_EQ(std::string::npos, expected.find("\xEF\xBF\xBD")) << "no U+FFFD";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// A slot too small for the converted value truncates on a character boundary
+// and reports SQL_NO_TOTAL: once the bytes are transcoded the wire length is
+// the wrong unit, so it cannot be reported as the remaining count.
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharReportsNoTotal) {
+    SKIP_IF_COMPARING_MSODBCSQL();  // asserts UTF-8; see AB#47564 above
+    ExecDirect(
+        "SELECT REPLICATE(CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), "
+        "5000) AS c1");
+
+    // 8 payload bytes: four whole two-byte characters, and no room for a fifth.
+    SQLCHAR buf[9] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(SQL_NO_TOTAL, ind) << "the converted UTF-8 length is not known while streaming";
+    EXPECT_STREQ("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", reinterpret_cast<const char*>(buf));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToWcharReportsNoTotal) {
     ExecDirect("SELECT REPLICATE(CAST('y' AS VARCHAR(MAX)), 5000) AS c1");
 

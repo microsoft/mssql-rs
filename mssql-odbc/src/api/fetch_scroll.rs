@@ -32,6 +32,7 @@ use mssql_tds::datatypes::sql_json::SqlJson;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, get_encoding_type};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
+use mssql_tds::encoding_rs;
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::query::metadata::PlpEncoding;
 use uuid::Uuid;
@@ -41,7 +42,7 @@ use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
     TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, is_typed_c_target,
-    utf16le_chunk_to_utf8, widen_into_pending,
+    transcode_narrow_into_pending, utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE,
@@ -1779,11 +1780,17 @@ unsafe fn deliver_bound_plp(
             encoding,
             PlpEncoding::SingleByteText | PlpEncoding::Utf8Text
         );
-    let mut narrow_decoder = if widen_narrow_to_utf16 {
-        column_info
-            .text_encoding
-            .and_then(|encoding| encoding.encoding())
-            .map(|encoding| encoding.new_decoder_without_bom_handling())
+    let narrow_wire_encoding = column_info
+        .text_encoding
+        .and_then(|encoding| encoding.encoding());
+    // Codepage text delivered as SQL_C_CHAR must be decoded through the column's
+    // collation, since SQL_C_CHAR output is UTF-8 (AB#47566). A UTF-8 collation
+    // is already in the target encoding, so it stays on the verbatim path.
+    let transcode_narrow_to_utf8 = target == SQL_C_CHAR
+        && matches!(encoding, PlpEncoding::SingleByteText)
+        && narrow_wire_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8);
+    let mut narrow_decoder = if widen_narrow_to_utf16 || transcode_narrow_to_utf8 {
+        narrow_wire_encoding.map(|encoding| encoding.new_decoder_without_bom_handling())
     } else {
         None
     };
@@ -1807,7 +1814,7 @@ unsafe fn deliver_bound_plp(
 
     let transcode_utf16_to_utf8 =
         target == SQL_C_CHAR && matches!(encoding, PlpEncoding::Utf16Text);
-    let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
+    let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16 || transcode_narrow_to_utf8;
     let buf_elements = char_buf_elements(target, stride);
     // Room for the payload. Character targets always write a terminator; binary
     // is not a string, so the whole slot is payload.
@@ -1820,6 +1827,7 @@ unsafe fn deliver_bound_plp(
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut out_units: Vec<u16> = Vec::new();
     let mut decoded_units: Vec<u16> = Vec::new();
+    let mut decoded_utf8: Vec<u8> = Vec::new();
     let mut pending_byte: Option<u8> = None;
     let mut pending_high_surrogate: Option<u16> = None;
     let mut truncated = false;
@@ -1838,7 +1846,36 @@ unsafe fn deliver_bound_plp(
             continue;
         }
 
-        if let Some(decoder) = narrow_decoder.as_mut() {
+        if transcode_narrow_to_utf8 {
+            // Codepage text into a UTF-8 SQL_C_CHAR slot. The decoder carries a
+            // multi-byte sequence split across a PLP chunk boundary; unlike the
+            // streaming SQLGetData path there is no continuation call, so the
+            // slot either takes the whole value or reports truncation.
+            let Some(decoder) = narrow_decoder.as_mut() else {
+                drain_plp_to_end(client, runtime, scratch)?;
+                return Ok(RowOutcome::Error(RowIssue::Unsupported));
+            };
+            decoded_utf8.clear();
+            transcode_narrow_into_pending(
+                decoder,
+                &mut decoded_utf8,
+                &scratch[..chunk.read],
+                chunk.reached_end,
+                usize::MAX,
+            );
+            // Whole characters only: a partial UTF-8 sequence left in the
+            // caller's buffer would not decode.
+            for ch in String::from_utf8_lossy(&decoded_utf8).chars() {
+                let need = ch.len_utf8();
+                if out_bytes.len() + need <= capacity_elements {
+                    let mut enc = [0u8; 4];
+                    out_bytes.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
+                } else {
+                    truncated = true;
+                    break;
+                }
+            }
+        } else if let Some(decoder) = narrow_decoder.as_mut() {
             decoded_units.clear();
             widen_into_pending(
                 decoder,
