@@ -230,10 +230,22 @@ pub(crate) struct DescRecord {
     /// that merely landed on the same values through this driver's own
     /// `SetTypeDefaults`-equivalent default-fill must not trigger it, or a
     /// bare `SQLBindParameter` into a same-shaped column would wrongly skip
-    /// the rescale every other source takes. Reset to `false` by any APD
-    /// reset (`SQLBindParameter`, or a `SQL_DESC_TYPE` write) alongside
-    /// `data_ptr`/`data_bound`, and set to `true` only by `set_precision`/
-    /// `set_scale` themselves.
+    /// the rescale every other source takes. It also gates which *source*
+    /// scale the non-fast-path rescale trusts (`decimal_from_numeric`'s
+    /// slow path): explicit means the APD's own `scale` is authoritative,
+    /// non-explicit falls back to the struct's own embedded scale, since
+    /// that is the only self-description available for a value the app
+    /// never described through the descriptor.
+    ///
+    /// Set to `true` only by `set_precision`/`set_scale` themselves. Reset
+    /// to `false` by a `SQL_DESC_TYPE` write that changes the concise type
+    /// (`set_type`) and by `SQLBindParameter`'s own APD write
+    /// (`write_to_records`) *only when its `ValueType` is changing* —
+    /// mirroring the ODBC spec's `SQLBindParameter` rebind rule that
+    /// rebinding the same `ValueType` retains other APD fields set by a
+    /// prior bind or `SQLSetDescField` call. A same-`SQL_C_NUMERIC` rebind
+    /// therefore keeps this flag from a prior explicit call even though the
+    /// precision/scale *values* still reset to `(SQL_PREC_NUMERIC, 0)`.
     pub(crate) precision_scale_explicit: bool,
     /// IPD only: set when the application has itself written this record's
     /// type/size (`SQL_DESC_CONCISE_TYPE`/`TYPE`, `DATETIME_INTERVAL_CODE`,

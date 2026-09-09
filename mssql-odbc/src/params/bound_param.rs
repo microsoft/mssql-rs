@@ -98,29 +98,33 @@ impl BoundParam {
     /// IPD's `length`/`precision`/`scale` rather than leaving fields from a
     /// previous, differently-shaped binding behind.
     ///
-    /// msodbcsql's `SetADRecBP` also `ZeroMemory`s the whole APD record and
-    /// re-applies `SetTypeDefaults`'s C-type-keyed defaults on every call
-    /// (`sqlcdesc.cpp:2883`); for `SQL_C_NUMERIC` that default is
-    /// `(SQL_PREC_NUMERIC, 0)` (`sqlcdesc.cpp:12344`,
-    /// `case SQL_NUMERIC: pGenDescRec->cbPrecision = SQL_PREC_NUMERIC;
-    /// pGenDescRec->ibScale = 0;` — `SQL_C_NUMERIC` and `SQL_NUMERIC` share
-    /// the same integer value). This driver only tracks the (execution-
-    /// critical, per `decimal_from_numeric`) precision/scale pair for that one
-    /// C type, so the reset below is scoped to it; every other C type's APD
-    /// precision/scale stays at whatever `DescRecord::default_for` seeded
-    /// (`0, 0`), which is harmless because nothing reads them. Without this
-    /// reset, a `SQL_C_NUMERIC` bind that never calls `SQLSetDescFieldW` left
-    /// `app_precision`/`app_scale` at `(0, 0)` instead of msodbcsql's real
-    /// `(38, 0)` — silently forcing the slow (rescale) path even for the
-    /// common "bind straight into a `NUMERIC(38,0)` column" case msodbcsql
-    /// fast-paths, and, once the struct's own scale is nonzero, treating it
-    /// as scale `0` in that slow path and corrupting the value. Resetting on
-    /// every call (not just the first) also closes the APD half of the
-    /// rebind-staleness gap this comment used to track as
-    /// [#470](https://github.com/microsoft/mssql-rs/issues/470); the ARD
-    /// half (`SQLBindCol`, `handles::stmt::ColumnBinding::write_to_record`)
-    /// is unaffected by this SQL_C_NUMERIC-input-parameter-scoped fix and
-    /// still tracks the general gap there.
+    /// msodbcsql's `SetADRecBP` also re-applies `SetTypeDefaults`'s
+    /// C-type-keyed defaults on every call (`sqlcdesc.cpp:2883`); for
+    /// `SQL_C_NUMERIC` that default is `(SQL_PREC_NUMERIC, 0)`
+    /// (`sqlcdesc.cpp:12344`, `case SQL_NUMERIC: pGenDescRec->cbPrecision =
+    /// SQL_PREC_NUMERIC; pGenDescRec->ibScale = 0;` — `SQL_C_NUMERIC` and
+    /// `SQL_NUMERIC` share the same integer value). This driver only tracks
+    /// the (execution-critical, per `decimal_from_numeric`) precision/scale
+    /// pair for that one C type, so the value reset below is scoped to it;
+    /// every other C type's APD precision/scale stays at whatever
+    /// `DescRecord::default_for` seeded (`0, 0`), which is harmless because
+    /// nothing reads them. Without this reset, a `SQL_C_NUMERIC` bind that
+    /// never calls `SQLSetDescFieldW` left `app_precision`/`app_scale` at
+    /// `(0, 0)` instead of msodbcsql's real `(38, 0)` — silently forcing the
+    /// slow (rescale) path even for the common "bind straight into a
+    /// `NUMERIC(38,0)` column" case msodbcsql fast-paths.
+    ///
+    /// `precision_scale_explicit` is *not* part of that per-call value
+    /// reset, though: per the ODBC spec, rebinding the same `ValueType`
+    /// (`SQLBindParameter`'s `fCType`) retains other APD fields set by a
+    /// prior bind or `SQLSetDescField` call, so it only clears when the C
+    /// type is genuinely changing (verified against msodbcsql's parity-
+    /// comparison harness —
+    /// `NumericRebindDoesNotInheritAPreviousBindsStaleApdScale` regressed
+    /// when this flag was cleared unconditionally, since a same-type
+    /// rebind's freshly-defaulted `(38, 0)` values must still be treated as
+    /// the deliberate, "app is in control" state a prior explicit call left
+    /// behind, not as an unset default).
     ///
     /// `SQL_DESC_INDICATOR_PTR` and `SQL_DESC_OCTET_LENGTH_PTR`
     /// both receive the same pointer here — `SQLBindParameter`'s one
@@ -134,6 +138,15 @@ impl BoundParam {
         apd_record: &mut DescRecord,
         ipd_record: &mut DescRecord,
     ) {
+        // Per the ODBC spec's SQLBindParameter rebind rule: rebinding the
+        // *same* ValueType retains other APD fields from a previous bind or
+        // SQLSetDescField call; only a genuine ValueType change resets them
+        // to type defaults. `precision_scale_explicit` therefore only clears
+        // here when the C type is actually changing — a same-type rebind
+        // (even a bare one) must not forget that the app once wrote
+        // SQL_DESC_PRECISION/SCALE, or `decimal_from_numeric`'s fast-path
+        // gate would wrongly treat it as never-explicit.
+        let type_changing = apd_record.concise_type != self.c_type;
         apd_record.concise_type = self.c_type;
         apd_record.datetime_interval_code = datetime_interval_code_for(self.c_type);
         apd_record.data_ptr = self.parameter_value_ptr;
@@ -141,11 +154,12 @@ impl BoundParam {
         apd_record.octet_length = self.buffer_length;
         apd_record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
         apd_record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
-        // msodbcsql's SetADRecBP (SQLBindParameter's APD writer) ZeroMemory's
-        // the whole record then calls SetTypeDefaults unconditionally, so a
-        // bind always clears any prior "app wrote precision/scale" state —
-        // it does not survive a rebind, even to the same C type.
-        apd_record.precision_scale_explicit = false;
+        if type_changing {
+            apd_record.precision_scale_explicit = false;
+        }
+        // The precision/scale *values* reset to SQL_C_NUMERIC's type default
+        // on every bind regardless (msodbcsql's SetTypeDefaults), even a
+        // same-type rebind — only the explicit-flag survives one.
         if self.c_type == SQL_C_NUMERIC {
             apd_record.precision = SQL_PREC_NUMERIC;
             apd_record.scale = 0;
@@ -396,9 +410,11 @@ mod tests {
             strlen_or_ind_ptr: &raw mut ind,
             octet_length_ptr: &raw mut ind,
         };
-        // Seed the record with stale values from a prior, differently-shaped
-        // binding to also prove the reset happens on every call, not just
-        // the first.
+        // Seed the record as `default_for` would leave a genuinely unbound
+        // one (`concise_type: SQL_C_DEFAULT`), but with stale explicit
+        // precision/scale left behind — as if a *different* prior ValueType
+        // had set them — to prove the value reset happens on every call and
+        // the flag resets too, since the ValueType is changing here.
         let mut apd_record = DescRecord {
             precision: 7,
             scale: 2,
@@ -412,7 +428,59 @@ mod tests {
         assert_eq!(apd_record.scale, 0);
         assert!(
             !apd_record.precision_scale_explicit,
-            "a fresh SQLBindParameter must not inherit a prior bind's explicit precision/scale flag"
+            "a rebind that changes ValueType away from SQL_C_NUMERIC (the \
+             seeded record's SQL_C_DEFAULT) must not inherit a prior bind's \
+             explicit precision/scale flag"
+        );
+    }
+
+    /// The ODBC-spec counterpart of the test above: rebinding the *same*
+    /// `ValueType` (`SQL_C_NUMERIC` again) must retain `precision_scale_explicit`
+    /// from a prior explicit `SQLSetDescField` call even though the
+    /// precision/scale *values* still reset to `SetTypeDefaults`'
+    /// `(SQL_PREC_NUMERIC, 0)` — verified against msodbcsql's parity harness
+    /// (`NumericRebindDoesNotInheritAPreviousBindsStaleApdScale`): a bare
+    /// second `SQLBindParameter(..., SQL_C_NUMERIC, ...)` after a first bind
+    /// that wrote APD precision/scale explicitly must still use the APD's
+    /// (now-defaulted) scale as the rescale source, not the second struct's
+    /// own embedded scale — which only happens if this flag survives.
+    #[test]
+    fn write_to_records_keeps_explicit_flag_across_a_same_type_rebind() {
+        let mut value = crate::api::odbc_types::SqlNumericStruct::default();
+        let mut ind: SqlLen = std::mem::size_of_val(&value) as SqlLen;
+        let bound = BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: crate::api::odbc_types::SQL_C_NUMERIC,
+            sql_type: crate::api::odbc_types::SQL_DECIMAL,
+            column_size: 10,
+            decimal_digits: 2,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
+            parameter_value_ptr: (&raw mut value).cast(),
+            buffer_length: ind,
+            strlen_or_ind_ptr: &raw mut ind,
+            octet_length_ptr: &raw mut ind,
+        };
+        // Seed the record as a prior SQL_C_NUMERIC bind that had SQLSetDescFieldW
+        // called on it would leave it: same concise_type, explicit precision/scale.
+        let mut apd_record = DescRecord {
+            concise_type: crate::api::odbc_types::SQL_C_NUMERIC,
+            precision: 10,
+            scale: 2,
+            precision_scale_explicit: true,
+            ..DescRecord::default_for(DescKind::AppParam)
+        };
+        let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
+        bound.write_to_records(&mut apd_record, &mut ipd_record);
+
+        assert_eq!(apd_record.precision, SQL_PREC_NUMERIC);
+        assert_eq!(apd_record.scale, 0);
+        assert!(
+            apd_record.precision_scale_explicit,
+            "a same-ValueType SQL_C_NUMERIC rebind must retain a prior \
+             explicit precision/scale flag, per the ODBC SQLBindParameter \
+             rebind rule"
         );
     }
 
