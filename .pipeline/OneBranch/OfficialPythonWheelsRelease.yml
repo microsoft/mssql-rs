@@ -39,6 +39,11 @@ parameters:
     type: boolean
     default: false  # Safety: default to false to prevent accidental releases
 
+  - name: validateCratesOnly
+    displayName: 'Validate Rust crate artifacts without publishing'
+    type: boolean
+    default: false
+
   - name: tagRelease
     displayName: 'Create git tag and release branch'
     type: boolean
@@ -212,7 +217,7 @@ extends:
     ###########################################################################
     # Stage 2: Publish Rust crates through ESRP
     ###########################################################################
-    - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true)) }}:
+    - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
       - stage: ReleaseCrates
         displayName: 'Release Rust Crates'
         dependsOn: Release
@@ -229,6 +234,8 @@ extends:
           - name: ob_outputDirectory
             value: '$(Build.ArtifactStagingDirectory)'
           steps:
+          - checkout: self
+
           - download: officialBuild
             artifact: 'drop_Build_RustCrates'
             displayName: 'Download Rust crate artifacts'
@@ -238,7 +245,7 @@ extends:
               -ArtifactDirectory '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates'
             displayName: 'Validate Rust crate release artifact'
 
-          - ${{ if eq(parameters.publishMssqlTds, true) }}:
+          - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.validateCratesOnly, true)) }}:
             - pwsh: >
                 .pipeline/scripts/test-cratesio-package.ps1
                 -CrateName 'mssql-tds'
@@ -247,7 +254,7 @@ extends:
                 -MaxAttempts 1
               displayName: 'Preflight mssql-tds version'
 
-          - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
+          - ${{ if or(eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
             - pwsh: >
                 .pipeline/scripts/test-cratesio-package.ps1
                 -CrateName 'mssql-mock-tds'

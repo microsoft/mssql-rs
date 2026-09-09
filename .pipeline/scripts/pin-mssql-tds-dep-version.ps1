@@ -79,13 +79,15 @@ foreach ($entry in @(
     }
 
     if ($keyMatches.Count -eq 1) {
-        $dependency = $keyPattern.Replace($dependency, "$key = `"$value`"", 1)
+        $replacement = "$key = `"$value`"".Replace('$', '$$')
+        $dependency = $keyPattern.Replace($dependency, $replacement, 1)
     }
     else {
+        $replacement = "{ $key = `"$value`", ".Replace('$', '$$')
         $dependency = [regex]::Replace(
             $dependency,
             '\{\s*',
-            "{ $key = `"$value`", ",
+            $replacement,
             1
         )
     }
