@@ -88,6 +88,7 @@ extends:
           WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
         steps:
         - checkout: self
+          path: s/mssql-rs
 
         - ${{ if eq(parameters.publishToPyPI, true) }}:
           - pwsh: |
@@ -98,7 +99,7 @@ extends:
 
         - pwsh: |
             $ErrorActionPreference = 'Stop'
-            $sourceRoot = "$(Build.SourcesDirectory)/.pipeline/pypi-stub"
+            $sourceRoot = "$(Pipeline.Workspace)/s/mssql-rs/.pipeline/pypi-stub"
             $dist = Join-Path $sourceRoot 'dist'
             $stage = "$(Agent.TempDirectory)/pypi-publish"
             $extract = "$(Agent.TempDirectory)/pypi-verify"
