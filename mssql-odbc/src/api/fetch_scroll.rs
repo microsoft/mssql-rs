@@ -40,8 +40,8 @@ use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
-    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, utf16le_chunk_to_utf8,
-    widen_into_pending,
+    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, hex_buffer_elements,
+    utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE,
@@ -1821,7 +1821,7 @@ unsafe fn deliver_bound_plp(
     let capacity_elements = if target == SQL_C_BINARY {
         stride
     } else if hex_stream {
-        buf_elements.saturating_sub(1) & !1
+        hex_buffer_elements(buf_elements).saturating_sub(1)
     } else {
         buf_elements.saturating_sub(1)
     };
@@ -2207,6 +2207,11 @@ unsafe fn deliver_bound(
     };
 
     let buf_elements = char_buf_elements(binding.target_type, stride);
+    let buf_elements = if matches!(value, ColumnValues::Bytes(_)) {
+        hex_buffer_elements(buf_elements)
+    } else {
+        buf_elements
+    };
     if binding.target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = text.encode_utf16().collect();
         unsafe { write_if_some(octet_length, (utf16.len() * 2) as SqlLen) };

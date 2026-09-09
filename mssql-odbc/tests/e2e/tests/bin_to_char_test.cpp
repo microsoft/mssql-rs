@@ -234,6 +234,74 @@ TEST_F(BinToCharLiveTest, StreamedHexChunksWithADecreasingRemainder) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(BinToCharLiveTest, StreamedWideHexChunksWithADecreasingByteRemainder) {
+    const char* expected[] = {"01", "02", "AB", "40"};
+    for (const SQLLEN bufUnits : {3, 4}) {
+        SCOPED_TRACE(bufUnits);
+        FetchOne("SELECT CAST(0x0102AB40 AS VARBINARY(MAX))");
+
+        for (int i = 0; i < 4; ++i) {
+            SCOPED_TRACE(i);
+            SQLWCHAR buf[5] = {'~', '~', '~', '~', '~'};
+            SQLLEN ind = -1;
+            const SQLRETURN rc = SQLGetData(
+                stmt_, 1, SQL_C_WCHAR, buf, bufUnits * sizeof(SQLWCHAR), &ind);
+            ASSERT_EQ(i == 3 ? SQL_SUCCESS : SQL_SUCCESS_WITH_INFO, rc)
+                << StmtDiagState();
+            EXPECT_EQ(static_cast<SQLLEN>((8 - 2 * i) * sizeof(SQLWCHAR)), ind);
+            EXPECT_EQ(static_cast<SQLWCHAR>(expected[i][0]), buf[0]);
+            EXPECT_EQ(static_cast<SQLWCHAR>(expected[i][1]), buf[1]);
+            EXPECT_EQ(0, buf[2]);
+            EXPECT_EQ('~', buf[bufUnits]) << "must not write past BufferLength";
+            if (i < 3) {
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            }
+        }
+
+        SQLWCHAR buf[5] = {};
+        SQLLEN ind = -1;
+        EXPECT_EQ(SQL_NO_DATA,
+                  SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind));
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+TEST_F(BinToCharLiveTest, StreamedHexPairSizedProbesDoNotConsumeValue) {
+    const auto check = [&](auto& buf, SQLSMALLINT target) {
+        const SQLLEN unitBytes = sizeof(buf[0]);
+        for (SQLLEN bufBytes = 0; bufBytes < 3 * unitBytes; ++bufBytes) {
+            SCOPED_TRACE(::testing::Message() << "target " << target
+                                             << ", buffer bytes " << bufBytes);
+            FetchOne("SELECT CAST(0x0102AB AS VARBINARY(MAX))");
+            SQLLEN ind = -1;
+            for (int probe = 0; probe < 2; ++probe) {
+                for (auto& unit : buf) unit = '~';
+                ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                          SQLGetData(stmt_, 1, target, buf, bufBytes, &ind));
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+                EXPECT_EQ(6 * unitBytes, ind);
+                EXPECT_EQ(bufBytes >= unitBytes ? 0 : '~', buf[0]);
+                EXPECT_EQ('~', buf[1]);
+            }
+
+            ASSERT_EQ(SQL_SUCCESS,
+                      SQLGetData(stmt_, 1, target, buf, sizeof(buf), &ind));
+            EXPECT_EQ(6 * unitBytes, ind);
+            const char* expected = "0102AB";
+            for (int i = 0; i < 6; ++i) EXPECT_EQ(expected[i], buf[i]);
+            EXPECT_EQ(0, buf[6]);
+            EXPECT_EQ('~', buf[7]);
+            EXPECT_EQ(SQL_NO_DATA,
+                      SQLGetData(stmt_, 1, target, buf, sizeof(buf), &ind));
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        }
+    };
+    SQLCHAR narrow[8];
+    SQLWCHAR wide[8];
+    ASSERT_NO_FATAL_FAILURE(check(narrow, SQL_C_CHAR));
+    ASSERT_NO_FATAL_FAILURE(check(wide, SQL_C_WCHAR));
+}
+
 // A value far larger than any single wire chunk, so the remaining count comes
 // from the declared total rather than from what happens to be buffered.
 TEST_F(BinToCharLiveTest, LargeStreamedValueReportsTheFullCharacterCount) {
@@ -248,6 +316,25 @@ TEST_F(BinToCharLiveTest, LargeStreamedValueReportsTheFullCharacterCount) {
     EXPECT_EQ(2200000, ind) << "characters, which is twice the byte count";
     EXPECT_EQ("ABABABABABABAB", text) << "14 characters: 15 payload bytes rounded to 7 whole bytes";
     SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinToCharLiveTest, LargeStreamedWideValueReportsTheFullByteCount) {
+    FetchOne(
+        "SELECT CAST(REPLICATE(CAST(0xAB AS VARBINARY(MAX)), 1100000) AS VARBINARY(MAX))");
+
+    SQLWCHAR buf[17];
+    for (auto& unit : buf) unit = '~';
+    SQLLEN ind = -1;
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 1, SQL_C_WCHAR, buf, 16 * sizeof(SQLWCHAR), &ind));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(static_cast<SQLLEN>(2200000 * sizeof(SQLWCHAR)), ind);
+    for (int i = 0; i < 14; ++i) {
+        EXPECT_EQ(i % 2 == 0 ? 'A' : 'B', buf[i]) << "unit " << i;
+    }
+    EXPECT_EQ(0, buf[14]) << "the odd payload slot cannot split a hex pair";
+    EXPECT_EQ('~', buf[16]) << "must not write past BufferLength";
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
 // The UDT types arrive as PLP binary too, so they render the same way.
@@ -314,6 +401,93 @@ TEST_F(BinToCharLiveTest, BoundVarbinaryMaxRendersHexWhetherBufferedOrStreamed) 
         SQLFreeStmt(stmt_, SQL_UNBIND);
         SQLCloseCursor(stmt_);
     }
+}
+
+TEST_F(BinToCharLiveTest, BoundWideVarbinaryMaxRendersHexWhetherBufferedOrStreamed) {
+    struct Case {
+        const char* repeat;
+        SQLLEN expectedChars;
+        SQLRETURN expectedRc;
+    };
+    // Above 1 MiB, the value cannot take the fully buffered delivery path.
+    const Case cases[] = {{"10", 20, SQL_SUCCESS},
+                          {"1100000", 2200000, SQL_SUCCESS_WITH_INFO}};
+
+    for (const auto& c : cases) {
+        for (const SQLLEN bufUnits : {21, 64}) {
+            SCOPED_TRACE(::testing::Message() << "repeat " << c.repeat
+                                             << ", buffer units " << bufUnits);
+            const std::string sql =
+                std::string("SELECT CAST(REPLICATE(CAST(0xAB AS VARBINARY(MAX)), ") +
+                c.repeat + ") AS VARBINARY(MAX)), CAST(42 AS INT)";
+            ASSERT_SQL_OK(ExecDirect(sql), SQL_HANDLE_STMT, stmt_);
+
+            SQLWCHAR buf[65];
+            for (auto& unit : buf) unit = '~';
+            SQLLEN ind = -1;
+            SQLINTEGER following = -1;
+            SQLLEN followingInd = -1;
+            ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_WCHAR, buf,
+                                    bufUnits * sizeof(SQLWCHAR), &ind),
+                          SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_SLONG, &following,
+                                    sizeof(following), &followingInd),
+                          SQL_HANDLE_STMT, stmt_);
+
+            ASSERT_EQ(c.expectedRc, SQLFetch(stmt_)) << StmtDiagState();
+            EXPECT_EQ(c.expectedChars * static_cast<SQLLEN>(sizeof(SQLWCHAR)), ind);
+            if (c.expectedRc == SQL_SUCCESS_WITH_INFO) {
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+            }
+            const SQLLEN copiedChars =
+                c.expectedRc == SQL_SUCCESS ? c.expectedChars : (bufUnits - 1) & ~SQLLEN{1};
+            for (SQLLEN i = 0; i < copiedChars; ++i) {
+                EXPECT_EQ(i % 2 == 0 ? 'A' : 'B', buf[i]) << "unit " << i;
+            }
+            EXPECT_EQ(0, buf[copiedChars]);
+            EXPECT_EQ('~', buf[bufUnits]) << "must not write past BufferLength";
+            EXPECT_EQ(42, following) << "the truncated stream must be drained";
+            EXPECT_EQ(static_cast<SQLLEN>(sizeof(following)), followingInd);
+            EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        }
+    }
+}
+
+TEST_F(BinToCharLiveTest, BoundHexNeverSplitsAByteAcrossTheBufferEdge) {
+    const auto check = [&](auto& buf, SQLSMALLINT target) {
+        for (const char* source : {"BINARY(3)", "VARBINARY(8)", "VARBINARY(MAX)"}) {
+            for (const SQLLEN bufUnits : {0, 1, 2, 3, 4, 5, 6, 7}) {
+                SCOPED_TRACE(::testing::Message() << source << ", target " << target
+                                                 << ", buffer units " << bufUnits);
+                ASSERT_SQL_OK(ExecDirect(std::string("SELECT CAST(0x0102AB AS ") + source + ")"),
+                              SQL_HANDLE_STMT, stmt_);
+                for (auto& unit : buf) unit = '~';
+                SQLLEN ind = -1;
+                ASSERT_SQL_OK(SQLBindCol(stmt_, 1, target, buf,
+                                        bufUnits * sizeof(buf[0]), &ind),
+                              SQL_HANDLE_STMT, stmt_);
+                ASSERT_EQ(bufUnits == 7 ? SQL_SUCCESS : SQL_SUCCESS_WITH_INFO,
+                          SQLFetch(stmt_)) << StmtDiagState();
+                EXPECT_EQ(static_cast<SQLLEN>(6 * sizeof(buf[0])), ind);
+                if (bufUnits < 7) {
+                    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+                }
+                const SQLLEN copiedChars = bufUnits == 0 ? 0 : (bufUnits - 1) & ~SQLLEN{1};
+                const char* expected = "0102AB";
+                for (SQLLEN i = 0; i < copiedChars; ++i) EXPECT_EQ(expected[i], buf[i]);
+                if (bufUnits > 0) EXPECT_EQ(0, buf[copiedChars]);
+                EXPECT_EQ('~', buf[bufUnits]);
+                ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+                ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+    };
+    SQLCHAR narrow[8];
+    SQLWCHAR wide[8];
+    ASSERT_NO_FATAL_FAILURE(check(narrow, SQL_C_CHAR));
+    ASSERT_NO_FATAL_FAILURE(check(wide, SQL_C_WCHAR));
 }
 
 // A uniqueidentifier is not hex-rendered: it has its own string form, which the

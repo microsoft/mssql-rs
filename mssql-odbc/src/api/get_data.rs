@@ -1278,13 +1278,8 @@ fn write_captured_column(
     };
     // `value` borrow ends here — `as_text` is owned.
 
-    // A hex rendering is written in whole bytes: msodbcsql fills 2 characters at
-    // a time and leaves an odd trailing slot empty rather than splitting a pair,
-    // so a 4-byte buffer takes "01" and not "010". Rounding the capacity down to
-    // an even count here gives the shared writer that behaviour, and keeps every
-    // resume offset even so a pair cannot straddle two chunks either.
-    let buf_elements = if hex_rendered && buf_elements > 0 {
-        (buf_elements.saturating_sub(1) & !1) + 1
+    let buf_elements = if hex_rendered {
+        hex_buffer_elements(buf_elements)
     } else {
         buf_elements
     };
@@ -1904,14 +1899,14 @@ fn stream_active_plp_chunk<'a>(
     // available and 01004 are reported as usual. msodbcsql answers this shape
     // the same way.
     //
-    // Payload room too small to carry one whole wide character is a different
+    // For text, too little room for one whole wide character is a different
     // case: a SQL_C_WCHAR buffer of 1 or 3 bytes cannot make progress and is
     // rejected with HY090. UTF-8 output has a byte carry, so any SQL_C_CHAR
     // buffer with payload room can make progress.
     //
-    // A probe is exactly two shapes: a zero-length buffer, and one sized for
-    // the terminator alone. Everything else that cannot make progress is an
-    // error, on the widening path as much as anywhere else -- widening sizes
+    // Text probes use a zero-length buffer or one sized for the terminator.
+    // Hex also treats buffers too small for a complete pair as probes.
+    // Other text buffers that cannot make progress are errors -- widening sizes
     // its read from output units rather than byte capacity, so its own
     // zero-progress shapes have to be spelled out rather than inferred from
     // `max_read`.
@@ -1923,7 +1918,7 @@ fn stream_active_plp_chunk<'a>(
     } else {
         max_read == 0
     };
-    if makes_no_progress && !is_length_probe {
+    if makes_no_progress && !is_length_probe && !hex_stream {
         if let Some(mut state) = retained_stmt_state.take() {
             post_sql_error(
                 &mut state,
@@ -2221,7 +2216,7 @@ fn stream_active_plp_chunk<'a>(
             emitted > 0 || reached_end || widen_out_units == 0,
             "narrow PLP widening made no forward progress"
         );
-    } else if target_type == SQL_C_WCHAR {
+    } else if target_type == SQL_C_WCHAR && !hex_stream {
         let usable = read & !1;
         let buf_elements = (buffer_length as usize) / std::mem::size_of::<SqlWChar>();
         if buf_elements > 0 && !target_value_ptr.is_null() {
@@ -2934,6 +2929,15 @@ fn strip_sub_one_leading_zero(s: String) -> String {
         format!("-.{rest}")
     } else {
         s
+    }
+}
+
+/// Capacity including the terminator, rounded down to preserve whole hex pairs.
+pub(crate) fn hex_buffer_elements(buf_elements: usize) -> usize {
+    if buf_elements == 0 {
+        0
+    } else {
+        ((buf_elements - 1) & !1) + 1
     }
 }
 
