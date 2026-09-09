@@ -345,6 +345,35 @@ pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
     Some(p)
 }
 
+/// The local calendar date, as `(year, month, day)`.
+///
+/// ODBC Appendix D says a time value converted to a timestamp takes the current
+/// date, and msodbcsql reads it from `localtime_s` (`ParseDateTime`,
+/// `sqlccnvt.cpp`) rather than UTC, so this follows the process's local zone to
+/// agree with it either side of midnight.
+pub(crate) fn current_local_date() -> (i16, u16, u16) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `localtime_r` fills the caller-owned `tm` and is thread-safe.
+        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+            return (1900, 1, 1);
+        }
+        (
+            (tm.tm_year + 1900) as i16,
+            (tm.tm_mon + 1) as u16,
+            tm.tm_mday as u16,
+        )
+    }
+    #[cfg(windows)]
+    {
+        let mut st = windows::Win32::Foundation::SYSTEMTIME::default();
+        unsafe { windows::Win32::System::SystemInformation::GetLocalTime(&mut st) };
+        (st.wYear as i16, st.wMonth, st.wDay)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

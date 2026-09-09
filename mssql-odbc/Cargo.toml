@@ -50,10 +50,17 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    # GetLocalTime, for the current date a time-only value is widened with.
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# msodbcsql widens a time-only value with the *local* current date
+# (`localtime_s` in sqlccnvt.cpp), which std cannot supply.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Enable the `test-util` feature on mssql-tds so unit tests can build a
