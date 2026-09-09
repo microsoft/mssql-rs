@@ -1905,8 +1905,13 @@ fn stream_active_plp_chunk<'a>(
         return SQL_ERROR;
     }
 
+    // The first binary read may discover an empty PLP value. Use temporary
+    // storage for that read so initializing a Rust byte slice cannot overwrite
+    // a caller buffer when no payload is delivered. Later chunks can stream
+    // directly because a prior read established that the value is non-empty.
     let direct_wire_output = max_read > 0
         && !target_value_ptr.is_null()
+        && !(target_type == SQL_C_BINARY && starting_new_stream)
         && matches!(
             (target_type, plp_encoding),
             (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
@@ -2257,15 +2262,21 @@ fn stream_active_plp_chunk<'a>(
         };
     } else if target_type == SQL_C_BINARY {
         // Binary delivery is a straight byte copy with no terminator, whatever
-        // the column's encoding. The gates above guarantee `plp_encoding` is
-        // `Some`, so `direct_wire_output` is false only for a zero-length buffer
-        // (`read == 0`) or a null `target_value_ptr`, which the Driver Manager
-        // rejects with HY009 before the call reaches the driver.
+        // the column's encoding. The first chunk uses temporary storage so an
+        // empty value leaves the caller's buffer untouched; subsequent chunks
+        // are read directly into that buffer.
         debug_assert!(
-            direct_wire_output || read == 0,
+            direct_wire_output || (starting_new_stream && !target_value_ptr.is_null()) || read == 0,
             "binary chunk read {read} bytes without a caller buffer to put them in"
         );
         unsafe {
+            if !direct_wire_output && !target_value_ptr.is_null() {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    target_value_ptr.cast::<u8>(),
+                    read,
+                );
+            }
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         }
     } else {
