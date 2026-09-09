@@ -809,22 +809,6 @@ TEST_F(GetDataLiveTest, UnsupportedCTypeReturnsHyc00ThenValueReadable) {
 // HYC00 rather than corrupt the stream. The reference msodbcsql driver supports
 // binary-to-char (hex) conversion, so this is mssql-odbc-specific — skip it on
 // the msodbcsql comparison leg.
-TEST_F(GetDataLiveTest, VarbinaryMaxToCharReturnsHyc00) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-    ASSERT_SQL_OK(ExecDirect("SELECT CAST(0x41424344 AS VARBINARY(MAX)) AS c1"),
-                  SQL_HANDLE_STMT, stmt_);
-
-    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
-
-    SQLCHAR buf[64] = {0};
-    SQLLEN ind = 0;
-    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
-    EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
-
-    SQLCloseCursor(stmt_);
-}
-
 // Jumping to a later column while a PLP stream is still open is incorrect usage
 // per the ODBC spec. The driver must clear the stale stream, drain the partially
 // read column, and return the later column's value rather than corrupt the row.
@@ -1934,25 +1918,28 @@ TEST_F(GetDataLiveTest, Datetime2ToTimestampTargetKeepsFraction) {
 // non-PLP type with no character rendering. If binary→hex is ever implemented,
 // re-point this again, or assert the recovery via the target-type HYC00 path (an
 // unsupported SQL_C target) with a type that will stay unsupported.
-TEST_F(GetDataLiveTest, UnsupportedColumnTypeHyc00PreservesValue) {
+// Anchored on an unsupported *target* rather than an unsupported column type.
+// It used to read a VARBINARY(8) as characters, but AB#47240 made that a real
+// conversion, and no non-PLP column type is unconvertible any more. SQL_C_NUMERIC
+// is the durable stand-in: the refusal comes from the target side, which is where
+// a soft HYC00 has to keep the value addressable.
+TEST_F(GetDataLiveTest, UnsupportedTargetHyc00PreservesValue) {
     SKIP_IF_COMPARING_MSODBCSQL();
-    ASSERT_SQL_OK(
-        ExecDirect("SELECT CAST(0x4142434445464748 AS VARBINARY(8)) AS c1"),
-        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(ExecDirect("SELECT CAST(1 AS INT) AS c1"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
     // First attempt with an unsupported target for this column type fails soft.
-    SQLCHAR buf[64] = {0};
+    SQL_NUMERIC_STRUCT numeric {};
     SQLLEN ind = 0;
-    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind);
+    SQLRETURN rc = SQLGetData(stmt_, 1, SQL_C_NUMERIC, &numeric, sizeof(numeric), &ind);
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 
     // The column is still addressable: a retry (again HYC00, not 24000) proves
     // the value was not consumed by the failed attempt.
-    SQLCHAR buf2[64] = {0};
+    SQL_NUMERIC_STRUCT numeric2 {};
     SQLLEN ind2 = 0;
-    SQLRETURN rc2 = SQLGetData(stmt_, 1, SQL_C_CHAR, buf2, sizeof(buf2), &ind2);
+    SQLRETURN rc2 = SQLGetData(stmt_, 1, SQL_C_NUMERIC, &numeric2, sizeof(numeric2), &ind2);
     EXPECT_EQ(SQL_ERROR, rc2);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
 

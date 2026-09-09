@@ -1253,6 +1253,7 @@ fn write_captured_column(
     }
     stmt_state.direct_text_target = None;
 
+    let hex_rendered = matches!(value, ColumnValues::Bytes(_));
     let as_text = match column_value_to_text(value) {
         Ok(t) => t,
         Err(TextError::Malformed) => {
@@ -1276,6 +1277,17 @@ fn write_captured_column(
         }
     };
     // `value` borrow ends here — `as_text` is owned.
+
+    // A hex rendering is written in whole bytes: msodbcsql fills 2 characters at
+    // a time and leaves an odd trailing slot empty rather than splitting a pair,
+    // so a 4-byte buffer takes "01" and not "010". Rounding the capacity down to
+    // an even count here gives the shared writer that behaviour, and keeps every
+    // resume offset even so a pair cannot straddle two chunks either.
+    let buf_elements = if hex_rendered && buf_elements > 0 {
+        (buf_elements.saturating_sub(1) & !1) + 1
+    } else {
+        buf_elements
+    };
 
     // Resume from where a prior truncated read of this column left off. The
     // offset unit matches the target C type (bytes for CHAR, UTF-16 code units
@@ -1667,6 +1679,8 @@ fn stream_active_plp_chunk<'a>(
             // the encoding. The two must agree or a chunked read is admitted on
             // its first call and refused on its second.
             (SQL_C_BINARY, _) => true,
+            // A binary column read as characters is rendered as hex (AB#47240).
+            (SQL_C_CHAR | SQL_C_WCHAR, PlpEncoding::Binary) => true,
             _ => false,
         };
         if !compatible {
@@ -1781,6 +1795,8 @@ fn stream_active_plp_chunk<'a>(
             // every encoding qualifies -- varbinary(max) and image, and the UDT
             // types (hierarchyid, geometry, geography) that arrive as PLP.
             (SQL_C_BINARY, Some(_)) => true,
+            // A binary column read as characters is rendered as hex (AB#47240).
+            (SQL_C_CHAR | SQL_C_WCHAR, Some(PlpEncoding::Binary)) => true,
             _ => false,
         };
         if !compatible {
@@ -1814,6 +1830,21 @@ fn stream_active_plp_chunk<'a>(
 
     // Room the caller left for payload, once the terminator every character
     // target needs is set aside.
+    // A binary column read as characters: every wire byte becomes two hex
+    // characters, so the caller's capacity bounds the read at half (CHAR) or a
+    // quarter (WCHAR) of itself, and a byte's pair is never split.
+    let hex_stream = matches!(plp_encoding, Some(PlpEncoding::Binary))
+        && (target_type == SQL_C_CHAR || target_type == SQL_C_WCHAR);
+    // Lengths for a hex rendering are reported in the target's own units: two
+    // characters per wire byte, and twice that again in bytes for SQL_C_WCHAR.
+    let hex_scale: SqlLen = if !hex_stream {
+        1
+    } else if target_type == SQL_C_WCHAR {
+        2 * std::mem::size_of::<SqlWChar>() as SqlLen
+    } else {
+        2
+    };
+
     let terminator_bytes = if target_type == SQL_C_WCHAR {
         std::mem::size_of::<SqlWChar>()
     } else if target_type == SQL_C_BINARY {
@@ -1828,7 +1859,13 @@ fn stream_active_plp_chunk<'a>(
     } else {
         usize::MAX
     };
-    let max_read = if widen_narrow_to_utf16 {
+    let max_read = if hex_stream {
+        if target_type == SQL_C_WCHAR {
+            payload_capacity / (2 * std::mem::size_of::<SqlWChar>())
+        } else {
+            payload_capacity / 2
+        }
+    } else if widen_narrow_to_utf16 {
         // Wire bytes in, UTF-16 code units out, so the caller's capacity does
         // not bound the read directly.
         //
@@ -1909,6 +1946,8 @@ fn stream_active_plp_chunk<'a>(
     // storage for that read so initializing a Rust byte slice cannot overwrite
     // a caller buffer when no payload is delivered. Later chunks can stream
     // directly because a prior read established that the value is non-empty.
+    // A hex rendering is not listed below, so it never reads straight into the
+    // caller's buffer -- it expands two characters per wire byte.
     let direct_wire_output = max_read > 0
         && !target_value_ptr.is_null()
         && !(target_type == SQL_C_BINARY && starting_new_stream)
@@ -2260,6 +2299,31 @@ fn stream_active_plp_chunk<'a>(
                 "UTF-16 to UTF-8 transcode made no forward progress"
             );
         };
+    } else if hex_stream {
+        // Two characters per wire byte, so `max_read` already capped the read at
+        // what the caller's buffer can hold and nothing is carried between calls.
+        let hex = bytes_to_hex(&payload[..read]);
+        unsafe {
+            if target_type == SQL_C_WCHAR {
+                let units: Vec<u16> = hex.encode_utf16().collect();
+                copy_with_nul(
+                    target_value_ptr as *mut SqlWChar,
+                    buffer_length as usize / std::mem::size_of::<SqlWChar>(),
+                    &units,
+                );
+            } else {
+                copy_with_nul(
+                    target_value_ptr as *mut u8,
+                    buffer_length as usize,
+                    hex.as_bytes(),
+                );
+            }
+            // Overwritten with the remaining count if this chunk truncates.
+            write_if_some(
+                strlen_or_ind_ptr,
+                (read as SqlLen).saturating_mul(hex_scale),
+            );
+        }
     } else if target_type == SQL_C_BINARY {
         // Binary delivery is a straight byte copy with no terminator, whatever
         // the column's encoding. The first chunk uses temporary storage so an
@@ -2381,7 +2445,7 @@ fn stream_active_plp_chunk<'a>(
         SQL_NO_TOTAL
     } else if let Some(total) = known_total {
         let consumed_before = total_read.saturating_sub(read) as u64;
-        total.saturating_sub(consumed_before) as SqlLen
+        (total.saturating_sub(consumed_before) as SqlLen).saturating_mul(hex_scale)
     } else {
         SQL_NO_TOTAL
     };
@@ -2880,6 +2944,18 @@ fn strip_sub_one_leading_zero(s: String) -> String {
     }
 }
 
+/// Upper-case hex, two characters per byte and no `0x` prefix, matching what
+/// msodbcsql renders for a binary column read as characters.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Infallible into a String.
+        let _ = write!(out, "{b:02X}");
+    }
+    out
+}
+
 pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError> {
     match v {
         ColumnValues::TinyInt(x) => Ok(x.to_string()),
@@ -2911,6 +2987,9 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
             let mut buffer = uuid::Uuid::encode_buffer();
             Ok(u.hyphenated().encode_upper(&mut buffer).to_string())
         }
+        // ODBC Appendix D makes binary -> character mandatory; msodbcsql renders
+        // upper-case hex with no `0x` prefix, two characters per byte.
+        ColumnValues::Bytes(b) => Ok(bytes_to_hex(b)),
         ColumnValues::Vector(vec) => Ok(format_vector(vec)),
         ColumnValues::Date(_)
         | ColumnValues::Time(_)
@@ -2921,7 +3000,6 @@ pub(crate) fn column_value_to_text(v: &ColumnValues) -> Result<String, TextError
             .map(|p| format_datetime_parts(&p))
             .ok_or(TextError::Unsupported),
         ColumnValues::Null => Ok(String::new()),
-        _ => Err(TextError::Unsupported),
     }
 }
 
@@ -3671,10 +3749,10 @@ mod tests {
             .as_deref(),
             Some("hi")
         );
-        // A type with no textual rendering in this helper yields None.
+        // Binary renders as upper-case hex, two characters per byte (AB#47240).
         assert_eq!(
-            column_value_to_text_opt(&ColumnValues::Bytes(vec![1, 2, 3])),
-            None
+            column_value_to_text_opt(&ColumnValues::Bytes(vec![1, 0x2A, 0xFF])).as_deref(),
+            Some("012AFF")
         );
     }
 
