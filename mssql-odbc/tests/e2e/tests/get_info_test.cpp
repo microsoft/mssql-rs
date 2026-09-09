@@ -189,8 +189,12 @@ TEST_F(GetInfoLiveTest, IdentifierLimitsAreSysnameWidth) {
 TEST_F(GetInfoLiveTest, MaxStatementLenAndConformance) {
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
+    SQLUINTEGER packetSize = 0;
 
-    EXPECT_EQ(512u * 1024u, GetInfoU32(dbc_, SQL_MAX_STATEMENT_LEN, &rc, &len));
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_PACKET_SIZE, &packetSize,
+                                    SQL_IS_UINTEGER, nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(128u * packetSize, GetInfoU32(dbc_, SQL_MAX_STATEMENT_LEN, &rc, &len));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
     EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len);
 
