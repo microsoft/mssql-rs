@@ -56,6 +56,7 @@
 //  30.  CursorApiAfterARowReturningArrayExecute    - AB#47944 as the app sees it
 //  31.  PreparedStatementReExecutesAtDifferentArraySizes - 4 -> 7 -> 2
 //  32.  TimestampoffsetArrayStridesByItsStructSize - fixed struct, not BufferLength
+//  32b. Time2ArrayStridesByItsStructSize          - the sibling C type
 
 #include "odbc_test_fixture.h"
 
@@ -66,10 +67,18 @@
 #include <vector>
 
 // Mirrors msodbcsql's sqlncli.h, matching datetime_types_test.cpp. The
-// static_assert fails the build rather than silently misreading a buffer.
+// static_asserts fail the build rather than silently misreading a buffer.
 #ifndef SQL_C_SS_TIMESTAMPOFFSET
 #define SQL_C_TYPES_EXTENDED 0x04000L
+#define SQL_C_SS_TIME2 (SQL_C_TYPES_EXTENDED + 0)
 #define SQL_C_SS_TIMESTAMPOFFSET (SQL_C_TYPES_EXTENDED + 1)
+
+typedef struct tagSS_TIME2_STRUCT {
+    SQLUSMALLINT hour;
+    SQLUSMALLINT minute;
+    SQLUSMALLINT second;
+    SQLUINTEGER fraction;
+} SQL_SS_TIME2_STRUCT;
 
 typedef struct tagSS_TIMESTAMPOFFSET_STRUCT {
     SQLSMALLINT year;
@@ -84,10 +93,16 @@ typedef struct tagSS_TIMESTAMPOFFSET_STRUCT {
 } SQL_SS_TIMESTAMPOFFSET_STRUCT;
 #endif
 
+#ifndef SQL_SS_TIME2
+#define SQL_SS_TIME2 (-154)
+#endif
+
 #ifndef SQL_SS_TIMESTAMPOFFSET
 #define SQL_SS_TIMESTAMPOFFSET (-155)
 #endif
 
+static_assert(sizeof(SQL_SS_TIME2_STRUCT) == 12,
+              "SQL_SS_TIME2_STRUCT layout does not match the msodbcsql ABI");
 static_assert(sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT) == 20,
               "SQL_SS_TIMESTAMPOFFSET_STRUCT layout does not match the msodbcsql ABI");
 
@@ -1905,4 +1920,49 @@ TEST_F(ParamArrayTest, TimestampoffsetArrayStridesByItsStructSize) {
     EXPECT_EQ("10,11,12",
               ScalarString("SELECT STRING_AGG(CONVERT(varchar(2), DATEPART(hour, v)), ',') "
                            "WITHIN GROUP (ORDER BY id) FROM #pa_dto"));
+}
+
+// -------------------------------------------------------------------
+// 32b. The same stride rule for SQL_C_SS_TIME2, the other C type that
+// reaches BindOffset's cbValueMax default and is normalised out of it by
+// GetLengthForFixedLengthCType. Same silent failure mode - the fix
+// changed both types, so both are pinned end to end rather than one by
+// measurement and one by a unit assertion.
+//
+// Measured on both drivers.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, Time2ArrayStridesByItsStructSize) {
+    ExecDirect("CREATE TABLE #pa_t2 (id int NOT NULL, v time(0) NOT NULL)");
+    Prepare("INSERT INTO #pa_t2 (id, v) VALUES (?, ?)");
+
+    SQLINTEGER ids[3] = {1, 2, 3};
+    SQLLEN id_ind[3] = {0, 0, 0};
+    SQL_SS_TIME2_STRUCT times[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        times[i].hour = static_cast<SQLUSMALLINT>(10 + i); // the discriminator
+        times[i].minute = 0;
+        times[i].second = 0;
+        times[i].fraction = 0;
+    }
+    SQLLEN time_ind[3] = {sizeof(SQL_SS_TIME2_STRUCT), sizeof(SQL_SS_TIME2_STRUCT),
+                          sizeof(SQL_SS_TIME2_STRUCT)};
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    // BufferLength 0, exactly as an application binds a fixed C struct.
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SS_TIME2,
+                                   SQL_SS_TIME2, 8, 0, times, 0, time_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 3));
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa_t2"));
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(DISTINCT v) FROM #pa_t2"))
+        << "a zero BufferLength must not collapse the array onto set 0";
+    EXPECT_EQ("10,11,12",
+              ScalarString("SELECT STRING_AGG(CONVERT(varchar(2), DATEPART(hour, v)), ',') "
+                           "WITHIN GROUP (ORDER BY id) FROM #pa_t2"));
 }

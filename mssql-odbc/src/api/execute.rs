@@ -1651,17 +1651,13 @@ mod tests {
 
     /// Sets skipped by `SQL_PARAM_IGNORE` never reach the wire, so they are
     /// absent from `rows` while still counting towards the processed total.
-    /// The count is therefore "through set N", not "N sets reported" - the
-    /// distinction the short-batch diagnostic has to describe accurately.
     #[test]
     fn params_processed_counts_ignored_sets_it_never_saw() {
         // PARAMSET_SIZE 5, sets 0 and 1 ignored, only set 2 reported.
-        let processed = params_processed(false, 5, &[reported_row(2)]);
-        assert_eq!(processed, 3, "processed runs through set index 2");
         assert_eq!(
-            [reported_row(2)].len(),
-            1,
-            "but only one set was actually reported"
+            params_processed(false, 5, &[reported_row(2)]),
+            3,
+            "runs through set index 2, rather than counting the one set reported"
         );
     }
 

@@ -82,6 +82,13 @@ pub(crate) enum AppValue {
 /// `SQL_C_SS_VECTOR` is intentionally absent until AB#47790 defines this
 /// driver's application-buffer ABI. `c_type` must already be resolved from
 /// `SQL_C_DEFAULT` by the binding path.
+///
+/// The variable-width arm is exactly msodbcsql's `IsFixedCType`
+/// (`sqlcprot.h:1301`), negated:
+/// `(a != SQL_C_CHAR && a != SQL_C_WCHAR && a != SQL_C_BINARY && a != SQL_C_SS_VECTOR)`.
+/// Those four are the only C types msodbcsql treats as application-sized, so
+/// every other type here is fixed by construction and no further one can be
+/// stranded on `BufferLength`.
 pub(crate) fn parameter_value_stride(c_type: SqlSmallInt, buffer_length: SqlLen) -> Option<usize> {
     let width = match c_type {
         SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY => {
