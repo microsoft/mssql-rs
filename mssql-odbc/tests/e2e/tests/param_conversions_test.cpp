@@ -1022,6 +1022,12 @@ TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
 // wall clock and lost. A literal that omits one takes +00:00, matching
 // CONVERT(datetimeoffset, '2024-05-20 12:34:56'); the compare leg adjudicates
 // that default against msodbcsql.
+//
+// The second assertion below currently fails on the compare leg for any host
+// not at UTC: msodbcsql fills a missing offset from the *client* timezone
+// (`sqlccnvt.cpp:4849` -> `PopulateTimeZoneValues` -> `GetTimeZoneInformation`),
+// so it answers +05:30 on an IST machine. CI runs at UTC, which is why the
+// divergence has never surfaced there. Tracked in AB#48006.
 TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralKeepsItsOffset) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56+05:30", 0, 0),

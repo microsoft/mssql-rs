@@ -1651,8 +1651,11 @@ TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
 
     // A bound status array downgrades the failure (case 9), on both drivers.
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+    // Any later call on this handle clears its diagnostics, so read them first.
+    const std::string diag = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
     SQLFreeStmt(stmt_, SQL_CLOSE);
 
+    EXPECT_EQ("23000", diag) << "the CHECK violation is the reported failure";
     EXPECT_EQ(static_cast<SQLULEN>(kSets), processed);
     for (int index : failing) {
         EXPECT_EQ(SQL_PARAM_ERROR, status[static_cast<size_t>(index)])

@@ -9,7 +9,8 @@ use tracing::{debug, error};
 use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
-    ExecuteOptions, PreparedBatchResult, StatementId, StatementResult, StreamedParamStatus,
+    ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, StatementId, StatementResult,
+    StreamedParamStatus,
 };
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -570,14 +571,7 @@ fn finish_parameter_array(
     let total_rows = result
         .total_rows_affected()
         .unwrap_or(SQL_NO_ROWCOUNT_TOTAL);
-    let processed = if complete {
-        outputs.paramset_size
-    } else {
-        result
-            .rows
-            .last()
-            .map_or(0, |row| row.row_index.saturating_add(1))
-    };
+    let processed = params_processed(complete, outputs.paramset_size, &result.rows);
     let info_messages = client.take_info_messages();
 
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -627,7 +621,7 @@ fn finish_parameter_array(
             SQLSTATE_01000,
             0,
             format!(
-                "Batched RPC reported {processed} of {} parameter sets; the rest kept SQL_PARAM_UNUSED",
+                "Batched RPC reported through parameter set {processed} of {}; later sets kept SQL_PARAM_UNUSED",
                 outputs.paramset_size
             ),
         );
@@ -660,13 +654,45 @@ fn finish_parameter_array(
     // it never compares the reported count against SQL_ATTR_PARAMSET_SIZE
     // (sqlctokn.cpp OnDone) - and leaves the unreported statuses untouched
     // because it has no SQL_PARAM_UNUSED pre-fill. AB#47945.
+    parameter_array_return_code(
+        failed_sets,
+        complete,
+        had_info || !info_messages.is_empty(),
+        !outputs.param_status_ptr.is_null(),
+    )
+}
+
+/// `SQL_ATTR_PARAMS_PROCESSED_PTR` for a finished batch. ODBC counts the sets
+/// the call reached, not the sets the server spoke about, so an ignored set
+/// still advances it and a short batch stops at the last set reported.
+fn params_processed(
+    complete: bool,
+    paramset_size: SqlULen,
+    rows: &[PreparedBatchRowResult],
+) -> SqlULen {
+    if complete {
+        paramset_size
+    } else {
+        rows.last().map_or(0, |row| row.row_index.saturating_add(1))
+    }
+}
+
+/// The one rule deciding a parameter array's return code. Split out because
+/// [`finish_parameter_array`] needs a live `TdsClient` and cannot be unit
+/// tested; every branch below is reachable only from here.
+fn parameter_array_return_code(
+    failed_sets: usize,
+    complete: bool,
+    had_diagnostic: bool,
+    has_status_array: bool,
+) -> SqlReturn {
     if failed_sets > 0 {
-        if outputs.param_status_ptr.is_null() {
-            SQL_ERROR
-        } else {
+        if has_status_array {
             SQL_SUCCESS_WITH_INFO
+        } else {
+            SQL_ERROR
         }
-    } else if !complete || had_info || !info_messages.is_empty() {
+    } else if !complete || had_diagnostic {
         SQL_SUCCESS_WITH_INFO
     } else {
         SQL_SUCCESS
@@ -1586,6 +1612,81 @@ mod tests {
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+    }
+
+    fn reported_row(row_index: usize) -> PreparedBatchRowResult {
+        PreparedBatchRowResult {
+            row_index,
+            rows_affected: Some(1),
+            errors: Vec::new(),
+            has_result_set: false,
+            has_info: false,
+        }
+    }
+
+    /// A complete batch reports the whole array regardless of what the server
+    /// said per set, and a short one stops at the last set reported.
+    #[test]
+    fn params_processed_counts_through_the_last_reported_set() {
+        assert_eq!(params_processed(true, 5, &[reported_row(0)]), 5);
+        assert_eq!(
+            params_processed(false, 5, &[reported_row(0), reported_row(1)]),
+            2
+        );
+        assert_eq!(params_processed(false, 5, &[]), 0);
+    }
+
+    /// Sets skipped by `SQL_PARAM_IGNORE` never reach the wire, so they are
+    /// absent from `rows` while still counting towards the processed total.
+    /// The count is therefore "through set N", not "N sets reported" - the
+    /// distinction the short-batch diagnostic has to describe accurately.
+    #[test]
+    fn params_processed_counts_ignored_sets_it_never_saw() {
+        // PARAMSET_SIZE 5, sets 0 and 1 ignored, only set 2 reported.
+        let processed = params_processed(false, 5, &[reported_row(2)]);
+        assert_eq!(processed, 3, "processed runs through set index 2");
+        assert_eq!(
+            [reported_row(2)].len(),
+            1,
+            "but only one set was actually reported"
+        );
+    }
+
+    /// The whole return-code rule, including the short-batch arm that no E2E
+    /// test can reach: no server behaviour is known to shorten a batch without
+    /// an error explaining it.
+    #[test]
+    fn parameter_array_return_code_covers_every_arm() {
+        assert_eq!(
+            parameter_array_return_code(0, true, false, true),
+            SQL_SUCCESS,
+            "clean batch"
+        );
+        assert_eq!(
+            parameter_array_return_code(0, true, true, true),
+            SQL_SUCCESS_WITH_INFO,
+            "a diagnostic alone downgrades"
+        );
+        assert_eq!(
+            parameter_array_return_code(0, false, false, true),
+            SQL_SUCCESS_WITH_INFO,
+            "a short batch downgrades even with no failure and no diagnostic"
+        );
+        assert_eq!(
+            parameter_array_return_code(0, false, false, false),
+            SQL_SUCCESS_WITH_INFO,
+            "a short batch does not need a status array to downgrade"
+        );
+        assert_eq!(
+            parameter_array_return_code(1, true, false, true),
+            SQL_SUCCESS_WITH_INFO,
+            "a status array carries the per-set detail"
+        );
+        assert_eq!(
+            parameter_array_return_code(1, true, false, false),
+            SQL_ERROR,
+            "without one the caller cannot see which set failed"
+        );
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,
