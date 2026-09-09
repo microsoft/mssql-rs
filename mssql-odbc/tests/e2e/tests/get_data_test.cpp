@@ -1596,8 +1596,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnSizedColumnIsSingleCall) {
 
 // tests/test_004_cursor.py::test_varbinarymax_insert_fetch_null -- the NULL leg
 // of the varbinary(max) test. A NULL MAX column must report SQL_NULL_DATA on the
-// probe rather than failing; binary *data* delivery is still unimplemented
-// (AB#47239), which is why only the NULL case is covered here.
+// probe rather than failing. The non-NULL delivery leg is covered by the binary
+// delivery tests below.
 TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn) {
     ASSERT_SQL_OK(ExecDirect("SELECT CAST(NULL AS NVARCHAR(MAX)) AS c1"), SQL_HANDLE_STMT,
                   stmt_);
@@ -1615,8 +1615,8 @@ TEST_F(GetDataLiveTest, DescribeColSizedFetchOnNullMaxColumn) {
 // tests/test_004_cursor.py::test_varbinarymax_insert_fetch_null -- the read that
 // actually failed. mssql-python fetches a nullable varbinary(max) with a real
 // SQL_C_BINARY buffer, not the zero-length probe, so the request reaches the
-// target-type check. Binary *data* delivery is still unimplemented (AB#47239);
-// a NULL carries no data, so it must be answered rather than rejected.
+// target-type check. A NULL carries no data, so it must be answered rather than
+// rejected; the non-NULL delivery leg is covered separately.
 //
 // The nonzero buffer is the point of this test: with a zero-length buffer the
 // read is admitted as a length probe and the NULL gate is never consulted.
@@ -1860,16 +1860,9 @@ TEST_F(GetDataLiveTest, BinaryColumnBesideALobStaysWithinItsBuffer) {
     const SQLRETURN read_rc =
         SQLGetData(stmt_, 1, SQL_C_BINARY, buf.data(), static_cast<SQLLEN>(buf.size()), &read_ind);
 
-    if (SQL_SUCCEEDED(read_rc)) {
-        // Delivering is fine; over-promising is not.
-        EXPECT_LE(read_ind, static_cast<SQLLEN>(buf.size()))
-            << "indicator exceeds the caller's buffer -- the memcpy would run off the end";
-        EXPECT_EQ(9, read_ind);
-    } else {
-        // Binary *data* delivery is still AB#47239, so a refusal is expected
-        // today. Refusing is safe; the crash came from claiming success.
-        EXPECT_EQ(SQL_ERROR, read_rc);
-    }
+    ASSERT_TRUE(SQL_SUCCEEDED(read_rc)) << "rc=" << read_rc;
+    EXPECT_EQ(9, read_ind);
+    EXPECT_EQ(0, std::memcmp(buf.data(), "\x01\x02\x03\x04\x05\x06\x07\x08\x09", 9));
 
     // 3. The LOB after it must still decode. A desync left behind by the binary
     //    column would otherwise surface as silent corruption rather than a

@@ -1095,9 +1095,8 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxDoesNotSplitASurrogatePair) {
     SQLCloseCursor(stmt_);
 }
 
-// Bound binary delivery is unimplemented for every type, not just the max ones
-// (AB#47239), so this asserts our own answer rather than parity -- msodbcsql
-// delivers it.
+// Bound VARBINARY(MAX) delivery across a rowset with a trailing scalar, so a
+// mis-sized drain would corrupt the following column and row.
 TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
     // Two rows and a trailing scalar: a bound LOB is drained into the caller's
     // buffer, and the value after it -- and the row after that -- still have to
