@@ -33,6 +33,9 @@ void set_counters(benchmark::State& state, const RetrievalMetrics& metrics) {
         state.counters["metadata_bind_ms"] = metrics.metadata_bind_seconds * 1000.0;
     }
     state.counters["fetch_ms"] = metrics.fetch_seconds * 1000.0;
+    if (metrics.execute_calls != 0) {
+        state.counters["execute_calls"] = static_cast<double>(metrics.execute_calls);
+    }
     // Zero for the bound modes. On the row-at-a-time workloads it is the number of
     // driver round trips the consumer's access pattern forced, which is the thing
     // that actually differs between drivers there.
@@ -80,6 +83,37 @@ int main(int argc, char** argv) {
                         for (auto _ : state) {
                             (void)_;
                             const auto metrics = current->retrieve();
+                            state.SetIterationTime(metrics.total_seconds);
+                            set_counters(state, metrics);
+                        }
+                    } catch (const std::exception& error) {
+                        benchmark_error = error.what();
+                        state.SkipWithError(benchmark_error.c_str());
+                    }
+                })
+                ->Iterations(1)
+                ->UseManualTime()
+                ->Unit(benchmark::kMillisecond);
+        }
+
+        std::unique_ptr<mssql::odbc::bench::ParameterArrayWriteRunner> write_runner;
+        if (config.scenario.empty() || config.scenario == "write") {
+            write_runner =
+                std::make_unique<mssql::odbc::bench::ParameterArrayWriteRunner>(
+                    session, config.write_mode);
+            write_runner->preflight();
+            auto* const current = write_runner.get();
+            benchmark::RegisterBenchmark(
+                current->name(),
+                [current, &benchmark_error](benchmark::State& state) {
+                    if (!benchmark_error.empty()) {
+                        state.SkipWithError(benchmark_error.c_str());
+                        return;
+                    }
+                    try {
+                        for (auto _ : state) {
+                            (void)_;
+                            const auto metrics = current->execute();
                             state.SetIterationTime(metrics.total_seconds);
                             set_counters(state, metrics);
                         }

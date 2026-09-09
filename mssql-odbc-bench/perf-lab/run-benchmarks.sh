@@ -32,7 +32,7 @@ SCIPY_VERSION="1.15.3"
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
 # new scenario needs no other change here.
-SCENARIOS=(narrow wide rowset varwidth getdata)
+SCENARIOS=(narrow wide rowset varwidth getdata write)
 
 BASELINE_TEMP_DIR=""
 BASELINE_TREE=""
@@ -439,6 +439,9 @@ fi
     echo "microsoft_driver_sha256=$MICROSOFT_DRIVER_SHA256"
     echo "packet_size=$ODBC_BENCH_PACKET_SIZE"
     echo "packet_size_verified_by_harness=true"
+    echo "write_candidate_mode=parameter_array"
+    echo "write_baseline_mode=sequential"
+    echo "write_reference_mode=parameter_array"
     echo "repetitions=$REPETITIONS"
     echo "regression_ratio=$REGRESSION_RATIO"
     echo "confirm_runs=$CONFIRM_RUNS"
@@ -468,12 +471,17 @@ run_leg() {
     local scenario="$1"
     local driver="$2"
     local output="$3"
-    echo ">>> Running $scenario with $driver..."
+    local write_mode=parameter_array
+    if [ "$scenario" = "write" ] && [ "$driver" = "$BASELINE_DRIVER_NAME" ]; then
+        write_mode=sequential
+    fi
+    echo ">>> Running $scenario with $driver (write mode: $write_mode)..."
     # Linux keeps the PacketSize spelling for every driver, including Microsoft
     # ODBC: on Linux that driver rejects "Packet Size" (01S00) and accepts
     # "PacketSize" (01S02). Windows uses the "Packet Size" spelling instead.
     ODBC_BENCH_DRIVER="$driver" \
         ODBC_BENCH_SCENARIO="$scenario" \
+        ODBC_BENCH_WRITE_MODE="$write_mode" \
         ODBC_BENCH_PACKET_SIZE_KEYWORD="PacketSize" \
         "${BENCH_PREFIX[@]}" "$BENCH_EXE" \
         "--benchmark_repetitions=$REPETITIONS" \

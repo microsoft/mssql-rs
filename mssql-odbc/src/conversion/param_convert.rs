@@ -149,11 +149,11 @@ impl ParamBuildError {
 /// # Safety
 /// See [`bound_param_to_value`].
 pub(crate) unsafe fn bound_param_to_rpc(
-    name: String,
+    name: Option<String>,
     param: &BoundParam,
 ) -> Result<RpcParameter, ParamBuildError> {
     let (value, type_metadata) = unsafe { bound_param_to_value(param) }?;
-    let parameter = RpcParameter::new(Some(name), StatusFlags::NONE, value);
+    let parameter = RpcParameter::new(name, StatusFlags::NONE, value);
     Ok(match type_metadata {
         Some(metadata) => parameter.with_type_metadata(metadata),
         None => parameter,

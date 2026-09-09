@@ -335,6 +335,16 @@ pub const SQL_PARAM_INPUT: SqlSmallInt = 1;
 pub const SQL_PARAM_INPUT_OUTPUT: SqlSmallInt = 2;
 pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
 
+// Parameter-array operation and status values.
+pub const SQL_PARAM_PROCEED: SqlUSmallInt = 0;
+pub const SQL_PARAM_IGNORE: SqlUSmallInt = 1;
+pub const SQL_PARAM_SUCCESS: SqlUSmallInt = 0;
+pub const SQL_PARAM_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
+pub const SQL_PARAM_ERROR: SqlUSmallInt = 5;
+pub const SQL_PARAM_UNUSED: SqlUSmallInt = 7;
+
+pub const SQL_NO_ROWCOUNT_TOTAL: i64 = -1;
+
 // Values of NULLABLE field in descriptor
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
 pub const SQL_NULLABLE: SqlSmallInt = 1;

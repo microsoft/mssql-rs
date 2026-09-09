@@ -846,6 +846,70 @@ source:
   the **current local date** and succeeds (`sqlccnvt.cpp:4776-4798`). Needs a
   platform-specific local-date helper, tracked by AB#47247.
   `ATimeOnlyLiteralAgainstATimestampTargetIs22018` carries the skip.
+## Parameter arrays (`executemany`)
+
+`SQL_ATTR_PARAMSET_SIZE > 1` on the prepared path executes the whole array as
+**one batched RPC request** rather than a loop of round trips. AB#47905 owns the
+ODBC side, AB#47907 the `mssql-tds` batching primitives. The attribute
+accept/store contract itself belongs to AB#46377 and is documented in
+[attributes_plan.md](attributes_plan.md).
+
+- **Batching.** One RPC per set in a single request, separated by
+  `RPC_BATCH_DELIMITER` (`0xff`), drained set by set (`execute_prepared_batch`,
+  `drain_prepared_batch`). 1000-row prepared `INSERT` over loopback: 21.2 ms
+  batched, 204.2 ms looped, 22.4 ms for msodbcsql.
+- **Binding.** Column-wise and row-wise (`SQL_ATTR_PARAM_BIND_TYPE`) layouts and
+  `SQL_ATTR_PARAM_BIND_OFFSET_PTR` are all honoured.
+- **Reporting.** `SQL_ATTR_PARAMS_PROCESSED_PTR` counts sets reached,
+  `SQL_ATTR_PARAM_STATUS_PTR` is pre-filled `SQL_PARAM_UNUSED` and written per
+  set, `SQL_ATTR_PARAM_OPERATION_PTR` skips a set marked `SQL_PARAM_IGNORE`, and
+  `SQLRowCount` sums the sets' affected rows, reporting
+  `SQL_NO_ROWCOUNT_TOTAL` only when no set produced a count.
+- **Failure handling.** A set that fails to build client-side does not abort the
+  batch - the request serializes as it streams, so earlier sets are already on
+  the wire. The return code is decided once, from one rule, whether the set
+  failed client-side or server-side: `SQL_SUCCESS_WITH_INFO` when a status array
+  is bound to carry the per-set detail, `SQL_ERROR` without one. There is no
+  all-failed special case - measured, msodbcsql still downgrades when every set
+  fails. Total *client-side* failure is `SQL_ERROR` on both drivers, because
+  nothing reaches the wire.
+
+### Divergences and limitations
+
+What each driver does, the measurements behind it, and the reasoning live on the
+work items. Not restated here.
+
+| # | case | this driver | work item |
+|---|---|---|---|
+| 1 | a set that fails **client-side** conversion | sets already serialized still commit and the call is partial success; msodbcsql materializes first, sends nothing, and reports total failure | AB#47945 |
+| 2 | `SQLExecDirect` with `PARAMSET_SIZE > 1` | `HYC00`, with or without markers | AB#47939 |
+| 3 | array over a **row-returning** statement | executes, discards the result sets | AB#47944 |
+| 4 | data-at-execution combined with an array | `HYC00` at execute | AB#47958 |
+| 5 | output / `InputOutput` parameters | refused at `SQLBindParameter` | driver-wide gap, not array-specific |
+| 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | AB#47790 |
+| 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | AB#47945 |
+
+Divergence 7 is new surface rather than new behaviour. ODBC defines
+`SQL_ATTR_PARAMSET_SIZE` as an alias for the APD header's
+`SQL_DESC_ARRAY_SIZE`, but the two have separate storage here:
+`set_stmt_attr.rs` writes `StmtState::paramset_size`, `set_desc_field.rs` writes
+the descriptor header, and `stage_execution` reads only the former. The split
+predates this work - the row-side attributes have the same shape - but it was
+harmless while `PARAMSET_SIZE > 1` was refused outright. Now the descriptor
+route is the one spelling that silently executes a single set, and
+`SQLGetDescField` and `SQLGetStmtAttr` can disagree about the same logical
+value.
+
+Only 1 is partly a decision: matching msodbcsql's "send nothing" needs a
+validation pre-pass over every set, costing the streaming serializer that buys
+the perf parity above. The *return code* is deliberately not copied -
+msodbcsql's `SQL_ERROR` is a total-failure code, correct there because nothing
+ran, and reporting it over committed rows would invite a retry that
+double-inserts. The rest are gaps.
+
+1-4 are pinned by `param_array_test.cpp` cases gated with
+`SKIP_IF_COMPARING_MSODBCSQL()`; 5 by
+`output_parameters_are_refused_before_the_array_path_sees_them`.
 
 ## Remaining work
 
@@ -866,8 +930,9 @@ source:
   the off-diagonal cross-product, together with the `HYC00` -> `07006` flip that
   depends on it - is P9 (AB#47790). `ColumnSize` still does not bound a
   data-at-execution value in either family (AB#47590).
-- **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`),
-  parameter arrays (`SQL_ATTR_PARAMSET_SIZE`), and TVPs.
+- **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`)
+  and TVPs. Parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented - see the
+  section above for the surface that is still missing.
 - **`mssql-tds` gap found by P8, closed by AB#47800:** a `sql_variant` could not
   carry a `varchar` payload - `get_variant_base_type` and
   `create_variant_inner_context` assumed every `ColumnValues::String` was

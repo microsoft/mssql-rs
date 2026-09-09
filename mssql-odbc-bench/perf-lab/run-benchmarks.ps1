@@ -370,9 +370,16 @@ function Invoke-BenchmarkLeg {
         [Parameter(Mandatory)][string]$Output
     )
 
-    Write-Host ">>> Running $Scenario with $Driver..."
     $env:ODBC_BENCH_DRIVER = $Driver
     $env:ODBC_BENCH_SCENARIO = $Scenario
+    $env:ODBC_BENCH_WRITE_MODE = if (
+        $Scenario -eq 'write' -and $Driver -eq $script:BaselineDriverName
+    ) {
+        'sequential'
+    } else {
+        'parameter_array'
+    }
+    Write-Host ">>> Running $Scenario with $Driver (write mode: $($env:ODBC_BENCH_WRITE_MODE))..."
     # Windows Microsoft ODBC accepts the spaced spelling; the Rust driver and the
     # Linux runner use PacketSize.
     $env:ODBC_BENCH_PACKET_SIZE_KEYWORD = if ($Driver -eq $script:MicrosoftDriverName) {
@@ -485,7 +492,7 @@ $HarnessBuildDir = Join-Path $RepoRoot 'target\odbc-bench'
 $CandidateTargetDir = Join-Path $RepoRoot 'target\odbc-candidate'
 $BaselineTargetDir = Join-Path $RepoRoot 'target\odbc-baseline'
 $CandidateDriverName = 'MSSQL Rust ODBC Perf Candidate'
-$BaselineDriverName = 'MSSQL Rust ODBC Perf Baseline'
+$script:BaselineDriverName = 'MSSQL Rust ODBC Perf Baseline'
 $script:MicrosoftDriverName = 'ODBC Driver 18 for SQL Server'
 $script:NumpyVersion = '2.2.6'
 $script:ScipyVersion = '1.15.3'
@@ -493,7 +500,7 @@ $script:ScipyVersion = '1.15.3'
 # Scenario catalog. The C++ harness filters its workloads by scenario, and every
 # downstream step - ordering, comparison, confirmation - iterates this list, so a
 # new scenario needs no other change here.
-$Scenarios = @('narrow', 'wide', 'rowset', 'varwidth', 'getdata')
+$Scenarios = @('narrow', 'wide', 'rowset', 'varwidth', 'getdata', 'write')
 $script:OdbcInstRoot = 'HKLM:\Software\ODBC\ODBCINST.INI'
 $script:DriversRegKey = "$script:OdbcInstRoot\ODBC Drivers"
 $script:Repetitions = Get-PositiveIntEnv -Name 'ODBC_BENCH_REPETITIONS' -Default 5
@@ -707,9 +714,9 @@ try {
     $CandidateState = Save-DriverRegistration -Name $CandidateDriverName
     $CandidateRegistrationAttempted = $true
     Set-DriverRegistration -Name $CandidateDriverName -DriverPath $CandidateDriver
-    $BaselineState = Save-DriverRegistration -Name $BaselineDriverName
+    $BaselineState = Save-DriverRegistration -Name $script:BaselineDriverName
     $BaselineRegistrationAttempted = $true
-    Set-DriverRegistration -Name $BaselineDriverName -DriverPath $BaselineDriver
+    Set-DriverRegistration -Name $script:BaselineDriverName -DriverPath $BaselineDriver
 
     $CandidateCommit = (Invoke-Native { git rev-parse HEAD } | Out-String).Trim()
     $RustcVersion = (Invoke-Native { rustc -Vv } | Out-String).TrimEnd()
@@ -724,6 +731,9 @@ try {
         "microsoft_driver_sha256=$MicrosoftDriverSha256",
         "packet_size=$($env:ODBC_BENCH_PACKET_SIZE)",
         "packet_size_verified_by_harness=true",
+        "write_candidate_mode=parameter_array",
+        "write_baseline_mode=sequential",
+        "write_reference_mode=parameter_array",
         "repetitions=$script:Repetitions",
         "regression_ratio=$(Format-Invariant $RegressionRatio 'F4')",
         "confirm_runs=$ConfirmRuns",
@@ -805,9 +815,9 @@ try {
         if ($index % 2 -eq 0) {
             Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $candidateFiles[$scenario]
             Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:MicrosoftDriverName -Output $microsoftFiles[$scenario]
-            Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $baselineFiles[$scenario]
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:BaselineDriverName -Output $baselineFiles[$scenario]
         } else {
-            Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $baselineFiles[$scenario]
+            Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:BaselineDriverName -Output $baselineFiles[$scenario]
             Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:MicrosoftDriverName -Output $microsoftFiles[$scenario]
             Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $candidateFiles[$scenario]
         }
@@ -879,9 +889,9 @@ try {
                 # stable position effect cancels across the default four rounds.
                 if ($round % 2 -eq 1) {
                     Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $roundCandidate
-                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $roundBaseline
+                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:BaselineDriverName -Output $roundBaseline
                 } else {
-                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $BaselineDriverName -Output $roundBaseline
+                    Invoke-BenchmarkLeg -Scenario $scenario -Driver $script:BaselineDriverName -Output $roundBaseline
                     Invoke-BenchmarkLeg -Scenario $scenario -Driver $CandidateDriverName -Output $roundCandidate
                 }
                 $roundArguments += @('--baseline', $roundBaseline, '--candidate', $roundCandidate)

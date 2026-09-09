@@ -9,17 +9,26 @@ use tracing::{debug, error};
 use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
-    ExecuteOptions, StatementId, StatementResult, StreamedParamStatus,
+    ExecuteOptions, PreparedBatchResult, StatementId, StatementResult, StreamedParamStatus,
 };
+use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, park_dae_client, query_timeout_expired_error, snapshot_bound_params,
+    ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
+    deduct_query_timeout, fail_with_tds, finish_execute, park_dae_client, publish_scalar_processed,
+    query_timeout_expired_error, return_client_idle, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn};
+use crate::api::odbc_types::{
+    SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
+    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE,
+    SQL_NO_ROWCOUNT_TOTAL, SQL_PARAM_ERROR, SQL_PARAM_IGNORE, SQL_PARAM_INPUT, SQL_PARAM_PROCEED,
+    SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn, SqlULen, SqlUSmallInt,
+};
+use crate::conversion::param_convert::is_data_at_exec_indicator;
 use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::{
@@ -98,9 +107,79 @@ struct DaeExecution {
     query_timeout: u32,
 }
 
+struct BatchExecution {
+    bound_params: Vec<Option<crate::params::BoundParam>>,
+    active_rows: Vec<usize>,
+    marker_count: usize,
+    bind_offset: isize,
+    param_bind_type: SqlULen,
+    outputs: ParamArrayOutputs,
+    prepared: PreparedPlan,
+    orphaned: Option<StatementId>,
+    query_timeout: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ParamArrayOutputs {
+    paramset_size: SqlULen,
+    param_status_ptr: *mut SqlUSmallInt,
+    params_processed_ptr: *mut SqlULen,
+}
+
 enum ExecutionStaging {
     Ready(Execution),
     NeedData(DaeExecution),
+    Batch(BatchExecution),
+}
+
+struct PreparedRows<'a> {
+    bound_params: &'a [Option<crate::params::BoundParam>],
+    active_rows: std::slice::Iter<'a, usize>,
+    marker_count: usize,
+    bind_offset: isize,
+    param_bind_type: SqlULen,
+    failures: Vec<(usize, DiagMsg)>,
+}
+
+impl Iterator for PreparedRows<'_> {
+    type Item = Result<(usize, Vec<RpcParameter>), TdsError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = *self.active_rows.next()?;
+        // Unnamed: every row of a batch serializes positionally, which writes a
+        // zero-length name and never reads `RpcParameter::name`. The @P{n} names
+        // the declaration needs are applied by `execute_prepared_batch`, which
+        // renames its own clone of the first row that builds.
+        let built = match unsafe {
+            build_named_params_for_row(
+                self.bound_params,
+                self.marker_count,
+                self.bind_offset,
+                self.param_bind_type,
+                row,
+                false,
+            )
+        } {
+            Ok(built) => built,
+            Err(error) => {
+                self.failures.push((row, error.diag()));
+                return Some(Err(TdsError::UsageError(format!(
+                    "Parameter-array row {} changed after validation: {}",
+                    row + 1,
+                    error.diag().text
+                ))));
+            }
+        };
+        if !built.dae_params.is_empty() {
+            self.failures
+                .push((row, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED));
+            return Some(Err(TdsError::UsageError(format!(
+                "Parameter-array row {} changed to data-at-execution after validation",
+                row + 1
+            ))));
+        }
+        Some(Ok((row, built.params)))
+    }
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
@@ -318,6 +397,262 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 }
             }
         }
+
+        ExecutionStaging::Batch(BatchExecution {
+            bound_params,
+            active_rows,
+            marker_count,
+            bind_offset,
+            param_bind_type,
+            outputs,
+            mut prepared,
+            mut orphaned,
+            query_timeout,
+        }) => {
+            if active_rows.is_empty() {
+                unsafe {
+                    write_params_processed(outputs.params_processed_ptr, outputs.paramset_size);
+                }
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.prepared = Some(prepared);
+                    stmt_state.pending_unprepare = orphaned;
+                    // No set ran, so there is no count at all.
+                    stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
+                    stmt_state.clear_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN);
+                    stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
+                }
+                return SQL_SUCCESS;
+            }
+
+            let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecute") {
+                Ok(client) => client,
+                Err(rc) => {
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    return rc;
+                }
+            };
+            let started = Instant::now();
+            if let Err(e) =
+                begin_transaction_if_manual(dbc, &mut client, "SQLExecute", query_timeout)
+            {
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.prepared = Some(prepared);
+                    stmt_state.pending_unprepare = orphaned;
+                }
+                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
+            }
+            let query_timeout = match deduct_query_timeout(query_timeout, started.elapsed()) {
+                Ok(remaining) => remaining,
+                Err(()) => {
+                    if let Ok(mut stmt_state) = stmt.inner.lock() {
+                        stmt_state.prepared = Some(prepared);
+                        stmt_state.pending_unprepare = orphaned;
+                    }
+                    return fail_with_tds(
+                        dbc,
+                        stmt,
+                        statement_handle,
+                        client,
+                        &query_timeout_expired_error(),
+                    );
+                }
+            };
+
+            let mut rows = PreparedRows {
+                bound_params: &bound_params,
+                active_rows: active_rows.iter(),
+                marker_count,
+                bind_offset,
+                param_bind_type,
+                failures: Vec::new(),
+            };
+            let batch_result = dbc.runtime.block_on(client.execute_prepared_batch(
+                &mut prepared.stmt,
+                &mut rows,
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ));
+            if let Ok(mut stmt_state) = stmt.inner.lock() {
+                stmt_state.prepared = Some(prepared);
+                stmt_state.pending_unprepare = orphaned;
+            }
+            // A row that fails to build is skipped by the writer rather than
+            // aborting the batch: the request is serialized as it streams, so
+            // the sets before the failure are already on the wire. msodbcsql
+            // materializes first and sends nothing (measured: 0 rows written),
+            // which is the one half of this divergence we keep - matching it
+            // would mean a validation pre-pass over every set and giving up the
+            // streaming serializer that buys the measured perf parity.
+            let failures = std::mem::take(&mut rows.failures);
+            let all_rows_failed = failures.len() == active_rows.len();
+            if !failures.is_empty() {
+                unsafe {
+                    for (row, _) in &failures {
+                        write_param_status(outputs.param_status_ptr, *row, SQL_PARAM_ERROR);
+                    }
+                }
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    for (_, diag) in &failures {
+                        post_diag(&mut stmt_state, *diag);
+                    }
+                }
+            }
+            if all_rows_failed {
+                // No set reached the wire, so nothing ran and nothing was
+                // written. The status array above already describes each set.
+                unsafe {
+                    write_params_processed(outputs.params_processed_ptr, outputs.paramset_size);
+                }
+                return_client_idle(dbc, statement_handle, client);
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+                }
+                return SQL_ERROR;
+            }
+
+            let result = match batch_result {
+                Ok(result) => result,
+                Err(error) => {
+                    error!(%error, "SQLExecute: parameter-array execution failed");
+                    return fail_with_tds(dbc, stmt, statement_handle, client, &error);
+                }
+            };
+            finish_parameter_array(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                result,
+                outputs,
+                failures.len(),
+            )
+        }
+    }
+}
+
+/// # Safety
+/// When non-null, `status_ptr` must point to an array containing `row`.
+unsafe fn write_param_status(status_ptr: *mut SqlUSmallInt, row: usize, status: SqlUSmallInt) {
+    if !status_ptr.is_null() {
+        unsafe { status_ptr.wrapping_add(row).write_unaligned(status) };
+    }
+}
+
+/// # Safety
+/// When non-null, `processed_ptr` must point to one writable `SqlULen`.
+unsafe fn write_params_processed(processed_ptr: *mut SqlULen, processed: SqlULen) {
+    if !processed_ptr.is_null() {
+        unsafe { processed_ptr.write_unaligned(processed) };
+    }
+}
+
+/// Reports a finished parameter array.
+///
+/// `client_side_failures` counts sets that never reached the wire because they
+/// could not be built. They are folded in with the sets the server rejected so
+/// the return code is decided once, from one rule, rather than by the caller
+/// second-guessing this function afterwards.
+fn finish_parameter_array(
+    dbc: &crate::handles::DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut client: mssql_tds::connection::tds_client::TdsClient,
+    result: PreparedBatchResult,
+    outputs: ParamArrayOutputs,
+    client_side_failures: usize,
+) -> SqlReturn {
+    let mut failed_sets = client_side_failures;
+    let mut had_info = false;
+    let total_rows = result
+        .total_rows_affected()
+        .unwrap_or(SQL_NO_ROWCOUNT_TOTAL);
+    let processed = if result.complete {
+        outputs.paramset_size
+    } else {
+        result
+            .rows
+            .last()
+            .map_or(0, |row| row.row_index.saturating_add(1))
+    };
+    let info_messages = client.take_info_messages();
+
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        return_client_idle(dbc, statement_handle, client);
+        return SQL_ERROR;
+    };
+    for row in result.rows {
+        // A set that returned rows still ran: the OUTPUT rows are dropped
+        // because one statement handle cannot hold N result sets (AB#47944),
+        // but reporting it SQL_PARAM_ERROR would invite a retry that
+        // double-inserts.
+        let status = if row.has_result_set && row.errors.is_empty() {
+            had_info = true;
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_01000,
+                0,
+                format!(
+                    "Parameter-array row {} produced a result set; its rows were discarded",
+                    row.row_index + 1
+                ),
+            );
+            SQL_PARAM_SUCCESS_WITH_INFO
+        } else if row.errors.is_empty() {
+            if row.has_info {
+                had_info = true;
+                SQL_PARAM_SUCCESS_WITH_INFO
+            } else {
+                SQL_PARAM_SUCCESS
+            }
+        } else {
+            failed_sets += 1;
+            post_tds_error(
+                &mut stmt_state,
+                &TdsError::from_sql_errors(row.errors),
+                SQLSTATE_HY000,
+            );
+            SQL_PARAM_ERROR
+        };
+        unsafe {
+            write_param_status(outputs.param_status_ptr, row.row_index, status);
+        }
+    }
+    post_tds_info_messages(&mut stmt_state, &info_messages);
+    stmt_state.row_count = total_rows;
+    stmt_state.clear_exhaustion_state();
+    stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
+    stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
+    drop(stmt_state);
+
+    unsafe {
+        write_params_processed(outputs.params_processed_ptr, processed);
+    }
+    return_client_idle(dbc, statement_handle, client);
+
+    // One rule, whether the set failed client-side before it reached the wire or
+    // server-side after: a status array can carry the per-set detail, so the
+    // call softens to SQL_SUCCESS_WITH_INFO; without one the caller cannot see
+    // which set failed, so it stays SQL_ERROR (msodbcsql, sqlctokn.cpp:2341-2360).
+    //
+    // There is deliberately no all-failed special case here. Measured on
+    // msodbcsql 18.6.2.1, a 3-set batch where every set violates a CHECK
+    // constraint returns SQL_SUCCESS_WITH_INFO with a status array bound, not
+    // SQL_ERROR - its downgrade has no such branch. Total *client-side* failure
+    // is still SQL_ERROR, but that is decided by the caller, because nothing
+    // reached the wire and no set ran.
+    if failed_sets > 0 {
+        if outputs.param_status_ptr.is_null() {
+            SQL_ERROR
+        } else {
+            SQL_SUCCESS_WITH_INFO
+        }
+    } else if had_info || !info_messages.is_empty() {
+        SQL_SUCCESS_WITH_INFO
+    } else {
+        SQL_SUCCESS
     }
 }
 
@@ -403,8 +738,138 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     // sequence it opens will read for the rest of this execute.
     stmt_state.bound_params = bound_params;
 
+    if stmt_state.paramset_size > 1 {
+        let paramset_size = stmt_state.paramset_size;
+        let row_count = paramset_size;
+        let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+        let param_bind_type = stmt_state
+            .inert_attrs
+            .get(SQL_ATTR_PARAM_BIND_TYPE)
+            .unwrap_or(SQL_BIND_BY_COLUMN);
+        let operation_ptr = stmt_state
+            .inert_attrs
+            .get(SQL_ATTR_PARAM_OPERATION_PTR)
+            .unwrap_or(0) as *const SqlUSmallInt;
+        let param_status_ptr = stmt_state
+            .inert_attrs
+            .get(SQL_ATTR_PARAM_STATUS_PTR)
+            .unwrap_or(0) as *mut SqlUSmallInt;
+        let params_processed_ptr = stmt_state
+            .inert_attrs
+            .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
+            .unwrap_or(0) as *mut SqlULen;
+
+        for parameter in 0..marker_count {
+            let Some(Some(bound)) = stmt_state.bound_params.get(parameter) else {
+                post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
+                return Err(SQL_ERROR);
+            };
+            if bound.input_output_type != SQL_PARAM_INPUT {
+                post_sql_error(
+                    &mut stmt_state,
+                    SQLSTATE_HYC00,
+                    0,
+                    "Parameter arrays currently support input-only parameters",
+                );
+                return Err(SQL_ERROR);
+            }
+        }
+
+        unsafe {
+            write_params_processed(params_processed_ptr, 0);
+            for row in 0..row_count {
+                write_param_status(param_status_ptr, row, SQL_PARAM_UNUSED);
+            }
+        }
+
+        let mut active_rows = Vec::with_capacity(row_count);
+        for row in 0..row_count {
+            let operation = if operation_ptr.is_null() {
+                SQL_PARAM_PROCEED
+            } else {
+                unsafe { operation_ptr.wrapping_add(row).read_unaligned() }
+            };
+            // Only SQL_PARAM_IGNORE skips a set; every other value proceeds,
+            // matching msodbcsql (sqlccmd.cpp:3218, :6605, sqlctokn.cpp:2396).
+            if operation == SQL_PARAM_IGNORE {
+                continue;
+            }
+
+            for parameter in 0..marker_count {
+                let bound = stmt_state
+                    .bound_params
+                    .get(parameter)
+                    .and_then(Option::as_ref)
+                    .copied()
+                    .ok_or_else(|| {
+                        post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
+                        SQL_ERROR
+                    })?;
+                let positioned = match bound.for_row(row, bind_offset, param_bind_type) {
+                    Ok(positioned) => positioned,
+                    Err(_) => {
+                        unsafe {
+                            write_param_status(param_status_ptr, row, SQL_PARAM_ERROR);
+                            write_params_processed(params_processed_ptr, row + 1);
+                        }
+                        post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                        return Err(SQL_ERROR);
+                    }
+                };
+                let dae = !positioned.octet_length_ptr.is_null()
+                    && is_data_at_exec_indicator(unsafe {
+                        positioned.octet_length_ptr.read_unaligned()
+                    });
+                if dae {
+                    unsafe {
+                        write_param_status(param_status_ptr, row, SQL_PARAM_ERROR);
+                        write_params_processed(params_processed_ptr, row + 1);
+                    }
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HYC00,
+                        0,
+                        "Data-at-execution parameters are not supported in parameter arrays",
+                    );
+                    return Err(SQL_ERROR);
+                }
+            }
+            active_rows.push(row);
+        }
+
+        let Some(prepared) = stmt_state.prepared.take() else {
+            error!("SQLExecute: prepared plan disappeared during array staging");
+            post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+            return Err(SQL_ERROR);
+        };
+        let orphaned = stmt_state.pending_unprepare.take();
+        let query_timeout = stmt_state.query_timeout;
+        stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+        stmt_state.clear_result_metadata();
+        stmt_state.reset_row_stream();
+        stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
+        stmt_state.pending_row_counts.clear();
+        stmt_state.set_state(STMT_STATE_EXEC_STARTED);
+        return Ok(ExecutionStaging::Batch(BatchExecution {
+            bound_params: std::mem::take(&mut stmt_state.bound_params),
+            active_rows,
+            marker_count,
+            bind_offset,
+            param_bind_type,
+            outputs: ParamArrayOutputs {
+                paramset_size,
+                param_status_ptr,
+                params_processed_ptr,
+            },
+            prepared,
+            orphaned,
+            query_timeout,
+        }));
+    }
+
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
+    publish_scalar_processed(&stmt_state);
     let ParamsWithDae { params, dae_params } =
         unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
@@ -419,7 +884,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
     stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
-    stmt_state.row_count = -1;
+    stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
     stmt_state.pending_row_counts.clear();
     stmt_state.set_state(STMT_STATE_EXEC_STARTED);
 
@@ -446,8 +911,11 @@ mod tests {
     use super::*;
     use crate::api::bind_param::sql_bind_parameter;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_NULL_HANDLE, SQL_PARAM_INPUT, SQL_SUCCESS, SQL_VARCHAR,
-        SqlLen,
+        SQL_ATTR_PARAM_BIND_TYPE, SQL_ATTR_PARAM_OPERATION_PTR, SQL_ATTR_PARAM_STATUS_PTR,
+        SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG,
+        SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NULL_HANDLE, SQL_PARAM_ERROR, SQL_PARAM_IGNORE,
+        SQL_PARAM_INPUT, SQL_PARAM_OUTPUT, SQL_PARAM_PROCEED, SQL_PARAM_UNUSED, SQL_SUCCESS,
+        SQL_VARCHAR, SqlLen, SqlULen,
     };
     use crate::api::util::rewrite_param_markers;
     use crate::handles::DescHandle;
@@ -633,6 +1101,7 @@ mod tests {
         let (exec_prepared_sql, exec_orphaned) = match staging {
             ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
             ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+            ExecutionStaging::Batch(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
         };
         assert_eq!(exec_orphaned, Some(orphan));
         assert_eq!(exec_prepared_sql, "SELECT 1");
@@ -655,6 +1124,7 @@ mod tests {
         let (exec_prepared_sql, exec_orphaned) = match staging {
             ExecutionStaging::Ready(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
             ExecutionStaging::NeedData(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
+            ExecutionStaging::Batch(e) => (e.prepared.stmt.sql().to_string(), e.orphaned),
         };
         assert_eq!(exec_orphaned, None);
         assert_eq!(exec_prepared_sql, "SELECT 1");
@@ -676,6 +1146,7 @@ mod tests {
         let query_timeout = match staging {
             ExecutionStaging::Ready(e) => e.query_timeout,
             ExecutionStaging::NeedData(e) => e.query_timeout,
+            ExecutionStaging::Batch(e) => e.query_timeout,
         };
         assert_eq!(query_timeout, 42);
     }
@@ -693,8 +1164,411 @@ mod tests {
         let query_timeout = match staging {
             ExecutionStaging::Ready(e) => e.query_timeout,
             ExecutionStaging::NeedData(e) => e.query_timeout,
+            ExecutionStaging::Batch(e) => e.query_timeout,
         };
         assert_eq!(query_timeout, 0);
+    }
+
+    #[test]
+    fn stage_parameter_array_preserves_original_indices_and_ignore_rows() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let mut values = [10i32, 20, 30];
+        let mut indicators = [size_of::<i32>() as SqlLen; 3];
+        let mut operations = [SQL_PARAM_PROCEED, SQL_PARAM_IGNORE, SQL_PARAM_PROCEED];
+        let mut statuses = [99 as SqlUSmallInt; 3];
+        let mut processed: SqlULen = 99;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    values.as_mut_ptr().cast(),
+                    size_of::<i32>() as SqlLen,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 3;
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAM_OPERATION_PTR,
+                operations.as_mut_ptr() as SqlULen,
+            );
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAMS_PROCESSED_PTR,
+                (&raw mut processed) as SqlULen,
+            );
+        }
+
+        let ExecutionStaging::Batch(batch) =
+            stage_execution(stmt).expect("array staging should succeed")
+        else {
+            panic!("expected array staging");
+        };
+        assert_eq!(batch.active_rows, vec![0, 2]);
+        assert_eq!(statuses, [SQL_PARAM_UNUSED; 3]);
+        assert_eq!(processed, 0);
+
+        let rows = PreparedRows {
+            bound_params: &batch.bound_params,
+            active_rows: batch.active_rows.iter(),
+            marker_count: batch.marker_count,
+            bind_offset: batch.bind_offset,
+            param_bind_type: batch.param_bind_type,
+            failures: Vec::new(),
+        }
+        .collect::<Result<Vec<_>, _>>()
+        .expect("validated parameter rows should build again");
+        assert_eq!(
+            rows.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    /// Stages four good rows, then invalidates some the way an application can
+    /// between validation and execution - the only way a row still fails once
+    /// the batch is under way.
+    fn stage_three_rows(
+        h: &TestHandles,
+        values: &mut [i32; 4],
+        indicators: &mut [SqlLen; 4],
+        statuses: &mut [SqlUSmallInt; 4],
+        processed: &mut SqlULen,
+    ) -> BatchExecution {
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    values.as_mut_ptr().cast(),
+                    size_of::<i32>() as SqlLen,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 4;
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAMS_PROCESSED_PTR,
+                (&raw mut *processed) as SqlULen,
+            );
+        }
+        let ExecutionStaging::Batch(batch) =
+            stage_execution(stmt).expect("array staging should succeed")
+        else {
+            panic!("expected array staging");
+        };
+        batch
+    }
+
+    #[test]
+    fn prepared_rows_skips_a_failing_row_and_keeps_building_the_rest() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut values = [10i32, 20, 30, 40];
+        let mut indicators = [size_of::<i32>() as SqlLen; 4];
+        let mut statuses = [99 as SqlUSmallInt; 4];
+        let mut processed: SqlULen = 99;
+        let batch = stage_three_rows(
+            &h,
+            &mut values,
+            &mut indicators,
+            &mut statuses,
+            &mut processed,
+        );
+
+        // Written through the pointer the binding captured, which is how the
+        // driver reads it back.
+        unsafe { indicators.as_mut_ptr().add(1).write(SQL_DATA_AT_EXEC) };
+        unsafe { indicators.as_mut_ptr().add(3).write(SQL_DATA_AT_EXEC) };
+
+        let mut rows = PreparedRows {
+            bound_params: &batch.bound_params,
+            active_rows: batch.active_rows.iter(),
+            marker_count: batch.marker_count,
+            bind_offset: batch.bind_offset,
+            param_bind_type: batch.param_bind_type,
+            failures: Vec::new(),
+        };
+        let built = rows.by_ref().collect::<Vec<_>>();
+
+        assert_eq!(built.len(), 4);
+        assert!(built[0].is_ok());
+        assert!(built[1].is_err());
+        assert!(
+            built[2].is_ok(),
+            "a row that fails to build must not stop the rows after it"
+        );
+        assert!(built[3].is_err());
+        assert_eq!(
+            rows.failures
+                .iter()
+                .map(|(row, _)| *row)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "every failing row has to be reportable, not just one of them"
+        );
+    }
+
+    #[test]
+    fn stage_parameter_array_rejects_data_at_execution_before_io() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let mut token = 0u8;
+        let mut indicators = [SQL_DATA_AT_EXEC; 2];
+        let mut statuses = [SQL_PARAM_UNUSED; 2];
+        let mut processed: SqlULen = 0;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_VARCHAR,
+                    0,
+                    0,
+                    (&raw mut token).cast(),
+                    0,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 2;
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAMS_PROCESSED_PTR,
+                (&raw mut processed) as SqlULen,
+            );
+        }
+
+        assert!(stage_execution(stmt).is_err());
+        assert_eq!(statuses[0], SQL_PARAM_ERROR);
+        assert_eq!(statuses[1], SQL_PARAM_UNUSED);
+        assert_eq!(processed, 1);
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_HYC00
+        );
+    }
+
+    /// Output parameters are refused by `SQLBindParameter` itself, so nothing
+    /// non-input ever reaches `bound_params` and the array path's own
+    /// input-only guard is unreachable. Pins that, so the guard is not mistaken
+    /// for an array-specific deviation (AB#47945).
+    #[test]
+    fn output_parameters_are_refused_before_the_array_path_sees_them() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let mut values = [1i32, 2];
+        let mut indicators = [size_of::<i32>() as SqlLen; 2];
+        let rc = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_OUTPUT,
+                SQL_C_SLONG,
+                SQL_INTEGER,
+                0,
+                0,
+                values.as_mut_ptr().cast(),
+                size_of::<i32>() as SqlLen,
+                indicators.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(rc, SQL_ERROR, "binding an output parameter must fail");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_HYC00
+        );
+        stmt.inner.lock().unwrap().paramset_size = 2;
+        // The marker is still unbound, so staging stops at 07002 - it never
+        // reaches the input-only check.
+        assert!(stage_execution(stmt).is_err());
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            SQLSTATE_07002
+        );
+    }
+
+    /// Only `SQL_PARAM_IGNORE` skips a set. msodbcsql tests for that one value
+    /// and lets every other bit pattern proceed (`sqlccmd.cpp:3218`); measured
+    /// against msodbcsql 18, an operation value of 7 inserts all three sets.
+    #[test]
+    fn stage_parameter_array_proceeds_on_an_unknown_operation_value() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let mut values = [1i32, 2, 3];
+        let mut indicators = [size_of::<i32>() as SqlLen; 3];
+        let mut operations = [SQL_PARAM_PROCEED, 42 as SqlUSmallInt, SQL_PARAM_PROCEED];
+        let mut statuses = [0xFFFF as SqlUSmallInt; 3];
+        let mut processed: SqlULen = 0xDEAD;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    values.as_mut_ptr().cast(),
+                    size_of::<i32>() as SqlLen,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 3;
+            state.inert_attrs.set(
+                SQL_ATTR_PARAM_OPERATION_PTR,
+                operations.as_mut_ptr() as SqlULen,
+            );
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAMS_PROCESSED_PTR,
+                (&raw mut processed) as SqlULen,
+            );
+        }
+
+        let ExecutionStaging::Batch(batch) =
+            stage_execution(stmt).expect("an unknown operation value must not fail")
+        else {
+            panic!("expected array staging");
+        };
+        assert_eq!(
+            batch.active_rows,
+            vec![0, 1, 2],
+            "7 is not SQL_PARAM_IGNORE, so every set runs"
+        );
+        assert_eq!(
+            statuses, [SQL_PARAM_UNUSED; 3],
+            "staging prefills the status array and must not mark the set in error"
+        );
+        assert_eq!(processed, 0, "nothing has run yet");
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    /// The unknown-value acceptance above sits in the same loop as the
+    /// `SQL_PARAM_IGNORE` skip. Pins that only the validation was removed and
+    /// the skip still applies when both appear in one operation array.
+    #[test]
+    fn stage_parameter_array_still_skips_ignore_beside_an_unknown_value() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let mut values = [1i32, 2, 3];
+        let mut indicators = [size_of::<i32>() as SqlLen; 3];
+        let mut operations = [SQL_PARAM_IGNORE, 7 as SqlUSmallInt, SQL_PARAM_PROCEED];
+        let mut statuses = [0xFFFF as SqlUSmallInt; 3];
+        let mut processed: SqlULen = 0xDEAD;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    values.as_mut_ptr().cast(),
+                    size_of::<i32>() as SqlLen,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 3;
+            state.inert_attrs.set(
+                SQL_ATTR_PARAM_OPERATION_PTR,
+                operations.as_mut_ptr() as SqlULen,
+            );
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAMS_PROCESSED_PTR,
+                (&raw mut processed) as SqlULen,
+            );
+        }
+
+        let ExecutionStaging::Batch(batch) =
+            stage_execution(stmt).expect("array staging should succeed")
+        else {
+            panic!("expected array staging");
+        };
+        assert_eq!(
+            batch.active_rows,
+            vec![1, 2],
+            "only SQL_PARAM_IGNORE skips; the unknown value runs"
+        );
+        assert_eq!(
+            statuses, [SQL_PARAM_UNUSED; 3],
+            "staging prefills the status array and marks nothing in error"
+        );
+        assert_eq!(processed, 0, "nothing has run yet");
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+    }
+
+    /// A marker with no binding is 07002 on the array path too, and must be
+    /// caught before any set is sent.
+    #[test]
+    fn stage_parameter_array_rejects_an_unbound_marker() {
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().paramset_size = 2;
+
+        assert!(stage_execution(stmt).is_err());
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_07002);
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
     /// `SQL_ATTR_QUERY_TIMEOUT` must actually bound the wait for a response,
@@ -837,7 +1711,9 @@ mod tests {
                 );
                 assert_eq!(dae.params.len(), 1, "one param in list");
             }
-            ExecutionStaging::Ready(_) => panic!("expected NeedData staging for DAE param"),
+            ExecutionStaging::Ready(_) | ExecutionStaging::Batch(_) => {
+                panic!("expected NeedData staging for DAE param")
+            }
         }
     }
 }
