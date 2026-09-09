@@ -82,12 +82,12 @@ function Set-MssqlTdsDependencyVersion {
     )
 
     $pattern = [regex]'(?m)^(?<prefix>\s*mssql-tds\s*=\s*\{[^\r\n}]*?\bversion\s*=\s*)"[^"]+"(?<suffix>[^\r\n}]*\}\s*)$'
-    $matches = $pattern.Matches($Content)
-    if ($matches.Count -ne 1) {
-        throw "Expected one versioned mssql-tds dependency in ${Path}, found $($matches.Count)"
+    $depMatches = $pattern.Matches($Content)
+    if ($depMatches.Count -ne 1) {
+        throw "Expected one versioned mssql-tds dependency in ${Path}, found $($depMatches.Count)"
     }
 
-    $match = $matches[0]
+    $match = $depMatches[0]
     $replacement = $match.Groups['prefix'].Value + "`"$Version`"" + $match.Groups['suffix'].Value
     return $Content.Substring(0, $match.Index) +
         $replacement +

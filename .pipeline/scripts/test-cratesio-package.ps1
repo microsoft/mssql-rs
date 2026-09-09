@@ -27,7 +27,12 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $response = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck -TimeoutSec 30
     }
     catch {
-        throw "Failed to query crates.io for ${CrateName}@${Version}: $($_.Exception.Message)"
+        if ($ExpectedState -eq 'Absent' -or $attempt -eq $MaxAttempts) {
+            throw "Failed to query crates.io for ${CrateName}@${Version}: $($_.Exception.Message)"
+        }
+        Write-Host "Transient crates.io request failure: $($_.Exception.Message)"
+        Start-Sleep -Seconds $DelaySeconds
+        continue
     }
 
     $statusCode = [int]$response.StatusCode
@@ -46,12 +51,17 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Write-Host "$CrateName@$Version is available on crates.io."
         return
     }
-    if ($statusCode -ne 404) {
+    if ($statusCode -ne 404 -and $statusCode -ne 429 -and $statusCode -lt 500) {
         throw "crates.io returned HTTP $statusCode for $uri"
     }
 
     if ($attempt -lt $MaxAttempts) {
-        Write-Host "Waiting for $CrateName@$Version on crates.io ($attempt/$MaxAttempts)..."
+        if ($statusCode -eq 404) {
+            Write-Host "Waiting for $CrateName@$Version on crates.io ($attempt/$MaxAttempts)..."
+        }
+        else {
+            Write-Host "Transient HTTP $statusCode from crates.io; retrying ($attempt/$MaxAttempts)..."
+        }
         Start-Sleep -Seconds $DelaySeconds
     }
 }

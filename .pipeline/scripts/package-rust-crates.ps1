@@ -32,16 +32,17 @@ $manifestEntries = @()
 Push-Location $RepositoryRoot
 try {
     foreach ($crateName in $crateNames) {
-        # The dependent crate cannot be verified until mssql-tds reaches crates.io.
-        # Workspace validation runs separately, so package without a generated lockfile.
         $arguments = @(
             'package'
             '--package', $crateName
-            '--no-verify'
             '--allow-dirty'
             '--exclude-lockfile'
             '--target-dir', $TargetDirectory
         )
+        if ($crateName -eq 'mssql-mock-tds') {
+            # Verification requires its mssql-tds version to exist on crates.io.
+            $arguments += '--no-verify'
+        }
 
         & cargo @arguments
         if ($LASTEXITCODE -ne 0) {

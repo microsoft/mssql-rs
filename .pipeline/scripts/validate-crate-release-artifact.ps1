@@ -67,6 +67,39 @@ for ($index = 0; $index -lt $expectedNames.Count; $index++) {
     }
     $expectedFiles += $cratePath
 
+    if ($expectedName -eq 'mssql-mock-tds') {
+        $packagedManifestPath = "$expectedName-$($entry.version)/Cargo.toml"
+        $packagedManifest = (& tar -xOf $cratePath $packagedManifestPath) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not read $packagedManifestPath from $expectedFileName"
+        }
+
+        $dependency = [regex]::Match(
+            $packagedManifest,
+            '(?ms)^\[dependencies\.mssql-tds\]\s*$(?<body>.*?)(?=^\[|\z)'
+        )
+        if (-not $dependency.Success) {
+            throw "$expectedFileName has no mssql-tds dependency"
+        }
+
+        $dependencyVersion = [regex]::Match(
+            $dependency.Groups['body'].Value,
+            '(?m)^\s*version\s*=\s*"([^"]+)"'
+        )
+        if (-not $dependencyVersion.Success -or $dependencyVersion.Groups[1].Value -ne $entry.version) {
+            $actualVersion = if ($dependencyVersion.Success) {
+                $dependencyVersion.Groups[1].Value
+            }
+            else {
+                '<missing>'
+            }
+            throw "$expectedFileName records mssql-tds dependency version '$actualVersion', expected '$($entry.version)'"
+        }
+        if ($dependency.Groups['body'].Value -match '(?m)^\s*(path|registry|registry-index)\s*=') {
+            throw "$expectedFileName does not resolve mssql-tds from crates.io"
+        }
+    }
+
     $variableName = if ($expectedName -eq 'mssql-tds') {
         'mssqlTdsCrateVersion'
     }
