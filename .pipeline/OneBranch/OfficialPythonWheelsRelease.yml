@@ -329,7 +329,7 @@ extends:
     ###########################################################################
     # Stage 3: Tag the source commit and create release branch
     ###########################################################################
-    - ${{ if eq(parameters.tagRelease, true) }}:
+    - ${{ if and(eq(parameters.tagRelease, true), ne(parameters.validateCratesOnly, true)) }}:
       - stage: Tag
         displayName: 'Tag Release and Create Branch'
         ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true)) }}:
