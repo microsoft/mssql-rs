@@ -20,6 +20,7 @@ use crate::error::{DiagRecord, HasDiagnostics};
 use crate::params::BoundParam;
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
+use mssql_tds::encoding_rs;
 use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
 
@@ -41,11 +42,19 @@ pub(crate) struct ActivePlpStream {
     /// UTF-16 surrogate pair becomes a 4-byte UTF-8 character, so a chunk is
     /// transcoded whole and only the bytes that fit are copied out.
     pub(crate) pending_utf8: Vec<u8>,
-    /// Incremental decoder for a narrow-text PLP column that has to be
-    /// converted on the way out: to UTF-16LE for `SQL_C_WCHAR`
-    /// (`varchar(max)`/`json`), or to UTF-8 for `SQL_C_CHAR` under a non-UTF-8
-    /// collation (AB#47566). `None` when the wire bytes are already in the
-    /// target's encoding and can be copied verbatim.
+    /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
+    /// `json`, which carries none), or `None` when the column is not narrow
+    /// text. This is a property of the *column*, so a target type that arrives
+    /// only on a continuation call still finds it — unlike a decoder built from
+    /// the first call's target, which would leave a `SQL_C_BINARY`-first stream
+    /// unable to convert later.
+    pub(crate) narrow_encoding: Option<&'static encoding_rs::Encoding>,
+    /// Incremental decoder over `narrow_encoding`, built by
+    /// [`Self::ensure_narrow_decoder`] the first time a target actually needs to
+    /// convert. Serves both directions: to UTF-16LE for `SQL_C_WCHAR`
+    /// (`varchar(max)`/`json`) and to UTF-8 for `SQL_C_CHAR` under a non-UTF-8
+    /// collation (AB#47566). One decoder for both, so a target switch mid-stream
+    /// reuses a carry that is still meaningful.
     ///
     /// A decoder rather than a byte carry because the column's codepage can be
     /// multi-byte (`lcid_to_encoding` reaches SHIFT_JIS, GBK, BIG5, EUC-KR and
@@ -92,7 +101,7 @@ impl ActivePlpStream {
     pub(crate) fn new(
         column: usize,
         encoding: PlpEncoding,
-        narrow_decoder: Option<Decoder>,
+        narrow_encoding: Option<&'static encoding_rs::Encoding>,
     ) -> Self {
         Self {
             column,
@@ -100,7 +109,8 @@ impl ActivePlpStream {
             pending_byte: None,
             pending_high_surrogate: None,
             pending_utf8: Vec::new(),
-            narrow_decoder,
+            narrow_encoding,
+            narrow_decoder: None,
             pending_units: Vec::new(),
             prefetched_wire: Vec::new(),
             prefetched_offset: 0,
@@ -108,6 +118,21 @@ impl ActivePlpStream {
             prefetched_known_total: None,
             prefetched_reached_end: false,
             prefetch_error: None,
+        }
+    }
+
+    /// Builds the narrow decoder if this column has an encoding and no decoder
+    /// yet, so a caller can then take it by field alongside the carry buffers.
+    ///
+    /// Deferred to first use rather than built in `new` because the first
+    /// `SQLGetData` on a column may ask for `SQL_C_BINARY`, which needs no
+    /// decoder; a later call on the same stream may still ask for `SQL_C_CHAR`,
+    /// which does.
+    pub(crate) fn ensure_narrow_decoder(&mut self) {
+        if self.narrow_decoder.is_none()
+            && let Some(encoding) = self.narrow_encoding
+        {
+            self.narrow_decoder = Some(encoding.new_decoder_without_bom_handling());
         }
     }
 

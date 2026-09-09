@@ -857,16 +857,21 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
 // carry a character split across a wire chunk boundary; without the carry each
 // half becomes U+FFFD and the slot fills with replacement characters.
 //
-// Skipped on the msodbcsql leg for the same reason its SQLGetData twin is:
-// msodbcsql on Linux converts through the client locale and best-fits every CJK
-// character to '?' under a UTF-8 locale.
+// The token is 11 wire bytes (four GBK characters plus "abc"), deliberately
+// coprime with the 8 KiB PLP_BOUND_CHUNK: an 8-byte token would put every
+// power-of-two read exactly on a character boundary and the carry this test is
+// named for would never be exercised.
+//
+// The msodbcsql leg is measured rather than skipped, per
+// .github/instructions/mssql-odbc.instructions.md: a skip must be backed by a
+// compare run that actually fails. If this leg diverges, record the observed
+// build and result here and reinstate SKIP_IF_COMPARING_MSODBCSQL().
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunks) {
-    SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) + NCHAR(0x754C) "
-        "COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 3000) AS c1");
+        "+ N'abc' COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 3000) AS c1");
 
-    // 3000 repetitions of 4 CJK characters: 24000 wire bytes, 36000 UTF-8.
+    // 3000 repetitions of 11 wire bytes: 33,000 on the wire, 39,000 as UTF-8.
     std::vector<SQLCHAR> buf(64 * 1024, 0);
     SQLLEN ind = 0;
     ASSERT_SQL_OK(
@@ -874,7 +879,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
 
-    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C";  // 你好世界
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+                              "abc";  // 你好世界abc
     std::string expected;
     expected.reserve(token.size() * 3000);
     for (int i = 0; i < 3000; ++i) {
@@ -887,11 +893,16 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
     SQLCloseCursor(stmt_);
 }
 
-// A slot too small for the converted value truncates on a character boundary
-// and reports SQL_NO_TOTAL: once the bytes are transcoded the wire length is
-// the wrong unit, so it cannot be reported as the remaining count.
-TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharReportsNoTotal) {
-    SKIP_IF_COMPARING_MSODBCSQL();  // asserts UTF-8; see AB#47564 above
+// A slot too small for the converted value truncates on a character boundary.
+// The indicator stays a concrete wire-byte count: msodbcsql keys it on the C
+// types, and `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a 1:1 conversion
+// ratio" branch, so converting through the collation does not make the value
+// unmeasurable. 5,000 CP1252 characters are 5,000 wire bytes.
+//
+// Unskipped on the msodbcsql leg deliberately. Both the UTF-8 payload and the
+// 1:1 indicator are claims of agreement between the two drivers, so this test
+// only earns its keep by being measured against both.
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), "
         "5000) AS c1");
@@ -903,7 +914,7 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharReportsNoTotal) {
                   stmt_);
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
-    EXPECT_EQ(SQL_NO_TOTAL, ind) << "the converted UTF-8 length is not known while streaming";
+    EXPECT_EQ(5000, ind) << "CHAR->CHAR keeps the 1:1 wire-byte estimate";
     EXPECT_STREQ("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", reinterpret_cast<const char*>(buf));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);

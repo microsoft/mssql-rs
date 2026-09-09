@@ -1134,12 +1134,12 @@ TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip) {
 // buffer sized to make the driver read an odd number of wire bytes splits one
 // across most calls. Each half must be rejoined rather than become U+FFFD.
 //
-// Skipped on the msodbcsql leg for the same reason its SQL_C_WCHAR twin is:
-// msodbcsql on Linux converts through the client locale, which under a UTF-8
-// locale best-fits every CJK character to '?'. The disagreement is about the
-// conversion, not the chunking.
+// The msodbcsql leg is measured rather than skipped: the SQL_C_WCHAR twin's
+// documented '?' best-fit divergence was measured for a different conversion,
+// and .github/instructions/mssql-odbc.instructions.md requires a skip to be
+// backed by a compare run that actually fails. If this leg diverges, record the
+// observed build and result here and reinstate SKIP_IF_COMPARING_MSODBCSQL().
 TEST_F(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks) {
-    SKIP_IF_COMPARING_MSODBCSQL();
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
                               "abc";  // 你好世界abc
     const std::string expected = RepeatToken(token, 400);
@@ -1196,6 +1196,34 @@ TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted) {
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
 
     EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 30));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A stream opened by a SQL_C_BINARY read must still convert when a later call
+// asks for SQL_C_CHAR. Keying the decoder on the first call's target type left
+// `narrow_decoder` unset here, and the SQL_C_CHAR continuation then fell through
+// to the verbatim copy — handing back the raw CP1252 bytes this PR exists to
+// eliminate. The encoding is a property of the column, so readiness must not
+// depend on call history.
+TEST_F(GetDataLiveTest, VarcharMaxBinaryFirstStillConvertsOnLaterCharRead) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' ' "
+                   "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Zero-length SQL_C_BINARY length probe: opens the stream without asking for
+    // any conversion, exactly as mssql-python does per column.
+    SQLLEN ind = 0;
+    SQLGetData(stmt_, 1, SQL_C_BINARY, nullptr, 0, &ind);
+
+    // The same column, now as text: must be UTF-8, not raw CP1252.
+    const std::string got = ReadCharDataInChunks(stmt_, 1, 64);
+    EXPECT_NE(std::string::npos, got.find("caf\xC3\xA9"))
+        << "SQL_C_CHAR after a binary probe must still decode through the collation";
+    EXPECT_EQ(std::string::npos, got.find('\xE9'))
+        << "a raw CP1252 byte means the conversion was skipped";
 
     SQLCloseCursor(stmt_);
 }

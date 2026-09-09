@@ -226,7 +226,7 @@ fn sql_get_data_safe(
             active_plp.encoding,
             active_plp.pending_units.len(),
             active_plp.pending_utf8.len(),
-            active_plp.narrow_decoder.is_some(),
+            active_plp.narrow_encoding,
         );
         return stream_active_plp_chunk(
             stmt,
@@ -1627,7 +1627,12 @@ fn stream_active_plp_chunk<'a>(
     buffer_length: SqlLen,
     strlen_or_ind_ptr: *mut SqlLen,
     starting_new_stream: bool,
-    prepared_stream: Option<(PlpEncoding, usize, usize, bool)>,
+    prepared_stream: Option<(
+        PlpEncoding,
+        usize,
+        usize,
+        Option<&'static encoding_rs::Encoding>,
+    )>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
     if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR && target_type != SQL_C_BINARY {
@@ -1649,8 +1654,10 @@ fn stream_active_plp_chunk<'a>(
         return SQL_ERROR;
     }
 
-    let (plp_encoding, widen_carry_len, utf8_carry_len, decoder_ready) =
-        if let Some((encoding, widen_carry_len, utf8_carry_len, decoder_ready)) = prepared_stream {
+    let (plp_encoding, widen_carry_len, utf8_carry_len, narrow_encoding) =
+        if let Some((encoding, widen_carry_len, utf8_carry_len, narrow_encoding)) = prepared_stream
+        {
+            let decoder_ready = narrow_encoding.is_some();
             let compatible = match (target_type, encoding) {
                 (SQL_C_WCHAR, PlpEncoding::Utf16Text) => true,
                 (SQL_C_WCHAR, PlpEncoding::SingleByteText | PlpEncoding::Utf8Text) => decoder_ready,
@@ -1686,7 +1693,7 @@ fn stream_active_plp_chunk<'a>(
                 Some(encoding),
                 widen_carry_len,
                 utf8_carry_len,
-                decoder_ready,
+                narrow_encoding,
             )
         } else {
             let mut stmt_state = match retained_stmt_state.take() {
@@ -1707,14 +1714,15 @@ fn stream_active_plp_chunk<'a>(
                     .unwrap_or(PlpEncoding::SingleByteText);
                 // Narrow text is decoded through the column's own collation,
                 // matching what the non-PLP path already does via
-                // `SqlString::to_utf8_string`. Built once per stream so the decoder
-                // can carry a character split across a chunk boundary.
+                // `SqlString::to_utf8_string`. The *encoding* is resolved once
+                // per stream and the decoder is built on first need, so it
+                // survives a target-type switch across continuation calls.
                 //
                 // The encoding is derived here rather than through
                 // `get_encoding_type`, which unwraps the collation and would panic
                 // on a `json` column (UTF-8 on the wire, no collation) — a panic
                 // across the FFI boundary is UB.
-                let wire_encoding = match encoding {
+                let narrow_encoding = match encoding {
                     // json is UTF-8 on the wire and carries no collation.
                     PlpEncoding::Utf8Text => Some(encoding_rs::UTF_8),
                     PlpEncoding::SingleByteText => column_meta
@@ -1728,20 +1736,8 @@ fn stream_active_plp_chunk<'a>(
                         }),
                     _ => None,
                 };
-                let narrow_decoder = match target_type {
-                    // Narrow wire bytes are never UTF-16, so widening always decodes.
-                    SQL_C_WCHAR => wire_encoding,
-                    // SQL_C_CHAR output is UTF-8, so a column already UTF-8 on the
-                    // wire needs no decoder — the verbatim copy is correct and
-                    // cheaper. Anything else is codepage text and must be converted
-                    // (AB#47566); leaving it verbatim hands the caller raw codepage
-                    // bytes labelled UTF-8.
-                    SQL_C_CHAR => wire_encoding.filter(|e| *e != encoding_rs::UTF_8),
-                    _ => None,
-                };
-                let narrow_decoder = narrow_decoder.map(|e| e.new_decoder_without_bom_handling());
                 stmt_state.active_plp =
-                    Some(ActivePlpStream::new(col_index, encoding, narrow_decoder));
+                    Some(ActivePlpStream::new(col_index, encoding, narrow_encoding));
                 stmt_state.current_row_last_col = col_index;
             }
 
@@ -1775,7 +1771,11 @@ fn stream_active_plp_chunk<'a>(
             let encoding = stream.map(|s| s.encoding);
             // A narrow column can only be converted when its collation resolved to a
             // concrete encoding; without one there is nothing to decode through.
-            let decoder_ready = stream.is_some_and(|s| s.narrow_decoder.is_some());
+            // Keyed on the column's encoding rather than on whether a decoder exists,
+            // so a stream opened by a `SQL_C_BINARY` read (which builds none) can
+            // still convert when a later call asks for text.
+            let narrow_encoding = stream.and_then(|s| s.narrow_encoding);
+            let decoder_ready = narrow_encoding.is_some();
             let compatible = match (target_type, encoding) {
                 (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text)) => true,
                 (SQL_C_WCHAR, Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)) => {
@@ -1808,7 +1808,7 @@ fn stream_active_plp_chunk<'a>(
                 stream.map(|s| s.encoding),
                 stream.map_or(0, |s| s.pending_units.len()),
                 stream.map_or(0, |s| s.pending_utf8.len()),
-                decoder_ready,
+                narrow_encoding,
             );
             retained_stmt_state = Some(stmt_state);
             stream_state
@@ -1817,12 +1817,14 @@ fn stream_active_plp_chunk<'a>(
     // SQL_C_CHAR delivery of a UTF-16 PLP column must transcode on the fly.
     let transcode_utf16_to_utf8 = target_type == SQL_C_CHAR && is_unicode_plp;
     // SQL_C_CHAR delivery of a codepage-text PLP column must decode through the
-    // column's collation on the fly (AB#47566). `decoder_ready` is false when
-    // the column is already UTF-8 on the wire (json, or a UTF-8 collation),
-    // where the verbatim copy below is correct.
+    // column's collation on the fly (AB#47566). A column already UTF-8 on the
+    // wire (json, or a UTF-8 collation) is excluded: it is already in the target
+    // encoding, so the verbatim copy below is both correct and cheaper, and
+    // running it through a decoder would only risk turning an invalid sequence
+    // into U+FFFD.
     let transcode_narrow_to_utf8 = target_type == SQL_C_CHAR
         && matches!(plp_encoding, Some(PlpEncoding::SingleByteText))
-        && decoder_ready;
+        && narrow_encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8);
     // SQL_C_WCHAR delivery of a narrow (codepage or UTF-8) PLP column must
     // widen on the fly. Mirrors the compatibility gate above so the two cannot
     // drift: a Binary column never reaches here.
@@ -2169,13 +2171,14 @@ fn stream_active_plp_chunk<'a>(
                 error!("SQLGetData: narrow PLP stream vanished mid-call");
                 return SQL_ERROR;
             };
+            stream.ensure_narrow_decoder();
             let ActivePlpStream {
                 narrow_decoder,
                 pending_units,
                 ..
             } = stream;
             let Some(decoder) = narrow_decoder.as_mut() else {
-                error!("SQLGetData: narrow PLP stream lost its decoder");
+                error!("SQLGetData: narrow PLP stream has no encoding to widen through");
                 return SQL_ERROR;
             };
             let emit = widen_into_pending(
@@ -2325,13 +2328,14 @@ fn stream_active_plp_chunk<'a>(
             let Some(stream) = ss.active_plp.as_mut() else {
                 return SQL_ERROR;
             };
+            stream.ensure_narrow_decoder();
             let ActivePlpStream {
                 narrow_decoder,
                 pending_utf8,
                 ..
             } = stream;
             let Some(decoder) = narrow_decoder.as_mut() else {
-                error!("SQLGetData: narrow PLP stream lost its decoder");
+                error!("SQLGetData: narrow PLP stream has no encoding to convert through");
                 return SQL_ERROR;
             };
             let emit = transcode_narrow_into_pending(
@@ -2451,22 +2455,29 @@ fn stream_active_plp_chunk<'a>(
     //     value until we have converted all of it ... as per spec." Its own tests
     //     assert this (RegressionsODBC nvarchar->SQL_C_TCHAR under an ANSI client,
     //     and SQLVariantODBC's "Mplat driver conversion to UTF8 results in
-    //     SQL_NO_TOTAL"). Only the same-encoding varchar->SQL_C_CHAR path, where
-    //     msodbcsql assumes a 1:1 ratio, gets a concrete count -- which is exactly
-    //     the `known_total` branch below. This path is therefore already converged.
+    //     SQL_NO_TOTAL").
     //
     // The varchar->SQL_C_WCHAR widening falls under the same rule and for the
     // same reason: delivered UTF-16 code units are not wire bytes, so it reports
     // SQL_NO_TOTAL too.
-    let remaining_indicator =
-        if transcode_utf16_to_utf8 || widen_narrow_to_utf16 || transcode_narrow_to_utf8 {
-            SQL_NO_TOTAL
-        } else if let Some(total) = known_total {
-            let consumed_before = total_read.saturating_sub(read) as u64;
-            total.saturating_sub(consumed_before) as SqlLen
-        } else {
-            SQL_NO_TOTAL
-        };
+    //
+    // The codepage varchar->SQL_C_CHAR conversion does NOT, even though it also
+    // transcodes. msodbcsql keys this decision on the C types, not on whether a
+    // conversion happens: `sqlcdata.h:1230` takes CHAR->CHAR on the first branch
+    // and reports `cbDataAvail` on an explicit "assume a 1:1 conversion ratio"
+    // comment, reaching `VARMAX_LENGTH_UNLIMITED`/SQL_NO_TOTAL only on the
+    // CHAR<->WCHAR branch below it. So a `varchar(max)` read as SQL_C_CHAR keeps
+    // its concrete wire-byte count under every collation. `PlpKnownLengthIndicatorCountsDown`
+    // and `ABoundVarcharMaxTruncatedReportsFullLength` are unskipped cross-leg
+    // parity tests that measure exactly this, and they hold msodbcsql to it.
+    let remaining_indicator = if transcode_utf16_to_utf8 || widen_narrow_to_utf16 {
+        SQL_NO_TOTAL
+    } else if let Some(total) = known_total {
+        let consumed_before = total_read.saturating_sub(read) as u64;
+        total.saturating_sub(consumed_before) as SqlLen
+    } else {
+        SQL_NO_TOTAL
+    };
     unsafe { write_if_some(strlen_or_ind_ptr, remaining_indicator) };
     post_diag(&mut stmt_state, WARN_STRING_TRUNCATION);
 
@@ -2532,9 +2543,15 @@ pub(crate) fn widen_into_pending(
 ///
 /// A single wire byte can decode to three UTF-8 bytes — CP1252 0x80 is U+20AC —
 /// and a DBCS lead/trail pair is two bytes in for at most three out, so `room /
-/// 3` is the ratio that never overshoots for either. Never below one byte, so a
-/// buffer with any payload room still consumes wire rather than stalling; the
-/// overshoot that floor allows lands in `pending_utf8` like any other surplus.
+/// 3` is the ratio that does not overshoot within a single chunk. It is not an
+/// absolute bound: `encoding_rs::GBK` decodes gb18030, so a 4-byte sequence
+/// whose first three bytes are already carried emits 4 UTF-8 bytes from the one
+/// byte fed on the next call. Overshoot is harmless — it lands in `pending_utf8`
+/// like any other surplus — so the ratio only has to be right often enough to
+/// keep the carry small.
+///
+/// Never below one byte, so a buffer with any payload room still consumes wire
+/// rather than stalling.
 fn narrow_max_read(payload_capacity: usize, pending_utf8_len: usize) -> usize {
     let remaining = payload_capacity.saturating_sub(pending_utf8_len);
     if remaining == 0 {

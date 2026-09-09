@@ -1814,7 +1814,13 @@ unsafe fn deliver_bound_plp(
 
     let transcode_utf16_to_utf8 =
         target == SQL_C_CHAR && matches!(encoding, PlpEncoding::Utf16Text);
-    let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16 || transcode_narrow_to_utf8;
+    // Deliberately excludes `transcode_narrow_to_utf8`: msodbcsql keys the
+    // indicator on the C types rather than on whether a conversion happens, and
+    // `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a 1:1 conversion ratio"
+    // branch, so a codepage `varchar(max)` read as SQL_C_CHAR keeps a concrete
+    // count. `ABoundVarcharMaxTruncatedReportsFullLength` measures this on both
+    // legs.
+    let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
     let buf_elements = char_buf_elements(target, stride);
     // Room for the payload. Character targets always write a terminator; binary
     // is not a string, so the whole slot is payload.
@@ -1851,6 +1857,11 @@ unsafe fn deliver_bound_plp(
             // multi-byte sequence split across a PLP chunk boundary; unlike the
             // streaming SQLGetData path there is no continuation call, so the
             // slot either takes the whole value or reports truncation.
+            // Cannot fire today: `transcode_narrow_to_utf8` requires
+            // `narrow_wire_encoding` to be `Some`, which is exactly when the
+            // decoder above is built. Kept as a drain-and-refuse rather than an
+            // `unreachable!()` because a panic here would cross the FFI
+            // boundary, which is UB.
             let Some(decoder) = narrow_decoder.as_mut() else {
                 drain_plp_to_end(client, runtime, scratch)?;
                 return Ok(RowOutcome::Error(RowIssue::Unsupported));
