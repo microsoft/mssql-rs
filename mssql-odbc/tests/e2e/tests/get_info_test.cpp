@@ -6,13 +6,15 @@
 // mssql-odbc deliberately diverges for its first release the assertion is
 // widened rather than skipped, and the divergence is named in a comment.
 //
-// This suite is built against the ANSI entry points, so the driver's UTF-16
-// output is re-encoded by the driver manager on the way back: reported lengths
-// are in SQLTCHAR units, and the DM -- not the driver -- decides what a
-// too-small buffer and a null-pointer size probe report. The exact SQLGetInfoW
-// buffer contract (byte length, NUL placement, untruncated length on 01004) is
-// therefore pinned by the Rust unit tests in `mssql-odbc/src/api/get_info.rs`;
-// what is asserted here is the part the DM passes through unchanged.
+// This suite builds wide on Windows and narrow on Unix (see ODBC_E2E_FORCE_UNICODE
+// in CMakeLists.txt), so lengths are asserted in SQLTCHAR units rather than
+// hard-coded to UTF-16. On the narrow build the driver manager re-encodes the
+// driver's UTF-16 output, and it -- not the driver -- decides what a too-small
+// buffer and a null-pointer size probe report: msodbcsql18 and mssql-odbc behave
+// identically there. The exact SQLGetInfoW buffer contract (byte length, NUL
+// placement, untruncated length on 01004) is therefore pinned by the Rust unit
+// tests in `mssql-odbc/src/api/get_info.rs`; what is asserted here is the part
+// that survives the driver manager unchanged.
 
 #include "odbc_test_fixture.h"
 
@@ -205,8 +207,9 @@ TEST_F(GetInfoLiveTest, KeywordsAndSpecialCharacters) {
 // ===================================================================
 
 // A null InfoValuePtr is a size probe: it must succeed and report a length
-// without writing anything. The unit tests assert the exact byte count; here the
-// DM reports the driver's UTF-16 length unhalved, so only the shape is checked.
+// without writing anything. The unit tests assert the exact byte count; on the
+// narrow build the driver manager reports the driver's UTF-16 length unhalved,
+// so only the shape is checked here.
 TEST_F(GetInfoLiveTest, NullBufferReportsRequiredLength) {
     SQLSMALLINT probe = -1;
     SQLRETURN rc = SQLGetInfo(dbc_, SQL_KEYWORDS, nullptr, 0, &probe);
@@ -216,9 +219,10 @@ TEST_F(GetInfoLiveTest, NullBufferReportsRequiredLength) {
 
 // A short buffer must be reported as a truncation, not a silent short read.
 TEST_F(GetInfoLiveTest, ShortBufferTruncatesWith01004) {
-    SQLTCHAR small[4] = {};
+    // Not named `small`: the Windows SDK's rpcndr.h defines that as a macro for `char`.
+    SQLTCHAR tiny[4] = {};
     SQLSMALLINT len = -1;
-    SQLRETURN rc = SQLGetInfo(dbc_, SQL_KEYWORDS, small, sizeof(small), &len);
+    SQLRETURN rc = SQLGetInfo(dbc_, SQL_KEYWORDS, tiny, sizeof(tiny), &len);
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
     EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, dbc_, "01004"));
 }
