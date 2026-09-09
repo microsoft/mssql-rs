@@ -58,6 +58,19 @@ TEST_F(BinaryFetchLiveTest, FixedBinaryDeliversWholeValue) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(BinaryFetchLiveTest, FixedBinaryPreservesEmbeddedZero) {
+    FetchOne("SELECT CAST(0x01000203 AS BINARY(4))");
+
+    unsigned char buf[4] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(4, ind);
+    const unsigned char expected[4] = {1, 0, 2, 3};
+    EXPECT_EQ(0, std::memcmp(buf, expected, sizeof(expected)));
+    SQLCloseCursor(stmt_);
+}
+
 // The indicator counts down because it reports what was left before each call,
 // not what the call delivered.
 TEST_F(BinaryFetchLiveTest, FixedBinaryChunksWithARemainingCount) {
@@ -146,6 +159,19 @@ TEST_F(BinaryFetchLiveTest, EmptyVarbinaryReportsZeroLength) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(BinaryFetchLiveTest, NullVarbinaryReportsNull) {
+    FetchOne("SELECT CAST(NULL AS VARBINARY(8))");
+
+    unsigned char buf[8];
+    std::memset(buf, 0xEE, sizeof(buf));
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_NULL_DATA, ind);
+    EXPECT_EQ(0xEE, buf[0]) << "a NULL value must not disturb the buffer";
+    SQLCloseCursor(stmt_);
+}
+
 // ---------------------------------------------------------------------------
 // PLP: varbinary(max) and the UDT types, which arrive as a wire stream rather
 // than a materialized value.
@@ -161,6 +187,20 @@ TEST_F(BinaryFetchLiveTest, VarbinaryMaxDeliversWholeValue) {
                   stmt_);
     EXPECT_EQ(10, ind);
     for (int i = 0; i < 10; ++i) EXPECT_EQ(0x41, buf[i]) << "byte " << i;
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, EmptyVarbinaryMaxReportsZeroLength) {
+    FetchOne("SELECT CAST(0x AS VARBINARY(MAX))");
+    AssertColumnSqlType(SQL_VARBINARY);
+
+    unsigned char buf[8];
+    std::memset(buf, 0xEE, sizeof(buf));
+    SQLLEN ind = -1;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BINARY, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(0, ind);
+    EXPECT_EQ(0xEE, buf[0]) << "an empty stream must not disturb the buffer";
     SQLCloseCursor(stmt_);
 }
 
@@ -277,6 +317,83 @@ TEST_F(BinaryFetchLiveTest, BoundVarbinaryMaxDeliversWholeValue) {
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(10, ind);
     for (int i = 0; i < 10; ++i) EXPECT_EQ(0x41, buf[i]) << "byte " << i;
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, BoundBinaryNullsReportNullWithoutDisturbingBuffers) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(NULL AS VARBINARY(8)), CAST(NULL AS VARBINARY(MAX))"),
+        SQL_HANDLE_STMT, stmt_);
+
+    unsigned char fixedBuf[8];
+    unsigned char plpBuf[8];
+    std::memset(fixedBuf, 0xEE, sizeof(fixedBuf));
+    std::memset(plpBuf, 0xDD, sizeof(plpBuf));
+    SQLLEN fixedInd = 0;
+    SQLLEN plpInd = 0;
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 1, SQL_C_BINARY, fixedBuf, sizeof(fixedBuf), &fixedInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 2, SQL_C_BINARY, plpBuf, sizeof(plpBuf), &plpInd),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NULL_DATA, fixedInd);
+    EXPECT_EQ(SQL_NULL_DATA, plpInd);
+    EXPECT_EQ(0xEE, fixedBuf[0]);
+    EXPECT_EQ(0xDD, plpBuf[0]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, AdjacentBoundBinaryColumnsStayWithinTheirBuffers) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT CAST(0x01020304 AS BINARY(4)), CAST(0x05060708 AS BINARY(4))"),
+        SQL_HANDLE_STMT, stmt_);
+
+    struct {
+        unsigned char first[4];
+        unsigned char second[4];
+    } buffers = {};
+    SQLLEN firstInd = 0;
+    SQLLEN secondInd = 0;
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 1, SQL_C_BINARY, buffers.first, sizeof(buffers.first), &firstInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 2, SQL_C_BINARY, buffers.second, sizeof(buffers.second), &secondInd),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(4, firstInd);
+    EXPECT_EQ(4, secondInd);
+    EXPECT_EQ(0, std::memcmp(buffers.first, "\x01\x02\x03\x04", 4));
+    EXPECT_EQ(0, std::memcmp(buffers.second, "\x05\x06\x07\x08", 4));
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+TEST_F(BinaryFetchLiveTest, BoundBinaryRowArrayUsesTheBinaryStride) {
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT b FROM (VALUES (1, CAST(0x01020304 AS BINARY(4))),"
+                   " (2, CAST(0x05060708 AS BINARY(4)))) AS t(n, b) ORDER BY n"),
+        SQL_HANDLE_STMT, stmt_);
+
+    unsigned char buffers[2][4] = {};
+    SQLLEN indicators[2] = {};
+    SQLULEN rowsFetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_BINARY, buffers, sizeof(buffers[0]), indicators),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2u, rowsFetched);
+    EXPECT_EQ(4, indicators[0]);
+    EXPECT_EQ(4, indicators[1]);
+    EXPECT_EQ(0, std::memcmp(buffers[0], "\x01\x02\x03\x04", 4));
+    EXPECT_EQ(0, std::memcmp(buffers[1], "\x05\x06\x07\x08", 4));
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }
