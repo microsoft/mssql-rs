@@ -358,13 +358,15 @@ does not grow every time a new msodbcsql build is measured.
     This matches msodbcsql on Windows: `AddRPCUserParameters` posts the
     `IDS_01_S07` returned by `ParamToSQLType` (`odbc/sqlcmisc.cpp`), and its
     caller restores `SQL_NEED_DATA` without clearing that diagnostic
-    (`odbc/sqlccmd.cpp`). The shared source at `master` (`577aff3fa`) has no
-    adjacent `MPLAT_UNIX` branch, but retail 18.6.2.1 suppresses the warning on
-    Linux while the same pinned version reports it on Windows (build 173606).
-    This driver follows the Windows behavior on every platform; only the Linux
-    msodbcsql comparison leg skips the two pre-DAE assertions. A truncation
-    after the first DAE parameter remains silent. Signed off by Theekshna
-    Kotian on 2026-09-09. Tracked in AB#47946.
+    (`odbc/sqlccmd.cpp`). This driver stores the diagnostic on every platform,
+    pinned by `park_dae_client_posts_numeric_fractional_truncation`. On Linux,
+    unixODBC's `function_return_ex` (`DriverManager/__info.c`) extracts driver
+    diagnostics for `SQL_SUCCESS_WITH_INFO`, `SQL_ERROR`, and `SQL_NO_DATA`, but
+    not `SQL_NEED_DATA`; therefore the Linux E2E tests expect no visible
+    diagnostic for either driver. Windows expects `01S07`. Build 173710 confirms
+    both outcomes against retail msodbcsql 18.6.2.1. Truncation after the first
+    DAE parameter remains silent. Signed off by Theekshna Kotian on 2026-09-09.
+    Tracked in AB#47946.
 
 ## No panics
 

@@ -201,10 +201,6 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionInterleavesWithBoundParams) {
 }
 
 TEST_F(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsReported) {
-#ifdef __linux__
-    // msodbcsql 18.6.2.1 suppresses this warning on Linux.
-    SKIP_IF_COMPARING_MSODBCSQL();
-#endif
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v"),
                   SQL_HANDLE_STMT, stmt_);
 
@@ -226,7 +222,13 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsReported)
     SQLRETURN rc = SQLExecute(stmt_);
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+#ifdef __linux__
+    // unixODBC's function_return_ex does not extract driver diagnostics for
+    // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here.
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+#else
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
+#endif
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
     EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
@@ -749,10 +751,6 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectDataAtExecutionInterleavesWithBoundPara
 }
 
 TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationBeforeDataAtExecutionIsReported) {
-#ifdef __linux__
-    // msodbcsql 18.6.2.1 suppresses this warning on Linux.
-    SKIP_IF_COMPARING_MSODBCSQL();
-#endif
     SQL_NUMERIC_STRUCT numeric = {};
     numeric.precision = 3;
     numeric.scale = 2;
@@ -772,7 +770,13 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationBeforeDataAtExecutionI
         ExecDirect("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v");
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
+#ifdef __linux__
+    // unixODBC's function_return_ex does not extract driver diagnostics for
+    // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here.
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
+#else
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
+#endif
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
     EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
