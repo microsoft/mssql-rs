@@ -839,6 +839,10 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening) {
 // Not skipped on the msodbcsql leg: both drivers deliver UTF-8 for SQL_C_CHAR
 // on Linux, so they must agree.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
+    // Windows-only skip: msodbcsql returns the raw CP1252 byte E9 with
+    // indicator 1 there, rather than UTF-8 C3 A9 with indicator 2 (AB#47564).
+    // Measured as agreeing on Linux in build 173873.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     ExecDirect(
         "SELECT CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)) AS c1");
 
@@ -917,6 +921,11 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
 // skipping would also delete the SQL_NO_TOTAL check, which is the part that
 // actually pins this PR's behaviour.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
+    // Windows-only skip: the payload assertion expects UTF-8, which msodbcsql
+    // does not deliver there (AB#47564), and its ANSI output also changes how
+    // many characters fit in the slot. The indicator comparison below is
+    // measured on the Linux leg, where both drivers deliver UTF-8.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), "
         "5000) AS c1");

@@ -1106,7 +1106,12 @@ TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip) {
 // Deliberately NOT skipped on the msodbcsql leg: both drivers deliver UTF-8 for
 // SQL_C_CHAR on Linux, so they must agree here. That is the whole point of this
 // test.
+// Not skipped on Linux/macOS: both drivers deliver UTF-8 for SQL_C_CHAR there
+// and this case passed on both legs of build 173873, which is the parity claim
+// this PR rests on. Skipped only on Windows, where msodbcsql uses the client
+// ANSI code page instead (AB#47564).
 TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     // UTF-8 spelling of "café René señor Müller Größe naïve " -- what a caller
     // asking for SQL_C_CHAR must receive.
     const std::string token = "caf\xC3\xA9 Ren\xC3\xA9 se\xC3\xB1or M\xC3\xBCller "
@@ -1192,6 +1197,9 @@ TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkSizeDoesNotChangeValue) {
 // verbatim path and NOT be decoded a second time. Double-converting would
 // mangle every non-ASCII character.
 TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted) {
+    // Windows-only skip: msodbcsql re-encodes the UTF-8 wire bytes into the
+    // client ANSI code page there (AB#47564). Measured as agreeing on Linux.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
                               "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
     const std::string expected = RepeatToken(token, 300);
@@ -1214,6 +1222,10 @@ TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted) {
 // eliminate. The encoding is a property of the column, so readiness must not
 // depend on call history.
 TEST_F(GetDataLiveTest, VarcharMaxBinaryFirstStillConvertsOnLaterCharRead) {
+    // Windows-only skip: the assertion is that the value comes back as UTF-8,
+    // which msodbcsql does not do on Windows (AB#47564). Measured as agreeing
+    // on Linux, where it exercises the same decoder-lifetime path.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     ASSERT_SQL_OK(
         ExecDirect("SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' ' "
                    "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
