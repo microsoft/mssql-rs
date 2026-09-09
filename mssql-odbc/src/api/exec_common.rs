@@ -120,6 +120,8 @@ fn unwind_dae_inner(
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
+/// A pre-DAE truncation is posted before `SQL_NEED_DATA`, matching
+/// `AddRPCUserParameters` and its caller in `sqlccmd.cpp`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn park_dae_client(
     stmt: &StmtHandle,
@@ -127,6 +129,7 @@ pub(super) fn park_dae_client(
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     dae_params: Vec<DaeParam>,
+    fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -136,6 +139,9 @@ pub(super) fn park_dae_client(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
     SQL_NEED_DATA
 }
 
@@ -497,7 +503,8 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
-    /// Whether any non-DAE parameter lost fractional digits during conversion.
+    /// Whether a parameter before the first DAE marker lost fractional digits.
+    /// With no DAE marker, covers the full parameter list.
     pub(super) fractional_truncated: bool,
 }
 
@@ -674,7 +681,7 @@ pub(super) unsafe fn build_named_params(
         } else {
             match unsafe { bound_param_to_rpc(name, &bound_param) } {
                 Ok((param, outcome)) => {
-                    if outcome == ConvOk::Truncated {
+                    if outcome == ConvOk::Truncated && dae_params.is_empty() {
                         fractional_truncated = true;
                     }
                     params.push(param);
@@ -1135,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn park_dae_client_drops_numeric_fractional_truncation() {
+    fn park_dae_client_posts_numeric_fractional_truncation() {
         use crate::test_support::TestHandles;
         use mssql_tds::test_client_support::tds_client_from_tokens;
 
@@ -1149,12 +1156,14 @@ mod tests {
             None,
             None,
             Vec::new(),
+            true,
             "SQLExecute",
         );
 
         assert_eq!(rc, SQL_NEED_DATA);
         let state = stmt.inner.lock().unwrap();
-        assert!(state.diag_records.is_empty());
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
     }
 
     /// Builds a scripted client positioned on a row-returning result (empty
@@ -1732,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn build_named_params_tracks_truncation_after_first_dae_param() {
+    fn build_named_params_ignores_truncation_after_first_dae_param() {
         use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -1785,7 +1794,7 @@ mod tests {
 
         let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
         assert_eq!(built.dae_params.len(), 1);
-        assert!(built.fractional_truncated);
+        assert!(!built.fractional_truncated);
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
@@ -2068,6 +2077,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                false,
                 "test",
             ),
             crate::api::odbc_types::SQL_NEED_DATA

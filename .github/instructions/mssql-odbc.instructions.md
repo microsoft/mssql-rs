@@ -353,6 +353,18 @@ does not grow every time a new msodbcsql build is measured.
     `ColAttributeLiveTest.EmptyVariantProbeConsumesValueButKeepsBaseType`
     accepts either so the parity leg still compares the base type and the
     `SQL_NO_DATA` re-read.
+14. A numeric parameter truncated before a later data-at-execution parameter
+    posts `01S07` while `SQLExecute` / `SQLExecDirect` returns `SQL_NEED_DATA`.
+    This matches msodbcsql on Windows: `AddRPCUserParameters` posts the
+    `IDS_01_S07` returned by `ParamToSQLType` (`odbc/sqlcmisc.cpp`), and its
+    caller restores `SQL_NEED_DATA` without clearing that diagnostic
+    (`odbc/sqlccmd.cpp`). The shared source at `master` (`577aff3fa`) has no
+    adjacent `MPLAT_UNIX` branch, but retail 18.6.2.1 suppresses the warning on
+    Linux while the same pinned version reports it on Windows (build 173606).
+    This driver follows the Windows behavior on every platform; only the Linux
+    msodbcsql comparison leg skips the two pre-DAE assertions. A truncation
+    after the first DAE parameter remains silent. Signed off by Theekshna
+    Kotian on 2026-09-09. Tracked in AB#47946.
 
 ## No panics
 

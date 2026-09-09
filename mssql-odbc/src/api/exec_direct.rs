@@ -266,9 +266,15 @@ fn sql_exec_direct_w_safe(
                     fractional_truncated,
                 )
             }
-            Ok(StreamedParamStatus::NeedData { .. }) => {
-                park_dae_client(stmt, client, None, None, dae_params, "SQLExecDirectW")
-            }
+            Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
+                stmt,
+                client,
+                None,
+                None,
+                dae_params,
+                fractional_truncated,
+                "SQLExecDirectW",
+            ),
             Err(e) => {
                 error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
                 fail_with_tds(dbc, stmt, statement_handle, client, &e)
