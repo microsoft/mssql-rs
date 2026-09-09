@@ -222,12 +222,13 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationBeforeDataAtExecutionIsReported)
     SQLRETURN rc = SQLExecute(stmt_);
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-#ifdef __linux__
-    // unixODBC's function_return_ex does not extract driver diagnostics for
-    // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here.
-    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
-#else
+#ifdef _WIN32
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
+#else
+    // unixODBC's function_return_ex does not extract driver diagnostics for
+    // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here
+    // (Linux and macOS both link unixODBC for this suite).
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 #endif
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
@@ -770,12 +771,13 @@ TEST_F(PrepareExecuteLiveTest, ExecDirectNumericTruncationBeforeDataAtExecutionI
         ExecDirect("SELECT CONVERT(VARCHAR(32), ?) + ':' + ? AS v");
     ASSERT_EQ(SQL_NEED_DATA, rc)
         << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_STMT, stmt_);
-#ifdef __linux__
-    // unixODBC's function_return_ex does not extract driver diagnostics for
-    // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here.
-    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
-#else
+#ifdef _WIN32
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
+#else
+    // unixODBC's function_return_ex does not extract driver diagnostics for
+    // SQL_NEED_DATA, so neither driver's 01S07 is application-visible here
+    // (Linux and macOS both link unixODBC for this suite).
+    EXPECT_EQ("", ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_));
 #endif
     SQLPOINTER value_ptr = nullptr;
     ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
