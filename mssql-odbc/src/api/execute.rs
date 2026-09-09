@@ -1297,6 +1297,91 @@ mod tests {
         );
     }
 
+    /// **Found in review**: the all-`SQL_PARAM_IGNORE` batch early return
+    /// (`active_rows.is_empty()`) was the only successful `SQLExecute` path
+    /// that returned without calling `clear_exhaustion_state()`. Every other
+    /// successful execute reaches `finish_execute` or `finish_parameter_array`,
+    /// which do clear it. Left stale, a reused statement handle would surface
+    /// the *previous* query's `batch_exhausted`/`pending_fetch_error`/
+    /// `pending_fetch_info` against this brand new (all-ignored) execution —
+    /// the same class of bug fixed for the pure-DML branch in
+    /// `exec_direct_pure_dml_clears_stale_exhausted_and_pending_info`.
+    #[test]
+    fn all_ignored_array_clears_stale_exhausted_and_pending_info() {
+        use mssql_tds::error::SqlInfoMessage;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        set_prepared(h.stmt, "INSERT INTO t VALUES (?)");
+        let mut values = [10i32, 20, 30];
+        let mut indicators = [size_of::<i32>() as SqlLen; 3];
+        let mut operations = [SQL_PARAM_IGNORE; 3];
+        let mut statuses = [99 as SqlUSmallInt; 3];
+        let mut processed: SqlULen = 99;
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    SQL_PARAM_INPUT,
+                    SQL_C_SLONG,
+                    SQL_INTEGER,
+                    0,
+                    0,
+                    values.as_mut_ptr().cast(),
+                    size_of::<i32>() as SqlLen,
+                    indicators.as_mut_ptr(),
+                )
+            },
+            SQL_SUCCESS
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.paramset_size = 3;
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAM_OPERATION_PTR,
+                operations.as_mut_ptr() as SqlULen,
+            );
+            state
+                .inert_attrs
+                .set(SQL_ATTR_PARAM_STATUS_PTR, statuses.as_mut_ptr() as SqlULen);
+            state.inert_attrs.set(
+                SQL_ATTR_PARAMS_PROCESSED_PTR,
+                (&raw mut processed) as SqlULen,
+            );
+            // As if a previous query's zero-row fetch exhausted the whole
+            // batch and stashed a trailing INFO message and error, left over
+            // on the reused handle.
+            state.result_set_exhausted = true;
+            state.batch_exhausted = true;
+            state.pending_fetch_error = Some(TdsError::ProtocolError("stale".to_string()));
+            state.pending_fetch_info = vec![SqlInfoMessage {
+                message: "previous query's PRINT output".to_string(),
+                state: 1,
+                class: 0,
+                number: 0,
+                server_name: None,
+                proc_name: None,
+                line_number: None,
+            }];
+        }
+
+        let ret = sql_execute_safe(h.stmt, stmt);
+
+        assert_eq!(ret, SQL_SUCCESS);
+        let state = stmt.inner.lock().unwrap();
+        assert!(
+            !state.batch_exhausted,
+            "SQLMoreResults must not fast-path to SQL_NO_DATA on the previous query's flag"
+        );
+        assert!(!state.result_set_exhausted);
+        assert!(state.pending_fetch_error.is_none());
+        assert!(state.pending_fetch_info.is_empty());
+    }
+
     /// Stages four good rows, then invalidates some the way an application can
     /// between validation and execution - the only way a row still fails once
     /// the batch is under way.
