@@ -818,14 +818,27 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
             }
         }
 
+        // Reserved before anything is written: `PARAMSET_SIZE` is any non-zero
+        // SQLULEN, and an infallible `with_capacity` on an absurd one aborts
+        // the host process instead of failing the call. Checked ahead of the
+        // prefill so a size that cannot be serviced never walks the caller's
+        // status array either.
+        let mut active_rows = Vec::new();
+        if active_rows.try_reserve(row_count).is_err() {
+            error!("SQLExecute: failed to reserve {row_count} parameter sets (HY001)");
+            post_diag(&mut stmt_state, ERR_MEMORY_ALLOCATION);
+            return Err(SQL_ERROR);
+        }
+
         unsafe {
             write_params_processed(params_processed_ptr, 0);
-            for row in 0..row_count {
-                write_param_status(param_status_ptr, row, SQL_PARAM_UNUSED);
+            if !param_status_ptr.is_null() {
+                for row in 0..row_count {
+                    write_param_status(param_status_ptr, row, SQL_PARAM_UNUSED);
+                }
             }
         }
 
-        let mut active_rows = Vec::with_capacity(row_count);
         for row in 0..row_count {
             let operation = if operation_ptr.is_null() {
                 SQL_PARAM_PROCEED

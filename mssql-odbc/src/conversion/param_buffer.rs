@@ -61,20 +61,34 @@ pub(crate) enum AppValue {
 
 /// Byte stride between consecutive values in a column-wise parameter array.
 ///
-/// ODBC ignores `BufferLength` for most fixed-width C types. Character,
-/// binary, and SQL Server temporal values use it as the size of one array
-/// slot, matching msodbcsql's `BindOffset` default of
-/// `dwOffset = lpbindinfo->cbValueMax`
+/// ODBC ignores `BufferLength` for fixed-width C types. Only character and
+/// binary use it as the size of one array slot, matching msodbcsql's
+/// `BindOffset` default of `dwOffset = lpbindinfo->cbValueMax`
 /// (`Sql/Ntdbms/sqlncli/odbc/sqlcfunc.cpp:2280-2283`). Zero therefore makes
 /// every row address the same value buffer; a negative width has no usable
-/// stride. `SQL_C_SS_VECTOR` is intentionally absent until AB#47790 defines
-/// this driver's application-buffer ABI. `c_type` must already be resolved
-/// from `SQL_C_DEFAULT` by the binding path.
+/// stride.
+///
+/// `SQL_C_SS_TIME2` and `SQL_C_SS_TIMESTAMPOFFSET` reach that same default in
+/// `BindOffset`, but are fixed here because `SQLBindParameter` has already
+/// overwritten `cbValueMax` with the struct size by then -
+/// `GetLengthForFixedLengthCType` (`sqlcprot.h:1404-1410`) gives both an
+/// explicit arm, and `sqlcdesc.cpp:3083` applies it at bind time. Reading
+/// `BindOffset` alone says these stride by `BufferLength`; measured, they do
+/// not, and a `BufferLength` of 0 - the natural binding for a fixed C struct -
+/// would otherwise alias every set onto set 0 and insert one value N times.
+/// This matches [`crate::api::fetch_scroll::element_stride`], which already
+/// treats both as fixed.
+///
+/// `SQL_C_SS_VECTOR` is intentionally absent until AB#47790 defines this
+/// driver's application-buffer ABI. `c_type` must already be resolved from
+/// `SQL_C_DEFAULT` by the binding path.
 pub(crate) fn parameter_value_stride(c_type: SqlSmallInt, buffer_length: SqlLen) -> Option<usize> {
     let width = match c_type {
-        SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY | SQL_C_SS_TIME2 | SQL_C_SS_TIMESTAMPOFFSET => {
+        SQL_C_CHAR | SQL_C_WCHAR | SQL_C_BINARY => {
             return usize::try_from(buffer_length).ok();
         }
+        SQL_C_SS_TIME2 => std::mem::size_of::<SqlSsTime2Struct>(),
+        SQL_C_SS_TIMESTAMPOFFSET => std::mem::size_of::<SqlSsTimestampoffsetStruct>(),
         SQL_C_BIT | SQL_C_TINYINT | SQL_C_UTINYINT => std::mem::size_of::<u8>(),
         SQL_C_STINYINT => std::mem::size_of::<i8>(),
         SQL_C_SHORT | SQL_C_SSHORT => std::mem::size_of::<i16>(),
@@ -421,13 +435,7 @@ mod tests {
 
     #[test]
     fn parameter_array_variable_width_strides_use_buffer_length_bytes() {
-        for c_type in [
-            SQL_C_CHAR,
-            SQL_C_WCHAR,
-            SQL_C_BINARY,
-            SQL_C_SS_TIME2,
-            SQL_C_SS_TIMESTAMPOFFSET,
-        ] {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {
             for buffer_length in [0, 1, 7, 2056, 4096] {
                 assert_eq!(
                     parameter_value_stride(c_type, buffer_length),
@@ -464,6 +472,11 @@ mod tests {
             (SQL_C_NUMERIC, 19),
             (SQL_C_INTERVAL_YEAR, 28),
             (SQL_C_INTERVAL_MINUTE_TO_SECOND, 28),
+            // msodbcsql replaces the caller's BufferLength with these widths at
+            // bind time (GetLengthForFixedLengthCType, sqlcprot.h:1404-1410), so
+            // a BufferLength of 0 must not collapse an array onto set 0.
+            (SQL_C_SS_TIME2, 12),
+            (SQL_C_SS_TIMESTAMPOFFSET, 20),
         ];
 
         for (c_type, expected) in cases {

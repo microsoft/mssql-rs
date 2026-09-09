@@ -55,6 +55,7 @@
 //  29.  ThousandSetArrayCorrelatesFailuresToTheirOwnSets - boundary sets 0/499/999
 //  30.  CursorApiAfterARowReturningArrayExecute    - AB#47944 as the app sees it
 //  31.  PreparedStatementReExecutesAtDifferentArraySizes - 4 -> 7 -> 2
+//  32.  TimestampoffsetArrayStridesByItsStructSize - fixed struct, not BufferLength
 
 #include "odbc_test_fixture.h"
 
@@ -63,6 +64,32 @@
 #include <limits>
 #include <string>
 #include <vector>
+
+// Mirrors msodbcsql's sqlncli.h, matching datetime_types_test.cpp. The
+// static_assert fails the build rather than silently misreading a buffer.
+#ifndef SQL_C_SS_TIMESTAMPOFFSET
+#define SQL_C_TYPES_EXTENDED 0x04000L
+#define SQL_C_SS_TIMESTAMPOFFSET (SQL_C_TYPES_EXTENDED + 1)
+
+typedef struct tagSS_TIMESTAMPOFFSET_STRUCT {
+    SQLSMALLINT year;
+    SQLUSMALLINT month;
+    SQLUSMALLINT day;
+    SQLUSMALLINT hour;
+    SQLUSMALLINT minute;
+    SQLUSMALLINT second;
+    SQLUINTEGER fraction;
+    SQLSMALLINT timezone_hour;
+    SQLSMALLINT timezone_minute;
+} SQL_SS_TIMESTAMPOFFSET_STRUCT;
+#endif
+
+#ifndef SQL_SS_TIMESTAMPOFFSET
+#define SQL_SS_TIMESTAMPOFFSET (-155)
+#endif
+
+static_assert(sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT) == 20,
+              "SQL_SS_TIMESTAMPOFFSET_STRUCT layout does not match the msodbcsql ABI");
 
 namespace {
 
@@ -1805,4 +1832,77 @@ TEST_F(ParamArrayTest, PreparedStatementReExecutesAtDifferentArraySizes) {
     EXPECT_EQ(4, ScalarInt("SELECT COUNT(*) FROM #pa WHERE id BETWEEN 101 AND 199"));
     EXPECT_EQ(7, ScalarInt("SELECT COUNT(*) FROM #pa WHERE id BETWEEN 201 AND 299"));
     EXPECT_EQ(2, ScalarInt("SELECT COUNT(*) FROM #pa WHERE id BETWEEN 301 AND 399"));
+}
+
+// -------------------------------------------------------------------
+// 32. A SQL_C_SS_TIMESTAMPOFFSET array strides by the struct size, not
+// by BufferLength, so binding one with BufferLength 0 - the natural
+// thing to pass for a fixed C struct - still walks the array.
+//
+// Reading msodbcsql's BindOffset alone says the opposite: it gives every
+// fixed type an explicit sizeof arm (sqlcfunc.cpp:2194-2249) but has
+// none for SQL_C_SS_TIME2 or SQL_C_SS_TIMESTAMPOFFSET, so both reach
+// `default: dwOffset = lpbindinfo->cbValueMax` (:2280). What that misses
+// is that SQLBindParameter has already replaced cbValueMax with the
+// struct size - GetLengthForFixedLengthCType (sqlcprot.h:1404-1410) has
+// an arm for each, applied at sqlcdesc.cpp:3083 - so the default never
+// sees the application's 0.
+//
+// Measured on both drivers, hence no skip. This driver aliased every set
+// onto set 0 here until the stride was corrected, inserting one value N
+// times under SQL_SUCCESS with no diagnostic.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, TimestampoffsetArrayStridesByItsStructSize) {
+    ExecDirect("CREATE TABLE #pa_dto (id int NOT NULL, v datetimeoffset(0) NOT NULL)");
+    Prepare("INSERT INTO #pa_dto (id, v) VALUES (?, ?)");
+
+    SQLINTEGER ids[3] = {1, 2, 3};
+    SQLLEN id_ind[3] = {0, 0, 0};
+    SQL_SS_TIMESTAMPOFFSET_STRUCT stamps[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        stamps[i].year = 2024;
+        stamps[i].month = 5;
+        stamps[i].day = 20;
+        stamps[i].hour = static_cast<SQLUSMALLINT>(10 + i); // the discriminator
+        stamps[i].minute = 0;
+        stamps[i].second = 0;
+        stamps[i].fraction = 0;
+        stamps[i].timezone_hour = 0;
+        stamps[i].timezone_minute = 0;
+    }
+    SQLLEN stamp_ind[3] = {sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT),
+                           sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT),
+                           sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)};
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, id_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    // BufferLength 0, exactly as an application binds a fixed C struct.
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SS_TIMESTAMPOFFSET,
+                                   SQL_SS_TIMESTAMPOFFSET, 34, 0, stamps, 0, stamp_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 3));
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa_dto"));
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(DISTINCT v) FROM #pa_dto"))
+        << "a zero BufferLength must not collapse the array onto set 0";
+    EXPECT_EQ("10,11,12",
+              ScalarString("SELECT STRING_AGG(CONVERT(varchar(2), DATEPART(hour, v)), ',') "
+                           "WITHIN GROUP (ORDER BY id) FROM #pa_dto"));
+
+    // An explicit width is the same stride, so the two agree.
+    ExecOnProbe("DELETE FROM #pa_dto");
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SS_TIMESTAMPOFFSET,
+                                   SQL_SS_TIMESTAMPOFFSET, 34, 0, stamps,
+                                   sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT), stamp_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+
+    EXPECT_EQ("10,11,12",
+              ScalarString("SELECT STRING_AGG(CONVERT(varchar(2), DATEPART(hour, v)), ',') "
+                           "WITHIN GROUP (ORDER BY id) FROM #pa_dto"));
 }
