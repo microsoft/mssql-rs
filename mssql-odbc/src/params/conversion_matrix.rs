@@ -46,6 +46,14 @@ const INTEGER_SQL_TARGETS: &[SqlSmallInt] = &[SQL_TINYINT, SQL_SMALLINT, SQL_INT
 
 const DECIMAL_SQL_TARGETS: &[SqlSmallInt] = &[SQL_DECIMAL, SQL_NUMERIC];
 
+const TEMPORAL_SQL_TARGETS: &[SqlSmallInt] = &[
+    SQL_TYPE_DATE,
+    SQL_TYPE_TIME,
+    SQL_SS_TIME2,
+    SQL_TYPE_TIMESTAMP,
+    SQL_SS_TIMESTAMPOFFSET,
+];
+
 /// `xml` takes a character payload but declares its own wire type, so it is
 /// listed apart from `CHARACTER_SQL_TARGETS`.
 const CHARACTER_PAYLOAD_SQL_TARGETS: &[SqlSmallInt] = &[SQL_SS_XML];
@@ -67,13 +75,15 @@ pub(crate) fn is_supported_conversion(c_type: SqlSmallInt, sql_type: SqlSmallInt
             CHARACTER_SQL_TARGETS,
             INTEGER_SQL_TARGETS,
             DECIMAL_SQL_TARGETS,
+            TEMPORAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
+            &[SQL_SS_VARIANT],
         ],
-        // A narrow `sql_variant` payload cannot be serialized until AB#47800.
         SQL_C_WCHAR => &[
             CHARACTER_SQL_TARGETS,
             INTEGER_SQL_TARGETS,
             DECIMAL_SQL_TARGETS,
+            TEMPORAL_SQL_TARGETS,
             CHARACTER_PAYLOAD_SQL_TARGETS,
             &[SQL_SS_VARIANT],
         ],
@@ -224,6 +234,27 @@ mod tests {
             .collect()
     }
 
+    /// mssql-python binds a `datetime.time` as isoformat text against
+    /// `SQL_TYPE_TIME`, so the character rows have to reach the temporal
+    /// targets or the whole insert fails at bind time (AB#47851).
+    #[test]
+    fn a_character_c_type_reaches_the_temporal_sql_types() {
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for sql_type in [
+                SQL_TYPE_DATE,
+                SQL_TYPE_TIME,
+                SQL_SS_TIME2,
+                SQL_TYPE_TIMESTAMP,
+                SQL_SS_TIMESTAMPOFFSET,
+            ] {
+                assert!(
+                    is_supported_conversion(c_type, sql_type),
+                    "{c_type} -> {sql_type} should be supported"
+                );
+            }
+        }
+    }
+
     /// The scalar rows, each with the exact set of SQL types it may reach.
     ///
     /// Asserted in both directions: a row that quietly widens is a binding
@@ -254,19 +285,16 @@ mod tests {
     }
 
     /// Character C types reach the non-character payloads that can be serialized.
-    /// The narrow `sql_variant` path remains deferred under AB#47800.
     #[test]
     fn a_character_c_type_reaches_the_types_that_default_to_one() {
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
-            for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML] {
+            for sql_type in [SQL_DECIMAL, SQL_NUMERIC, SQL_SS_XML, SQL_SS_VARIANT] {
                 assert!(
                     is_supported_conversion(c_type, sql_type),
                     "{c_type} -> {sql_type} should be supported"
                 );
             }
         }
-        assert!(!is_supported_conversion(SQL_C_CHAR, SQL_SS_VARIANT));
-        assert!(is_supported_conversion(SQL_C_WCHAR, SQL_SS_VARIANT));
     }
 
     /// The off-diagonal rows are one-way: a character buffer parses a decimal

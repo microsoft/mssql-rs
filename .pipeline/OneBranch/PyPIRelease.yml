@@ -1,0 +1,173 @@
+#################################################################################
+#                OneBranch Pipeline - mssql-python-rs PyPI Release               #
+#                                                                               #
+# The single ESRP -> PyPI publish pipeline for the `mssql-python-rs` package.    #
+#                                                                               #
+# PHASE 1 (now): publishes a tiny placeholder sdist (see .pipeline/pypi-stub/,   #
+# version 0.0.0) to CREATE and RESERVE the PyPI project name and prove the ESRP  #
+# -> PyPI path end to end.                                                       #
+#                                                                               #
+# PHASE 2 (later): the build stage below is replaced to collect the real,       #
+# signed wheels from the Official Python Wheels Build and publish those. The     #
+# ESRP release stage stays as-is. The placeholder 0.0.0 version is yanked once   #
+# the first real version ships.                                                 #
+#                                                                               #
+# Manual trigger only. `publishToPyPI` defaults to false: a default run is a    #
+# dry run that verifies and stages the committed sdist with NO publish. Flip it  #
+# to true only for a deliberate publish from `stable`.                           #
+#                                                                               #
+# Reuses the shared 'ESRP Federated Creds (AME)' variable group (same AKV cert  #
+# / ESRP creds mssql-python publishes with).                                    #
+#################################################################################
+
+name: $(Year:YY)$(DayOfYear)$(Rev:.r)-PyPI-Release
+
+trigger: none
+pr: none
+
+parameters:
+  - name: publishToPyPI
+    displayName: 'Publish stub to PyPI via ESRP (real reservation). Leave false for a dry run.'
+    type: boolean
+    default: false
+
+variables:
+  - name: CDP_DEFINITION_BUILD_COUNT
+    value: $[counter('', 0)]
+  - name: LinuxContainerImage
+    value: 'mcr.microsoft.com/onebranch/azurelinux/build:3.0'
+  - name: WindowsContainerImage
+    value: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+  - name: DEBIAN_FRONTEND
+    value: noninteractive
+  - group: 'ESRP Federated Creds (AME)'
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+# Official template: required for a real production publish to public PyPI. The
+# pipeline must be classified Production in the product catalog for this to run.
+extends:
+  template: v2/OneBranch.Official.CrossPlat.yml@templates
+  parameters:
+    featureFlags:
+      EnableCDPxPAT: false
+      WindowsHostVersion: 1ESWindows2022
+    globalSdl:
+      binskim:
+        enabled: true
+        scanOutputDirectoryOnly: true
+      credscan:
+        enabled: true
+      policheck:
+        enabled: true
+
+    stages:
+    #########################################################################
+    # The stub sdist is prebuilt and committed under
+    # .pipeline/pypi-stub/dist/, so the pipeline builds nothing: the sealed
+    # OneBranch container has no Python and no outbound network. Dry runs use
+    # the same release job and verification path without invoking ESRP.
+    #########################################################################
+    - stage: ReleaseStub
+      displayName: 'Publish mssql-python-rs stub'
+      jobs:
+      - job: PyPIRelease
+        displayName: 'Verify and publish stub sdist'
+        templateContext:
+          type: releaseJob
+          isProduction: true
+        pool:
+          type: windows
+        variables:
+          ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+          WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'
+        steps:
+        - checkout: self
+          path: s/mssql-rs
+
+        - ${{ if eq(parameters.publishToPyPI, true) }}:
+          - pwsh: |
+              if ("$(Build.SourceBranch)" -ne 'refs/heads/stable') {
+                throw 'PyPI publishing is allowed only from refs/heads/stable.'
+              }
+            displayName: 'Require stable branch for publish'
+
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $sourceRoot = "$(Pipeline.Workspace)/s/mssql-rs/.pipeline/pypi-stub"
+            $dist = Join-Path $sourceRoot 'dist'
+            $stage = "$(Agent.TempDirectory)/pypi-publish"
+            $extract = "$(Agent.TempDirectory)/pypi-verify"
+            Remove-Item $stage, $extract -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $stage, $extract | Out-Null
+
+            $sdists = @(Get-ChildItem $dist -Filter 'mssql_python_rs-*.tar.gz' -File)
+            if ($sdists.Count -ne 1) {
+              throw "Expected exactly one stub sdist, found $($sdists.Count)."
+            }
+
+            tar.exe -xzf $sdists[0].FullName -C $extract
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to extract the stub sdist.' }
+            $archiveRoot = @(Get-ChildItem $extract -Directory)
+            if ($archiveRoot.Count -ne 1) { throw 'Expected one root directory in the stub sdist.' }
+
+            $pyproject = Get-Content (Join-Path $sourceRoot 'pyproject.toml') -Raw
+            $expectedName = [regex]::Match($pyproject, '(?m)^name\s*=\s*"([^"]+)"').Groups[1].Value
+            $expectedVersion = [regex]::Match($pyproject, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+            $init = Get-Content (Join-Path $sourceRoot 'mssql_python_rs/__init__.py') -Raw
+            $initVersion = [regex]::Match($init, '(?m)^__version__\s*=\s*"([^"]+)"').Groups[1].Value
+            if (-not $expectedName -or -not $expectedVersion -or $initVersion -ne $expectedVersion) {
+              throw 'Tracked package name/version metadata is missing or inconsistent.'
+            }
+
+            $pkgInfo = Get-Content (Join-Path $archiveRoot[0].FullName 'PKG-INFO') -Raw
+            $archiveName = [regex]::Match($pkgInfo, '(?m)^Name:\s*(.+)\r?$').Groups[1].Value.Trim()
+            $archiveVersion = [regex]::Match($pkgInfo, '(?m)^Version:\s*(.+)\r?$').Groups[1].Value.Trim()
+            if ($archiveName -ne $expectedName -or $archiveVersion -ne $expectedVersion) {
+              throw "Archive metadata $archiveName $archiveVersion does not match $expectedName $expectedVersion."
+            }
+
+            function Read-Normalized([string] $path) {
+              return (Get-Content $path -Raw).Replace("`r`n", "`n")
+            }
+            $trackedFiles = @('LICENSE', 'README.md', 'pyproject.toml', 'mssql_python_rs/__init__.py')
+            foreach ($relativePath in $trackedFiles) {
+              $tracked = Read-Normalized (Join-Path $sourceRoot $relativePath)
+              $archived = Read-Normalized (Join-Path $archiveRoot[0].FullName $relativePath)
+              if ($tracked -cne $archived) { throw "Archive payload differs from tracked $relativePath." }
+            }
+
+            Copy-Item $sdists[0].FullName $stage
+          displayName: 'Verify and stage stub sdist'
+
+        - ${{ if eq(parameters.publishToPyPI, true) }}:
+          # ContentType PyPI: the real publish. The first PyPI publish of
+          # mssql-python-rs creates and reserves the project name.
+          - task: EsrpRelease@9
+            displayName: 'ESRP Release to PyPI (reserve mssql-python-rs)'
+            inputs:
+              connectedservicename: '$(ESRPConnectedServiceName)'
+              usemanagedidentity: true
+              keyvaultname: '$(AuthAKVName)'
+              signcertname: '$(AuthSignCertName)'
+              clientid: '$(EsrpClientId)'
+              Intent: 'PackageDistribution'
+              ContentType: 'PyPI'
+              ContentSource: 'Folder'
+              FolderLocation: '$(Agent.TempDirectory)/pypi-publish'
+              WaitForReleaseCompletion: true
+              Owners: '$(owner)'
+              Approvers: '$(approver)'
+              ServiceEndpointUrl: 'https://api.esrp.microsoft.com'
+              MainPublisher: 'ESRPRELPACMAN'
+              DomainTenantId: '$(DomainTenantId)'
+
+          - pwsh: |
+              Write-Host 'Reservation publish complete: mssql-python-rs 0.0.0 submitted to PyPI via ESRP.'
+              Write-Host 'The PyPI project name is now reserved. Yank the stub version once the real release lands.'
+            displayName: 'Reservation summary'

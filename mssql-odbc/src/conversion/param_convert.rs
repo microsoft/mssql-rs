@@ -56,7 +56,8 @@ use crate::api::type_rules::{
     is_wide_character_sql_type,
 };
 use crate::conversion::datetime::{
-    DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY, days_since_0001_from_civil,
+    DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY, civil_from_days_since_0001,
+    days_since_0001_from_civil, is_valid_timezone_offset, parse_datetime_literal,
 };
 use crate::conversion::error::ConvError;
 use crate::conversion::numeric::{
@@ -209,6 +210,12 @@ pub(crate) unsafe fn bound_param_to_value(
         (AppValue::Guid(g), SqlFamily::Guid) => SqlType::Uuid(Some(guid_to_uuid(g))),
         (AppValue::DateTime(p), SqlFamily::DateTime) => {
             return convert_datetime_sql(param.sql_type, param.decimal_digits, p);
+        }
+        (AppValue::NarrowText(bytes), SqlFamily::DateTime) => {
+            return datetime_from_text(param, AppText::Utf8(bytes));
+        }
+        (AppValue::WideText(bytes), SqlFamily::DateTime) => {
+            return datetime_from_text(param, AppText::Utf16(bytes));
         }
         // `xml` is UTF-16LE on the wire, which is exactly what a `SQL_C_WCHAR`
         // buffer already holds, so the wide path moves the allocation through.
@@ -1319,6 +1326,62 @@ fn decimal_of(sql_type: SqlSmallInt, value: DecimalParts) -> SqlType {
     }
 }
 
+/// Builds a date/time value from a character buffer, reusing the fetch
+/// direction's literal parser so both directions accept the same forms.
+///
+/// [`convert_datetime_sql`]'s `22007` is remapped to `22018`: that state is for
+/// a C *struct* naming no real instant, whereas a character source that cannot
+/// become its target is a failed cast. msodbcsql agrees - every post-parse
+/// failure in `ParseDateTime` is `CVT_CAST_ERROR`, which is `IDS_22_005`
+/// (`sqlcprot.h:956`). `22008` passes through: a dropped component is an
+/// overflow, not a parse failure.
+fn datetime_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, ParamBuildError> {
+    let mut parts = parse_datetime_literal(&text.into_string())
+        .ok_or(ParamBuildError::Value(ConvError::InvalidCharacterValue))?;
+    if parts.has_tz && param.sql_type != SQL_SS_TIMESTAMPOFFSET {
+        parts = fold_offset_to_utc(parts)?;
+    }
+    convert_datetime_sql(param.sql_type, param.decimal_digits, parts).map_err(|e| match e {
+        ParamBuildError::InvalidDateTime => {
+            ParamBuildError::Value(ConvError::InvalidCharacterValue)
+        }
+        other => other,
+    })
+}
+
+/// Rebases a parsed literal's offset onto UTC and clears it, as msodbcsql's
+/// `ParseDateTime` does for every non-`datetimeoffset` target on the `TOSERVER`
+/// direction (`sqlccnvt.cpp:4820-4849`). Keeping the local wall clock would
+/// send a different instant than the caller wrote, with no diagnostic.
+///
+/// Only whole minutes move, so seconds and fraction are carried across rather
+/// than rebuilt from a tick count, which would round away a sub-tick fraction
+/// [`convert_datetime_sql`] must still reject as `22008`.
+fn fold_offset_to_utc(p: DateTimeParts) -> Result<DateTimeParts, ParamBuildError> {
+    let invalid = ParamBuildError::Value(ConvError::InvalidCharacterValue);
+    // The parser admits an offset only alongside a date and a time.
+    let days = days_since_0001_from_civil(p.year, p.month, p.day).ok_or(invalid)?;
+    let offset_minutes = i64::from(p.tz_hour) * 60 + i64::from(p.tz_minute);
+    let total_minutes = days * 1440 + i64::from(p.hour) * 60 + i64::from(p.minute) - offset_minutes;
+    let utc_days = total_minutes.div_euclid(1440);
+    if !(0..=MAX_DAYS_SINCE_0001).contains(&utc_days) {
+        return Err(invalid);
+    }
+    let minute_of_day = total_minutes.rem_euclid(1440);
+    let date = civil_from_days_since_0001(utc_days);
+    Ok(DateTimeParts {
+        year: date.year,
+        month: date.month,
+        day: date.day,
+        hour: (minute_of_day / 60) as u16,
+        minute: (minute_of_day % 60) as u16,
+        tz_hour: 0,
+        tz_minute: 0,
+        has_tz: false,
+        ..p
+    })
+}
+
 /// Builds a date/time value from an application struct.
 ///
 /// The struct carries no scale, so the wire scale comes from `DecimalDigits`,
@@ -1363,9 +1426,15 @@ fn convert_datetime_sql(
 
     match sql_type {
         SQL_TYPE_DATE => {
-            // Unreachable through the API: the conversion matrix has no
-            // `SQL_C_TYPE_TIMESTAMP` -> `SQL_TYPE_DATE` row, so no binding can
-            // carry a time here yet (AB#47790). msodbcsql accepts the pairing.
+            // A character literal reaches this arm as of AB#47851: the matrix
+            // now has `SQL_C_CHAR`/`SQL_C_WCHAR` -> `SQL_TYPE_DATE`, so
+            // `2024-05-20 12:00:00` arrives here carrying a time and must be
+            // rejected rather than silently truncated to the date. The state
+            // is measured against retail on the compare leg
+            // (`ACharLiteralStillObeysTheTargetRules`,
+            // `FoldingAnOffsetCanMakeADateTargetOverflow`), not just asserted
+            // here. Still no `SQL_C_TYPE_TIMESTAMP` -> `SQL_TYPE_DATE` row,
+            // which msodbcsql accepts and this driver does not (AB#47790).
             if p.has_time && ((p.hour | p.minute | p.second) != 0 || p.fraction_ns != 0) {
                 return Err(truncated);
             }
@@ -1446,19 +1515,6 @@ fn reject_fraction_past_scale(
         return Err(on_truncation);
     }
     Ok(ticks)
-}
-
-/// Port of msodbcsql's `IsValidTimezoneOffsetValue` (`dataconv.cpp:118`).
-///
-/// The mixed-sign rules are the non-obvious part: `+5h -30m` is rejected even
-/// though it totals a legal +4:30, because the two components must agree in
-/// sign. Checking only the total would silently accept it.
-fn is_valid_timezone_offset(tz_hour: i16, tz_minute: i16) -> bool {
-    let total = i32::from(tz_hour) * 60 + i32::from(tz_minute);
-    !((tz_hour > 0 && tz_minute < 0)
-        || (tz_hour < 0 && tz_minute > 0)
-        || !(-59..=59).contains(&tz_minute)
-        || total.abs() > 14 * 60)
 }
 
 /// Typed NULL for a bound parameter.
@@ -2131,6 +2187,444 @@ mod tests {
         }
     }
 
+    /// Binds text as `c_type` against a temporal declaration.
+    fn convert_datetime_text(
+        c_type: SqlSmallInt,
+        sql_type: SqlSmallInt,
+        decimal_digits: SqlSmallInt,
+        text: &str,
+    ) -> Result<TypedValue, ParamBuildError> {
+        let mut bytes: Vec<u8> = if c_type == SQL_C_WCHAR {
+            text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        } else {
+            text.as_bytes().to_vec()
+        };
+        let mut ind: SqlLen = bytes.len() as SqlLen;
+        let mut p = param(c_type, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+        p.sql_type = sql_type;
+        p.decimal_digits = decimal_digits;
+        unsafe { bound_param_to_value(&p) }
+    }
+
+    /// The AB#47851 shape: mssql-python sends `datetime.time` as isoformat text
+    /// with `DecimalDigits` 6, not as a `SQL_C_TYPE_TIME` struct.
+    #[test]
+    fn a_character_time_literal_binds_as_time() {
+        let ticks = 12 * 36_000_000_000u64 + 34 * 600_000_000 + 56 * 10_000_000;
+        for c_type in [SQL_C_CHAR, SQL_C_WCHAR] {
+            for sql_type in [SQL_TYPE_TIME, SQL_SS_TIME2] {
+                let (value, _) =
+                    convert_datetime_text(c_type, sql_type, 6, "12:34:56.000000").unwrap();
+                match value {
+                    SqlType::Time(Some(t)) => assert_eq!(t.time_nanoseconds, ticks),
+                    other => panic!("{c_type} -> {sql_type}: expected Time, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn character_date_and_timestamp_literals_bind() {
+        let (value, _) = convert_datetime_text(SQL_C_CHAR, SQL_TYPE_DATE, 0, "2024-05-20").unwrap();
+        assert!(matches!(value, SqlType::Date(Some(_))));
+
+        let (value, _) =
+            convert_datetime_text(SQL_C_CHAR, SQL_TYPE_TIMESTAMP, 3, "2024-05-20 12:34:56.123")
+                .unwrap();
+        assert!(matches!(value, SqlType::DateTime2(Some(_))));
+    }
+
+    /// The target's own rules still apply to a parsed literal: a date target
+    /// cannot carry a non-zero time.
+    #[test]
+    fn a_character_literal_still_obeys_the_target_rules() {
+        assert_eq!(
+            convert_datetime_text(SQL_C_CHAR, SQL_TYPE_DATE, 0, "2024-05-20 12:00:00").unwrap_err(),
+            ParamBuildError::DateTimeFieldOverflow
+        );
+    }
+
+    /// An unparseable temporal literal is `22018`, matching the decimal row
+    /// above and the fetch direction.
+    #[test]
+    fn an_unparseable_temporal_literal_is_22018() {
+        for text in ["abc", "", "25:00:00", "2023-02-31"] {
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, SQL_TYPE_TIME, 0, text).unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "text {text:?}"
+            );
+        }
+    }
+
+    /// A separator with no time after it names no time, so it is `22018` on
+    /// every target rather than a date-only literal. The time targets rejected
+    /// it on `!has_time` alone; `date` and `timestamp` read the date and
+    /// ignored the dangling separator, which is why this loops over all five.
+    #[test]
+    fn a_dangling_separator_is_22018_for_every_temporal_target() {
+        for sql_type in [
+            SQL_TYPE_DATE,
+            SQL_TYPE_TIME,
+            SQL_SS_TIME2,
+            SQL_TYPE_TIMESTAMP,
+            SQL_SS_TIMESTAMPOFFSET,
+        ] {
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, sql_type, 0, "2024-05-20T").unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "sql_type {sql_type}"
+            );
+        }
+    }
+
+    /// Both character C types must reach the same value on every temporal
+    /// target; a difference by width would be a defect in the decode.
+    #[test]
+    fn both_character_widths_reach_the_same_temporal_value() {
+        for (sql_type, digits, text) in [
+            (SQL_TYPE_DATE, 0, "2024-05-20"),
+            (SQL_TYPE_TIME, 6, "12:34:56.123456"),
+            (SQL_SS_TIME2, 7, "12:34:56.1234567"),
+            (SQL_TYPE_TIMESTAMP, 3, "2024-05-20 12:34:56.123"),
+            (SQL_SS_TIMESTAMPOFFSET, 0, "2024-05-20 12:34:56+05:30"),
+        ] {
+            let narrow = convert_datetime_text(SQL_C_CHAR, sql_type, digits, text).unwrap();
+            let wide = convert_datetime_text(SQL_C_WCHAR, sql_type, digits, text).unwrap();
+            assert_eq!(narrow.0, wide.0, "{sql_type} from {text:?}");
+        }
+    }
+
+    /// The offset is folded into the wire value the same way the struct path
+    /// folds it, so a literal and a `SQL_SS_TIMESTAMPOFFSET_STRUCT` naming the
+    /// same instant cannot disagree.
+    #[test]
+    fn a_character_datetimeoffset_literal_keeps_its_offset() {
+        let (value, _) = convert_datetime_text(
+            SQL_C_CHAR,
+            SQL_SS_TIMESTAMPOFFSET,
+            0,
+            "2024-05-20 12:34:56+05:30",
+        )
+        .unwrap();
+        match value {
+            SqlType::DateTimeOffset(Some(v)) => {
+                assert_eq!(v.offset, 5 * 60 + 30);
+                // 12:34:56 local at +05:30 is 07:04:56 UTC on the wire.
+                let ticks = 7 * 36_000_000_000u64 + 4 * 600_000_000 + 56 * 10_000_000;
+                assert_eq!(v.datetime2.time.time_nanoseconds, ticks);
+            }
+            other => panic!("expected DateTimeOffset, got {other:?}"),
+        }
+    }
+
+    /// A literal with no offset against a `datetimeoffset` target takes
+    /// `+00:00` rather than failing for want of one, matching
+    /// `CAST('2024-05-20 12:34:56' AS datetimeoffset)`. The wall clock is
+    /// already UTC then, so nothing is folded.
+    #[test]
+    fn a_character_datetimeoffset_literal_without_an_offset_defaults_to_utc() {
+        let (value, _) =
+            convert_datetime_text(SQL_C_CHAR, SQL_SS_TIMESTAMPOFFSET, 0, "2024-05-20 12:34:56")
+                .unwrap();
+        match value {
+            SqlType::DateTimeOffset(Some(v)) => {
+                assert_eq!(v.offset, 0);
+                let ticks = 12 * 36_000_000_000u64 + 34 * 600_000_000 + 56 * 10_000_000;
+                assert_eq!(v.datetime2.time.time_nanoseconds, ticks);
+                assert_eq!(
+                    v.datetime2.days,
+                    u32::try_from(days_since_0001_from_civil(2024, 5, 20).unwrap()).unwrap()
+                );
+            }
+            other => panic!("expected DateTimeOffset, got {other:?}"),
+        }
+    }
+
+    /// `DecimalDigits` bounds the value even though the declaration is always at
+    /// maximum scale, exactly as it does for the struct path.
+    #[test]
+    fn a_character_fraction_past_the_declared_scale_is_22008() {
+        assert_eq!(
+            convert_datetime_text(SQL_C_CHAR, SQL_TYPE_TIME, 3, "12:34:56.1234567").unwrap_err(),
+            ParamBuildError::DateTimeFieldOverflow
+        );
+        // A dropped zero is silent, so the same scale accepts the padded form.
+        assert!(convert_datetime_text(SQL_C_CHAR, SQL_TYPE_TIME, 3, "12:34:56.1230000").is_ok());
+    }
+
+    /// A fraction finer than the 100 ns wire tick cannot be carried whatever the
+    /// declared scale says.
+    #[test]
+    fn a_sub_tick_character_fraction_is_22008() {
+        assert_eq!(
+            convert_datetime_text(SQL_C_CHAR, SQL_TYPE_TIME, 7, "12:34:56.123456789").unwrap_err(),
+            ParamBuildError::DateTimeFieldOverflow
+        );
+    }
+
+    /// A timestamp target needs a date; a time-only literal has none to supply.
+    ///
+    /// **Diverges from msodbcsql**, which fills the current local date and
+    /// succeeds (`ParseDateTime`, `sqlccnvt.cpp:4776-4798`). Needs a
+    /// platform-specific local-date helper, tracked by AB#47247.
+    ///
+    /// The state is `22018`, not the `22007` the struct path reports: the
+    /// source is character, and `CVT_CAST_ERROR` is `IDS_22_005`
+    /// (`sqlcprot.h:956`).
+    #[test]
+    fn a_time_only_literal_cannot_fill_a_timestamp() {
+        for sql_type in [SQL_TYPE_TIMESTAMP, SQL_SS_TIMESTAMPOFFSET] {
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, sql_type, 0, "12:34:56").unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "target {sql_type}"
+            );
+        }
+    }
+
+    /// The mirror case: a date-only literal has no time for a `time` target.
+    /// This one is parity - msodbcsql answers `CVT_CAST_ERROR` for exactly this
+    /// pairing (`sqlccnvt.cpp:4801-4806`).
+    #[test]
+    fn a_date_only_literal_cannot_fill_a_time_target() {
+        for sql_type in [SQL_TYPE_TIME, SQL_SS_TIME2] {
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, sql_type, 0, "2024-05-20").unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "target {sql_type}"
+            );
+        }
+    }
+
+    /// A full timestamp into a `time` target keeps the time and drops the date
+    /// silently - no date check exists on that arm. Pinned because a reader
+    /// will assume the asymmetry with the `date` target (which reports `22008`
+    /// for a non-zero time) is a bug rather than the intended shape.
+    #[test]
+    fn a_timestamp_literal_into_a_time_target_drops_the_date() {
+        let ticks = 12 * 36_000_000_000u64 + 34 * 600_000_000 + 56 * 10_000_000;
+        for sql_type in [SQL_TYPE_TIME, SQL_SS_TIME2] {
+            let (value, _) =
+                convert_datetime_text(SQL_C_CHAR, sql_type, 0, "2024-05-20 12:34:56").unwrap();
+            match value {
+                SqlType::Time(Some(t)) => assert_eq!(t.time_nanoseconds, ticks),
+                other => panic!("{sql_type}: expected Time, got {other:?}"),
+            }
+        }
+    }
+
+    /// A valid offset is folded into the value for every target that is not
+    /// `datetimeoffset`, matching msodbcsql's `ParseDateTime`
+    /// (`sqlccnvt.cpp:4820-4849`, `TOSERVER`). Keeping the local wall clock
+    /// would send a different instant than the caller wrote.
+    #[test]
+    fn a_valid_offset_is_folded_to_utc_for_non_offset_targets() {
+        // 12:34:56+05:30 is 07:04:56 UTC on the same day.
+        let utc = 7 * 36_000_000_000u64 + 4 * 600_000_000 + 56 * 10_000_000;
+        let (value, _) = convert_datetime_text(
+            SQL_C_CHAR,
+            SQL_TYPE_TIMESTAMP,
+            0,
+            "2024-05-20 12:34:56+05:30",
+        )
+        .unwrap();
+        match value {
+            SqlType::DateTime2(Some(v)) => {
+                assert_eq!(v.time.time_nanoseconds, utc);
+                assert_eq!(
+                    v.days,
+                    u32::try_from(days_since_0001_from_civil(2024, 5, 20).unwrap()).unwrap()
+                );
+            }
+            other => panic!("expected DateTime2, got {other:?}"),
+        }
+
+        // The time targets keep only the folded time.
+        for sql_type in [SQL_TYPE_TIME, SQL_SS_TIME2] {
+            let (value, _) =
+                convert_datetime_text(SQL_C_CHAR, sql_type, 0, "2024-05-20 12:34:56+05:30")
+                    .unwrap();
+            match value {
+                SqlType::Time(Some(t)) => assert_eq!(t.time_nanoseconds, utc, "{sql_type}"),
+                other => panic!("{sql_type}: expected Time, got {other:?}"),
+            }
+        }
+    }
+
+    /// The fold can move the value onto the previous or next day, which the
+    /// wall-clock reading could never do.
+    #[test]
+    fn folding_an_offset_can_cross_a_date_boundary() {
+        let (value, _) = convert_datetime_text(
+            SQL_C_CHAR,
+            SQL_TYPE_TIMESTAMP,
+            0,
+            "2024-05-20 01:00:00+05:30",
+        )
+        .unwrap();
+        match value {
+            SqlType::DateTime2(Some(v)) => {
+                // 01:00+05:30 is 19:30 UTC on 2024-05-19.
+                assert_eq!(
+                    v.days,
+                    u32::try_from(days_since_0001_from_civil(2024, 5, 19).unwrap()).unwrap()
+                );
+                assert_eq!(
+                    v.time.time_nanoseconds,
+                    19 * 36_000_000_000u64 + 30 * 600_000_000
+                );
+            }
+            other => panic!("expected DateTime2, got {other:?}"),
+        }
+
+        // A negative offset moves the other way: 23:00 - (-05:30) is 04:30 on
+        // 2024-05-21.
+        let (value, _) = convert_datetime_text(
+            SQL_C_CHAR,
+            SQL_TYPE_TIMESTAMP,
+            0,
+            "2024-05-20 23:00:00-05:30",
+        )
+        .unwrap();
+        match value {
+            SqlType::DateTime2(Some(v)) => {
+                assert_eq!(
+                    v.days,
+                    u32::try_from(days_since_0001_from_civil(2024, 5, 21).unwrap()).unwrap()
+                );
+                assert_eq!(
+                    v.time.time_nanoseconds,
+                    4 * 36_000_000_000u64 + 30 * 600_000_000
+                );
+            }
+            other => panic!("expected DateTime2, got {other:?}"),
+        }
+
+        // A fold that leaves the representable range is a failed cast, at
+        // either end of it. `SQL_TYPE_TIME` discards the date, so it is the
+        // only target where the fold's own range guard — rather than the
+        // target's date conversion — is what rejects the value.
+        for target in [SQL_TYPE_TIMESTAMP, SQL_TYPE_TIME] {
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, target, 0, "9999-12-31 23:59:59-05:30")
+                    .unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "{target}"
+            );
+            assert_eq!(
+                convert_datetime_text(SQL_C_CHAR, target, 0, "0001-01-01 00:00:00+05:30")
+                    .unwrap_err(),
+                ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                "{target}"
+            );
+        }
+    }
+
+    /// Folding runs before the target's own rules, so an offset that moves a
+    /// midnight literal off midnight makes it unrepresentable as a `date`.
+    #[test]
+    fn folding_an_offset_can_make_a_date_target_overflow() {
+        assert_eq!(
+            convert_datetime_text(SQL_C_CHAR, SQL_TYPE_DATE, 0, "2024-05-20 00:00:00+05:30")
+                .unwrap_err(),
+            ParamBuildError::DateTimeFieldOverflow
+        );
+        // A zero offset moves nothing, so the same literal still converts.
+        assert!(
+            convert_datetime_text(SQL_C_CHAR, SQL_TYPE_DATE, 0, "2024-05-20 00:00:00+00:00")
+                .is_ok()
+        );
+    }
+
+    /// The fraction is carried across the fold rather than rebuilt, so a
+    /// sub-tick fraction still reaches the scale check.
+    #[test]
+    fn folding_an_offset_preserves_the_fraction() {
+        assert_eq!(
+            convert_datetime_text(
+                SQL_C_CHAR,
+                SQL_TYPE_TIMESTAMP,
+                7,
+                "2024-05-20 12:34:56.123456789+05:30"
+            )
+            .unwrap_err(),
+            ParamBuildError::DateTimeFieldOverflow
+        );
+    }
+
+    /// A date-only literal into a timestamp is midnight, not an error - the
+    /// missing time component is zero rather than absent.
+    #[test]
+    fn a_date_only_literal_fills_a_timestamp_at_midnight() {
+        let (value, _) =
+            convert_datetime_text(SQL_C_CHAR, SQL_TYPE_TIMESTAMP, 0, "2024-05-20").unwrap();
+        match value {
+            SqlType::DateTime2(Some(v)) => assert_eq!(v.time.time_nanoseconds, 0),
+            other => panic!("expected DateTime2, got {other:?}"),
+        }
+    }
+
+    /// Both separators and a padded-to-scale fraction are the forms mssql-python
+    /// actually emits, so they are pinned rather than left to the parser tests.
+    #[test]
+    fn the_consumer_literal_forms_convert() {
+        for text in [
+            "2024-05-20 12:34:56.123000",
+            "2024-05-20T12:34:56.123000",
+            "2024-05-20 12:34:56",
+        ] {
+            assert!(
+                convert_datetime_text(SQL_C_CHAR, SQL_TYPE_TIMESTAMP, 6, text).is_ok(),
+                "text {text:?}"
+            );
+        }
+    }
+
+    /// An out-of-range offset fails the literal for *every* temporal target,
+    /// not just the one that inspects the offset. The non-offset targets
+    /// discard it, so without this the malformed text would convert silently.
+    #[test]
+    fn an_out_of_range_offset_is_rejected_for_every_temporal_target() {
+        for sql_type in [
+            SQL_TYPE_DATE,
+            SQL_TYPE_TIME,
+            SQL_SS_TIME2,
+            SQL_TYPE_TIMESTAMP,
+            SQL_SS_TIMESTAMPOFFSET,
+        ] {
+            for text in [
+                "2024-05-20 00:00:00+14:30",
+                "2024-05-20 00:00:00+14:01",
+                "2024-05-20 00:00:00-14:30",
+            ] {
+                assert_eq!(
+                    convert_datetime_text(SQL_C_CHAR, sql_type, 0, text).unwrap_err(),
+                    ParamBuildError::Value(ConvError::InvalidCharacterValue),
+                    "{sql_type} accepted {text:?}"
+                );
+            }
+            // The boundary itself stays legal. The literal folds *to* midnight
+            // so the `date` target has no time left to reject.
+            assert!(
+                convert_datetime_text(SQL_C_CHAR, sql_type, 0, "2024-05-20 14:00:00+14:00").is_ok(),
+                "{sql_type} rejected +14:00"
+            );
+        }
+    }
+
+    /// A NULL temporal parameter is typed from `ParameterType` alone and never
+    /// reaches the parser, so an unparseable buffer behind a NULL indicator is
+    /// still a NULL rather than `22018`.
+    #[test]
+    fn a_null_character_temporal_parameter_stays_null() {
+        let mut ind: SqlLen = SQL_NULL_DATA;
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_TYPE_TIME;
+        let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+        assert!(matches!(value, SqlType::Time(None)));
+    }
+
     /// `decimal` rejects a zero precision before the value is even parsed, so a
     /// defaulted binding that leaves `ColumnSize` at 0 is `HY104` rather than a
     /// silently mis-declared parameter.
@@ -2599,9 +3093,8 @@ mod tests {
     /// is read as "unstated" and a `ColumnSize` past the target's ceiling is
     /// clamped, rather than either falling through to `max`.
     ///
-    /// Bound `SQL_C_WCHAR` because that is the only pairing the matrix admits
-    /// (AB#47800); the ceiling is the wide one, so a narrow binding here would
-    /// assert 8000 on a path no application can reach.
+    /// Bound `SQL_C_WCHAR`; see `a_narrow_variant_wraps_a_bounded_inner_declaration`
+    /// for the `SQL_C_CHAR` counterpart the matrix now also admits (AB#47800).
     #[test]
     fn a_variant_wraps_a_bounded_inner_declaration() {
         let wide =
@@ -2644,7 +3137,7 @@ mod tests {
     ///
     /// The clamp declares that ceiling, so the overflow is caught here as
     /// `22001` at bind rather than by the server one call later. Both refuse;
-    /// only the diagnostic differs (AB#47800).
+    /// only the diagnostic differs.
     #[test]
     fn a_variant_payload_past_the_wide_ceiling_is_truncation() {
         let text = "x".repeat(SQL_PREC_NCHAR + 1);
@@ -2657,6 +3150,38 @@ mod tests {
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
         assert_eq!(err, ParamBuildError::StringTruncation);
         assert_eq!(err.diag().state, *b"22001");
+    }
+
+    /// Narrow counterpart to `a_variant_wraps_a_bounded_inner_declaration`:
+    /// `SQL_C_CHAR` -> `SQL_SS_VARIANT` is the pairing the conversion matrix
+    /// admitted once mssql-tds could serialize a narrow (BigVarChar) inner
+    /// value (AB#47800). Same rules as the wide case, narrow ceiling.
+    #[test]
+    fn a_narrow_variant_wraps_a_bounded_inner_declaration() {
+        let cases: &[(usize, u16)] = &[
+            (8, 8),
+            // Unstated: the narrow ceiling, not `max`.
+            (0, SQL_PREC_BIGCHARBINARY as u16),
+            // Past the narrow ceiling: clamped, not `max`.
+            (SQL_PREC_BIGCHARBINARY + 1, SQL_PREC_BIGCHARBINARY as u16),
+            (usize::MAX, SQL_PREC_BIGCHARBINARY as u16),
+        ];
+
+        for &(column_size, expected) in cases {
+            let mut bytes = b"hi".to_vec();
+            let mut ind: SqlLen = 2;
+            let mut p = param(SQL_C_CHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+            p.sql_type = SQL_SS_VARIANT;
+            p.column_size = column_size;
+            let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+            match value {
+                SqlType::Variant(inner) => assert!(
+                    matches!(*inner, SqlType::Varchar(Some(_), n) if n == expected),
+                    "column_size {column_size}: got {inner:?}"
+                ),
+                other => panic!("column_size {column_size}: expected Variant, got {other:?}"),
+            }
+        }
     }
 
     /// Every newly bound row must produce a typed NULL from `ParameterType`

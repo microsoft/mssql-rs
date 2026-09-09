@@ -118,5 +118,16 @@ fn mssql_py_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         python_entra_token_factory::invoke_entra_id_token_factory,
         m
     )?)?;
+    #[cfg(debug_assertions)]
+    {
+        m.add_function(wrap_pyfunction!(
+            async_fetch::_arm_fetch_publication_pause,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            async_fetch::_release_fetch_publication_pause,
+            m
+        )?)?;
+    }
     Ok(())
 }

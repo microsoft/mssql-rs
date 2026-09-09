@@ -1,8 +1,8 @@
 #################################################################################
 #                        OneBranch Pipelines - Official Release                 #
-# Downloads NuGet wheel artifacts from the Official Build pipeline and         #
-# publishes them to Azure Artifacts. Also tags the source commit and           #
-# creates a release branch.                                                     #
+# Downloads artifacts from the Official Build pipeline, publishes the wheel    #
+# NuGet package to Azure Artifacts, and can publish Rust crates to crates.io.   #
+# It can also tag the source commit and create a release branch.                #
 #                                                                               #
 # This pipeline does NOT build anything — it consumes artifacts produced by    #
 # OfficialBuild.yml.                                                            #
@@ -29,8 +29,23 @@ parameters:
     type: boolean
     default: false  # Safety: default to false to prevent accidental releases
 
+  - name: publishMssqlTds
+    displayName: 'Publish mssql-tds to crates.io'
+    type: boolean
+    default: false  # Safety: default to false to prevent accidental releases
+
+  - name: publishMssqlMockTds
+    displayName: 'Publish mssql-mock-tds to crates.io'
+    type: boolean
+    default: false  # Safety: default to false to prevent accidental releases
+
+  - name: validateCratesOnly
+    displayName: 'Validate selected Rust crates without publishing'
+    type: boolean
+    default: false
+
   - name: tagRelease
-    displayName: 'Create git tag and release branch'
+    displayName: 'Create mssql-py-core git tag and release branch'
     type: boolean
     default: false  # Safety: default to false
 
@@ -90,6 +105,10 @@ extends:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_nugetPublishing_enabled: ${{ parameters.publishNuGet }}
         steps:
+        - checkout: self
+          persistCredentials: true
+          fetchDepth: 0
+
         #####################################################################
         # Step 1: Download NuGet artifact from the Official Build pipeline
         #####################################################################
@@ -127,17 +146,40 @@ extends:
         - pwsh: |
             $ErrorActionPreference = 'Stop'
 
-            $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
-            if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
-              $version = $Matches[1]
-            } else {
-              Write-Error "Could not extract version from Cargo.toml"
-              exit 1
+            $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
+            $sourceBranch = "$(resources.pipeline.officialBuild.sourceBranch)"
+            git fetch origin $sourceBranch
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not fetch selected build branch $sourceBranch"
+            }
+            git cat-file -e "${commitSha}^{commit}"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Selected build commit $commitSha was not found on $sourceBranch"
+            }
+            function Get-BuildSourceFile {
+              param([string]$Path)
+
+              $content = & git show "${commitSha}:$Path"
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not read $Path from selected build commit $commitSha"
+              }
+              return $content -join "`n"
             }
 
+            $cargoToml = Get-BuildSourceFile "mssql-py-core/Cargo.toml"
+            if ($cargoToml -notmatch '(?ms)^\[package\]\s*$.*?^version\s*=\s*"([^"]+)"') {
+              throw "Could not extract [package].version from selected build commit"
+            }
             # Official release: clean semver, no prerelease suffix
-            $packageVersion = $version
-            $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
+            $packageVersion = $Matches[1]
+
+            $pyprojectToml = Get-BuildSourceFile "mssql-py-core/pyproject.toml"
+            if ($pyprojectToml -notmatch '(?ms)^\[project\]\s*$.*?^name\s*=\s*"([^"]+)".*?^version\s*=\s*"([^"]+)"') {
+              throw "Could not extract [project] name and version from selected build commit"
+            }
+            $distributionName = $Matches[1]
+            $pythonVersion = $Matches[2]
+
             $shortSha = $commitSha.Substring(0, 8)
 
             Write-Host "Release version: $packageVersion"
@@ -158,14 +200,20 @@ extends:
             $wheels | Copy-Item -Destination $wheelsDir -Force
             Write-Host "Collected $($wheels.Count) wheels"
 
+            & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
+              -WheelsDir $wheelsDir `
+              -ExpectedName $distributionName `
+              -ExpectedVersion $pythonVersion `
+              -RequireOdbc:$true
+
             # Create .nuspec
             $nuspecContent = @"
             <?xml version="1.0"?>
             <package>
               <metadata>
-                <id>mssql-py-core-wheels</id>
+                <id>mssql-python-rs-wheels</id>
                 <version>$packageVersion</version>
-                <description>Python wheels for mssql-py-core (official release). Commit: $shortSha. Build: $(resources.pipeline.officialBuild.runID)</description>
+                <description>Python wheels containing the $distributionName TDS core and ODBC driver. Commit: $shortSha. Build: $(resources.pipeline.officialBuild.runID)</description>
                 <authors>SqlClientDrivers</authors>
               </metadata>
               <files>
@@ -174,7 +222,7 @@ extends:
             </package>
             "@
 
-            $nuspecPath = "$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec"
+            $nuspecPath = "$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec"
             $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
             Write-Host "Created nuspec: $nuspecPath"
           displayName: 'Prepare release NuGet package'
@@ -183,7 +231,7 @@ extends:
           displayName: 'Create NuGet package'
           inputs:
             command: pack
-            packagesToPack: '$(Build.StagingDirectory)/mssql-py-core-wheels.nuspec'
+            packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
             packDestination: '$(ob_outputDirectory)/packages'
             basePath: '$(Build.StagingDirectory)'
 
@@ -200,11 +248,123 @@ extends:
           displayName: 'Verify NuGet package'
 
     ###########################################################################
-    # Stage 2: Tag the source commit and create release branch
+    # Stage 2: Publish Rust crates through ESRP
+    ###########################################################################
+    - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
+      - stage: ReleaseCrates
+        displayName: 'Release Rust Crates'
+        dependsOn: Release
+        jobs:
+        - job: PublishRustCrates
+          displayName: 'Publish Rust crates to crates.io'
+          templateContext:
+            type: releaseJob
+            isProduction: true
+          pool:
+            type: windows
+          variables:
+          - group: 'ESRP Federated Creds (AME)'
+          - name: ob_outputDirectory
+            value: '$(Build.ArtifactStagingDirectory)'
+          steps:
+          - checkout: self
+
+          - download: officialBuild
+            artifact: 'drop_Build_RustCrates'
+            displayName: 'Download Rust crate artifacts'
+
+          - pwsh: >
+              .pipeline/scripts/validate-crate-release-artifact.ps1
+              -ArtifactDirectory '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates'
+            displayName: 'Validate Rust crate release artifact'
+
+          - ${{ if eq(parameters.publishMssqlTds, true) }}:
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-tds'
+                -Version '$(mssqlTdsCrateVersion)'
+                -ExpectedState Absent
+                -MaxAttempts 1
+              displayName: 'Preflight mssql-tds version'
+
+          - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-mock-tds'
+                -Version '$(mssqlMockTdsCrateVersion)'
+                -ExpectedState Absent
+                -MaxAttempts 1
+              displayName: 'Preflight mssql-mock-tds version'
+
+          - ${{ if and(eq(parameters.publishMssqlTds, true), ne(parameters.validateCratesOnly, true)) }}:
+            - task: EsrpRelease@12
+              displayName: 'Publish mssql-tds to crates.io'
+              inputs:
+                connectedservicename: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
+                usemanagedidentity: true
+                keyvaultname: '$(AuthAKVName)'
+                signcertname: '$(AuthSignCertName)'
+                clientid: '$(EsrpClientId)'
+                intent: 'PackageDistribution'
+                contenttype: 'Rust'
+                contentsource: 'Folder'
+                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates\mssql-tds'
+                waitforreleasecompletion: true
+                owners: '$(owner)'
+                approvers: '$(approver)'
+                serviceendpointurl: 'https://api.esrp.microsoft.com'
+                mainpublisher: 'ESRPRELPACMAN'
+                domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
+
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-tds'
+                -Version '$(mssqlTdsCrateVersion)'
+                -ExpectedState Available
+              displayName: 'Wait for mssql-tds on crates.io'
+
+          - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.publishMssqlTds, true)) }}:
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-tds'
+                -Version '$(mssqlTdsCrateVersion)'
+                -ExpectedState Available
+                -MaxAttempts 1
+              displayName: 'Verify mssql-tds dependency is published'
+
+          - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.validateCratesOnly, true)) }}:
+            - task: EsrpRelease@12
+              displayName: 'Publish mssql-mock-tds to crates.io'
+              inputs:
+                connectedservicename: 'ESRP Managed Identity federated auth - AME tenant-mssql-rs'
+                usemanagedidentity: true
+                keyvaultname: '$(AuthAKVName)'
+                signcertname: '$(AuthSignCertName)'
+                clientid: '$(EsrpClientId)'
+                intent: 'PackageDistribution'
+                contenttype: 'Rust'
+                contentsource: 'Folder'
+                folderlocation: '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates\mssql-mock-tds'
+                waitforreleasecompletion: true
+                owners: '$(owner)'
+                approvers: '$(approver)'
+                serviceendpointurl: 'https://api.esrp.microsoft.com'
+                mainpublisher: 'ESRPRELPACMAN'
+                domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
+
+            - pwsh: >
+                .pipeline/scripts/test-cratesio-package.ps1
+                -CrateName 'mssql-mock-tds'
+                -Version '$(mssqlMockTdsCrateVersion)'
+                -ExpectedState Available
+              displayName: 'Verify mssql-mock-tds on crates.io'
+
+    ###########################################################################
+    # Stage 3: Tag the mssql-py-core release source
     ###########################################################################
     - ${{ if eq(parameters.tagRelease, true) }}:
       - stage: Tag
-        displayName: 'Tag Release and Create Branch'
+        displayName: 'Tag mssql-py-core Release'
         dependsOn: Release
         jobs:
         - job: TagAndBranch
@@ -216,19 +376,31 @@ extends:
           steps:
           - checkout: self
             persistCredentials: true
+            fetchDepth: 0
 
           - pwsh: |
               $ErrorActionPreference = 'Stop'
 
-              $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
-              if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
+              $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
+              $sourceBranch = "$(resources.pipeline.officialBuild.sourceBranch)"
+              git fetch origin $sourceBranch
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not fetch selected build branch $sourceBranch"
+              }
+              git cat-file -e "${commitSha}^{commit}"
+              if ($LASTEXITCODE -ne 0) {
+                throw "Selected build commit $commitSha was not found on $sourceBranch"
+              }
+              $cargoToml = & git show "${commitSha}:mssql-py-core/Cargo.toml"
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not read Cargo.toml from selected build commit $commitSha"
+              }
+              if (($cargoToml -join "`n") -match '(?ms)^\[package\]\s*$.*?^version\s*=\s*"([^"]+)"') {
                 $version = $Matches[1]
               } else {
-                Write-Error "Could not extract version from Cargo.toml"
-                exit 1
+                throw "Could not extract [package].version from selected build commit"
               }
 
-              $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
               $tagName = "v$version"
               $branchName = "release/$version"
 

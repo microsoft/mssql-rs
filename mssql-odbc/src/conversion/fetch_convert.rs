@@ -31,7 +31,7 @@ use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
 use crate::conversion::datetime::{
     DAYS_0001_TO_1900, DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY,
-    civil_from_days_since_0001, days_in_month, hms_from_ticks_100ns,
+    civil_from_days_since_0001, hms_from_ticks_100ns, parse_datetime_literal,
 };
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{
@@ -315,11 +315,11 @@ pub(crate) unsafe fn convert_guid_c(
 
 /// Converts a TDS `date` into normalized calendar fields.
 pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
-    let (year, month, day) = civil_from_days_since_0001(i64::from(date.get_days()));
+    let date = civil_from_days_since_0001(i64::from(date.get_days()));
     DateTimeParts {
-        year,
-        month,
-        day,
+        year: date.year,
+        month: date.month,
+        day: date.day,
         has_date: true,
         ..Default::default()
     }
@@ -327,12 +327,12 @@ pub(crate) fn date_parts(date: &SqlDate) -> DateTimeParts {
 
 /// Converts a TDS `time` into normalized clock fields.
 pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
-    let (hour, minute, second, fraction_ns) = hms_from_ticks_100ns(time.time_nanoseconds);
+    let t = hms_from_ticks_100ns(time.time_nanoseconds);
     DateTimeParts {
-        hour,
-        minute,
-        second,
-        fraction_ns,
+        hour: t.hour,
+        minute: t.minute,
+        second: t.second,
+        fraction_ns: t.fraction_ns,
         scale: time.scale,
         has_time: true,
         ..Default::default()
@@ -341,11 +341,11 @@ pub(crate) fn time_parts(time: &SqlTime) -> DateTimeParts {
 
 /// Converts a TDS `datetime2` into normalized calendar and clock fields.
 pub(crate) fn datetime2_parts(datetime: &SqlDateTime2) -> DateTimeParts {
-    let (year, month, day) = civil_from_days_since_0001(i64::from(datetime.days));
+    let date = civil_from_days_since_0001(i64::from(datetime.days));
     let mut parts = time_parts(&datetime.time);
-    parts.year = year;
-    parts.month = month;
-    parts.day = day;
+    parts.year = date.year;
+    parts.month = date.month;
+    parts.day = date.day;
     parts.has_date = true;
     parts
 }
@@ -363,17 +363,16 @@ pub(crate) fn datetimeoffset_parts(datetime: &SqlDateTimeOffset) -> Option<DateT
         return None;
     }
 
-    let (year, month, day) = civil_from_days_since_0001(days);
-    let (hour, minute, second, fraction_ns) =
-        hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
+    let date = civil_from_days_since_0001(days);
+    let t = hms_from_ticks_100ns(utc_ticks.rem_euclid(TICKS_PER_DAY) as u64);
     Some(DateTimeParts {
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        fraction_ns,
+        year: date.year,
+        month: date.month,
+        day: date.day,
+        hour: t.hour,
+        minute: t.minute,
+        second: t.second,
+        fraction_ns: t.fraction_ns,
         scale: datetime.datetime2.time.scale,
         tz_hour: datetime.offset / 60,
         tz_minute: datetime.offset % 60,
@@ -393,15 +392,15 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
         ColumnValues::DateTime2(datetime) => return Some(datetime2_parts(datetime)),
         ColumnValues::DateTimeOffset(datetime) => return datetimeoffset_parts(datetime),
         ColumnValues::DateTime(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
             // `datetime` time is counted in 1/300-second ticks since midnight.
             let ticks = u64::from(dt.time);
             let secs = ticks / 300;
             // ODBC exposes the legacy type rounded to millisecond precision.
             let fraction_ms = ((dt.time % 300) * 1_000 + 150) / 300;
-            p.year = y;
-            p.month = m;
-            p.day = day;
+            p.year = date.year;
+            p.month = date.month;
+            p.day = date.day;
             p.hour = (secs / 3600) as u16;
             p.minute = ((secs % 3600) / 60) as u16;
             p.second = (secs % 60) as u16;
@@ -412,10 +411,10 @@ pub(crate) fn extract_datetime_parts(value: &ColumnValues) -> Option<DateTimePar
             p.has_time = true;
         }
         ColumnValues::SmallDateTime(dt) => {
-            let (y, m, day) = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
-            p.year = y;
-            p.month = m;
-            p.day = day;
+            let date = civil_from_days_since_0001(i64::from(dt.days) + DAYS_0001_TO_1900);
+            p.year = date.year;
+            p.month = date.month;
+            p.day = date.day;
             p.hour = dt.time / 60;
             p.minute = dt.time % 60;
             p.has_date = true;
@@ -440,147 +439,6 @@ pub(crate) fn is_datetime_c_target(target_type: SqlSmallInt) -> bool {
             | SQL_C_TIMESTAMP
             | SQL_C_SS_TIMESTAMPOFFSET
     )
-}
-
-/// Parses `YYYY-MM-DD`.
-fn parse_date_literal(s: &str) -> Option<(i16, u16, u16)> {
-    let mut it = s.split('-');
-    let (y, m, d) = (it.next()?, it.next()?, it.next()?);
-    if it.next().is_some() || y.len() != 4 {
-        return None;
-    }
-    // `str::parse` accepts a leading `+`, which would make `+123-01-01` a valid
-    // date; require plain digits.
-    if !y
-        .bytes()
-        .chain(m.bytes())
-        .chain(d.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let year: i16 = y.parse().ok()?;
-    let month: u16 = m.parse().ok()?;
-    let day: u16 = d.parse().ok()?;
-    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
-        return None;
-    }
-    // Reject impossible days (2023-02-31, or 02-29 outside a leap year) rather
-    // than writing them into a date struct as a successful conversion.
-    if !(1..=days_in_month(year, month)).contains(&day) {
-        return None;
-    }
-    Some((year, month, day))
-}
-
-/// Parses `HH:MM[:SS[.f{1,9}]]`, returning the components plus the number of
-/// fractional digits supplied (the effective scale).
-fn parse_time_literal(s: &str) -> Option<(u16, u16, u16, u32, u8)> {
-    let mut it = s.split(':');
-    let hour_s = it.next()?;
-    let minute_s = it.next()?;
-    let sec_part = it.next().unwrap_or("0");
-    if it.next().is_some() {
-        return None;
-    }
-    let (sec_digits, frac_digits) = match sec_part.split_once('.') {
-        Some((a, b)) => (a, b),
-        None => (sec_part, ""),
-    };
-    // `str::parse` accepts a leading `+`, which would make `+1:00:00` a valid
-    // time; require plain digits.
-    if !hour_s
-        .bytes()
-        .chain(minute_s.bytes())
-        .chain(sec_digits.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let hour: u16 = hour_s.parse().ok()?;
-    let minute: u16 = minute_s.parse().ok()?;
-    let second: u16 = sec_digits.parse().ok()?;
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    if !frac_digits.is_empty() && !frac_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    // `SQL_TIMESTAMP_STRUCT.fraction` is nanoseconds, so a character literal can
-    // carry 9 exact digits; msodbcsql rejects anything longer rather than
-    // truncating it, and a character source has no server-side scale to cap it.
-    if frac_digits.len() > 9 {
-        return None;
-    }
-    let mut nanos: u32 = 0;
-    for i in 0..9 {
-        let digit = frac_digits
-            .as_bytes()
-            .get(i)
-            .map_or(0, |b| u32::from(b - b'0'));
-        nanos = nanos * 10 + digit;
-    }
-    Some((hour, minute, second, nanos, frac_digits.len() as u8))
-}
-
-/// Parses the character forms of `date`, `time`, `datetime2` and
-/// `datetimeoffset` into [`DateTimeParts`].
-fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
-    let mut s = text.trim();
-    let mut p = DateTimeParts::default();
-
-    // A trailing "+HH:MM" / "-HH:MM" is a UTC offset. Match it only in that
-    // exact shape so the hyphens inside a date are never mistaken for one.
-    // Compared as bytes: slicing the `str` would panic when a multi-byte
-    // character straddles the boundary, and the payload is server data.
-    if let Some(tail) = s.len().checked_sub(6).and_then(|i| s.as_bytes().get(i..))
-        && (tail[0] == b'+' || tail[0] == b'-')
-        && tail[3] == b':'
-        && tail[1..3].iter().chain(&tail[4..6]).all(u8::is_ascii_digit)
-    {
-        let sign: i16 = if tail[0] == b'+' { 1 } else { -1 };
-        let hh = i16::from(tail[1] - b'0') * 10 + i16::from(tail[2] - b'0');
-        let mm = i16::from(tail[4] - b'0') * 10 + i16::from(tail[5] - b'0');
-        if hh > 14 || mm > 59 {
-            return None;
-        }
-        p.tz_hour = sign * hh;
-        p.tz_minute = sign * mm;
-        p.has_tz = true;
-        // The matched tail is all ASCII, so this boundary is a char boundary.
-        s = s[..s.len() - 6].trim_end();
-    }
-
-    let (date_str, time_str) = match s.split_once(['T', ' ']) {
-        Some((d, t)) => (Some(d), Some(t.trim())),
-        None if s.contains(':') => (None, Some(s)),
-        None => (Some(s), None),
-    };
-
-    if let Some(d) = date_str {
-        let (y, m, day) = parse_date_literal(d)?;
-        p.year = y;
-        p.month = m;
-        p.day = day;
-        p.has_date = true;
-    }
-    if let Some(t) = time_str.filter(|t| !t.is_empty()) {
-        let (h, mi, sec, frac_ns, scale) = parse_time_literal(t)?;
-        p.hour = h;
-        p.minute = mi;
-        p.second = sec;
-        p.fraction_ns = frac_ns;
-        p.scale = scale;
-        p.has_time = true;
-    }
-    if !p.has_date && !p.has_time {
-        return None;
-    }
-    // An offset is only meaningful alongside a date and time.
-    if p.has_tz && !(p.has_date && p.has_time) {
-        return None;
-    }
-    Some(p)
 }
 
 /// Converts a date/time column value, or a character column holding a date/time
@@ -1565,6 +1423,28 @@ mod tests {
         assert_eq!(ok, ConvOk::Exact);
         assert_eq!((out.year, out.month, out.day), (2023, 1, 1));
         assert_eq!((out.hour, out.minute, out.second), (12, 34, 56));
+    }
+
+    /// The offset bound is on the total, so `+14:30` fails here too even though
+    /// the target never reads the offset back out. AB#47851 moved this rule
+    /// into the shared parser; before that the fetch direction bounded hours
+    /// and minutes independently and converted this literal. No SQL Server
+    /// `datetimeoffset` renders such a value, so only a character column can
+    /// carry one to this path.
+    #[test]
+    fn an_out_of_range_offset_is_rejected_for_non_offset_targets() {
+        let mut out = SqlTimestampStruct::default();
+        let mut ind: SqlLen = 0;
+        let err = unsafe {
+            convert_datetime_c(
+                &utf8_col("2023-01-01 12:34:56+14:30"),
+                SQL_C_TYPE_TIMESTAMP,
+                (&mut out as *mut SqlTimestampStruct).cast(),
+                &mut ind,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(err, ConvError::InvalidCharacterValue);
     }
 
     /// Digits that overflow `f64` are out of range, not unparseable text.

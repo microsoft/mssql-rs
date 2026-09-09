@@ -258,11 +258,7 @@ steps:
     displayName: "Update CA certificates on the client"
 
 - ${{ if eq(parameters.buildTarget, 'MacOS') }}:
-  # timeoutInMinutes backstops the scripts' own wall-clock budgets: the macOS
-  # job caps at 60 minutes and SQL setup must not be what exhausts it.
-  - script: bash .pipeline/scripts/start-colima-macos.sh
-    displayName: 'Install and start Colima-based Docker'
-    timeoutInMinutes: 15
+  - template: macos-docker-steps.yml
 
   - script: bash .pipeline/scripts/start-sql-server-macos.sh
     displayName: 'Start SQL Server (Docker, no TLS certs)'

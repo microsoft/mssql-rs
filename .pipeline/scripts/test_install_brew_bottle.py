@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import os
+import stat
 import tarfile
 import tempfile
 import unittest
@@ -141,11 +142,20 @@ class HostRanking(unittest.TestCase):
 
 
 def make_bottle(entries):
-    """A gzipped tar of `(name, is_file)` members, as the registry serves them."""
+    """A gzipped tar of `(name, is_file)` members, as the registry serves them.
+
+    A member may also be `(name, 'symlink', linkname)` to aim a link precisely.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name, is_file in entries:
-            if is_file:
+        for entry in entries:
+            name, kind = entry[0], entry[1]
+            if kind == "symlink":
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.SYMTYPE
+                info.linkname = entry[2]
+                tar.addfile(info)
+            elif kind:
                 payload = b"#!/bin/sh\n"
                 info = tarfile.TarInfo(name)
                 info.size = len(payload)
@@ -187,6 +197,137 @@ class Extraction(unittest.TestCase):
     def test_a_bottle_without_bin_entries_is_an_error(self):
         with self.assertRaises(RuntimeError):
             self.extract([("docker/29.7.2/README.md", True)])
+
+
+class PrefixExtraction(unittest.TestCase):
+    """extract_prefix merges several bottles into one relocatable prefix."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+
+    def extract(self, formula, version, entries):
+        return bottle.extract_prefix(make_bottle(entries), formula, version, self.root)
+
+    def on_disk(self):
+        return sorted(
+            str(p.relative_to(self.root))
+            for p in Path(self.root).rglob("*")
+            if p.is_file() or p.is_symlink()
+        )
+
+    def test_root_metadata_is_namespaced_per_formula(self):
+        # Every formula ships its own LICENSE/sbom at the prefix root; merging
+        # them flat would keep only the last one extracted.
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/LICENSE", True),
+            ("docker/29.7.2/sbom.spdx.json", True),
+        ])
+        self.extract("lima", "2.2.0", [
+            ("lima/2.2.0/LICENSE", True),
+            ("lima/2.2.0/sbom.spdx.json", True),
+        ])
+        self.assertEqual(self.on_disk(), [
+            "metadata/docker/LICENSE",
+            "metadata/docker/sbom.spdx.json",
+            "metadata/lima/LICENSE",
+            "metadata/lima/sbom.spdx.json",
+        ])
+
+    def test_functional_content_still_merges_into_a_shared_prefix(self):
+        # limactl resolves ../share/lima relative to its own bin/, so the
+        # subdirectories must merge rather than be namespaced.
+        self.extract("docker", "29.7.2", [("docker/29.7.2/bin/docker", True)])
+        self.extract("lima", "2.2.0", [
+            ("lima/2.2.0/bin/limactl", True),
+            ("lima/2.2.0/share/lima/lima-guestagent.Linux-x86_64.gz", True),
+            ("lima/2.2.0/libexec/lima/lima-driver-vz", True),
+        ])
+        self.assertEqual(self.on_disk(), [
+            "bin/docker",
+            "bin/limactl",
+            "libexec/lima/lima-driver-vz",
+            "share/lima/lima-guestagent.Linux-x86_64.gz",
+        ])
+
+    def test_brew_bookkeeping_is_not_shipped(self):
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/.brew/docker.rb", True),
+            ("docker/29.7.2/bin/docker", True),
+        ])
+        self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_revision_tag_reads_the_unrevised_cellar_directory(self):
+        self.extract("docker", "29.7.2-1", [("docker/29.7.2/bin/docker", True)])
+        self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_traversal_outside_the_prefix_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            self.extract("docker", "29.7.2", [("docker/29.7.2/bin/../../../evil", True)])
+        self.assertEqual(self.on_disk(), [])
+
+    def test_an_absolute_symlink_is_refused(self):
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/bin/docker", True),
+            ("docker/29.7.2/bin/escape", "symlink", "/etc/passwd"),
+        ])
+        self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_a_relative_symlink_that_lands_back_inside_is_kept(self):
+        # `../elsewhere` from bin/ resolves to <prefix>/elsewhere, which is in
+        # the prefix. Judging the linkname by its leading `../` would refuse a
+        # link that never leaves.
+        self.extract("docker", "29.7.2", [
+            ("docker/29.7.2/bin/docker", True),
+            ("docker/29.7.2/bin/sibling", "symlink", "../elsewhere"),
+        ])
+        self.assertEqual(self.on_disk(), ["bin/docker", "bin/sibling"])
+
+    def test_the_archive_cannot_ask_for_setuid(self):
+        blob = make_bottle([("docker/29.7.2/bin/docker", True)])
+        # Rewrite the member's mode: tarfile keeps whatever the archive says.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(blob)) as src, \
+                tarfile.open(fileobj=buf, mode="w:gz") as out:
+            for member in src.getmembers():
+                member.mode = 0o4777
+                out.addfile(member, src.extractfile(member))
+        bottle.extract_prefix(buf.getvalue(), "docker", "29.7.2", self.root)
+        mode = os.stat(os.path.join(self.root, "bin/docker")).st_mode
+        self.assertFalse(mode & stat.S_ISUID, "setuid survived extraction")
+        self.assertFalse(mode & stat.S_ISGID, "setgid survived extraction")
+        self.assertFalse(mode & stat.S_IWOTH, "world-writable survived extraction")
+        self.assertTrue(mode & stat.S_IXUSR, "the executable bit should survive")
+
+    def test_a_symlink_climbing_out_through_a_subdirectory_is_refused(self):
+        # No leading `../`, so a prefix test on the linkname alone accepts it,
+        # and a later member written through the link lands outside the prefix.
+        for linkname in ("a/../../../outside", "./../../outside", "bin/../../.."):
+            with self.subTest(linkname=linkname):
+                self.setUp()
+                self.extract("docker", "29.7.2", [
+                    ("docker/29.7.2/bin/docker", True),
+                    ("docker/29.7.2/bin/escape", "symlink", linkname),
+                ])
+                self.assertEqual(self.on_disk(), ["bin/docker"])
+
+    def test_a_symlink_staying_inside_the_prefix_is_kept(self):
+        # lima ships these, so refusing every symlink is not an option.
+        self.extract("lima", "2.2.0", [
+            ("lima/2.2.0/bin/limactl", True),
+            ("lima/2.2.0/bin/nested/../limactl-alias", "symlink", "limactl"),
+            ("lima/2.2.0/share/lima/link", "symlink", "../../bin/limactl"),
+        ])
+        self.assertEqual(
+            self.on_disk(), ["bin/limactl", "bin/limactl-alias", "share/lima/link"]
+        )
+
+
+class FormulaNames(unittest.TestCase):
+    def test_a_name_that_is_really_more_url_is_refused(self):
+        # The name is pasted into registry URLs.
+        for name in ("../../evil", "docker/../other", "docker?tag=x", "", "Docker"):
+            with self.assertRaises(RuntimeError, msg=name):
+                bottle.anonymous_token(name)
 
 
 if __name__ == "__main__":
