@@ -25,7 +25,7 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_NUMERIC, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME,
+    SQL_C_NUMERIC, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
     SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
     SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH,
@@ -542,7 +542,9 @@ pub(super) fn set_precision(
 /// the scale as unsigned, which rejects any negative value outright for a 3.x
 /// app. Reusing the AD-only allowance for an IPD record would let a bound
 /// `SQL_NUMERIC` parameter accept a negative `SQL_DESC_SCALE` that msodbcsql
-/// (and the RPC wire format) would never allow.
+/// (and the RPC wire format) would never allow. `CheckSqlPrecScale<FALSE>`
+/// (`sqlcdesc.cpp:11527-11539`) applies the identical bound to `SQL_DECIMAL`,
+/// so an IPD record's SQL type check also matches that constant.
 pub(super) fn set_scale(
     state: &mut DescState,
     kind: DescKind,
@@ -558,7 +560,7 @@ pub(super) fn set_scale(
     let record_info = state
         .record(record_number)
         .map(|r| (r.concise_type, r.precision));
-    if let Some((SQL_C_NUMERIC, precision)) = record_info
+    if let Some((SQL_C_NUMERIC | SQL_DECIMAL, precision)) = record_info
         && (scale > precision || (!is_application && scale < 0))
     {
         error!(
@@ -1276,6 +1278,35 @@ mod tests {
                 1,
                 SQL_DESC_TYPE,
                 SQL_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, (-1isize) as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_PRECISION_OR_SCALE);
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, 3isize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.ipd(), 1, SQL_DESC_SCALE), 3);
+    }
+
+    /// `CheckSqlPrecScale<FALSE>` applies the identical unsigned-scale bound
+    /// to `SQL_DECIMAL` as it does to `SQL_NUMERIC` (`sqlcdesc.cpp:11527-
+    /// 11539`, same `case` block), so an IPD `SQL_DECIMAL` record must reject
+    /// a negative `SQL_DESC_SCALE` just like `SQL_NUMERIC` above.
+    #[test]
+    fn set_desc_field_ipd_decimal_scale_may_not_be_negative() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_DECIMAL as isize as SqlPointer,
                 0,
             )
         };
