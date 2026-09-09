@@ -419,6 +419,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     stmt_state.pending_unprepare = orphaned;
                     // No set ran, so there is no count at all.
                     stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
+                    stmt_state.clear_exhaustion_state();
                     stmt_state.clear_state(STMT_STATE_EXEC_STARTED | STMT_STATE_CURSOR_OPEN);
                     stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
                 }

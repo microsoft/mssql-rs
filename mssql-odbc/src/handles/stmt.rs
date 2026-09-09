@@ -1011,9 +1011,10 @@ impl StmtState {
     /// Clears everything AB#47508's read-ahead peek can leave behind, so a
     /// fresh result set never inherits a previous one's exhaustion state or
     /// deferred diagnostics. Called from every `finish_execute` terminal
-    /// branch and `close_cursor.rs`'s `reset_cursor_state` — folded into one
-    /// method so the invariant lives in a single place rather than four
-    /// call sites that could each independently drift or be missed.
+    /// branch, the all-`SQL_PARAM_IGNORE` batch early return, and
+    /// `close_cursor.rs`'s `reset_cursor_state` — folded into one method so
+    /// the invariant lives in a single place rather than several call sites
+    /// that could each independently drift or be missed.
     pub(crate) fn clear_exhaustion_state(&mut self) {
         self.result_set_exhausted = false;
         self.batch_exhausted = false;

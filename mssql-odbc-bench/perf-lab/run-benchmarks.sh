@@ -472,6 +472,11 @@ run_leg() {
     local driver="$2"
     local output="$3"
     local write_mode=parameter_array
+    # KNOWN GAP (microsoft/mssql-rs#534): this baseline/candidate mode split makes
+    # the regression gate apples-to-oranges for write/ - a sequential-mode
+    # baseline vs a batched candidate never crosses the 1.05 regression ratio, and
+    # it is selected by driver name rather than capability, so it will not
+    # self-heal once the baseline can run parameter arrays. See #534 for options.
     if [ "$scenario" = "write" ] && [ "$driver" = "$BASELINE_DRIVER_NAME" ]; then
         write_mode=sequential
     fi
