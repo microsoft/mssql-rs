@@ -2257,11 +2257,14 @@ fn stream_active_plp_chunk<'a>(
         };
     } else if target_type == SQL_C_BINARY {
         // Binary delivery is a straight byte copy with no terminator, whatever
-        // the column's encoding. Every binary read that moves bytes qualifies for
-        // `direct_wire_output` -- the gates above guarantee `plp_encoding` is
-        // `Some` here, so it is false only when there is no room or no buffer,
-        // and then `read` is 0 -- meaning the payload already landed in the
-        // caller's buffer and only the length is left to report.
+        // the column's encoding. The gates above guarantee `plp_encoding` is
+        // `Some`, so `direct_wire_output` is false only for a zero-length buffer
+        // (`read == 0`) or a null `target_value_ptr`, which the Driver Manager
+        // rejects with HY009 before the call reaches the driver.
+        debug_assert!(
+            direct_wire_output || read == 0,
+            "binary chunk read {read} bytes without a caller buffer to put them in"
+        );
         unsafe {
             write_if_some(strlen_or_ind_ptr, read as SqlLen);
         }
