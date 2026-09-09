@@ -448,11 +448,12 @@ pub(crate) struct StmtState {
     /// 1-based column number of the last successful SQLGetData call on this row.
     /// Used to enforce forward-only column access (07009) and SQL_NO_DATA on re-read.
     pub(crate) current_row_last_col: usize,
-    /// Byte/code-unit offset into the current non-PLP column's text, for
+    /// Byte/code-unit offset into the current non-PLP column's value, for
     /// resumable `SQLGetData`. `(1-based column, offset)`; `None` when no
     /// partial read is outstanding. The offset unit matches the target C type
-    /// the column is being read as (bytes for `SQL_C_CHAR`, UTF-16 code units
-    /// for `SQL_C_WCHAR`); a single column's chunk loop uses one target type.
+    /// the column is being read as (bytes for `SQL_C_CHAR` and `SQL_C_BINARY`,
+    /// UTF-16 code units for `SQL_C_WCHAR`); a single column's chunk loop uses
+    /// one target type.
     pub(crate) partial_text_offset: Option<(usize, usize)>,
     /// Direct string path already validated for `(1-based column, C target type)`.
     pub(crate) direct_text_target: Option<(usize, SqlSmallInt)>,

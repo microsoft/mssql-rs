@@ -1,5 +1,13 @@
 #!/bin/bash
-# Installs Docker + Colima on a Microsoft-hosted macOS agent and boots the VM.
+# Boots a Colima VM on a Microsoft-hosted macOS agent from a prebuilt toolchain.
+#
+# Nothing is installed here and nothing is downloaded: TOOLCHAIN_DIR points at a
+# payload of docker, colima, lima and colima's guest image, fetched from our own
+# feed by .pipeline/templates/macos-docker-steps.yml and produced by
+# .pipeline/macos-docker-toolchain-pipeline.yml. A run therefore contacts
+# neither Homebrew nor ghcr.io nor github.com, which is the point: Homebrew
+# dropping the Intel docker bottle at 29.8.0 turned `brew install docker` into
+# an 8-minute Go build, and colima's image download has failed on DNS.
 #
 # Colima's VM boot is flaky on hosted macOS (~3% of runs): the lima hostagent
 # either misses its 5s startup window or never emits the `running` event. Both
@@ -25,58 +33,80 @@ COLIMA_START_TIMEOUT_SECONDS=${COLIMA_START_TIMEOUT_SECONDS:-540}
 # The macOS job only gets 60 minutes, so cap the retries by wall clock rather
 # than letting three boots of an unhealthy agent eat the test budget.
 COLIMA_BUDGET_SECONDS=${COLIMA_BUDGET_SECONDS:-480}
-# `brew install docker` is deliberately not used bare. Homebrew ships no bottle
-# for the docker CLI on Intel macOS as of 29.8.0, so a bare install compiles it
-# from source and builds Go (~8 min) to do so. Measured over 147 runs: agents
-# that resolved the bottled 29.7.2 finished this phase in 29s median and failed
-# 1% of the time, while agents that built 29.8.0 took 441s median (774s max) and
-# failed 36% — the build alone exhausted the step timeout.
-#
-# `--force-bottle` makes brew fail rather than fall back to source. When it does
-# fail, install-brew-bottle.py takes the newest version that *is* bottled for
-# this platform straight from Homebrew's registry, so there is no version to pin
-# by hand and no third-party download. Both paths therefore install exactly what
-# Homebrew would have, and this self-heals once the current version is bottled
-# again — which on arm64 it already is.
-DOCKER_CLI_DIR=${DOCKER_CLI_DIR:-$HOME/.docker-cli/bin}
-# Bounded so a slow install fails here with a message rather than silently
-# consuming the step budget and surfacing as an opaque "task has timed out".
-INSTALL_TIMEOUT_SECONDS=${INSTALL_TIMEOUT_SECONDS:-300}
+# The payload to run from. Required: there is no second way to get a docker CLI
+# onto the agent, and a run that quietly found one some other way would not be
+# the run we tested.
+TOOLCHAIN_DIR=${TOOLCHAIN_DIR:-}
 
-install_tooling() {
-  # `set -e` is suppressed inside a function called from a conditional, so every
-  # prerequisite has to report failure explicitly or a broken brew would look
-  # like a successful install and only surface as a confusing colima failure.
-  brew update || return 1
-  brew install colima || return 1
-
-  if brew install --force-bottle docker; then
-    return 0
-  fi
-  echo "##[warning]No docker CLI bottle for the current version on this platform; falling back to the newest bottled version"
-  python3 "$(dirname "$0")/install-brew-bottle.py" docker "$DOCKER_CLI_DIR" || return 1
+fail() {
+  echo "##[error]$1"
+  exit 1
 }
 
-# A leftover directory would make the "did we fall back?" check below lie.
-rm -rf "$DOCKER_CLI_DIR"
+manifest_field() {
+  python3 -c 'import json, sys
+value = json.load(open(sys.argv[1]))
+for key in sys.argv[2:]:
+    value = value[key]
+print(value)' "$TOOLCHAIN_DIR/manifest.json" "$@"
+}
 
-install_status=0
-run_bounded "$INSTALL_TIMEOUT_SECONDS" install_tooling || install_status=$?
-if [ "$install_status" -eq 124 ]; then
-  echo "##[error]Installing colima and the docker CLI did not finish within ${INSTALL_TIMEOUT_SECONDS}s"
-  exit 1
-elif [ "$install_status" -ne 0 ]; then
-  echo "##[error]Installing colima and the docker CLI failed (exit $install_status)"
-  exit 1
-fi
+# Manifest values that become paths are checked rather than trusted. The
+# payload is ours, but "it came from our feed" is not the same as "it is
+# well-formed", and these are joined onto a directory.
+plain_name() {
+  case "$1" in
+    "" | . | .. | */* | *[!A-Za-z0-9._-]*)
+      fail "toolchain manifest gave $2 as '$1', which is not a plain file name" ;;
+  esac
+}
 
-# Only the fallback populates DOCKER_CLI_DIR; brew's own docker is already on PATH.
-# prependpath only affects later steps, so also fix PATH for this one.
-if [ -x "$DOCKER_CLI_DIR/docker" ]; then
-  export PATH="$DOCKER_CLI_DIR:$PATH"
-  echo "##vso[task.prependpath]$DOCKER_CLI_DIR"
-fi
+# Puts the packaged toolchain on PATH and seeds colima's image cache. Nothing
+# here is bounded, unlike `colima start` below: it is local file work against a
+# payload the agent already has.
+install_from_package() {
+  [ -n "$TOOLCHAIN_DIR" ] \
+    || fail "TOOLCHAIN_DIR is not set; this script runs from the packaged toolchain (see .pipeline/templates/macos-docker-steps.yml)"
+  [ -f "$TOOLCHAIN_DIR/manifest.json" ] \
+    || fail "no manifest.json in the toolchain payload at $TOOLCHAIN_DIR"
+
+  # Universal Packages do not carry POSIX modes, so the executable bit does not
+  # survive the round trip through the feed.
+  chmod -R +x "$TOOLCHAIN_DIR/bin" "$TOOLCHAIN_DIR/libexec" 2>/dev/null || true
+  export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+  echo "##vso[task.prependpath]$TOOLCHAIN_DIR/bin"
+
+  # Checked here rather than left to fail at the first use: `colima start`
+  # reporting a missing limactl is a much longer walk back to "the payload was
+  # incomplete".
+  local tool
+  for tool in docker colima limactl; do
+    [ -x "$TOOLCHAIN_DIR/bin/$tool" ] || fail "toolchain payload has no executable bin/$tool"
+  done
+
+  # colima looks the guest image up in this cache by sha256 of the URL it would
+  # otherwise download it from, so seeding it under that name is what keeps the
+  # ~350 MB fetch from github.com out of the job.
+  local cache_dir="$HOME/Library/Caches/colima/caches"
+  local cache_name image_name cached image
+  cache_name=$(manifest_field image cache_filename)
+  image_name=$(manifest_field image filename)
+  plain_name "$cache_name" "image.cache_filename"
+  plain_name "$image_name" "image.filename"
+  cached="$cache_dir/$cache_name"
+  image="$TOOLCHAIN_DIR/image/$image_name"
+  [ -f "$image" ] || fail "toolchain payload has no guest image at $image"
+  mkdir -p "$cache_dir"
+  [ -f "$cached" ] || cp "$image" "$cached"
+
+  echo "toolchain: $(manifest_field arch) payload, layout $(manifest_field payload_format), id $(manifest_field identity)"
+  echo "guest image seeded at $cached ($(du -h "$cached" | cut -f1))"
+}
+
+install_from_package
+
 docker --version
+colima version | head -1
 
 start_time=$(date +%s)
 deadline=$((start_time + COLIMA_BUDGET_SECONDS))
@@ -96,6 +126,11 @@ while [ "$attempts" -lt "$COLIMA_START_ATTEMPTS" ]; do
 
   attempts=$((attempts + 1))
   echo "##[group]colima start (attempt $attempts/$COLIMA_START_ATTEMPTS, ${limit}s limit)"
+  # The only bounded command in this script, and it must stay that way: on
+  # timeout run_bounded signals the bounded command's own process group, so a
+  # wedged boot cannot leave limactl or qemu alive holding the task's stdout.
+  # Nesting another run_bounded around this one would put that group out of
+  # reach of the outer kill and reintroduce exactly that orphan.
   if run_bounded "$limit" colima start --cpu "$COLIMA_CPU" --memory "$COLIMA_MEMORY" --disk "$COLIMA_DISK"; then
     echo "##[endgroup]"
     docker context use colima >/dev/null || true

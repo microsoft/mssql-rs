@@ -5,11 +5,14 @@
 """Install the newest Homebrew bottle of a formula that exists for this platform.
 
 Homebrew publishes bottles as OCI artifacts on ghcr.io, readable anonymously.
-When `brew install --force-bottle` fails because the *current* formula version
-has no bottle for the running platform (docker 29.8.0 ships arm64 macOS and
-Linux only), the previous version usually still does. This walks the registry
-newest-first, finds a version bottled for this platform, and extracts its
-binaries.
+That is the only thing this needs: no `brew`, no taps, no local Homebrew state.
+It walks the registry newest-first, finds a version bottled for the requested
+platform, and extracts it — which matters because the current version is not
+always bottled everywhere (docker 29.8.0 ships arm64 macOS and Linux only, so
+Intel resolves to 29.7.2-1).
+
+Used by build-macos-docker-toolchain.py to assemble the macOS docker toolchain
+payload, cross-building both architectures from Linux via BOTTLE_ARCH_OVERRIDE.
 
 The bottle blob is content-addressed: the layer digest is its SHA-256, so the
 download is verified against the digest the registry advertises rather than a
@@ -80,6 +83,10 @@ def _get(url, token=None, accept=None, binary=False, attempts=3):
 
 
 def anonymous_token(formula):
+    # The name is pasted into registry URLs below, so it has to look like a
+    # formula and not like more path or query.
+    if not re.match(r"^[a-z0-9][a-z0-9._+-]*$", formula):
+        raise RuntimeError(f"{formula!r} is not a Homebrew formula name")
     scope = f"repository:{REPO_PREFIX}/{formula}:pull"
     data, _ = _get(f"{REGISTRY}/token?service=ghcr.io&scope={scope}")
     return data["token"]
@@ -243,6 +250,66 @@ def extract_bin(blob, formula, version, dest_dir):
     if not installed:
         raise RuntimeError(f"bottle for {formula} {version} contained no bin/ entries")
     return installed
+
+
+def extract_prefix(blob, formula, version, dest_root):
+    """Extract the whole install prefix, merging it into dest_root.
+
+    lima is not self-contained in bin/: limactl reaches for
+    ../share/lima/lima-guestagent.* and ../libexec/lima/*, so a bin-only copy
+    produces a lima that cannot boot a VM.
+
+    Files at the prefix root are per-formula metadata (LICENSE, NOTICE,
+    README.md, sbom.spdx.json, ...) and every formula ships its own, so a
+    merged prefix would keep only whichever was extracted last. Those go to
+    metadata/<formula>/ instead; everything functional lives in a subdirectory
+    and merges as-is.
+    """
+    base, _ = ref_parts(version)
+    root = f"{formula}/{base}/"
+    extracted = []
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if not (member.isfile() or member.issym()):
+                continue
+            # Never a path that escapes the prefix -- the archive is untrusted.
+            name = os.path.normpath(member.name).replace(os.sep, "/")
+            if not name.startswith(root) or ".." in name.split("/"):
+                continue
+            relative = name[len(root):]
+            if relative.startswith(".brew/"):
+                continue
+            if "/" not in relative:
+                relative = f"metadata/{formula}/{relative}"
+            target = os.path.join(dest_root, relative)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if member.issym():
+                # Where the link would land, relative to dest_root. Testing the
+                # linkname for a leading `../` is not enough: `a/../../outside`
+                # has none and still escapes, and a later member writing
+                # through the link would follow it out of the prefix.
+                landing = os.path.normpath(
+                    os.path.join(os.path.dirname(relative), member.linkname)
+                )
+                if os.path.isabs(member.linkname) or landing.split("/")[0] == "..":
+                    continue
+                if os.path.lexists(target):
+                    os.unlink(target)
+                os.symlink(member.linkname, target)
+            else:
+                src = tar.extractfile(member)
+                if src is None:
+                    continue
+                with open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                # Masked, not honoured: the archive should not get to ask for
+                # setuid, setgid, sticky or group/other write on a file being
+                # unpacked onto the agent.
+                os.chmod(target, (member.mode or 0o644) & 0o755)
+            extracted.append(relative)
+    if not extracted:
+        raise RuntimeError(f"bottle for {formula} {version} extracted nothing")
+    return extracted
 
 
 def main():
