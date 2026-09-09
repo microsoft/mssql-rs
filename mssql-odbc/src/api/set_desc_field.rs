@@ -439,12 +439,21 @@ pub(super) fn set_type(
         }
     };
 
+    // Scoped to AppParam/Ad, not AppRow: this mirrors msodbcsql's APD-side
+    // SetTypeDefaults reset (SQL_C_NUMERIC's (SQL_PREC_NUMERIC, 0) default),
+    // which is a parameter-binding concept with no ARD analogue verified
+    // here. Including AppRow would drop an already-bound fetch column's
+    // `data_ptr` the moment its C type is retyped through the ARD, turning a
+    // legitimate rebind into a silent unbind with no e2e coverage for that
+    // half.
+    let is_application_param = matches!(kind, DescKind::AppParam | DescKind::Ad);
     write_record_field(state, record_number, |r| {
         r.concise_type = resolved;
         r.datetime_interval_code = datetime_interval_code_for(resolved);
-        if kind.is_application() {
+        if is_application_param {
             r.data_ptr = std::ptr::null_mut();
             r.data_bound = false;
+            r.precision_scale_explicit = false;
             if resolved == SQL_C_NUMERIC {
                 r.precision = SQL_PREC_NUMERIC;
                 r.scale = 0;
@@ -517,6 +526,7 @@ pub(super) fn set_precision(
 
     write_record_field(state, record_number, |r| {
         r.precision = precision;
+        r.precision_scale_explicit = true;
         r.explicitly_bound = true;
     })
 }
@@ -561,6 +571,7 @@ pub(super) fn set_scale(
 
     write_record_field(state, record_number, |r| {
         r.scale = scale;
+        r.precision_scale_explicit = true;
         r.explicitly_bound = true;
     })
 }

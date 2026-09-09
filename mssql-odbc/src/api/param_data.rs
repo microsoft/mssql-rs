@@ -333,6 +333,11 @@ fn sql_param_data_safe(
                 statement_handle,
                 client,
                 "SQLParamData",
+                // `false`: a DAE completion never carries a
+                // fractional-truncation warning here, since the truncation
+                // check runs once against the already-fully-streamed value
+                // (`decimal_from_numeric`/`decimal_from_text`), not per
+                // `SQLPutData` chunk.
                 false,
             )
         }

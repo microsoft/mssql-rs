@@ -85,6 +85,8 @@ fn ird_record_from_metadata(meta: &ColumnMetadata) -> DescRecord {
         indicator_ptr: std::ptr::null_mut(),
         octet_length_ptr: std::ptr::null_mut(),
         data_bound: false,
+        // APD-only flag; meaningless on an IRD record.
+        precision_scale_explicit: false,
         // IPD-only flag; meaningless on an IRD record.
         explicitly_bound: false,
     }

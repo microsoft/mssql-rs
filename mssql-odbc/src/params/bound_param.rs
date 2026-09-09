@@ -43,6 +43,11 @@ pub(crate) struct BoundParam {
     pub(crate) decimal_digits: SqlSmallInt,
     pub(crate) app_precision: SqlSmallInt,
     pub(crate) app_scale: SqlSmallInt,
+    /// Whether the application itself wrote the APD's `SQL_DESC_PRECISION`/
+    /// `SQL_DESC_SCALE` (`SQLSetDescField`/`SQLSetDescRec`), rather than
+    /// merely inheriting this driver's own default-fill. See
+    /// `DescRecord::precision_scale_explicit`.
+    pub(crate) precision_scale_explicit: bool,
     /// Pointer to the application's value buffer (read at execute time).
     pub(crate) parameter_value_ptr: *mut c_void,
     /// Length in bytes of the application value buffer.
@@ -136,6 +141,11 @@ impl BoundParam {
         apd_record.octet_length = self.buffer_length;
         apd_record.indicator_ptr = self.strlen_or_ind_ptr as SqlPointer;
         apd_record.octet_length_ptr = self.octet_length_ptr as SqlPointer;
+        // msodbcsql's SetADRecBP (SQLBindParameter's APD writer) ZeroMemory's
+        // the whole record then calls SetTypeDefaults unconditionally, so a
+        // bind always clears any prior "app wrote precision/scale" state —
+        // it does not survive a rebind, even to the same C type.
+        apd_record.precision_scale_explicit = false;
         if self.c_type == SQL_C_NUMERIC {
             apd_record.precision = SQL_PREC_NUMERIC;
             apd_record.scale = 0;
@@ -223,6 +233,7 @@ impl BoundParam {
             decimal_digits,
             app_precision: apd_record.precision,
             app_scale: apd_record.scale,
+            precision_scale_explicit: apd_record.precision_scale_explicit,
             parameter_value_ptr: apd_record.data_ptr,
             buffer_length: apd_record.octet_length,
             strlen_or_ind_ptr: apd_record.indicator_ptr as *mut SqlLen,
@@ -270,6 +281,7 @@ mod tests {
             decimal_digits: 0,
             app_precision: 0,
             app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: value,
             buffer_length: 8,
             strlen_or_ind_ptr: ind,
@@ -378,6 +390,7 @@ mod tests {
             decimal_digits: 0,
             app_precision: 0,
             app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: (&raw mut value).cast(),
             buffer_length: ind,
             strlen_or_ind_ptr: &raw mut ind,
@@ -389,6 +402,7 @@ mod tests {
         let mut apd_record = DescRecord {
             precision: 7,
             scale: 2,
+            precision_scale_explicit: true,
             ..DescRecord::default_for(DescKind::AppParam)
         };
         let mut ipd_record = DescRecord::default_for(DescKind::ImpParam);
@@ -396,6 +410,10 @@ mod tests {
 
         assert_eq!(apd_record.precision, SQL_PREC_NUMERIC);
         assert_eq!(apd_record.scale, 0);
+        assert!(
+            !apd_record.precision_scale_explicit,
+            "a fresh SQLBindParameter must not inherit a prior bind's explicit precision/scale flag"
+        );
     }
 
     /// Per ODBC's "Decimal Digits" appendix, `DecimalDigits` for the whole
@@ -416,6 +434,7 @@ mod tests {
             decimal_digits: 7,
             app_precision: 0,
             app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: buf.as_mut_ptr().cast(),
             buffer_length: 8,
             strlen_or_ind_ptr: &raw mut ind,

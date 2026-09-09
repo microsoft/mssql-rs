@@ -309,6 +309,7 @@ mod tests {
                 indicator_ptr: ptr::null_mut(),
                 octet_length_ptr: ptr::null_mut(),
                 data_bound: false,
+                precision_scale_explicit: false,
                 explicitly_bound: false,
             },
         );
@@ -346,6 +347,7 @@ mod tests {
                 indicator_ptr: ptr::null_mut(),
                 octet_length_ptr: ptr::null_mut(),
                 data_bound: false,
+                precision_scale_explicit: false,
                 explicitly_bound: false,
             },
         );
@@ -382,6 +384,7 @@ mod tests {
                 indicator_ptr: ptr::null_mut(),
                 octet_length_ptr: ptr::null_mut(),
                 data_bound: false,
+                precision_scale_explicit: false,
                 explicitly_bound: false,
             },
         );
