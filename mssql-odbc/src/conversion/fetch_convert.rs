@@ -449,7 +449,7 @@ pub(crate) fn is_datetime_c_target(target_type: SqlSmallInt) -> bool {
 }
 
 /// Returns `true` if `target_type` is one of the fixed-width C targets
-/// [`convert_typed_c`] routes: the integer, float, GUID, and date/time structs.
+/// `get_data::convert_typed_c` routes: the integer, float, GUID, and date/time structs.
 /// `SQLGetData` and block fetch gate their typed-conversion path on this.
 pub(crate) fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
     is_integer_c_target(target_type)
