@@ -954,6 +954,33 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
     SQLCloseCursor(stmt_);
 }
 
+// A UTF-8 collation is already in the target encoding, so it is delivered by a
+// verbatim byte copy rather than through the decoder. That makes it the one
+// SQL_C_CHAR shape whose slot boundary can land mid-sequence, so the partial
+// tail has to be trimmed exactly as it is for `json`. The token is a 3-byte
+// character against an 8-byte payload slot: two whole characters fit, and the
+// third must be dropped rather than delivered as a fragment.
+TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ExecDirect(
+        "SELECT REPLICATE(CAST(NCHAR(0x4F60) "
+        "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 500) AS c1");
+
+    // 8 payload bytes: two whole 3-byte characters, and no room for a third.
+    SQLCHAR buf[9] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    const std::string got(reinterpret_cast<const char*>(buf));
+    EXPECT_EQ("\xE4\xBD\xA0\xE4\xBD\xA0", got) << "a partial character must not be delivered";
+    EXPECT_EQ(6u, got.size()) << "6 bytes of whole characters, not 8 bytes ending mid-sequence";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToWcharReportsNoTotal) {
     ExecDirect("SELECT REPLICATE(CAST('y' AS VARCHAR(MAX)), 5000) AS c1");
 

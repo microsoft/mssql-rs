@@ -1814,6 +1814,20 @@ unsafe fn deliver_bound_plp(
 
     let transcode_utf16_to_utf8 =
         target == SQL_C_CHAR && matches!(encoding, PlpEncoding::Utf16Text);
+    // Wire bytes that are already UTF-8 and are delivered by a verbatim copy:
+    // `json`, and a `SingleByteText` column whose collation is UTF-8, which the
+    // transcode branch deliberately skips for exactly that reason. Both can
+    // truncate mid-sequence at the slot boundary, so both need the partial tail
+    // trimmed -- treating them as equivalent here is what makes the "already in
+    // the target encoding" claim above actually hold. Binary is excluded: it is
+    // not text, and a binary caller asked for the bytes verbatim.
+    let verbatim_utf8_text = target != SQL_C_BINARY
+        && !transcode_narrow_to_utf8
+        && match encoding {
+            PlpEncoding::Utf8Text => true,
+            PlpEncoding::SingleByteText => narrow_wire_encoding == Some(encoding_rs::UTF_8),
+            _ => false,
+        };
     // Deliberately excludes `transcode_narrow_to_utf8`: msodbcsql keys the
     // indicator on the C types rather than on whether a conversion happens, and
     // `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a 1:1 conversion ratio"
@@ -1951,9 +1965,10 @@ unsafe fn deliver_bound_plp(
                     break;
                 }
             }
-        } else if target != SQL_C_BINARY && matches!(encoding, PlpEncoding::Utf8Text) {
-            // Binary is excluded: `trim_partial_utf8` would drop a truncated tail
-            // that a binary caller asked for verbatim.
+        } else if verbatim_utf8_text {
+            // Binary is excluded from `verbatim_utf8_text`: `trim_partial_utf8`
+            // would drop a truncated tail that a binary caller asked for
+            // verbatim.
             for b in &scratch[..chunk.read] {
                 if out_bytes.len() < capacity_elements {
                     out_bytes.push(*b);

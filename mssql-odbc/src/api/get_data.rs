@@ -2470,11 +2470,27 @@ fn stream_active_plp_chunk<'a>(
     // its concrete wire-byte count under every collation. `PlpKnownLengthIndicatorCountsDown`
     // and `ABoundVarcharMaxTruncatedReportsFullLength` are unskipped cross-leg
     // parity tests that measure exactly this, and they hold msodbcsql to it.
+    //
+    // Decoded output can outlive the wire, so the carry is added to the wire
+    // count: converting fills `pending_utf8` faster than a small caller buffer
+    // drains it, and once the wire is exhausted the wire term alone is 0. Without
+    // this a drain-only call would report "0 bytes remaining" alongside the
+    // 01004 truncation warning it returns below -- self-contradictory, and it
+    // strands a caller that sizes its next buffer from the indicator rather than
+    // looping on the return code. This is also the term msodbcsql carries as
+    // `cbTruncatedCharsInConvBuf` in the same `sqlcdata.h:1230` expression.
+    // `pending_units` needs no equivalent: it is only filled by the widening
+    // path, which reports SQL_NO_TOTAL above.
+    let held_converted_bytes = stmt_state
+        .active_plp
+        .as_ref()
+        .map_or(0, |s| s.pending_utf8.len());
     let remaining_indicator = if transcode_utf16_to_utf8 || widen_narrow_to_utf16 {
         SQL_NO_TOTAL
     } else if let Some(total) = known_total {
         let consumed_before = total_read.saturating_sub(read) as u64;
-        total.saturating_sub(consumed_before) as SqlLen
+        let wire_remaining = total.saturating_sub(consumed_before);
+        wire_remaining.saturating_add(held_converted_bytes as u64) as SqlLen
     } else {
         SQL_NO_TOTAL
     };
