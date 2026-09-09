@@ -51,6 +51,10 @@
 //  26.  ConversionFailureIsReportedPerSetWhereverItSits - divergence: AB#47945
 //  26b. EverySetFailingToConvertIsError          - total client-side failure
 //  27.  AnInfoMessageDegradesTheBatchOnBothDrivers - info-token parity
+//  28.  ArrayOfAThousandSetsWritesEveryRowInOrder  - depth: packing, drain, order
+//  29.  ThousandSetArrayCorrelatesFailuresToTheirOwnSets - boundary sets 0/499/999
+//  30.  CursorApiAfterARowReturningArrayExecute    - AB#47944 as the app sees it
+//  31.  PreparedStatementReExecutesAtDifferentArraySizes - 4 -> 7 -> 2
 
 #include "odbc_test_fixture.h"
 
@@ -1548,4 +1552,254 @@ TEST_F(ParamArrayTest, AnInfoMessageDegradesTheBatchOnBothDrivers) {
     for (int i = 0; i < 3; ++i) {
         EXPECT_EQ(SQL_PARAM_SUCCESS_WITH_INFO, status[i]) << "set " << i;
     }
+}
+
+// -------------------------------------------------------------------
+// 28. Depth. Every other case in this file runs at PARAMSET_SIZE <= 7,
+// which fits one TDS packet and one pass of the drain loop. The whole
+// mechanism this PR introduces is packing N sp_execute RPCs into a
+// single request, so the interesting failures - packet fragmentation in
+// the batch serializer, the drain loop running past the first packet,
+// and row-count accumulation across many DONEs - only appear at depth.
+//
+// The IDENTITY column is the point: seq is assigned in insertion order,
+// so `seq <> id` finds any set executed out of order or duplicated,
+// which a COUNT or a SUM would both miss.
+//
+// Every assertion here holds on both drivers; measured on msodbcsql 18.6.2.1.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ArrayOfAThousandSetsWritesEveryRowInOrder) {
+    constexpr int kSets = 1000;
+    ExecDirect("CREATE TABLE #pa_big (seq int IDENTITY(1,1) NOT NULL, id int NOT NULL)");
+    Prepare("INSERT INTO #pa_big (id) VALUES (?)");
+
+    std::vector<SQLINTEGER> ids(kSets);
+    std::vector<SQLLEN> ind(kSets, 0);
+    std::vector<SQLUSMALLINT> status(kSets, 0xFFFF);
+    for (int i = 0; i < kSets; ++i) {
+        ids[static_cast<size_t>(i)] = i + 1;
+    }
+    SQLULEN processed = 0xDEAD;
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids.data(), 0, ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, kSets));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status.data()));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, &processed));
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN affected = -12345;
+    ASSERT_SQL_OK(SQLRowCount(stmt_, &affected), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(kSets, affected) << "one row per set, summed across the batch";
+
+    EXPECT_EQ(static_cast<SQLULEN>(kSets), processed);
+    int bad_status = -1;
+    for (int i = 0; i < kSets; ++i) {
+        if (status[static_cast<size_t>(i)] != SQL_PARAM_SUCCESS) {
+            bad_status = i;
+            break;
+        }
+    }
+    EXPECT_EQ(-1, bad_status) << "first set not reported SQL_PARAM_SUCCESS";
+
+    EXPECT_EQ(kSets, ScalarInt("SELECT COUNT(*) FROM #pa_big"));
+    EXPECT_EQ(0, ScalarInt("SELECT COUNT(*) FROM #pa_big WHERE seq <> id"))
+        << "sets must execute in order, exactly once each";
+}
+
+// -------------------------------------------------------------------
+// 29. Failure-to-set correlation at depth, on the boundaries.
+//
+// Mapping a server error back to the set that caused it is index
+// arithmetic this PR introduced. At three sets an off-by-one is
+// invisible - it lands on a neighbour that is also being asserted - so
+// this drives 1000 sets and fails the first, a middle, and the last.
+// Set i carries id i+1, so the failing ids are 1, 500 and 1000: the
+// table check catches a shift that the status array alone would not.
+//
+// Every assertion here holds on both drivers; measured on msodbcsql 18.6.2.1.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
+    constexpr int kSets = 1000;
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    std::vector<SQLINTEGER> ids(kSets);
+    std::vector<SQLINTEGER> vals(kSets, 50); // under the CHECK (v < 100)
+    std::vector<SQLLEN> ind(kSets, 0);
+    std::vector<SQLUSMALLINT> status(kSets, 0xFFFF);
+    for (int i = 0; i < kSets; ++i) {
+        ids[static_cast<size_t>(i)] = i + 1;
+    }
+    const int failing[3] = {0, 499, 999};
+    for (int index : failing) {
+        vals[static_cast<size_t>(index)] = 500; // violates CHECK (v < 100)
+    }
+    SQLULEN processed = 0xDEAD;
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids.data(), 0, ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals.data(), 0, ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, kSets));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status.data()));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, &processed));
+
+    // A bound status array downgrades the failure (case 9), on both drivers.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+
+    EXPECT_EQ(static_cast<SQLULEN>(kSets), processed);
+    for (int index : failing) {
+        EXPECT_EQ(SQL_PARAM_ERROR, status[static_cast<size_t>(index)])
+            << "set " << index << " violates the CHECK";
+    }
+    int wrongly_marked = -1;
+    for (int i = 0; i < kSets; ++i) {
+        const bool expected_to_fail =
+            (i == failing[0] || i == failing[1] || i == failing[2]);
+        if (!expected_to_fail && status[static_cast<size_t>(i)] != SQL_PARAM_SUCCESS) {
+            wrongly_marked = i;
+            break;
+        }
+    }
+    EXPECT_EQ(-1, wrongly_marked) << "first healthy set not reported SQL_PARAM_SUCCESS";
+
+    EXPECT_EQ(kSets - 3, ScalarInt("SELECT COUNT(*) FROM #pa"));
+    EXPECT_EQ(0, ScalarInt("SELECT COUNT(*) FROM #pa WHERE id IN (1, 500, 1000)"))
+        << "the rows missing must be the ones whose sets were marked failed";
+}
+
+// -------------------------------------------------------------------
+// 30. What an application actually sees on the cursor API after a
+// row-returning array execute. Case 25 asserts the statuses and that the
+// connection survives, but nothing in this suite touches
+// SQLNumResultCols / SQLFetch / SQLMoreResults afterwards - which is the
+// app-visible shape of the AB#47944 divergence.
+//
+// Pins measured behaviour rather than a desired contract: mssql-odbc
+// discards the OUTPUT rows, so the handle carries no result set and the
+// cursor calls report exactly that.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect("CREATE TABLE #pa_out3 (id int)");
+    Prepare("INSERT INTO #pa_out3 (id) OUTPUT inserted.id VALUES (?)");
+
+    SQLINTEGER ids[3] = {1, 2, 3};
+    SQLLEN ind[3] = {0, 0, 0};
+    SQLUSMALLINT status[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+    SQLULEN processed = 0xDEAD;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, 3));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, &processed));
+
+    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+
+    SQLSMALLINT columns = -1;
+    const SQLRETURN cols_rc = SQLNumResultCols(stmt_, &columns);
+    const std::string cols_diag =
+        ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+
+    const SQLRETURN fetch_rc = SQLFetch(stmt_);
+    const std::string fetch_diag =
+        ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+
+    const SQLRETURN more_rc = SQLMoreResults(stmt_);
+    const std::string more_diag =
+        ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
+
+    SQLFreeStmt(stmt_, SQL_CLOSE);
+
+    // The OUTPUT rows were discarded, so the handle has no result set left.
+    EXPECT_EQ(SQL_SUCCESS, cols_rc);
+    EXPECT_EQ(0, columns) << "no result set is current after the array execute";
+    EXPECT_TRUE(cols_diag.empty()) << "unexpected diagnostic: " << cols_diag;
+
+    EXPECT_EQ(SQL_ERROR, fetch_rc) << "there is no cursor to fetch from";
+    EXPECT_EQ("24000", fetch_diag);
+
+    EXPECT_EQ(SQL_NO_DATA, more_rc) << "no further result sets are queued";
+    EXPECT_TRUE(more_diag.empty()) << "unexpected diagnostic: " << more_diag;
+
+    // The statement is still usable and every set really ran.
+    EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa_out3"));
+}
+
+// -------------------------------------------------------------------
+// 31. One prepared statement re-executed at three different array sizes.
+//
+// Case 11b re-executes three times but always at size 4 with the same
+// bindings, so the sp_prepare handle is only ever reused at its original
+// width. Growing then shrinking is this PR's surface: the batch is built
+// from a declaration cloned off the first buildable set, and a stale
+// declaration or a stale size would show up as the wrong number of rows.
+//
+// Each phase writes its own id range and nothing is deleted between
+// them, so a set leaking from the previous declaration lands in a range
+// that is counted separately.
+//
+// Every assertion here holds on both drivers; measured on msodbcsql 18.6.2.1.
+// -------------------------------------------------------------------
+TEST_F(ParamArrayTest, PreparedStatementReExecutesAtDifferentArraySizes) {
+    ExecDirect(kGuardTable);
+    Prepare("INSERT INTO #pa (id, v) VALUES (?, ?)");
+
+    constexpr int kMax = 7;
+    SQLINTEGER ids[kMax] = {};
+    SQLINTEGER vals[kMax] = {};
+    SQLLEN ind[kMax] = {};
+    SQLUSMALLINT status[kMax] = {};
+    SQLULEN processed = 0;
+
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, ids, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                   SQL_INTEGER, 10, 0, vals, 0, ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status));
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, &processed));
+
+    const int sizes[3] = {4, 7, 2};
+    const int bases[3] = {100, 200, 300};
+    for (int phase = 0; phase < 3; ++phase) {
+        const int size = sizes[phase];
+        for (int i = 0; i < kMax; ++i) {
+            ids[i] = bases[phase] + i + 1;
+            vals[i] = 1;
+            ind[i] = 0;
+            status[i] = 0xFFFF;
+        }
+        processed = 0xDEAD;
+
+        ASSERT_EQ(SQL_SUCCESS,
+                  SetStmtULen(SQL_ATTR_PARAMSET_SIZE, static_cast<SQLULEN>(size)));
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLFreeStmt(stmt_, SQL_CLOSE);
+
+        EXPECT_EQ(static_cast<SQLULEN>(size), processed) << "phase " << phase;
+        for (int i = 0; i < size; ++i) {
+            EXPECT_EQ(SQL_PARAM_SUCCESS, status[i])
+                << "phase " << phase << " set " << i;
+        }
+        for (int i = size; i < kMax; ++i) {
+            EXPECT_EQ(0xFFFF, status[i])
+                << "phase " << phase << " wrote past PARAMSET_SIZE at slot " << i;
+        }
+    }
+
+    // 4 + 7 + 2, each in its own range: a row from a stale declaration would
+    // land in the wrong bucket rather than just changing the total.
+    EXPECT_EQ(13, ScalarInt("SELECT COUNT(*) FROM #pa"));
+    EXPECT_EQ(4, ScalarInt("SELECT COUNT(*) FROM #pa WHERE id BETWEEN 101 AND 199"));
+    EXPECT_EQ(7, ScalarInt("SELECT COUNT(*) FROM #pa WHERE id BETWEEN 201 AND 299"));
+    EXPECT_EQ(2, ScalarInt("SELECT COUNT(*) FROM #pa WHERE id BETWEEN 301 AND 399"));
 }
