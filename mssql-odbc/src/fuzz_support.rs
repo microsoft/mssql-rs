@@ -279,8 +279,8 @@ fn build_column_value(cur: &mut ByteCursor) -> ColumnValues {
 }
 
 /// Fixed-width `SQL_C_*` fetch targets offered to the conversion fuzzers. The
-/// reachable subset is derived at run time by [`routes_fixed_width_fetch`] — the
-/// exact predicates `get_data::convert_typed_c` routes on — so the fuzzer tracks
+/// reachable subset is derived at run time by [`is_typed_c_target`] — the exact
+/// predicate `get_data::convert_typed_c` routes on — so the fuzzer tracks
 /// production's routing table instead of a parallel list that can fall behind
 /// it. A candidate production does not route yet (e.g. `SQL_C_NUMERIC`) is
 /// filtered out and becomes reachable for free once a converter for it lands.
@@ -372,8 +372,12 @@ pub fn fuzz_fetch_convert(data: &[u8]) {
 /// for: the character and binary buffers, the scalar bit/float/GUID spellings,
 /// all five date/time C structs, and every `type_rules::is_integer_c_type`
 /// variant (including the legacy `SQL_C_TINYINT`/`SQL_C_SHORT`/`SQL_C_LONG`
-/// spellings). `sql_type` is drawn independently, so unsupported pairings still
-/// exercise the bind-time rejection path.
+/// spellings). `sql_type` is drawn independently, so an unsupported pairing
+/// falls through `bound_param_to_value`'s own unsupported-conversion arm — an
+/// unrecognized `sql_type` fails `sql_family`, a recognized one with no matching
+/// C type hits the `_ =>` arm. That is the post-bind fallback, not the
+/// `is_supported_conversion` gate `SQLBindParameter` applies, which this harness
+/// does not drive.
 const PARAM_C_TYPES: [SqlSmallInt; 23] = [
     SQL_C_CHAR,
     SQL_C_WCHAR,
@@ -404,8 +408,9 @@ const PARAM_C_TYPES: [SqlSmallInt; 23] = [
 /// reach from a fuzzed C type, derived by scanning the predicate itself rather
 /// than a hand-copied list, so a newly implemented conversion is fuzzed the
 /// moment the matrix accepts it. `sql_type` is still drawn independently in
-/// `fuzz_bound_param`, so unsupported pairings keep exercising the rejection
-/// path.
+/// `fuzz_bound_param`, so an unsupported pairing keeps falling through
+/// `bound_param_to_value`'s post-bind unsupported-conversion arm (the
+/// `sql_family`/`_ =>` rejection), not the `SQLBindParameter` bind-time gate.
 static PARAM_SQL_TYPES: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
     (SqlSmallInt::MIN..=SqlSmallInt::MAX)
         .filter(|&sql_type| {

@@ -3,10 +3,11 @@
 
 //! Fuzz the bind-parameter read + convert path (`bound_param_to_value`) that
 //! `SQLExecute` runs over an application's value and length/indicator buffers.
-//! The wrapper backs the value buffer with the input plus eight trailing zero
-//! bytes and confines the indicator to in-bounds values, so this hunts for real
-//! conversion defects (bad length arithmetic, transcode panics) rather than
-//! harness-induced out-of-bounds reads.
+//! The wrapper backs the value buffer with the input plus trailing zero padding
+//! wide enough for the widest fixed-width C target, and confines the indicator
+//! to in-bounds values, so this hunts for real conversion defects (bad length
+//! arithmetic, transcode panics) rather than harness-induced out-of-bounds
+//! reads.
 //!
 //! First bytes pick the C type, SQL type, indicator mode, column size, and
 //! scale; the rest is the parameter value buffer.
