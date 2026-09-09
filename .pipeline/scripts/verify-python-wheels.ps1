@@ -116,11 +116,15 @@ foreach ($wheel in $wheels) {
 
         $nameMatch = [regex]::Match($metadata, '(?m)^Name:\s*(.+?)\r?$')
         $versionMatch = [regex]::Match($metadata, '(?m)^Version:\s*(.+?)\r?$')
+        $requiresPythonMatch = [regex]::Match($metadata, '(?m)^Requires-Python:\s*(.+?)\r?$')
         if (-not $nameMatch.Success) {
             throw "$($wheel.Name): METADATA has no Name field"
         }
         if (-not $versionMatch.Success) {
             throw "$($wheel.Name): METADATA has no Version field"
+        }
+        if (-not $requiresPythonMatch.Success) {
+            throw "$($wheel.Name): METADATA has no Requires-Python field"
         }
 
         $actualName = ConvertTo-CanonicalName $nameMatch.Groups[1].Value
@@ -129,6 +133,9 @@ foreach ($wheel in $wheels) {
         }
         if ($versionMatch.Groups[1].Value -ne $ExpectedVersion) {
             throw "$($wheel.Name): metadata Version is '$($versionMatch.Groups[1].Value)', expected '$ExpectedVersion'"
+        }
+        if ($requiresPythonMatch.Groups[1].Value -ne '>=3.10') {
+            throw "$($wheel.Name): metadata Requires-Python is '$($requiresPythonMatch.Groups[1].Value)', expected '>=3.10'"
         }
 
         if ($RequireOdbc) {

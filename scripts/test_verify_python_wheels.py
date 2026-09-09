@@ -32,12 +32,16 @@ def write_wheel(
     distribution: str = "mssql_python_rs",
     include_odbc: bool = True,
     uppercase_odbc: bool = False,
+    requires_python: str = ">=3.10",
 ) -> Path:
     wheel_path = directory / f"{distribution}-0.1.0-{python_tag}-{python_tag}-{platform}.whl"
     with zipfile.ZipFile(wheel_path, "w") as wheel:
         wheel.writestr(
             "mssql_python_rs-0.1.0.dist-info/METADATA",
-            "Metadata-Version: 2.4\nName: mssql-python-rs\nVersion: 0.1.0\n",
+            "Metadata-Version: 2.4\n"
+            "Name: mssql-python-rs\n"
+            "Version: 0.1.0\n"
+            f"Requires-Python: {requires_python}\n",
         )
         wheel.writestr("mssql_py_core/__init__.py", "")
         if include_odbc:
@@ -180,3 +184,14 @@ def test_validator_rejects_wrong_case_wheel_filename(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "Wheel matrix mismatch" in result.stderr
+
+
+def test_validator_rejects_unsupported_python_floor(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", python_tag="cp310", requires_python=">=3.8")
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Requires-Python is '>=3.8', expected '>=3.10'" in result.stderr

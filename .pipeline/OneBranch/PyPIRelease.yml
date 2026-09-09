@@ -136,6 +136,10 @@ extends:
             if ($LASTEXITCODE -ne 0) {
               throw "Selected build commit $commitSha was not found on $sourceBranch"
             }
+            git -C $repoRoot merge-base --is-ancestor $commitSha FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) {
+              throw "Selected build commit $commitSha is not reachable from $sourceBranch"
+            }
 
             $pyprojectLines = & git -C $repoRoot show "${commitSha}:mssql-py-core/pyproject.toml"
             if ($LASTEXITCODE -ne 0) {
