@@ -6,21 +6,58 @@
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_ACTIVE_STATEMENTS, SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE,
-    SQL_ASYNC_NOTIFICATION, SQL_ASYNC_NOTIFICATION_NOT_CAPABLE, SQL_CB_CLOSE,
-    SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DBMS_NAME, SQL_DBMS_VER,
-    SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER, SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER,
-    SQL_ERROR, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS,
-    SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_MAX_DRIVER_CONNECTIONS,
-    SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE,
-    SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_TC_ALL, SQL_TXN_CAPABLE, SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT,
-    SQL_TXN_READ_COMMITTED, SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_ACCESSIBLE_PROCEDURES, SQL_ACCESSIBLE_TABLES, SQL_ACTIVE_STATEMENTS,
+    SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE, SQL_ASYNC_NOTIFICATION,
+    SQL_ASYNC_NOTIFICATION_NOT_CAPABLE, SQL_CATALOG_NAME_SEPARATOR, SQL_CATALOG_TERM, SQL_CB_CLOSE,
+    SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DATA_SOURCE_NAME,
+    SQL_DATA_SOURCE_READ_ONLY, SQL_DBMS_NAME, SQL_DBMS_VER, SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER,
+    SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER, SQL_ERROR, SQL_EXPRESSIONS_IN_ORDERBY,
+    SQL_FN_NONE_SUPPORTED, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS,
+    SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_KEYWORDS, SQL_MAX_COLUMN_NAME_LEN,
+    SQL_MAX_DRIVER_CONNECTIONS, SQL_MAX_SCHEMA_NAME_LEN, SQL_MAX_STATEMENT_LEN,
+    SQL_MAX_TABLE_NAME_LEN, SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_NUMERIC_FUNCTIONS,
+    SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE, SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE,
+    SQL_PROCEDURES, SQL_SC_SQL92_ENTRY, SQL_SCHEMA_TERM, SQL_SERVER_NAME, SQL_SPECIAL_CHARACTERS,
+    SQL_SQL_CONFORMANCE, SQL_STRING_FUNCTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_SYSTEM_FUNCTIONS, SQL_TC_ALL, SQL_TIMEDATE_FUNCTIONS, SQL_TXN_CAPABLE,
+    SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT, SQL_TXN_READ_COMMITTED, SQL_USER_NAME,
+    SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, WARN_STRING_TRUNCATION, post_diag};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+
+/// `sysname`, the type of every identifier column in the catalog views, which
+/// bounds `SQL_MAX_COLUMN_NAME_LEN`, `SQL_MAX_SCHEMA_NAME_LEN`, and
+/// `SQL_MAX_TABLE_NAME_LEN` alike.
+const MAX_IDENTIFIER_LEN: u16 = 128;
+
+/// `SQL_MAX_STATEMENT_LEN`, in bytes (msodbcsql18 reports the same 512 KB).
+const MAX_STATEMENT_LEN: u32 = 512 * 1024;
+
+/// `SQL_KEYWORDS`: SQL Server reserved words that are *not* in the ODBC
+/// interoperable list, which is the only thing ODBC asks this to report.
+/// Verbatim from msodbcsql18 18.6.2.1.
+const SQL_SERVER_KEYWORDS: &str = "BACKUP,BREAK,BROWSE,BULK,CHECKPOINT,CLUSTERED,COMMITTED,\
+COMPUTE,CONFIRM,CONTROLROW,DATABASE,DBCC,DISK,DISTRIBUTED,DUMMY,ERRLVL,ERROREXIT,EXIT,FILE,\
+FILLFACTOR,FLOPPY,HOLDLOCK,IDENTITY_INSERT,IDENTITYCOL,IF,KILL,LINENO,MERGE,MIRROREXIT,\
+NONCLUSTERED,OFF,OFFSETS,ONCE,OVER,PERCENT,PERM,PERMANENT,PLAN,PRINT,PROC,PROCESSEXIT,RAISERROR,\
+READ,READTEXT,RECONFIGURE,REPEATABLE,RESTORE,RETURN,ROWCOUNT,RULE,SAVE,SERIALIZABLE,SETUSER,\
+SHUTDOWN,STATISTICS,TAPE,TEMP,TEXTSIZE,TOP,TRAN,TRIGGER,TRUNCATE,TSEQUEL,UNCOMMITTED,UPDATETEXT,\
+USE,WAITFOR,WHILE,WRITETEXT";
+
+/// `SQL_SPECIAL_CHARACTERS`: characters legal in an unquoted SQL Server
+/// identifier beyond `A-Z`, `0-9`, and `_`. `#` and `$` plus the Latin-1
+/// letters, which excludes U+00D7 (multiplication sign) and U+00F7 (division
+/// sign) because those are symbols, not letters. `@` is absent: it is only legal
+/// as the *first* character of a variable or parameter name.
+/// `special_characters_match_msodbcsql` pins the exact code points.
+const SQL_SERVER_SPECIAL_CHARACTERS: &str = "#$\u{c0}\u{c1}\u{c2}\u{c3}\u{c4}\u{c5}\u{c6}\u{c7}\u{c8}\u{c9}\u{ca}\u{cb}\u{cc}\u{cd}\
+\u{ce}\u{cf}\u{d0}\u{d1}\u{d2}\u{d3}\u{d4}\u{d5}\u{d6}\u{d8}\u{d9}\u{da}\u{db}\u{dc}\u{dd}\
+\u{de}\u{df}\u{e0}\u{e1}\u{e2}\u{e3}\u{e4}\u{e5}\u{e6}\u{e7}\u{e8}\u{e9}\u{ea}\u{eb}\u{ec}\
+\u{ed}\u{ee}\u{ef}\u{f0}\u{f1}\u{f2}\u{f3}\u{f4}\u{f5}\u{f6}\u{f8}\u{f9}\u{fa}\u{fb}\u{fc}\
+\u{fd}\u{fe}\u{ff}";
 
 /// Returns driver/data-source metadata for a connection.
 ///
@@ -105,6 +142,24 @@ fn sql_get_info_w_safe(
     free_errors(&mut state);
 
     unsafe { write_if_some(string_length_ptr, 0) };
+
+    // Identity strings live behind the same borrow `write_wide_str` needs, so
+    // take a copy before the call rather than restructuring the writer.
+    let identity_value = match info_type {
+        SQL_DATA_SOURCE_NAME => Some(state.identity.data_source_name.clone()),
+        SQL_SERVER_NAME => Some(state.identity.server_name.clone()),
+        SQL_USER_NAME => Some(state.identity.user_name.clone()),
+        _ => None,
+    };
+    if let Some(value) = identity_value {
+        return write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            &value,
+        );
+    }
 
     match info_type {
         SQL_MAX_DRIVER_CONNECTIONS => {
@@ -215,6 +270,82 @@ fn sql_get_info_w_safe(
             string_length_ptr,
             "03.80.0000",
         ),
+        SQL_SQL_CONFORMANCE => write_u32(info_value_ptr, SQL_SC_SQL92_ENTRY, string_length_ptr),
+        SQL_KEYWORDS => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            SQL_SERVER_KEYWORDS,
+        ),
+        SQL_SPECIAL_CHARACTERS => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            SQL_SERVER_SPECIAL_CHARACTERS,
+        ),
+        SQL_CATALOG_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "database",
+        ),
+        SQL_CATALOG_NAME_SEPARATOR => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            ".",
+        ),
+        // msodbcsql reports the pre-ODBC-3 term, and applications building
+        // three-part names key off it, so parity wins over the modern spelling.
+        SQL_SCHEMA_TERM => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "owner",
+        ),
+        // SQL Server has procedures. The other half of ODBC's definition -- the
+        // `{call ...}` invocation escape -- is still outstanding (AB#46384).
+        SQL_PROCEDURES => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "Y",
+        ),
+        SQL_MAX_COLUMN_NAME_LEN | SQL_MAX_SCHEMA_NAME_LEN | SQL_MAX_TABLE_NAME_LEN => {
+            write_u16(info_value_ptr, MAX_IDENTIFIER_LEN, string_length_ptr)
+        }
+        SQL_MAX_STATEMENT_LEN => write_u32(info_value_ptr, MAX_STATEMENT_LEN, string_length_ptr),
+        SQL_NUMERIC_FUNCTIONS
+        | SQL_STRING_FUNCTIONS
+        | SQL_SYSTEM_FUNCTIONS
+        | SQL_TIMEDATE_FUNCTIONS => {
+            write_u32(info_value_ptr, SQL_FN_NONE_SUPPORTED, string_length_ptr)
+        }
+        // Matching msodbcsql18: SQL Server grants the catalog views to public,
+        // so what `SQLTables` / `SQLProcedures` list back is what the caller may
+        // use.
+        SQL_ACCESSIBLE_TABLES | SQL_ACCESSIBLE_PROCEDURES | SQL_EXPRESSIONS_IN_ORDERBY => {
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                "Y",
+            )
+        }
+        SQL_DATA_SOURCE_READ_ONLY => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "N",
+        ),
         _ => {
             error!(info_type, "SQLGetInfoW: unsupported info type");
             post_diag(&mut state, ERR_INVALID_INFO_TYPE);
@@ -316,6 +447,39 @@ mod tests {
         (rc, val, len)
     }
 
+    /// Fetches a wide-string info type into a buffer large enough for any value
+    /// this driver returns, and decodes the reported byte length.
+    fn get_wide_str(dbc: SqlHandle, info_type: SqlUSmallInt) -> (SqlReturn, String, SqlSmallInt) {
+        let mut buf = [0u16; 2048];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                dbc,
+                info_type,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                &mut len,
+            )
+        };
+        let n = if len < 0 { 0 } else { (len as usize) / 2 };
+        (rc, String::from_utf16_lossy(&buf[..n]), len)
+    }
+
+    /// Every wide-string info type added for AB#47086, with the value measured
+    /// from msodbcsql18 18.6.2.1 against SQL Server.
+    const STRING_CASES: &[(SqlUSmallInt, &str)] = &[
+        (SQL_KEYWORDS, SQL_SERVER_KEYWORDS),
+        (SQL_SPECIAL_CHARACTERS, SQL_SERVER_SPECIAL_CHARACTERS),
+        (SQL_CATALOG_TERM, "database"),
+        (SQL_CATALOG_NAME_SEPARATOR, "."),
+        (SQL_SCHEMA_TERM, "owner"),
+        (SQL_PROCEDURES, "Y"),
+        (SQL_ACCESSIBLE_TABLES, "Y"),
+        (SQL_ACCESSIBLE_PROCEDURES, "Y"),
+        (SQL_EXPRESSIONS_IN_ORDERBY, "Y"),
+        (SQL_DATA_SOURCE_READ_ONLY, "N"),
+    ];
+
     #[test]
     fn null_handle_returns_invalid_handle() {
         let (rc, _, _) = get_u16(SQL_NULL_HANDLE, SQL_ACTIVE_STATEMENTS);
@@ -333,6 +497,9 @@ mod tests {
             (SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CB_CLOSE),
             (SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_CB_CLOSE),
             (SQL_TXN_CAPABLE, SQL_TC_ALL),
+            (SQL_MAX_COLUMN_NAME_LEN, MAX_IDENTIFIER_LEN),
+            (SQL_MAX_SCHEMA_NAME_LEN, MAX_IDENTIFIER_LEN),
+            (SQL_MAX_TABLE_NAME_LEN, MAX_IDENTIFIER_LEN),
         ] {
             let (rc, val, len) = get_u16(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -350,6 +517,12 @@ mod tests {
             (SQL_ASYNC_NOTIFICATION, SQL_ASYNC_NOTIFICATION_NOT_CAPABLE),
             (SQL_DEFAULT_TXN_ISOLATION, SQL_TXN_READ_COMMITTED),
             (SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT),
+            (SQL_SQL_CONFORMANCE, SQL_SC_SQL92_ENTRY),
+            (SQL_MAX_STATEMENT_LEN, MAX_STATEMENT_LEN),
+            (SQL_NUMERIC_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
+            (SQL_STRING_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
+            (SQL_SYSTEM_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
+            (SQL_TIMEDATE_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
@@ -502,5 +675,180 @@ mod tests {
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, ERR_INVALID_INFO_TYPE.state);
+    }
+
+    #[test]
+    fn string_info_types_report_expected_values() {
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in STRING_CASES {
+            let (rc, value, len) = get_wide_str(h.dbc, *info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(&value, expected, "info_type {info_type}");
+            assert_eq!(
+                len,
+                (expected.encode_utf16().count() * 2) as SqlSmallInt,
+                "info_type {info_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_info_types_report_length_with_null_buffer() {
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in STRING_CASES {
+            let mut len: SqlSmallInt = -1;
+            let rc = unsafe { sql_get_info_w(h.dbc, *info_type, ptr::null_mut(), 0, &mut len) };
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(
+                len,
+                (expected.encode_utf16().count() * 2) as SqlSmallInt,
+                "info_type {info_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_info_types_truncate_with_01004() {
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in STRING_CASES {
+            // A one-character value already fills a 2-wchar buffer, so only the
+            // longer values can demonstrate truncation.
+            if expected.encode_utf16().count() < 2 {
+                continue;
+            }
+            let mut buf = [0u16; 2];
+            let mut len: SqlSmallInt = -1;
+            let rc = unsafe {
+                sql_get_info_w(
+                    h.dbc,
+                    *info_type,
+                    buf.as_mut_ptr() as SqlPointer,
+                    (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, SQL_SUCCESS_WITH_INFO, "info_type {info_type}");
+            // The full untruncated length is still reported.
+            assert_eq!(
+                len,
+                (expected.encode_utf16().count() * 2) as SqlSmallInt,
+                "info_type {info_type}"
+            );
+            assert_eq!(buf[1], 0, "info_type {info_type}: missing NUL");
+            assert_eq!(
+                String::from_utf16_lossy(&buf[..1]),
+                expected.chars().next().unwrap().to_string(),
+                "info_type {info_type}"
+            );
+
+            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc_ref.inner.lock().unwrap();
+            assert_eq!(
+                state.diag_records.last().map(|d| d.sql_state),
+                Some(WARN_STRING_TRUNCATION.state),
+                "info_type {info_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_info_types_are_empty_before_connect() {
+        let h = TestHandles::with_env_dbc();
+        for info_type in [SQL_DATA_SOURCE_NAME, SQL_SERVER_NAME, SQL_USER_NAME] {
+            let (rc, value, len) = get_wide_str(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(value, "", "info_type {info_type}");
+            assert_eq!(len, 0, "info_type {info_type}");
+        }
+    }
+
+    #[test]
+    fn identity_info_types_report_connected_session() {
+        let h = TestHandles::with_env_dbc();
+        {
+            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut state = dbc_ref.inner.lock().unwrap();
+            state.identity = crate::handles::dbc::ConnectionIdentity {
+                data_source_name: "ReportingDsn".to_string(),
+                server_name: "SQLPROD01\\INST".to_string(),
+                user_name: "reporting_app".to_string(),
+            };
+        }
+
+        for (info_type, expected) in [
+            (SQL_DATA_SOURCE_NAME, "ReportingDsn"),
+            (SQL_SERVER_NAME, "SQLPROD01\\INST"),
+            (SQL_USER_NAME, "reporting_app"),
+        ] {
+            let (rc, value, len) = get_wide_str(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(value, expected, "info_type {info_type}");
+            assert_eq!(
+                len,
+                (expected.encode_utf16().count() * 2) as SqlSmallInt,
+                "info_type {info_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_info_types_truncate_with_01004() {
+        let h = TestHandles::with_env_dbc();
+        {
+            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut state = dbc_ref.inner.lock().unwrap();
+            state.identity.server_name = "SQLPROD01".to_string();
+        }
+
+        let mut buf = [0u16; 4];
+        let mut len: SqlSmallInt = -1;
+        let rc = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_SERVER_NAME,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * std::mem::size_of::<SqlWChar>()) as SqlSmallInt,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(len, 18);
+        assert_eq!(String::from_utf16_lossy(&buf[..3]), "SQL");
+        assert_eq!(buf[3], 0);
+    }
+
+    #[test]
+    fn special_characters_match_msodbcsql() {
+        // `#` and `$`, then every Latin-1 letter. U+00D7 and U+00F7 are the
+        // multiplication and division signs, not letters, so they are excluded.
+        let mut expected = vec!['#', '$'];
+        expected.extend(
+            (0xC0u32..=0xFFu32)
+                .filter(|c| *c != 0xD7 && *c != 0xF7)
+                .map(|c| char::from_u32(c).expect("Latin-1 range is valid Unicode")),
+        );
+        assert_eq!(
+            SQL_SERVER_SPECIAL_CHARACTERS.chars().collect::<Vec<_>>(),
+            expected
+        );
+        // msodbcsql18 reports 64 characters (128 bytes as UTF-16).
+        assert_eq!(SQL_SERVER_SPECIAL_CHARACTERS.chars().count(), 64);
+    }
+
+    #[test]
+    fn keywords_are_a_bare_comma_separated_upper_case_list() {
+        // msodbcsql18 reports 69 words in 1090 bytes of UTF-16, with no spaces
+        // around the separators; an application splits on ',' verbatim.
+        assert_eq!(SQL_SERVER_KEYWORDS.encode_utf16().count() * 2, 1090);
+        let words: Vec<&str> = SQL_SERVER_KEYWORDS.split(',').collect();
+        assert_eq!(words.len(), 69);
+        for word in &words {
+            assert!(!word.is_empty(), "empty keyword");
+            assert_eq!(*word, word.to_ascii_uppercase(), "keyword not upper case");
+            assert!(
+                !word.contains(char::is_whitespace),
+                "keyword {word} contains whitespace"
+            );
+        }
     }
 }
