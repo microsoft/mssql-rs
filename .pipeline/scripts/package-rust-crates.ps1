@@ -67,6 +67,49 @@ try {
             sha256 = (Get-FileHash $destination -Algorithm SHA256).Hash.ToLowerInvariant()
         }
     }
+
+    $verificationDirectory = Join-Path $TargetDirectory 'package-verification'
+    New-Item -ItemType Directory -Path $verificationDirectory -Force | Out-Null
+    foreach ($crateName in $crateNames) {
+        $cratePath = Join-Path $TargetDirectory "package/$crateName-$Version.crate"
+        & tar -xzf $cratePath -C $verificationDirectory
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not extract $cratePath for verification"
+        }
+    }
+
+    $tdsPackageDirectory = Join-Path $verificationDirectory "mssql-tds-$Version"
+    $mockPackageDirectory = Join-Path $verificationDirectory "mssql-mock-tds-$Version"
+    $mockManifestPath = Join-Path $mockPackageDirectory 'Cargo.toml'
+    $mockManifest = Get-Content $mockManifestPath -Raw
+    $dependency = [regex]::Match(
+        $mockManifest,
+        '(?ms)^\[dependencies\.mssql-tds\]\s*$(?<body>.*?)(?=^\[|\z)'
+    )
+    if (-not $dependency.Success) {
+        throw 'Packaged mssql-mock-tds has no mssql-tds dependency'
+    }
+    if ($dependency.Groups['body'].Value -match '(?m)^\s*path\s*=') {
+        throw 'Packaged mssql-mock-tds unexpectedly contains an mssql-tds path dependency'
+    }
+
+    $relativeTdsPath = [System.IO.Path]::GetRelativePath(
+        $mockPackageDirectory,
+        $tdsPackageDirectory
+    ).Replace('\', '/')
+    $patchedDependency = $dependency.Value.TrimEnd() + "`npath = `"$relativeTdsPath`"`n`n"
+    $mockManifest = $mockManifest.Substring(0, $dependency.Index) +
+        $patchedDependency +
+        $mockManifest.Substring($dependency.Index + $dependency.Length)
+    Set-Content $mockManifestPath $mockManifest -NoNewline
+
+    & cargo check `
+        --manifest-path $mockManifestPath `
+        --target-dir (Join-Path $TargetDirectory 'package-verification-target')
+    if ($LASTEXITCODE -ne 0) {
+        throw "Packaged mssql-mock-tds failed cargo check with exit code $LASTEXITCODE"
+    }
+    Write-Host 'Verified packaged mssql-mock-tds against packaged mssql-tds.'
 }
 finally {
     Pop-Location
