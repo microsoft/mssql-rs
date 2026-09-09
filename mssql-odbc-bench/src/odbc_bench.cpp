@@ -2256,6 +2256,30 @@ private:
     std::array<unsigned char, 8> probe_sink_{};
 };
 
+// Manual commit stops the sequential leg paying one implicit transaction per row,
+// which is what makes it comparable to the single array execute. Scope it to the
+// run so it cannot leak into read benchmarks sharing the session.
+class AutocommitOffScope {
+public:
+    explicit AutocommitOffScope(OdbcSession& session) : session_(session) {
+        session_.set_autocommit(false);
+    }
+
+    ~AutocommitOffScope() {
+        try {
+            session_.set_autocommit(true);
+        } catch (...) {
+            // A destructor cannot report this, and the run already has its result.
+        }
+    }
+
+    AutocommitOffScope(const AutocommitOffScope&) = delete;
+    AutocommitOffScope& operator=(const AutocommitOffScope&) = delete;
+
+private:
+    OdbcSession& session_;
+};
+
 class ParameterArrayWriteRunner::Impl {
 public:
     struct SequentialRow {
@@ -2302,7 +2326,6 @@ public:
                 static_cast<SQLLEN>(written * sizeof(SQLWCHAR));
             sequential_rows_[row].payload_indicator = payload_indicators_[row];
         }
-        session_.set_autocommit(false);
         prepare();
         if (mode_ == "parameter_array") {
             bind_array();
@@ -2474,6 +2497,7 @@ private:
     }
 
     RetrievalMetrics run() {
+        const AutocommitOffScope manual_commit(session_);
         session_.execute_non_query("TRUNCATE TABLE " +
                                    std::string(kParameterArrayTable));
         session_.commit();
