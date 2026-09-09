@@ -20,6 +20,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -862,11 +863,15 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
 // power-of-two read exactly on a character boundary and the carry this test is
 // named for would never be exercised.
 //
-// The msodbcsql leg is measured rather than skipped, per
-// .github/instructions/mssql-odbc.instructions.md: a skip must be backed by a
-// compare run that actually fails. If this leg diverges, record the observed
-// build and result here and reinstate SKIP_IF_COMPARING_MSODBCSQL().
+// Skip is backed by a measurement, per
+// .github/instructions/mssql-odbc.instructions.md. Run unskipped on build
+// 173873 against the pinned retail msodbcsql leg: this driver passed and
+// msodbcsql failed the value comparison. Same mechanism as the SQLGetData twin
+// (VarcharMaxDbcsToCharSplitsCharacterAcrossChunks), which shows the corruption
+// verbatim: msodbcsql drops a GBK lead byte at a chunk boundary and the
+// following bytes decode shifted by one.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) + NCHAR(0x754C) "
         "+ N'abc' COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 3000) AS c1");
@@ -894,14 +899,23 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
 }
 
 // A slot too small for the converted value truncates on a character boundary.
-// The indicator stays a concrete wire-byte count: msodbcsql keys it on the C
-// types, and `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a 1:1 conversion
-// ratio" branch, so converting through the collation does not make the value
-// unmeasurable. 5,000 CP1252 characters are 5,000 wire bytes.
+// The indicator stays a concrete count rather than SQL_NO_TOTAL: msodbcsql keys
+// it on the C types, and `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a
+// 1:1 conversion ratio" branch, so converting through the collation does not
+// make the value unmeasurable.
 //
-// Unskipped on the msodbcsql leg deliberately. Both the UTF-8 payload and the
-// 1:1 indicator are claims of agreement between the two drivers, so this test
-// only earns its keep by being measured against both.
+// Measured on the msodbcsql leg of build 173873. The shared, load-bearing claim
+// holds on both drivers: the indicator is NOT SQL_NO_TOTAL. The exact number
+// diverges, because msodbcsql's estimate is
+// `cbDataAvail + dwDataOffset + cbTruncatedCharsInConvBuf` -- it adds back the
+// bytes already delivered plus whatever its internal conversion buffer is
+// holding, so it reports 5008 where this driver reports the 5000 wire bytes
+// still available. Neither equals the true converted length (10,000 UTF-8
+// bytes); the msodbcsql comment says as much by calling it an assumption.
+// That internal accounting is not reproducible from outside the driver, so the
+// exact value is asserted per-leg rather than skipping the case outright --
+// skipping would also delete the SQL_NO_TOTAL check, which is the part that
+// actually pins this PR's behaviour.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), "
@@ -914,8 +928,19 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
                   stmt_);
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
-    EXPECT_EQ(5000, ind) << "CHAR->CHAR keeps the 1:1 wire-byte estimate";
+
+    // The shared assertion: CHAR->CHAR keeps a concrete 1:1 estimate on both
+    // drivers and never degrades to SQL_NO_TOTAL.
+    EXPECT_NE(SQL_NO_TOTAL, ind) << "CHAR->CHAR keeps the 1:1 wire-byte estimate";
     EXPECT_STREQ("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", reinterpret_cast<const char*>(buf));
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        // 5000 on the wire + 8 delivered, per the sqlcdata.h formula above.
+        EXPECT_EQ(5008, ind);
+    } else {
+        EXPECT_EQ(5000, ind) << "wire bytes still available before this call's copy";
+    }
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }

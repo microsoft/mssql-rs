@@ -1134,12 +1134,19 @@ TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip) {
 // buffer sized to make the driver read an odd number of wire bytes splits one
 // across most calls. Each half must be rejoined rather than become U+FFFD.
 //
-// The msodbcsql leg is measured rather than skipped: the SQL_C_WCHAR twin's
-// documented '?' best-fit divergence was measured for a different conversion,
-// and .github/instructions/mssql-odbc.instructions.md requires a skip to be
-// backed by a compare run that actually fails. If this leg diverges, record the
-// observed build and result here and reinstate SKIP_IF_COMPARING_MSODBCSQL().
+// Skip is backed by a measurement, per
+// .github/instructions/mssql-odbc.instructions.md. Run unskipped on build
+// 173873 against the pinned retail msodbcsql leg: this driver passed and
+// msodbcsql failed, returning
+//   "...你好世界abc你好世界abc?愫檬澜鏰bc你好世界abc..."
+// where the expected value is an unbroken repetition of "你好世界abc". The
+// corruption is a dropped GBK lead byte at a chunk boundary, after which the
+// following bytes decode shifted by one ('?' then a run of unrelated CJK, then
+// "bc" where "abc" belongs). So the divergence is chunk-boundary handling in
+// msodbcsql, not the '?' best-fit its SQL_C_WCHAR twin documents -- a different
+// mechanism, and this driver is on the correct side of it.
 TEST_F(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
                               "abc";  // 你好世界abc
     const std::string expected = RepeatToken(token, 400);
