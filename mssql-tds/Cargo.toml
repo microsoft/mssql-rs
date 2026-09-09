@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust implementation of the TDS (Tabular Data Stream) protocol for SQL Server"
 license = "MIT"
+license-file = "../LICENSE"
 readme = "README.md"
 repository = "https://github.com/microsoft/mssql-rs"
 keywords = ["sql-server", "tds", "mssql", "database", "async"]
 categories = ["database", "network-programming"]
-exclude = [".env", "tests/**", "benches/**"]
+exclude = ["**/.env*", "tests/**", "benches/**"]
 
 [features]
 default = ["integrated-auth", "tls-schannel-direct-on-windows"]

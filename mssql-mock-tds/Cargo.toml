@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Mock TDS server library and CLI for testing SQL Server clients"
 license = "MIT"
+license-file = "../LICENSE"
 repository = "https://github.com/microsoft/mssql-rs"
 
 [lints]
