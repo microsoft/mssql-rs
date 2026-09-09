@@ -515,12 +515,13 @@ stages:
       - pwsh: |
           $ErrorActionPreference = 'Stop'
 
-          # Extract version from mssql-py-core/Cargo.toml
-          $cargoToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/Cargo.toml" -Raw
-          if ($cargoToml -match '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"') {
+          # The NuGet package transports the Python distribution, so it follows
+          # the wheel version rather than the independently-versioned Rust crate.
+          $pyprojectToml = Get-Content "$(Build.SourcesDirectory)/mssql-py-core/pyproject.toml" -Raw
+          if ($pyprojectToml -match '(?ms)^\[project\]\s*$.*?^version\s*=\s*"([^"]+)"') {
             $version = $Matches[1]
           } else {
-            Write-Error "Could not extract version from Cargo.toml"
+            Write-Error "Could not extract [project].version from mssql-py-core/pyproject.toml"
             exit 1
           }
 

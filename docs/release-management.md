@@ -44,10 +44,11 @@ PyPI: mssql-python
 
 ## Version Scheme
 
-The Rust crate and NuGet transport package share the version from
-`mssql-py-core/Cargo.toml`. The `mssql-python-rs` Python distribution has an
-independent version in `mssql-py-core/pyproject.toml`. For example, NuGet
-`mssql-python-rs-wheels 0.1.10` can contain `mssql_python_rs-0.1.0-*.whl`.
+The NuGet transport package and `mssql-python-rs` Python distribution share the
+version from `mssql-py-core/pyproject.toml`. The Rust crate has an independent
+version in `mssql-py-core/Cargo.toml`. For example, NuGet
+`mssql-python-rs-wheels 0.1.0` contains `mssql_python_rs-0.1.0-*.whl`, while the
+Rust crate can have a different version.
 
 The NuGet prerelease suffix depends on the build type:
 
@@ -280,7 +281,7 @@ Steps:
 ## NuGet Package Structure
 
 ```
-mssql-python-rs-wheels.0.1.10.nupkg
+mssql-python-rs-wheels.0.1.0.nupkg
 ├── mssql-python-rs-wheels.nuspec
 └── wheels/
   ├── mssql_python_rs-0.1.0-cp310-cp310-win_amd64.whl
@@ -302,7 +303,7 @@ Every NuGet package description includes:
 - Azure DevOps build number
 
 ```
-mssql-python-rs-wheels 0.1.10
+mssql-python-rs-wheels 0.1.0
 Description: Python wheels containing the mssql-python-rs TDS core and ODBC driver. Commit: a1b2c3d4. Build: 20260217.1
 ```
 

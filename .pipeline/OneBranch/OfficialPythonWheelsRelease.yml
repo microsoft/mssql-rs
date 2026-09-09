@@ -166,19 +166,15 @@ extends:
               return $content -join "`n"
             }
 
-            $cargoToml = Get-BuildSourceFile "mssql-py-core/Cargo.toml"
-            if ($cargoToml -notmatch '(?ms)^\[package\]\s*$.*?^version\s*=\s*"([^"]+)"') {
-              throw "Could not extract [package].version from selected build commit"
-            }
-            # Official release: clean semver, no prerelease suffix
-            $packageVersion = $Matches[1]
-
             $pyprojectToml = Get-BuildSourceFile "mssql-py-core/pyproject.toml"
             if ($pyprojectToml -notmatch '(?ms)^\[project\]\s*$.*?^name\s*=\s*"([^"]+)".*?^version\s*=\s*"([^"]+)"') {
               throw "Could not extract [project] name and version from selected build commit"
             }
             $distributionName = $Matches[1]
             $pythonVersion = $Matches[2]
+            # Official NuGet transports these wheels and therefore uses their
+            # distribution version, independent of the Rust crate version.
+            $packageVersion = $pythonVersion
 
             $shortSha = $commitSha.Substring(0, 8)
 
