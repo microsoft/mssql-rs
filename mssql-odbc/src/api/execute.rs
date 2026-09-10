@@ -510,6 +510,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 }
                 return_client_idle(dbc, statement_handle, client);
                 if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.clear_exhaustion_state();
                     stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
                 }
                 return SQL_ERROR;
