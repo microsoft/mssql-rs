@@ -284,26 +284,32 @@ by unit + e2e tests.
 - `SQLGetConnectAttrW` deliberately has **no** arm, so it falls through to
   `HY092` exactly as msodbcsql does (`sqlcmisc.cpp:4378`).
 
-**Enforcement (AB#46385 — delivered):** every statement-scoped wire operation
-threads `StmtState::query_timeout` into `ExecuteOptions::timeout_secs`, so a
-non-zero value bounds the wait for a response: on expiry the client sends
-`ATTENTION` and reports the failure as `HYT00`, matching msodbcsql. `0` (the
-default) stays unlimited — no behavior change for the common case. See
-mssql-rs#439, where the timeout being silently dropped left a blocked statement
-with no client-side escape hatch.
+**Enforcement (AB#46385 — delivered):** the statement-scoped entry points that
+run a wire operation thread `StmtState::query_timeout` into
+`ExecuteOptions::timeout_secs`, so a non-zero value bounds the wait for a
+response: on expiry the client sends `ATTENTION` and reports the failure as
+`HYT00`, matching msodbcsql. `0` (the default) stays unlimited — no behavior
+change for the common case. See mssql-rs#439, where the timeout being silently
+dropped left a blocked statement with no client-side escape hatch.
 
 The covered surface is `SQLExecute` / `SQLExecDirectW` (mssql-rs#442) plus the
-catalog functions, `SQLGetTypeInfoW` and `SQLDescribeParam` (mssql-rs#466) —
-the latter three were left on `ExecuteOptions::default()` by #442 and closed
-separately. The budget lives on the client for the lifetime of the batch
-(`remaining_request_timeout`), so it also bounds the row reads on the result
-set each of these opens; passing `()` disabled it end to end, not just for the
-initial RPC. msodbcsql reaches the same coverage structurally: catalog
+seven implemented catalog functions, `SQLGetTypeInfoW` and `SQLDescribeParam`
+(mssql-rs#466) — the latter group was left on `ExecuteOptions::default()` by
+\#442 and closed separately. The budget lives on the client for the lifetime of
+the batch (`remaining_request_timeout`), so it also bounds the row reads on the
+result set each of these opens; passing `()` disabled it end to end, not just
+for the initial RPC. msodbcsql reaches the same coverage structurally: catalog
 functions and `SQLGetTypeInfo` are executed *through `SQLExecDirectW` itself*
 (`sqlcdd.cpp:1866`, `:2239`) and `SQLDescribeParam` reaches `AutoFillIPD`
 (`sqlcdesc.cpp:9379`), all reading the same `GetQueryTimeOut(lpstmt)`
-(`sqlcprot.h:1607`). `SQLPrepare` needs no wiring here because this driver
-defers the server-side prepare to execute.
+(`sqlcprot.h:1607`). `SQLPrepare` needs no wiring because this driver defers
+the server-side prepare to execute.
+
+**Known exception:** `SQLFreeHandle(SQL_HANDLE_STMT)`'s best-effort
+`sp_unprepare` (`free_handle.rs:497`) still runs unbounded. msodbcsql bounds
+its equivalent in `DropPrepHandle` (`sqlcfunc.cpp:790-830`); closing the gap
+here needs the timeout captured before the statement state is torn down, so it
+is tracked separately by mssql-rs#546 rather than folded into #466.
 
 **Acceptance:** `cursor.timeout = N` in mssql-python stops logging
 "Failed to set query timeout"; value round-trips through get; clamp + `01S02`

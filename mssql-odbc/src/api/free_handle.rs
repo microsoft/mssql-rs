@@ -493,6 +493,12 @@ fn best_effort_unprepare_on_free_inner(
 
     // `unprepare` skips a handle from a superseded session (already gone
     // server-side) and releases a live one.
+    //
+    // `()` leaves this unbounded by `SQL_ATTR_QUERY_TIMEOUT`, unlike every
+    // other statement-scoped wire operation. msodbcsql bounds its equivalent
+    // (`DropPrepHandle`, `sqlcfunc.cpp:790-830`); doing the same here needs the
+    // statement's timeout captured before its state is torn down, so it is
+    // tracked by mssql-rs#546 rather than papered over here.
     for statement_id in handles {
         if let Err(e) = dbc.runtime.block_on(client.unprepare(statement_id, ())) {
             error!(%e, "SQLFreeHandle(STMT): sp_unprepare failed — handle leaked until disconnect");

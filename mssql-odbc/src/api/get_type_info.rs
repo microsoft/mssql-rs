@@ -446,6 +446,49 @@ mod tests {
         );
     }
 
+    /// The AC2 counterpart to the test above: `SQL_ATTR_QUERY_TIMEOUT` must
+    /// also bound the implicit transaction begin that precedes the RPC. The
+    /// sibling only delays the RPC response, so reverting the pre-execute
+    /// arguments to `0` left it green; this delays only the Begin request.
+    #[test]
+    fn get_type_info_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const BEGIN_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_tm_begin_delay(BEGIN_DELAY);
+        dbc.inner.lock().unwrap().autocommit = false;
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_get_type_info_w_safe(h.stmt, stmt, SQL_ALL_TYPES);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLGetTypeInfoW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the implicit transaction begin well below the server's \
+             {BEGIN_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
     #[test]
     fn exported_wrapper_forwards_to_impl() {
         // Exercise the extern "C" entrypoint (init_tracing + delegation) rather
