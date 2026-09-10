@@ -905,10 +905,20 @@ row-attribution is deferred.
 
 `SQL_PARAM_ARRAY_ROW_COUNTS` and `SQL_PARAM_ARRAY_SELECTS` (`SQLGetInfo`) are
 both implemented: `SQL_PARC_NO_BATCH` (one rolled-up `SQLRowCount`, matching
-the "Reporting" behaviour above) and `SQL_PAS_NO_SELECT` (matching
-divergence 3 - a row-returning statement executes but its result sets are
-discarded, so an `INSERT ... OUTPUT` run through an array loses its OUTPUT
-rows with only a `01000` to notice).
+the "Reporting" behaviour above) and `SQL_PAS_NO_SELECT`. Both differ from
+msodbcsql 18.6.2.1, measured: it reports `SQL_PARC_BATCH` and `SQL_PAS_BATCH`,
+and its behaviour backs the claim - an `INSERT ... OUTPUT` at `PARAMSET_SIZE` 3
+hands back three result sets through `SQLMoreResults`.
+
+`SQL_PAS_NO_SELECT` is the one value here that is not literally true of this
+driver. The spec meaning is "a result-set generating statement is not allowed
+with an array of parameters", and this driver does allow one: divergence 3 runs
+every set and discards the result sets with a `01000`. It is reported anyway
+because the alternatives mislead in a more damaging direction - `SQL_PAS_BATCH`
+would tell an application the OUTPUT rows are retrievable when zero are
+delivered, which is exactly the silent data loss the value exists to warn
+about. Making it literally true means refusing such statements outright, which
+belongs to AB#47944 rather than to `SQLGetInfo`.
 
 Divergence 8 is defence-in-depth, not a live bug: no server behaviour is known
 to produce it. msodbcsql cannot report it because it never compares the reported

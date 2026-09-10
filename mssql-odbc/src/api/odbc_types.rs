@@ -311,11 +311,14 @@ pub const SQL_PARC_NO_BATCH: u32 = 2;
 /// `SQL_PARAM_ARRAY_SELECTS`: per spec, a driver reporting this value does
 /// not allow a result-set-generating statement to be executed with an array
 /// of parameters. This driver actually *does* execute one and discards the
-/// result sets instead of refusing it (divergence 3 in `parameters_plan.md`)
-/// — advertising the stricter, spec-conformant answer is still the right
-/// call, since it matches msodbcsql and warns applications off relying on
-/// `SELECT` over `PARAMSET_SIZE > 1`, but a caller cannot tell from this
-/// value alone that the driver is more permissive than it claims.
+/// result sets instead of refusing it (divergence 3 in `parameters_plan.md`),
+/// so the value is not literally true here. It is reported anyway because the
+/// alternative misleads in a more damaging direction: `SQL_PAS_BATCH` would
+/// promise OUTPUT rows this driver never delivers. msodbcsql 18.6.2.1 does
+/// report `SQL_PAS_BATCH`, measured, and backs it - an `INSERT ... OUTPUT` at
+/// `PARAMSET_SIZE` 3 hands back three result sets - so this is a divergence,
+/// not a match. Making it literally true means refusing such statements,
+/// which belongs to AB#47944.
 /// `sqlext.h`: `#define SQL_PAS_NO_SELECT 3`.
 pub const SQL_PAS_NO_SELECT: u32 = 3;
 

@@ -171,9 +171,15 @@ TEST_F(GetInfoLiveTest, YesNoCapabilities) {
 }
 
 // SQL_PARAM_ARRAY_ROW_COUNTS/SELECTS: literal SQL_PARC_NO_BATCH/SQL_PAS_NO_SELECT
-// against <sqlext.h>, so this runs unchanged against msodbcsql18 and catches a
-// transcription slip in either value (see divergence 9 in parameters_plan.md).
+// against <sqlext.h>, so a transcription slip in either value still fails here.
+//
+// mssql-odbc only. Measured on msodbcsql 18.6.2.1: it answers SQL_PARC_BATCH (1)
+// and SQL_PAS_BATCH (1), and its behaviour backs the claim - an INSERT ... OUTPUT
+// at PARAMSET_SIZE 3 hands back three result sets through SQLMoreResults. This
+// driver discards them (divergence 3, AB#47944), so the values differ by design.
 TEST_F(GetInfoLiveTest, ParamArrayCapabilities) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
 
