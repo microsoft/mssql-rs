@@ -61,6 +61,11 @@ The NuGet prerelease suffix depends on the build type:
 
 NuGet SemVer 2.0 ordering: `dev` < `nightly` < release (no suffix).
 
+Earlier development packages used the Cargo version and were published as
+`0.1.10-dev.*`. Those packages sort above the new `0.1.0-*` lineage. Consumers
+must select or pin the intended `0.1.0` lineage rather than resolving the latest
+prerelease across all versions.
+
 ---
 
 ## Scenario 1: Nightly Builds
@@ -75,7 +80,7 @@ NuGet SemVer 2.0 ordering: `dev` < `nightly` < release (no suffix).
 1. Schedule triggers at 2 AM UTC
 2. Pipeline builds 34 wheels across all platforms
 3. Publish stage:
-  - Extracts the Python distribution version from `mssql-py-core/pyproject.toml` (e.g., `0.2.0`)
+  - Extracts the Python distribution version from mssql-py-core/pyproject.toml (e.g., 0.2.0)
    - Appends -nightly.YYYYMMDD suffix
   - Packs wheels into NuGet: mssql-python-rs-wheels.0.2.0-nightly.20260217
    - OneBranch auto-publishes to mssql-rs/mssql-rs feed

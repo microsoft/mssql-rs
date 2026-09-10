@@ -106,15 +106,16 @@ def test_release_defaults_are_safe():
 
 
 @pytest.mark.parametrize(
-    ("build_reason", "expected_version"),
+    ("build_reason", "is_official", "expected_version"),
     [
-        ("Schedule", "0.1.0-nightly.20260910"),
-        ("IndividualCI", "0.1.0-dev.20260910.12345"),
-        ("Manual", "0.1.0-dev.20260910.12345"),
+        ("Schedule", False, "0.1.0-nightly.20260910"),
+        ("IndividualCI", False, "0.1.0-dev.20260910.12345"),
+        ("Manual", False, "0.1.0-dev.20260910.12345"),
+        ("Manual", True, "0.1.0"),
     ],
 )
 def test_nonofficial_nuget_versions_follow_python_distribution(
-    tmp_path: Path, build_reason: str, expected_version: str
+    tmp_path: Path, build_reason: str, is_official: bool, expected_version: str
 ) -> None:
     source = tmp_path / "source"
     package = source / "mssql-py-core"
@@ -132,7 +133,7 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
         "buildPythonWheels": True,
         "buildOdbcNative": True,
         "buildRustCrates": False,
-        "isOfficial": False,
+        "isOfficial": is_official,
         "publishToFeed": True,
     }
     pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
