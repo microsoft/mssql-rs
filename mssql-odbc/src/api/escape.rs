@@ -1701,6 +1701,57 @@ mod tests {
         assert!(!had_status);
     }
 
+    /// The invariants the fuzz target asserts, pinned over a corpus of the
+    /// shapes that break hand-written lexers, so CI covers them without nightly.
+    #[test]
+    fn scanner_invariants_hold_over_awkward_input() {
+        for input in [
+            "",
+            "{",
+            "}",
+            "{}",
+            "{{{{",
+            "}}}}",
+            "'",
+            "\"",
+            "[",
+            "/*",
+            "--",
+            "--(*",
+            "*)--",
+            "{d '",
+            "'{d ''}'",
+            "/* {call p} ",
+            "{call p({call q({call r})})}",
+            "?{?}?",
+            "{fn UCASE(?)}",
+            "N'{ts '' }'",
+            "{escape",
+            "{interval '1' DAY",
+            "{ }",
+            "select 1 -- {fn x}\n{fn UCASE('a')}",
+        ] {
+            let markers = input.matches('?').count();
+            if let Ok(t) = translate_escapes(input) {
+                assert_eq!(
+                    t.sql.matches('?').count(),
+                    markers,
+                    "marker count changed for {input:?} -> {:?}",
+                    t.sql
+                );
+            }
+            let (noscan_sql, noscan_count, call) =
+                translate_and_rewrite(input, true).expect("NOSCAN never fails");
+            let (expected, expected_count) = super::super::util::rewrite_param_markers(input);
+            assert_eq!(noscan_sql, expected, "{input:?}");
+            assert_eq!(noscan_count, expected_count, "{input:?}");
+            assert!(call.is_none(), "{input:?}");
+            // Must terminate and never panic.
+            let _ = translate_and_rewrite(input, false);
+            let _ = describe_text(input);
+        }
+    }
+
     #[test]
     fn empty_input_is_handled() {
         let t = translate_escapes("").unwrap();

@@ -11,6 +11,7 @@
 //! panics, hangs, and (for the pointer readers) out-of-bounds reads, not for a
 //! particular result.
 
+use crate::api::escape::{describe_text, translate_and_rewrite, translate_escapes};
 use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DATE, SQL_C_DOUBLE,
     SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG,
@@ -22,6 +23,7 @@ use crate::api::odbc_types::{
     SQL_PARAM_INPUT, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_VARCHAR, SQL_WVARCHAR, SqlHandle,
     SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt, SqlWChar,
 };
+use crate::api::util::rewrite_param_markers;
 use crate::api::util::{read_utf16, read_utf16_attr, read_utf16_long};
 use crate::api::{
     SQLAllocHandle, SQLExecDirectW, SQLFetch, SQLFreeHandle, SQLGetData, SQLNumResultCols,
@@ -56,6 +58,39 @@ pub fn fuzz_connection_string(input: &str) {
     if let Ok((params, _has_warnings)) = parse_connection_string(input) {
         let _ = params.fmt_as_odbc_conn_str();
     }
+}
+
+/// Drive ODBC escape-sequence translation and both marker-rewriting phases.
+///
+/// A hand-written lexer over application-supplied text is exactly the shape
+/// fuzzing pays for. Two invariants are asserted beyond "does not panic":
+/// translation never invents or loses a parameter marker, and the NOSCAN path
+/// is byte-identical to marker rewriting on its own.
+pub fn fuzz_escape_sequences(input: &str) {
+    let markers = input.matches('?').count();
+
+    if let Ok(translated) = translate_escapes(input) {
+        // Phase 1 must leave every `?` exactly where it was: SQLNativeSql
+        // returns markers untranslated.
+        assert_eq!(
+            translated.sql.matches('?').count(),
+            markers,
+            "escape translation changed the marker count: {input:?} -> {:?}",
+            translated.sql
+        );
+    }
+
+    // With NOSCAN on, translation is skipped entirely and the result must match
+    // phase 2 run on its own.
+    if let Ok((noscan_sql, noscan_count, call)) = translate_and_rewrite(input, true) {
+        let (expected, expected_count) = rewrite_param_markers(input);
+        assert_eq!(noscan_sql, expected);
+        assert_eq!(noscan_count, expected_count);
+        assert!(call.is_none());
+    }
+
+    let _ = translate_and_rewrite(input, false);
+    let _ = describe_text(input);
 }
 
 /// Drive character→numeric parsing and every downstream narrowing.
