@@ -486,7 +486,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // the sets before the failure are already on the wire. msodbcsql
             // materializes first and sends nothing (measured: 0 rows written),
             // which is the one half of this divergence we keep - matching it
-            // would need this streaming serializer to give up materializing
+            // would mean giving up this streaming serializer and materializing
             // the whole batch upfront. stage_execution already walks every
             // (row, parameter) pair once to enforce the input-only and
             // data-at-execution refusals; what streaming avoids is the
