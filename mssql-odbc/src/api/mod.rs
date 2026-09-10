@@ -34,6 +34,8 @@ mod get_info;
 mod get_type_info;
 mod ird;
 mod more_results;
+mod native_sql;
+mod num_params;
 mod num_result_cols;
 pub(crate) mod odbc_types;
 mod param_data;

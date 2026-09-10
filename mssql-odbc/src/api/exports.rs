@@ -226,6 +226,45 @@ pub unsafe extern "C" fn SQLGetInfoW(
     }
 }
 
+/// ODBC entry point: `SQLNumParams`.
+///
+/// # Safety
+/// See [`super::num_params::sql_num_params`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLNumParams(
+    statement_handle: SqlHandle,
+    parameter_count_ptr: *mut SqlSmallInt,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe { super::num_params::sql_num_params(statement_handle, parameter_count_ptr) }
+}
+
+/// ODBC entry point: `SQLNativeSqlW`.
+///
+/// # Safety
+/// See [`super::native_sql::sql_native_sql_w`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn SQLNativeSqlW(
+    connection_handle: SqlHandle,
+    in_statement_text: *const SqlWChar,
+    text_length1: SqlInteger,
+    out_statement_text: *mut SqlWChar,
+    buffer_length: SqlInteger,
+    text_length2_ptr: *mut SqlInteger,
+) -> SqlReturn {
+    crate::init_tracing();
+    unsafe {
+        super::native_sql::sql_native_sql_w(
+            connection_handle,
+            in_statement_text,
+            text_length1,
+            out_statement_text,
+            buffer_length,
+            text_length2_ptr,
+        )
+    }
+}
+
 // ---- Diagnostics -----------------------------------------------------------
 
 /// Retrieves a diagnostic record (SQLSTATE, native error, message) previously
