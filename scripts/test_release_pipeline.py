@@ -21,6 +21,7 @@ from test_verify_python_wheels import write_wheel_matrix
 
 _ROOT = Path(__file__).parents[1]
 _PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
+_BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
 _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
 _SWITCHES = (
     "publishNuGet",
@@ -102,6 +103,71 @@ def test_release_defaults_are_safe():
     assert pipeline["trigger"] == "none"
     assert pipeline["pr"] == "none"
     assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
+
+
+@pytest.mark.parametrize(
+    ("build_reason", "expected_version"),
+    [
+        ("Schedule", "0.1.0-nightly.20260910"),
+        ("IndividualCI", "0.1.0-dev.20260910.12345"),
+        ("Manual", "0.1.0-dev.20260910.12345"),
+    ],
+)
+def test_nonofficial_nuget_versions_follow_python_distribution(
+    tmp_path: Path, build_reason: str, expected_version: str
+) -> None:
+    source = tmp_path / "source"
+    package = source / "mssql-py-core"
+    package.mkdir(parents=True)
+    (package / "Cargo.toml").write_text(
+        '[package]\nname = "mssql-py-core"\nversion = "0.1.10"\n', encoding="utf-8"
+    )
+    (package / "pyproject.toml").write_text(
+        '[project]\nname = "mssql-python-rs"\nversion = "0.1.0"\n', encoding="utf-8"
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": True,
+    }
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    publish = next(stage for stage in pipeline["stages"] if stage["stage"] == "Publish")
+    step = next(
+        step
+        for step in publish["jobs"][0]["steps"]
+        if step.get("displayName") == "Generate NuGet package metadata"
+    )
+    script = step["pwsh"].replace(
+        '$dateStamp = Get-Date -Format "yyyyMMdd"', '$dateStamp = "20260910"'
+    )
+    variables = {
+        "Build.SourcesDirectory": str(source),
+        "Build.StagingDirectory": str(staging),
+        "Build.Reason": build_reason,
+        "Build.BuildId": "12345",
+        "Build.SourceVersion": "a" * 40,
+        "Build.BuildNumber": "20260910.1",
+    }
+    for key, value in variables.items():
+        script = script.replace(f"$({key})", value)
+
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Package version: {expected_version}" in result.stdout
+    metadata = ET.parse(staging / "mssql-python-rs-wheels.nuspec").find("metadata")
+    assert metadata.findtext("version") == expected_version
 
 
 @pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=5)))
