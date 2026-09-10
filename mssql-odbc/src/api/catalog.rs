@@ -1960,10 +1960,10 @@ mod tests {
 
         const RESPONSE_DELAY: Duration = Duration::from_secs(8);
         const STMT_TIMEOUT_SECS: u32 = 1;
-        // A sanity bound, not the discriminator: the call must finish far
-        // inside the server's delay. What this test actually pins down is the
-        // budget-exhausted arm itself — a bypassed deduction also fails fast
-        // here, so that would not show up as a timing difference.
+        // A sanity bound only. The real discriminator is the message
+        // assertion below: timing cannot separate the two paths, because a
+        // bypassed deduction just lets the RPC time out on its own budget
+        // and reproduce HYT00 just as quickly.
         const BOUND: Duration = Duration::from_secs(5);
 
         let h = TestHandles::with_env_dbc_stmt();
@@ -1991,6 +1991,18 @@ mod tests {
             state.diag_records[0].sql_state, *b"HYT00",
             "an exhausted budget must report HYT00, got {:?}",
             state.diag_records[0].sql_state
+        );
+        // This is what makes the test mutation-resistant: the two paths carry
+        // different text. Reaching the RPC and timing out there yields
+        // "Elapsed: deadline has elapsed", so only the pre-send budget check
+        // produces this message.
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("expired before the statement could be sent"),
+            "the budget must be found exhausted before the RPC is sent, not by the RPC's own \
+             timeout: {}",
+            state.diag_records[0].message
         );
     }
 
