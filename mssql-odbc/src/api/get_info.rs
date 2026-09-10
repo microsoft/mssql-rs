@@ -17,6 +17,7 @@ use crate::api::odbc_types::{
     SQL_MAX_DRIVER_CONNECTIONS, SQL_MAX_SCHEMA_NAME_LEN, SQL_MAX_STATEMENT_LEN,
     SQL_MAX_TABLE_NAME_LEN, SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_NUMERIC_FUNCTIONS,
     SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE, SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE,
+    SQL_PARAM_ARRAY_ROW_COUNTS, SQL_PARAM_ARRAY_SELECTS, SQL_PARC_NO_BATCH, SQL_PAS_NO_SELECT,
     SQL_PROCEDURES, SQL_SC_SQL92_ENTRY, SQL_SCHEMA_TERM, SQL_SERVER_NAME, SQL_SPECIAL_CHARACTERS,
     SQL_SQL_CONFORMANCE, SQL_STRING_FUNCTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
     SQL_SYSTEM_FUNCTIONS, SQL_TC_ALL, SQL_TIMEDATE_FUNCTIONS, SQL_TXN_CAPABLE,
@@ -353,6 +354,14 @@ fn sql_get_info_w_safe(
             string_length_ptr,
             "N",
         ),
+        // Array execution (`SQL_ATTR_PARAMSET_SIZE > 1`) rolls every set's
+        // count into one `SQLRowCount` and discards result sets from a
+        // row-returning statement — see divergences 3 and the array-execution
+        // notes in `parameters_plan.md`.
+        SQL_PARAM_ARRAY_ROW_COUNTS => {
+            write_u32(info_value_ptr, SQL_PARC_NO_BATCH, string_length_ptr)
+        }
+        SQL_PARAM_ARRAY_SELECTS => write_u32(info_value_ptr, SQL_PAS_NO_SELECT, string_length_ptr),
         _ => {
             error!(info_type, "SQLGetInfoW: unsupported info type");
             post_diag(&mut state, ERR_INVALID_INFO_TYPE);
@@ -534,6 +543,8 @@ mod tests {
             (SQL_STRING_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_SYSTEM_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_TIMEDATE_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
+            (SQL_PARAM_ARRAY_ROW_COUNTS, SQL_PARC_NO_BATCH),
+            (SQL_PARAM_ARRAY_SELECTS, SQL_PAS_NO_SELECT),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");

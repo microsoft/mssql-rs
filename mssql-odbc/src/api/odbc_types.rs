@@ -275,6 +275,8 @@ pub const SQL_SQL_CONFORMANCE: SqlUSmallInt = 118;
 pub const SQL_DM_VER: SqlUSmallInt = 171;
 pub const SQL_ASYNC_DBC_FUNCTIONS: SqlUSmallInt = 10023;
 pub const SQL_ASYNC_NOTIFICATION: SqlUSmallInt = 10025;
+pub const SQL_PARAM_ARRAY_ROW_COUNTS: SqlUSmallInt = 153;
+pub const SQL_PARAM_ARRAY_SELECTS: SqlUSmallInt = 154;
 
 // SQLGetInfo return values.
 pub const SQL_OAC_LEVEL2: u16 = 0x0002;
@@ -301,6 +303,15 @@ pub const SQL_GD_ANY_COLUMN: u32 = 0x00000001;
 pub const SQL_GD_ANY_ORDER: u32 = 0x00000002;
 pub const SQL_ASYNC_DBC_NOT_CAPABLE: u32 = 0x00000000;
 pub const SQL_ASYNC_NOTIFICATION_NOT_CAPABLE: u32 = 0x00000000;
+/// `SQL_PARAM_ARRAY_ROW_COUNTS`: one rolled-up `SQLRowCount` for the whole
+/// array rather than one per set (`SQLGetInfo` never reports `SQL_PARC_BATCH`
+/// here — `SQLRowCount` already sums every set's affected rows).
+pub const SQL_PARC_NO_BATCH: u32 = 0;
+/// `SQL_PARAM_ARRAY_SELECTS`: a row-returning statement is accepted with an
+/// array but its result sets are discarded (see divergence 3 in
+/// `parameters_plan.md`), so applications must not rely on `SELECT` over
+/// `PARAMSET_SIZE > 1`.
+pub const SQL_PAS_NO_SELECT: u32 = 2;
 
 // ODBC-SQL-type identifiers.
 pub const SQL_UNKNOWN_TYPE: SqlSmallInt = 0;
@@ -401,9 +412,15 @@ pub const SQL_DIAG_SUBCLASS_ORIGIN: SqlSmallInt = 9;
 pub const SQL_DIAG_CONNECTION_NAME: SqlSmallInt = 10;
 pub const SQL_DIAG_SERVER_NAME: SqlSmallInt = 11;
 pub const SQL_DIAG_DYNAMIC_FUNCTION_CODE: SqlSmallInt = 12;
+pub const SQL_DIAG_ROW_NUMBER: SqlSmallInt = 1750;
 
 // Dynamic-function-code value: statement type is unknown/unclassified.
 pub const SQL_DIAG_UNKNOWN_STATEMENT: SqlInteger = 0;
+
+// SQL_DIAG_ROW_NUMBER sentinels: the record is not associated with any row
+// (`SQL_NO_ROW_NUMBER`), or the driver cannot say which row (`SQL_ROW_NUMBER_UNKNOWN`).
+pub const SQL_NO_ROW_NUMBER: SqlLen = -1;
+pub const SQL_ROW_NUMBER_UNKNOWN: SqlLen = -2;
 
 // Special length/indicator constants.
 pub const SQL_NULL_DATA: SqlLen = -1;

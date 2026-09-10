@@ -895,6 +895,20 @@ work items. Not restated here.
 | 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | AB#47790 |
 | 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | AB#47945 |
 | 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS` | AB#47945 |
+| 9 | `SQL_DIAG_ROW_NUMBER` on a diagnostic raised during array execution | always `SQL_NO_ROW_NUMBER` - no per-set attribution is plumbed through `post_tds_error` yet, so a batch with several failing sets reports several records with no mapping back to the row that produced each one | microsoft/mssql-rs#541 |
+
+Divergence 9's absence was unobservable before this PR: nothing produced
+per-row diagnostics until array execution existed. `SQL_DIAG_ROW_NUMBER`
+itself is now implemented and correctly reports `SQL_NO_ROW_NUMBER` for every
+non-array diagnostic (there is no row to report); only the array-execution
+row-attribution is deferred.
+
+`SQL_PARAM_ARRAY_ROW_COUNTS` and `SQL_PARAM_ARRAY_SELECTS` (`SQLGetInfo`) are
+both implemented: `SQL_PARC_NO_BATCH` (one rolled-up `SQLRowCount`, matching
+the "Reporting" behaviour above) and `SQL_PAS_NO_SELECT` (matching
+divergence 3 - a row-returning statement executes but its result sets are
+discarded, so an `INSERT ... OUTPUT` run through an array loses its OUTPUT
+rows with only a `01000` to notice).
 
 Divergence 8 is defence-in-depth, not a live bug: no server behaviour is known
 to produce it. msodbcsql cannot report it because it never compares the reported

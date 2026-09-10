@@ -16,11 +16,12 @@ use tracing::{debug, error};
 
 use crate::api::odbc_types::{
     SQL_DIAG_CLASS_ORIGIN, SQL_DIAG_CONNECTION_NAME, SQL_DIAG_DYNAMIC_FUNCTION_CODE,
-    SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_SERVER_NAME,
-    SQL_DIAG_SQLSTATE, SQL_DIAG_SUBCLASS_ORIGIN, SQL_DIAG_UNKNOWN_STATEMENT, SQL_ERROR,
-    SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT, SQL_INVALID_HANDLE,
-    SQL_NO_DATA, SQL_SQLSTATE_SIZE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger,
-    SqlPointer, SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_DIAG_MESSAGE_TEXT, SQL_DIAG_NATIVE, SQL_DIAG_NUMBER, SQL_DIAG_ROW_NUMBER,
+    SQL_DIAG_SERVER_NAME, SQL_DIAG_SQLSTATE, SQL_DIAG_SUBCLASS_ORIGIN, SQL_DIAG_UNKNOWN_STATEMENT,
+    SQL_ERROR, SQL_HANDLE_DBC, SQL_HANDLE_DESC, SQL_HANDLE_ENV, SQL_HANDLE_STMT,
+    SQL_INVALID_HANDLE, SQL_NO_DATA, SQL_NO_ROW_NUMBER, SQL_SQLSTATE_SIZE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger, SqlLen, SqlPointer, SqlReturn, SqlSmallInt,
+    SqlWChar,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{DiagRecord, HasDiagnostics};
@@ -273,6 +274,13 @@ unsafe fn handle_record_field(
         }
         SQL_DIAG_NATIVE => {
             unsafe { write_if_some(diag_info_ptr as *mut SqlInteger, rec.native_error) };
+            SQL_SUCCESS
+        }
+        // No per-set/per-row attribution is plumbed through `TdsError` yet
+        // (tracked separately), so every record reports "not associated with
+        // a row" rather than a wrong or misleading row number.
+        SQL_DIAG_ROW_NUMBER => {
+            unsafe { write_if_some(diag_info_ptr as *mut SqlLen, SQL_NO_ROW_NUMBER) };
             SQL_SUCCESS
         }
         SQL_DIAG_MESSAGE_TEXT => {
@@ -972,6 +980,30 @@ mod tests {
         };
         assert_eq!(ret, SQL_SUCCESS);
         assert_eq!(native, 42);
+        unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
+    }
+
+    #[test]
+    fn diag_field_row_number_reports_no_row_number() {
+        // No per-set/per-row attribution is plumbed through yet, so every
+        // record must report SQL_NO_ROW_NUMBER rather than a wrong index.
+        let env = alloc_env();
+        push_diag(env, *b"HY024", 0, "some error");
+
+        let mut row_number: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_diag_field_w(
+                SQL_HANDLE_ENV,
+                env,
+                1,
+                SQL_DIAG_ROW_NUMBER,
+                &mut row_number as *mut SqlLen as SqlPointer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(row_number, SQL_NO_ROW_NUMBER);
         unsafe { sql_free_handle(SQL_HANDLE_ENV, env) };
     }
 
