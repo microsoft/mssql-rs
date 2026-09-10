@@ -184,3 +184,57 @@ TEST_F(GetDiagFieldTest, DiagNumberAfterSuccessIsZero) {
     EXPECT_EQ(SQL_SUCCESS, rc);
     EXPECT_EQ(0, count);
 }
+
+// ===================================================================
+// Tests that require a live SQL Server (SQL_DIAG_ROW_NUMBER is scoped to
+// SQL_HANDLE_STMT only, so it needs a real statement-level diagnostic).
+// ===================================================================
+
+class DiagFieldRowNumberLiveTest : public ODBCTest {
+protected:
+    void SetUp() override {
+        ODBCTest::SetUp();
+        if (!ODBCTestConfig::Instance().HasConnection()) {
+            FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
+        }
+        Connect();
+    }
+};
+
+// This driver doesn't track per-row batch failures yet (see divergence 9 in
+// docs/parameters_plan.md, tracked by microsoft/mssql-rs#541), so it always
+// reports SQL_NO_ROW_NUMBER on a stmt-level diagnostic. Asserting the literal
+// spec constant (rather than the driver's own SQL_NO_ROW_NUMBER back at
+// itself) catches a transcription slip and runs unchanged against msodbcsql18.
+TEST_F(DiagFieldRowNumberLiveTest, ReportsNoRowNumberOnStmtError) {
+    SQLRETURN rc = SQLExecDirect(stmt_,
+        const_cast<SQLTCHAR*>(ODBCTestUtils::ToSqlTStr(
+            "SELECT * FROM mssql_rs_nonexistent_table_xyz").c_str()),
+        SQL_NTS);
+    ASSERT_EQ(SQL_ERROR, rc);
+
+    SQLINTEGER row_number = 0;
+    rc = SQLGetDiagFieldW(SQL_HANDLE_STMT, stmt_, 1,
+                          SQL_DIAG_ROW_NUMBER,
+                          &row_number, 0, nullptr);
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(-1 /* SQL_NO_ROW_NUMBER */, row_number);
+}
+
+// SQL_DIAG_ROW_NUMBER is scoped to SQL_HANDLE_STMT per spec; other handle
+// types must refuse it (mirrors the driver's existing refusal of the sibling
+// SQL_DIAG_COLUMN_NUMBER on non-STMT handles).
+TEST_F(DiagFieldRowNumberLiveTest, RefusedOnDbcHandle) {
+    // Unknown attribute number reliably posts a diagnostic without depending
+    // on server-specific validation behavior.
+    SQLRETURN rc = SQLSetConnectAttr(dbc_, 99999,
+                                     reinterpret_cast<SQLPOINTER>(0), 0);
+    ASSERT_NE(SQL_SUCCESS, rc);
+    ASSERT_NE(SQL_SUCCESS_WITH_INFO, rc);
+
+    SQLINTEGER row_number = 0;
+    rc = SQLGetDiagFieldW(SQL_HANDLE_DBC, dbc_, 1,
+                          SQL_DIAG_ROW_NUMBER,
+                          &row_number, 0, nullptr);
+    EXPECT_EQ(SQL_ERROR, rc);
+}

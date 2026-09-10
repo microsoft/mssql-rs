@@ -170,6 +170,24 @@ TEST_F(GetInfoLiveTest, YesNoCapabilities) {
     }
 }
 
+// SQL_PARAM_ARRAY_ROW_COUNTS/SELECTS: literal SQL_PARC_NO_BATCH/SQL_PAS_NO_SELECT
+// against <sqlext.h>, so this runs unchanged against msodbcsql18 and catches a
+// transcription slip in either value (see divergence 9 in parameters_plan.md).
+TEST_F(GetInfoLiveTest, ParamArrayCapabilities) {
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT len = -1;
+
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_PARC_NO_BATCH),
+              GetInfoU32(dbc_, SQL_PARAM_ARRAY_ROW_COUNTS, &rc, &len));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len);
+
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_PAS_NO_SELECT),
+              GetInfoU32(dbc_, SQL_PARAM_ARRAY_SELECTS, &rc, &len));
+    EXPECT_TRUE(SQL_SUCCEEDED(rc));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len);
+}
+
 TEST_F(GetInfoLiveTest, IdentifierLimitsAreSysnameWidth) {
     for (SQLUSMALLINT infoType : {SQL_MAX_COLUMN_NAME_LEN, SQL_MAX_SCHEMA_NAME_LEN,
                                   SQL_MAX_TABLE_NAME_LEN}) {

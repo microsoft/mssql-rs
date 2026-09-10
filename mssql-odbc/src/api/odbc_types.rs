@@ -308,10 +308,15 @@ pub const SQL_ASYNC_NOTIFICATION_NOT_CAPABLE: u32 = 0x00000000;
 /// here — `SQLRowCount` already sums every set's affected rows).
 /// `sqlext.h`: `#define SQL_PARC_NO_BATCH 2`.
 pub const SQL_PARC_NO_BATCH: u32 = 2;
-/// `SQL_PARAM_ARRAY_SELECTS`: a row-returning statement is accepted with an
-/// array but its result sets are discarded (see divergence 3 in
-/// `parameters_plan.md`), so applications must not rely on `SELECT` over
-/// `PARAMSET_SIZE > 1`. `sqlext.h`: `#define SQL_PAS_NO_SELECT 3`.
+/// `SQL_PARAM_ARRAY_SELECTS`: per spec, a driver reporting this value does
+/// not allow a result-set-generating statement to be executed with an array
+/// of parameters. This driver actually *does* execute one and discards the
+/// result sets instead of refusing it (divergence 3 in `parameters_plan.md`)
+/// — advertising the stricter, spec-conformant answer is still the right
+/// call, since it matches msodbcsql and warns applications off relying on
+/// `SELECT` over `PARAMSET_SIZE > 1`, but a caller cannot tell from this
+/// value alone that the driver is more permissive than it claims.
+/// `sqlext.h`: `#define SQL_PAS_NO_SELECT 3`.
 pub const SQL_PAS_NO_SELECT: u32 = 3;
 
 // ODBC-SQL-type identifiers.
