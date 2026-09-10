@@ -20,6 +20,7 @@ use crate::api::odbc_types::{
     SQL_C_WCHAR, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_NULL_DATA, SQL_SUCCESS, SqlHandle,
     SqlLen, SqlPointer, SqlReturn,
 };
+use crate::conversion::param_convert::reserve_dae_buffer;
 use crate::error::free_errors;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw};
 
@@ -378,7 +379,7 @@ unsafe fn sql_put_data_safe(
                 // borrowed capacity, released just below.
                 &mut dae.progress.unit_carry
             };
-            if target.try_reserve(byte_count).is_err() {
+            if reserve_dae_buffer(target, byte_count).is_err() {
                 drop(stmt_state);
                 error!(
                     "SQLPutData: failed to reserve {byte_count} bytes for a data-at-execution value (HY001)"
@@ -387,7 +388,7 @@ unsafe fn sql_put_data_safe(
             }
             if length_limit.is_some()
                 && !std::ptr::eq(target, &dae.progress.unit_carry)
-                && dae.progress.unit_carry.try_reserve(byte_count).is_err()
+                && reserve_dae_buffer(&mut dae.progress.unit_carry, byte_count).is_err()
             {
                 drop(stmt_state);
                 error!(

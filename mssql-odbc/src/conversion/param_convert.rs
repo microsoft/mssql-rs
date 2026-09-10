@@ -148,6 +148,15 @@ impl ParamBuildError {
     }
 }
 
+pub(crate) fn reserve_dae_buffer(
+    buffer: &mut Vec<u8>,
+    additional: usize,
+) -> Result<(), ParamBuildError> {
+    buffer
+        .try_reserve(additional)
+        .map_err(|_| ParamBuildError::MemoryAllocation)
+}
+
 /// Converts a bound parameter into an RPC parameter, optionally named
 /// (`@P1`-style).
 ///
@@ -368,18 +377,14 @@ impl DaeLengthLimit {
         // caller reserves this buffer before entry, and returning it directly
         // avoids a second infallible allocation for the kept prefix.
         let mut joined = std::mem::take(carry);
-        joined
-            .try_reserve(chunk.len())
-            .map_err(|_| ParamBuildError::MemoryAllocation)?;
+        reserve_dae_buffer(&mut joined, chunk.len())?;
         joined.extend_from_slice(chunk);
         let whole = if unit <= 1 {
             joined.len()
         } else {
             joined.len() - joined.len() % unit
         };
-        carry
-            .try_reserve(joined.len() - whole)
-            .map_err(|_| ParamBuildError::MemoryAllocation)?;
+        reserve_dae_buffer(carry, joined.len() - whole)?;
         carry.extend_from_slice(&joined[whole..]);
 
         let (kept, consumed) = self.fit(&joined[..whole], already)?;
@@ -4251,6 +4256,13 @@ mod tests {
             vec![0x61, 0x00, 0x62, 0x00, 0x63, 0x00],
             "the split code unit must be reassembled, not dropped"
         );
+    }
+
+    #[test]
+    fn dae_reservation_capacity_overflow_maps_to_hy001() {
+        let error = reserve_dae_buffer(&mut Vec::new(), usize::MAX).unwrap_err();
+        assert_eq!(error, ParamBuildError::MemoryAllocation);
+        assert_eq!(error.diag().state, ERR_MEMORY_ALLOCATION.state);
     }
 
     /// `fit` is the single-call primitive: it measures whole units only, so a
