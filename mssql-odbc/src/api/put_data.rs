@@ -174,6 +174,11 @@ unsafe fn sql_put_data_safe(
             if let Some(dae) = stmt_state.dae.as_mut()
                 && dae.deferred
             {
+                if dae.call_in_flight() {
+                    error!("SQLPutData: DAE sequence is in use by another call");
+                    post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+                    return SQL_ERROR;
+                }
                 dae.progress.put_data_called = true;
                 dae.progress.is_null = true;
                 return SQL_SUCCESS;
@@ -780,6 +785,28 @@ mod tests {
         assert!(dae.progress.put_data_called);
         assert!(!dae.progress.is_null);
         assert_eq!(dae.progress.bytes_sent, 0);
+    }
+
+    #[test]
+    fn deferred_null_write_rejects_an_in_flight_sequence() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut dae = open_dae(None);
+            dae.deferred = true;
+            dae.set_call_in_flight(true);
+            state.dae = Some(dae);
+        }
+
+        let ret = unsafe { sql_put_data(h.stmt, std::ptr::null_mut(), SQL_NULL_DATA) };
+        assert_eq!(ret, SQL_ERROR);
+
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records[0].sql_state, ERR_FUNCTION_SEQUENCE.state);
+        let dae = state.dae.as_ref().expect("sequence still active");
+        assert!(!dae.progress.put_data_called);
+        assert!(!dae.progress.is_null);
     }
 
     #[test]
