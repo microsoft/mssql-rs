@@ -1,6 +1,7 @@
 # mssql-odbc — ODBC escape sequences (AB#46384) — implementation plan
 
-Status: **plan agreed, implementation in progress.**
+Status: **implemented.** Kept as the design record for the change; the
+corrections measurement forced on the original plan are marked below.
 
 Written from the work items, the msodbcsql reference source, `mssql-rs` `main` at `0d431b71`, and
 live probes against SQL Server 2025 and msodbcsql 18.
@@ -77,12 +78,15 @@ contract the new code must reproduce:
 | `{call dbo.myproc(?, DEFAULT, {ts '2020-01-02 13:14:15'})}` | `  EXEC dbo.myproc ?,DEFAULT,{ts '2020-01-02 13:14:15'}  ` |
 | `SELECT {bogus 1}` | error, SQLSTATE `42000`, "Syntax error, permission violation, or other nonspecific error" |
 
-Two things to note, because they constrain the design:
+Three things to note, because they constrain the design:
 
 1. A translated escape is replaced by `" " + text + " "`, so an extra space appears on each side.
 2. **`?` markers are preserved verbatim.** `SQLNativeSql` translates escapes and nothing else — it
    does not rewrite markers to `@Pn`. That is why translation and marker rewriting have to be
    separate phases (§5.1).
+3. **Escapes inside literals, comments and bracketed identifiers are not escapes.** `SELECT
+   '{bogus 1}'` comes back unchanged rather than failing, so the scanner has to be lexically aware
+   even though `FindECode` reads as a plain character search.
 
 `SQLNativeSql` always uses the **textual** `EXEC` form for `{call}` because it has no statement
 handle; on a real statement the RPC path is taken instead.
@@ -356,9 +360,14 @@ replaced by the text plus one space on each side):
 | `{interval '30' SECOND}` | `'INTERVAL +''30.000000'' SECOND(2,6)'` |
 | `{interval '30.5' SECOND(2,1)}` | `'INTERVAL +''30.5'' SECOND(2,1)'` |
 
-Validation, all → `42000` (`ParseInterval`, `sqlccnvt.cpp:6720-6780`): precision > 9; scale > 9;
-leading value ≥ 10^precision; `month > 11`; `hour > 23`; `minute > 59`; `second > 59`; trailing junk.
-Fraction digits beyond `scale` are truncated and reported as a warning (`01S07`), not an error.
+Validation (`ParseInterval`, `sqlccnvt.cpp:6720-6780`): precision > 9; scale > 9; leading value
+≥ 10^precision; `month > 11`; `hour > 23`; `minute > 59`; `second > 59`; trailing junk. All of them
+report **`22018`**, not the `42000` every other escape uses, because msodbcsql routes `{interval}`
+through the type converter rather than the escape parser.
+
+Fraction digits beyond `scale` are an **error, `22001`** — `ProcessDTI` promotes `CVT_FRACT_TRUNC`
+from `01S07` to `22001` for an ODBC 3.x application (`sqlcmisc.cpp:7945`). An earlier draft of this
+plan said "warning, `01S07`", which measurement disproved.
 
 ### 5.4 `{encrypt N'…'}` — exact reproduction
 
@@ -385,8 +394,14 @@ security primitive.
 Two paths, mirroring msodbcsql:
 
 - **RPC path** — the trimmed statement is exactly one `{[?=]call name[(args…)]}` and every argument
-  is `?`, `DEFAULT`, or empty. Dispatch through `execute_stored_procedure(name, …)` with parameters
-  from an extended `build_named_params`. Output parameters need only `StatusFlags::BY_REF_VALUE`.
+  is `?`, `DEFAULT`, or empty. Dispatch through `execute_stored_procedure(name, …)`. Output
+  parameters need only `StatusFlags::BY_REF_VALUE`.
+
+  Parameters go in **positionally**, not as `@P1..@Pn`. The server matches an RPC's *named*
+  parameters against the procedure's own parameter names, so `@P1` fails with "expects parameter
+  '@a', which was not supplied" — found by the e2e tests, not by unit tests. The `{? = call …}`
+  return-status binding is skipped entirely: it travels on the RETURNSTATUS token, not as an
+  argument.
 - **Text path** — everything else (a call inside a batch, literal or nested-escape arguments,
   multiple calls): rewrite to `EXEC name @P1, @P2 OUTPUT, DEFAULT, …` and run through
   `sp_executesql`.
@@ -416,11 +431,14 @@ of the change and must be reviewed as such.
 - `build_named_params` marks them `StatusFlags::BY_REF_VALUE`.
 - ODBC requires output values to be invisible until every result set the procedure produced has been
   consumed. `get_return_values()` fills as tokens arrive, so writeback is gated on batch exhaustion
-  at `more_results.rs:306` — where the TODO already sits — not written back eagerly at execute time.
+  rather than written back eagerly at execute time. There are **two** such points, not one: the
+  `SQLMoreResults` batch-end arm (the existing TODO), and `finish_execute`'s no-result-set path — a
+  procedure that returns no rows is already exhausted there and `SQLMoreResults` never runs for it.
 - Matching follows msodbcsql: **by name first, then by ordinal**. Honour `StrLen_or_IndPtr`
   including `SQL_NULL_DATA`; report truncation as `01004`.
-- `{? = call …}` binds the return status to parameter 1: `HY105` when bound `SQL_PARAM_INPUT`,
-  `07001` when unbound.
+- `{? = call …}` binds the return status to parameter 1, identified from the *statement form*
+  rather than the bound direction — msodbcsql forces that parameter to OUTPUT and rejects an input
+  binding (`sqlcmisc.cpp:8310`), so the direction the application chose does not identify it.
 
 ### 5.7 mssql-tds changes
 
@@ -453,25 +471,19 @@ Realistically ~2,000–2,800 lines including tests, which is large — so the PR
 **ordered, individually-reviewable commit sequence**, and the PR description points reviewers at it
 commit by commit.
 
-| # | Commit | Content | Rough size |
-| --- | --- | --- | --- |
-| 0 | `Add the escape-sequence implementation plan` | This document. | — |
-| 1 | `Add the ODBC escape scanner` | Shared lexer + `translate_escapes`; `rewrite_param_markers` moved onto the same lexer with its tests unchanged. Recognition, classification, syntax validation, pass-through policy. No caller changes yet. | ~450 |
-| 2 | `Translate {escape}, {interval}, {encrypt}` | The three literal translations, to the byte-exact specs in §5.3/§5.4. Pure functions, heavily unit-tested. | ~350 |
-| 3 | `Implement SQLNativeSql` | Export `SQLNativeSqlW` (phase 1 only — markers preserved), including the truncation/`01004` buffer contract and the null-out-buffer length query. First user-visible behaviour. | ~200 |
-| 4 | `Honour SQL_ATTR_NOSCAN and scan on execute` | Attribute becomes real; statements retain their original SQL (§5.2); `SQLExecDirectW` / `SQLPrepareW` run phase 1 then phase 2; `42000` raised before any network I/O. | ~300 |
-| 5 | `Implement SQLNumParams` | Export + `HY010` for unprepared. | ~120 |
-| 6 | `Expose the RPC return status in mssql-tds` | Public accessor + tests. | ~120 |
-| 7 | `Emit OUTPUT in the sp_executesql parameter declaration` | `rpc_parameters.rs:678` honours `is_output()`, with tests proving an output value round-trips through `sp_executesql`. | ~120 |
-| 8 | `Bracket-quote the procedure name in the AE describe path` | The `tds_client.rs:5851` fix + regression test. Standalone so it is reviewable as a security fix. | ~80 |
-| 9 | `Translate {call} and dispatch as RPC` | Name validation, RPC path, `EXEC` text fallback with `OUTPUT` at the call site, `;N` group numbers, `07001` binding checks. Output binding still rejected at this commit. | ~500 |
-| 10 | `Accept and write back output parameters` | Bind-time acceptance, `BY_REF_VALUE` marking, writeback gated on batch exhaustion, name-then-ordinal matching, indicators, `SQL_NULL_DATA`, `01004` truncation, `{? = call}` return status. Resolves the `more_results.rs:306` TODO. | ~550 |
-| 11 | `Describe {call} parameters` | Translated original text into the `sp_describe_undeclared_parameters` path; `{? = call}` parameter 1 reported as `SQL_INTEGER(10)`. | ~200 |
-| 12 | `Add escape-sequence e2e tests and parity run` | C++ gtest coverage, msodbcsql parity leg, fuzz target. | ~500 |
-| 13 | `Report escape capabilities from SQLGetInfo` | Replace the zeroed masks and add the remaining escape-related info types (§7). | ~150 |
+| Commit | Content |
+| --- | --- |
+| `Add the ODBC escape-sequence implementation plan` | This document. |
+| `Add the ODBC escape scanner and literal translations` | Shared lexer + `translate_escapes`; `rewrite_param_markers` moved onto it, unchanged. `{escape}` / `{interval}` / `{encrypt}` translated to the byte-exact specs above. |
+| `Implement SQLNativeSql and SQLNumParams` | Both exported and advertised through `SQLGetFunctions`. |
+| `Translate escapes on execute, honour NOSCAN, dispatch {call} as RPC` | Execution paths run phase 1 then phase 2; `SQL_ATTR_NOSCAN` becomes functional; `PreparedPlan` retains the original text; `SQLDescribeParam` re-translates from it. |
+| `Quote the procedure name and emit OUTPUT in sp_executesql` | The three mssql-tds changes, including the Always Encrypted injection fix. |
+| `Accept and write back output parameters` | Bind-time acceptance, `BY_REF_VALUE` marking, writeback at both batch-exhaustion points. |
+| `Report escape capabilities and fuzz the scanner` | The measured `SQLGetInfo` values, plus a fuzz target and its invariants pinned as a unit test. |
+| `Add escape-sequence e2e tests and fix what they caught` | C++ gtest coverage, and the four execution bugs it found. |
 
-If the security fix in commit 8 needs to ship ahead of the feature, it is self-contained and can be
-cherry-picked into its own PR.
+The security fix is self-contained in its own commit and can be cherry-picked into its own PR if
+it needs to ship ahead of the feature.
 
 ---
 
