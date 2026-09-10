@@ -210,7 +210,7 @@ fn sql_set_desc_rec_safe(
     if precision_write != SQL_SUCCESS {
         return precision_write;
     }
-    let scale_write = set_scale(&mut state, record_number, scale as SqlPointer);
+    let scale_write = set_scale(&mut state, desc.kind, record_number, scale as SqlPointer);
     if scale_write != SQL_SUCCESS {
         return scale_write;
     }

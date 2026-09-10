@@ -1074,6 +1074,156 @@ TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip) {
     SQLCloseCursor(stmt_);
 }
 
+// The regression this conversion exists for: AB#47875, where mssql-python's
+// test_varchar_cp1252_lob_with_collation received raw CP1252 bytes and its
+// strict UTF-8 decode fell back to returning `bytes`.
+//
+// SQL_C_CHAR output is UTF-8, so a CP1252 varchar(max) must be decoded through
+// the column's collation on the way out. CP1252 is single-byte, so a verbatim
+// copy delivers the correct character *count* with the wrong bytes -- which is
+// how the defect stayed hidden. Asserting the UTF-8 spelling is what catches it.
+//
+// Not skipped on Linux/macOS: both drivers deliver UTF-8 for SQL_C_CHAR there
+// and this case passed on both legs of build 173873, which is the parity claim
+// this PR rests on. Skipped only on Windows, where msodbcsql uses the client
+// ANSI code page instead (AB#47564).
+TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkedRoundTrip) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    // UTF-8 spelling of "café René señor Müller Größe naïve " -- what a caller
+    // asking for SQL_C_CHAR must receive.
+    const std::string token = "caf\xC3\xA9 Ren\xC3\xA9 se\xC3\xB1or M\xC3\xBCller "
+                              "Gr\xC3\xB6\xC3\x9F"
+                              "e na\xC3\xAF"
+                              "ve ";
+    const std::string expected = RepeatToken(token, 250);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Ren' + NCHAR(0xE9) "
+                   "+ N' se' + NCHAR(0xF1) + N'or M' + NCHAR(0xFC) + N'ller "
+                   "Gr' + NCHAR(0xF6) + NCHAR(0xDF) + N'e na' + NCHAR(0xEF) + N've ' "
+                   "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 250) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    const std::string got = ReadCharDataInChunks(stmt_, 1, 61);
+    EXPECT_EQ(expected, got);
+    EXPECT_GT(got.size(), 250u * 35u) << "UTF-8 must be longer than the CP1252 wire bytes";
+
+    SQLCloseCursor(stmt_);
+}
+
+// The pinning case for the chunk-boundary carry on the SQL_C_CHAR path. Under a
+// Chinese_PRC collation the wire is GBK, two bytes per CJK character, and a
+// buffer sized to make the driver read an odd number of wire bytes splits one
+// across most calls. Each half must be rejoined rather than become U+FFFD.
+//
+// Skip is backed by a measurement, per
+// .github/instructions/mssql-odbc.instructions.md. Run unskipped on build
+// 173873 against the pinned retail msodbcsql leg: this driver passed and
+// msodbcsql failed, returning
+//   "...你好世界abc你好世界abc?愫檬澜鏰bc你好世界abc..."
+// where the expected value is an unbroken repetition of "你好世界abc". The
+// corruption is a dropped GBK lead byte at a chunk boundary, after which the
+// following bytes decode shifted by one ('?' then a run of unrelated CJK, then
+// "bc" where "abc" belongs). So the divergence is chunk-boundary handling in
+// msodbcsql, not the '?' best-fit its SQL_C_WCHAR twin documents -- a different
+// mechanism, and this driver is on the correct side of it.
+TEST_F(GetDataLiveTest, VarcharMaxDbcsToCharSplitsCharacterAcrossChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+                              "abc";  // 你好世界abc
+    const std::string expected = RepeatToken(token, 400);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) "
+                   "+ NCHAR(0x754C) + N'abc' "
+                   "COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 29));
+
+    SQLCloseCursor(stmt_);
+}
+
+// Chunking must be invisible on the SQL_C_CHAR path too: the same column read
+// in one call and in many must produce the same value. A buffer of 7 is the
+// tightest interesting size -- decoding expands, so the driver's read has to be
+// sized down from the caller's capacity or output overruns every call.
+TEST_F(GetDataLiveTest, VarcharMaxCp1252ToCharChunkSizeDoesNotChangeValue) {
+    const char* kQuery =
+        "SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' Gr' + NCHAR(0xF6) + NCHAR(0xDF) "
+        "+ N'e na' + NCHAR(0xEF) + N've ' "
+        "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1";
+
+    ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    const std::string one_shot = ReadCharDataInChunks(stmt_, 1, 65536);
+    SQLCloseCursor(stmt_);
+
+    for (size_t buf_size : {7u, 16u, 33u, 1024u}) {
+        ASSERT_SQL_OK(ExecDirect(kQuery), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(one_shot, ReadCharDataInChunks(stmt_, 1, buf_size))
+            << "buffer size " << buf_size;
+        SQLCloseCursor(stmt_);
+    }
+
+    EXPECT_FALSE(one_shot.empty());
+}
+
+// A UTF-8 collation is already in the target encoding, so it must stay on the
+// verbatim path and NOT be decoded a second time. Double-converting would
+// mangle every non-ASCII character.
+TEST_F(GetDataLiveTest, VarcharMaxUtf8CollationToCharIsNotDoubleConverted) {
+    // Windows-only skip: msodbcsql re-encodes the UTF-8 wire bytes into the
+    // client ANSI code page there (AB#47564). Measured as agreeing on Linux.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD"
+                              "caf\xC3\xA9\xF0\x9F\x98\x80";  // 你好café😀
+    const std::string expected = RepeatToken(token, 300);
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + N'caf' "
+                   "+ NCHAR(0xE9) + NCHAR(0xD83D) + NCHAR(0xDE00) "
+                   "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 300) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(expected, ReadCharDataInChunks(stmt_, 1, 30));
+
+    SQLCloseCursor(stmt_);
+}
+
+// A stream opened by a SQL_C_BINARY read must still convert when a later call
+// asks for SQL_C_CHAR. Keying the decoder on the first call's target type left
+// `narrow_decoder` unset here, and the SQL_C_CHAR continuation then fell through
+// to the verbatim copy — handing back the raw CP1252 bytes this PR exists to
+// eliminate. The encoding is a property of the column, so readiness must not
+// depend on call history.
+TEST_F(GetDataLiveTest, VarcharMaxBinaryFirstStillConvertsOnLaterCharRead) {
+    // Windows-only skip: the assertion is that the value comes back as UTF-8,
+    // which msodbcsql does not do on Windows (AB#47564). Measured as agreeing
+    // on Linux, where it exercises the same decoder-lifetime path.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ASSERT_SQL_OK(
+        ExecDirect("SELECT REPLICATE(CAST(N'caf' + NCHAR(0xE9) + N' ' "
+                   "COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), 400) AS c1"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Zero-length SQL_C_BINARY length probe: opens the stream without asking for
+    // any conversion, exactly as mssql-python does per column.
+    SQLLEN ind = 0;
+    SQLGetData(stmt_, 1, SQL_C_BINARY, nullptr, 0, &ind);
+
+    // The same column, now as text: must be UTF-8, not raw CP1252.
+    const std::string got = ReadCharDataInChunks(stmt_, 1, 64);
+    EXPECT_NE(std::string::npos, got.find("caf\xC3\xA9"))
+        << "SQL_C_CHAR after a binary probe must still decode through the collation";
+    EXPECT_EQ(std::string::npos, got.find('\xE9'))
+        << "a raw CP1252 byte means the conversion was skipped";
+
+    SQLCloseCursor(stmt_);
+}
+
 // The widening decodes through the column's own collation, so a non-ASCII
 // CP1252 value must come back as the original characters and not as raw bytes
 // zero-extended into code units. A 26-byte buffer delivers 12 characters per
