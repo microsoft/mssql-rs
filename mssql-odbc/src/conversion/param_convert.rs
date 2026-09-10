@@ -349,9 +349,9 @@ impl DaeLengthLimit {
     /// would reassemble as `U+0061 U+6300`. Carrying it keeps the sequence
     /// aligned and the value intact.
     ///
-    /// Returns the bytes to keep and the units they consumed. The final
-    /// [`DaeLengthLimit::finish`] releases anything still carried, so a value
-    /// that genuinely ends mid-unit still reaches the wire rather than vanishing.
+    /// Returns the bytes to keep and the units they consumed. The caller
+    /// releases anything still carried when the value ends, so a value that
+    /// genuinely ends mid-unit still reaches the wire rather than vanishing.
     pub(crate) fn fit_chunk(
         &self,
         carry: &mut Vec<u8>,
@@ -373,12 +373,6 @@ impl DaeLengthLimit {
 
         let (kept, consumed) = self.fit(&joined[..whole], already)?;
         Ok((kept.to_vec(), consumed))
-    }
-
-    /// Releases a unit the value ended part-way through, so a trailing half
-    /// element is still sent rather than silently dropped.
-    pub(crate) fn finish(&self, carry: &mut Vec<u8>) -> Vec<u8> {
-        std::mem::take(carry)
     }
 
     /// Applies the limit to one chunk given the total already accepted,
@@ -4238,7 +4232,7 @@ mod tests {
             got.extend_from_slice(&kept);
             consumed_total += consumed;
         }
-        got.extend_from_slice(&wide.finish(&mut carry));
+        got.extend_from_slice(&std::mem::take(&mut carry));
         assert_eq!(
             got,
             vec![0x61, 0x00, 0x62, 0x00, 0x63, 0x00],
@@ -4259,7 +4253,7 @@ mod tests {
     /// Neither driver drops the byte from the value: msodbcsql streams it, and
     /// multi-call callers here go through [`DaeLengthLimit::fit_chunk`], which
     /// carries the split byte into the next chunk, with
-    /// [`DaeLengthLimit::finish`] releasing a trailing partial unit.
+    /// the caller releasing a trailing partial unit.
     #[test]
     fn dae_limit_fit_measures_whole_units_only() {
         let wide = dae_length_limit(SQL_C_WCHAR, SQL_WVARCHAR, 1)

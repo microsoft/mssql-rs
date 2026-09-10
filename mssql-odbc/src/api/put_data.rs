@@ -430,12 +430,12 @@ unsafe fn sql_put_data_safe(
         // bytes this call already took, prepending a stray leading byte with no
         // diagnostic. Keeping the entry state costs at most one unit.
         let unit_carry_restore = unit_carry.clone();
-        let fitted_owned: Vec<u8>;
+        let fitted: Cow<'_, [u8]>;
         let consumed: usize;
         match limit {
             Some(limit) => match limit.fit_chunk(&mut unit_carry, chunk, retained_before) {
                 Ok((kept, used)) => {
-                    fitted_owned = kept;
+                    fitted = Cow::Owned(kept);
                     consumed = used;
                 }
                 Err(e) => {
@@ -445,7 +445,7 @@ unsafe fn sql_put_data_safe(
                 }
             },
             None => {
-                fitted_owned = chunk.to_vec();
+                fitted = Cow::Borrowed(chunk);
                 consumed = chunk.len();
             }
         }
@@ -454,7 +454,6 @@ unsafe fn sql_put_data_safe(
             return SQL_ERROR;
         };
         dae.progress.unit_carry = unit_carry;
-        let fitted: &[u8] = &fitted_owned;
         let retained_total = retained_before.saturating_add(consumed);
 
         // A buffered parameter never touches the wire here: it accumulates and
@@ -479,7 +478,7 @@ unsafe fn sql_put_data_safe(
                 post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
                 return SQL_ERROR;
             }
-            dae.progress.buffer.extend_from_slice(fitted);
+            dae.progress.buffer.extend_from_slice(&fitted);
             dae.progress.bytes_sent = app_total;
             dae.progress.retained_units = retained_total;
             dae.progress.put_data_called = true;
@@ -503,7 +502,7 @@ unsafe fn sql_put_data_safe(
                 Some(dae) => {
                     let mut carry = std::mem::take(&mut dae.progress.carry);
                     carry_restore = Some(carry.clone());
-                    let out = transcode.push(&mut carry, fitted);
+                    let out = transcode.push(&mut carry, &fitted);
                     dae.progress.carry = carry;
                     Cow::Owned(out)
                 }
@@ -512,7 +511,7 @@ unsafe fn sql_put_data_safe(
                     return SQL_ERROR;
                 }
             },
-            None => Cow::Owned(fitted_owned),
+            None => fitted,
         };
 
         let client = if outgoing.is_empty() {

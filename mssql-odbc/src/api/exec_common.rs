@@ -1993,7 +1993,12 @@ mod tests {
 
     #[test]
     fn rebuild_deferred_params_reports_fractional_truncation() {
-        use crate::api::odbc_types::{SQL_C_NUMERIC, SqlNumericStruct};
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        assert!(matches!(
+            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL),
+            Err(ParamBuildError::UnsupportedCType(SQL_C_NUMERIC))
+        ));
 
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };

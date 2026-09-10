@@ -270,7 +270,7 @@ fn sql_param_data_safe(
                 let mut pending = dae
                     .current_param()
                     .and_then(|p| p.length_limit)
-                    .map(|limit| limit.finish(&mut dae.progress.unit_carry))
+                    .map(|_| std::mem::take(&mut dae.progress.unit_carry))
                     .unwrap_or_default();
                 match dae.current_param().and_then(|p| p.transcode) {
                     Some(transcode) => {

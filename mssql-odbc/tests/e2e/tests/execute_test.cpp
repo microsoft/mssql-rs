@@ -298,7 +298,7 @@ TEST_F(PrepareExecuteLiveTest, NumericTruncationAfterDataAtExecutionIsNotReporte
 // bind order, as msodbcsql offers them; the RPC opens as soon as no parameter
 // still to be visited needs collecting, so the PLP-capable one bound after it
 // streams rather than being held in memory.
-TEST_F(PrepareExecuteLiveTest, MixedDataAtExecutionStreamsThePlpParameter) {
+TEST_F(PrepareExecuteLiveTest, MixedDataAtExecutionPreservesBindOrderAndValues) {
     ASSERT_SQL_OK(Prepare("SELECT ? AS a, ? AS b"), SQL_HANDLE_STMT, stmt_);
 
     SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
