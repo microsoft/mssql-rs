@@ -2623,6 +2623,12 @@ pub(crate) fn transcode_narrow_into_pending(
     // `reached_end` flushes any half-formed sequence to U+FFFD, and the decoder
     // must not be used afterwards. Once the wire is exhausted there is nothing
     // left to feed it, so later calls only drain what is already decoded.
+    //
+    // The flush therefore only happens when the final wire bytes and
+    // `reached_end` arrive together. If `reached_end` first arrives on a call
+    // with no payload, a sequence the decoder is still holding is dropped rather
+    // than replaced. Same shape as `widen_into_pending` above, which has carried
+    // this guard since before this path existed; tracked in AB#48073.
     if !(payload.is_empty() && reached_end) {
         let base = pending.len();
         let headroom = decoder
@@ -3857,6 +3863,33 @@ mod tests {
             );
         }
         (String::from_utf8(delivered).unwrap(), per_call)
+    }
+
+    /// A malformed narrow sequence at true end-of-stream becomes U+FFFD rather
+    /// than being dropped or panicking — the UTF-8 counterpart of
+    /// `utf16_chunk_trailing_odd_byte_at_end_is_replacement`. A GBK lead byte
+    /// with no trail byte is reachable from SQL: `CAST(0xD0 AS VARCHAR(MAX))`
+    /// under a DBCS collation puts exactly that on the wire.
+    ///
+    /// Only covers the flush landing in the same call as the dangling bytes,
+    /// which is the shape the decode guard admits. When `reached_end` first
+    /// arrives on a call with no payload the decoder is never flushed and the
+    /// carry is dropped instead — pre-existing behaviour shared with
+    /// `widen_into_pending`, tracked in AB#48073.
+    #[test]
+    fn narrow_transcode_malformed_sequence_at_end_is_replacement() {
+        let mut decoder = encoding_rs::GBK.new_decoder_without_bom_handling();
+        let mut pending: Vec<u8> = Vec::new();
+
+        let emit =
+            transcode_narrow_into_pending(&mut decoder, &mut pending, b"abc\xD0", true, usize::MAX);
+
+        assert_eq!(emit, pending.len());
+        assert_eq!(
+            String::from_utf8(pending).unwrap(),
+            "abc\u{FFFD}",
+            "a dangling DBCS lead byte must become U+FFFD, not vanish"
+        );
     }
 
     /// The regression this path exists for (AB#47566 / AB#47875): a CP1252
