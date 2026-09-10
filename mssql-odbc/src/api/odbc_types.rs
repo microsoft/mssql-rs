@@ -589,6 +589,10 @@ pub const SQL_ATTR_CURSOR_SENSITIVITY: SqlInteger = -2;
 pub const SQL_ATTR_QUERY_TIMEOUT: SqlInteger = 0;
 pub const SQL_ATTR_MAX_ROWS: SqlInteger = 1;
 pub const SQL_ATTR_NOSCAN: SqlInteger = 2;
+/// `SQL_ATTR_NOSCAN` values: scan for escape sequences (the ODBC default), or
+/// send the statement text through untouched.
+pub const SQL_NOSCAN_OFF: SqlULen = 0;
+pub const SQL_NOSCAN_ON: SqlULen = 1;
 pub const SQL_ATTR_MAX_LENGTH: SqlInteger = 3;
 pub const SQL_ATTR_ASYNC_ENABLE: SqlInteger = 4;
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;

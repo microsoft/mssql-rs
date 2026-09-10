@@ -977,6 +977,8 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
+                call: None,
             });
         }
         let mut buf: Vec<u8> = b"abc\0".to_vec();
@@ -1040,6 +1042,8 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
+                call: None,
             });
         }
         poison_apd(h.apd());

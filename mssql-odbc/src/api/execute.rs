@@ -1043,6 +1043,8 @@ mod tests {
         state.prepared = Some(PreparedPlan {
             stmt: PreparedStatement::new(rewritten),
             marker_count,
+            original_sql: String::new(),
+            call: None,
         });
     }
 

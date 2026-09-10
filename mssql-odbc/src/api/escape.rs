@@ -118,17 +118,6 @@ pub(crate) struct CallSite {
 }
 
 impl CallSite {
-    /// Number of `?` markers this call consumes, including the return-status
-    /// marker of the `{? = call …}` form.
-    pub(crate) fn marker_count(&self) -> usize {
-        usize::from(self.returns_status)
-            + self
-                .args
-                .iter()
-                .filter(|a| matches!(a, CallArg::Marker { .. }))
-                .count()
-    }
-
     /// True when every argument can be carried as an RPC parameter, i.e. the
     /// call needs no `EXEC` text at all.
     pub(crate) fn is_rpc_eligible(&self) -> bool {
@@ -488,6 +477,27 @@ pub(crate) fn translate_escapes(sql: &str) -> Result<Translated, EscapeError> {
     Ok(Translated { sql: out, call })
 }
 
+/// Runs both phases for the execution path: escape translation (unless
+/// `SQL_ATTR_NOSCAN` is on) followed by `?` -> `@P1..@Pn` rewriting.
+///
+/// With `NOSCAN` on the text goes to the server as written, which is what the
+/// attribute is for; the recovered call site is dropped with it, so `{call ...}`
+/// is no longer special-cased either. That matches msodbcsql, where
+/// `DoSubstitutions` skips `SubstituteECodes` entirely and nothing sets
+/// `CANONICAL_CALL` (`sqlcmisc.cpp:4553-4566`).
+pub(crate) fn translate_and_rewrite(
+    sql: &str,
+    noscan: bool,
+) -> Result<(String, usize, Option<CallSite>), EscapeError> {
+    if noscan {
+        let (rewritten, count) = super::util::rewrite_param_markers(sql);
+        return Ok((rewritten, count, None));
+    }
+    let translated = translate_escapes(sql)?;
+    let (rewritten, count) = super::util::rewrite_param_markers(&translated.sql);
+    Ok((rewritten, count, translated.call))
+}
+
 /// msodbcsql surrounds every *translated* escape with a space on each side —
 /// `WriteCharToExtBuffer(… L' ' …)` before the replacement text
 /// (`sqlcmisc.cpp:4653`) and again before splicing it in (`:4851`). Passed-
@@ -573,6 +583,36 @@ fn translate_encrypt(remainder: &str) -> Result<String, EscapeError> {
 /// matches msodbcsql byte for byte.
 fn scramble_login_byte(b: u8) -> u8 {
     (((b & 0x0f) << 4) | (b >> 4)) ^ 0xa5
+}
+
+/// Builds the text `sp_describe_undeclared_parameters` should be asked about.
+///
+/// Describe has to translate escapes even when `SQL_ATTR_NOSCAN` is on, because
+/// the server metadata RPC cannot parse `{call ...}` at all — msodbcsql does
+/// the same, calling `DoSubstitutions` with no statement handle before it asks
+/// (`AutoFillIPD`, `sqlcdesc.cpp:9355`).
+///
+/// The `{? = call ...}` form needs one extra step: the return-status marker has
+/// no place in `EXEC`, and `EXEC ?=proc ?` is a syntax error to the metadata
+/// RPC (measured). It is dropped here and described by the caller as an
+/// `SQL_INTEGER`, which is what msodbcsql reports for it.
+///
+/// Returns the text to describe and whether a return-status parameter was
+/// dropped from the front.
+pub(crate) fn describe_text(original_sql: &str) -> Result<(String, bool), EscapeError> {
+    let translated = translate_escapes(original_sql)?;
+    match translated.call.as_ref().filter(|c| c.returns_status) {
+        Some(call) => {
+            let without_status = CallSite {
+                proc_name: call.proc_name.clone(),
+                returns_status: false,
+                args: call.args.clone(),
+            };
+            let text = format!(" {} ", call_to_exec_text(&without_status));
+            Ok((super::util::rewrite_param_markers(&text).0, true))
+        }
+        None => Ok((super::util::rewrite_param_markers(&translated.sql).0, false)),
+    }
 }
 
 /// Renders a parsed call as the textual `EXEC` form msodbcsql produces when it
@@ -1431,13 +1471,11 @@ mod tests {
         let call = t.call.expect("single call should be RPC eligible");
         assert_eq!(call.proc_name, "dbo.p");
         assert!(!call.returns_status);
-        assert_eq!(call.marker_count(), 2);
         assert!(call.is_rpc_eligible());
 
         let t = translate_escapes("{? = call dbo.p(?, DEFAULT)}").unwrap();
         let call = t.call.unwrap();
         assert!(call.returns_status);
-        assert_eq!(call.marker_count(), 2);
         assert!(call.is_rpc_eligible());
     }
 
@@ -1470,7 +1508,6 @@ mod tests {
             .call
             .unwrap();
         assert!(!call.is_rpc_eligible());
-        assert_eq!(call.marker_count(), 1);
     }
 
     #[test]
@@ -1617,6 +1654,51 @@ mod tests {
             }
         }
         assert_eq!(markers, 1);
+    }
+
+    // -- phase 1 + phase 2 together ---------------------------------------
+
+    #[test]
+    fn execute_path_translates_then_rewrites_markers() {
+        let (sql, count, call) = translate_and_rewrite("{call p(?,?)}", false).unwrap();
+        assert_eq!(sql, " EXEC p @P1,@P2  ");
+        assert_eq!(count, 2);
+        assert!(call.is_some());
+    }
+
+    /// SQL_ATTR_NOSCAN suppresses translation entirely -- the text goes to the
+    /// server as written -- but markers are still rewritten, because that is
+    /// how parameters are bound at all.
+    #[test]
+    fn noscan_suppresses_translation_but_not_marker_rewriting() {
+        let (sql, count, call) = translate_and_rewrite("{call p(?,?)}", true).unwrap();
+        assert_eq!(sql, "{call p(@P1,@P2)}");
+        assert_eq!(count, 2);
+        assert!(call.is_none(), "NOSCAN must not produce an RPC call site");
+    }
+
+    /// With NOSCAN on, a malformed escape is the server's problem, not ours.
+    #[test]
+    fn noscan_does_not_reject_malformed_escapes() {
+        assert!(translate_and_rewrite("SELECT {bogus 1}", true).is_ok());
+        assert!(translate_and_rewrite("SELECT {bogus 1}", false).is_err());
+    }
+
+    /// Describe always translates, and drops the return-status marker because
+    /// the metadata RPC cannot parse it.
+    #[test]
+    fn describe_text_drops_the_return_status_marker() {
+        let (text, had_status) = describe_text("{? = call dbo.p(?,?)}").unwrap();
+        assert_eq!(text, " EXEC dbo.p @P1,@P2  ");
+        assert!(had_status);
+
+        let (text, had_status) = describe_text("{call dbo.p(?,?)}").unwrap();
+        assert_eq!(text, " EXEC dbo.p @P1,@P2  ");
+        assert!(!had_status);
+
+        let (text, had_status) = describe_text("SELECT ?, ?").unwrap();
+        assert_eq!(text, "SELECT @P1, @P2");
+        assert!(!had_status);
     }
 
     #[test]

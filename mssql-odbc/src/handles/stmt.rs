@@ -12,6 +12,7 @@ use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
+use crate::api::escape::CallSite;
 use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
@@ -650,6 +651,16 @@ impl InertStmtAttrs {
         Self::index_of(attribute).map(|i| self.0[i])
     }
 
+    /// True when `SQL_ATTR_NOSCAN` is on, i.e. the application has asked the
+    /// driver not to scan its SQL for ODBC escape sequences.
+    ///
+    /// The attribute keeps its measured get/set behaviour — it is stored and
+    /// round-tripped like the rest of the inert set — but the execution path
+    /// now reads it, so it actually suppresses translation.
+    pub(crate) fn noscan(&self) -> bool {
+        self.get(odbc_types::SQL_ATTR_NOSCAN) == Some(odbc_types::SQL_NOSCAN_ON)
+    }
+
     /// Stores `value`, returning whether `attribute` is an inert identifier.
     pub(crate) fn set(&mut self, attribute: SqlInteger, value: SqlULen) -> bool {
         match Self::index_of(attribute) {
@@ -1013,6 +1024,17 @@ pub(crate) struct PreparedPlan {
     /// Number of `@P1..@Pn` markers in `stmt`'s SQL, computed once at prepare so
     /// `SQLExecute` builds the parameter list without re-scanning the text.
     pub(crate) marker_count: usize,
+    /// The statement text exactly as the application supplied it, before escape
+    /// translation and marker rewriting.
+    ///
+    /// Kept because the rewritten text is lossy for metadata: `SQLDescribeParam`
+    /// has to translate escapes even when `SQL_ATTR_NOSCAN` is on, and by then
+    /// `{? = call proc(?)}` would already have become `{@P1 = call proc(@P2)}`,
+    /// where the canonical return marker is no longer recognisable.
+    pub(crate) original_sql: String,
+    /// Set when the statement is a single canonical `{call ...}`, so the
+    /// execute and describe paths can treat it as a procedure invocation.
+    pub(crate) call: Option<CallSite>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

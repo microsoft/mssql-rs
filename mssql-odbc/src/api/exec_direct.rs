@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
+use super::escape::translate_and_rewrite;
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
     finish_execute_with_param_warning, flush_pending_unprepare, park_dae_client,
@@ -16,7 +17,7 @@ use super::exec_common::{
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use super::util::{read_utf16, rewrite_param_markers};
+use super::util::read_utf16;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn, SqlSmallInt,
     SqlWChar,
@@ -130,7 +131,7 @@ fn sql_exec_direct_w_safe(
     };
 
     // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count, query_timeout) = {
+    let (named_params, rewritten_sql, marker_count, call, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -151,10 +152,19 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         }
         stmt_state.bound_params = bound_params;
-        // Rewrite markers and read the bound parameter buffers before mutating
-        // any state, so a binding error (07002 / HYC00) leaves the statement
-        // unchanged.
-        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        // Translate escapes and rewrite markers, then read the bound parameter
+        // buffers, all before mutating any state — so a malformed escape
+        // (42000 / 22018 / 22001) or a binding error (07002 / HYC00) leaves the
+        // statement unchanged and nothing reaches the wire.
+        let (rewritten_sql, marker_count, call) =
+            match translate_and_rewrite(&sql, stmt_state.inert_attrs.noscan()) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    error!(error = %e, "SQLExecDirectW: escape translation failed");
+                    post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                    return SQL_ERROR;
+                }
+            };
         // msodbcsql batches one sp_executesql per set here (sqlccmd.cpp:3310).
         // Refused until AB#47939 wires that up: no shipped consumer drives it -
         // mssql-python's executemany always uses the prepare + execute path
@@ -197,6 +207,7 @@ fn sql_exec_direct_w_safe(
             named_params,
             rewritten_sql,
             marker_count,
+            call,
             stmt_state.query_timeout,
         )
     };
@@ -306,23 +317,38 @@ fn sql_exec_direct_w_safe(
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
     // STMT lock is held during I/O. `query_timeout` (already deducted above)
     // bounds either call; `0` means unlimited, matching the ODBC default.
-    let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
-        dbc.runtime
-            .block_on(client.execute_sp_executesql(
-                rewritten_sql,
-                params,
-                ExecuteOptions::new().timeout_secs(query_timeout),
-            ))
-            .map(|_| ())
-    } else {
-        // Statement-wise navigation: position on the batch's first statement
-        // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
-        // individually navigable via SQLMoreResults. finish_execute inspects the
-        // resulting client state.
-        dbc.runtime
-            .block_on(client.execute(sql, ExecuteOptions::new().timeout_secs(query_timeout)))
-            .map(|_| ())
-    };
+    let exec_result: Result<(), mssql_tds::error::Error> =
+        if let Some(call) = call.as_ref().filter(|c| c.is_rpc_eligible()) {
+            // A statement that is nothing but `{call proc(?)}` goes out as a TDS
+            // RPC rather than as text, which is what makes output parameters and
+            // the return status available. Anything less strict — a call inside a
+            // batch, or with a literal argument — took the EXEC text form during
+            // translation and runs through sp_executesql below.
+            dbc.runtime
+                .block_on(client.execute_stored_procedure(
+                    call.proc_name.clone(),
+                    None,
+                    Some(params),
+                    ExecuteOptions::new().timeout_secs(query_timeout),
+                ))
+                .map(|_| ())
+        } else if marker_count > 0 {
+            dbc.runtime
+                .block_on(client.execute_sp_executesql(
+                    rewritten_sql,
+                    params,
+                    ExecuteOptions::new().timeout_secs(query_timeout),
+                ))
+                .map(|_| ())
+        } else {
+            // Statement-wise navigation: position on the batch's first statement
+            // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
+            // individually navigable via SQLMoreResults. finish_execute inspects the
+            // resulting client state.
+            dbc.runtime
+                .block_on(client.execute(sql, ExecuteOptions::new().timeout_secs(query_timeout)))
+                .map(|_| ())
+        };
     if let Err(e) = exec_result {
         error!(%e, "SQLExecDirectW: execution failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
@@ -446,6 +472,8 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
+                call: None,
             });
             state.set_state(STMT_STATE_PREPARED);
         }
