@@ -705,7 +705,6 @@ fn report_parameter_array(
     has_more: bool,
 ) -> SqlReturn {
     let mut failed_sets = std::mem::take(&mut batch.client_side_failures);
-    let mut had_info = false;
     let complete = result.complete;
     if let Some(count) = result.total_rows_affected() {
         batch.rows_affected = Some(batch.rows_affected.unwrap_or(0).saturating_add(count));
@@ -724,7 +723,6 @@ fn report_parameter_array(
         let row_truncated = batch.truncated_rows.binary_search(&row.row_index).is_ok();
         let status = if row.errors.is_empty() {
             if row.has_info || row_truncated {
-                had_info = true;
                 had_fractional_truncation |= row_truncated;
                 SQL_PARAM_SUCCESS_WITH_INFO
             } else {
@@ -781,7 +779,7 @@ fn report_parameter_array(
     parameter_array_return_code(
         failed_sets,
         complete || has_more,
-        had_info,
+        had_fractional_truncation,
         !batch.outputs.param_status_ptr.is_null(),
     )
 }
@@ -1850,6 +1848,54 @@ mod tests {
             errors: Vec::new(),
             has_result_set: false,
             has_info: false,
+        }
+    }
+
+    #[test]
+    fn parameter_array_prior_info_does_not_warn_without_a_new_diagnostic() {
+        for truncated in [false, true] {
+            let handles = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(handles.stmt) };
+            let mut state = stmt.inner.lock().unwrap();
+            let mut status = SQL_PARAM_UNUSED;
+            let mut processed = 0;
+            let mut batch = BatchClientResults {
+                outputs: ParamArrayOutputs {
+                    paramset_size: 1,
+                    param_status_ptr: &mut status,
+                    params_processed_ptr: &mut processed,
+                },
+                client_side_failures: 0,
+                truncated_rows: if truncated { vec![0] } else { Vec::new() },
+                rows_affected: None,
+                processed: 0,
+            };
+            let mut row = reported_row(0);
+            row.has_info = true;
+            row.has_result_set = true;
+            let rc = report_parameter_array(
+                &mut state,
+                PreparedBatchResult {
+                    rows: vec![row],
+                    complete: true,
+                },
+                &mut batch,
+                None,
+                false,
+            );
+            assert_eq!(status, SQL_PARAM_SUCCESS_WITH_INFO);
+            assert_eq!(processed, 1);
+            if truncated {
+                assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+                assert_eq!(state.diag_records.len(), 1);
+                assert_eq!(
+                    state.diag_records[0].sql_state,
+                    WARN_FRACTIONAL_TRUNCATION.state
+                );
+            } else {
+                assert_eq!(rc, SQL_SUCCESS);
+                assert!(state.diag_records.is_empty());
+            }
         }
     }
 

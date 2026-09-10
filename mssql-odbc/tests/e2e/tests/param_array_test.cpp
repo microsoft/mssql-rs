@@ -1830,6 +1830,35 @@ TEST_F(ParamArrayTest, ProcedureArrayDeliversEveryResultSet) {
     }
 }
 
+TEST_F(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClose) {
+    Prepare("DECLARE @value int = ?; IF @value = 1 PRINT 'first set info'; SELECT @value");
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLUSMALLINT status[3] = {};
+    SQLULEN processed = 0;
+    BindIntArray(values, indicators, 3, status, &processed);
+
+    for (const bool close_early : {false, true}) {
+        SCOPED_TRACE(close_early ? "close" : "navigate");
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+        FetchIntResult(1);
+        if (close_early) {
+            EXPECT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            EXPECT_TRUE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+        } else {
+            for (int expected = 2; expected <= 3; ++expected) {
+                ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+                EXPECT_TRUE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+                FetchIntResult(expected);
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+            EXPECT_TRUE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+            EXPECT_EQ(3u, processed);
+        }
+    }
+}
+
 TEST_F(ParamArrayTest, RowReturningArraySkipsIgnoredSets) {
     Prepare("SELECT CAST(? AS int)");
     SQLINTEGER values[4] = {1, 2, 3, 4};
