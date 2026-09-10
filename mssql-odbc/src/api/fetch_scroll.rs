@@ -40,8 +40,8 @@ use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
-    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, is_typed_c_target,
-    utf16le_chunk_to_utf8, widen_into_pending,
+    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, utf16le_chunk_to_utf8,
+    widen_into_pending,
 };
 use crate::api::odbc_types::{
     SQL_BIND_BY_COLUMN, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE,
@@ -59,7 +59,7 @@ use crate::api::util::{copy_with_nul, write_if_some};
 use crate::conversion::datetime::DateTimeParts;
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
-    date_parts, datetime2_parts, datetimeoffset_parts, time_parts,
+    date_parts, datetime2_parts, datetimeoffset_parts, is_typed_c_target, time_parts,
 };
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::OdbcVersion;

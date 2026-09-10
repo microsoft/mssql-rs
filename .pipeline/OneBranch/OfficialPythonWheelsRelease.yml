@@ -92,25 +92,24 @@ extends:
 
     stages:
     ###########################################################################
-    # Stage 1: Download artifacts, verify, and publish NuGet
+    # Stage 1: Always validate wheels; optionally package and publish NuGet
     ###########################################################################
     - stage: Release
-      displayName: 'Release NuGet Package'
+      displayName: 'Validate Wheels and Optionally Publish NuGet'
+      dependsOn: []
       jobs:
       - job: PublishRelease
-        displayName: 'Download Build Artifacts and Publish'
+        displayName: 'Validate Official Wheels and Optionally Publish'
         pool:
           type: windows
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_nugetPublishing_enabled: ${{ parameters.publishNuGet }}
+          ob_git_fetchDepth: 0
+          ob_git_persistCredentials: true
         steps:
-        - checkout: self
-          persistCredentials: true
-          fetchDepth: 0
-
         #####################################################################
-        # Step 1: Download NuGet artifact from the Official Build pipeline
+        # Step 1: Download artifacts from the Official Build pipeline
         #####################################################################
         - download: officialBuild
           displayName: 'Download all artifacts from Official Build'
@@ -139,54 +138,25 @@ extends:
           displayName: 'List downloaded artifacts'
 
         #####################################################################
-        # Step 3: Extract version and create NuGet package
-        # This reuses the same version logic from stages.yml but with
-        # isOfficial=true, producing a clean semver (no prerelease suffix).
+        # Step 3: Validate wheels against the selected build's exact source
         #####################################################################
         - pwsh: |
             $ErrorActionPreference = 'Stop'
 
-            $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
-            $sourceBranch = "$(resources.pipeline.officialBuild.sourceBranch)"
-            git fetch origin $sourceBranch
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not fetch selected build branch $sourceBranch"
-            }
-            git cat-file -e "${commitSha}^{commit}"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Selected build commit $commitSha was not found on $sourceBranch"
-            }
-            function Get-BuildSourceFile {
-              param([string]$Path)
-
-              $content = & git show "${commitSha}:$Path"
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not read $Path from selected build commit $commitSha"
-              }
-              return $content -join "`n"
-            }
-
-            $cargoToml = Get-BuildSourceFile "mssql-py-core/Cargo.toml"
-            if ($cargoToml -notmatch '(?ms)^\[package\]\s*$.*?^version\s*=\s*"([^"]+)"') {
-              throw "Could not extract [package].version from selected build commit"
-            }
+            $metadata = & "$(Build.SourcesDirectory)/.pipeline/scripts/get-python-release-metadata.ps1" `
+              -RepositoryDirectory "$(Build.SourcesDirectory)" `
+              -CommitSha "$(resources.pipeline.officialBuild.sourceCommit)" `
+              -SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)" `
+              -IncludeWheelMetadata
+            $commitSha = $metadata.SourceCommit
             # Official release: clean semver, no prerelease suffix
-            $packageVersion = $Matches[1]
-
-            $pyprojectToml = Get-BuildSourceFile "mssql-py-core/pyproject.toml"
-            if ($pyprojectToml -notmatch '(?ms)^\[project\]\s*$.*?^name\s*=\s*"([^"]+)".*?^version\s*=\s*"([^"]+)"') {
-              throw "Could not extract [project] name and version from selected build commit"
-            }
-            $distributionName = $Matches[1]
-            $pythonVersion = $Matches[2]
-
-            $shortSha = $commitSha.Substring(0, 8)
+            $packageVersion = $metadata.Version
+            $distributionName = $metadata.DistributionName
+            $pythonVersion = $metadata.PythonVersion
 
             Write-Host "Release version: $packageVersion"
             Write-Host "Source commit: $commitSha"
             Write-Host "Build run: $(resources.pipeline.officialBuild.runID)"
-            Write-Host "##vso[task.setvariable variable=releaseVersion]$packageVersion"
-            Write-Host "##vso[task.setvariable variable=sourceCommit]$commitSha"
 
             # Collect wheels
             $wheelsDir = "$(Build.StagingDirectory)/wheels"
@@ -194,7 +164,7 @@ extends:
             $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse |
               Where-Object { $_.FullName -match '[\\/]+wheels[\\/][^\\/]+\.whl$' }
             if ($wheels.Count -eq 0) {
-              Write-Error "No wheels found to package. Aborting."
+              Write-Error "No wheels found to validate. Aborting."
               exit 1
             }
             $wheels | Copy-Item -Destination $wheelsDir -Force
@@ -206,46 +176,54 @@ extends:
               -ExpectedVersion $pythonVersion `
               -RequireOdbc:$true
 
-            # Create .nuspec
-            $nuspecContent = @"
-            <?xml version="1.0"?>
-            <package>
-              <metadata>
-                <id>mssql-python-rs-wheels</id>
-                <version>$packageVersion</version>
-                <description>Python wheels containing the $distributionName TDS core and ODBC driver. Commit: $shortSha. Build: $(resources.pipeline.officialBuild.runID)</description>
-                <authors>SqlClientDrivers</authors>
-              </metadata>
-              <files>
-                <file src="wheels\**\*.whl" target="wheels" />
-              </files>
-            </package>
-            "@
+            Write-Host "##vso[task.setvariable variable=releaseVersion]$packageVersion"
+            Write-Host "##vso[task.setvariable variable=sourceCommit]$commitSha"
+            Write-Host "##vso[task.setvariable variable=releaseDistributionName]$distributionName"
+          displayName: 'Validate official Python wheels'
+          workingDirectory: '$(Build.SourcesDirectory)'
 
-            $nuspecPath = "$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec"
-            $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
-            Write-Host "Created nuspec: $nuspecPath"
-          displayName: 'Prepare release NuGet package'
+        - ${{ if eq(parameters.publishNuGet, true) }}:
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $packageVersion = "$(releaseVersion)"
+              $distributionName = "$(releaseDistributionName)"
+              $shortSha = "$(sourceCommit)".Substring(0, 8)
 
-        - task: NuGetCommand@2
-          displayName: 'Create NuGet package'
-          inputs:
-            command: pack
-            packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
-            packDestination: '$(ob_outputDirectory)/packages'
-            basePath: '$(Build.StagingDirectory)'
+              $nuspecContent = @"
+              <?xml version="1.0"?>
+              <package>
+                <metadata>
+                  <id>mssql-python-rs-wheels</id>
+                  <version>$packageVersion</version>
+                  <description>Python wheels containing the $distributionName TDS core and ODBC driver. Commit: $shortSha. Build: $(resources.pipeline.officialBuild.runID)</description>
+                  <authors>SqlClientDrivers</authors>
+                </metadata>
+                <files>
+                  <file src="wheels\**\*.whl" target="wheels" />
+                </files>
+              </package>
+              "@
 
-        - pwsh: |
-            Write-Host "=== Release NuGet package ==="
-            Get-ChildItem "$(ob_outputDirectory)/packages" -Filter *.nupkg | ForEach-Object {
-              Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
-            }
-            if ($${{ parameters.publishNuGet }}) {
+              $nuspecPath = "$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec"
+              $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
+              Write-Host "Created nuspec: $nuspecPath"
+            displayName: 'Prepare release NuGet package'
+
+          - task: NuGetCommand@2
+            displayName: 'Create NuGet package'
+            inputs:
+              command: pack
+              packagesToPack: '$(Build.StagingDirectory)/mssql-python-rs-wheels.nuspec'
+              packDestination: '$(ob_outputDirectory)/packages'
+              basePath: '$(Build.StagingDirectory)'
+
+          - pwsh: |
+              Write-Host "=== Release NuGet package ==="
+              Get-ChildItem "$(ob_outputDirectory)/packages" -Filter *.nupkg | ForEach-Object {
+                Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
+              }
               Write-Host "NuGet WILL be published to feed (publishNuGet=true)"
-            } else {
-              Write-Host "DRY RUN — NuGet will NOT be published (publishNuGet=false)"
-            }
-          displayName: 'Verify NuGet package'
+            displayName: 'Verify NuGet package'
 
     ###########################################################################
     # Stage 2: Publish Rust crates through ESRP
@@ -253,7 +231,7 @@ extends:
     - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
       - stage: ReleaseCrates
         displayName: 'Release Rust Crates'
-        dependsOn: Release
+        dependsOn: []
         jobs:
         - job: PublishRustCrates
           displayName: 'Publish Rust crates to crates.io'
@@ -267,8 +245,6 @@ extends:
           - name: ob_outputDirectory
             value: '$(Build.ArtifactStagingDirectory)'
           steps:
-          - checkout: self
-
           - download: officialBuild
             artifact: 'drop_Build_RustCrates'
             displayName: 'Download Rust crate artifacts'
@@ -373,33 +349,18 @@ extends:
             type: windows
           variables:
             ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+            ob_git_fetchDepth: 0
+            ob_git_persistCredentials: true
           steps:
-          - checkout: self
-            persistCredentials: true
-            fetchDepth: 0
-
           - pwsh: |
               $ErrorActionPreference = 'Stop'
 
-              $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
-              $sourceBranch = "$(resources.pipeline.officialBuild.sourceBranch)"
-              git fetch origin $sourceBranch
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not fetch selected build branch $sourceBranch"
-              }
-              git cat-file -e "${commitSha}^{commit}"
-              if ($LASTEXITCODE -ne 0) {
-                throw "Selected build commit $commitSha was not found on $sourceBranch"
-              }
-              $cargoToml = & git show "${commitSha}:mssql-py-core/Cargo.toml"
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not read Cargo.toml from selected build commit $commitSha"
-              }
-              if (($cargoToml -join "`n") -match '(?ms)^\[package\]\s*$.*?^version\s*=\s*"([^"]+)"') {
-                $version = $Matches[1]
-              } else {
-                throw "Could not extract [package].version from selected build commit"
-              }
+              $metadata = & "$(Build.SourcesDirectory)/.pipeline/scripts/get-python-release-metadata.ps1" `
+                -RepositoryDirectory "$(Build.SourcesDirectory)" `
+                -CommitSha "$(resources.pipeline.officialBuild.sourceCommit)" `
+                -SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)"
+              $commitSha = $metadata.SourceCommit
+              $version = $metadata.Version
 
               $tagName = "v$version"
               $branchName = "release/$version"
@@ -410,18 +371,18 @@ extends:
               Write-Host "Branch:     $branchName"
 
               # Create annotated tag on the build's source commit
-              git tag -a $tagName $commitSha -m "Release $version"
+              git -C "$(Build.SourcesDirectory)" tag -a $tagName $commitSha -m "Release $version"
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create tag"; exit 1 }
 
               # Create release branch from the tagged commit
-              git branch $branchName $commitSha
+              git -C "$(Build.SourcesDirectory)" branch $branchName $commitSha
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create branch"; exit 1 }
 
               # Push tag and branch
-              git push origin $tagName
+              git -C "$(Build.SourcesDirectory)" push origin $tagName
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to push tag"; exit 1 }
 
-              git push origin $branchName
+              git -C "$(Build.SourcesDirectory)" push origin $branchName
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to push branch"; exit 1 }
 
               Write-Host "====================================="
@@ -430,3 +391,4 @@ extends:
               Write-Host "  Branch: $branchName"
               Write-Host "====================================="
             displayName: 'Create git tag and release branch'
+            workingDirectory: '$(Build.SourcesDirectory)'

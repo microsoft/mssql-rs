@@ -6,6 +6,8 @@ import subprocess
 import zipfile
 from pathlib import Path
 
+import pytest
+
 _VALIDATOR = Path(__file__).parents[1] / ".pipeline" / "scripts" / "verify-python-wheels.ps1"
 
 _LIBS = "mssql_py_core/libs"
@@ -33,14 +35,16 @@ def write_wheel(
     include_odbc: bool = True,
     uppercase_odbc: bool = False,
     requires_python: str = ">=3.10",
+    metadata_name: str = "mssql-python-rs",
+    metadata_version: str = "0.1.0",
 ) -> Path:
     wheel_path = directory / f"{distribution}-0.1.0-{python_tag}-{python_tag}-{platform}.whl"
     with zipfile.ZipFile(wheel_path, "w") as wheel:
         wheel.writestr(
             "mssql_python_rs-0.1.0.dist-info/METADATA",
             "Metadata-Version: 2.4\n"
-            "Name: mssql-python-rs\n"
-            "Version: 0.1.0\n"
+            f"Name: {metadata_name}\n"
+            f"Version: {metadata_version}\n"
             f"Requires-Python: {requires_python}\n",
         )
         wheel.writestr("mssql_py_core/__init__.py", "")
@@ -159,6 +163,41 @@ def test_validator_rejects_incomplete_matrix(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "Expected 34 wheels, found 1" in result.stderr
+
+
+def test_validator_rejects_no_wheels(tmp_path: Path) -> None:
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Expected 34 wheels, found 0" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        ({"metadata_name": "wrong-distribution"}, "metadata Name is 'wrong-distribution'"),
+        ({"metadata_version": "9.9.9"}, "metadata Version is '9.9.9'"),
+    ],
+)
+def test_validator_rejects_wrong_metadata(tmp_path: Path, metadata: dict, message: str) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].unlink()
+    write_wheel(tmp_path, "win_amd64", python_tag="cp310", **metadata)
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_validator_rejects_wrong_filename_version(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    wheels[0].rename(wheels[0].with_name(wheels[0].name.replace("-0.1.0-", "-9.9.9-")))
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "Wheel matrix mismatch" in result.stderr
 
 
 def test_validator_rejects_same_count_with_unexpected_wheel(tmp_path: Path) -> None:
