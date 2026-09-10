@@ -364,6 +364,19 @@ TEST_F(BinToCharLiveTest, GeometryRendersItsWireBytesAsHex) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(BinToCharLiveTest, GeographyRendersItsWireBytesAsHex) {
+    FetchOne("SELECT geography::Point(47.651, -122.349, 4326)");
+
+    SQLRETURN rc;
+    SQLLEN ind = -1;
+    std::string text;
+    ReadChar(128, &rc, &ind, &text);
+    EXPECT_EQ(SQL_SUCCESS, rc);
+    EXPECT_EQ(44, ind) << "22 wire bytes";
+    EXPECT_EQ("E6100000010C17D9CEF753D347407593180456965EC0", text);
+    SQLCloseCursor(stmt_);
+}
+
 // Bound delivery must not depend on how big the value happens to be. A small
 // varbinary(max) arrives buffered and goes through deliver_bound; a large one
 // streams through deliver_bound_plp. Both have to render hex.
