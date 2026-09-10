@@ -232,7 +232,7 @@ Sprint end:
 
 1. **Run the Official Python Wheels Build** for the source commit to release
 2. **Trigger the Official release pipeline** with that build selected and `publishNuGet: true`
-  - This produces a clean semver NuGet: `mssql-python-rs-wheels.0.2.1`
+   - This produces a clean semver NuGet: `mssql-python-rs-wheels.0.2.1`
    - OneBranch runs full SDL scanning (BinSkim, Clippy, AV)
    - Package is published to `mssql-rs/mssql-rs` feed
 
@@ -314,7 +314,7 @@ If a critical bug is found after release:
 3. Bump `[package].version` in `mssql-py-core/Cargo.toml` only if the Rust crate also needs a new independent version
 4. Run the Official Python Wheels Build for the hotfix commit
 5. Trigger the Official release pipeline with `publishNuGet: true`
-  - This publishes `mssql-python-rs-wheels.0.2.2`
+   - This publishes `mssql-python-rs-wheels.0.2.2`
 6. Enable `tagRelease` only when creating the separate Cargo-versioned mssql-py-core tag and release branch
 7. Update `mssql-python` to use `mssql-python-rs==0.2.2`
 
