@@ -44,10 +44,11 @@ PyPI: mssql-python
 
 ## Version Scheme
 
-The Rust crate and NuGet transport package share the version from
-`mssql-py-core/Cargo.toml`. The `mssql-python-rs` Python distribution has an
-independent version in `mssql-py-core/pyproject.toml`. For example, NuGet
-`mssql-python-rs-wheels 0.1.10` can contain `mssql_python_rs-0.1.0-*.whl`.
+The NuGet transport package and `mssql-python-rs` Python distribution share the
+version from `mssql-py-core/pyproject.toml`. The Rust crate has an independent
+version in `mssql-py-core/Cargo.toml`. For example, NuGet
+`mssql-python-rs-wheels 0.1.0` contains `mssql_python_rs-0.1.0-*.whl`, while the
+Rust crate can have a different version.
 
 The NuGet prerelease suffix depends on the build type:
 
@@ -59,6 +60,11 @@ The NuGet prerelease suffix depends on the build type:
 | **PR** | Wheels built for validation only — **not published** | — |
 
 NuGet SemVer 2.0 ordering: `dev` < `nightly` < release (no suffix).
+
+Earlier development packages used the Cargo version and were published as
+`0.1.10-dev.*`. Those packages sort above the new `0.1.0-*` lineage. Consumers
+must select or pin the intended `0.1.0` lineage rather than resolving the latest
+prerelease across all versions.
 
 ---
 
@@ -74,7 +80,7 @@ NuGet SemVer 2.0 ordering: `dev` < `nightly` < release (no suffix).
 1. Schedule triggers at 2 AM UTC
 2. Pipeline builds 34 wheels across all platforms
 3. Publish stage:
-   - Extracts version from mssql-py-core/Cargo.toml (e.g., 0.2.0)
+  - Extracts the Python distribution version from mssql-py-core/pyproject.toml (e.g., 0.2.0)
    - Appends -nightly.YYYYMMDD suffix
   - Packs wheels into NuGet: mssql-python-rs-wheels.0.2.0-nightly.20260217
    - OneBranch auto-publishes to mssql-rs/mssql-rs feed
@@ -152,16 +158,18 @@ nuget install mssql-python-rs-wheels -Version 0.2.0-dev.20260217.140071 -Source 
 
 ## Scenario 3: Upgrading mssql-python to a New Native Package Version
 
-**Purpose**: When `mssql-python` needs to adopt a new version of the native core (e.g., new features, bug fixes).
+**Purpose**: When `mssql-python` needs to adopt a new `mssql-python-rs` distribution version (e.g., new features or bug fixes).
 
 ### Steps in mssql-rs
 
 1. **Make changes** to `mssql-tds` and/or `mssql-py-core`
-2. **Bump version** in `mssql-py-core/Cargo.toml` (and `mssql-tds/Cargo.toml` if changed)
-   - First code change in a sprint bumps the version
-   - Subsequent changes in the same sprint do NOT bump again
-3. **Merge PR** — CI produces `mssql-python-rs-wheels.0.2.1-dev.YYYYMMDD.BuildId`
-4. **Nightly** picks it up: `mssql-python-rs-wheels.0.2.1-nightly.YYYYMMDD`
+2. **Bump `[project].version`** in `mssql-py-core/pyproject.toml` when the Python distribution version changes
+   - This version controls the wheel filenames, PyPI distribution, and NuGet transport package
+3. **Manage Rust crate versions independently**
+   - Bump `[package].version` in a crate's `Cargo.toml` only when that Rust crate version changes
+   - A Rust crate bump does not change the Python wheel or NuGet version
+4. **Merge PR** — CI produces `mssql-python-rs-wheels.0.2.1-dev.YYYYMMDD.BuildId`
+5. **Nightly** picks it up: `mssql-python-rs-wheels.0.2.1-nightly.YYYYMMDD`
 
 ### Steps in mssql-python
 
@@ -184,16 +192,19 @@ nuget install mssql-python-rs-wheels -Version 0.2.0-dev.20260217.140071 -Source 
 ### Sprint example
 
 ```
-Sprint 42 starts. Current released: mssql-py-core 0.2.0
+Sprint 42 starts. Current Python distribution: mssql-python-rs 0.2.0
+Independent Rust crate version: mssql-py-core 0.1.10
 
 Week 1:
-  mssql-rs PR #101: Fix connection timeout (bumps 0.2.0 → 0.2.1)
+  mssql-rs PR #101: Fix connection timeout
+  → bumps pyproject.toml from 0.2.0 → 0.2.1
+  → leaves the Rust crate at 0.1.10 unless that crate needs its own release
   → merges → dev package: 0.2.1-dev.20260303.11001
   → nightly: 0.2.1-nightly.20260303
   mssql-python: tests against 0.2.1-nightly.20260303 ✅
 
 Week 2:
-  mssql-rs PR #105: Add retry logic (no version bump — stays 0.2.1)
+  mssql-rs PR #105: Add retry logic (Python distribution stays 0.2.1)
   → merges → dev package: 0.2.1-dev.20260310.11042
   → nightly: 0.2.1-nightly.20260310
   mssql-python: tests against 0.2.1-nightly.20260310 ✅
@@ -213,29 +224,35 @@ Sprint end:
 
 - [ ] All PRs for the sprint are merged to `main`
 - [ ] Latest nightly (`0.2.1-nightly.*`) is passing in `mssql-python` CI
-- [ ] Version in `mssql-py-core/Cargo.toml` is correct (e.g., `0.2.1`)
+- [ ] `[project].version` in `mssql-py-core/pyproject.toml` is correct (e.g., `0.2.1`)
+- [ ] Any Rust crate selected for release has the intended independent version in its `Cargo.toml`
 - [ ] No outstanding breaking changes without coordination
 
 ### Release build
 
-1. **Trigger the Official pipeline manually** with `isOfficial: true`
-  - This produces a clean semver NuGet: `mssql-python-rs-wheels.0.2.1`
+1. **Run the Official Python Wheels Build** for the source commit to release
+2. **Trigger the Official release pipeline** with that build selected and `publishNuGet: true`
+   - This produces a clean semver NuGet: `mssql-python-rs-wheels.0.2.1`
    - OneBranch runs full SDL scanning (BinSkim, Clippy, AV)
    - Package is published to `mssql-rs/mssql-rs` feed
 
-2. **Tag the release commit**:
+### Optional mssql-py-core source tag
+
+The release pipeline's `tagRelease` option is separate from NuGet publication. It reads
+`[package].version` from `mssql-py-core/Cargo.toml`, then creates the corresponding tag
+and release branch. For a Rust crate version of `0.1.10`, it creates:
 
 ```bash
-git tag -a v0.2.1 -m "Release 0.2.1"
-git push origin v0.2.1
+git tag -a v0.1.10 -m "Release 0.1.10"
+git push origin v0.1.10
 ```
-
-3. **Create release branch** (for potential hotfixes):
 
 ```bash
-git checkout -b release/0.2.1 v0.2.1
-git push origin release/0.2.1
+git checkout -b release/0.1.10 v0.1.10
+git push origin release/0.1.10
 ```
+
+Do not derive this tag or branch from the Python/NuGet version when the versions differ.
 
 ### Post-release in mssql-python
 
@@ -292,21 +309,14 @@ missing ODBC payloads, and exact-source metadata failures.
 
 If a critical bug is found after release:
 
-```
-main            ──●──●──●──●──  (sprint 43 work continues with 0.3.0)
-                       │
-release/0.2.1   ───────●── cherry-pick fix
-                       │
-                       └── bump to 0.2.2, trigger Official pipeline
-                           → mssql-python-rs-wheels.0.2.2
-                           → tag v0.2.2
-```
-
-Steps:
-1. Cherry-pick fix to `release/0.2.1`
-2. Bump `mssql-py-core/Cargo.toml` to `0.2.2`
-3. Trigger Official pipeline from `release/0.2.1` branch
-4. Tag `v0.2.2`, update `mssql-python` to use `0.2.2`
+1. Cherry-pick the fix to the appropriate maintenance branch
+2. Bump `[project].version` in `mssql-py-core/pyproject.toml` for the Python hotfix (for example, `0.2.1` → `0.2.2`)
+3. Bump `[package].version` in `mssql-py-core/Cargo.toml` only if the Rust crate also needs a new independent version
+4. Run the Official Python Wheels Build for the hotfix commit
+5. Trigger the Official release pipeline with `publishNuGet: true`
+   - This publishes `mssql-python-rs-wheels.0.2.2`
+6. Enable `tagRelease` only when creating the separate Cargo-versioned mssql-py-core tag and release branch
+7. Update `mssql-python` to use `mssql-python-rs==0.2.2`
 
 ---
 
@@ -325,7 +335,7 @@ Steps:
 ## NuGet Package Structure
 
 ```
-mssql-python-rs-wheels.0.1.10.nupkg
+mssql-python-rs-wheels.0.1.0.nupkg
 ├── mssql-python-rs-wheels.nuspec
 └── wheels/
   ├── mssql_python_rs-0.1.0-cp310-cp310-win_amd64.whl
@@ -347,11 +357,13 @@ Every NuGet package description includes:
 - Azure DevOps build number
 
 ```
-mssql-python-rs-wheels 0.1.10
+mssql-python-rs-wheels 0.1.0
 Description: Python wheels containing the mssql-python-rs TDS core and ODBC driver. Commit: a1b2c3d4. Build: 20260217.1
 ```
 
-This creates: **NuGet version → git tag → exact source commit → pipeline run with logs**.
+This creates: **NuGet version → package description → source commit and pipeline run with logs**.
+When `tagRelease` is enabled, the separate Cargo-versioned tag and release branch provide
+additional source traceability for `mssql-py-core`; a NuGet release does not require that tag.
 
 ## Feed Retention Guidelines
 

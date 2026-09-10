@@ -149,10 +149,11 @@ extends:
               -SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)" `
               -IncludeWheelMetadata
             $commitSha = $metadata.SourceCommit
-            # Official release: clean semver, no prerelease suffix
-            $packageVersion = $metadata.Version
             $distributionName = $metadata.DistributionName
             $pythonVersion = $metadata.PythonVersion
+            # NuGet transports the wheels and therefore uses their distribution
+            # version, independent of the Rust crate version used for tagging.
+            $packageVersion = $pythonVersion
 
             Write-Host "Release version: $packageVersion"
             Write-Host "Source commit: $commitSha"
