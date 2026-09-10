@@ -5,11 +5,26 @@ build-backend = "maturin"
 [project]
 name = "mssql-python-rs"
 version = "0.1.0"
+description = "Rust-based native runtime (TDS core and ODBC driver) consumed by the mssql-python driver."
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Microsoft Corporation" }]
+keywords = ["sqlserver", "azure-sql", "tds", "odbc", "mssql"]
 classifiers = [
-    "Programming Language :: Rust",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Database",
 ]
+
+[project.urls]
+Homepage = "https://github.com/microsoft/mssql-python"
+Source = "https://github.com/microsoft/mssql-rs"
 
 [tool.maturin]
 module-name = "mssql_py_core"

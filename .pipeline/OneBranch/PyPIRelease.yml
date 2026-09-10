@@ -96,10 +96,10 @@ extends:
 
         - ${{ if eq(parameters.publishToPyPI, true) }}:
           - pwsh: |
-              if ($env:RELEASE_SOURCE_BRANCH -ne 'refs/heads/stable') {
+              if ($env:RELEASE_SOURCE_BRANCH -cne 'refs/heads/stable') {
                 throw 'PyPI publishing is allowed only from refs/heads/stable.'
               }
-              if ($env:OFFICIAL_BUILD_SOURCE_BRANCH -ne 'refs/heads/stable') {
+              if ($env:OFFICIAL_BUILD_SOURCE_BRANCH -cne 'refs/heads/stable') {
                 throw 'PyPI publishing requires an Official Build produced from refs/heads/stable.'
               }
             displayName: 'Require stable branch for publish'

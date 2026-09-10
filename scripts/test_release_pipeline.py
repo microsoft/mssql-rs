@@ -132,8 +132,15 @@ def test_pypi_release_switch_graph(publish: bool) -> None:
     assert ("Release summary" in names) == publish
     assert any(step.get("download") == "officialBuild" for step in steps)
     assert any(step.get("checkout") == "self" for step in steps)
+    stage_step = next(
+        step for step in steps if step.get("displayName") == "Verify and stage official wheels"
+    )
+    assert "-RequireOdbc" in stage_step["pwsh"]
     if not publish:
         assert not any(step.get("task", "").startswith("EsrpRelease@") for step in steps)
+    else:
+        esrp = next(step for step in steps if step.get("task", "").startswith("EsrpRelease@"))
+        assert esrp["inputs"]["FolderLocation"] == "$(Agent.TempDirectory)/pypi-publish"
 
 
 @pytest.mark.parametrize(
@@ -142,6 +149,8 @@ def test_pypi_release_switch_graph(publish: bool) -> None:
         ("refs/heads/stable", "refs/heads/stable", True),
         ("refs/heads/main", "refs/heads/stable", False),
         ("refs/heads/stable", "refs/heads/main", False),
+        ("refs/heads/stable", "refs/heads/STABLE", False),
+        ("refs/heads/STABLE", "refs/heads/stable", False),
     ],
 )
 def test_pypi_publish_requires_both_stable_branches(
