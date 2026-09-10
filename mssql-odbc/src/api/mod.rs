@@ -16,6 +16,7 @@ mod describe_param;
 mod disconnect;
 mod driver_connect;
 mod end_tran;
+pub(crate) mod escape;
 mod exec_common;
 mod exec_direct;
 mod execute;
