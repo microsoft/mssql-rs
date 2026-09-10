@@ -1,0 +1,15 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Re-download the immutable selected build artifact in every job, never an
+# intermediate artifact or a directory supplied by the registry-check agent.
+steps:
+- download: officialBuild
+  artifact: 'drop_Build_RustCrates'
+  displayName: 'Download Rust crate artifacts'
+
+- pwsh: >
+    & "$(Build.SourcesDirectory)/.pipeline/scripts/validate-crate-release-artifact.ps1"
+    -ArtifactDirectory "$(Pipeline.Workspace)/officialBuild/drop_Build_RustCrates"
+  displayName: 'Validate Rust crate release artifact'
+  workingDirectory: '$(Build.SourcesDirectory)'

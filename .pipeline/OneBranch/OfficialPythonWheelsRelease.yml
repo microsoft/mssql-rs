@@ -88,107 +88,64 @@ extends:
     nugetPublishing:
       feeds:
       - name: public/mssql-rs_Public
-        continueOnConflict: true
+        continueOnConflict: false
 
     stages:
     ###########################################################################
-    # Stage 1: Always validate wheels; optionally package and publish NuGet
+    # Python is independent of Rust. Only selected publication contacts NuGet.
     ###########################################################################
     - stage: Release
       displayName: 'Validate Wheels and Optionally Publish NuGet'
       dependsOn: []
       jobs:
-      - job: PublishRelease
-        displayName: 'Validate Official Wheels and Optionally Publish'
+      - job: ValidateWheels
+        displayName: 'Validate Official Wheels'
         pool:
           type: windows
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-          ob_nugetPublishing_enabled: ${{ parameters.publishNuGet }}
+          ob_nugetPublishing_enabled: false
           ob_git_fetchDepth: 0
           ob_git_persistCredentials: true
         steps:
-        #####################################################################
-        # Step 1: Download artifacts from the Official Build pipeline
-        #####################################################################
-        - download: officialBuild
-          displayName: 'Download all artifacts from Official Build'
-          # Downloads every artifact published by the selected build run
-          # (one per platform: Windows x64/ARM64, Linux x64/ARM64, macOS).
+        - template: ../templates/validate-release-wheels.yml
 
-        #####################################################################
-        # Step 2: List and verify downloaded artifacts
-        #####################################################################
-        - pwsh: |
-            Write-Host "====================================="
-            Write-Host "Downloaded Artifacts from Build $(resources.pipeline.officialBuild.runID)"
-            Write-Host "Source commit: $(resources.pipeline.officialBuild.sourceCommit)"
-            Write-Host "====================================="
+      - ${{ if eq(parameters.publishNuGet, true) }}:
+        - job: NuGetPreflight
+          displayName: 'Check NuGet release version'
+          dependsOn: ValidateWheels
+          pool:
+            type: windows
+            isCustom: true
+            name: Azure Pipelines
+            vmImage: windows-2022
+          variables:
+            releaseVersion: $[ dependencies.ValidateWheels.outputs['wheelMetadata.releaseVersion'] ]
+          steps:
+          # Custom jobs do not inject a checkout; governed jobs below do.
+          - checkout: self
+          - pwsh: >
+              & "$(Build.SourcesDirectory)/.pipeline/scripts/test-nuget-release-version.ps1"
+              -Version "$(releaseVersion)"
+            displayName: 'Preflight wheel NuGet version'
 
-            $artifactPath = "$(Pipeline.Workspace)/officialBuild"
-            if (Test-Path $artifactPath) {
-              Get-ChildItem -Path $artifactPath -Recurse | ForEach-Object {
-                $size = [math]::Round($_.Length / 1KB, 1)
-                Write-Host "  $($_.FullName.Replace($artifactPath, ''))  ($size KB)"
-              }
-            } else {
-              Write-Error "Artifact directory not found: $artifactPath"
-              exit 1
-            }
-          displayName: 'List downloaded artifacts'
-
-        #####################################################################
-        # Step 3: Validate wheels against the selected build's exact source
-        #####################################################################
-        - pwsh: |
-            $ErrorActionPreference = 'Stop'
-
-            $metadata = & "$(Build.SourcesDirectory)/.pipeline/scripts/get-python-release-metadata.ps1" `
-              -RepositoryDirectory "$(Build.SourcesDirectory)" `
-              -CommitSha "$(resources.pipeline.officialBuild.sourceCommit)" `
-              -SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)" `
-              -IncludeWheelMetadata
-            $commitSha = $metadata.SourceCommit
-            $distributionName = $metadata.DistributionName
-            $pythonVersion = $metadata.PythonVersion
-            # NuGet transports the wheels and therefore uses their distribution
-            # version, independent of the Rust crate version used for tagging.
-            $packageVersion = $pythonVersion
-
-            Write-Host "Release version: $packageVersion"
-            Write-Host "Source commit: $commitSha"
-            Write-Host "Build run: $(resources.pipeline.officialBuild.runID)"
-
-            # Collect wheels
-            $wheelsDir = "$(Build.StagingDirectory)/wheels"
-            New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
-            $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse |
-              Where-Object { $_.FullName -match '[\\/]+wheels[\\/][^\\/]+\.whl$' }
-            if ($wheels.Count -eq 0) {
-              Write-Error "No wheels found to validate. Aborting."
-              exit 1
-            }
-            $wheels | Copy-Item -Destination $wheelsDir -Force
-            Write-Host "Collected $($wheels.Count) wheels"
-
-            & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
-              -WheelsDir $wheelsDir `
-              -ExpectedName $distributionName `
-              -ExpectedVersion $pythonVersion `
-              -RequireOdbc:$true
-
-            Write-Host "##vso[task.setvariable variable=releaseVersion]$packageVersion"
-            Write-Host "##vso[task.setvariable variable=sourceCommit]$commitSha"
-            Write-Host "##vso[task.setvariable variable=releaseDistributionName]$distributionName"
-          displayName: 'Validate official Python wheels'
-          workingDirectory: '$(Build.SourcesDirectory)'
-
-        - ${{ if eq(parameters.publishNuGet, true) }}:
+        - job: PublishNuGet
+          displayName: 'Publish Official Wheel NuGet'
+          dependsOn: NuGetPreflight
+          pool:
+            type: windows
+          variables:
+            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+            ob_nugetPublishing_enabled: true
+            ob_git_fetchDepth: 0
+            ob_git_persistCredentials: true
+          steps:
+          - template: ../templates/validate-release-wheels.yml
           - pwsh: |
               $ErrorActionPreference = 'Stop'
-              $packageVersion = "$(releaseVersion)"
-              $distributionName = "$(releaseDistributionName)"
-              $shortSha = "$(sourceCommit)".Substring(0, 8)
+              $packageVersion = "$(wheelMetadata.releaseVersion)"
+              $distributionName = "$(wheelMetadata.releaseDistributionName)"
+              $shortSha = "$(wheelMetadata.sourceCommit)".Substring(0, 8)
 
               $nuspecContent = @"
               <?xml version="1.0"?>
@@ -227,53 +184,78 @@ extends:
             displayName: 'Verify NuGet package'
 
     ###########################################################################
-    # Stage 2: Publish Rust crates through ESRP
+    # Rust: offline integrity -> registry preflight -> ESRP -> availability.
+    # Read-only custom jobs run on Azure Pipelines, never in isolated containers.
     ###########################################################################
     - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
       - stage: ReleaseCrates
         displayName: 'Release Rust Crates'
         dependsOn: []
         jobs:
-        - job: PublishRustCrates
-          displayName: 'Publish Rust crates to crates.io'
-          templateContext:
-            type: releaseJob
-            isProduction: true
+        - job: ValidateCrates
+          displayName: 'Validate Rust crate artifacts'
           pool:
             type: windows
           variables:
-          - group: 'ESRP Federated Creds (AME)'
-          - name: ob_outputDirectory
-            value: '$(Build.ArtifactStagingDirectory)'
+            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           steps:
-          - download: officialBuild
-            artifact: 'drop_Build_RustCrates'
-            displayName: 'Download Rust crate artifacts'
+          - template: ../templates/validate-release-crates.yml
 
-          - pwsh: >
-              .pipeline/scripts/validate-crate-release-artifact.ps1
-              -ArtifactDirectory '$(Pipeline.Workspace)\officialBuild\drop_Build_RustCrates'
-            displayName: 'Validate Rust crate release artifact'
+        - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true)) }}:
+          - job: RegistryPreflight
+            displayName: 'Check selected crates.io versions'
+            dependsOn: ValidateCrates
+            pool:
+              type: windows
+              isCustom: true
+              name: Azure Pipelines
+              vmImage: windows-2022
+            steps:
+            - checkout: self
+            - template: ../templates/validate-release-crates.yml
 
-          - ${{ if eq(parameters.publishMssqlTds, true) }}:
-            - pwsh: >
-                .pipeline/scripts/test-cratesio-package.ps1
-                -CrateName 'mssql-tds'
-                -Version '$(mssqlTdsCrateVersion)'
-                -ExpectedState Absent
-                -MaxAttempts 1
-              displayName: 'Preflight mssql-tds version'
+            - ${{ if eq(parameters.publishMssqlTds, true) }}:
+              - pwsh: >
+                  & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
+                  -CrateName 'mssql-tds'
+                  -Version '$(mssqlTdsCrateVersion)'
+                  -ExpectedState Absent
+                  -MaxAttempts 1
+                displayName: 'Preflight mssql-tds version'
 
-          - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
-            - pwsh: >
-                .pipeline/scripts/test-cratesio-package.ps1
-                -CrateName 'mssql-mock-tds'
-                -Version '$(mssqlMockTdsCrateVersion)'
-                -ExpectedState Absent
-                -MaxAttempts 1
-              displayName: 'Preflight mssql-mock-tds version'
+            - ${{ if eq(parameters.publishMssqlMockTds, true) }}:
+              - pwsh: >
+                  & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
+                  -CrateName 'mssql-mock-tds'
+                  -Version '$(mssqlMockTdsCrateVersion)'
+                  -ExpectedState Absent
+                  -MaxAttempts 1
+                displayName: 'Preflight mssql-mock-tds version'
 
-          - ${{ if and(eq(parameters.publishMssqlTds, true), ne(parameters.validateCratesOnly, true)) }}:
+            - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.publishMssqlTds, true)) }}:
+              - pwsh: >
+                  & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
+                  -CrateName 'mssql-tds'
+                  -Version '$(mssqlTdsCrateVersion)'
+                  -ExpectedState Available
+                  -MaxAttempts 1
+                displayName: 'Verify mssql-tds dependency is published'
+
+        - ${{ if and(eq(parameters.publishMssqlTds, true), ne(parameters.validateCratesOnly, true)) }}:
+          - job: PublishCore
+            displayName: 'Publish mssql-tds'
+            dependsOn: RegistryPreflight
+            templateContext:
+              type: releaseJob
+              isProduction: true
+            pool:
+              type: windows
+            variables:
+            - group: 'ESRP Federated Creds (AME)'
+            - name: ob_outputDirectory
+              value: '$(Build.ArtifactStagingDirectory)'
+            steps:
+            - template: ../templates/validate-release-crates.yml
             - task: EsrpRelease@12
               displayName: 'Publish mssql-tds to crates.io'
               inputs:
@@ -293,23 +275,42 @@ extends:
                 mainpublisher: 'ESRPRELPACMAN'
                 domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
 
+          - job: CoreAvailable
+            displayName: 'Verify published mssql-tds is available'
+            dependsOn: PublishCore
+            pool:
+              type: windows
+              isCustom: true
+              name: Azure Pipelines
+              vmImage: windows-2022
+            steps:
+            - checkout: self
+            - template: ../templates/validate-release-crates.yml
             - pwsh: >
-                .pipeline/scripts/test-cratesio-package.ps1
+                & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
                 -CrateName 'mssql-tds'
                 -Version '$(mssqlTdsCrateVersion)'
                 -ExpectedState Available
               displayName: 'Wait for mssql-tds on crates.io'
 
-          - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.publishMssqlTds, true)) }}:
-            - pwsh: >
-                .pipeline/scripts/test-cratesio-package.ps1
-                -CrateName 'mssql-tds'
-                -Version '$(mssqlTdsCrateVersion)'
-                -ExpectedState Available
-                -MaxAttempts 1
-              displayName: 'Verify mssql-tds dependency is published'
-
-          - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.validateCratesOnly, true)) }}:
+        - ${{ if and(eq(parameters.publishMssqlMockTds, true), ne(parameters.validateCratesOnly, true)) }}:
+          - job: PublishMock
+            displayName: 'Publish mssql-mock-tds'
+            ${{ if eq(parameters.publishMssqlTds, true) }}:
+              dependsOn: CoreAvailable
+            ${{ else }}:
+              dependsOn: RegistryPreflight
+            templateContext:
+              type: releaseJob
+              isProduction: true
+            pool:
+              type: windows
+            variables:
+            - group: 'ESRP Federated Creds (AME)'
+            - name: ob_outputDirectory
+              value: '$(Build.ArtifactStagingDirectory)'
+            steps:
+            - template: ../templates/validate-release-crates.yml
             - task: EsrpRelease@12
               displayName: 'Publish mssql-mock-tds to crates.io'
               inputs:
@@ -329,8 +330,19 @@ extends:
                 mainpublisher: 'ESRPRELPACMAN'
                 domaintenantid: '975f013f-7f24-47e8-a7d3-abc4752bf346'
 
+          - job: MockAvailable
+            displayName: 'Verify published mssql-mock-tds is available'
+            dependsOn: PublishMock
+            pool:
+              type: windows
+              isCustom: true
+              name: Azure Pipelines
+              vmImage: windows-2022
+            steps:
+            - checkout: self
+            - template: ../templates/validate-release-crates.yml
             - pwsh: >
-                .pipeline/scripts/test-cratesio-package.ps1
+                & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
                 -CrateName 'mssql-mock-tds'
                 -Version '$(mssqlMockTdsCrateVersion)'
                 -ExpectedState Available
