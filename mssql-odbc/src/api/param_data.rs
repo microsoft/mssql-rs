@@ -31,7 +31,7 @@ use tracing::{debug, error};
 use mssql_tds::connection::tds_client::{ExecuteOptions, StatementResult, StreamedParamStatus};
 
 use super::exec_common::{
-    abort_dae_with_diag, clear_exec_started, fail_with_tds, finish_execute,
+    abort_dae_with_diag, clear_exec_started, fail_with_tds, finish_execute_with_param_warning,
     rebuild_deferred_params, return_client_idle,
 };
 use super::sqlstate::*;
@@ -384,7 +384,19 @@ fn sql_param_data_safe(
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
-            finish_execute(dbc, stmt, statement_handle, client, "SQLParamData")
+            finish_execute_with_param_warning(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                "SQLParamData",
+                // `false`: a DAE completion never carries a
+                // fractional-truncation warning here, since the truncation
+                // check runs once against the already-fully-streamed value
+                // (`decimal_from_numeric`/`decimal_from_text`), not per
+                // `SQLPutData` chunk.
+                false,
+            )
         }
 
         Err(e) => {

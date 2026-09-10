@@ -25,7 +25,7 @@ use std::mem::size_of;
 use tracing::{debug, error};
 
 use crate::api::odbc_types::{
-    SQL_C_NUMERIC, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME,
+    SQL_C_NUMERIC, SQL_CODE_DATE, SQL_CODE_TIME, SQL_CODE_TIMESTAMP, SQL_DATETIME, SQL_DECIMAL,
     SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
     SQL_DESC_CONCISE_TYPE, SQL_DESC_COUNT, SQL_DESC_DATA_PTR, SQL_DESC_DATETIME_INTERVAL_CODE,
     SQL_DESC_INDICATOR_PTR, SQL_DESC_LENGTH, SQL_DESC_NAME, SQL_DESC_OCTET_LENGTH,
@@ -325,7 +325,7 @@ fn set_record_field(
             })
         }
         SQL_DESC_PRECISION => set_precision(state, record_number, value_ptr),
-        SQL_DESC_SCALE => set_scale(state, record_number, value_ptr),
+        SQL_DESC_SCALE => set_scale(state, kind, record_number, value_ptr),
         SQL_DESC_NAME => set_name(state, record_number, value_ptr, buffer_length),
         SQL_DESC_UNNAMED => set_unnamed(state, record_number, value_ptr),
         SQL_DESC_PARAMETER_TYPE => set_parameter_type(state, record_number, value_ptr),
@@ -439,9 +439,29 @@ pub(super) fn set_type(
         }
     };
 
+    // Scoped to every application-descriptor kind (AppRow/AppParam/Ad), not
+    // just AppParam: msodbcsql's SQL_DESC_TYPE/CONCISE_TYPE handler resets
+    // `rgbValue` to `NOT_BOUND` and calls `SetTypeDefaults` whenever
+    // `ObjectType == SQL_HANDLE_AD` (`sqlcdesc.cpp:1736-1740`), and that one
+    // object type covers the implicit ARD, the implicit APD, and any
+    // explicit descriptor alike (`sqlsrv.h:542`, `DescKind::is_application`
+    // doc comment) -- retail never special-cases APD over ARD here. An
+    // already-bound fetch column genuinely gets unbound when its C type is
+    // retyped through the ARD, matching retail; see
+    // `changing_ard_type_to_numeric_resets_defaults_and_unbinds_data` below.
+    let is_application_desc = kind.is_application();
     write_record_field(state, record_number, |r| {
         r.concise_type = resolved;
         r.datetime_interval_code = datetime_interval_code_for(resolved);
+        if is_application_desc {
+            r.data_ptr = std::ptr::null_mut();
+            r.data_bound = false;
+            r.precision_scale_explicit = false;
+            if resolved == SQL_C_NUMERIC {
+                r.precision = SQL_PREC_NUMERIC;
+                r.scale = 0;
+            }
+        }
         r.explicitly_bound = true;
     })
 }
@@ -509,15 +529,28 @@ pub(super) fn set_precision(
 
     write_record_field(state, record_number, |r| {
         r.precision = precision;
+        r.precision_scale_explicit = true;
         r.explicitly_bound = true;
     })
 }
 
 /// `SQL_DESC_SCALE` write. Same `SQL_C_NUMERIC` consistency bound as
-/// [`set_precision`]: scale must be non-negative and `<= precision`
-/// (`sqlcdesc.cpp:11391-11394`).
+/// [`set_precision`]: scale must be `<= precision`
+/// (`sqlcdesc.cpp:11391-11394`). Negative scales are valid only on an
+/// application descriptor (ARD/APD/AD): msodbcsql's `CheckADDescRecConsistency`
+/// bounds only the upper end for `SQL_C_NUMERIC` (`sqlcdesc.cpp:11391-11394`).
+/// `SQL_C_NUMERIC` and `SQL_NUMERIC` share the same numeric value (`2`), so an
+/// IPD record's SQL type can equal this same constant; there msodbcsql's
+/// separate `CheckSqlPrecScale<FALSE>` (`sqlcdesc.cpp:11511-11536`) compares
+/// the scale as unsigned, which rejects any negative value outright for a 3.x
+/// app. Reusing the AD-only allowance for an IPD record would let a bound
+/// `SQL_NUMERIC` parameter accept a negative `SQL_DESC_SCALE` that msodbcsql
+/// (and the RPC wire format) would never allow. `CheckSqlPrecScale<FALSE>`
+/// (`sqlcdesc.cpp:11527-11539`) applies the identical bound to `SQL_DECIMAL`,
+/// so an IPD record's SQL type check also matches that constant.
 pub(super) fn set_scale(
     state: &mut DescState,
+    kind: DescKind,
     record_number: SqlSmallInt,
     value_ptr: SqlPointer,
 ) -> SqlReturn {
@@ -526,11 +559,12 @@ pub(super) fn set_scale(
         return SQL_ERROR;
     };
 
+    let is_application = kind.is_application();
     let record_info = state
         .record(record_number)
         .map(|r| (r.concise_type, r.precision));
-    if let Some((SQL_C_NUMERIC, precision)) = record_info
-        && (scale < 0 || scale > precision)
+    if let Some((SQL_C_NUMERIC | SQL_DECIMAL, precision)) = record_info
+        && (scale > precision || (!is_application && scale < 0))
     {
         error!(
             scale,
@@ -542,6 +576,7 @@ pub(super) fn set_scale(
 
     write_record_field(state, record_number, |r| {
         r.scale = scale;
+        r.precision_scale_explicit = true;
         r.explicitly_bound = true;
     })
 }
@@ -578,7 +613,7 @@ pub(super) fn set_data_ptr(
         .record(record_number)
         .map(|r| (r.concise_type, r.precision, r.scale));
     if let Some((SQL_C_NUMERIC, precision, scale)) = record_info
-        && (!(1..=SQL_PREC_NUMERIC).contains(&precision) || scale < 0 || scale > precision)
+        && (!(1..=SQL_PREC_NUMERIC).contains(&precision) || scale > precision)
     {
         error!(
             precision,
@@ -588,7 +623,10 @@ pub(super) fn set_data_ptr(
         post_diag(state, ERR_INVALID_PRECISION_OR_SCALE);
         return SQL_ERROR;
     }
-    write_record_field(state, record_number, |r| r.data_ptr = value_ptr)
+    write_record_field(state, record_number, |r| {
+        r.data_ptr = value_ptr;
+        r.data_bound = true;
+    })
 }
 
 /// `SQL_DESC_NAME` write (IPD only — the only kind `classify_field` marks
@@ -693,10 +731,11 @@ mod tests {
     use super::*;
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
-        SQL_ATTR_APP_PARAM_DESC, SQL_C_LONG, SQL_C_WCHAR, SQL_INTEGER, SQL_INTERVAL_YEAR,
-        SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_TYPE_DATE, SqlNumericStruct,
+        SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_C_LONG, SQL_C_WCHAR, SQL_INTEGER,
+        SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC,
+        SQL_TYPE_DATE, SqlNumericStruct,
     };
-    use crate::api::set_stmt_attr::sql_get_stmt_attr_w;
+    use crate::api::set_stmt_attr::{sql_get_stmt_attr_w, sql_set_stmt_attr_w};
     use crate::error::diag::DiagRecord;
     use crate::handles::{DescHandle, handle_from_raw};
     use crate::test_support::TestHandles;
@@ -848,6 +887,167 @@ mod tests {
             data_ptr,
             &mut numeric_buf as *mut SqlNumericStruct as SqlPointer
         );
+    }
+
+    #[test]
+    fn changing_apd_type_to_numeric_resets_defaults_and_unbinds_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut old_value = 7i32;
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_LONG as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_DATA_PTR,
+                    &mut old_value as *mut i32 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.apd(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        let state = desc.inner.lock().unwrap();
+        let record = state.record(1).unwrap();
+        assert!(record.data_ptr.is_null());
+        assert!(!record.data_bound);
+        assert_eq!(record.precision, SQL_PREC_NUMERIC);
+        assert_eq!(record.scale, 0);
+    }
+
+    // msodbcsql's SQL_DESC_TYPE handler resets `rgbValue`/defaults for every
+    // `ObjectType == SQL_HANDLE_AD` record (`sqlcdesc.cpp:1736-1740`), and
+    // that one object type covers the ARD exactly as it does the APD
+    // (`sqlsrv.h:542`) -- retyping an already-bound fetch column through the
+    // ARD unbinds it too, the same as retyping a bound parameter through the
+    // APD.
+    #[test]
+    fn changing_ard_type_to_numeric_resets_defaults_and_unbinds_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut old_value = 7i32;
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_LONG as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_DATA_PTR,
+                    &mut old_value as *mut i32 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let state = desc.inner.lock().unwrap();
+        let record = state.record(1).unwrap();
+        assert!(record.data_ptr.is_null());
+        assert!(!record.data_bound);
+        assert_eq!(record.precision, SQL_PREC_NUMERIC);
+        assert_eq!(record.scale, 0);
+    }
+
+    // Same as above, but through an explicitly allocated descriptor
+    // associated as the ARD via `SQL_ATTR_APP_ROW_DESC`, since `DescKind::Ad`
+    // is the kind such a descriptor carries regardless of which role it's
+    // currently plugged into -- this is the exact reproduction from PR #521
+    // review thread PRRT_kwDOPLFXwM6gzXDQ.
+    #[test]
+    fn changing_explicit_desc_type_to_numeric_unbinds_data_when_used_as_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_ROW_DESC, desc as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+
+        let mut old_value = 7i32;
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(desc, 1, SQL_DESC_TYPE, SQL_C_LONG as isize as SqlPointer, 0)
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    desc,
+                    1,
+                    SQL_DESC_DATA_PTR,
+                    &mut old_value as *mut i32 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    desc,
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let desc_handle = unsafe { handle_from_raw::<DescHandle>(desc) };
+        let state = desc_handle.inner.lock().unwrap();
+        let record = state.record(1).unwrap();
+        assert!(record.data_ptr.is_null());
+        assert!(!record.data_bound);
     }
 
     #[test]
@@ -1151,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn set_desc_field_numeric_scale_exceeding_precision_returns_hy094() {
+    fn set_desc_field_numeric_scale_may_be_negative_but_not_exceed_precision() {
         let h = TestHandles::with_env_dbc_stmt();
         unsafe {
             sql_set_desc_field_w(
@@ -1171,6 +1371,121 @@ mod tests {
 
         let ret =
             unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, (-1isize) as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.apd(), 1, SQL_DESC_SCALE), -1);
+    }
+
+    /// `SQL_C_NUMERIC` and `SQL_NUMERIC` share the same value (`2`), so an IPD
+    /// record's SQL type can equal the same constant `set_scale` gates its
+    /// application-descriptor allowance on. msodbcsql rejects a negative
+    /// `SQL_DESC_SCALE` on an IPD `SQL_NUMERIC` record unconditionally
+    /// (`CheckSqlPrecScale<FALSE>` reinterprets the scale as unsigned,
+    /// `sqlcdesc.cpp:11527-11533`) — only the application-descriptor path
+    /// (`CheckADDescRecConsistency`) allows it.
+    #[test]
+    fn set_desc_field_ipd_numeric_scale_may_not_be_negative() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, (-1isize) as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_PRECISION_OR_SCALE);
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, 3isize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.ipd(), 1, SQL_DESC_SCALE), 3);
+    }
+
+    /// `CheckSqlPrecScale<FALSE>` applies the identical unsigned-scale bound
+    /// to `SQL_DECIMAL` as it does to `SQL_NUMERIC` (`sqlcdesc.cpp:11527-
+    /// 11539`, same `case` block), so an IPD `SQL_DECIMAL` record must reject
+    /// a negative `SQL_DESC_SCALE` just like `SQL_NUMERIC` above.
+    #[test]
+    fn set_desc_field_ipd_decimal_scale_may_not_be_negative() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.ipd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_DECIMAL as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, (-1isize) as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_last_diag(&desc_diags(h.ipd()), ERR_INVALID_PRECISION_OR_SCALE);
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.ipd(), 1, SQL_DESC_SCALE, 3isize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.ipd(), 1, SQL_DESC_SCALE), 3);
+    }
+
+    #[test]
+    fn set_desc_field_numeric_scale_may_equal_precision() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_C_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+
+        let ret =
+            unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, 5isize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_small_int(h.apd(), 1, SQL_DESC_SCALE), 5);
+    }
+
+    #[test]
+    fn set_desc_field_data_ptr_catches_precision_lowered_below_scale() {
+        let h = TestHandles::with_env_dbc_stmt();
+        unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_TYPE,
+                SQL_C_NUMERIC as isize as SqlPointer,
+                0,
+            )
+        };
+        unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_PRECISION, 5isize as SqlPointer, 0) };
+        unsafe { sql_set_desc_field_w(h.apd(), 1, SQL_DESC_SCALE, 5isize as SqlPointer, 0) };
+
+        let ret = unsafe {
+            sql_set_desc_field_w(h.apd(), 1, SQL_DESC_PRECISION, 4isize as SqlPointer, 0)
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let mut numeric_buf = SqlNumericStruct::default();
+        let ret = unsafe {
+            sql_set_desc_field_w(
+                h.apd(),
+                1,
+                SQL_DESC_DATA_PTR,
+                &mut numeric_buf as *mut SqlNumericStruct as SqlPointer,
+                0,
+            )
+        };
         assert_eq!(ret, SQL_ERROR);
         assert_last_diag(&desc_diags(h.apd()), ERR_INVALID_PRECISION_OR_SCALE);
     }
@@ -1196,14 +1511,8 @@ mod tests {
         assert_eq!(ret, SQL_SUCCESS);
     }
 
-    /// Regression: `set_precision`/`set_scale` only validate against the
-    /// type stored *at the time each is written*. An out-of-range precision
-    /// set while the type is still something else (so the numeric bound
-    /// didn't apply yet), followed by changing the type to `SQL_C_NUMERIC`,
-    /// must still be caught — matching msodbcsql's final consistency check
-    /// at bind time — rather than silently accepted.
     #[test]
-    fn set_desc_field_data_ptr_catches_precision_set_before_type_became_numeric() {
+    fn changing_type_to_numeric_replaces_stale_precision() {
         let h = TestHandles::with_env_dbc_stmt();
         // Precision 39 is out of range only once the type becomes SQL_C_NUMERIC.
         unsafe {
@@ -1240,8 +1549,11 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-        assert_last_diag(&desc_diags(h.apd()), ERR_INVALID_PRECISION_OR_SCALE);
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(
+            get_small_int(h.apd(), 1, SQL_DESC_PRECISION),
+            SQL_PREC_NUMERIC
+        );
     }
 
     #[test]

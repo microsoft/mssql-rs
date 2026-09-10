@@ -127,8 +127,8 @@ stages:
       # Unit-test wheel packaging scripts on PR runs; the packaging pipeline
       # steps themselves are non-PR gated.
       - pwsh: |
-          python -m pip install --quiet pytest
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py -q
+          python -m pip install --quiet pytest pyyaml
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py -q
         displayName: 'Unit test Python wheel packaging scripts'
       - template: build-template.yml
         parameters:
@@ -586,6 +586,88 @@ stages:
           osType: Linux
           fuzzDurationSeconds: 300
           fuzzTarget: fuzz_bulk_copy
+
+  - job: Fuzz_Odbc_Ffi_Linux
+    displayName: Fuzz Test ODBC FFI Execute Linux (30 min)
+    pool:
+      name: ${{ parameters.poolName }}
+      demands:
+        - imageOverride -equals RUST-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 1800
+          fuzzTarget: fuzz_ffi_execute
+          fuzzDir: mssql-odbc/fuzz
+
+  - job: Fuzz_Odbc_Additional_Targets_Linux
+    displayName: Fuzz ODBC Additional Targets Linux (Serial - 5 min each)
+    pool:
+      name: ${{ parameters.poolName }}
+      demands:
+        - imageOverride -equals RUST-UBUSLIM
+    variables:
+      CARGO_TARGET_DIR: $(Build.SourcesDirectory)
+    steps:
+      - template: cargo-authenticate-template.yml
+        parameters:
+          osType: Linux
+      - template: install-dependencies.yml
+        parameters:
+          osType: Linux
+          enableJsDeps: false
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_connection_string
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_numeric_parse
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_datetime_parse
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_read_utf16
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_transcode
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_fetch_convert
+          fuzzDir: mssql-odbc/fuzz
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_bound_param
+          fuzzDir: mssql-odbc/fuzz
 
 - stage: Build_mssql_python
   dependsOn:

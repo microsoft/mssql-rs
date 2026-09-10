@@ -13,7 +13,7 @@ use crate::api::txn::rollback_before_disconnect;
 use crate::error::free_errors;
 use crate::handles::DbcHandle;
 use crate::handles::StmtHandle;
-use crate::handles::dbc::ConnectionState;
+use crate::handles::dbc::{ConnectionIdentity, ConnectionState};
 use crate::handles::desc::DescHandle;
 use crate::handles::{HandleType, free_handle, handle_from_raw};
 
@@ -151,6 +151,7 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     state.client = None;
     state.active_stmt = None;
     state.effective_vendor_settings = None;
+    state.identity = ConnectionIdentity::default();
     state.connection_state = ConnectionState::Disconnected;
 
     debug!("SQLDisconnect: disconnected successfully");

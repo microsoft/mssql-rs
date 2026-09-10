@@ -170,7 +170,7 @@ pub(crate) fn hms_from_ticks_100ns(ticks: u64) -> TimeOfDay {
 }
 
 /// Parses `YYYY-MM-DD`.
-fn parse_date_literal(s: &str) -> Option<CivilDate> {
+pub(crate) fn parse_date_literal(s: &str) -> Option<CivilDate> {
     let mut it = s.split('-');
     let (y, m, d) = (it.next()?, it.next()?, it.next()?);
     if it.next().is_some() || y.len() != 4 {
@@ -202,7 +202,7 @@ fn parse_date_literal(s: &str) -> Option<CivilDate> {
 
 /// Parses `HH:MM[:SS[.f{1,9}]]`, returning the components plus the number of
 /// fractional digits supplied (the effective scale).
-fn parse_time_literal(s: &str) -> Option<ParsedTime> {
+pub(crate) fn parse_time_literal(s: &str) -> Option<ParsedTime> {
     let mut it = s.split(':');
     let hour_s = it.next()?;
     let minute_s = it.next()?;

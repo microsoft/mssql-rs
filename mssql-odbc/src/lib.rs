@@ -10,6 +10,13 @@ mod conversion;
 mod error;
 mod handles;
 mod params;
+
+// Internal parse/convert helpers re-exposed as safe wrappers for coverage-guided
+// fuzzing (see `fuzz/`). The `fuzzing` cfg is set only by cargo-fuzz, so the
+// shipped driver's FFI surface is unchanged.
+#[cfg(fuzzing)]
+pub mod fuzz_support;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 

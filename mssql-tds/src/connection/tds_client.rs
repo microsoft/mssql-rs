@@ -1087,6 +1087,12 @@ impl TdsClient {
         self.negotiated_settings.login_ack_server_version
     }
 
+    /// Returns the instance name the server reported for itself during login
+    /// (`@@SERVERNAME`), which is not necessarily the host the client dialled.
+    pub fn server_reported_name(&self) -> Option<&str> {
+        self.negotiated_settings.server_reported_name.as_deref()
+    }
+
     /// Returns `true` if the connection is known to be dead.
     ///
     /// This surfaces the connection's last-known liveness status, updated
