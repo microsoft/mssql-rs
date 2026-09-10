@@ -9,11 +9,15 @@ import ast
 import itertools
 import json
 import re
+import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 import yaml
+
+from test_verify_python_wheels import write_wheel_matrix
 
 _ROOT = Path(__file__).parents[1]
 _PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
@@ -112,10 +116,21 @@ def test_release_switch_graph(values):
 
     release = stages["Release"]
     assert release["dependsOn"] == []
-    assert evaluate(release["condition"], flags) == nuget
-    assert not evaluate(release["condition"], flags, succeeded=False)
+    assert evaluate(release.get("condition", "succeeded()"), flags)
+    assert not evaluate(release.get("condition", "succeeded()"), flags, succeeded=False)
     assert release["jobs"][0]["variables"]["ob_nugetPublishing_enabled"] == str(nuget).lower()
-    # All wheel-only downloads, metadata, validation and packing are in this gated stage.
+    release_steps = release["jobs"][0]["steps"]
+    release_names = [step.get("displayName") for step in release_steps]
+    assert any(step.get("download") == "officialBuild" for step in release_steps)
+    assert "Validate official Python wheels" in release_names
+    for name in ("Prepare release NuGet package", "Create NuGet package", "Verify NuGet package"):
+        assert (name in release_names) == nuget
+        if nuget:
+            assert release_names.index("Validate official Python wheels") < release_names.index(name)
+    assert any(step.get("task") == "NuGetCommand@2" for step in release_steps) == nuget
+    if not nuget:
+        assert ".nuspec" not in str(release_steps)
+        assert ".nupkg" not in str(release_steps)
     for name, stage in stages.items():
         if name != "Release":
             assert "verify-python-wheels" not in str(stage)
@@ -128,7 +143,7 @@ def test_release_switch_graph(values):
     assert ("ReleaseCrates" in stages) == (core or mock or dry_run)
     if "ReleaseCrates" in stages:
         crates = stages["ReleaseCrates"]
-        # Explicitly empty: an unrelated NuGet failure/skip cannot block crates.
+        # Explicitly empty: wheel validation or NuGet failure cannot block crates.
         assert crates["dependsOn"] == []
         steps = crates["jobs"][0]["steps"]
         tasks = [step["displayName"] for step in steps if step.get("task") == "EsrpRelease@12"]
@@ -148,7 +163,8 @@ def test_release_switch_graph(values):
 
     assert ("Tag" in stages) == tag
     if tag:
-        assert stages["Tag"]["dependsOn"] == ("Release" if nuget else [])
+        assert stages["Tag"]["dependsOn"] == "Release"
+        assert not evaluate(stages["Tag"].get("condition", "succeeded()"), flags, succeeded=False)
         assert stages["Tag"]["displayName"] == "Tag mssql-py-core Release"
         assert "mssqlTdsCrateVersion" not in str(stages["Tag"])
 
@@ -169,6 +185,18 @@ def test_release_switch_graph(values):
         assert '-CommitSha "$(resources.pipeline.officialBuild.sourceCommit)"' in step["pwsh"]
         assert '-SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)"' in step["pwsh"]
         assert ("-IncludeWheelMetadata" in step["pwsh"]) == (name == "Release")
+        if name == "Release":
+            assert step["displayName"] == "Validate official Python wheels"
+            assert "condition" not in step
+            assert "verify-python-wheels.ps1" in step["pwsh"]
+            assert ".nuspec" not in step["pwsh"]
+            for variable in ("releaseVersion", "sourceCommit", "releaseDistributionName"):
+                assert step["pwsh"].index("verify-python-wheels.ps1") < step["pwsh"].index(
+                    f"task.setvariable variable={variable}"
+                )
+                if nuget:
+                    preparation = release_steps[release_names.index("Prepare release NuGet package")]
+                    assert f"$({variable})" in preparation["pwsh"]
         if name == "Tag":
             git_commands = re.findall(r"^\s*git .+$", step["pwsh"], re.MULTILINE)
             assert len(git_commands) == 4
@@ -211,6 +239,68 @@ def source_repositories(tmp_path):
     selected = commit_metadata(remote, "0.1.10")
     commit_metadata(remote, "8.8.8")
     return remote, checkout, selected
+
+
+@pytest.mark.parametrize("nuget,wheels_present", [(False, False), (False, True), (True, True)])
+def test_wheel_validation_and_optional_nuspec(source_repositories, tmp_path, nuget, wheels_present):
+    remote, checkout, _ = source_repositories
+    (remote / "mssql-py-core" / "pyproject.toml").write_text(
+        '[project]\nname = "mssql-python-rs"\nversion = "0.1.0"\n', encoding="utf-8"
+    )
+    selected = commit_metadata(remote, "0.1.10", python=False)
+    scripts = checkout / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    for filename in ("get-python-release-metadata.ps1", "verify-python-wheels.ps1"):
+        shutil.copy2(_ROOT / ".pipeline" / "scripts" / filename, scripts / filename)
+
+    artifact_wheels = tmp_path / "officialBuild" / "drop" / "wheels"
+    artifact_wheels.mkdir(parents=True)
+    if wheels_present:
+        write_wheel_matrix(artifact_wheels)
+    staging = tmp_path / "staging"
+    flags = dict.fromkeys(_SWITCHES, False) | {"publishNuGet": nuget}
+    pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    variables = {
+        "Build.SourcesDirectory": str(checkout),
+        "Build.StagingDirectory": str(staging),
+        "Pipeline.Workspace": str(tmp_path),
+        "resources.pipeline.officialBuild.sourceCommit": selected,
+        "resources.pipeline.officialBuild.sourceBranch": "refs/heads/main",
+        "resources.pipeline.officialBuild.runID": "123",
+    }
+
+    def run_step(name):
+        script = next(step["pwsh"] for step in steps if step.get("displayName") == name)
+        for key, value in variables.items():
+            script = script.replace(f"$({key})", value)
+        return subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", script],
+            cwd=tmp_path, capture_output=True, text=True, check=False,
+        )
+
+    result = run_step("Validate official Python wheels")
+    assert not list(staging.glob("*.nuspec"))
+    assert not list(staging.glob("**/*.nupkg"))
+    if not wheels_present:
+        assert result.returncode != 0
+        assert "No wheels found to validate" in result.stderr
+        assert "task.setvariable" not in result.stdout
+        return
+
+    assert result.returncode == 0, result.stderr
+    assert "Validated 34 mssql-python-rs wheels" in result.stdout
+    variables.update(re.findall(r"##vso\[task.setvariable variable=(\w+)\](.*)", result.stdout))
+    assert variables["releaseVersion"] == "0.1.10"
+    assert variables["sourceCommit"] == selected
+    assert variables["releaseDistributionName"] == "mssql-python-rs"
+    if nuget:
+        result = run_step("Prepare release NuGet package")
+        assert result.returncode == 0, result.stderr
+        metadata = ET.parse(staging / "mssql-python-rs-wheels.nuspec").find("metadata")
+        assert metadata.findtext("version") == "0.1.10"
+        assert selected[:8] in metadata.findtext("description")
+        assert "mssql-python-rs" in metadata.findtext("description")
 
 
 def read_metadata(checkout, commit, cwd, branch="refs/heads/main", wheels=True):

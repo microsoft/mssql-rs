@@ -248,26 +248,29 @@ git push origin release/0.2.1
 
 `.pipeline/OneBranch/OfficialPythonWheelsRelease.yml` consumes the selected
 `Official Python Wheels Build` run without rebuilding it. All release switches
-default to `false`.
+default to `false`. Official wheel artifacts are always downloaded and validated
+against that build's source metadata, even when NuGet publishing is disabled.
 
 | Switch | Behavior |
 |---|---|
-| `publishNuGet` | Download and validate wheels, prepare and pack the NuGet package, then publish it. When false, the entire NuGet stage is skipped, not run as a dry run. |
+| `publishNuGet` | Prepare, pack, verify and publish the NuGet package after wheel validation. When false, these NuGet-only steps are omitted; wheel download and validation still run. |
 | `publishMssqlTds` | Select `mssql-tds` for crates.io publication through ESRP. |
 | `publishMssqlMockTds` | Select `mssql-mock-tds` for crates.io publication through ESRP. |
 | `validateCratesOnly` | Validate the crate artifact and run selected-crate preflights without ESRP publication. Can also validate the artifact with neither crate selected. |
 | `tagRelease` | Tag and branch the selected build's `mssql-py-core` version. This does not tag Rust crate versions. |
 
-The NuGet and Rust crate stages have no dependency on each other. Crate-only
-publication and validation do not download or validate wheels, and a NuGet
-failure does not block the crate stage. OneBranch's per-job policy validation
-still applies. When publishing both crates, the core must become available on
+The wheel validation/NuGet and Rust crate stages have no dependency on each other.
+The crate stage downloads only crate artifacts and does not wait for wheel
+validation or NuGet. A failure in either wheel validation or NuGet does not block
+crates. OneBranch's per-job policy validation still applies. When publishing both
+crates, the core must become available on
 crates.io before the mock is published; mock-only publication requires the core
 version to be available already.
 
-Tagging waits for NuGet only when `publishNuGet` is also selected. With NuGet
-disabled, `tagRelease` can run independently, and it never waits for Rust crate
-publication. Leaving all switches off performs no release work.
+Tagging always waits for successful wheel validation, plus NuGet publication when
+`publishNuGet` is selected. It never waits for Rust crate publication. Leaving all
+switches off is a wheel validation-only run: no NuGet packaging or publication,
+ESRP, Git tags, or release-branch writes.
 
 NuGet and tag metadata come from the selected build's exact source commit, not
 the release pipeline's checkout or the current branch tip. A missing branch,
@@ -277,6 +280,13 @@ These jobs configure OneBranch's built-in checkout with `ob_git_fetchDepth` and
 checkout can relocate the repository while governed task restrictions prevent
 updating the source path. Git commands use the explicit source directory, and
 wheel validation and packaging remain inside the governed build container.
+
+For release-pipeline changes, use the ADO Preview API first to inspect expanded
+gates and OneBranch policy/checkout settings without queuing a run. Once a live
+run is authorized, select a known successful Official Build and leave all switches
+off to exercise genuine artifacts in the governed container without publishing.
+Local regression tests also cover missing wheels, incorrect names/versions,
+missing ODBC payloads, and exact-source metadata failures.
 
 ### Hotfix process
 
