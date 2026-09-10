@@ -302,6 +302,17 @@ stages:
             --drivers-dir "$(Build.SourcesDirectory)/drivers"
         displayName: 'Inject ODBC driver into wheels (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - script: |
+          set -e
+          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+          docker run --rm \
+            -v "$(ob_outputDirectory)/wheels:/wheels" \
+            -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+            -e AUDITWHEEL_PLAT=manylinux_2_34 \
+            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest \
+            bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+        displayName: 'Repair glibc wheels into manylinux (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Linux x64 Artifacts'
       inputs:
@@ -380,6 +391,17 @@ stages:
               --wheels-dir "$(ob_outputDirectory)/wheels" \
               --drivers-dir "$(Build.SourcesDirectory)/drivers"
           displayName: 'Inject ODBC driver into wheels (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - script: |
+            set -e
+            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+            docker run --rm \
+              -v "$(ob_outputDirectory)/wheels:/wheels" \
+              -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+              -e AUDITWHEEL_PLAT=manylinux_2_34 \
+              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest \
+              bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+          displayName: 'Repair glibc wheels into manylinux (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Linux ARM64 Artifacts'
