@@ -368,8 +368,7 @@ pub(crate) fn current_local_date() -> (i16, u16, u16) {
     }
     #[cfg(windows)]
     {
-        let mut st = windows::Win32::Foundation::SYSTEMTIME::default();
-        unsafe { windows::Win32::System::SystemInformation::GetLocalTime(&mut st) };
+        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
         (st.wYear as i16, st.wMonth, st.wDay)
     }
 }
