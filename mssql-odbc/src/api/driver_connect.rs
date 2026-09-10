@@ -19,7 +19,7 @@ use crate::api::txn::apply_post_connect_txn_settings;
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::DbcHandle;
-use crate::handles::dbc::{ConnectionState, DbcState, VendorConnOverrides};
+use crate::handles::dbc::{ConnectionIdentity, ConnectionState, DbcState, VendorConnOverrides};
 use crate::handles::{HandleType, handle_from_raw};
 
 use mssql_tds::connection::client_context::{ClientContext, IPAddressPreference};
@@ -439,6 +439,17 @@ fn do_connect(
     // previous connection string back into its next connection attempt.
     state.effective_vendor_settings =
         Some(effective_vendor_settings(&params, client.is_encrypted()));
+    state.identity = ConnectionIdentity {
+        data_source_name: params.dsn.clone(),
+        // The server names itself in the INFO tokens it sends at login; the host
+        // the caller dialled is only a fallback for a server that sent none.
+        server_name: client
+            .server_reported_name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(params.server.as_str())
+            .to_string(),
+        user_name: params.uid.clone(),
+    };
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
