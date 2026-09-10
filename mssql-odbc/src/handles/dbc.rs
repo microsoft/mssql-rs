@@ -176,6 +176,31 @@ pub(crate) struct DbcState {
     /// to the connection's existing statements and records it here for future
     /// ones (msodbcsql `sqlcmisc.cpp:2879-2922`, `sqlcfunc.cpp:173`).
     pub(crate) stmt_query_timeout: u32,
+    /// Non-secret identity of the current session, answering `SQLGetInfo`'s
+    /// `SQL_DATA_SOURCE_NAME`, `SQL_SERVER_NAME`, and `SQL_USER_NAME` without a
+    /// round trip. Populated on a successful connect, cleared on disconnect.
+    pub(crate) identity: ConnectionIdentity,
+}
+
+/// The parts of a connection's identity that `SQLGetInfo` reports back to the
+/// application.
+///
+/// Deliberately holds no credential: the connection string is never retained,
+/// and only the login name is kept, never the password or access token.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectionIdentity {
+    /// `SQL_DATA_SOURCE_NAME`. Empty for a DSN-less connection, matching
+    /// msodbcsql18.
+    pub(crate) data_source_name: String,
+    /// `SQL_SERVER_NAME`. The instance name the server reported for itself at
+    /// login (`@@SERVERNAME`), falling back to the host that was dialled when
+    /// the login response carried no INFO token.
+    pub(crate) server_name: String,
+    /// `SQL_USER_NAME`. The login the session authenticated as; empty for
+    /// integrated and token authentication, which never supply one. msodbcsql
+    /// instead reports `USER_NAME()`, which it fetches lazily on first use;
+    /// this driver has no way to issue an internal query mid-session.
+    pub(crate) user_name: String,
 }
 
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
@@ -199,6 +224,7 @@ impl std::fmt::Debug for DbcState {
             .field("local_tran_started", &self.local_tran_started)
             .field("current_catalog", &self.current_catalog)
             .field("stmt_query_timeout", &self.stmt_query_timeout)
+            .field("identity", &self.identity)
             .finish()
     }
 }
@@ -239,6 +265,7 @@ impl DbcHandle {
                 reset_generation: 0,
                 current_catalog: None,
                 stmt_query_timeout: 0,
+                identity: ConnectionIdentity::default(),
             }),
         }
     }
