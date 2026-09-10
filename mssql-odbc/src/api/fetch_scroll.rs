@@ -1875,6 +1875,7 @@ unsafe fn deliver_bound_plp(
             continue;
         }
 
+        // Binary hex expansion and SingleByteText transcoding are mutually exclusive.
         if hex_stream {
             for b in &scratch[..chunk.read] {
                 let filled = if target == SQL_C_WCHAR {
