@@ -3270,6 +3270,13 @@ mod tests {
     }
 
     #[test]
+    fn internal_conversion_failure_maps_to_a_driver_error() {
+        let diag = ParamBuildError::Value(ConvError::Internal).diag();
+        assert_eq!(diag.state, ERR_INTERNAL_CONVERSION.state);
+        assert_eq!(diag.text, ERR_INTERNAL_CONVERSION.text);
+    }
+
+    #[test]
     fn wchar_explicit_length_becomes_nvarchar() {
         let mut buf: Vec<u16> = "hi".encode_utf16().collect();
         let mut ind: SqlLen = (buf.len() * 2) as SqlLen;
