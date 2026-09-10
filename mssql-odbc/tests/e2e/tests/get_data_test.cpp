@@ -1103,9 +1103,6 @@ TEST_F(GetDataLiveTest, VarcharMaxToWcharChunkedRoundTrip) {
 // copy delivers the correct character *count* with the wrong bytes -- which is
 // how the defect stayed hidden. Asserting the UTF-8 spelling is what catches it.
 //
-// Deliberately NOT skipped on the msodbcsql leg: both drivers deliver UTF-8 for
-// SQL_C_CHAR on Linux, so they must agree here. That is the whole point of this
-// test.
 // Not skipped on Linux/macOS: both drivers deliver UTF-8 for SQL_C_CHAR there
 // and this case passed on both legs of build 173873, which is the parity claim
 // this PR rests on. Skipped only on Windows, where msodbcsql uses the client

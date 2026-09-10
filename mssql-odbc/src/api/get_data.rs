@@ -2486,12 +2486,27 @@ fn stream_active_plp_chunk<'a>(
     // from those same bytes, so reading it after the fact would count this
     // call's read twice. `pending_units` needs no equivalent: it is only filled
     // by the widening path, which reports SQL_NO_TOTAL above.
+    //
+    // Scoped to the arm that owns the carry. `pending_utf8` is only ever filled
+    // by a SQL_C_CHAR call, but it outlives that call, and the compatibility
+    // gate admits a different target on a continuation (`(SQL_C_BINARY, _)`
+    // unconditionally, and SQL_C_WCHAR on a Utf16Text column takes this same
+    // branch). Adding UTF-8 bytes to a binary or UTF-16 delivery's count would
+    // report a number in neither unit; those targets keep the plain wire count
+    // they have on main. Reaching that state needs the mid-stream target switch
+    // tracked in AB#48046, which strands the stream on 01004 regardless -- this
+    // line just does not depend on that being fixed.
+    let held_converted_bytes = if transcode_narrow_to_utf8 {
+        utf8_carry_len as u64
+    } else {
+        0
+    };
     let remaining_indicator = if transcode_utf16_to_utf8 || widen_narrow_to_utf16 {
         SQL_NO_TOTAL
     } else if let Some(total) = known_total {
         let consumed_before = total_read.saturating_sub(read) as u64;
         let wire_remaining = total.saturating_sub(consumed_before);
-        wire_remaining.saturating_add(utf8_carry_len as u64) as SqlLen
+        wire_remaining.saturating_add(held_converted_bytes) as SqlLen
     } else {
         SQL_NO_TOTAL
     };
