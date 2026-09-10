@@ -124,12 +124,11 @@ stages:
       - template: install-dependencies.yml
         parameters:
           osType: Windows
-      # Unit-test wheel packaging scripts on PR runs; the packaging pipeline
-      # steps themselves are non-PR gated.
+      # Packaging and artifact gates must be tested even when PR runs skip them.
       - pwsh: |
           python -m pip install --quiet pytest pyyaml
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py -q
-        displayName: 'Unit test Python wheel packaging scripts'
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py scripts/test_validation_pipeline.py -q
+        displayName: 'Unit test packaging scripts and pipeline configuration'
       - template: build-template.yml
         parameters:
           osType: Windows
