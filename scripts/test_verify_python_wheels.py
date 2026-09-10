@@ -14,8 +14,8 @@ _LIBS = "mssql_py_core/libs"
 _PLATFORM_DRIVERS = {
     "win_amd64": (f"{_LIBS}/windows/x64/mssqlodbc.dll",),
     "win_arm64": (f"{_LIBS}/windows/arm64/mssqlodbc.dll",),
-    "linux_x86_64": (f"{_LIBS}/linux/glibc/x86_64/lib/mssqlodbc.so",),
-    "linux_aarch64": (f"{_LIBS}/linux/glibc/arm64/lib/mssqlodbc.so",),
+    "manylinux_2_34_x86_64": (f"{_LIBS}/linux/glibc/x86_64/lib/mssqlodbc.so",),
+    "manylinux_2_34_aarch64": (f"{_LIBS}/linux/glibc/arm64/lib/mssqlodbc.so",),
     "musllinux_1_2_x86_64": (f"{_LIBS}/linux/musl/x86_64/lib/mssqlodbc.so",),
     "musllinux_1_2_aarch64": (f"{_LIBS}/linux/musl/arm64/lib/mssqlodbc.so",),
     "macosx_15_0_universal2": (
@@ -116,9 +116,11 @@ def test_validator_rejects_missing_odbc_driver(tmp_path: Path) -> None:
 
 def test_validator_rejects_wrong_case_odbc_driver(tmp_path: Path) -> None:
     wheels = write_wheel_matrix(tmp_path)
-    linux_wheel = next(wheel for wheel in wheels if "cp310-cp310-linux_x86_64" in wheel.name)
+    linux_wheel = next(
+        wheel for wheel in wheels if "cp310-cp310-manylinux_2_34_x86_64" in wheel.name
+    )
     linux_wheel.unlink()
-    write_wheel(tmp_path, "linux_x86_64", python_tag="cp310", uppercase_odbc=True)
+    write_wheel(tmp_path, "manylinux_2_34_x86_64", python_tag="cp310", uppercase_odbc=True)
 
     result = run_validator(tmp_path)
 
@@ -211,11 +213,29 @@ def test_validator_rejects_same_count_with_unexpected_wheel(tmp_path: Path) -> N
 
 def test_validator_rejects_wrong_case_wheel_filename(tmp_path: Path) -> None:
     wheels = write_wheel_matrix(tmp_path)
-    linux_wheel = next(wheel for wheel in wheels if "cp310-cp310-linux_x86_64" in wheel.name)
-    uppercase_name = linux_wheel.name.replace("linux", "LINUX")
+    linux_wheel = next(
+        wheel for wheel in wheels if "cp310-cp310-manylinux_2_34_x86_64" in wheel.name
+    )
+    uppercase_name = linux_wheel.name.replace("cp310", "CP310")
     linux_wheel.rename(linux_wheel.with_name(uppercase_name))
 
     result = run_validator(tmp_path)
 
     assert result.returncode != 0
     assert "Wheel matrix mismatch" in result.stderr
+
+
+def test_validator_rejects_non_pypi_linux_tag(tmp_path: Path) -> None:
+    wheels = write_wheel_matrix(tmp_path)
+    manylinux_wheel = next(
+        wheel for wheel in wheels if "cp310-cp310-manylinux_2_34_x86_64" in wheel.name
+    )
+    manylinux_wheel.unlink()
+    write_wheel(tmp_path, "linux_x86_64", python_tag="cp310", include_odbc=False)
+
+    result = run_validator(tmp_path)
+
+    normalized = "".join(result.stderr.split())
+    assert result.returncode != 0
+    assert "linux_x86_64" in normalized
+    assert "PyPIrejects" in normalized

@@ -15,10 +15,12 @@ classifiers = [
 [tool.maturin]
 module-name = "mssql_py_core"
 features = ["pyo3/extension-module"]
-# Don't vendor shared libraries (libssl, libcrypto) into the wheel.
-# Built on manylinux_2_34 (AlmaLinux 9) so the native extension links against
-# libssl.so.3 / libcrypto.so.3 and expects the OS to provide OpenSSL 3.x at runtime.
-# On macOS (Security.framework) and Windows (SChannel) there is no OpenSSL dep.
+# Skip maturin's build-time auditwheel: the mssql-odbc driver is injected into
+# the wheel after the build, so repair must run on the final wheel. The pipeline
+# runs `auditwheel repair` post-injection (scripts/repair-glibc-wheels-in-container.sh)
+# to resolve the native dependencies of both the extension and mssqlodbc.so and
+# retag the glibc wheels manylinux_*. macOS (Security.framework) and Windows
+# (SChannel) have no OpenSSL dependency.
 auditwheel = "skip"
 
 [project.optional-dependencies]
