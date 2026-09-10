@@ -35,9 +35,17 @@ protected:
     // Reads column 1 as SQL_C_CHAR into a buffer of exactly `bufLen` bytes.
     void ReadChar(SQLLEN bufLen, SQLRETURN* rc, SQLLEN* ind, std::string* text) {
         char buf[512];
+        ASSERT_GE(bufLen, 0);
+        ASSERT_LE(bufLen, static_cast<SQLLEN>(sizeof(buf)));
         std::memset(buf, 0x7E, sizeof(buf));
         *rc = SQLGetData(stmt_, 1, SQL_C_CHAR, buf, bufLen, ind);
-        *text = SQL_SUCCEEDED(*rc) ? std::string(buf) : std::string();
+        text->clear();
+        if (SQL_SUCCEEDED(*rc) && bufLen > 0) {
+            const char* end =
+                static_cast<const char*>(std::memchr(buf, '\0', static_cast<size_t>(bufLen)));
+            ASSERT_NE(nullptr, end) << "missing terminator within BufferLength";
+            text->assign(buf, static_cast<size_t>(end - buf));
+        }
     }
 };
 
@@ -132,17 +140,49 @@ TEST_F(BinToCharLiveTest, ChunkedHexReportsADecreasingRemainder) {
     SQLCloseCursor(stmt_);
 }
 
+TEST_F(BinToCharLiveTest, NonPlpZeroLengthHexProbePreservesBufferAndValue) {
+    const auto check = [&](auto& buf, SQLSMALLINT target) {
+        for (const char* source : {"BINARY(3)", "VARBINARY(8)"}) {
+            SCOPED_TRACE(::testing::Message() << source << ", target " << target);
+            FetchOne(std::string("SELECT CAST(0x0102AB AS ") + source + ")");
+            for (auto& unit : buf) unit = '~';
+            SQLLEN ind = -1;
+            for (int probe = 0; probe < 2; ++probe) {
+                ASSERT_EQ(SQL_SUCCESS_WITH_INFO,
+                          SQLGetData(stmt_, 1, target, buf, 0, &ind));
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+                EXPECT_EQ(static_cast<SQLLEN>(6 * sizeof(buf[0])), ind);
+                for (const auto unit : buf) EXPECT_EQ('~', unit);
+            }
+            ASSERT_EQ(SQL_SUCCESS,
+                      SQLGetData(stmt_, 1, target, buf, sizeof(buf), &ind));
+            EXPECT_EQ(static_cast<SQLLEN>(6 * sizeof(buf[0])), ind);
+            const char* expected = "0102AB";
+            for (int i = 0; i < 6; ++i) EXPECT_EQ(expected[i], buf[i]);
+            EXPECT_EQ(0, buf[6]);
+            EXPECT_EQ('~', buf[7]);
+            EXPECT_EQ(SQL_NO_DATA,
+                      SQLGetData(stmt_, 1, target, buf, sizeof(buf), &ind));
+            ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+        }
+    };
+    SQLCHAR narrow[8];
+    SQLWCHAR wide[8];
+    ASSERT_NO_FATAL_FAILURE(check(narrow, SQL_C_CHAR));
+    ASSERT_NO_FATAL_FAILURE(check(wide, SQL_C_WCHAR));
+}
+
 TEST_F(BinToCharLiveTest, WideTargetRendersTheSameHex) {
     FetchOne("SELECT CAST(0x0102AB AS BINARY(3))");
 
     SQLWCHAR wbuf[64];
-    std::memset(wbuf, 0, sizeof(wbuf));
+    for (auto& unit : wbuf) unit = '~';
     SQLLEN ind = -1;
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, wbuf, sizeof(wbuf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(12, ind) << "characters are reported in bytes for a wide target";
     std::string narrow;
-    for (int i = 0; wbuf[i] && i < 64; ++i) narrow.push_back(static_cast<char>(wbuf[i]));
+    for (int i = 0; i < 64 && wbuf[i]; ++i) narrow.push_back(static_cast<char>(wbuf[i]));
     EXPECT_EQ("0102AB", narrow);
     SQLCloseCursor(stmt_);
 }
@@ -158,14 +198,14 @@ TEST_F(BinToCharLiveTest, WideTargetAlsoKeepsBytesWhole) {
     for (const auto& c : cases) {
         FetchOne("SELECT CAST(0x0102AB AS BINARY(3))");
         SQLWCHAR wbuf[64];
-        std::memset(wbuf, 0, sizeof(wbuf));
+        for (auto& unit : wbuf) unit = '~';
         SQLLEN ind = -1;
         EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
                   SQLGetData(stmt_, 1, SQL_C_WCHAR, wbuf, c.bufBytes, &ind))
             << "bufBytes " << c.bufBytes;
         EXPECT_EQ(12, ind) << "bufBytes " << c.bufBytes;
         std::string narrow;
-        for (int i = 0; wbuf[i] && i < 64; ++i) narrow.push_back(static_cast<char>(wbuf[i]));
+        for (int i = 0; i < 64 && wbuf[i]; ++i) narrow.push_back(static_cast<char>(wbuf[i]));
         EXPECT_EQ(c.expected, narrow) << "bufBytes " << c.bufBytes;
         SQLCloseCursor(stmt_);
     }
@@ -210,10 +250,9 @@ TEST_F(BinToCharLiveTest, NullVarbinaryMaxReportsNull) {
     ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(SQL_NULL_DATA, ind);
-    // Buffer contents are deliberately not asserted: this driver writes a
-    // terminator on a NULL where msodbcsql leaves the slot untouched. That
-    // predates hex rendering -- a NULL never enters the conversion at all -- so
-    // it is left alone here rather than folded into this change.
+    // No comparison skip: only the shared NULL indicator is asserted.
+    // The pre-existing NULL terminator difference is tracked in #555;
+    // buffer-content parity belongs with that fix, not hex conversion.
     SQLCloseCursor(stmt_);
 }
 
@@ -409,7 +448,8 @@ TEST_F(BinToCharLiveTest, BoundVarbinaryMaxRendersHexWhetherBufferedOrStreamed) 
         EXPECT_EQ(c.expectedIndicator, ind) << "repeat " << c.repeat;
         std::string expected;
         while (expected.size() < c.expectedChars) expected += "AB";
-        EXPECT_EQ(expected, std::string(buf)) << "repeat " << c.repeat;
+        EXPECT_EQ(0, buf[c.expectedChars]) << "repeat " << c.repeat;
+        EXPECT_EQ(expected, std::string(buf, c.expectedChars)) << "repeat " << c.repeat;
 
         SQLFreeStmt(stmt_, SQL_UNBIND);
         SQLCloseCursor(stmt_);

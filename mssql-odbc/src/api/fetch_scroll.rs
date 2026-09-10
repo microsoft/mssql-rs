@@ -1843,12 +1843,9 @@ unsafe fn deliver_bound_plp(
     let hex_stream =
         matches!(encoding, PlpEncoding::Binary) && (target == SQL_C_CHAR || target == SQL_C_WCHAR);
     // Room for the payload. Character targets always write a terminator; binary
-    // is not a string, so the whole slot is payload. A hex rendering rounds down
-    // to an even count so a byte's two characters are never split.
+    // is not a string, so the whole slot is payload.
     let capacity_elements = if target == SQL_C_BINARY {
         stride
-    } else if hex_stream {
-        hex_buffer_elements(buf_elements).saturating_sub(1)
     } else {
         buf_elements.saturating_sub(1)
     };
@@ -1883,6 +1880,7 @@ unsafe fn deliver_bound_plp(
                 } else {
                     out_bytes.len()
                 };
+                // Append both hex digits or leave the trailing slot unused.
                 if filled + 2 > capacity_elements {
                     truncated = true;
                     break;
