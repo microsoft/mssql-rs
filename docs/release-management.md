@@ -327,6 +327,11 @@ gates and OneBranch policy/checkout settings without queuing a run. Preview prov
 the selected agent context, not runtime pool authorization or registry reachability.
 Once a live run is authorized, select a known successful Official Build and leave all switches
 off to exercise genuine artifacts in the governed container without publishing.
+That all-off run does not exercise the crate registry jobs. For an authorized
+non-publishing crate preflight run, set `validateCratesOnly: true` and select
+`publishMssqlTds` and/or `publishMssqlMockTds`; leave `publishNuGet` and `tagRelease`
+false. Use an Official Build whose selected crate versions are not yet published.
+Mock-only validation also requires its core version to be available already.
 Local regression tests also cover missing wheels, incorrect names/versions,
 missing ODBC payloads, and exact-source metadata failures.
 
