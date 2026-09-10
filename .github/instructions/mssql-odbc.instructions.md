@@ -241,6 +241,15 @@ does not grow every time a new msodbcsql build is measured.
    type but not the other would be worse than the divergence.
    `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
+
+   The same rule applies to a bound UTF-8-collation `varchar(max)` delivered as
+   `SQL_C_CHAR`, which is verbatim on both drivers because the wire bytes are
+   already UTF-8. Measured on build 173919 with a 3-byte character against an
+   8-byte payload slot: msodbcsql fills all 8 and returns
+   `"\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD"`, ending mid-character, where this driver
+   stops at 6. `ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary`
+   splits per-leg on `ODBC_TEST_TARGET` rather than skipping, so the shared part
+   — both truncate, report `01004`, and deliver a prefix — stays measured.
 9. A bound `time` / `datetimeoffset` column strides by
     `sizeof(SQL_SS_TIME2_STRUCT)` (12) and
     `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by `BufferLength`.

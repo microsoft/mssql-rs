@@ -84,6 +84,37 @@ using SqlTString = std::basic_string<SQLTCHAR>;
         }                                                                      \
     } while (0)
 
+// Skip on the msodbcsql leg of a comparison run, but only on Windows, for a
+// test that asserts UTF-8 SQL_C_CHAR output.
+//
+// msodbcsql converts SQL_C_CHAR to the client's ANSI code page on Windows, so a
+// CP1252 'e-acute' arrives as the single byte E9 rather than the two UTF-8
+// bytes C3 A9. On Linux and macOS msodbcsql delivers UTF-8 and agrees with this
+// driver, so the comparison is kept there instead of being skipped on every
+// platform: that agreement is real and is the parity claim worth measuring.
+// Tracked as AB#47564 (client code page support for SQL_C_CHAR on the fetch
+// path).
+//
+// Measured, not assumed: build 173873 (Linux) passed these cases on both
+// drivers; build 173890 (Windows) failed them on the msodbcsql leg only, e.g.
+// `ABoundVarcharMaxUsesItsCollationForChar` got "\xE9" where "\xC3\xA9" was
+// expected, with indicator 1 rather than 2.
+#ifdef _WIN32
+#define SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS()                                \
+    do {                                                                       \
+        const char* _target = std::getenv("ODBC_TEST_TARGET");                 \
+        if (_target && std::string(_target) == "msodbcsql") {                  \
+            GTEST_SKIP() << "msodbcsql delivers SQL_C_CHAR in the client ANSI " \
+                            "code page on Windows (AB#47564); the UTF-8 "      \
+                            "comparison is measured on the Linux leg";         \
+        }                                                                      \
+    } while (0)
+#else
+#define SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS()                                \
+    do {                                                                       \
+    } while (0)
+#endif
+
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
