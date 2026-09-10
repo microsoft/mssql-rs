@@ -21,3 +21,5 @@ pub(crate) mod fetch_convert;
 pub(crate) mod numeric;
 mod param_buffer;
 pub(crate) mod param_convert;
+
+pub(crate) use param_buffer::parameter_value_stride;

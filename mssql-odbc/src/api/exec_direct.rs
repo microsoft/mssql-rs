@@ -12,13 +12,14 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
     finish_execute_with_param_warning, flush_pending_unprepare, park_dae_client, park_deferred_dae,
-    query_timeout_expired_error, snapshot_bound_params,
+    publish_scalar_processed, query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn, SqlSmallInt,
+    SqlWChar,
 };
 use crate::error::free_errors;
 use crate::error::post_sql_error;
@@ -154,6 +155,25 @@ fn sql_exec_direct_w_safe(
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
         let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        // msodbcsql batches one sp_executesql per set here (sqlccmd.cpp:3310).
+        // Refused until AB#47939 wires that up: no shipped consumer drives it -
+        // mssql-python's executemany always uses the prepare + execute path
+        // (ddbc_bindings.cpp:3052). Refused with no markers too: msodbcsql sets
+        // iRowEnd = dwArraySize regardless of parameter count
+        // (sqlccmd.cpp:3192-3199), so running once instead of N times would
+        // drop N-1 executions with nothing to show for it.
+        if stmt_state.paramset_size > 1 {
+            error!("SQLExecDirectW: parameter arrays are not supported on this path");
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Parameter arrays are not supported with SQLExecDirect; \
+                 prepare the statement and use SQLExecute",
+            );
+            return SQL_ERROR;
+        }
+        publish_scalar_processed(&stmt_state);
         let named_params =
             match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
                 Ok(params) => params,
@@ -164,7 +184,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_result_metadata();
         stmt_state.reset_row_stream();
-        stmt_state.row_count = -1;
+        stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
         stmt_state.pending_row_counts.clear();
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.

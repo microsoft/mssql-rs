@@ -145,16 +145,17 @@ impl ParamBuildError {
     }
 }
 
-/// Converts a bound parameter into a named (`@P1`-style) RPC parameter.
+/// Converts a bound parameter into an RPC parameter, optionally named
+/// (`@P1`-style).
 ///
 /// # Safety
 /// See [`bound_param_to_value_with_outcome`].
 pub(crate) unsafe fn bound_param_to_rpc(
-    name: String,
+    name: impl Into<Option<String>>,
     param: &BoundParam,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
     let ((value, type_metadata), outcome) = unsafe { bound_param_to_value_with_outcome(param) }?;
-    let parameter = RpcParameter::new(Some(name), StatusFlags::NONE, value);
+    let parameter = RpcParameter::new(name.into(), StatusFlags::NONE, value);
     let parameter = match type_metadata {
         Some(metadata) => parameter.with_type_metadata(metadata),
         None => parameter,

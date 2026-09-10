@@ -309,6 +309,43 @@ pub enum StreamedParamStatus {
     Complete(StatementResult),
 }
 
+/// Result for one command in a prepared RPC batch.
+#[derive(Debug, Clone)]
+pub struct PreparedBatchRowResult {
+    /// Caller-supplied row index, preserved across skipped application rows.
+    pub row_index: usize,
+    /// Aggregate update count reported for this RPC, or `None` when unavailable.
+    pub rows_affected: Option<u64>,
+    /// SQL Server errors associated with this RPC.
+    pub errors: Vec<SqlErrorInfo>,
+    /// Whether the RPC produced a row-returning result set.
+    pub has_result_set: bool,
+    /// Whether the RPC produced at least one informational message.
+    pub has_info: bool,
+}
+
+/// Ordered results from one logical prepared RPC batch.
+#[derive(Debug, Clone)]
+pub struct PreparedBatchResult {
+    /// One result for every RPC command serialized into the request.
+    pub rows: Vec<PreparedBatchRowResult>,
+    /// Whether the server returned a boundary for every serialized RPC.
+    pub complete: bool,
+}
+
+impl PreparedBatchResult {
+    /// Sum of reported update counts, or `None` when none were available.
+    pub fn total_rows_affected(&self) -> Option<i64> {
+        let mut counts = self.rows.iter().filter_map(|row| row.rows_affected);
+        let first = counts.next()?;
+        Some(
+            counts.fold(i64::try_from(first).unwrap_or(i64::MAX), |total, count| {
+                total.saturating_add(i64::try_from(count).unwrap_or(i64::MAX))
+            }),
+        )
+    }
+}
+
 /// State machine for an in-progress incremental (streamed) PLP parameter write,
 /// parked as owned state on the client between calls (mirrors the read side's
 /// [`ActiveRowReadState`]). `Active` holds the suspended RPC message plus the
@@ -1557,6 +1594,250 @@ impl TdsClient {
         self.position_on_first_result().await
     }
 
+    async fn execute_sp_execute_batch<'a, I>(
+        &mut self,
+        statement_id: StatementId,
+        rows: I,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        let Some(handle) = self.prepared_handles.get(&statement_id).copied() else {
+            return Err(UsageError(
+                "Cannot execute. Given prepared statement is not materialized on this connection"
+                    .to_string(),
+            ));
+        };
+
+        let ExecuteOptions {
+            timeout: timeout_sec,
+            cancel: cancel_handle,
+            column_encryption,
+        } = options.into();
+        self.current_command_ce_setting = column_encryption;
+        self.remaining_request_timeout = timeout_sec
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(u64::from(seconds)));
+        self.cancel_handle = cancel_handle.map(|handle| handle.child_handle());
+        self.transport.reset_reader();
+
+        let database_collation = self.negotiated_settings.database_collation;
+        let send_started = self.request_timeout_start();
+        let rows = rows.into_iter();
+        let mut packet_writer = PacketType::RpcRequest.create_packet_writer(
+            self.transport.as_writer(),
+            timeout_sec,
+            cancel_handle,
+        );
+        let (row_count, _) = rows.size_hint();
+        let mut row_indices = Vec::with_capacity(row_count);
+        let mut first = true;
+        let serialization_result = async {
+            for row in rows {
+                // A row's parameters are all converted before any of its bytes
+                // reach the writer, so a build failure leaves no partial
+                // command behind: skipping it keeps the batch well-formed and
+                // the connection synchronised. msodbcsql reaches the same end
+                // state by retracting the started command with
+                // RPCBATCH_IGNORELAST (tdsrpc.cpp:258-268); it needs the byte
+                // because it streams conversion straight into the RPC buffer.
+                let Ok((row_index, mut positional_params)) = row else {
+                    continue;
+                };
+                RpcParameter::reject_data_at_exec(positional_params.iter())?;
+                if positional_params
+                    .iter()
+                    .any(RpcParameter::force_column_encryption)
+                {
+                    return Err(UsageError(
+                        "Batched prepared execution does not support ForceColumnEncryption."
+                            .to_string(),
+                    ));
+                }
+                let handle_parameter =
+                    RpcParameter::new(None, StatusFlags::NONE, SqlType::Int(Some(handle)));
+                positional_params.insert(0, handle_parameter);
+                let rpc = SqlRpc::new_batch_command(
+                    RpcType::ProcId(RpcProcs::Execute),
+                    Some(positional_params),
+                    None,
+                    &database_collation,
+                    &self.execution_context,
+                    first,
+                );
+                rpc.serialize_batch_command(&mut packet_writer, first)
+                    .await?;
+                first = false;
+                row_indices.push(row_index);
+            }
+            if first {
+                return Err(UsageError(
+                    "Prepared RPC batch contains no executable rows".to_string(),
+                ));
+            }
+            packet_writer.finalize().await
+        }
+        .await;
+        let message = packet_writer.suspend();
+        self.finish_send(serialization_result, message).await?;
+        if let Some(start) = send_started {
+            self.update_remaining_timeout(start);
+        }
+
+        let result = self.drain_prepared_batch(row_indices).await;
+        if result.is_err() {
+            self.execution_context.set_has_open_batch(false);
+            self.current_result_set_has_been_read_till_end = true;
+            self.current_metadata = None;
+        }
+        result
+    }
+
+    async fn drain_prepared_batch(
+        &mut self,
+        row_indices: Vec<usize>,
+    ) -> TdsResult<PreparedBatchResult> {
+        let expected_rows = row_indices.len();
+        let parser_context = ParserContext::ColumnEncryption(
+            self.negotiated_settings.is_column_encryption_supported(),
+        );
+        let mut results = Vec::with_capacity(row_indices.len());
+        let mut row_indices = row_indices.into_iter();
+        let mut current_index = row_indices.next().ok_or_else(|| {
+            UsageError("Prepared RPC batch contains no executable rows".to_string())
+        })?;
+        let mut errors = Vec::new();
+        let mut rows_affected = None;
+        let mut has_result_set = false;
+        let mut info_count = self.info_messages.len();
+
+        loop {
+            let token = self.next_response_token(&parser_context).await?;
+            match token {
+                Tokens::ColMetadata(metadata) => {
+                    has_result_set = true;
+                    if self
+                        .drain_result_set_rows(Arc::new(metadata), &mut errors)
+                        .await?
+                    {
+                        results.push(PreparedBatchRowResult {
+                            row_index: current_index,
+                            rows_affected,
+                            errors,
+                            has_result_set,
+                            has_info: self.info_messages.len() != info_count,
+                        });
+                        // The DONE that ended this result set carried no MORE.
+                        // If sets are still outstanding it ended the stream
+                        // early, so there are unread tokens and the connection
+                        // cannot be reused.
+                        //
+                        // This arm keys off MORE while the DONE arm below keys
+                        // off RPC_IN_BATCH, on the assumption that the server
+                        // moves the two together for a batched RPC. A DONE
+                        // carrying RPC_IN_BATCH with MORE clear would fail here
+                        // rather than continue - loudly, but on a healthy
+                        // connection. No server has been observed doing it.
+                        if row_indices.next().is_some() {
+                            self.transport.mark_known_dead();
+                            return Err(crate::error::Error::ProtocolError(
+                                "Batched RPC result set ended before every set reported"
+                                    .to_string(),
+                            ));
+                        }
+                        break;
+                    }
+                }
+                Tokens::DoneInProc(done) => {
+                    if done.status.contains(DoneStatus::COUNT)
+                        && done.cur_cmd != CurrentCommand::Select
+                    {
+                        rows_affected =
+                            Some(rows_affected.unwrap_or(0u64).saturating_add(done.row_count));
+                    }
+                }
+                Tokens::DoneProc(done) | Tokens::Done(done) => {
+                    if done.status.contains(DoneStatus::COUNT)
+                        && done.cur_cmd != CurrentCommand::Select
+                    {
+                        rows_affected =
+                            Some(rows_affected.unwrap_or(0u64).saturating_add(done.row_count));
+                    }
+                    if done.has_error() && errors.is_empty() {
+                        // Tokens for the rest of the batch are still unread, so
+                        // this connection cannot be handed back to the pool.
+                        self.transport.mark_known_dead();
+                        return Err(crate::error::Error::ProtocolError(
+                            "Server reported an error for a batched RPC without an ERROR token"
+                                .to_string(),
+                        ));
+                    }
+
+                    // msodbcsql treats any non-DONEINPROC DONE as the parameter
+                    // set boundary (sqlctokn.cpp:2329) and uses DONE_RPCINBATCH
+                    // only to say another command follows (:2413). So every DONE
+                    // reaching here reports its set; the flag decides whether to
+                    // expect another, never whether this one counts.
+                    results.push(PreparedBatchRowResult {
+                        row_index: current_index,
+                        rows_affected,
+                        errors,
+                        has_result_set,
+                        has_info: self.info_messages.len() != info_count,
+                    });
+
+                    if !done.status.contains(DoneStatus::RPC_IN_BATCH) {
+                        if done.has_more() {
+                            // No further RPC, yet the server says more tokens
+                            // follow: the batch never reached a final DONE, so
+                            // this connection cannot go back to the pool.
+                            self.transport.mark_known_dead();
+                            return Err(crate::error::Error::ProtocolError(
+                                "Batched RPC results ended without a final DONE".to_string(),
+                            ));
+                        }
+                        break;
+                    }
+                    match row_indices.next() {
+                        Some(next_index) => current_index = next_index,
+                        None => {
+                            self.transport.mark_known_dead();
+                            return Err(crate::error::Error::ProtocolError(
+                                "Server returned more batched RPC results than were sent"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    errors = Vec::new();
+                    rows_affected = None;
+                    has_result_set = false;
+                    info_count = self.info_messages.len();
+                }
+                Tokens::Error(error_token) => {
+                    errors.push(self.record_error_token(&error_token));
+                }
+                other => self.apply_drain_side_effect(other, &mut errors)?,
+            }
+        }
+
+        // A short batch means the stream ended at a final DONE before every
+        // command reported - an accounting mismatch, not a desynchronised
+        // socket, so the connection stays usable and `complete` carries it.
+        let complete = results.len() == expected_rows;
+
+        self.execution_context.set_has_open_batch(false);
+        self.current_result_set_has_been_read_till_end = true;
+        self.current_metadata = None;
+
+        let result = PreparedBatchResult {
+            rows: results,
+            complete,
+        };
+        self.last_rows_affected = result.total_rows_affected().unwrap_or(-1);
+        Ok(result)
+    }
+
     /// Starts a parameterized `sp_executesql` whose MAX parameter values are
     /// supplied later, in chunks (data-at-execution).
     ///
@@ -1651,6 +1932,21 @@ impl TdsClient {
             database_collation,
         )
         .await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub async fn execute_sp_execute_batch_for_test<I>(
+        &mut self,
+        statement_id: StatementId,
+        rows: I,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        self.begin_command();
+        self.execute_sp_execute_batch(statement_id, rows, ExecuteOptions::default())
+            .await
     }
 
     /// Opens the command boundary, recovers a dead connection, and resolves the
@@ -2860,12 +3156,9 @@ impl TdsClient {
         &mut self,
         sql: String,
         named_params: Vec<RpcParameter>,
+        command_started: bool,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementId> {
-        if self.command_is_busy() {
-            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
-        };
-
         let ExecuteOptions {
             timeout: timeout_sec,
             cancel: cancel_handle,
@@ -2873,8 +3166,15 @@ impl TdsClient {
         } = options.into();
         self.current_command_ce_setting = column_encryption;
 
-        self.begin_command();
-        let reconnect_elapsed = self.check_and_reconnect(timeout_sec, cancel_handle).await?;
+        let reconnect_elapsed = if command_started {
+            Duration::ZERO
+        } else {
+            if self.command_is_busy() {
+                return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+            }
+            self.begin_command();
+            self.check_and_reconnect(timeout_sec, cancel_handle).await?
+        };
         let budget = Self::deduct_timeout(timeout_sec, reconnect_elapsed);
         let resolved = budget.into_timeout()?;
         let timeout_sec = resolved.seconds();
@@ -3192,6 +3492,104 @@ impl TdsClient {
                 result
             }
         }
+    }
+
+    /// Executes parameter rows against one prepared statement in a single TDS
+    /// RPC request.
+    ///
+    /// Rows are pulled from `rows` as each RPC is serialized, so callers can
+    /// convert application buffers lazily without retaining the complete batch.
+    /// The `usize` carried with each row is returned unchanged for result/status
+    /// correlation.
+    ///
+    /// The method recovers once before preparing or sending, reuses one server
+    /// handle for every row, and applies one timeout/cancellation budget to the
+    /// complete operation. Data-at-execution and Always Encrypted parameters are
+    /// rejected; callers must use the scalar execution path for those shapes.
+    pub async fn execute_prepared_batch<'a, I>(
+        &mut self,
+        statement: &mut PreparedStatement,
+        rows: I,
+        orphaned: &mut Option<StatementId>,
+        options: impl Into<ExecuteOptions<'a>>,
+    ) -> TdsResult<PreparedBatchResult>
+    where
+        I: IntoIterator<Item = TdsResult<(usize, Vec<RpcParameter>)>>,
+    {
+        if self.command_is_busy() {
+            return Err(UsageError(ALREADY_EXECUTING_ERROR.to_string()));
+        }
+
+        let mut rows = rows.into_iter().peekable();
+        // A row that fails to build is skipped rather than aborting the batch,
+        // so the parameter declaration comes from the first row that builds -
+        // not from row 0. The caller's iterator has already recorded the ones
+        // skipped here, so consuming them loses nothing.
+        while matches!(rows.peek(), Some(Err(_))) {
+            rows.next();
+        }
+        let Some(Ok((_, first_params))) = rows.peek() else {
+            return Ok(PreparedBatchResult {
+                rows: Vec::new(),
+                complete: true,
+            });
+        };
+        let declaration_params = first_params.clone();
+        RpcParameter::reject_data_at_exec(declaration_params.iter())?;
+        let mut opts = options.into();
+        self.current_command_ce_setting = opts.column_encryption;
+        if self.should_encrypt_parameters() {
+            return Err(UsageError(
+                "Batched prepared execution is not supported with Always Encrypted.".to_string(),
+            ));
+        }
+
+        self.begin_command();
+        let started = Instant::now();
+        let reconnect_elapsed = self.check_and_reconnect(opts.timeout, opts.cancel).await?;
+        let original_timeout = opts.timeout;
+        let mut budget = Self::deduct_timeout(original_timeout, reconnect_elapsed);
+        opts.timeout = budget.into_timeout()?.seconds();
+
+        let live_id = statement
+            .id
+            .filter(|id| self.prepared_handles.contains_key(id));
+        let statement_id = match live_id {
+            Some(id) => id,
+            None => {
+                if let Some(orphan_id) = orphaned.take() {
+                    self.execute_sp_unprepare(orphan_id, true, opts.clone())
+                        .await?;
+                    budget = Self::deduct_timeout(original_timeout, started.elapsed());
+                    opts.timeout = budget.into_timeout()?.seconds();
+                }
+
+                let declaration_params = declaration_params
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, mut parameter)| {
+                        parameter.name = Some(format!("@P{}", index + 1));
+                        parameter
+                    })
+                    .collect();
+                let statement_id = self
+                    .execute_sp_prepare(
+                        statement.sql.clone(),
+                        declaration_params,
+                        true,
+                        opts.clone(),
+                    )
+                    .await?;
+                statement.id = Some(statement_id);
+                budget = Self::deduct_timeout(original_timeout, started.elapsed());
+                opts.timeout = budget.into_timeout()?.seconds();
+                statement_id
+            }
+        };
+
+        self.execute_sp_execute_batch(statement_id, rows, opts)
+            .await
     }
 
     /// Streaming counterpart to [`execute_prepared`](Self::execute_prepared) for
@@ -3761,7 +4159,8 @@ impl TdsClient {
         named_params: Vec<RpcParameter>,
         options: impl Into<ExecuteOptions<'a>>,
     ) -> TdsResult<StatementId> {
-        self.execute_sp_prepare(sql, named_params, options).await
+        self.execute_sp_prepare(sql, named_params, false, options)
+            .await
     }
 
     /// Records `handle` under a fresh id without a round-trip, so wire-protocol
@@ -13740,6 +14139,339 @@ mod tests {
             1,
             "the RETURNVALUE must be surfaced as an output parameter"
         );
+    }
+
+    // ── Batched prepared RPC execution ──
+
+    fn batch_done_in_proc(rows: u64) -> Tokens {
+        Tokens::DoneInProc(DoneToken {
+            status: DoneStatus::MORE | DoneStatus::COUNT,
+            cur_cmd: CurrentCommand::Insert,
+            row_count: rows,
+        })
+    }
+
+    fn batch_done_proc(more: bool, error: bool) -> Tokens {
+        let mut status = if more {
+            DoneStatus::RPC_IN_BATCH
+        } else {
+            DoneStatus::FINAL
+        };
+        if error {
+            status |= DoneStatus::ERROR;
+        }
+        Tokens::DoneProc(DoneToken {
+            status,
+            cur_cmd: CurrentCommand::None,
+            row_count: 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_serializes_two_rpc_commands_in_one_message() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, sent) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![
+            Ok((
+                3,
+                vec![RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(10)),
+                )],
+            )),
+            Ok((
+                7,
+                vec![RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(20)),
+                )],
+            )),
+        ];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("batched sp_execute should succeed");
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].row_index, 3);
+        assert_eq!(result.rows[0].rows_affected, Some(1));
+        assert_eq!(result.rows[1].row_index, 7);
+        assert_eq!(result.rows[1].rows_affected, Some(1));
+        assert_eq!(result.total_rows_affected(), Some(2));
+
+        let wire = sent.lock().unwrap();
+        let packet_len = u16::from_be_bytes([wire[2], wire[3]]) as usize;
+        assert_eq!(
+            packet_len,
+            wire.len(),
+            "batch must be one logical TDS message"
+        );
+        assert_eq!(wire[0], PacketType::RpcRequest as u8);
+        assert_ne!(
+            wire[1] & crate::message::messages::PacketStatusFlags::Eom as u8,
+            0
+        );
+        let payload = reassemble_sent(&wire);
+        let proc_marker = [0xff, 0xff, RpcProcs::Execute as u8, 0, 0, 0];
+        assert_eq!(
+            payload
+                .windows(proc_marker.len())
+                .filter(|window| *window == proc_marker)
+                .count(),
+            2
+        );
+        let delimiter_and_proc = [0xff, 0xff, 0xff, RpcProcs::Execute as u8, 0, 0, 0];
+        assert!(
+            payload
+                .windows(delimiter_and_proc.len())
+                .any(|window| window == delimiter_and_proc)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_skips_a_row_that_fails_to_build() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            batch_done_in_proc(1),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, sent) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let int_row = |index: usize, value: i32| {
+            Ok((
+                index,
+                vec![RpcParameter::new(
+                    Some("@P1".to_string()),
+                    StatusFlags::NONE,
+                    SqlType::Int(Some(value)),
+                )],
+            ))
+        };
+        let rows = vec![
+            int_row(3, 10),
+            Err(UsageError("row 5 changed after validation".to_string())),
+            int_row(7, 20),
+        ];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("a row that fails to build must not fail the batch");
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].row_index, 3);
+        assert_eq!(result.rows[1].row_index, 7);
+
+        // The skipped row must leave no trace on the wire: two commands joined
+        // by exactly one delimiter, in one complete message.
+        let wire = sent.lock().unwrap();
+        let packet_len = u16::from_be_bytes([wire[2], wire[3]]) as usize;
+        assert_eq!(
+            packet_len,
+            wire.len(),
+            "a skipped row must still leave one complete TDS message"
+        );
+        assert_ne!(
+            wire[1] & crate::message::messages::PacketStatusFlags::Eom as u8,
+            0
+        );
+        let payload = reassemble_sent(&wire);
+        let proc_marker = [0xff, 0xff, RpcProcs::Execute as u8, 0, 0, 0];
+        assert_eq!(
+            payload
+                .windows(proc_marker.len())
+                .filter(|window| *window == proc_marker)
+                .count(),
+            2,
+            "the failed row must not have contributed a command"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_correlates_a_server_error_to_its_row() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 2627,
+                state: 1,
+                severity: 14,
+                message: "duplicate key".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            batch_done_proc(false, true),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![Ok((0, Vec::new())), Ok((1, Vec::new()))];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("row-scoped SQL errors should remain correlated results");
+        assert!(result.rows[0].errors.is_empty());
+        assert_eq!(result.rows[1].errors.len(), 1);
+        assert_eq!(result.rows[1].errors[0].number, 2627);
+        assert!(result.complete);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_preserves_an_early_batch_aborting_error() {
+        let tokens = vec![
+            batch_done_in_proc(1),
+            batch_done_proc(true, false),
+            Tokens::Error(crate::token::tokens::ErrorToken {
+                number: 8115,
+                state: 1,
+                severity: 16,
+                message: "arithmetic overflow".to_string(),
+                server_name: "test-server".to_string(),
+                proc_name: String::new(),
+                line_number: 1,
+            }),
+            batch_done_proc(false, true),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![
+            Ok((0, Vec::new())),
+            Ok((1, Vec::new())),
+            Ok((2, Vec::new())),
+        ];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("batch-aborting SQL errors remain row results");
+        assert!(!result.complete);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[1].errors[0].number, 8115);
+        assert_eq!(result.total_rows_affected(), Some(1));
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_reports_a_short_reply_with_no_error_to_explain_it() {
+        // Two commands sent, one reported, and the stream ends cleanly with no
+        // server error. The shortfall is carried on `complete` so the ODBC
+        // layer can report it while keeping the set the server did report.
+        let tokens = vec![batch_done_in_proc(1), batch_done_proc(false, false)];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let rows = vec![Ok((0, Vec::new())), Ok((1, Vec::new()))];
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, rows)
+            .await
+            .expect("a short batch is reported, not rejected");
+        assert!(!result.complete, "one of two commands reported");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].row_index, 0);
+        assert!(
+            !client.is_connection_dead(),
+            "the stream ended at a final DONE, so the socket is still usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_reports_instead_of_silently_discarding_result_sets() {
+        let tokens = vec![
+            empty_col_metadata(),
+            Tokens::Done(DoneToken {
+                status: DoneStatus::MORE,
+                cur_cmd: CurrentCommand::Select,
+                row_count: 0,
+            }),
+            batch_done_proc(false, false),
+        ];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, vec![Ok((4, Vec::new()))])
+            .await
+            .expect("row-returning RPC should be drained and reported");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].row_index, 4);
+        assert!(result.rows[0].has_result_set);
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_rejects_forced_encryption_before_writing() {
+        let (mut client, sent) = create_capturing_client(Vec::new());
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let forced = RpcParameter::new(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            SqlType::Int(Some(1)),
+        )
+        .with_force_column_encryption(true);
+
+        let error = client
+            .execute_sp_execute_batch_for_test(statement_id, vec![Ok((0, vec![forced]))])
+            .await
+            .expect_err("forced encryption is unsupported on the batch fast path");
+        assert!(matches!(&error, UsageError(message) if message.contains("ForceColumnEncryption")));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_deducts_send_time_from_response_budget() {
+        let tokens = vec![batch_done_in_proc(1), batch_done_proc(false, false)];
+        let (mut client, observed) = create_timeout_observing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+        let mut statement =
+            PreparedStatement::materialized_for_test("INSERT INTO t VALUES (@P1)", statement_id);
+        let mut orphaned = None;
+        let row = Ok((
+            0,
+            vec![RpcParameter::new(
+                Some("@P1".to_string()),
+                StatusFlags::NONE,
+                SqlType::Int(Some(1)),
+            )],
+        ));
+
+        client
+            .execute_prepared_batch(
+                &mut statement,
+                vec![row],
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(1),
+            )
+            .await
+            .expect("batch should complete against scripted response");
+        let observed = observed.lock().unwrap();
+        let response_budget = observed[0].expect("finite timeout should reach the reader");
+        assert!(
+            response_budget < Duration::from_secs(1),
+            "serialization/send time must be charged before response reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_batch_preserves_unavailable_row_count() {
+        let tokens = vec![batch_done_proc(false, false)];
+        let (mut client, _) = create_capturing_client(tokens);
+        let statement_id = client.register_prepared_handle_for_test(42);
+
+        let result = client
+            .execute_sp_execute_batch_for_test(statement_id, vec![Ok((0, Vec::new()))])
+            .await
+            .expect("batch without DONE_COUNT should still succeed");
+        assert_eq!(result.total_rows_affected(), None);
+        assert_eq!(client.last_rows_affected(), -1);
     }
 
     // ── Streamed (data-at-execution) PLP parameter write ──

@@ -1073,6 +1073,9 @@ bitflags::bitflags! {
         /// Attention.
         const ATTN = 0x0020;
 
+        /// This DONE terminates one RPC inside a batched RPC request.
+        const RPC_IN_BATCH = 0x0080;
+
         /// Server Error.
         const SERVER_ERROR = 0x0100;
     }
@@ -1465,6 +1468,9 @@ mod coverage_tests {
 
         let status = DoneStatus::from(0x0020);
         assert!(status.contains(DoneStatus::ATTN));
+
+        let status = DoneStatus::from(0x0080);
+        assert!(status.contains(DoneStatus::RPC_IN_BATCH));
 
         let status = DoneStatus::from(0x0100);
         assert!(status.contains(DoneStatus::SERVER_ERROR));

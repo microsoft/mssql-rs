@@ -32,7 +32,7 @@ those attributes drive — that is already split into sibling stories.
 | `SQL_ATTR_APP_PARAM_DESC` / `APP_ROW_DESC` as attributes | **46377** |
 | Descriptor handle semantics behind them | AB#46374 Descriptors |
 | `SQL_ATTR_PARAMSET_SIZE` accept/store | **46377** |
-| Array-bound `executemany` execution | AB#46576 Batch insert |
+| Array-bound `executemany` execution | AB#47905 |
 | `SQL_ATTR_RESET_CONNECTION`, `SQL_ATTR_CONNECTION_DEAD` | AB#47317 (Closed) |
 | `SQL_ATTR_AUTOCOMMIT`, `SQL_ATTR_TXN_ISOLATION` | AB#46379 (Closed) |
 | Connection-string keyword parsing | AB#46372 (Closed) |
@@ -406,8 +406,9 @@ ideal rather than what this driver does.
 | 14 | `ROW_NUMBER` | — | get-only; `24000` unless positioned on a row, else 0 |
 | 15 | `ENABLE_AUTO_IPD` | 0 | stored |
 | 17 | `PARAM_BIND_OFFSET_PTR` | 0 (null) | **enforced**: dereferenced at execute and added to both bound pointers |
-| 16, 18–21, 23–24 | bind/offset/status pointers | 0 | stored |
-| 22 | `PARAMSET_SIZE` | 1 | 1 → success; above 1 → `HYC00` (array binding is a deferred feature) |
+| 16, 23–24 | fetch/row operation pointers | 0 | stored |
+| 18–21 | parameter bind/operation/status pointers | 0 | consumed by parameter-array execution — see the divergence table in [parameters_plan.md](parameters_plan.md) |
+| 22 | `PARAMSET_SIZE` | 1 | positive sizes accepted; 0 never reaches the driver (the DM rejects it with `HY024`); non-DAE input arrays execute as one batched RPC request |
 | 10014 | `METADATA_ID` | 0 | `SQL_FALSE` accepted; `SQL_TRUE` → `HYC00` |
 | -1 | `CURSOR_SCROLLABLE` | `SQL_NONSCROLLABLE` | the boolean face of `CURSOR_TYPE` |
 | -2 | `CURSOR_SENSITIVITY` | `SQL_INSENSITIVE` | `SQL_UNSPECIFIED` normalises to insensitive, silently |
@@ -454,6 +455,18 @@ msodbcsql and reports `01S02` here, because scrollable cursors are a deferred
 feature. It is the same single divergence already recorded for
 `SQL_ATTR_CURSOR_TYPE`, since the two are one setting. Variation 40 asserts the
 shared invariant on both drivers and the per-driver state separately.
+
+#### Parameter-array divergences live in `parameters_plan.md`
+
+S4 owns only the accept/store/read-back contract for the array attributes. What
+they *do* once `PARAMSET_SIZE > 1` executes an array — including the points where
+that execution diverges from msodbcsql, and the work items tracking each — is
+documented in
+[parameters_plan.md § Parameter arrays](parameters_plan.md#parameter-arrays-executemany).
+None of those divergences is visible from this side: measured through the Driver
+Manager, every value of `PARAMSET_SIZE` this driver accepts or refuses matches
+msodbcsql, including 0, which the DM rejects with `HY024` for both drivers
+before either sees it.
 
 **Cross-story notes:** `SQL_ATTR_NOSCAN` is now readable for AB#46384.
 `SQL_ATTR_METADATA_ID = SQL_FALSE` succeeds and reads back. `SQL_TRUE` returns

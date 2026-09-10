@@ -418,6 +418,14 @@ driver, not by what is convenient to write:
   measured separately. `VARBINARY` is deliberately absent: binary delivery is
   still unimplemented in `mssql-odbc` (AB#47239), so including it would fail two
   legs and pass the third.
+- **Parameter-array writes.** A prepared three-column `INSERT` writes 2,000 rows
+  using the column-wise buffers produced by `mssql-python` executemany.
+  Autocommit is disabled to match `mssql-python`'s default transaction mode;
+  the explicit commit is outside the timed region. Candidate and msodbcsql use
+  one parameter-array `SQLExecute`. The pinned Rust baseline predates
+  parameter-array support and therefore runs the same values as 2,000 sequential
+  prepared executes; reports identify that leg as a sequential baseline rather
+  than implying it exercised unsupported array behavior.
 
 Every workload is a C++ call into the driver through the ODBC Driver Manager.
 `mssql-python` is a workload-shape reference only — the source of the rowset
