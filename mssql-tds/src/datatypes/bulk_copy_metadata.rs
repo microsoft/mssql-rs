@@ -472,7 +472,8 @@ pub struct BulkCopyColumnMetadata {
     /// This is the collation name retrieved from sp_tablecollations_100
     /// and used in the INSERT BULK SQL command.
     /// Custom names must be 1-128 ASCII letters, digits, or underscores, starting
-    /// with a letter. Invalid tokens return `Error::UsageError` during bulk copy.
+    /// with a letter. Invalid tokens return
+    /// [`Error::UsageError`](crate::error::Error::UsageError) during bulk copy.
     pub collation_name: Option<String>,
 
     /// Character encoding (for character types)
