@@ -439,18 +439,21 @@ pub(super) fn set_type(
         }
     };
 
-    // Scoped to AppParam/Ad, not AppRow: this mirrors msodbcsql's APD-side
-    // SetTypeDefaults reset (SQL_C_NUMERIC's (SQL_PREC_NUMERIC, 0) default),
-    // which is a parameter-binding concept with no ARD analogue verified
-    // here. Including AppRow would drop an already-bound fetch column's
-    // `data_ptr` the moment its C type is retyped through the ARD, turning a
-    // legitimate rebind into a silent unbind with no e2e coverage for that
-    // half.
-    let is_application_param = matches!(kind, DescKind::AppParam | DescKind::Ad);
+    // Scoped to every application-descriptor kind (AppRow/AppParam/Ad), not
+    // just AppParam: msodbcsql's SQL_DESC_TYPE/CONCISE_TYPE handler resets
+    // `rgbValue` to `NOT_BOUND` and calls `SetTypeDefaults` whenever
+    // `ObjectType == SQL_HANDLE_AD` (`sqlcdesc.cpp:1736-1740`), and that one
+    // object type covers the implicit ARD, the implicit APD, and any
+    // explicit descriptor alike (`sqlsrv.h:542`, `DescKind::is_application`
+    // doc comment) -- retail never special-cases APD over ARD here. An
+    // already-bound fetch column genuinely gets unbound when its C type is
+    // retyped through the ARD, matching retail; see
+    // `changing_ard_type_to_numeric_resets_defaults_and_unbinds_data` below.
+    let is_application_desc = kind.is_application();
     write_record_field(state, record_number, |r| {
         r.concise_type = resolved;
         r.datetime_interval_code = datetime_interval_code_for(resolved);
-        if is_application_param {
+        if is_application_desc {
             r.data_ptr = std::ptr::null_mut();
             r.data_bound = false;
             r.precision_scale_explicit = false;
@@ -728,11 +731,11 @@ mod tests {
     use super::*;
     use crate::api::get_desc_field::sql_get_desc_field_w;
     use crate::api::odbc_types::{
-        SQL_ATTR_APP_PARAM_DESC, SQL_C_LONG, SQL_C_WCHAR, SQL_INTEGER, SQL_INTERVAL_YEAR,
-        SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC, SQL_TYPE_DATE,
-        SqlNumericStruct,
+        SQL_ATTR_APP_PARAM_DESC, SQL_ATTR_APP_ROW_DESC, SQL_C_LONG, SQL_C_WCHAR, SQL_INTEGER,
+        SQL_INTERVAL_YEAR, SQL_INVALID_HANDLE, SQL_NAMED, SQL_NULL_HANDLE, SQL_NUMERIC,
+        SQL_TYPE_DATE, SqlNumericStruct,
     };
-    use crate::api::set_stmt_attr::sql_get_stmt_attr_w;
+    use crate::api::set_stmt_attr::{sql_get_stmt_attr_w, sql_set_stmt_attr_w};
     use crate::error::diag::DiagRecord;
     use crate::handles::{DescHandle, handle_from_raw};
     use crate::test_support::TestHandles;
@@ -935,6 +938,116 @@ mod tests {
         assert!(!record.data_bound);
         assert_eq!(record.precision, SQL_PREC_NUMERIC);
         assert_eq!(record.scale, 0);
+    }
+
+    // msodbcsql's SQL_DESC_TYPE handler resets `rgbValue`/defaults for every
+    // `ObjectType == SQL_HANDLE_AD` record (`sqlcdesc.cpp:1736-1740`), and
+    // that one object type covers the ARD exactly as it does the APD
+    // (`sqlsrv.h:542`) -- retyping an already-bound fetch column through the
+    // ARD unbinds it too, the same as retyping a bound parameter through the
+    // APD.
+    #[test]
+    fn changing_ard_type_to_numeric_resets_defaults_and_unbinds_data() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut old_value = 7i32;
+
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_LONG as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_DATA_PTR,
+                    &mut old_value as *mut i32 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    h.ard(),
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let desc = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let state = desc.inner.lock().unwrap();
+        let record = state.record(1).unwrap();
+        assert!(record.data_ptr.is_null());
+        assert!(!record.data_bound);
+        assert_eq!(record.precision, SQL_PREC_NUMERIC);
+        assert_eq!(record.scale, 0);
+    }
+
+    // Same as above, but through an explicitly allocated descriptor
+    // associated as the ARD via `SQL_ATTR_APP_ROW_DESC`, since `DescKind::Ad`
+    // is the kind such a descriptor carries regardless of which role it's
+    // currently plugged into -- this is the exact reproduction from PR #521
+    // review thread PRRT_kwDOPLFXwM6gzXDQ.
+    #[test]
+    fn changing_explicit_desc_type_to_numeric_unbinds_data_when_used_as_ard() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let desc = h.alloc_explicit_desc();
+        assert_eq!(
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_ATTR_APP_ROW_DESC, desc as SqlPointer, 0) },
+            SQL_SUCCESS
+        );
+
+        let mut old_value = 7i32;
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(desc, 1, SQL_DESC_TYPE, SQL_C_LONG as isize as SqlPointer, 0)
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    desc,
+                    1,
+                    SQL_DESC_DATA_PTR,
+                    &mut old_value as *mut i32 as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(
+            unsafe {
+                sql_set_desc_field_w(
+                    desc,
+                    1,
+                    SQL_DESC_TYPE,
+                    SQL_C_NUMERIC as isize as SqlPointer,
+                    0,
+                )
+            },
+            SQL_SUCCESS
+        );
+
+        let desc_handle = unsafe { handle_from_raw::<DescHandle>(desc) };
+        let state = desc_handle.inner.lock().unwrap();
+        let record = state.record(1).unwrap();
+        assert!(record.data_ptr.is_null());
+        assert!(!record.data_bound);
     }
 
     #[test]
