@@ -28,6 +28,12 @@
 /// SQLTCHAR-based string type for ODBC API calls.
 using SqlTString = std::basic_string<SQLTCHAR>;
 
+// Not an attribute in any scope. Both drivers must answer HY092/HYC00.
+// Shared here (rather than duplicated per test file) so every caller stays
+// in sync if this value ever has to change; measured against msodbcsql 18,
+// see docs/attributes_plan.md §8.
+constexpr SQLINTEGER kUnknownAttribute = 99999;
+
 // ---------------------------------------------------------------------------
 // Assertion helper macros
 // ---------------------------------------------------------------------------
