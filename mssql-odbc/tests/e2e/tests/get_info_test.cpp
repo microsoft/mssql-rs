@@ -9,12 +9,9 @@
 // This suite builds wide on Windows and narrow on Unix (see ODBC_E2E_FORCE_UNICODE
 // in CMakeLists.txt), so lengths are asserted in SQLTCHAR units rather than
 // hard-coded to UTF-16. On the narrow build the driver manager re-encodes the
-// driver's UTF-16 output, and it -- not the driver -- decides what a too-small
-// buffer and a null-pointer size probe report: msodbcsql18 and mssql-odbc behave
-// identically there. The exact SQLGetInfoW buffer contract (byte length, NUL
-// placement, untruncated length on 01004) is therefore pinned by the Rust unit
-// tests in `mssql-odbc/src/api/get_info.rs`; what is asserted here is the part
-// that survives the driver manager unchanged.
+// driver's UTF-16 output and determines what a null-pointer size probe reports.
+// The truncation test calls SQLGetInfoW explicitly to check its byte-length and
+// buffer-boundary contract without the driver manager's ANSI conversion.
 
 #include "odbc_test_fixture.h"
 
@@ -241,12 +238,28 @@ TEST_F(GetInfoLiveTest, NullBufferReportsRequiredLength) {
 
 // A short buffer must be reported as a truncation, not a silent short read.
 TEST_F(GetInfoLiveTest, ShortBufferTruncatesWith01004) {
+    // unixODBC 2.3.11/2.3.12 SQLGetInfoInternal reuses its expanded wide-buffer
+    // length for unicode_to_ansi_copy, overrunning a short ANSI output buffer.
+    // Use the wide entry point on every platform to test the driver's contract.
+    SQLSMALLINT fullLen = -1;
+    ASSERT_EQ(SQL_SUCCESS, SQLGetInfoW(dbc_, SQL_KEYWORDS, nullptr, 0, &fullLen));
+
     // Not named `small`: the Windows SDK's rpcndr.h defines that as a macro for `char`.
-    SQLTCHAR tiny[4] = {};
+    struct {
+        SQLWCHAR value[4];
+        SQLWCHAR guard;
+    } tiny = {{0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}, 0xFFFF};
     SQLSMALLINT len = -1;
-    SQLRETURN rc = SQLGetInfo(dbc_, SQL_KEYWORDS, tiny, sizeof(tiny), &len);
+    SQLRETURN rc = SQLGetInfoW(dbc_, SQL_KEYWORDS, tiny.value, sizeof(tiny.value), &len);
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
     EXPECT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, dbc_, "01004"));
+    EXPECT_EQ(fullLen, len);
+    EXPECT_GT(len, static_cast<SQLSMALLINT>(sizeof(tiny.value)));
+    EXPECT_EQ(static_cast<SQLWCHAR>('B'), tiny.value[0]);
+    EXPECT_EQ(static_cast<SQLWCHAR>('A'), tiny.value[1]);
+    EXPECT_EQ(static_cast<SQLWCHAR>('C'), tiny.value[2]);
+    EXPECT_EQ(0, tiny.value[3]);
+    EXPECT_EQ(0xFFFF, tiny.guard);
 }
 
 // SQLGetInfo must work while a cursor is open on a non-MARS connection, and
