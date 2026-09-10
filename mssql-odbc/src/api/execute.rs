@@ -194,6 +194,10 @@ impl Iterator for PreparedRows<'_> {
         }
         Some(Ok((row, built.params)))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.active_rows.size_hint()
+    }
 }
 
 fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {

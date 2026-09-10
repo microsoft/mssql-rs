@@ -306,12 +306,13 @@ pub const SQL_ASYNC_NOTIFICATION_NOT_CAPABLE: u32 = 0x00000000;
 /// `SQL_PARAM_ARRAY_ROW_COUNTS`: one rolled-up `SQLRowCount` for the whole
 /// array rather than one per set (`SQLGetInfo` never reports `SQL_PARC_BATCH`
 /// here — `SQLRowCount` already sums every set's affected rows).
-pub const SQL_PARC_NO_BATCH: u32 = 0;
+/// `sqlext.h`: `#define SQL_PARC_NO_BATCH 2`.
+pub const SQL_PARC_NO_BATCH: u32 = 2;
 /// `SQL_PARAM_ARRAY_SELECTS`: a row-returning statement is accepted with an
 /// array but its result sets are discarded (see divergence 3 in
 /// `parameters_plan.md`), so applications must not rely on `SELECT` over
-/// `PARAMSET_SIZE > 1`.
-pub const SQL_PAS_NO_SELECT: u32 = 2;
+/// `PARAMSET_SIZE > 1`. `sqlext.h`: `#define SQL_PAS_NO_SELECT 3`.
+pub const SQL_PAS_NO_SELECT: u32 = 3;
 
 // ODBC-SQL-type identifiers.
 pub const SQL_UNKNOWN_TYPE: SqlSmallInt = 0;
@@ -412,7 +413,8 @@ pub const SQL_DIAG_SUBCLASS_ORIGIN: SqlSmallInt = 9;
 pub const SQL_DIAG_CONNECTION_NAME: SqlSmallInt = 10;
 pub const SQL_DIAG_SERVER_NAME: SqlSmallInt = 11;
 pub const SQL_DIAG_DYNAMIC_FUNCTION_CODE: SqlSmallInt = 12;
-pub const SQL_DIAG_ROW_NUMBER: SqlSmallInt = 1750;
+/// `sqlext.h`: `#define SQL_DIAG_ROW_NUMBER (-1248)`.
+pub const SQL_DIAG_ROW_NUMBER: SqlSmallInt = -1248;
 
 // Dynamic-function-code value: statement type is unknown/unclassified.
 pub const SQL_DIAG_UNKNOWN_STATEMENT: SqlInteger = 0;

@@ -543,8 +543,24 @@ mod tests {
             (SQL_STRING_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_SYSTEM_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_TIMEDATE_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
-            (SQL_PARAM_ARRAY_ROW_COUNTS, SQL_PARC_NO_BATCH),
-            (SQL_PARAM_ARRAY_SELECTS, SQL_PAS_NO_SELECT),
+        ] {
+            let (rc, val, len) = get_u32(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(val, expected, "info_type {info_type}");
+            assert_eq!(len, 4, "info_type {info_type}");
+        }
+    }
+
+    #[test]
+    fn param_array_info_types_match_odbc_spec_values() {
+        // Pinned against the literal `sqlext.h` values (not the driver's own
+        // constants) so a transcription slip in either fails this test:
+        // `SQL_PARC_NO_BATCH` is 2 (`SQL_PARC_BATCH` is 1), `SQL_PAS_NO_SELECT`
+        // is 3 (`SQL_PAS_BATCH` is 1, `SQL_PAS_NO_BATCH` is 2).
+        let h = TestHandles::with_env_dbc();
+        for (info_type, expected) in [
+            (SQL_PARAM_ARRAY_ROW_COUNTS, 2u32),
+            (SQL_PARAM_ARRAY_SELECTS, 3u32),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");

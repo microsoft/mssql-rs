@@ -987,6 +987,9 @@ mod tests {
     fn diag_field_row_number_reports_no_row_number() {
         // No per-set/per-row attribution is plumbed through yet, so every
         // record must report SQL_NO_ROW_NUMBER rather than a wrong index.
+        // Assert against the literal sqlext.h value (-1248), not the driver's
+        // own SQL_DIAG_ROW_NUMBER constant, so a transcription slip in that
+        // constant fails this test instead of passing vacuously.
         let env = alloc_env();
         push_diag(env, *b"HY024", 0, "some error");
 
@@ -996,7 +999,7 @@ mod tests {
                 SQL_HANDLE_ENV,
                 env,
                 1,
-                SQL_DIAG_ROW_NUMBER,
+                -1248,
                 &mut row_number as *mut SqlLen as SqlPointer,
                 0,
                 ptr::null_mut(),
