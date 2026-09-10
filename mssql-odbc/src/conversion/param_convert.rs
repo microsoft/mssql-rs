@@ -572,6 +572,11 @@ pub(crate) fn buffered_dae_to_rpc(
     } else {
         SqlLen::try_from(buffer.len()).map_err(|_| ParamBuildError::StringTruncation)?
     };
+    let synthetic = buffered_dae_binding(binding, buffer, &mut indicator);
+    unsafe { bound_param_to_rpc(name, &synthetic) }
+}
+
+fn buffered_dae_binding(binding: &BoundParam, buffer: &[u8], indicator: &mut SqlLen) -> BoundParam {
     let mut synthetic = *binding;
     // Points at the collected bytes for the duration of this call only, which
     // is where the ODBC contract the materialized path relies on is met: the
@@ -583,10 +588,10 @@ pub(crate) fn buffered_dae_to_rpc(
     // the `SQL_DATA_AT_EXEC` marker that started this sequence and it would
     // reject the value as unstaged.
     synthetic.parameter_value_ptr = buffer.as_ptr().cast_mut().cast();
-    synthetic.buffer_length = indicator.max(0);
-    synthetic.strlen_or_ind_ptr = &raw mut indicator;
-    synthetic.octet_length_ptr = &raw mut indicator;
-    unsafe { bound_param_to_rpc(name, &synthetic) }
+    synthetic.buffer_length = (*indicator).max(0);
+    synthetic.strlen_or_ind_ptr = &raw mut *indicator;
+    synthetic.octet_length_ptr = &raw mut *indicator;
+    synthetic
 }
 
 /// How a data-at-execution parameter reaches the wire.
@@ -4263,6 +4268,24 @@ mod tests {
         let error = reserve_dae_buffer(&mut Vec::new(), usize::MAX).unwrap_err();
         assert_eq!(error, ParamBuildError::MemoryAllocation);
         assert_eq!(error.diag().state, ERR_MEMORY_ALLOCATION.state);
+    }
+
+    #[test]
+    fn buffered_dae_binding_repoints_both_indicator_pointers() {
+        let mut stale_indicator = SQL_NULL_DATA;
+        let mut stale_octet_length = SQL_DATA_AT_EXEC;
+        let mut binding = param(SQL_C_CHAR, std::ptr::null_mut(), &mut stale_indicator);
+        binding.sql_type = SQL_INTEGER;
+        binding.octet_length_ptr = &raw mut stale_octet_length;
+
+        let mut buffered_length = 2;
+        let synthetic = buffered_dae_binding(&binding, b"42", &mut buffered_length);
+        assert_eq!(synthetic.strlen_or_ind_ptr, &raw mut buffered_length);
+        assert_eq!(synthetic.octet_length_ptr, &raw mut buffered_length);
+        assert_eq!(
+            unsafe { bound_param_to_value(&synthetic) }.unwrap().0,
+            SqlType::Int(Some(42))
+        );
     }
 
     /// `fit` is the single-call primitive: it measures whole units only, so a
