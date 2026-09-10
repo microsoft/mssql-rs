@@ -959,7 +959,18 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
 // SQL_C_CHAR shape whose slot boundary can land mid-sequence, so the partial
 // tail has to be trimmed exactly as it is for `json`. The token is a 3-byte
 // character against an 8-byte payload slot: two whole characters fit, and the
-// third must be dropped rather than delivered as a fragment.
+// third does not.
+//
+// The truncation contract is asserted on both legs; only the tail diverges.
+// Measured on build 173919: msodbcsql fills all 8 payload bytes and returns
+// "\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD", ending mid-character, where this driver
+// stops at 6. That is the same deliberate deviation already registered for the
+// SQL_C_WCHAR surrogate-pair case in
+// .github/instructions/mssql-odbc.instructions.md (item 8, AB#47767): this
+// driver trims a bound `max` column to a whole character where msodbcsql fills
+// the slot. Split per-leg rather than skipped so the shared part -- that both
+// drivers truncate, report 01004, and deliver a prefix of the value -- stays
+// measured against msodbcsql.
 TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary) {
     SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     ExecDirect(
@@ -975,8 +986,20 @@ TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBo
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
     const std::string got(reinterpret_cast<const char*>(buf));
-    EXPECT_EQ("\xE4\xBD\xA0\xE4\xBD\xA0", got) << "a partial character must not be delivered";
-    EXPECT_EQ(6u, got.size()) << "6 bytes of whole characters, not 8 bytes ending mid-sequence";
+    const std::string kSource = "\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD\xA0";  // 你你你
+
+    // Shared on both drivers: the value truncated to a prefix that fits.
+    EXPECT_LE(got.size(), 8u);
+    EXPECT_EQ(kSource.substr(0, got.size()), got) << "delivered bytes must be a prefix";
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        // Fills the slot, ending mid-character (build 173919).
+        EXPECT_EQ(8u, got.size());
+    } else {
+        EXPECT_EQ("\xE4\xBD\xA0\xE4\xBD\xA0", got) << "a partial character must not be delivered";
+        EXPECT_EQ(6u, got.size()) << "6 bytes of whole characters, not 8 ending mid-sequence";
+    }
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }

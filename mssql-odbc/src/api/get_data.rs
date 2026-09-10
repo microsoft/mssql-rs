@@ -2479,18 +2479,19 @@ fn stream_active_plp_chunk<'a>(
     // strands a caller that sizes its next buffer from the indicator rather than
     // looping on the return code. This is also the term msodbcsql carries as
     // `cbTruncatedCharsInConvBuf` in the same `sqlcdata.h:1230` expression.
-    // `pending_units` needs no equivalent: it is only filled by the widening
-    // path, which reports SQL_NO_TOTAL above.
-    let held_converted_bytes = stmt_state
-        .active_plp
-        .as_ref()
-        .map_or(0, |s| s.pending_utf8.len());
+    //
+    // `utf8_carry_len` is the carry as it stood at entry, which is the value
+    // this indicator is defined in terms of: `wire_remaining` already includes
+    // the bytes read by this call, and the post-drain carry holds output decoded
+    // from those same bytes, so reading it after the fact would count this
+    // call's read twice. `pending_units` needs no equivalent: it is only filled
+    // by the widening path, which reports SQL_NO_TOTAL above.
     let remaining_indicator = if transcode_utf16_to_utf8 || widen_narrow_to_utf16 {
         SQL_NO_TOTAL
     } else if let Some(total) = known_total {
         let consumed_before = total_read.saturating_sub(read) as u64;
         let wire_remaining = total.saturating_sub(consumed_before);
-        wire_remaining.saturating_add(held_converted_bytes as u64) as SqlLen
+        wire_remaining.saturating_add(utf8_carry_len as u64) as SqlLen
     } else {
         SQL_NO_TOTAL
     };
