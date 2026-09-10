@@ -9,8 +9,9 @@ set -euo pipefail
 
 WHEELS_DIR="${1:?usage: repair-glibc-wheels-in-container.sh <wheels-dir>}"
 PLAT="${AUDITWHEEL_PLAT:-manylinux_2_34}"
+AUDITWHEEL_BIN="${AUDITWHEEL_BIN:-auditwheel}"
 
-if ! command -v auditwheel >/dev/null 2>&1; then
+if ! command -v "$AUDITWHEEL_BIN" >/dev/null 2>&1; then
     echo "ERROR: auditwheel not found in container" >&2
     exit 1
 fi
@@ -30,7 +31,7 @@ for wheel in "$WHEELS_DIR"/*.whl; do
 
     echo "==> Repairing $name -> $plat"
     tmp="$(mktemp -d)"
-    auditwheel repair --plat "$plat" --wheel-dir "$tmp" "$wheel"
+    "$AUDITWHEEL_BIN" repair --plat "$plat" --wheel-dir "$tmp" "$wheel"
     count=$(find "$tmp" -maxdepth 1 -name '*.whl' | wc -l)
     if [ "$count" -ne 1 ]; then
         echo "ERROR: expected exactly one repaired wheel for $name, got $count" >&2
@@ -41,5 +42,10 @@ for wheel in "$WHEELS_DIR"/*.whl; do
     rm -rf "$tmp"
     repaired=$((repaired + 1))
 done
+
+if [ "$repaired" -eq 0 ]; then
+    echo "ERROR: no bare glibc wheels found to repair in $WHEELS_DIR" >&2
+    exit 1
+fi
 
 echo "Repaired $repaired glibc wheel(s) into $PLAT wheels."
