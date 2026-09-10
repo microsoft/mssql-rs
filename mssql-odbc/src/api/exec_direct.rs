@@ -11,14 +11,15 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, flush_pending_unprepare, park_dae_client, query_timeout_expired_error,
-    snapshot_bound_params,
+    finish_execute_with_param_warning, flush_pending_unprepare, park_dae_client,
+    publish_scalar_processed, query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
 use super::util::{read_utf16, rewrite_param_markers};
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SqlHandle, SqlReturn, SqlSmallInt, SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn, SqlSmallInt,
+    SqlWChar,
 };
 use crate::error::free_errors;
 use crate::error::post_sql_error;
@@ -154,6 +155,25 @@ fn sql_exec_direct_w_safe(
         // any state, so a binding error (07002 / HYC00) leaves the statement
         // unchanged.
         let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        // msodbcsql batches one sp_executesql per set here (sqlccmd.cpp:3310).
+        // Refused until AB#47939 wires that up: no shipped consumer drives it -
+        // mssql-python's executemany always uses the prepare + execute path
+        // (ddbc_bindings.cpp:3052). Refused with no markers too: msodbcsql sets
+        // iRowEnd = dwArraySize regardless of parameter count
+        // (sqlccmd.cpp:3192-3199), so running once instead of N times would
+        // drop N-1 executions with nothing to show for it.
+        if stmt_state.paramset_size > 1 {
+            error!("SQLExecDirectW: parameter arrays are not supported on this path");
+            post_sql_error(
+                &mut stmt_state,
+                SQLSTATE_HYC00,
+                0,
+                "Parameter arrays are not supported with SQLExecDirect; \
+                 prepare the statement and use SQLExecute",
+            );
+            return SQL_ERROR;
+        }
+        publish_scalar_processed(&stmt_state);
         let named_params =
             match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
                 Ok(params) => params,
@@ -164,7 +184,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_result_metadata();
         stmt_state.reset_row_stream();
-        stmt_state.row_count = -1;
+        stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
         stmt_state.pending_row_counts.clear();
         // Superseding a prepared plan orphans its server handle; release it
         // (deferred) once we hold the client below.
@@ -181,7 +201,11 @@ fn sql_exec_direct_w_safe(
         )
     };
 
-    let ParamsWithDae { params, dae_params } = named_params;
+    let ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    } = named_params;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
@@ -253,11 +277,24 @@ fn sql_exec_direct_w_safe(
                     dae_param_count = dae_params.len(),
                     "SQLExecDirectW: begin_sp_executesql completed despite data-at-execution parameters"
                 );
-                finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+                finish_execute_with_param_warning(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    client,
+                    "SQLExecDirectW",
+                    fractional_truncated,
+                )
             }
-            Ok(StreamedParamStatus::NeedData { .. }) => {
-                park_dae_client(stmt, client, None, None, dae_params, "SQLExecDirectW")
-            }
+            Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
+                stmt,
+                client,
+                None,
+                None,
+                dae_params,
+                fractional_truncated,
+                "SQLExecDirectW",
+            ),
             Err(e) => {
                 error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
                 fail_with_tds(dbc, stmt, statement_handle, client, &e)
@@ -291,7 +328,14 @@ fn sql_exec_direct_w_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+    finish_execute_with_param_warning(
+        dbc,
+        stmt,
+        statement_handle,
+        client,
+        "SQLExecDirectW",
+        fractional_truncated,
+    )
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@
 
 #include "odbc_test_fixture.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -826,6 +827,179 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening) {
     EXPECT_EQ(2, ind);
     EXPECT_EQ(u'\u00e9', buf[0]);
     EXPECT_EQ(0, buf[1]);
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// SQL_C_CHAR output is UTF-8, so a CP1252 varchar(max) must be decoded through
+// the column's collation on the bound path exactly as on the SQLGetData path
+// (AB#47566). A verbatim copy delivers the raw 0xE9 here, which is not valid
+// UTF-8 -- the same defect AB#47875 caught through mssql-python, one file over.
+//
+// Not skipped on the msodbcsql leg: both drivers deliver UTF-8 for SQL_C_CHAR
+// on Linux, so they must agree.
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
+    // Windows-only skip: msodbcsql returns the raw CP1252 byte E9 with
+    // indicator 1 there, rather than UTF-8 C3 A9 with indicator 2 (AB#47564).
+    // Measured as agreeing on Linux in build 173873.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ExecDirect(
+        "SELECT CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)) AS c1");
+
+    SQLCHAR buf[16] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    EXPECT_STREQ("\xC3\xA9", reinterpret_cast<const char*>(buf));
+    EXPECT_EQ(2, ind) << "one character, two UTF-8 bytes";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// A value long enough to arrive in several PLP wire chunks, under a DBCS
+// collation where each CJK character is two wire bytes. The decoder has to
+// carry a character split across a wire chunk boundary; without the carry each
+// half becomes U+FFFD and the slot fills with replacement characters.
+//
+// The token is 11 wire bytes (four GBK characters plus "abc"), deliberately
+// coprime with the 8 KiB PLP_BOUND_CHUNK: an 8-byte token would put every
+// power-of-two read exactly on a character boundary and the carry this test is
+// named for would never be exercised.
+//
+// Skip is backed by a measurement, per
+// .github/instructions/mssql-odbc.instructions.md. Run unskipped on build
+// 173873 against the pinned retail msodbcsql leg: this driver passed and
+// msodbcsql failed the value comparison. Same mechanism as the SQLGetData twin
+// (VarcharMaxDbcsToCharSplitsCharacterAcrossChunks), which shows the corruption
+// verbatim: msodbcsql drops a GBK lead byte at a chunk boundary and the
+// following bytes decode shifted by one.
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunks) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    ExecDirect(
+        "SELECT REPLICATE(CAST(NCHAR(0x4F60) + NCHAR(0x597D) + NCHAR(0x4E16) + NCHAR(0x754C) "
+        "+ N'abc' COLLATE Chinese_PRC_CI_AS AS VARCHAR(MAX)), 3000) AS c1");
+
+    // 3000 repetitions of 11 wire bytes: 33,000 on the wire, 39,000 as UTF-8.
+    std::vector<SQLCHAR> buf(64 * 1024, 0);
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(
+        SQLBindCol(stmt_, 1, SQL_C_CHAR, buf.data(), static_cast<SQLLEN>(buf.size()), &ind),
+        SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+
+    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+                              "abc";  // 你好世界abc
+    std::string expected;
+    expected.reserve(token.size() * 3000);
+    for (int i = 0; i < 3000; ++i) {
+        expected += token;
+    }
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf.data())));
+    EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
+    EXPECT_EQ(std::string::npos, expected.find("\xEF\xBF\xBD")) << "no U+FFFD";
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// A slot too small for the converted value truncates on a character boundary.
+// The indicator stays a concrete count rather than SQL_NO_TOTAL: msodbcsql keys
+// it on the C types, and `sqlcdata.h:1230` takes CHAR->CHAR on its "assume a
+// 1:1 conversion ratio" branch, so converting through the collation does not
+// make the value unmeasurable.
+//
+// Measured on the msodbcsql leg of build 173873. The shared, load-bearing claim
+// holds on both drivers: the indicator is NOT SQL_NO_TOTAL. The exact number
+// diverges, because msodbcsql's estimate is
+// `cbDataAvail + dwDataOffset + cbTruncatedCharsInConvBuf` -- it adds back the
+// bytes already delivered plus whatever its internal conversion buffer is
+// holding, so it reports 5008 where this driver reports the 5000 wire bytes
+// still available. Neither equals the true converted length (10,000 UTF-8
+// bytes); the msodbcsql comment says as much by calling it an assumption.
+// That internal accounting is not reproducible from outside the driver, so the
+// exact value is asserted per-leg rather than skipping the case outright --
+// skipping would also delete the SQL_NO_TOTAL check, which is the part that
+// actually pins this PR's behaviour.
+TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
+    // Windows-only skip: the payload assertion expects UTF-8, which msodbcsql
+    // does not deliver there (AB#47564), and its ANSI output also changes how
+    // many characters fit in the slot. The indicator comparison below is
+    // measured on the Linux leg, where both drivers deliver UTF-8.
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ExecDirect(
+        "SELECT REPLICATE(CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), "
+        "5000) AS c1");
+
+    // 8 payload bytes: four whole two-byte characters, and no room for a fifth.
+    SQLCHAR buf[9] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    // The shared assertion: CHAR->CHAR keeps a concrete 1:1 estimate on both
+    // drivers and never degrades to SQL_NO_TOTAL.
+    EXPECT_NE(SQL_NO_TOTAL, ind) << "CHAR->CHAR keeps the 1:1 wire-byte estimate";
+    EXPECT_STREQ("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", reinterpret_cast<const char*>(buf));
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        // 5000 on the wire + 8 delivered, per the sqlcdata.h formula above.
+        EXPECT_EQ(5008, ind);
+    } else {
+        EXPECT_EQ(5000, ind) << "wire bytes still available before this call's copy";
+    }
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+    SQLCloseCursor(stmt_);
+}
+
+// A UTF-8 collation is already in the target encoding, so it is delivered by a
+// verbatim byte copy rather than through the decoder. That makes it the one
+// SQL_C_CHAR shape whose slot boundary can land mid-sequence, so the partial
+// tail has to be trimmed exactly as it is for `json`. The token is a 3-byte
+// character against an 8-byte payload slot: two whole characters fit, and the
+// third does not.
+//
+// The truncation contract is asserted on both legs; only the tail diverges.
+// Measured on build 173919: msodbcsql fills all 8 payload bytes and returns
+// "\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD", ending mid-character, where this driver
+// stops at 6. That is the same deliberate deviation already registered for the
+// SQL_C_WCHAR surrogate-pair case in
+// .github/instructions/mssql-odbc.instructions.md (item 8, AB#47767): this
+// driver trims a bound `max` column to a whole character where msodbcsql fills
+// the slot. Split per-leg rather than skipped so the shared part -- that both
+// drivers truncate, report 01004, and deliver a prefix of the value -- stays
+// measured against msodbcsql.
+TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary) {
+    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    ExecDirect(
+        "SELECT REPLICATE(CAST(NCHAR(0x4F60) "
+        "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 500) AS c1");
+
+    // 8 payload bytes: two whole 3-byte characters, and no room for a third.
+    SQLCHAR buf[9] = {};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+
+    const std::string got(reinterpret_cast<const char*>(buf));
+    const std::string kSource = "\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD\xA0";  // 你你你
+
+    // Shared on both drivers: the value truncated to a prefix that fits.
+    EXPECT_LE(got.size(), 8u);
+    EXPECT_EQ(kSource.substr(0, got.size()), got) << "delivered bytes must be a prefix";
+
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        // Fills the slot, ending mid-character (build 173919).
+        EXPECT_EQ(8u, got.size());
+    } else {
+        EXPECT_EQ("\xE4\xBD\xA0\xE4\xBD\xA0", got) << "a partial character must not be delivered";
+        EXPECT_EQ(6u, got.size()) << "6 bytes of whole characters, not 8 ending mid-sequence";
+    }
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }

@@ -40,7 +40,7 @@ use crate::api::odbc_types::{
     SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_VARIANT, SQL_SS_VECTOR,
     SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE, SQL_TYPE_TIME,
     SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR, SQL_WVARCHAR,
-    SqlGuid, SqlLen, SqlSmallInt, SqlSsVectorLayout,
+    SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INVALID_CHARACTER_VALUE,
@@ -58,7 +58,7 @@ use crate::conversion::datetime::{
     DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY, civil_from_days_since_0001,
     days_since_0001_from_civil, is_valid_timezone_offset, parse_datetime_literal,
 };
-use crate::conversion::error::ConvError;
+use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{
     NumericSource, narrow_f64_to_f32, narrow_i128, parse_numeric_text,
 };
@@ -144,37 +144,48 @@ impl ParamBuildError {
     }
 }
 
-/// Converts a bound parameter into a named (`@P1`-style) RPC parameter.
+/// Converts a bound parameter into an RPC parameter, optionally named
+/// (`@P1`-style).
 ///
 /// # Safety
-/// See [`bound_param_to_value`].
+/// See [`bound_param_to_value_with_outcome`].
 pub(crate) unsafe fn bound_param_to_rpc(
-    name: String,
+    name: impl Into<Option<String>>,
     param: &BoundParam,
-) -> Result<RpcParameter, ParamBuildError> {
-    let (value, type_metadata) = unsafe { bound_param_to_value(param) }?;
-    let parameter = RpcParameter::new(Some(name), StatusFlags::NONE, value);
-    Ok(match type_metadata {
+) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
+    let ((value, type_metadata), outcome) = unsafe { bound_param_to_value_with_outcome(param) }?;
+    let parameter = RpcParameter::new(name.into(), StatusFlags::NONE, value);
+    let parameter = match type_metadata {
         Some(metadata) => parameter.with_type_metadata(metadata),
         None => parameter,
-    })
+    };
+    Ok((parameter, outcome))
 }
 
 /// Reads the application's value buffer and produces the corresponding
 /// [`SqlType`].
 ///
 /// # Safety
-/// `param.parameter_value_ptr` and `param.strlen_or_ind_ptr` must satisfy the
-/// ODBC binding contract: the value buffer is readable for the indicated
-/// length and the indicator pointer, if non-null, points to one valid `SqlLen`.
+/// See [`bound_param_to_value_with_outcome`].
+#[cfg(test)]
 pub(crate) unsafe fn bound_param_to_value(
     param: &BoundParam,
 ) -> Result<TypedValue, ParamBuildError> {
+    unsafe { bound_param_to_value_with_outcome(param) }.map(|(value, _)| value)
+}
+
+/// # Safety
+/// The value buffer must be readable for the indicated length. Each non-null
+/// indicator pointer must point to a valid `SqlLen`.
+unsafe fn bound_param_to_value_with_outcome(
+    param: &BoundParam,
+) -> Result<(TypedValue, ConvOk), ParamBuildError> {
     // NULL is settled from the indicator alone, so a typed NULL never reads the
     // value buffer.
     let len_spec = match unsafe { read_indicator(param) }? {
         Indicator::Null => {
-            return typed_null(param.sql_type, param.column_size, param.decimal_digits);
+            return typed_null(param.sql_type, param.column_size, param.decimal_digits)
+                .map(|value| (value, ConvOk::Exact));
         }
         Indicator::Length(len) => len,
     };
@@ -208,13 +219,16 @@ pub(crate) unsafe fn bound_param_to_value(
         (AppValue::Float(v), SqlFamily::Float) => convert_real_sql(param.sql_type, v),
         (AppValue::Guid(g), SqlFamily::Guid) => SqlType::Uuid(Some(guid_to_uuid(g))),
         (AppValue::DateTime(p), SqlFamily::DateTime) => {
-            return convert_datetime_sql(param.sql_type, param.decimal_digits, p);
+            return convert_datetime_sql(param.sql_type, param.decimal_digits, p)
+                .map(|value| (value, ConvOk::Exact));
         }
         (AppValue::NarrowText(bytes), SqlFamily::DateTime) => {
-            return datetime_from_text(param, AppText::Utf8(bytes));
+            return datetime_from_text(param, AppText::Utf8(bytes))
+                .map(|value| (value, ConvOk::Exact));
         }
         (AppValue::WideText(bytes), SqlFamily::DateTime) => {
-            return datetime_from_text(param, AppText::Utf16(bytes));
+            return datetime_from_text(param, AppText::Utf16(bytes))
+                .map(|value| (value, ConvOk::Exact));
         }
         // `xml` is UTF-16LE on the wire, which is exactly what a `SQL_C_WCHAR`
         // buffer already holds, so the wide path moves the allocation through.
@@ -226,10 +240,15 @@ pub(crate) unsafe fn bound_param_to_value(
         // is not optional: `SQL_C_DEFAULT` resolves `SQL_DECIMAL` to
         // `SQL_C_CHAR`, so without it every defaulted decimal binding fails.
         (AppValue::NarrowText(bytes), SqlFamily::Decimal) => {
-            return decimal_from_text(param, AppText::Utf8(bytes));
+            return decimal_from_text(param, AppText::Utf8(bytes))
+                .map(|value| (value, ConvOk::Exact));
         }
         (AppValue::WideText(bytes), SqlFamily::Decimal) => {
-            return decimal_from_text(param, AppText::Utf16(bytes));
+            return decimal_from_text(param, AppText::Utf16(bytes))
+                .map(|value| (value, ConvOk::Exact));
+        }
+        (AppValue::Numeric(value), SqlFamily::Decimal) => {
+            return decimal_from_numeric(param, value);
         }
         (AppValue::NarrowText(bytes), SqlFamily::Variant) => variant_of(convert_character_sql(
             SQL_VARCHAR,
@@ -244,7 +263,7 @@ pub(crate) unsafe fn bound_param_to_value(
         _ => return Err(ParamBuildError::ConversionNotImplemented),
     };
 
-    Ok((value, None))
+    Ok(((value, None), ConvOk::Exact))
 }
 
 /// Returns `true` when `indicator` is a data-at-execution value
@@ -911,10 +930,102 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
         }
     };
 
-    let target_scale = u32::from(scale);
+    // Truncation is checked before the precision/magnitude bound below, not
+    // after: `sqlccnvt.cpp:7823` sets `CVT_FRACT_TRUNC` and returns without
+    // ever reaching the whole-number overflow check, so a dropped fractional
+    // digit is always `22001` here, even when the truncated result would also
+    // overflow `precision`. `decimal_from_numeric` does not get this early
+    // return - its source is `SQL_C_NUMERIC`, not `SQL_C_CHAR`/`SQL_C_WCHAR`,
+    // so `CVT_FRACT_TRUNC` is never rewritten to `22001` for it
+    // (`sqlcfunc.cpp:3348`) and the overflow check applies unconditionally.
+    let (scaled, outcome) = rescale_mantissa(mantissa, i64::from(source_scale), scale)?;
+    if outcome == ConvOk::Truncated {
+        return Err(ParamBuildError::StringTruncation);
+    }
+    let value = decimal_from_magnitude(scaled, precision, scale)?;
+    Ok((decimal_of(param.sql_type, value), Some(metadata)))
+}
+
+fn decimal_from_numeric(
+    param: &BoundParam,
+    source: SqlNumericStruct,
+) -> Result<(TypedValue, ConvOk), ParamBuildError> {
+    let magnitude = u128::from_le_bytes(source.val);
+    // msodbcsql's FastDescribeRPCParam copies a matching non-NULL
+    // SQL_NUMERIC_STRUCT whole, including its wire precision and scale
+    // (`sqlcmisc.cpp:7014`).
+    // Additionally requires an application-authored APD precision/scale
+    // (`SQLSetDescField`/`SQLSetDescRec`), not merely a coincidental match
+    // with this driver's own default-fill (`SQLBindParameter`'s
+    // `SQL_PREC_NUMERIC`/scale-0 reset, or a `SQL_DESC_TYPE` rewrite):
+    // msodbcsql's parity-comparison harness shows a bare `SQLBindParameter`
+    // whose IPD happens to be `(precision, scale=0)` does NOT take this fast
+    // path in retail — it still rescales the embedded struct to the IPD's
+    // scale, unlike an app that explicitly wrote matching APD fields.
+    if param.precision_scale_explicit
+        && usize::try_from(param.app_precision) == Ok(param.column_size)
+        && param.app_scale == param.decimal_digits
+    {
+        let metadata = RpcTypeMetadata {
+            precision: Some(source.precision),
+            scale: Some(source.scale as u8),
+        };
+        let value = DecimalParts::new(
+            source.sign != 0,
+            source.precision,
+            source.scale as u8,
+            magnitude,
+        );
+        return Ok((
+            (decimal_of(param.sql_type, value), Some(metadata)),
+            ConvOk::Exact,
+        ));
+    }
+
+    let metadata = decimal_metadata(param.column_size, param.decimal_digits)?;
+    let (precision, scale) = (metadata.precision.unwrap_or(0), metadata.scale.unwrap_or(0));
+    let magnitude =
+        i128::try_from(magnitude).map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+    let mantissa = if source.sign == 0 {
+        -magnitude
+    } else {
+        magnitude
+    };
+    // When the application never explicitly wrote the APD's precision/scale,
+    // there is no APD-declared scale to trust as a description of `val[]`'s
+    // layout - it is only this driver's own default-fill. Fall back to the
+    // struct's own embedded scale instead, matching retail: a bare
+    // `SQLBindParameter` bind still rescales the struct's *own* claimed scale
+    // to the IPD's target scale (verified against msodbcsql's parity-
+    // comparison harness), rather than assuming an unset APD scale of 0.
+    let source_scale = if param.precision_scale_explicit {
+        i64::from(param.app_scale)
+    } else {
+        i64::from(source.scale)
+    };
+    let (scaled, outcome) = rescale_mantissa(mantissa, source_scale, scale)?;
+    let value = decimal_from_magnitude(scaled, precision, scale)?;
+    Ok(((decimal_of(param.sql_type, value), Some(metadata)), outcome))
+}
+
+/// Rescales `mantissa` from `source_scale` to `target_scale`, reporting
+/// [`ConvOk::Truncated`] when a scale-down drops a non-zero digit. Callers
+/// decide what a truncated result means for their SQLSTATE: `decimal_from_text`
+/// treats it as a hard `22001` before ever checking precision, while
+/// `decimal_from_numeric` lets the precision check in [`decimal_from_magnitude`]
+/// run regardless.
+fn rescale_mantissa(
+    mantissa: i128,
+    source_scale: i64,
+    target_scale: u8,
+) -> Result<(i128, ConvOk), ParamBuildError> {
+    let target_scale = i64::from(target_scale);
+    let mut outcome = ConvOk::Exact;
     let scaled = if target_scale >= source_scale {
+        let exponent = u32::try_from(target_scale - source_scale)
+            .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
         let factor = 10i128
-            .checked_pow(target_scale - source_scale)
+            .checked_pow(exponent)
             .ok_or(ParamBuildError::Value(ConvError::OutOfRange))?;
         mantissa
             .checked_mul(factor)
@@ -925,22 +1036,37 @@ fn decimal_from_text(param: &BoundParam, text: AppText) -> Result<TypedValue, Pa
         // non-zero dropped digit, and a zero mantissa is exactly zero. Falling
         // back to `OutOfRange` here would report 22003 where every smaller
         // literal of the same shape reports 22001.
-        match 10i128.checked_pow(source_scale - target_scale) {
-            Some(divisor) if mantissa % divisor == 0 => mantissa / divisor,
-            Some(_) => return Err(ParamBuildError::StringTruncation),
+        let exponent = u32::try_from(source_scale - target_scale)
+            .map_err(|_| ParamBuildError::Value(ConvError::OutOfRange))?;
+        match 10i128.checked_pow(exponent) {
+            Some(divisor) => {
+                if mantissa % divisor != 0 {
+                    outcome = ConvOk::Truncated;
+                }
+                mantissa / divisor
+            }
             None if mantissa == 0 => 0,
-            None => return Err(ParamBuildError::StringTruncation),
+            None => {
+                outcome = ConvOk::Truncated;
+                0
+            }
         }
     };
+    Ok((scaled, outcome))
+}
 
+/// The precision check has to run on the digit count, not on the mantissa
+/// width: `decimal(3,0)` cannot hold 1000 even though the mantissa is tiny.
+fn decimal_from_magnitude(
+    scaled: i128,
+    precision: u8,
+    scale: u8,
+) -> Result<DecimalParts, ParamBuildError> {
     let magnitude = scaled.unsigned_abs();
-    // The precision check has to run on the digit count, not on the mantissa
-    // width: `decimal(3,0)` cannot hold 1000 even though the mantissa is tiny.
     if magnitude >= 10u128.pow(u32::from(precision)) {
         return Err(ParamBuildError::Value(ConvError::OutOfRange));
     }
-    let value = DecimalParts::new(scaled >= 0, precision, scale, magnitude);
-    Ok((decimal_of(param.sql_type, value), Some(metadata)))
+    Ok(DecimalParts::new(scaled >= 0, precision, scale, magnitude))
 }
 
 fn decimal_of(sql_type: SqlSmallInt, value: DecimalParts) -> SqlType {
@@ -1347,10 +1473,10 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{
         SQL_C_BIT, SQL_C_CHAR, SQL_C_DEFAULT, SQL_C_DOUBLE, SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG,
-        SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET, SQL_C_SS_VECTOR,
-        SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME, SQL_C_TYPE_TIMESTAMP,
-        SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM, SQL_NO_TOTAL, SQL_NTS,
-        SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
+        SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SLONG, SQL_C_SS_TIME2, SQL_C_SS_TIMESTAMPOFFSET,
+        SQL_C_SS_VECTOR, SQL_C_STINYINT, SQL_C_TINYINT, SQL_C_TYPE_DATE, SQL_C_TYPE_TIME,
+        SQL_C_TYPE_TIMESTAMP, SQL_C_UBIGINT, SQL_C_WCHAR, SQL_DATA_AT_EXEC, SQL_DEFAULT_PARAM,
+        SQL_NO_TOTAL, SQL_NTS, SQL_NULL_DATA, SQL_PARAM_INPUT, SQL_SS_UDT, SqlULen,
     };
     use crate::params::conversion_matrix::is_supported_conversion;
     use std::ffi::c_void;
@@ -1367,6 +1493,9 @@ mod tests {
             sql_type: 0,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: ptr,
             buffer_length: 0,
             strlen_or_ind_ptr: ind,
@@ -1438,6 +1567,188 @@ mod tests {
         p.column_size = precision;
         p.decimal_digits = scale;
         unsafe { bound_param_to_value(&p) }
+    }
+
+    fn numeric_struct(magnitude: u128, sign: u8, scale: i8) -> SqlNumericStruct {
+        SqlNumericStruct {
+            precision: 38,
+            scale,
+            sign,
+            val: magnitude.to_le_bytes(),
+        }
+    }
+
+    /// Simulates an application that explicitly wrote the APD's
+    /// `SQL_DESC_SCALE` (`app_scale`) via `SQLSetDescFieldW`/`SQLSetDescRec`,
+    /// distinct from a bare `SQLBindParameter` bind, where the driver's own
+    /// default-fill leaves nothing "explicit" to trust over the struct's own
+    /// embedded scale. See `a_numeric_without_explicit_apd_precision_scale_*`
+    /// below for the bare-bind case.
+    fn convert_numeric(
+        source: SqlNumericStruct,
+        app_scale: SqlSmallInt,
+        sql_type: SqlSmallInt,
+        precision: SqlULen,
+        scale: SqlSmallInt,
+    ) -> Result<(TypedValue, ConvOk), ParamBuildError> {
+        let mut ind = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut p = param(SQL_C_NUMERIC, std::ptr::null_mut(), &mut ind);
+        p.sql_type = sql_type;
+        p.column_size = precision;
+        p.decimal_digits = scale;
+        p.app_scale = app_scale;
+        p.precision_scale_explicit = true;
+        decimal_from_numeric(&p, source)
+    }
+
+    #[test]
+    fn a_numeric_uses_apd_scale_and_rescales_exactly() {
+        let source = numeric_struct(15, 1, 9);
+        let ((value, _), outcome) = convert_numeric(source, 1, SQL_DECIMAL, 10, 3).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 10, 3, 1500)))
+        );
+
+        let source = numeric_struct(1500, 1, -7);
+        let ((value, _), outcome) = convert_numeric(source, 3, SQL_NUMERIC, 10, 1).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
+        assert_eq!(
+            value,
+            SqlType::Numeric(Some(DecimalParts::new(true, 10, 1, 15)))
+        );
+
+        let source = numeric_struct(123, 1, 0);
+        let ((value, _), outcome) = convert_numeric(source, -1, SQL_DECIMAL, 6, 0).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 6, 0, 1230)))
+        );
+    }
+
+    #[test]
+    fn a_numeric_nonzero_fraction_returns_truncated() {
+        let source = numeric_struct(1551, 1, 0);
+        let ((value, _), outcome) = convert_numeric(source, 3, SQL_DECIMAL, 10, 1).unwrap();
+        assert_eq!(outcome, ConvOk::Truncated);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 10, 1, 15)))
+        );
+    }
+
+    #[test]
+    fn a_negative_numeric_zero_is_normalized_positive() {
+        let source = numeric_struct(0, 0, 0);
+        let ((value, _), outcome) = convert_numeric(source, 4, SQL_DECIMAL, 8, 2).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 8, 2, 0)))
+        );
+    }
+
+    #[test]
+    fn a_numeric_enforces_precision_and_full_width_bounds() {
+        let overflow = numeric_struct(1000, 1, 0);
+        assert_eq!(
+            convert_numeric(overflow, 0, SQL_DECIMAL, 3, 0).unwrap_err(),
+            ParamBuildError::Value(ConvError::OutOfRange)
+        );
+
+        let maximum = numeric_struct(10u128.pow(38) - 1, 1, 0);
+        let ((value, _), outcome) = convert_numeric(maximum, 0, SQL_DECIMAL, 38, 0).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 38, 0, 10u128.pow(38) - 1)))
+        );
+
+        let high_bit = numeric_struct(1u128 << 127, 1, 0);
+        assert_eq!(
+            convert_numeric(high_bit, 0, SQL_DECIMAL, 38, 0).unwrap_err(),
+            ParamBuildError::Value(ConvError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_numeric_with_matching_descriptors_keeps_the_struct_bytes() {
+        let source = numeric_struct(1u128 << 127, 2, -1);
+        let mut ind = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut p = param(SQL_C_NUMERIC, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_DECIMAL;
+        p.column_size = 38;
+        p.decimal_digits = 0;
+        p.app_precision = 38;
+        p.app_scale = 0;
+        p.precision_scale_explicit = true;
+
+        let ((value, metadata), outcome) = decimal_from_numeric(&p, source).unwrap();
+        assert_eq!(outcome, ConvOk::Exact);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 38, u8::MAX, 1u128 << 127)))
+        );
+        assert_eq!(
+            metadata,
+            Some(RpcTypeMetadata {
+                precision: Some(38),
+                scale: Some(u8::MAX),
+            })
+        );
+    }
+
+    /// A bare `SQLBindParameter` bind with no `SQLSetDescField` call: the APD
+    /// precision/scale numerically match the IPD's only because
+    /// `write_to_records` defaults `SQL_C_NUMERIC` to `(SQL_PREC_NUMERIC, 0)`
+    /// and the IPD also declares scale 0. msodbcsql's own parity-comparison
+    /// harness confirms retail does NOT take the fast path here - it still
+    /// rescales the embedded struct to the IPD's scale/precision, unlike an
+    /// app that explicitly wrote a matching APD precision/scale. A struct
+    /// whose embedded metadata would be rejected by the fast path's
+    /// overflow-tolerant copy (`1u128 << 127`, matching the sibling test
+    /// above) must instead go through the normal bounded rescale here.
+    #[test]
+    fn a_numeric_without_explicit_apd_precision_scale_still_rescales() {
+        let source = numeric_struct(1u128 << 127, 1, 0);
+        let mut ind = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut p = param(SQL_C_NUMERIC, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_DECIMAL;
+        p.column_size = 38;
+        p.decimal_digits = 0;
+        p.app_precision = 38;
+        p.app_scale = 0;
+        p.precision_scale_explicit = false;
+
+        assert_eq!(
+            decimal_from_numeric(&p, source).unwrap_err(),
+            ParamBuildError::Value(ConvError::OutOfRange)
+        );
+    }
+
+    /// Same as above but with a value that fits the target: proves the
+    /// non-fast path really does forward the correctly-rescaled value rather
+    /// than merely rejecting the oversized case above by coincidence.
+    #[test]
+    fn a_numeric_without_explicit_apd_precision_scale_rescales_in_bounds_value() {
+        let source = numeric_struct(12345, 1, 3);
+        let mut ind = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+        let mut p = param(SQL_C_NUMERIC, std::ptr::null_mut(), &mut ind);
+        p.sql_type = SQL_DECIMAL;
+        p.column_size = 38;
+        p.decimal_digits = 0;
+        p.app_precision = 38;
+        p.app_scale = 0;
+        p.precision_scale_explicit = false;
+
+        let ((value, _), outcome) = decimal_from_numeric(&p, source).unwrap();
+        assert_eq!(outcome, ConvOk::Truncated);
+        assert_eq!(
+            value,
+            SqlType::Decimal(Some(DecimalParts::new(true, 38, 0, 12)))
+        );
     }
 
     fn date_struct(year: i16, month: u16, day: u16) -> crate::api::odbc_types::SqlDateStruct {
@@ -1642,6 +1953,22 @@ mod tests {
 
         let trailing_zeros = format!("0.1{}", "0".repeat(39));
         assert!(convert_decimal(SQL_DECIMAL, 38, 1, &trailing_zeros).is_ok());
+    }
+
+    /// A dropped fractional digit is `22001` even when the truncated result
+    /// would also overflow `precision`: `sqlccnvt.cpp:7823` sets
+    /// `CVT_FRACT_TRUNC` and returns immediately, never reaching the
+    /// whole-number overflow check below it. `"1234.55"` into `decimal(3,1)`
+    /// drops the trailing `5` (non-zero) before the rescaled `1234.5` ever
+    /// gets compared against `10^3`.
+    #[test]
+    fn a_dropped_fraction_is_22001_even_when_the_result_also_overflows() {
+        let err = convert_decimal(SQL_DECIMAL, 3, 1, "1234.55").unwrap_err();
+        assert_eq!(err.diag().state, *b"22001");
+
+        // Without the dropped fraction, the same overflow is `22003`.
+        let err = convert_decimal(SQL_DECIMAL, 3, 1, "1234.5").unwrap_err();
+        assert_eq!(err.diag().state, *b"22003");
     }
 
     /// Trailing fraction zeros must not push a literal onto the `f64` path.

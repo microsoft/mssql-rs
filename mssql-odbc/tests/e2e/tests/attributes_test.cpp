@@ -108,9 +108,6 @@ constexpr size_t kSysnameLen = 128;
 // Values measured against msodbcsql 18 rather than assumed; see
 // `docs/attributes_plan.md` §8 for the sweep that produced them.
 
-// Not an attribute in any scope. Both drivers must answer HY092.
-constexpr SQLINTEGER kUnknownAttribute = 99999;
-
 // Statement-only. msodbcsql's connection switch has no arm for it, because it
 // falls outside the ODBC 2.x statement-option fan-out band (0-12, 29).
 constexpr SQLINTEGER kRowArraySizeAttr = 27;
