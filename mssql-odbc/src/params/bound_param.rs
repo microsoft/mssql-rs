@@ -4,11 +4,12 @@
 use std::ffi::c_void;
 
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_PARAM_INPUT, SQL_PREC_NUMERIC, SqlLen, SqlPointer,
-    SqlSmallInt, SqlULen,
+    SQL_BIND_BY_COLUMN, SQL_C_DEFAULT, SQL_C_NUMERIC, SQL_PARAM_INPUT, SQL_PREC_NUMERIC, SqlLen,
+    SqlPointer, SqlSmallInt, SqlULen,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
 use crate::api::type_rules::{parameter_size_is_precision, resolve_default_c_type};
+use crate::conversion::parameter_value_stride;
 use crate::handles::OdbcVersion;
 use crate::handles::desc::{DescRecord, DescState};
 
@@ -66,6 +67,14 @@ pub(crate) struct BoundParam {
     pub(crate) octet_length_ptr: *mut SqlLen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamArrayLayoutError {
+    InvalidValueStride {
+        c_type: SqlSmallInt,
+        buffer_length: SqlLen,
+    },
+}
+
 impl BoundParam {
     /// Returns the binding with `SQL_ATTR_PARAM_BIND_OFFSET_PTR` applied.
     ///
@@ -88,6 +97,49 @@ impl BoundParam {
             self.octet_length_ptr = self.octet_length_ptr.wrapping_byte_offset(offset);
         }
         self
+    }
+
+    /// Positions a binding on one parameter-set row.
+    pub(crate) fn for_row(
+        self,
+        row: usize,
+        bind_offset: isize,
+        param_bind_type: SqlULen,
+    ) -> Result<Self, ParamArrayLayoutError> {
+        let mut positioned = self.with_bind_offset(bind_offset);
+        if row == 0 {
+            return Ok(positioned);
+        }
+        let (value_stride, indicator_stride) = if param_bind_type == SQL_BIND_BY_COLUMN {
+            let Some(value_stride) = parameter_value_stride(self.c_type, self.buffer_length) else {
+                return Err(ParamArrayLayoutError::InvalidValueStride {
+                    c_type: self.c_type,
+                    buffer_length: self.buffer_length,
+                });
+            };
+            (value_stride, std::mem::size_of::<SqlLen>())
+        } else {
+            let row_stride = param_bind_type;
+            (row_stride, row_stride)
+        };
+        let value_offset = row.wrapping_mul(value_stride);
+        let indicator_offset = row.wrapping_mul(indicator_stride);
+        if !positioned.parameter_value_ptr.is_null() {
+            positioned.parameter_value_ptr = positioned
+                .parameter_value_ptr
+                .wrapping_byte_add(value_offset);
+        }
+        if !positioned.strlen_or_ind_ptr.is_null() {
+            positioned.strlen_or_ind_ptr = positioned
+                .strlen_or_ind_ptr
+                .wrapping_byte_add(indicator_offset);
+        }
+        if !positioned.octet_length_ptr.is_null() {
+            positioned.octet_length_ptr = positioned
+                .octet_length_ptr
+                .wrapping_byte_add(indicator_offset);
+        }
+        Ok(positioned)
     }
 
     /// Writes this binding into the matching APD and IPD records at the same
@@ -281,7 +333,9 @@ impl BoundParam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_PARAM_INPUT, SQL_VARCHAR};
+    use crate::api::odbc_types::{
+        SQL_BIND_BY_COLUMN, SQL_C_CHAR, SQL_C_SLONG, SQL_PARAM_INPUT, SQL_VARCHAR,
+    };
     use crate::handles::desc::{DescHeader, DescKind};
 
     const ODBC_VERSION: OdbcVersion = OdbcVersion::Odbc3_80;
@@ -351,6 +405,68 @@ mod tests {
             shifted.strlen_or_ind_ptr as usize,
             original.strlen_or_ind_ptr as usize
         );
+    }
+
+    #[test]
+    fn column_wise_rows_use_value_and_indicator_strides() {
+        let mut values = [0i32; 3];
+        let mut indicators = [0 as SqlLen; 3];
+        let original = BoundParam {
+            c_type: SQL_C_SLONG,
+            parameter_value_ptr: values.as_mut_ptr().cast(),
+            buffer_length: 128,
+            strlen_or_ind_ptr: indicators.as_mut_ptr(),
+            octet_length_ptr: indicators.as_mut_ptr(),
+            ..param(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+
+        let positioned = original
+            .for_row(2, 0, SQL_BIND_BY_COLUMN)
+            .expect("fixed-width column binding has a known stride");
+        assert_eq!(
+            positioned.parameter_value_ptr as usize,
+            original.parameter_value_ptr as usize + 2 * size_of::<i32>()
+        );
+        assert_eq!(positioned.strlen_or_ind_ptr, unsafe {
+            indicators.as_mut_ptr().add(2)
+        });
+    }
+
+    #[test]
+    fn row_wise_rows_use_the_structure_stride_for_every_pointer() {
+        #[repr(C)]
+        struct Row {
+            value: i32,
+            indicator: SqlLen,
+        }
+
+        let mut rows = [
+            Row {
+                value: 1,
+                indicator: size_of::<i32>() as SqlLen,
+            },
+            Row {
+                value: 2,
+                indicator: size_of::<i32>() as SqlLen,
+            },
+        ];
+        let original = BoundParam {
+            c_type: SQL_C_SLONG,
+            parameter_value_ptr: (&raw mut rows[0].value).cast(),
+            buffer_length: size_of::<i32>() as SqlLen,
+            strlen_or_ind_ptr: &raw mut rows[0].indicator,
+            octet_length_ptr: &raw mut rows[0].indicator,
+            ..param(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+
+        let positioned = original
+            .for_row(1, 0, size_of::<Row>() as SqlULen)
+            .expect("row-wise binding uses the declared structure stride");
+        assert_eq!(
+            positioned.parameter_value_ptr,
+            (&raw mut rows[1].value).cast()
+        );
+        assert_eq!(positioned.strlen_or_ind_ptr, &raw mut rows[1].indicator);
     }
 
     fn empty_state() -> DescState {

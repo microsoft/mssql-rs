@@ -1218,15 +1218,26 @@ TEST_F(ScalarConversionLiveTest, CharTimestampAcceptsTheIsoSeparator) {
 }
 
 // The offset has to survive as an offset rather than being folded into the
-// wall clock and lost. A literal that omits one takes +00:00, matching
-// CONVERT(datetimeoffset, '2024-05-20 12:34:56'); the compare leg adjudicates
-// that default against msodbcsql.
+// wall clock and lost. Both drivers agree when the literal states one.
 TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralKeepsItsOffset) {
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56+05:30", 0, 0),
                   SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("2024-05-20 12:34:56.0000000 +05:30", ExecuteAndReadBack());
-    ResetParams();
+}
+
+// A literal that omits an offset takes +00:00, matching
+// CONVERT(datetimeoffset, '2024-05-20 12:34:56').
+//
+// mssql-odbc only: msodbcsql fills a missing offset from the *client*
+// timezone (`sqlccnvt.cpp:4849` -> `PopulateTimeZoneValues` ->
+// `GetTimeZoneInformation`), so it answers +05:30 on an IST host and +00:00 on
+// a UTC one. The expectation below is therefore host-dependent on the compare
+// leg, which is why it is skipped there rather than left to fail for anyone
+// not sitting in UTC - CI is, which is how the divergence stayed hidden.
+// Tracked in AB#48006.
+TEST_F(ScalarConversionLiveTest, CharDatetimeoffsetLiteralWithoutAnOffsetDefaultsToUtc) {
+    SKIP_IF_COMPARING_MSODBCSQL();
 
     ASSERT_SQL_OK(Prepare("SELECT CONVERT(VARCHAR(64), ?, 121)"), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(BindNarrow(SQL_SS_TIMESTAMPOFFSET, "2024-05-20 12:34:56", 0, 0),

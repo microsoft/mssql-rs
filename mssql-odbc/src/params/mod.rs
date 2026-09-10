@@ -8,4 +8,4 @@
 mod bound_param;
 pub(crate) mod conversion_matrix;
 
-pub(crate) use bound_param::BoundParam;
+pub(crate) use bound_param::{BoundParam, ParamArrayLayoutError};
