@@ -352,7 +352,7 @@ fn sql_param_data_safe(
             // but unprepared, and a concurrent SQLExecute would report 07002
             // instead of re-running the plan. `SQLExecDirect` parks no plan, so
             // a `None` plan is legitimate there.
-            let was_prepared = {
+            let (was_prepared, fractional_truncated) = {
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned on completion");
                     return_client_idle(dbc, statement_handle, client);
@@ -362,10 +362,14 @@ fn sql_param_data_safe(
                     stmt_state.dae.is_some(),
                     "SQLParamData: DAE sequence vanished before completion"
                 );
+                let fractional_truncated = stmt_state
+                    .dae
+                    .as_ref()
+                    .is_some_and(|dae| dae.fractional_truncated);
                 let parked = stmt_state.take_dae();
                 debug_assert!(parked.is_none(), "the client is checked out by this call");
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-                stmt_state.prepared.is_some()
+                (stmt_state.prepared.is_some(), fractional_truncated)
             };
 
             // Same contract as the non-streaming `SQLExecute` arm: a prepared
@@ -390,12 +394,7 @@ fn sql_param_data_safe(
                 statement_handle,
                 client,
                 "SQLParamData",
-                // `false`: a DAE completion never carries a
-                // fractional-truncation warning here, since the truncation
-                // check runs once against the already-fully-streamed value
-                // (`decimal_from_numeric`/`decimal_from_text`), not per
-                // `SQLPutData` chunk.
-                false,
+                fractional_truncated,
             )
         }
 
@@ -453,7 +452,7 @@ fn open_deferred_rpc(
             return Some(SQL_ERROR);
         };
 
-        let params = match rebuild_deferred_params(
+        let (params, fractional_truncated) = match rebuild_deferred_params(
             &mut stmt_state,
             prebuilt,
             &collected,
@@ -480,10 +479,19 @@ fn open_deferred_rpc(
                 return Some(rc);
             }
         };
-        (client, params, prepared, orphaned, sql, timeout_secs)
+        (
+            client,
+            params,
+            prepared,
+            orphaned,
+            sql,
+            timeout_secs,
+            fractional_truncated,
+        )
     };
 
-    let (mut client, params, mut prepared, mut orphaned, sql, timeout_secs) = taken;
+    let (mut client, params, mut prepared, mut orphaned, sql, timeout_secs, fractional_truncated) =
+        taken;
     let collation = client.get_collation();
     let options = ExecuteOptions::new().timeout_secs(timeout_secs);
 
@@ -533,6 +541,7 @@ fn open_deferred_rpc(
             // successful mixed execute unprepared and skipping the no-row drain
             // its `was_prepared` check gates.
             dae.restore_plan(prepared, orphaned);
+            dae.fractional_truncated = fractional_truncated;
             dae.begin_streaming_phase(client, collation);
             None
         }
@@ -549,12 +558,13 @@ fn open_deferred_rpc(
                 stmt_state.prepared = prepared;
                 stmt_state.pending_unprepare = orphaned;
             }
-            Some(finish_execute(
+            Some(finish_execute_with_param_warning(
                 dbc,
                 stmt,
                 statement_handle,
                 client,
                 "SQLParamData",
+                fractional_truncated,
             ))
         }
         Err(e) => {
@@ -609,7 +619,7 @@ fn run_deferred_execute(
         let prepared = dae.take_prepared();
         let mut orphaned = dae.take_orphaned();
 
-        let params = match rebuild_deferred_params(
+        let (params, fractional_truncated) = match rebuild_deferred_params(
             &mut stmt_state,
             prebuilt,
             &collected,
@@ -639,10 +649,19 @@ fn run_deferred_execute(
         // open a window in which a concurrent `SQLPrepareW` passes its
         // active-execute guard and installs a plan that the `prepared` restore
         // after the execute would then silently overwrite.
-        (client, params, prepared, orphaned, sql, timeout_secs)
+        (
+            client,
+            params,
+            prepared,
+            orphaned,
+            sql,
+            timeout_secs,
+            fractional_truncated,
+        )
     };
 
-    let (client, params, mut prepared, mut orphaned, sql, timeout_secs) = taken;
+    let (client, params, mut prepared, mut orphaned, sql, timeout_secs, fractional_truncated) =
+        taken;
     let Some(mut client) = client else {
         error!("SQLParamData: deferred sequence has no client to execute on");
         clear_exec_started(stmt);
@@ -694,7 +713,14 @@ fn run_deferred_execute(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    finish_execute(dbc, stmt, statement_handle, client, "SQLParamData")
+    finish_execute_with_param_warning(
+        dbc,
+        stmt,
+        statement_handle,
+        client,
+        "SQLParamData",
+        fractional_truncated,
+    )
 }
 
 #[cfg(test)]

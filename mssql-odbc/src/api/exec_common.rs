@@ -868,8 +868,9 @@ pub(super) fn rebuild_deferred_params(
     collected: &[(usize, Vec<u8>, bool)],
     dae_params: &[DaeParam],
     op: &str,
-) -> Result<Vec<RpcParameter>, SqlReturn> {
+) -> Result<(Vec<RpcParameter>, bool), SqlReturn> {
     let mut params = prebuilt;
+    let mut fractional_truncated = false;
 
     for (index, bytes, is_null) in collected {
         let Some(dae) = dae_params.iter().find(|p| p.bound_index == *index) else {
@@ -890,7 +891,10 @@ pub(super) fn rebuild_deferred_params(
         };
         let name = format!("@P{}", index + 1);
         match buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null) {
-            Ok(param) => *slot = param,
+            Ok((param, outcome)) => {
+                *slot = param;
+                fractional_truncated |= outcome == ConvOk::Truncated;
+            }
             Err(e) => {
                 error!(
                     "{op}: parameter {} conversion failed: {}",
@@ -903,7 +907,7 @@ pub(super) fn rebuild_deferred_params(
         }
     }
 
-    Ok(params)
+    Ok((params, fractional_truncated))
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -1965,6 +1969,126 @@ mod tests {
         assert!(!built.fractional_truncated);
     }
 
+    fn buffered_decimal_param(bound_index: usize) -> DaeParam {
+        use crate::api::odbc_types::SQL_DECIMAL;
+
+        let mut param = DaeParam::unbounded(bound_index, std::ptr::null_mut(), None);
+        param.plan = DaePlan::Buffer;
+        param.binding.c_type = SQL_C_CHAR;
+        param.binding.sql_type = SQL_DECIMAL;
+        param.binding.column_size = 5;
+        param.binding.decimal_digits = 1;
+        param
+    }
+
+    fn deferred_slot() -> RpcParameter {
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+        RpcParameter::data_at_exec(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        )
+    }
+
+    #[test]
+    fn rebuild_deferred_params_reports_fractional_truncation() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = buffered_decimal_param(0);
+        param.binding.c_type = SQL_C_NUMERIC;
+        param.binding.column_size = 10;
+        param.binding.app_scale = 3;
+        param.binding.precision_scale_explicit = true;
+        let numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 0,
+            sign: 1,
+            val: {
+                let mut value = [0; 16];
+                value[..2].copy_from_slice(&1551u16.to_le_bytes());
+                value
+            },
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const numeric).cast::<u8>(),
+                std::mem::size_of::<SqlNumericStruct>(),
+            )
+        }
+        .to_vec();
+        let dae_params = vec![param];
+        let collected = vec![(0, bytes, false)];
+
+        let (params, fractional_truncated) = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &collected,
+            &dae_params,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(params.len(), 1);
+        assert!(fractional_truncated);
+        assert!(state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_rejects_missing_binding_and_slot() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let missing_binding = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, Vec::new(), false)],
+            &[],
+            "test",
+        );
+        assert_eq!(missing_binding.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+
+        state.diag_records.clear();
+        let missing_slot = rebuild_deferred_params(
+            &mut state,
+            Vec::new(),
+            &[(0, Vec::new(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+        assert_eq!(missing_slot.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+    }
+
+    #[test]
+    fn rebuild_deferred_params_posts_conversion_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let result = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, b"not-a-number".to_vec(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+
+        assert_eq!(result.unwrap_err(), SQL_ERROR);
+        assert!(!state.diag_records.is_empty());
+    }
+
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
     /// `SQLParamData` enforces; `SQL_DATA_AT_EXEC` promises nothing.
     #[test]
@@ -2028,6 +2152,9 @@ mod tests {
                 sql_type,
                 column_size: 10,
                 decimal_digits: 0,
+                app_precision: 0,
+                app_scale: 0,
+                precision_scale_explicit: false,
                 parameter_value_ptr: std::ptr::null_mut(),
                 buffer_length: 0,
                 strlen_or_ind_ptr: &mut ind as *mut SqlLen,

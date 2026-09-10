@@ -725,6 +725,9 @@ impl DaeParam {
             sql_type: crate::api::odbc_types::SQL_VARBINARY,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: value_ptr,
             buffer_length: 0,
             strlen_or_ind_ptr: std::ptr::null_mut(),
@@ -849,6 +852,9 @@ pub(crate) struct DaeState {
     /// Remaining `SQL_ATTR_QUERY_TIMEOUT` budget captured at execute time, so
     /// the deferred execute is charged the same allowance as an immediate one.
     pub(crate) timeout_secs: u32,
+    /// A buffered conversion dropped non-zero fractional digits. Retained when
+    /// a mixed sequence switches to streaming so its final call can report 01S07.
+    pub(crate) fractional_truncated: bool,
 }
 
 impl DaeState {
@@ -871,6 +877,7 @@ impl DaeState {
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
+            fractional_truncated: false,
         }
     }
 
@@ -1012,6 +1019,7 @@ impl DaeState {
             prebuilt: Vec::new(),
             sql: None,
             timeout_secs: 0,
+            fractional_truncated: false,
         }
     }
 
@@ -1516,7 +1524,7 @@ impl Drop for StmtHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG};
+    use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_WVARCHAR};
     use crate::handles::desc::{DescHeader, DescKind};
     use mssql_tds::test_client_support::int_columns;
 
@@ -1548,6 +1556,42 @@ mod tests {
         let handle = StmtHandle::new(std::ptr::null_mut(), 0);
         let mut state = handle.inner.lock().unwrap();
         f(&mut state);
+    }
+
+    #[test]
+    fn buffered_phase_completes_only_when_remaining_params_stream() {
+        let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
+        buffered.plan = DaePlan::Buffer;
+        let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None);
+        let mut dae = DaeState::for_test(vec![buffered, streamed], None);
+
+        assert!(!dae.buffered_phase_complete());
+        dae.cursor = Some(0);
+        assert!(!dae.buffered_phase_complete());
+        dae.cursor = Some(1);
+        assert!(dae.buffered_phase_complete());
+        dae.cursor = Some(2);
+        assert!(!dae.buffered_phase_complete());
+    }
+
+    #[test]
+    fn begin_streaming_phase_transcodes_only_streamed_params_and_parks_client() {
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let mut buffered = DaeParam::unbounded(0, std::ptr::null_mut(), None);
+        buffered.plan = DaePlan::Buffer;
+        let streamed = DaeParam::unbounded(1, std::ptr::null_mut(), None)
+            .with_binding_types(SQL_C_CHAR, SQL_WVARCHAR);
+        let mut dae = DaeState::for_test(vec![buffered, streamed], Some(1));
+        dae.deferred = true;
+
+        dae.begin_streaming_phase(tds_client_from_tokens(Vec::new()), SqlCollation::default());
+
+        assert!(!dae.deferred);
+        assert!(dae.params[0].transcode.is_none());
+        assert!(dae.params[1].transcode.is_some());
+        assert!(dae.checkout_client().is_some());
+        assert!(dae.call_in_flight);
     }
 
     /// Grows `state` to `column_number` records (if needed) and writes

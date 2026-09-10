@@ -554,7 +554,7 @@ pub(crate) fn buffered_dae_to_rpc(
     binding: &BoundParam,
     buffer: &[u8],
     is_null: bool,
-) -> Result<RpcParameter, ParamBuildError> {
+) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
     let mut indicator: SqlLen = if is_null {
         SQL_NULL_DATA
     } else {
