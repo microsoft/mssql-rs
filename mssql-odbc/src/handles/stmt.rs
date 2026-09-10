@@ -540,6 +540,14 @@ pub(crate) struct StmtState {
     /// for every `execute*` call, so a non-zero value bounds the wait and
     /// surfaces `HYT00` on expiry, matching msodbcsql.
     pub(crate) query_timeout: u32,
+    /// True when the statement being executed is the `{? = call ...}` form, so
+    /// its first bound parameter carries the procedure's return status rather
+    /// than an argument value.
+    ///
+    /// msodbcsql forces that parameter to OUTPUT and errors if the application
+    /// bound it as input (`sqlcmisc.cpp:8310`), so the direction the
+    /// application chose does not identify it -- the statement text does.
+    pub(crate) call_returns_status: bool,
     /// `SQL_ATTR_MAX_ROWS`: cap on the number of rows returned from each result
     /// set; `0` (the ODBC default) means no cap.
     ///
@@ -1315,6 +1323,7 @@ impl StmtHandle {
                 state_flags: 0,
                 dae: None,
                 query_timeout,
+                call_returns_status: false,
                 max_rows: 0,
                 rows_returned: 0,
                 inert_attrs: InertStmtAttrs::default(),

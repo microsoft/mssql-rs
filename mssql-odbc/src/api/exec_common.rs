@@ -665,6 +665,52 @@ pub(super) fn snapshot_bound_params(
 /// `SQL_ATTR_PARAM_BIND_OFFSET_PTR` is non-null, their readable extents begin at
 /// each bound base plus the pointed-to signed byte offset, which may be
 /// negative, so every allocation must cover that displaced range.
+/// Builds the parameter list for a TDS RPC, where parameters bind by
+/// **position** rather than by name.
+///
+/// The `@P1..@Pn` names the sp_executesql path uses would be wrong here: the
+/// server matches an RPC's named parameters against the procedure's own
+/// parameter names, so `@P1` fails with "expects parameter '@a', which was not
+/// supplied". msodbcsql likewise sends canonical-call parameters positionally.
+///
+/// `skip` drops leading bindings that are not RPC parameters at all — the
+/// `{? = call ...}` return status is bound as parameter 1 but travels on the
+/// RETURNSTATUS token, not as an argument.
+///
+/// # Safety
+/// Same as [`build_named_params`].
+pub(super) unsafe fn build_positional_params(
+    stmt_state: &mut StmtState,
+    marker_count: usize,
+    skip: usize,
+    op: &str,
+) -> Result<ParamsWithDae, SqlReturn> {
+    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+    let bound: Vec<Option<BoundParam>> =
+        stmt_state.bound_params.iter().skip(skip).copied().collect();
+    match unsafe {
+        build_named_params_for_row(
+            &bound,
+            marker_count.saturating_sub(skip),
+            bind_offset,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            0,
+            false,
+        )
+    } {
+        Ok(params) => Ok(params),
+        Err(error) => {
+            error!(
+                "{op}: parameter {} could not be built: {}",
+                error.parameter() + skip,
+                error.diag().text
+            );
+            post_diag(stmt_state, error.diag());
+            Err(SQL_ERROR)
+        }
+    }
+}
+
 pub(super) unsafe fn build_named_params(
     stmt_state: &mut StmtState,
     marker_count: usize,
@@ -883,6 +929,18 @@ pub(super) fn finish_execute(
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
+        // A procedure that returns no result set is already exhausted by the
+        // drain above, so this is where its output parameters and return status
+        // become available -- SQLMoreResults never runs for it.
+        let return_values = client.get_return_values();
+        let return_status = client.get_return_status();
+        unsafe {
+            crate::api::output_params::write_back_output_params(
+                &mut stmt_state,
+                &return_values,
+                return_status,
+            );
+        }
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;

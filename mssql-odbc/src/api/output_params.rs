@@ -38,6 +38,7 @@ pub(crate) unsafe fn write_back_output_params(
     return_values: &[ReturnValue],
     return_status: Option<i32>,
 ) {
+    let returns_status = stmt_state.call_returns_status;
     let bound: Vec<(usize, BoundParam)> = stmt_state
         .bound_params
         .iter()
@@ -65,8 +66,9 @@ pub(crate) unsafe fn write_back_output_params(
     let mut consumed = 0usize;
     for (index, param) in bound {
         // The `{? = call ...}` return status comes from the RETURNSTATUS token,
-        // not from a RETURNVALUE, and is always an integer.
-        if param.input_output_type == SQL_RETURN_VALUE {
+        // not from a RETURNVALUE, and is always an integer. Parameter 1 of that
+        // form is the status whatever direction the application bound it with.
+        if param.input_output_type == SQL_RETURN_VALUE || (returns_status && index == 0) {
             let Some(status) = return_status else {
                 debug!(
                     parameter = index + 1,

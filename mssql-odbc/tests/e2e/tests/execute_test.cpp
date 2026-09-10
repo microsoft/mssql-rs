@@ -1955,14 +1955,23 @@ TEST_F(PrepareExecuteLiveTest, BindParameterNumberZeroReturns07009) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07009");
 }
 
-// Output parameters are not implemented in Phase 1: mssql-odbc rejects the bind
-// with HYC00. The reference msodbcsql driver supports output params, so this is
-// mssql-odbc-specific behavior — skip it on the msodbcsql comparison leg.
-TEST_F(PrepareExecuteLiveTest, OutputParameterReturnsHyc00) {
+// Output parameters bind successfully since AB#48049; the value is delivered
+// once the procedure's result sets are consumed (see escape_sequence_test).
+// Streamed output stays unimplemented, and that refusal is mssql-odbc-specific.
+TEST_F(PrepareExecuteLiveTest, OutputParameterBinds) {
+    std::vector<SQLCHAR> value = {'x', '\0'};
+    SQLLEN ind = SQL_NTS;
+    EXPECT_EQ(SQL_SUCCESS,
+              SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
+                               SQL_VARCHAR, 1, 0, value.data(),
+                               static_cast<SQLLEN>(value.size()), &ind));
+}
+
+TEST_F(PrepareExecuteLiveTest, StreamedOutputParameterReturnsHyc00) {
     SKIP_IF_COMPARING_MSODBCSQL();
     std::vector<SQLCHAR> value = {'x', '\0'};
     SQLLEN ind = SQL_NTS;
-    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
+    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT_STREAM, SQL_C_CHAR,
                                     SQL_VARCHAR, 1, 0, value.data(),
                                     static_cast<SQLLEN>(value.size()), &ind);
     EXPECT_EQ(SQL_ERROR, rc);

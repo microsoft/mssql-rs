@@ -11,9 +11,10 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::escape::translate_and_rewrite;
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute_with_param_warning, flush_pending_unprepare, park_dae_client,
-    publish_scalar_processed, query_timeout_expired_error, snapshot_bound_params,
+    ParamsWithDae, build_named_params, build_positional_params, claim_connection,
+    deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning,
+    flush_pending_unprepare, park_dae_client, publish_scalar_processed,
+    query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -184,11 +185,27 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         }
         publish_scalar_processed(&stmt_state);
-        let named_params =
-            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
-                Ok(params) => params,
-                Err(rc) => return rc,
-            };
+        // A canonical call binds its parameters by position; everything else
+        // binds them by the `@P1..@Pn` names the rewritten text declares.
+        let rpc_call = call.as_ref().filter(|c| c.is_rpc_eligible());
+        let named_params = match rpc_call {
+            Some(c) => {
+                let skip = usize::from(c.returns_status);
+                match unsafe {
+                    build_positional_params(&mut stmt_state, marker_count, skip, "SQLExecDirectW")
+                } {
+                    Ok(params) => params,
+                    Err(rc) => return rc,
+                }
+            }
+            None => {
+                match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") }
+                {
+                    Ok(params) => params,
+                    Err(rc) => return rc,
+                }
+            }
+        };
         // A new execute invalidates prior metadata/context immediately, so a
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -202,6 +219,7 @@ fn sql_exec_direct_w_safe(
         stmt_state.prepared = None;
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
+        stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         (
             named_params,
@@ -327,8 +345,8 @@ fn sql_exec_direct_w_safe(
             dbc.runtime
                 .block_on(client.execute_stored_procedure(
                     call.proc_name.clone(),
-                    None,
                     Some(params),
+                    None,
                     ExecuteOptions::new().timeout_secs(query_timeout),
                 ))
                 .map(|_| ())
@@ -344,9 +362,13 @@ fn sql_exec_direct_w_safe(
             // Statement-wise navigation: position on the batch's first statement
             // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
             // individually navigable via SQLMoreResults. finish_execute inspects the
-            // resulting client state.
+            // resulting client state. The *translated* text is sent: a statement
+            // with no parameter markers can still carry escapes.
             dbc.runtime
-                .block_on(client.execute(sql, ExecuteOptions::new().timeout_secs(query_timeout)))
+                .block_on(client.execute(
+                    rewritten_sql,
+                    ExecuteOptions::new().timeout_secs(query_timeout),
+                ))
                 .map(|_| ())
         };
     if let Err(e) = exec_result {
