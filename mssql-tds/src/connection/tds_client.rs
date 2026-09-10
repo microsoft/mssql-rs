@@ -150,6 +150,79 @@ impl CommandTimeoutBudget {
     }
 }
 
+/// Quotes a possibly multi-part procedure name for interpolation into T-SQL.
+///
+/// Each part is bracketed unless it is already delimited, and any `]` inside a
+/// part is doubled, so no separator, comment or statement terminator can escape
+/// the identifier. The optional `;n` procedure group number is preserved.
+fn quote_procedure_name(name: &str) -> TdsResult<String> {
+    let (body, group) = match name.split_once(';') {
+        Some((body, group)) if !group.is_empty() && group.bytes().all(|b| b.is_ascii_digit()) => {
+            (body, Some(group))
+        }
+        Some(_) => {
+            return Err(UsageError(format!("Invalid procedure name '{name}'")));
+        }
+        None => (name, None),
+    };
+
+    let mut quoted = String::with_capacity(body.len() + 8);
+    for (i, part) in split_identifier_parts(body)?.into_iter().enumerate() {
+        if i > 0 {
+            quoted.push('.');
+        }
+        // An empty part is legal in a qualified name (`db..proc`).
+        if part.is_empty() {
+            continue;
+        }
+        if (part.starts_with('[') && part.ends_with(']') && part.len() >= 2)
+            || (part.starts_with('"') && part.ends_with('"') && part.len() >= 2)
+        {
+            quoted.push_str(part);
+        } else {
+            quoted.push('[');
+            quoted.push_str(&part.replace(']', "]]"));
+            quoted.push(']');
+        }
+    }
+    if let Some(group) = group {
+        quoted.push(';');
+        quoted.push_str(group);
+    }
+    Ok(quoted)
+}
+
+/// Splits a qualified name on the dots that are outside `[...]` and `"..."`.
+fn split_identifier_parts(body: &str) -> TdsResult<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut delimiter: Option<char> = None;
+    for (i, c) in body.char_indices() {
+        match (delimiter, c) {
+            (None, '[') => delimiter = Some(']'),
+            (None, '"') => delimiter = Some('"'),
+            (None, '.') => {
+                parts.push(&body[start..i]);
+                start = i + 1;
+            }
+            (Some(close), c) if c == close => delimiter = None,
+            _ => {}
+        }
+    }
+    if delimiter.is_some() {
+        return Err(UsageError(format!(
+            "Unterminated quoted identifier in procedure name '{body}'"
+        )));
+    }
+    parts.push(&body[start..]);
+    if parts.len() > 4 {
+        return Err(UsageError(format!(
+            "Procedure name '{body}' has more than four parts"
+        )));
+    }
+    Ok(parts)
+}
+
 /// State of the `ReturnStatus` token observed while draining the most recent
 /// cursor RPC response. Distinguishes "no token was sent" from an actual raw
 /// status value, so neither case is silently collapsed at interpretation time.
@@ -5848,7 +5921,11 @@ impl TdsClient {
             }
         }
 
-        let mut tsql = format!("EXEC {stored_procedure_name}");
+        // Quoted rather than interpolated raw: with the ODBC {call ...}
+        // escape the procedure name is text lifted straight out of an
+        // application's SQL, so an unquoted name here would be a T-SQL
+        // injection point on Always Encrypted connections.
+        let mut tsql = format!("EXEC {}", quote_procedure_name(stored_procedure_name)?);
         let mut params_decl = String::new();
         let mut first = true;
 
@@ -7312,6 +7389,20 @@ impl TdsClient {
     /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
+    }
+
+    /// Returns the procedure's `RETURN` value from the most recent RPC, or
+    /// `None` when the server sent no `ReturnStatus` (0x79) token.
+    ///
+    /// Like [`get_return_values()`](Self::get_return_values) this is only
+    /// populated once the token stream has been read, so call it after the
+    /// result sets are consumed. ODBC surfaces it as the `{? = call ...}`
+    /// return-status parameter.
+    pub fn get_return_status(&self) -> Option<i32> {
+        match self.last_return_status {
+            ReturnStatus::Received(value) => Some(value),
+            ReturnStatus::NotReceived => None,
+        }
     }
 
     /// Returns the informational (INFO-token) messages captured from the
@@ -13226,7 +13317,9 @@ mod tests {
             TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &[], &params)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC dbo.my_proc @id=@id, @count=@count OUTPUT");
+        // The name is bracketed per part: it is application text on the
+        // ODBC {call ...} path.
+        assert_eq!(tsql, "EXEC [dbo].[my_proc] @id=@id, @count=@count OUTPUT");
         assert_eq!(params_decl, "@id int, @count bigint OUTPUT");
     }
 
@@ -13251,7 +13344,7 @@ mod tests {
             TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC proc @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
+        assert_eq!(tsql, "EXEC [proc] @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
         assert_eq!(
             params_decl,
             "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
@@ -16941,5 +17034,71 @@ mod tests {
             !client.is_connection_dead(),
             "a class < 20 error must not mark the connection dead"
         );
+    }
+}
+
+#[cfg(test)]
+mod procedure_name_quoting_tests {
+    use super::{quote_procedure_name, split_identifier_parts};
+
+    #[test]
+    fn regular_parts_are_bracketed() {
+        assert_eq!(quote_procedure_name("p").unwrap(), "[p]");
+        assert_eq!(quote_procedure_name("dbo.p").unwrap(), "[dbo].[p]");
+        assert_eq!(quote_procedure_name("db.dbo.p").unwrap(), "[db].[dbo].[p]");
+        // An empty middle part is legal: db..proc.
+        assert_eq!(quote_procedure_name("db..p").unwrap(), "[db]..[p]");
+    }
+
+    #[test]
+    fn already_delimited_parts_are_left_alone() {
+        assert_eq!(quote_procedure_name("[my proc]").unwrap(), "[my proc]");
+        assert_eq!(
+            quote_procedure_name("[db].[dbo].[my proc]").unwrap(),
+            "[db].[dbo].[my proc]"
+        );
+        assert_eq!(quote_procedure_name("\"q p\"").unwrap(), "\"q p\"");
+    }
+
+    #[test]
+    fn group_numbers_survive() {
+        assert_eq!(quote_procedure_name("p;2").unwrap(), "[p];2");
+        assert!(quote_procedure_name("p;").is_err());
+        assert!(quote_procedure_name("p;x").is_err());
+    }
+
+    /// The point of the quoting: nothing an application can put in a procedure
+    /// name may escape the identifier and become a second statement.
+    #[test]
+    fn injection_attempts_stay_inside_the_identifier() {
+        for name in [
+            "p; DROP TABLE t",
+            "p--comment",
+            "p'x'",
+            "p]; DROP TABLE t--",
+            "p /* c */",
+        ] {
+            // Either outcome is safe: a name that cannot be a group number is
+            // rejected outright, and anything else is bracketed so the payload
+            // stays inside the identifier.
+            let Ok(quoted) = quote_procedure_name(name) else {
+                continue;
+            };
+            assert!(quoted.starts_with('['), "{name} -> {quoted}");
+            assert!(quoted.ends_with(']'), "{name} -> {quoted}");
+            let inner = &quoted[1..quoted.len() - 1];
+            assert!(
+                !inner.contains(']') || inner.contains("]]"),
+                "{name} -> {quoted} leaves an unescaped bracket"
+            );
+        }
+        // A closing bracket is doubled, not passed through.
+        assert_eq!(quote_procedure_name("a]b").unwrap(), "[a]]b]");
+    }
+
+    #[test]
+    fn unterminated_and_overlong_names_are_rejected() {
+        assert!(split_identifier_parts("[unclosed").is_err());
+        assert!(split_identifier_parts("a.b.c.d.e").is_err());
     }
 }
