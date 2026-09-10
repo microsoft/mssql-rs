@@ -3710,6 +3710,52 @@ mod tests {
         assert_eq!(pending, vec![b'a' as u16, b'b' as u16, b'c' as u16]);
     }
 
+    #[test]
+    fn hex_buffer_elements_reserves_terminator_and_whole_pairs() {
+        let cases = [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 3),
+            (4, 3),
+            (5, 5),
+            (6, 5),
+            (7, 7),
+            (8, 7),
+            (usize::MAX - 1, usize::MAX - 2),
+            (usize::MAX, usize::MAX),
+        ];
+        for (capacity, expected) in cases {
+            assert_eq!(
+                hex_buffer_elements(capacity),
+                expected,
+                "capacity {capacity}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_pair_renders_every_byte_as_two_uppercase_digits() {
+        for byte in 0..=u8::MAX {
+            let expected = format!("{byte:02X}");
+            assert_eq!(
+                hex_pair(byte).as_slice(),
+                expected.as_bytes(),
+                "byte {byte}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_to_hex_preserves_order_and_zero_bytes_without_a_prefix() {
+        assert_eq!(bytes_to_hex(&[]), "");
+        assert_eq!(bytes_to_hex(&[0]), "00");
+        assert_eq!(
+            bytes_to_hex(&[0x00, 0x01, 0x0A, 0x10, 0xAB, 0xFF, 0x00]),
+            "00010A10ABFF00"
+        );
+    }
+
     /// Option-returning shim so these tests read the same as before the
     /// conversion core started distinguishing malformed payloads.
     fn column_value_to_text_opt(v: &ColumnValues) -> Option<String> {
