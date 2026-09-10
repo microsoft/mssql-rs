@@ -16,10 +16,10 @@ use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute_with_param_warning, park_dae_client, query_timeout_expired_error,
-    publish_scalar_processed, return_client_idle, snapshot_bound_params,
-    build_named_params_for_row,
+    ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
+    deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning, park_dae_client,
+    publish_scalar_processed, query_timeout_expired_error, return_client_idle,
+    snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
