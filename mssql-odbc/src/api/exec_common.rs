@@ -777,7 +777,7 @@ pub(super) unsafe fn build_named_params_for_row(
             .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                 ParamRowBuildError::Layout { parameter: i + 1 }
             })?;
-        let name = named.then(|| format!("@P{}", i + 1));
+        let name = named.then(|| parameter_name(i));
         let dae_indicator = if !bound_param.octet_length_ptr.is_null() {
             let ind = unsafe { bound_param.octet_length_ptr.read_unaligned() };
             is_data_at_exec_indicator(ind).then_some(ind)
@@ -872,6 +872,10 @@ pub(super) unsafe fn build_named_params_for_row(
     })
 }
 
+fn parameter_name(index: usize) -> String {
+    format!("@P{}", index + 1)
+}
+
 pub(super) fn finish_execute_with_param_warning(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
@@ -935,7 +939,7 @@ pub(super) fn rebuild_deferred_params(
             post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
             return Err(SQL_ERROR);
         };
-        let name = format!("@P{}", index + 1);
+        let name = parameter_name(*index);
         match buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null) {
             Ok((param, outcome)) => {
                 *slot = param;

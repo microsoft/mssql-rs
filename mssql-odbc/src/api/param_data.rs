@@ -205,6 +205,9 @@ fn sql_param_data_safe(
                 dae.return_client(client);
                 return SQL_ERROR;
             };
+            // A trailing partial SQL_C_WCHAR unit is deliberately omitted here;
+            // close-time conversion floors odd byte counts just like the
+            // materialized path.
             let bytes = std::mem::take(&mut dae.progress.buffer);
             let is_null = dae.progress.is_null;
             dae.buffered.push((bound_index, bytes, is_null));

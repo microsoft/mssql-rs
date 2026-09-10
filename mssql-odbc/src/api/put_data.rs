@@ -356,23 +356,17 @@ unsafe fn sql_put_data_safe(
         // above do rather than looking like the retriable "something else holds
         // this sequence" failure further down.
         //
-        // Reserved on the vector the chosen path actually grows: `buffer` for a
-        // value converted whole at close, `carry` for one converted on the way
-        // out, and `unit_carry` for an untranscoded stream that realigns a split
-        // unit -- that last one is what `fit_chunk` fills, so reserving on
-        // `carry` there would probe a vector that stays empty. A stream that
-        // keeps nothing at all -- no transcode and no partial-unit carry, the
-        // canonical `SQL_C_BINARY` case -- still probes `unit_carry` and then
-        // releases it, because `fit_chunk` copies what it keeps even when
-        // nothing is retained across calls.
+        // Reserved on the vector the chosen path eventually grows: `buffer` for
+        // a value converted whole at close, `carry` for one converted on the way
+        // out, and `unit_carry` for an untranscoded stream. A bounded path also
+        // probes `unit_carry`, because `fit_chunk` joins the chunk there before
+        // the eventual destination is touched.
         let has_transcode = dae
             .current_param()
             .and_then(|param| param.transcode)
             .is_some();
-        let carries_partial_units = dae
-            .current_param()
-            .and_then(|param| param.length_limit)
-            .is_some_and(|limit| limit.carries_partial_units());
+        let length_limit = dae.current_param().and_then(|param| param.length_limit);
+        let carries_partial_units = length_limit.is_some_and(|limit| limit.carries_partial_units());
         let retains_across_calls = will_buffer || has_transcode || carries_partial_units;
         if byte_count > 0 {
             let target = if will_buffer {
@@ -388,6 +382,16 @@ unsafe fn sql_put_data_safe(
                 drop(stmt_state);
                 error!(
                     "SQLPutData: failed to reserve {byte_count} bytes for a data-at-execution value (HY001)"
+                );
+                return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_MEMORY_ALLOCATION);
+            }
+            if length_limit.is_some()
+                && !std::ptr::eq(target, &dae.progress.unit_carry)
+                && dae.progress.unit_carry.try_reserve(byte_count).is_err()
+            {
+                drop(stmt_state);
+                error!(
+                    "SQLPutData: failed to reserve {byte_count} bytes for data-at-execution length fitting (HY001)"
                 );
                 return abort_dae_with_diag(dbc, stmt, statement_handle, ERR_MEMORY_ALLOCATION);
             }
@@ -445,7 +449,7 @@ unsafe fn sql_put_data_safe(
                 }
                 Err(e) => {
                     drop(stmt_state);
-                    error!("SQLPutData: value exceeds ColumnSize (22001)");
+                    error!("SQLPutData: data-at-execution chunk fitting failed");
                     return abort_dae_with_diag(dbc, stmt, statement_handle, e.diag());
                 }
             },

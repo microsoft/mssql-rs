@@ -47,7 +47,7 @@ use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INVALID_CHARACTER_VALUE,
     ERR_INVALID_DATETIME_FORMAT, ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
     ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_INVALID_USE_OF_DEFAULT_PARAM,
-    ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
+    ERR_MEMORY_ALLOCATION, ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_CONVERSION_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
 };
@@ -98,6 +98,8 @@ pub(crate) enum ParamBuildError {
     /// Character data longer than the declared length, in more than trailing
     /// blanks.
     StringTruncation,
+    /// Temporary storage for a data-at-execution chunk could not be reserved.
+    MemoryAllocation,
     /// A date/time C struct that names no real instant.
     InvalidDateTime,
     /// A date/time component the declared target cannot carry, and it was not
@@ -126,6 +128,7 @@ impl ParamBuildError {
             Self::NullValuePointer => ERR_INVALID_NULL_POINTER,
             Self::InvalidBufferLength => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
             Self::StringTruncation => ERR_PARAM_STRING_TRUNCATION,
+            Self::MemoryAllocation => ERR_MEMORY_ALLOCATION,
             Self::InvalidDateTime => ERR_INVALID_DATETIME_FORMAT,
             Self::DateTimeFieldOverflow => ERR_DATETIME_FIELD_OVERFLOW,
             Self::InvalidParameterSize(_) | Self::InvalidDecimalDigits(_) => {
@@ -360,20 +363,29 @@ impl DaeLengthLimit {
         already: usize,
     ) -> Result<(Vec<u8>, usize), ParamBuildError> {
         let unit = self.pad_unit.len();
-        if unit <= 1 {
-            let (kept, consumed) = self.fit(chunk, already)?;
-            return Ok((kept.to_vec(), consumed));
-        }
-
         // Whatever was held back joins the front of this chunk, so the two
-        // halves of a split unit are measured as the one element they are.
+        // halves of a split unit are measured as the one element they are. The
+        // caller reserves this buffer before entry, and returning it directly
+        // avoids a second infallible allocation for the kept prefix.
         let mut joined = std::mem::take(carry);
+        joined
+            .try_reserve(chunk.len())
+            .map_err(|_| ParamBuildError::MemoryAllocation)?;
         joined.extend_from_slice(chunk);
-        let whole = joined.len() - joined.len() % unit;
+        let whole = if unit <= 1 {
+            joined.len()
+        } else {
+            joined.len() - joined.len() % unit
+        };
+        carry
+            .try_reserve(joined.len() - whole)
+            .map_err(|_| ParamBuildError::MemoryAllocation)?;
         carry.extend_from_slice(&joined[whole..]);
 
         let (kept, consumed) = self.fit(&joined[..whole], already)?;
-        Ok((kept.to_vec(), consumed))
+        let kept_len = kept.len();
+        joined.truncate(kept_len);
+        Ok((joined, consumed))
     }
 
     /// Applies the limit to one chunk given the total already accepted,
