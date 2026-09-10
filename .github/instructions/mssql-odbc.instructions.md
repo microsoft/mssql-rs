@@ -708,16 +708,21 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   - A success-path test.
   - A null-output-handle test.
   - An invalid-handle-type or invalid-input test.
-- **A `max`/LOB column only reaches the bound *streaming* path when it is too
-  large for the transport to buffer whole.** `try_read_buffered_column` decodes
-  any fully buffered column - PLP included - into a `ColumnValues`, so a small
-  `varchar(max)`/`varbinary(max)` is delivered by `deliver_bound`, exactly like a
-  non-max value, and never enters `deliver_bound_plp`. A few kilobytes still
-  buffers; the streaming path is reachable around a megabyte (the existing 1 MiB
-  cases in `fetch_scroll_test.cpp` prove it). Size an e2e that targets
-  `deliver_bound_plp` accordingly, or it will silently assert the non-PLP path -
-  a bound binary `max` column against a typed C target answers `22018` from the
-  typed converter when buffered, and `HYC00` when streamed.
+- **A `max`/LOB column reaches the bound *streaming* path whatever its size.**
+  `try_read_row_column` attempts `try_begin_buffered_plp` for any column whose
+  metadata says `is_plp()` and yields `CursorColumn::PlpStreaming`
+  (`tds_client.rs`); the decision is gated on the column being PLP, never on its
+  length. So an e2e that targets `deliver_bound_plp` needs no particular size -
+  a handful of bytes reaches it. `ABoundVarcharMaxTruncatedToWcharReportsNoTotal`
+  is the proof already in the suite: 5,000 wire bytes asserting `SQL_NO_TOTAL`,
+  which on the bound path only `plp_indicator` produces, and that has exactly one
+  call site - inside `deliver_bound_plp`.
+  Do not confuse this with `PLP_TYPED_MATERIALIZE_LIMIT`, a separate 1 MiB cap on
+  how much a *typed* conversion will materialize (see the parity note above).
+- **Bound binary into a typed C target is refused, and the SQLSTATE differs by
+  driver for `max`.** Measured on 18.06.0001: `varbinary(8)` into `SQL_C_SLONG`
+  is `07006` on both, and `varbinary(max)` is `07006` on msodbcsql but `HYC00`
+  here. `varchar(8)`/`varchar(max)` holding `'42'` convert to `42` on both.
 - Use `cargo nextest` (via `cargo btest`), not `cargo test`.
 
 ## Code style
