@@ -11,8 +11,8 @@ use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, flush_pending_unprepare, park_dae_client, query_timeout_expired_error,
-    snapshot_bound_params,
+    finish_execute_with_param_warning, flush_pending_unprepare, park_dae_client,
+    query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -181,7 +181,11 @@ fn sql_exec_direct_w_safe(
         )
     };
 
-    let ParamsWithDae { params, dae_params } = named_params;
+    let ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    } = named_params;
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLExecDirectW") {
         Ok(client) => client,
@@ -253,11 +257,24 @@ fn sql_exec_direct_w_safe(
                     dae_param_count = dae_params.len(),
                     "SQLExecDirectW: begin_sp_executesql completed despite data-at-execution parameters"
                 );
-                finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+                finish_execute_with_param_warning(
+                    dbc,
+                    stmt,
+                    statement_handle,
+                    client,
+                    "SQLExecDirectW",
+                    fractional_truncated,
+                )
             }
-            Ok(StreamedParamStatus::NeedData { .. }) => {
-                park_dae_client(stmt, client, None, None, dae_params, "SQLExecDirectW")
-            }
+            Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
+                stmt,
+                client,
+                None,
+                None,
+                dae_params,
+                fractional_truncated,
+                "SQLExecDirectW",
+            ),
             Err(e) => {
                 error!(%e, "SQLExecDirectW: begin_sp_executesql failed");
                 fail_with_tds(dbc, stmt, statement_handle, client, &e)
@@ -291,7 +308,14 @@ fn sql_exec_direct_w_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    finish_execute(dbc, stmt, statement_handle, client, "SQLExecDirectW")
+    finish_execute_with_param_warning(
+        dbc,
+        stmt,
+        statement_handle,
+        client,
+        "SQLExecDirectW",
+        fractional_truncated,
+    )
 }
 
 #[cfg(test)]

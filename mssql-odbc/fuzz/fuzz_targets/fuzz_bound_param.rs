@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Fuzz the bind-parameter read + convert path (`bound_param_to_value`) that
+//! Fuzz the bind-parameter read + convert path (`bound_param_to_rpc`) that
 //! `SQLExecute` runs over an application's value and length/indicator buffers.
 //! The wrapper backs the value buffer with the input plus trailing zero padding
 //! wide enough for the widest fixed-width C target, and confines the indicator

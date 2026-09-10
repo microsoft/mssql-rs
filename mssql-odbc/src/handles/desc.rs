@@ -216,6 +216,37 @@ pub(crate) struct DescRecord {
     pub(crate) indicator_ptr: SqlPointer,
     /// `SQL_DESC_OCTET_LENGTH_PTR`. ARD/APD only. Opaque, see `data_ptr`.
     pub(crate) octet_length_ptr: SqlPointer,
+    /// Whether an application value binding has been established for this
+    /// record. Unlike `data_ptr`, this remains true for a null DAE token.
+    pub(crate) data_bound: bool,
+    /// APD only: whether the application itself wrote `SQL_DESC_PRECISION`
+    /// and/or `SQL_DESC_SCALE` via `SQLSetDescField`/`SQLSetDescRec`, as
+    /// opposed to this driver's own default-fill (`SQLBindParameter`'s
+    /// `SQL_C_NUMERIC` reset, or a `SQL_DESC_TYPE` write's matching reset —
+    /// see `set_type`). `decimal_from_numeric`'s fast path
+    /// (`sqlcfunc.cpp:3163-3172`) only forwards a `SQL_C_NUMERIC` struct's own
+    /// embedded precision/scale when the APD's precision/scale numerically
+    /// match the IPD's *and* the application chose them explicitly; an APD
+    /// that merely landed on the same values through this driver's own
+    /// `SetTypeDefaults`-equivalent default-fill must not trigger it, or a
+    /// bare `SQLBindParameter` into a same-shaped column would wrongly skip
+    /// the rescale every other source takes. It also gates which *source*
+    /// scale the non-fast-path rescale trusts (`decimal_from_numeric`'s
+    /// slow path): explicit means the APD's own `scale` is authoritative,
+    /// non-explicit falls back to the struct's own embedded scale, since
+    /// that is the only self-description available for a value the app
+    /// never described through the descriptor.
+    ///
+    /// Set to `true` only by `set_precision`/`set_scale` themselves. Reset
+    /// to `false` by a `SQL_DESC_TYPE` write that changes the concise type
+    /// (`set_type`) and by `SQLBindParameter`'s own APD write
+    /// (`write_to_records`) *only when its `ValueType` is changing* —
+    /// mirroring the ODBC spec's `SQLBindParameter` rebind rule that
+    /// rebinding the same `ValueType` retains other APD fields set by a
+    /// prior bind or `SQLSetDescField` call. A same-`SQL_C_NUMERIC` rebind
+    /// therefore keeps this flag from a prior explicit call even though the
+    /// precision/scale *values* still reset to `(SQL_PREC_NUMERIC, 0)`.
+    pub(crate) precision_scale_explicit: bool,
     /// IPD only: set when the application has itself written this record's
     /// type/size (`SQL_DESC_CONCISE_TYPE`/`TYPE`, `DATETIME_INTERVAL_CODE`,
     /// `LENGTH`, `OCTET_LENGTH`, `PRECISION` or `SCALE`) via
@@ -258,6 +289,8 @@ impl DescRecord {
             data_ptr: std::ptr::null_mut(),
             indicator_ptr: std::ptr::null_mut(),
             octet_length_ptr: std::ptr::null_mut(),
+            data_bound: false,
+            precision_scale_explicit: false,
             explicitly_bound: false,
         }
     }

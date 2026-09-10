@@ -15,7 +15,8 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 
 use super::exec_common::{
     ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute, park_dae_client, query_timeout_expired_error, snapshot_bound_params,
+    finish_execute_with_param_warning, park_dae_client, query_timeout_expired_error,
+    snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -72,6 +73,7 @@ unsafe fn sql_execute_impl(statement_handle: SqlHandle) -> SqlReturn {
 /// Values gathered under the STMT lock before any network I/O.
 struct Execution {
     named_params: Vec<RpcParameter>,
+    fractional_truncated: bool,
     /// The prepared plan moved out of `StmtState` for the execute; written
     /// back afterward (possibly re-prepared with a fresh handle).
     prepared: PreparedPlan,
@@ -91,6 +93,7 @@ struct DaeExecution {
     params: Vec<RpcParameter>,
     /// The streamed parameters, in original parameter order.
     dae_params: Vec<DaeParam>,
+    fractional_truncated: bool,
     prepared: PreparedPlan,
     orphaned: Option<StatementId>,
     /// `SQL_ATTR_QUERY_TIMEOUT` in effect for this statement, in seconds; `0`
@@ -114,6 +117,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
     match staging {
         ExecutionStaging::Ready(Execution {
             named_params,
+            fractional_truncated,
             mut prepared,
             mut orphaned,
             query_timeout,
@@ -215,12 +219,20 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
-            finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
+            finish_execute_with_param_warning(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                "SQLExecute",
+                fractional_truncated,
+            )
         }
 
         ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_params,
+            fractional_truncated,
             mut prepared,
             mut orphaned,
             query_timeout,
@@ -298,7 +310,14 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                         stmt_state.pending_unprepare = orphaned;
                     }
                     let _ = result; // result handled by finish_execute below
-                    finish_execute(dbc, stmt, statement_handle, client, "SQLExecute")
+                    finish_execute_with_param_warning(
+                        dbc,
+                        stmt,
+                        statement_handle,
+                        client,
+                        "SQLExecute",
+                        fractional_truncated,
+                    )
                 }
                 Ok(StreamedParamStatus::NeedData { .. }) => park_dae_client(
                     stmt,
@@ -306,6 +325,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     Some(prepared),
                     orphaned,
                     dae_params,
+                    fractional_truncated,
                     "SQLExecute",
                 ),
                 Err(e) => {
@@ -405,8 +425,11 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
 
     // Scan for data-at-execution parameters.  If any are present, use the
     // streaming path; otherwise, go through the normal prepared-execute path.
-    let ParamsWithDae { params, dae_params } =
-        unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
+    let ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    } = unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecute") }?;
 
     // All fallible validation passed: move the prepared plan out (written
     // back after the execute) and take any orphaned handle for piggyback drop.
@@ -426,6 +449,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
     if dae_params.is_empty() {
         Ok(ExecutionStaging::Ready(Execution {
             named_params: params,
+            fractional_truncated,
             prepared,
             orphaned,
             query_timeout,
@@ -434,6 +458,7 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         Ok(ExecutionStaging::NeedData(DaeExecution {
             params,
             dae_params,
+            fractional_truncated,
             prepared,
             orphaned,
             query_timeout,
