@@ -2784,6 +2784,10 @@ fn finish_typed_conv(
             post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
             SQL_ERROR
         }
+        Err(ConvError::Internal) => {
+            post_diag(stmt_state, ERR_INTERNAL_CONVERSION);
+            SQL_ERROR
+        }
         Err(ConvError::NotHandledHere) => {
             post_sql_error(
                 stmt_state,

@@ -486,7 +486,7 @@ pub(crate) unsafe fn convert_datetime_c(
     // the date-only targets below still refuse a time value.
     let mut p = p;
     if p.has_time && !p.has_date && matches!(target_type, SQL_C_TYPE_TIMESTAMP | SQL_C_TIMESTAMP) {
-        let (year, month, day) = current_local_date();
+        let (year, month, day) = current_local_date().ok_or(ConvError::Internal)?;
         p.year = year;
         p.month = month;
         p.day = day;

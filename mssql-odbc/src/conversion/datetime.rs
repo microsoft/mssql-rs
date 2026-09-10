@@ -345,37 +345,48 @@ pub(crate) fn parse_datetime_literal(text: &str) -> Option<DateTimeParts> {
     Some(p)
 }
 
-/// The local calendar date, as `(year, month, day)`.
+/// The local calendar date, as `(year, month, day)`, or `None` if the platform
+/// cannot provide it.
 ///
 /// ODBC Appendix D says a time value converted to a timestamp takes the current
 /// date, and msodbcsql reads it from `localtime_s` (`ParseDateTime`,
 /// `sqlccnvt.cpp`) rather than UTC, so this follows the process's local zone to
 /// agree with it either side of midnight.
-pub(crate) fn current_local_date() -> (i16, u16, u16) {
+pub(crate) fn current_local_date() -> Option<(i16, u16, u16)> {
     #[cfg(unix)]
     {
         // SAFETY: `localtime_r` fills the caller-owned `tm` and is thread-safe.
         let now = unsafe { libc::time(std::ptr::null_mut()) };
+        if now == -1 {
+            return None;
+        }
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
-            return (1900, 1, 1);
+            return None;
         }
-        (
-            (tm.tm_year + 1900) as i16,
-            (tm.tm_mon + 1) as u16,
-            tm.tm_mday as u16,
-        )
+        let year = i16::try_from(tm.tm_year.checked_add(1900)?).ok()?;
+        let month = u16::try_from(tm.tm_mon.checked_add(1)?).ok()?;
+        let day = u16::try_from(tm.tm_mday).ok()?;
+        Some((year, month, day))
     }
     #[cfg(windows)]
     {
         let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-        (st.wYear as i16, st.wMonth, st.wDay)
+        Some((i16::try_from(st.wYear).ok()?, st.wMonth, st.wDay))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_local_date_is_valid() {
+        let (year, month, day) = current_local_date().expect("the OS should provide a local date");
+        assert!(year >= 1970);
+        assert!((1..=12).contains(&month));
+        assert!((1..=31).contains(&day));
+    }
 
     #[test]
     fn civil_anchor_dates() {

@@ -46,19 +46,25 @@ protected:
     }
     void ExpectWidenedToToday(const std::string& sql, SQLSMALLINT target, SQLUSMALLINT hour,
                               SQLUSMALLINT minute, SQLUSMALLINT second, SQLUINTEGER fraction) {
-        FetchOne(sql);
+        ASSERT_NO_FATAL_FAILURE(FetchOne(sql));
         SQL_TIMESTAMP_STRUCT ts;
         std::memset(&ts, 0, sizeof(ts));
         SQLLEN ind = -1;
+
+        SQLSMALLINT before_year = 0;
+        SQLUSMALLINT before_month = 0, before_day = 0;
+        LocalToday(&before_year, &before_month, &before_day);
         ASSERT_SQL_OK(SQLGetData(stmt_, 1, target, &ts, sizeof(ts), &ind), SQL_HANDLE_STMT,
                       stmt_);
 
-        SQLSMALLINT year = 0;
-        SQLUSMALLINT month = 0, day = 0;
-        LocalToday(&year, &month, &day);
-        EXPECT_EQ(year, ts.year) << sql;
-        EXPECT_EQ(month, ts.month) << sql;
-        EXPECT_EQ(day, ts.day) << sql;
+        SQLSMALLINT after_year = 0;
+        SQLUSMALLINT after_month = 0, after_day = 0;
+        LocalToday(&after_year, &after_month, &after_day);
+        const bool matches_before =
+            ts.year == before_year && ts.month == before_month && ts.day == before_day;
+        const bool matches_after =
+            ts.year == after_year && ts.month == after_month && ts.day == after_day;
+        EXPECT_TRUE(matches_before || matches_after) << sql;
         EXPECT_EQ(hour, ts.hour) << sql;
         EXPECT_EQ(minute, ts.minute) << sql;
         EXPECT_EQ(second, ts.second) << sql;
@@ -100,7 +106,7 @@ TEST_F(TimeToTimestampLiveTest, LegacyTimestampSpellingWidensToo) {
 // differs by where the mismatch is: bad text for the target is 22018, while a
 // column whose type cannot feed the target at all is 07006.
 TEST_F(TimeToTimestampLiveTest, CharacterTimeIntoDateIsStillInvalidCharacterValue) {
-    FetchOne("SELECT CAST('12:34:56' AS VARCHAR(32))");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('12:34:56' AS VARCHAR(32))"));
 
     SQL_DATE_STRUCT date;
     std::memset(&date, 0, sizeof(date));
@@ -111,7 +117,7 @@ TEST_F(TimeToTimestampLiveTest, CharacterTimeIntoDateIsStillInvalidCharacterValu
 }
 
 TEST_F(TimeToTimestampLiveTest, TimeColumnIntoDateIsStillRestrictedDataType) {
-    FetchOne("SELECT CAST('12:34:56' AS TIME(0))");
+    ASSERT_NO_FATAL_FAILURE(FetchOne("SELECT CAST('12:34:56' AS TIME(0))"));
 
     SQL_DATE_STRUCT date;
     std::memset(&date, 0, sizeof(date));

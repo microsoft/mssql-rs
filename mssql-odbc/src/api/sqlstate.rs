@@ -192,6 +192,10 @@ pub(crate) const ERR_RESTRICTED_DATA_TYPE: DiagMsg = DiagMsg {
     state: SQLSTATE_07006,
     text: "Restricted data type attribute violation",
 };
+pub(crate) const ERR_INTERNAL_CONVERSION: DiagMsg = DiagMsg {
+    state: SQLSTATE_HY000,
+    text: "Internal error converting value",
+};
 // `SQL_DEFAULT_PARAM` is only legal for a canonical procedure call, which this
 // driver does not support, so the state is terminal rather than "not yet"
 // (msodbcsql `sqlccmd.cpp` -> IDS_07_S01 on a non-canonical call statement).
