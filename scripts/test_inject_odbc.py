@@ -44,9 +44,9 @@ def test_drivers_for_platform_tag(tag, expected):
 
 def test_musl_and_glibc_do_not_collide():
     # The whole design rests on these two resolving to different drivers.
-    assert inject.drivers_for_platform_tag("musllinux_1_2_x86_64") != inject.drivers_for_platform_tag(
-        "linux_x86_64"
-    )
+    assert inject.drivers_for_platform_tag(
+        "musllinux_1_2_x86_64"
+    ) != inject.drivers_for_platform_tag("linux_x86_64")
 
 
 @pytest.mark.parametrize("tag", ["win_ia64", "linux_riscv64", "any", ""])
@@ -57,9 +57,15 @@ def test_unrecognized_tag_returns_empty(tag):
 @pytest.mark.parametrize(
     "wheel_name, expected_tag",
     [
-        ("mssql_py_core-0.1.0-cp312-cp312-win_amd64.whl", "win_amd64"),
-        ("mssql_py_core-0.1.0-cp313-cp313-musllinux_1_2_aarch64.whl", "musllinux_1_2_aarch64"),
-        ("mssql_py_core-0.1.0-cp311-cp311-macosx_15_0_universal2.whl", "macosx_15_0_universal2"),
+        ("mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl", "win_amd64"),
+        (
+            "mssql_python_rs-0.1.0-cp313-cp313-musllinux_1_2_aarch64.whl",
+            "musllinux_1_2_aarch64",
+        ),
+        (
+            "mssql_python_rs-0.1.0-cp311-cp311-macosx_15_0_universal2.whl",
+            "macosx_15_0_universal2",
+        ),
     ],
 )
 def test_platform_tag_of(wheel_name, expected_tag):
@@ -79,8 +85,8 @@ def _make_wheel(path: Path) -> None:
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("mssql_py_core/__init__.py", b"# core\n")
         zf.writestr(
-            "mssql_py_core-0.1.0.dist-info/RECORD",
-            "mssql_py_core/__init__.py,,\nmssql_py_core-0.1.0.dist-info/RECORD,,\n",
+            "mssql_python_rs-0.1.0.dist-info/RECORD",
+            "mssql_py_core/__init__.py,,\n" "mssql_python_rs-0.1.0.dist-info/RECORD,,\n",
         )
 
 
@@ -90,7 +96,7 @@ def test_inject_roundtrip(tmp_path):
     driver_bytes = b"\x4d\x5aFAKE-DLL"
     (drivers / "windows" / "x64" / "mssqlodbc.dll").write_bytes(driver_bytes)
 
-    wheel = tmp_path / "mssql_py_core-0.1.0-cp312-cp312-win_amd64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl"
     _make_wheel(wheel)
 
     inject.inject_wheel(wheel, drivers)
@@ -100,11 +106,11 @@ def test_inject_roundtrip(tmp_path):
         names = zf.namelist()
         assert arc in names
         assert zf.read(arc) == driver_bytes
-        record = zf.read("mssql_py_core-0.1.0.dist-info/RECORD").decode("utf-8")
+        record = zf.read("mssql_python_rs-0.1.0.dist-info/RECORD").decode("utf-8")
 
     assert inject._record_line(arc, driver_bytes) in record.splitlines()
     # RECORD's own line stays hash-less.
-    assert "mssql_py_core-0.1.0.dist-info/RECORD,," in record
+    assert "mssql_python_rs-0.1.0.dist-info/RECORD,," in record
 
 
 def test_inject_preserves_entry_modes(tmp_path):
@@ -112,14 +118,14 @@ def test_inject_preserves_entry_modes(tmp_path):
     (drivers / "windows" / "x64").mkdir(parents=True)
     (drivers / "windows" / "x64" / "mssqlodbc.dll").write_bytes(b"MZ")
 
-    wheel = tmp_path / "mssql_py_core-0.1.0-cp312-cp312-win_amd64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl"
     with zipfile.ZipFile(wheel, "w") as zf:
         exe = zipfile.ZipInfo("mssql_py_core/_core.pyd")
         exe.external_attr = 0o755 << 16
         zf.writestr(exe, b"\x4d\x5a")
         zf.writestr(
-            "mssql_py_core-0.1.0.dist-info/RECORD",
-            "mssql_py_core/_core.pyd,,\nmssql_py_core-0.1.0.dist-info/RECORD,,\n",
+            "mssql_python_rs-0.1.0.dist-info/RECORD",
+            "mssql_py_core/_core.pyd,,\n" "mssql_python_rs-0.1.0.dist-info/RECORD,,\n",
         )
 
     inject.inject_wheel(wheel, drivers)
@@ -138,14 +144,14 @@ def test_inject_preserves_entry_modes(tmp_path):
 
 
 def test_inject_missing_driver_fails(tmp_path):
-    wheel = tmp_path / "mssql_py_core-0.1.0-cp312-cp312-win_amd64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_amd64.whl"
     _make_wheel(wheel)
     with pytest.raises(SystemExit):
         inject.inject_wheel(wheel, tmp_path / "empty-drivers")
 
 
 def test_inject_unknown_tag_fails(tmp_path):
-    wheel = tmp_path / "mssql_py_core-0.1.0-cp312-cp312-win_ia64.whl"
+    wheel = tmp_path / "mssql_python_rs-0.1.0-cp312-cp312-win_ia64.whl"
     _make_wheel(wheel)
     with pytest.raises(SystemExit):
         inject.inject_wheel(wheel, tmp_path / "drivers")

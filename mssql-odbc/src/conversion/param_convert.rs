@@ -3044,9 +3044,8 @@ mod tests {
     /// is read as "unstated" and a `ColumnSize` past the target's ceiling is
     /// clamped, rather than either falling through to `max`.
     ///
-    /// Bound `SQL_C_WCHAR` because that is the only pairing the matrix admits
-    /// (AB#47800); the ceiling is the wide one, so a narrow binding here would
-    /// assert 8000 on a path no application can reach.
+    /// Bound `SQL_C_WCHAR`; see `a_narrow_variant_wraps_a_bounded_inner_declaration`
+    /// for the `SQL_C_CHAR` counterpart the matrix now also admits (AB#47800).
     #[test]
     fn a_variant_wraps_a_bounded_inner_declaration() {
         let wide =
@@ -3089,7 +3088,7 @@ mod tests {
     ///
     /// The clamp declares that ceiling, so the overflow is caught here as
     /// `22001` at bind rather than by the server one call later. Both refuse;
-    /// only the diagnostic differs (AB#47800).
+    /// only the diagnostic differs.
     #[test]
     fn a_variant_payload_past_the_wide_ceiling_is_truncation() {
         let text = "x".repeat(SQL_PREC_NCHAR + 1);
@@ -3102,6 +3101,38 @@ mod tests {
         let err = unsafe { bound_param_to_value(&p) }.unwrap_err();
         assert_eq!(err, ParamBuildError::StringTruncation);
         assert_eq!(err.diag().state, *b"22001");
+    }
+
+    /// Narrow counterpart to `a_variant_wraps_a_bounded_inner_declaration`:
+    /// `SQL_C_CHAR` -> `SQL_SS_VARIANT` is the pairing the conversion matrix
+    /// admitted once mssql-tds could serialize a narrow (BigVarChar) inner
+    /// value (AB#47800). Same rules as the wide case, narrow ceiling.
+    #[test]
+    fn a_narrow_variant_wraps_a_bounded_inner_declaration() {
+        let cases: &[(usize, u16)] = &[
+            (8, 8),
+            // Unstated: the narrow ceiling, not `max`.
+            (0, SQL_PREC_BIGCHARBINARY as u16),
+            // Past the narrow ceiling: clamped, not `max`.
+            (SQL_PREC_BIGCHARBINARY + 1, SQL_PREC_BIGCHARBINARY as u16),
+            (usize::MAX, SQL_PREC_BIGCHARBINARY as u16),
+        ];
+
+        for &(column_size, expected) in cases {
+            let mut bytes = b"hi".to_vec();
+            let mut ind: SqlLen = 2;
+            let mut p = param(SQL_C_CHAR, bytes.as_mut_ptr() as *mut c_void, &mut ind);
+            p.sql_type = SQL_SS_VARIANT;
+            p.column_size = column_size;
+            let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
+            match value {
+                SqlType::Variant(inner) => assert!(
+                    matches!(*inner, SqlType::Varchar(Some(_), n) if n == expected),
+                    "column_size {column_size}: got {inner:?}"
+                ),
+                other => panic!("column_size {column_size}: expected Variant, got {other:?}"),
+            }
+        }
     }
 
     /// Every newly bound row must produce a typed NULL from `ParameterType`
@@ -3415,6 +3446,10 @@ mod tests {
             (SQL_C_WCHAR, SQL_SS_XML),
             (SQL_C_CHAR, SQL_DECIMAL),
             (SQL_C_WCHAR, SQL_SS_VARIANT),
+            // SQL_C_CHAR -> SQL_SS_VARIANT is the pairing AB#47800 itself
+            // opens: the refusal here is what that pairing's HYC00 moves to
+            // (from bind_param.rs, since the conversion matrix now admits it).
+            (SQL_C_CHAR, SQL_SS_VARIANT),
             // And again for the temporal targets this change makes bindable:
             // a streamed literal is still refused, only now at execute rather
             // than at `SQLBindParameter`.

@@ -105,6 +105,11 @@ pub(crate) struct NegotiatedSettings {
     pub login_ack_tds_version: Option<TdsVersion>,
     /// Server program version from LoginAckToken, captured for session recovery validation.
     pub login_ack_server_version: Option<Version>,
+    /// The instance name the server reported in the `ServerName` field of the
+    /// INFO tokens it sent during login (`@@SERVERNAME`). Captured here rather
+    /// than read back from `TdsClient::info_messages`, which is cleared at the
+    /// start of every command and is empty on a pooled connection.
+    pub server_reported_name: Option<String>,
 }
 
 impl NegotiatedSettings {
@@ -128,6 +133,7 @@ impl NegotiatedSettings {
             char_set,
             login_ack_tds_version,
             login_ack_server_version,
+            server_reported_name: None,
         }
     }
 
@@ -234,6 +240,7 @@ pub(crate) fn create_test_negotiated_settings_internal() -> NegotiatedSettings {
         char_set: None,
         login_ack_tds_version: None,
         login_ack_server_version: None,
+        server_reported_name: None,
     }
 }
 
@@ -242,6 +249,16 @@ pub(crate) struct SessionHandler<'a, 'b> {
     pub(crate) transport_context: &'b TransportContext,
 }
 
+/// Picks the server's own instance name (`@@SERVERNAME`) out of the INFO tokens
+/// received during login. A token that left the field blank is skipped rather
+/// than taken as the answer.
+fn server_name_from_login_messages(messages: &[SqlInfoMessage]) -> Option<String> {
+    messages
+        .iter()
+        .filter_map(|m| m.server_name.as_deref())
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
+}
 impl<'a, 'b> SessionHandler<'a, 'b> {
     pub(crate) async fn execute<T: NetworkReaderWriter + TdsTokenStreamReader + TdsPacketReader>(
         &mut self,
@@ -346,7 +363,7 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
 
         let language = change_props.language.clone().unwrap_or_default();
 
-        Ok(NegotiatedSettings::new(
+        let mut settings = NegotiatedSettings::new(
             session_settings,
             database_collation,
             language,
@@ -354,7 +371,14 @@ impl<'a, 'b> SessionHandler<'a, 'b> {
             change_props.char_set.clone(),
             login_ack_tds_version,
             login_ack_server_version,
-        ))
+        );
+
+        // Every INFO token carries the server's own instance name; the login
+        // response always contains at least the 5701 database-context message.
+        settings.server_reported_name =
+            server_name_from_login_messages(&login_result.diagnostics.info_messages);
+
+        Ok(settings)
     }
 
     async fn get_login_result<T: TdsTokenStreamReader + NetworkReaderWriter>(
@@ -718,10 +742,57 @@ impl LoginHandler<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NegotiatedSettings, create_test_negotiated_settings_internal};
+    use super::{
+        NegotiatedSettings, create_test_negotiated_settings_internal,
+        server_name_from_login_messages,
+    };
+    use crate::error::SqlInfoMessage;
     use crate::message::features::always_encrypted::AlwaysEncryptedFeature;
     use crate::message::features::session_recovery::SessionRecoveryFeature;
     use crate::message::login::Feature;
+
+    fn info_message(server_name: Option<&str>) -> SqlInfoMessage {
+        SqlInfoMessage {
+            message: "Changed database context to 'master'.".to_string(),
+            state: 1,
+            class: 0,
+            number: 5701,
+            server_name: server_name.map(str::to_string),
+            proc_name: None,
+            line_number: None,
+        }
+    }
+
+    #[test]
+    fn server_name_comes_from_the_first_login_message_that_carries_one() {
+        let messages = vec![info_message(Some("SQLPROD01")), info_message(Some("OTHER"))];
+        assert_eq!(
+            server_name_from_login_messages(&messages).as_deref(),
+            Some("SQLPROD01")
+        );
+    }
+
+    #[test]
+    fn blank_and_absent_server_names_are_skipped_not_accepted() {
+        // A token that left the field empty must not shadow a later one that
+        // filled it in.
+        let messages = vec![
+            info_message(None),
+            info_message(Some("")),
+            info_message(Some("SQLPROD01")),
+        ];
+        assert_eq!(
+            server_name_from_login_messages(&messages).as_deref(),
+            Some("SQLPROD01")
+        );
+    }
+
+    #[test]
+    fn no_usable_server_name_yields_none() {
+        assert_eq!(server_name_from_login_messages(&[]), None);
+        let blank = vec![info_message(None), info_message(Some(""))];
+        assert_eq!(server_name_from_login_messages(&blank), None);
+    }
 
     fn settings_with_ae(acknowledged: bool) -> NegotiatedSettings {
         let mut settings = create_test_negotiated_settings_internal();

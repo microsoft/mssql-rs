@@ -97,6 +97,14 @@ steps:
     displayName: Build Fuzz Targets
     condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
 
+  - bash: |
+      cd mssql-odbc/fuzz
+      echo "Building all mssql-odbc fuzz targets to verify they compile..."
+      RUSTFLAGS="--cfg fuzzing" cargo +nightly fuzz build
+      echo "mssql-odbc fuzz targets built successfully"
+    displayName: Build ODBC Fuzz Targets
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
 - ${{ if eq(parameters.enableTests, true) }}:
   # The hosted macOS agent took up to ~10 minutes to compile these from source
   # and would sometimes time out, so install the published prebuilt binaries

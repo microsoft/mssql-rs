@@ -6,10 +6,8 @@
   SANDBOX / TEST-ONLY helper. Pins the mssql-tds path dependency to a version.
 
 .DESCRIPTION
-  The mssql-tds path dependency in mssql-mock-tds/Cargo.toml has no version, which
-  cargo publish rejects ("all dependencies must have a version"). This adds the
-  stamped version while keeping the path (cargo uses the version on publish and the
-  path for local verify builds).
+  Updates the mssql-tds dependency to the stamped version while keeping the path
+  (cargo uses the version on publish and the path for local verify builds).
 
   A version alone is not enough: cargo records a dependency with no registry as
   coming from crates.io, where mssql-tds does not exist. Consumers of the feed then
@@ -58,21 +56,48 @@ $index = if ($IndexUrl -match '^sparse\+') { $IndexUrl } else { "sparse+$IndexUr
 
 $path = 'mssql-mock-tds/Cargo.toml'
 $c = Get-Content $path -Raw
-$c = $c -replace 'mssql-tds\s*=\s*\{\s*path\s*=\s*"\.\./mssql-tds"',
-                 "mssql-tds = { path = `"../mssql-tds`", version = `"$Version`", registry-index = `"$index`""
 
-# -replace changes nothing when the dependency line drifts from the shape above
-# (keys reordered, workspace = true), so without this the script would exit 0 having
-# done nothing and the run would fail much later, in cargo publish -p mssql-mock-tds
-# -- after cargo-publish-mock.ps1 has already put mssql-tds@$Version on the feed.
-# Feed versions are immutable, so that burns the version and the retry cannot
-# succeed. Counting rather than merely testing for presence also catches a second
-# run appending a duplicate set of keys, which TOML rejects.
-$dep = [regex]::Match($c, '(?m)^\s*mssql-tds\s*=\s*\{[^}]*\}')
-if (-not $dep.Success) {
-    Write-Error "No mssql-tds dependency line found in $path"
+$dependencyPattern = [regex]'(?m)^\s*mssql-tds\s*=\s*\{[^}\r\n]*\}\s*$'
+$dependencyMatches = $dependencyPattern.Matches($c)
+if ($dependencyMatches.Count -ne 1) {
+    Write-Error "Expected one mssql-tds dependency in ${path}, found $($dependencyMatches.Count)"
     exit 1
 }
+
+$dependency = $dependencyMatches[0].Value
+foreach ($entry in @(
+    @{ Key = 'version'; Value = $Version },
+    @{ Key = 'registry-index'; Value = $index }
+)) {
+    $key = $entry.Key
+    $value = $entry.Value
+    $keyPattern = [regex]"(?<![\w-])$key\s*=\s*`"[^`"]*`""
+    $keyMatches = $keyPattern.Matches($dependency)
+    if ($keyMatches.Count -gt 1) {
+        Write-Error "Expected at most one '$key' in the mssql-tds dependency of ${path}, found $($keyMatches.Count)"
+        exit 1
+    }
+
+    if ($keyMatches.Count -eq 1) {
+        $replacement = "$key = `"$value`"".Replace('$', '$$')
+        $dependency = $keyPattern.Replace($dependency, $replacement, 1)
+    }
+    else {
+        $replacement = "{ $key = `"$value`", ".Replace('$', '$$')
+        $openBracePattern = [regex]'\{\s*'
+        $dependency = $openBracePattern.Replace(
+            $dependency,
+            $replacement,
+            1
+        )
+    }
+}
+
+$c = $c.Substring(0, $dependencyMatches[0].Index) +
+    $dependency +
+    $c.Substring($dependencyMatches[0].Index + $dependencyMatches[0].Length)
+
+$dep = $dependencyPattern.Match($c)
 foreach ($key in 'version', 'registry-index') {
     $n = ([regex]::Matches($dep.Value, "(?<![\w-])$key\s*=")).Count
     if ($n -ne 1) {
