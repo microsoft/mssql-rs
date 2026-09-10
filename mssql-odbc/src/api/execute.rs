@@ -486,8 +486,12 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
             // the sets before the failure are already on the wire. msodbcsql
             // materializes first and sends nothing (measured: 0 rows written),
             // which is the one half of this divergence we keep - matching it
-            // would mean a validation pre-pass over every set and giving up the
-            // streaming serializer that buys the measured perf parity.
+            // would need this streaming serializer to give up materializing
+            // the whole batch upfront. stage_execution already walks every
+            // (row, parameter) pair once to enforce the input-only and
+            // data-at-execution refusals; what streaming avoids is the
+            // second, expensive pass - converting and buffering every set
+            // before any of it reaches the wire - not the walk itself.
             let failures = std::mem::take(&mut rows.failures);
             let all_rows_failed = failures.len() == active_rows.len();
             if !failures.is_empty() {

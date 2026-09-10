@@ -914,12 +914,15 @@ route is the one spelling that silently executes a single set, and
 `SQLGetDescField` and `SQLGetStmtAttr` can disagree about the same logical
 value.
 
-Only 1 is partly a decision: matching msodbcsql's "send nothing" needs a
-validation pre-pass over every set, costing the streaming serializer that buys
-the perf parity above. The *return code* is deliberately not copied -
-msodbcsql's `SQL_ERROR` is a total-failure code, correct there because nothing
-ran, and reporting it over committed rows would invite a retry that
-double-inserts. The rest are gaps.
+Only 1 is partly a decision: `stage_execution` already walks every
+`(row, parameter)` pair once for the input-only and data-at-execution
+refusals, so the pass itself is not what streaming avoids. Matching
+msodbcsql's "send nothing" needs a *second* pass - converting and
+materializing every set - before any of it reaches the wire, which is what
+the streaming serializer skips to buy the perf parity above. The *return
+code* is deliberately not copied - msodbcsql's `SQL_ERROR` is a total-failure
+code, correct there because nothing ran, and reporting it over committed
+rows would invite a retry that double-inserts. The rest are gaps.
 
 1-4 are pinned by `param_array_test.cpp` cases gated with
 `SKIP_IF_COMPARING_MSODBCSQL()`; 5 by
