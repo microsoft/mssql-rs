@@ -1167,3 +1167,61 @@ TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthIsCollectedAndDeclaredCh
     EXPECT_EQ("char/3", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
+
+TEST_F(CharConversionLiveTest, DataAtExecutionFixedWidthOverflowIs22001OnSecondChunk) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_CHAR, 4, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    SQLCHAR first[] = {'a', 'b'};
+    SQLCHAR second[] = {'c', 'd', 'e'};
+    ASSERT_SQL_OK(SQLPutData(stmt_, first, sizeof(first)), SQL_HANDLE_STMT,
+                  stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, second, sizeof(second)));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22001");
+}
+
+TEST_F(CharConversionLiveTest, DataAtExecutionBoundedFixedWidthReassemblesSplitUtf8) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_WCHAR, 4, 0, &token, 0, &ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+
+    SQLCHAR first[] = {'c', 'a', 'f', 0xC3};
+    SQLCHAR second[] = {0xA9};
+    ASSERT_SQL_OK(SQLPutData(stmt_, first, sizeof(first)), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLPutData(stmt_, second, sizeof(second)), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLWCHAR value[8] = {0};
+    SQLLEN value_len = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_WCHAR, value, sizeof(value),
+                             &value_len),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLWCHAR expected[] = {'c', 'a', 'f', 0x00E9};
+    ASSERT_EQ(sizeof(expected), static_cast<size_t>(value_len));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(SQLWCHAR); ++i) {
+        EXPECT_EQ(expected[i], value[i]) << "code unit " << i;
+    }
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}

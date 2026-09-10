@@ -644,6 +644,37 @@ TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDataAtExecutionSequence) {
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
+TEST_F(PrepareExecuteLiveTest, SQLCancelAbandonsDeferredDataAtExecutionSequence) {
+    ASSERT_SQL_OK(Prepare("SELECT ? AS v"), SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_CHAR, 4, 0, &token, 0, &buffered_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&token, value_ptr);
+
+    char partial[] = "ab";
+    ASSERT_SQL_OK(SQLPutData(stmt_, partial, 2), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_ERROR, SQLPutData(stmt_, partial, 2));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY010");
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    char complete[] = "done";
+    ASSERT_SQL_OK(SQLPutData(stmt_, complete, 4), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("done", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
 // The same cancel once a chunk has crossed a packet boundary. This is the one
 // event that strands *both* drivers, so it is the parity case for the
 // retraction: msodbcsql takes BATCHCTX::Cancel's STATE_BATCH_PARTIALCMDSENT arm
@@ -720,6 +751,43 @@ TEST_F(PrepareExecuteLiveTest, DataAtExecutionNullParam) {
 
     ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ("was-null", GetColumnChar(1));
+    EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+}
+
+TEST_F(PrepareExecuteLiveTest, BufferedNullPrecedesAStreamedValue) {
+    ASSERT_SQL_OK(Prepare("SELECT COALESCE(CONVERT(VARCHAR(16), ?), 'was-null')"
+                          " + '/' + ? AS v"),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN buffered_ind = SQL_DATA_AT_EXEC;
+    SQLLEN streamed_ind = SQL_DATA_AT_EXEC;
+    SQLCHAR buffered_token = 0;
+    SQLCHAR streamed_token = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_CHAR, 8, 0, &buffered_token, 0,
+                                   &buffered_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_VARCHAR, 0, 0, &streamed_token, 0,
+                                   &streamed_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLExecute(stmt_));
+    SQLPOINTER value_ptr = nullptr;
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&buffered_token, value_ptr);
+    char dummy = 0;
+    ASSERT_SQL_OK(SQLPutData(stmt_, &dummy, SQL_NULL_DATA), SQL_HANDLE_STMT,
+                  stmt_);
+
+    ASSERT_EQ(SQL_NEED_DATA, SQLParamData(stmt_, &value_ptr));
+    ASSERT_EQ(&streamed_token, value_ptr);
+    char streamed[] = "tail";
+    ASSERT_SQL_OK(SQLPutData(stmt_, streamed, 4), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLParamData(stmt_, &value_ptr), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ("was-null/tail", GetColumnChar(1));
     EXPECT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
 }
 
