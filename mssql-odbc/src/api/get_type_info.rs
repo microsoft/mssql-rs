@@ -489,6 +489,52 @@ mod tests {
         );
     }
 
+    /// The `SQLGetTypeInfo` counterpart to `catalog.rs`'s
+    /// `catalog_query_timeout_exhausted_by_unprepare_fails_before_sending`:
+    /// a swallowed best-effort unprepare timeout must leave the budget
+    /// exhausted and stop the call before the type-info RPC is sent.
+    #[test]
+    fn get_type_info_query_timeout_exhausted_by_unprepare_fails_before_sending() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // A sanity bound, not the discriminator: the call must finish far
+        // inside the server's delay. What this test actually pins down is the
+        // budget-exhausted arm itself — a bypassed deduction also fails fast
+        // here, so that would not show up as a timing difference.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_get_type_info_w_safe(h.stmt, stmt, SQL_ALL_TYPES);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLGetTypeInfoW took {elapsed:?} — the {STMT_TIMEOUT_SECS}s budget was already spent \
+             by the unprepare, so the type-info RPC must not have been sent at all"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "an exhausted budget must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
     #[test]
     fn exported_wrapper_forwards_to_impl() {
         // Exercise the extern "C" entrypoint (init_tracing + delegation) rather

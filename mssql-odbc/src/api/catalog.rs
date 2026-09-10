@@ -1942,6 +1942,58 @@ mod tests {
         );
     }
 
+    /// A best-effort `sp_unprepare` that eats the whole `SQL_ATTR_QUERY_TIMEOUT`
+    /// must stop the catalog call, not let it proceed unbounded.
+    ///
+    /// `flush_pending_unprepare` swallows its own timeout (a leaked handle must
+    /// not fail the caller), so it is the one pre-execute step that can survive
+    /// exhausting the budget — which is exactly why every call site re-checks
+    /// with `deduct_query_timeout` afterwards. This drives that arm: the
+    /// statement is armed with a pending unprepare, the mock holds the RPC well
+    /// past the budget, and the call must report `HYT00` *before* sending the
+    /// catalog procedure rather than starting it with no bound.
+    #[test]
+    fn catalog_query_timeout_exhausted_by_unprepare_fails_before_sending() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // A sanity bound, not the discriminator: the call must finish far
+        // inside the server's delay. What this test actually pins down is the
+        // budget-exhausted arm itself — a bypassed deduction also fails fast
+        // here, so that would not show up as a timing difference.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_tables_w_safe(h.stmt, stmt, None, None, None, None);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLTablesW took {elapsed:?} — the {STMT_TIMEOUT_SECS}s budget was already spent by \
+             the unprepare, so the catalog RPC must not have been sent at all"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "an exhausted budget must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
     /// `SQL_ATTR_QUERY_TIMEOUT` must bound catalog functions, not just
     /// `SQLExecute`/`SQLExecDirectW`. msodbcsql executes every catalog
     /// procedure through `SQLExecDirectW` itself (`sqlcdd.cpp:1866`), so they

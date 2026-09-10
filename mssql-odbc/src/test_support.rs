@@ -303,6 +303,33 @@ impl MockServer {
     }
 }
 
+/// Arms `stmt` with a pending `sp_unprepare` that will actually reach the wire.
+///
+/// `flush_pending_unprepare` runs before every statement-scoped operation and
+/// is deliberately best-effort: it logs a failure — including a timeout — and
+/// returns normally. That is exactly why each call site re-checks the budget
+/// afterwards, and it is the only step whose timeout can be *survived*, so it
+/// is the one way a test can reach those "budget exhausted before the statement
+/// could be sent" arms deterministically rather than by racing a stopwatch.
+///
+/// `TdsClient::unprepare` skips the round trip when it holds no handle for the
+/// id, so the handle is registered on the live client and the id it issues is
+/// parked on the statement.
+pub(crate) fn arm_pending_unprepare(
+    dbc: &crate::handles::dbc::DbcHandle,
+    stmt: &crate::handles::StmtHandle,
+) {
+    let statement_id = {
+        let mut dbc_state = dbc.inner.lock().unwrap();
+        dbc_state
+            .client
+            .as_mut()
+            .expect("connect_mock_server installs a live client")
+            .register_prepared_handle_for_test(1)
+    };
+    stmt.inner.lock().unwrap().pending_unprepare = Some(statement_id);
+}
+
 impl Drop for MockServer {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {

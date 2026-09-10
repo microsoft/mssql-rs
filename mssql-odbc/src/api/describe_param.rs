@@ -948,6 +948,67 @@ mod tests {
         );
     }
 
+    /// The `SQLDescribeParam` counterpart to `catalog.rs`'s
+    /// `catalog_query_timeout_exhausted_by_unprepare_fails_before_sending`:
+    /// a swallowed best-effort unprepare timeout must leave the budget
+    /// exhausted and stop the call before the metadata RPC is sent.
+    #[test]
+    fn describe_param_query_timeout_exhausted_by_unprepare_fails_before_sending() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // A sanity bound, not the discriminator: the call must finish far
+        // inside the server's delay. What this test actually pins down is the
+        // budget-exhausted arm itself — a bypassed deduction also fails fast
+        // here, so that would not show up as a timing difference.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+            });
+            state.query_timeout = STMT_TIMEOUT_SECS;
+        }
+
+        let started = Instant::now();
+        let rc = sql_describe_param_safe(
+            h.stmt,
+            stmt,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLDescribeParam took {elapsed:?} — the {STMT_TIMEOUT_SECS}s budget was already \
+             spent by the unprepare, so the metadata RPC must not have been sent at all"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "an exhausted budget must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
     #[test]
     fn invalid_ordinal_returns_07009_without_io() {
         let h = TestHandles::with_env_dbc_stmt();
