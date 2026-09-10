@@ -218,7 +218,8 @@ def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):
     git(checkout.parent, "clone", str(remote), str(checkout))
     scripts = checkout / ".pipeline" / "scripts"
     scripts.mkdir(parents=True)
-    shutil.copy2(_ROOT / ".pipeline" / "scripts" / "verify-python-wheels.ps1", scripts)
+    for filename in ("get-python-release-metadata.ps1", "verify-python-wheels.ps1"):
+        shutil.copy2(_ROOT / ".pipeline" / "scripts" / filename, scripts)
     wheels = workspace / "officialBuild" / "drop" / "wheels"
     wheels.mkdir(parents=True)
     originals = write_wheel_matrix(wheels)
@@ -239,10 +240,8 @@ def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):
     )
     agent_temp = tmp_path / "agent-temp"
     agent_temp.mkdir()
-    script = (
-        script.replace("$(Pipeline.Workspace)", str(workspace))
-        .replace("$(Agent.TempDirectory)", str(agent_temp))
-        .replace("$(resources.pipeline.officialBuild.runID)", "123")
+    script = script.replace("$(Pipeline.Workspace)", str(workspace)).replace(
+        "$(Agent.TempDirectory)", str(agent_temp)
     )
     result = subprocess.run(
         ["pwsh", "-NoProfile", "-Command", script],
@@ -254,6 +253,7 @@ def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):
             **os.environ,
             "OFFICIAL_BUILD_SOURCE_COMMIT": selected,
             "OFFICIAL_BUILD_SOURCE_BRANCH": "refs/heads/stable",
+            "OFFICIAL_BUILD_RUN_ID": "123",
         },
     )
     return result, originals, agent_temp / "pypi-publish", selected
@@ -516,6 +516,32 @@ def test_missing_commit_does_not_use_checkout(source_repositories, tmp_path):
     result = read_metadata(checkout, "0" * 40, tmp_path)
     assert result.returncode != 0
     assert "was not found after fetching" in result.stderr
+
+
+def test_metadata_rejects_commit_outside_selected_branch(source_repositories, tmp_path):
+    _, checkout, _ = source_repositories
+    git(checkout, "checkout", "--orphan", "unrelated")
+    git(checkout, "rm", "-rf", ".")
+    (checkout / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    git(checkout, "add", ".")
+    git(
+        checkout,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Unrelated commit",
+    )
+    unrelated = git(checkout, "rev-parse", "HEAD")
+
+    result = read_metadata(checkout, unrelated, tmp_path)
+
+    assert result.returncode != 0
+    assert "reachable from refs/heads/main" in result.stderr
 
 
 def test_missing_git_context_fails_explicitly(source_repositories, tmp_path):

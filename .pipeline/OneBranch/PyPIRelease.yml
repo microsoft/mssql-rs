@@ -120,37 +120,14 @@ extends:
               throw "Official Build artifacts not found: $artifactRoot"
             }
 
-            $commitSha = $env:OFFICIAL_BUILD_SOURCE_COMMIT
-            $sourceBranch = $env:OFFICIAL_BUILD_SOURCE_BRANCH
-            if ($commitSha -notmatch '^[0-9a-fA-F]{40}$') {
-              throw "Selected build commit is not a full Git SHA: $commitSha"
-            }
-            if ([string]::IsNullOrWhiteSpace($sourceBranch)) {
-              throw 'Selected build source branch is empty.'
-            }
-            git -C $repoRoot fetch origin $sourceBranch
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not fetch selected build branch $sourceBranch"
-            }
-            git -C $repoRoot cat-file -e "${commitSha}^{commit}"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Selected build commit $commitSha was not found on $sourceBranch"
-            }
-            git -C $repoRoot merge-base --is-ancestor $commitSha FETCH_HEAD
-            if ($LASTEXITCODE -ne 0) {
-              throw "Selected build commit $commitSha is not reachable from $sourceBranch"
-            }
-
-            $pyprojectLines = & git -C $repoRoot show "${commitSha}:mssql-py-core/pyproject.toml"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not read pyproject.toml from selected build commit $commitSha"
-            }
-            $pyproject = $pyprojectLines -join "`n"
-            if ($pyproject -notmatch '(?ms)^\[project\]\s*$.*?^name\s*=\s*"([^"]+)".*?^version\s*=\s*"([^"]+)"') {
-              throw 'Could not extract Python distribution name and version from selected build commit.'
-            }
-            $distributionName = $Matches[1]
-            $distributionVersion = $Matches[2]
+            $metadata = & "$repoRoot/.pipeline/scripts/get-python-release-metadata.ps1" `
+              -RepositoryDirectory $repoRoot `
+              -CommitSha $env:OFFICIAL_BUILD_SOURCE_COMMIT `
+              -SourceBranch $env:OFFICIAL_BUILD_SOURCE_BRANCH `
+              -IncludeWheelMetadata
+            $commitSha = $metadata.SourceCommit
+            $distributionName = $metadata.DistributionName
+            $distributionVersion = $metadata.PythonVersion
             if ($distributionName -ne 'mssql-python-rs') {
               throw "Selected build contains '$distributionName', expected 'mssql-python-rs'."
             }
@@ -185,17 +162,15 @@ extends:
               -ExpectedName $distributionName `
               -ExpectedVersion $distributionVersion `
               -RequireOdbc
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Official wheel validation failed.'
-            }
 
-            Write-Host "Selected Official Build: $(resources.pipeline.officialBuild.runID)"
+            Write-Host "Selected Official Build: $env:OFFICIAL_BUILD_RUN_ID"
             Write-Host "Selected source commit: $commitSha"
             Write-Host "Staged $($wheels.Count) $distributionName $distributionVersion wheels unchanged."
           displayName: 'Verify and stage official wheels'
           env:
             OFFICIAL_BUILD_SOURCE_COMMIT: $(resources.pipeline.officialBuild.sourceCommit)
             OFFICIAL_BUILD_SOURCE_BRANCH: $(resources.pipeline.officialBuild.sourceBranch)
+            OFFICIAL_BUILD_RUN_ID: $(resources.pipeline.officialBuild.runID)
 
         - ${{ if eq(parameters.publishToPyPI, true) }}:
           - task: EsrpRelease@9
