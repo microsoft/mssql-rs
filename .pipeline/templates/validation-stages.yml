@@ -127,8 +127,8 @@ stages:
       # Unit-test wheel packaging scripts on PR runs; the packaging pipeline
       # steps themselves are non-PR gated.
       - pwsh: |
-          python -m pip install --quiet pytest
-          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py -q
+          python -m pip install --quiet pytest pyyaml
+          python -m pytest scripts/test_inject_odbc.py scripts/test_verify_python_wheels.py scripts/test_release_pipeline.py -q
         displayName: 'Unit test Python wheel packaging scripts'
       - template: build-template.yml
         parameters:

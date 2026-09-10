@@ -96,6 +96,8 @@ extends:
     ###########################################################################
     - stage: Release
       displayName: 'Release NuGet Package'
+      dependsOn: []
+      condition: and(succeeded(), ${{ eq(parameters.publishNuGet, true) }})
       jobs:
       - job: PublishRelease
         displayName: 'Download Build Artifacts and Publish'
@@ -104,11 +106,9 @@ extends:
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           ob_nugetPublishing_enabled: ${{ parameters.publishNuGet }}
+          ob_git_fetchDepth: 0
+          ob_git_persistCredentials: true
         steps:
-        - checkout: self
-          persistCredentials: true
-          fetchDepth: 0
-
         #####################################################################
         # Step 1: Download NuGet artifact from the Official Build pipeline
         #####################################################################
@@ -146,40 +146,16 @@ extends:
         - pwsh: |
             $ErrorActionPreference = 'Stop'
 
-            $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
-            $sourceBranch = "$(resources.pipeline.officialBuild.sourceBranch)"
-            git fetch origin $sourceBranch
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not fetch selected build branch $sourceBranch"
-            }
-            git cat-file -e "${commitSha}^{commit}"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Selected build commit $commitSha was not found on $sourceBranch"
-            }
-            function Get-BuildSourceFile {
-              param([string]$Path)
-
-              $content = & git show "${commitSha}:$Path"
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not read $Path from selected build commit $commitSha"
-              }
-              return $content -join "`n"
-            }
-
-            $cargoToml = Get-BuildSourceFile "mssql-py-core/Cargo.toml"
-            if ($cargoToml -notmatch '(?ms)^\[package\]\s*$.*?^version\s*=\s*"([^"]+)"') {
-              throw "Could not extract [package].version from selected build commit"
-            }
+            $metadata = & "$(Build.SourcesDirectory)/.pipeline/scripts/get-python-release-metadata.ps1" `
+              -RepositoryDirectory "$(Build.SourcesDirectory)" `
+              -CommitSha "$(resources.pipeline.officialBuild.sourceCommit)" `
+              -SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)" `
+              -IncludeWheelMetadata
+            $commitSha = $metadata.SourceCommit
             # Official release: clean semver, no prerelease suffix
-            $packageVersion = $Matches[1]
-
-            $pyprojectToml = Get-BuildSourceFile "mssql-py-core/pyproject.toml"
-            if ($pyprojectToml -notmatch '(?ms)^\[project\]\s*$.*?^name\s*=\s*"([^"]+)".*?^version\s*=\s*"([^"]+)"') {
-              throw "Could not extract [project] name and version from selected build commit"
-            }
-            $distributionName = $Matches[1]
-            $pythonVersion = $Matches[2]
-
+            $packageVersion = $metadata.Version
+            $distributionName = $metadata.DistributionName
+            $pythonVersion = $metadata.PythonVersion
             $shortSha = $commitSha.Substring(0, 8)
 
             Write-Host "Release version: $packageVersion"
@@ -226,6 +202,7 @@ extends:
             $nuspecContent | Out-File -FilePath $nuspecPath -Encoding utf8
             Write-Host "Created nuspec: $nuspecPath"
           displayName: 'Prepare release NuGet package'
+          workingDirectory: '$(Build.SourcesDirectory)'
 
         - task: NuGetCommand@2
           displayName: 'Create NuGet package'
@@ -240,11 +217,7 @@ extends:
             Get-ChildItem "$(ob_outputDirectory)/packages" -Filter *.nupkg | ForEach-Object {
               Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB, 2)) MB)"
             }
-            if ($${{ parameters.publishNuGet }}) {
-              Write-Host "NuGet WILL be published to feed (publishNuGet=true)"
-            } else {
-              Write-Host "DRY RUN — NuGet will NOT be published (publishNuGet=false)"
-            }
+            Write-Host "NuGet WILL be published to feed (publishNuGet=true)"
           displayName: 'Verify NuGet package'
 
     ###########################################################################
@@ -253,7 +226,7 @@ extends:
     - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
       - stage: ReleaseCrates
         displayName: 'Release Rust Crates'
-        dependsOn: Release
+        dependsOn: []
         jobs:
         - job: PublishRustCrates
           displayName: 'Publish Rust crates to crates.io'
@@ -267,8 +240,6 @@ extends:
           - name: ob_outputDirectory
             value: '$(Build.ArtifactStagingDirectory)'
           steps:
-          - checkout: self
-
           - download: officialBuild
             artifact: 'drop_Build_RustCrates'
             displayName: 'Download Rust crate artifacts'
@@ -365,7 +336,10 @@ extends:
     - ${{ if eq(parameters.tagRelease, true) }}:
       - stage: Tag
         displayName: 'Tag mssql-py-core Release'
-        dependsOn: Release
+        ${{ if eq(parameters.publishNuGet, true) }}:
+          dependsOn: Release
+        ${{ else }}:
+          dependsOn: []
         jobs:
         - job: TagAndBranch
           displayName: 'Git tag + release branch'
@@ -373,33 +347,18 @@ extends:
             type: windows
           variables:
             ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
+            ob_git_fetchDepth: 0
+            ob_git_persistCredentials: true
           steps:
-          - checkout: self
-            persistCredentials: true
-            fetchDepth: 0
-
           - pwsh: |
               $ErrorActionPreference = 'Stop'
 
-              $commitSha = "$(resources.pipeline.officialBuild.sourceCommit)"
-              $sourceBranch = "$(resources.pipeline.officialBuild.sourceBranch)"
-              git fetch origin $sourceBranch
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not fetch selected build branch $sourceBranch"
-              }
-              git cat-file -e "${commitSha}^{commit}"
-              if ($LASTEXITCODE -ne 0) {
-                throw "Selected build commit $commitSha was not found on $sourceBranch"
-              }
-              $cargoToml = & git show "${commitSha}:mssql-py-core/Cargo.toml"
-              if ($LASTEXITCODE -ne 0) {
-                throw "Could not read Cargo.toml from selected build commit $commitSha"
-              }
-              if (($cargoToml -join "`n") -match '(?ms)^\[package\]\s*$.*?^version\s*=\s*"([^"]+)"') {
-                $version = $Matches[1]
-              } else {
-                throw "Could not extract [package].version from selected build commit"
-              }
+              $metadata = & "$(Build.SourcesDirectory)/.pipeline/scripts/get-python-release-metadata.ps1" `
+                -RepositoryDirectory "$(Build.SourcesDirectory)" `
+                -CommitSha "$(resources.pipeline.officialBuild.sourceCommit)" `
+                -SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)"
+              $commitSha = $metadata.SourceCommit
+              $version = $metadata.Version
 
               $tagName = "v$version"
               $branchName = "release/$version"
@@ -410,18 +369,18 @@ extends:
               Write-Host "Branch:     $branchName"
 
               # Create annotated tag on the build's source commit
-              git tag -a $tagName $commitSha -m "Release $version"
+              git -C "$(Build.SourcesDirectory)" tag -a $tagName $commitSha -m "Release $version"
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create tag"; exit 1 }
 
               # Create release branch from the tagged commit
-              git branch $branchName $commitSha
+              git -C "$(Build.SourcesDirectory)" branch $branchName $commitSha
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create branch"; exit 1 }
 
               # Push tag and branch
-              git push origin $tagName
+              git -C "$(Build.SourcesDirectory)" push origin $tagName
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to push tag"; exit 1 }
 
-              git push origin $branchName
+              git -C "$(Build.SourcesDirectory)" push origin $branchName
               if ($LASTEXITCODE -ne 0) { Write-Error "Failed to push branch"; exit 1 }
 
               Write-Host "====================================="
@@ -430,3 +389,4 @@ extends:
               Write-Host "  Branch: $branchName"
               Write-Host "====================================="
             displayName: 'Create git tag and release branch'
+            workingDirectory: '$(Build.SourcesDirectory)'

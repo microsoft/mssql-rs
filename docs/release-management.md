@@ -244,6 +244,40 @@ git push origin release/0.2.1
 3. Update `mssql-python` version (e.g., bump to `1.4.0`)
 4. Publish to PyPI
 
+### Releasing existing Official Build artifacts
+
+`.pipeline/OneBranch/OfficialPythonWheelsRelease.yml` consumes the selected
+`Official Python Wheels Build` run without rebuilding it. All release switches
+default to `false`.
+
+| Switch | Behavior |
+|---|---|
+| `publishNuGet` | Download and validate wheels, prepare and pack the NuGet package, then publish it. When false, the entire NuGet stage is skipped, not run as a dry run. |
+| `publishMssqlTds` | Select `mssql-tds` for crates.io publication through ESRP. |
+| `publishMssqlMockTds` | Select `mssql-mock-tds` for crates.io publication through ESRP. |
+| `validateCratesOnly` | Validate the crate artifact and run selected-crate preflights without ESRP publication. Can also validate the artifact with neither crate selected. |
+| `tagRelease` | Tag and branch the selected build's `mssql-py-core` version. This does not tag Rust crate versions. |
+
+The NuGet and Rust crate stages have no dependency on each other. Crate-only
+publication and validation do not download or validate wheels, and a NuGet
+failure does not block the crate stage. OneBranch's per-job policy validation
+still applies. When publishing both crates, the core must become available on
+crates.io before the mock is published; mock-only publication requires the core
+version to be available already.
+
+Tagging waits for NuGet only when `publishNuGet` is also selected. With NuGet
+disabled, `tagRelease` can run independently, and it never waits for Rust crate
+publication. Leaving all switches off performs no release work.
+
+NuGet and tag metadata come from the selected build's exact source commit, not
+the release pipeline's checkout or the current branch tip. A missing branch,
+commit, or required source file fails the operation without a checkout fallback.
+These jobs configure OneBranch's built-in checkout with `ob_git_fetchDepth` and
+`ob_git_persistCredentials`; do not add a second `checkout: self`. A duplicate
+checkout can relocate the repository while governed task restrictions prevent
+updating the source path. Git commands use the explicit source directory, and
+wheel validation and packaging remain inside the governed build container.
+
 ### Hotfix process
 
 If a critical bug is found after release:
@@ -272,6 +306,7 @@ Steps:
 |---|---|
 | `.pipeline/OneBranch/NonOfficialPythonWheelsPublish.yml` | Pipeline entry point (NonOfficial) — triggers, schedule, nugetPublishing config |
 | `.pipeline/OneBranch/stages.yml` | Build + Publish stages — 5 build jobs, NuGet packaging |
+| `.pipeline/OneBranch/OfficialPythonWheelsRelease.yml` | Independent opt-in NuGet and Rust crate releases from an existing Official Build, plus optional `mssql-py-core` tagging |
 | `.pipeline/templates/build-python-wheels-template.yml` | Shared wheel build template (manylinux, musllinux, Windows, macOS) |
 | `.pipeline/templates/install-dependencies.yml` | Dependency installation (Rust, Python, etc.) |
 | `.pipeline/templates/cargo-authenticate-template.yml` | Cargo registry authentication |
