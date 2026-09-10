@@ -270,7 +270,7 @@ against that build's source metadata, even when NuGet publishing is disabled.
 
 | Switch | Behavior |
 |---|---|
-| `publishNuGet` | Check the wheel NuGet version is absent, then revalidate wheels, pack and publish to `public/mssql-rs_Public`. When false, no NuGet registry requests or packaging occur; wheel download and validation still run. |
+| `publishNuGet` | Prepare, pack, verify and publish the NuGet package after wheel validation. When false, these NuGet-only steps are omitted; wheel download and validation still run. |
 | `publishMssqlTds` | Select `mssql-tds` for crates.io publication through ESRP. |
 | `publishMssqlMockTds` | Select `mssql-mock-tds` for crates.io publication through ESRP. |
 | `validateCratesOnly` | Validate the crate artifact and run selected-crate preflights without ESRP publication. Can also validate the artifact with neither crate selected. |
@@ -292,37 +292,19 @@ and post-publication waits are omitted. Selected versions must still be absent,
 and mock-only still requires its existing core dependency. Selecting both crates
 for validation does not wait for an unpublished proposed core version.
 
-Registry HTTP requests run only in read-only custom Windows jobs on the
+Crates.io HTTP requests run only in read-only custom Windows jobs on the
 `Azure Pipelines` pool (`windows-2022`), supported by GovernedTemplates'
 `Windows.Custom.Job.yml`. Those jobs run without a container or a user-specified
 `target: host`; policy validation and the prohibition on custom-pool release
 tasks remain enabled. They receive no ESRP variable group or release service
-connection. Offline validation, wheel packaging, and ESRP publication remain
+connection. Offline crate validation and ESRP publication remain
 governed. ESRP waits for completion; the network availability job then confirms
 that consumers can resolve the crate before a dependent publication starts.
 
 Every Rust job re-downloads `drop_Build_RustCrates` from the same immutable
 `resources.pipeline.officialBuild` run and checks the original manifest, archive
 hashes, and mock dependency. Publishers do not consume files produced by registry
-jobs. The NuGet gate receives the validated distribution version through the
-`ValidateWheels` job's named output variable; the publisher independently
-downloads and validates the original wheels against the selected source commit.
-No job relies on another job's filesystem or job-local variables.
-
-The Python branch is `ValidateWheels -> NuGetPreflight -> PublishNuGet` when
-publication is selected. Its destination is the wheel transport package
-`mssql-python-rs-wheels` in the public Azure Artifacts NuGet feed, not a new
-`mssql-py-core` crates.io or PyPI release. The separate PyPI stub-reservation
-pipeline is unchanged. Official NuGet release versions must be clean
-three-component versions from `pyproject.toml`.
-
-Preflights reject existing versions and fail on authentication, unexpected HTTP,
-malformed NuGet responses, and transport errors; errors never mean "absent".
-Crate availability uses bounded retries for 404, 429, 5xx, and transport failures.
-Preflight is not a lock: another pipeline may publish the same version afterward.
-Official NuGet publication therefore uses `continueOnConflict: false`, and
-crates.io continues to enforce immutability through ESRP. Neither path silently
-skips published packages on retry. Development and sandbox behavior is unchanged.
+jobs. No crate job relies on another job's filesystem or job-local variables.
 
 Tagging always waits for successful wheel validation, plus NuGet publication when
 `publishNuGet` is selected. It never waits for Rust crate publication. Leaving all
@@ -343,8 +325,7 @@ does not inject a checkout.
 For release-pipeline changes, use the ADO Preview API first to inspect expanded
 gates and OneBranch policy/checkout settings without queuing a run. Preview proves
 the selected agent context, not runtime pool authorization or registry reachability.
-Once a live
-run is authorized, select a known successful Official Build and leave all switches
+Once a live run is authorized, select a known successful Official Build and leave all switches
 off to exercise genuine artifacts in the governed container without publishing.
 Local regression tests also cover missing wheels, incorrect names/versions,
 missing ODBC payloads, and exact-source metadata failures.

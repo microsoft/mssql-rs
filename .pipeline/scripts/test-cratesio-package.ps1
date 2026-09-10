@@ -51,8 +51,7 @@ for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Write-Host "$CrateName@$Version is available on crates.io."
         return
     }
-    if ($statusCode -ne 404 -and $statusCode -ne 429 -and
-        ($statusCode -lt 500 -or $statusCode -gt 599)) {
+    if ($statusCode -ne 404 -and $statusCode -ne 429 -and $statusCode -lt 500) {
         throw "crates.io returned HTTP $statusCode for $uri"
     }
 

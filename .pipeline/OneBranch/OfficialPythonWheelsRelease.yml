@@ -88,64 +88,107 @@ extends:
     nugetPublishing:
       feeds:
       - name: public/mssql-rs_Public
-        continueOnConflict: false
+        continueOnConflict: true
 
     stages:
     ###########################################################################
-    # Python is independent of Rust. Only selected publication contacts NuGet.
+    # Stage 1: Always validate wheels; optionally package and publish NuGet
     ###########################################################################
     - stage: Release
       displayName: 'Validate Wheels and Optionally Publish NuGet'
       dependsOn: []
       jobs:
-      - job: ValidateWheels
-        displayName: 'Validate Official Wheels'
+      - job: PublishRelease
+        displayName: 'Validate Official Wheels and Optionally Publish'
         pool:
           type: windows
         variables:
           ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-          ob_nugetPublishing_enabled: false
+          ob_nugetPublishing_enabled: ${{ parameters.publishNuGet }}
           ob_git_fetchDepth: 0
           ob_git_persistCredentials: true
         steps:
-        - template: ../templates/validate-release-wheels.yml
+        #####################################################################
+        # Step 1: Download artifacts from the Official Build pipeline
+        #####################################################################
+        - download: officialBuild
+          displayName: 'Download all artifacts from Official Build'
+          # Downloads every artifact published by the selected build run
+          # (one per platform: Windows x64/ARM64, Linux x64/ARM64, macOS).
 
-      - ${{ if eq(parameters.publishNuGet, true) }}:
-        - job: NuGetPreflight
-          displayName: 'Check NuGet release version'
-          dependsOn: ValidateWheels
-          pool:
-            type: windows
-            isCustom: true
-            name: Azure Pipelines
-            vmImage: windows-2022
-          variables:
-            releaseVersion: $[ dependencies.ValidateWheels.outputs['wheelMetadata.releaseVersion'] ]
-          steps:
-          # Custom jobs do not inject a checkout; governed jobs below do.
-          - checkout: self
-          - pwsh: >
-              & "$(Build.SourcesDirectory)/.pipeline/scripts/test-nuget-release-version.ps1"
-              -Version "$(releaseVersion)"
-            displayName: 'Preflight wheel NuGet version'
+        #####################################################################
+        # Step 2: List and verify downloaded artifacts
+        #####################################################################
+        - pwsh: |
+            Write-Host "====================================="
+            Write-Host "Downloaded Artifacts from Build $(resources.pipeline.officialBuild.runID)"
+            Write-Host "Source commit: $(resources.pipeline.officialBuild.sourceCommit)"
+            Write-Host "====================================="
 
-        - job: PublishNuGet
-          displayName: 'Publish Official Wheel NuGet'
-          dependsOn: NuGetPreflight
-          pool:
-            type: windows
-          variables:
-            ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
-            ob_nugetPublishing_enabled: true
-            ob_git_fetchDepth: 0
-            ob_git_persistCredentials: true
-          steps:
-          - template: ../templates/validate-release-wheels.yml
+            $artifactPath = "$(Pipeline.Workspace)/officialBuild"
+            if (Test-Path $artifactPath) {
+              Get-ChildItem -Path $artifactPath -Recurse | ForEach-Object {
+                $size = [math]::Round($_.Length / 1KB, 1)
+                Write-Host "  $($_.FullName.Replace($artifactPath, ''))  ($size KB)"
+              }
+            } else {
+              Write-Error "Artifact directory not found: $artifactPath"
+              exit 1
+            }
+          displayName: 'List downloaded artifacts'
+
+        #####################################################################
+        # Step 3: Validate wheels against the selected build's exact source
+        #####################################################################
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+
+            $metadata = & "$(Build.SourcesDirectory)/.pipeline/scripts/get-python-release-metadata.ps1" `
+              -RepositoryDirectory "$(Build.SourcesDirectory)" `
+              -CommitSha "$(resources.pipeline.officialBuild.sourceCommit)" `
+              -SourceBranch "$(resources.pipeline.officialBuild.sourceBranch)" `
+              -IncludeWheelMetadata
+            $commitSha = $metadata.SourceCommit
+            $distributionName = $metadata.DistributionName
+            $pythonVersion = $metadata.PythonVersion
+            # NuGet transports the wheels and therefore uses their distribution
+            # version, independent of the Rust crate version used for tagging.
+            $packageVersion = $pythonVersion
+
+            Write-Host "Release version: $packageVersion"
+            Write-Host "Source commit: $commitSha"
+            Write-Host "Build run: $(resources.pipeline.officialBuild.runID)"
+
+            # Collect wheels
+            $wheelsDir = "$(Build.StagingDirectory)/wheels"
+            New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
+            $wheels = Get-ChildItem "$(Pipeline.Workspace)/officialBuild" -Filter *.whl -Recurse |
+              Where-Object { $_.FullName -match '[\\/]+wheels[\\/][^\\/]+\.whl$' }
+            if ($wheels.Count -eq 0) {
+              Write-Error "No wheels found to validate. Aborting."
+              exit 1
+            }
+            $wheels | Copy-Item -Destination $wheelsDir -Force
+            Write-Host "Collected $($wheels.Count) wheels"
+
+            & "$(Build.SourcesDirectory)/.pipeline/scripts/verify-python-wheels.ps1" `
+              -WheelsDir $wheelsDir `
+              -ExpectedName $distributionName `
+              -ExpectedVersion $pythonVersion `
+              -RequireOdbc:$true
+
+            Write-Host "##vso[task.setvariable variable=releaseVersion]$packageVersion"
+            Write-Host "##vso[task.setvariable variable=sourceCommit]$commitSha"
+            Write-Host "##vso[task.setvariable variable=releaseDistributionName]$distributionName"
+          displayName: 'Validate official Python wheels'
+          workingDirectory: '$(Build.SourcesDirectory)'
+
+        - ${{ if eq(parameters.publishNuGet, true) }}:
           - pwsh: |
               $ErrorActionPreference = 'Stop'
-              $packageVersion = "$(wheelMetadata.releaseVersion)"
-              $distributionName = "$(wheelMetadata.releaseDistributionName)"
-              $shortSha = "$(wheelMetadata.sourceCommit)".Substring(0, 8)
+              $packageVersion = "$(releaseVersion)"
+              $distributionName = "$(releaseDistributionName)"
+              $shortSha = "$(sourceCommit)".Substring(0, 8)
 
               $nuspecContent = @"
               <?xml version="1.0"?>
