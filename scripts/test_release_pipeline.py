@@ -77,8 +77,8 @@ def expand(value, parameters):
                 result.append(expanded)
         return result
     if isinstance(value, dict):
-        if value.get("template") == "../templates/validate-release-crates.yml":
-            template = _PIPELINE.parent / value["template"]
+        if value.get("template") == "/.pipeline/templates/validate-release-crates.yml@self":
+            template = _ROOT / value["template"].removeprefix("/").removesuffix("@self")
             return expand(yaml.safe_load(template.read_text(encoding="utf-8"))["steps"], parameters)
         result = {}
         matched = False
@@ -109,6 +109,17 @@ def test_release_defaults_are_safe():
     assert pipeline["trigger"] == "none"
     assert pipeline["pr"] == "none"
     assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
+
+
+def test_crate_templates_resolve_in_self_repository():
+    # StageList steps are expanded inside GovernedTemplates, so relative paths
+    # without @self can resolve against the wrong repository.
+    templates = re.findall(
+        r"^\s*-\s*template:\s*(.*validate-release-crates.*)$",
+        _PIPELINE.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
 
 
 @pytest.mark.parametrize(

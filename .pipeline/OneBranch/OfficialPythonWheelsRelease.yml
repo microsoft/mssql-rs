@@ -242,7 +242,7 @@ extends:
           variables:
             ob_outputDirectory: '$(Build.ArtifactStagingDirectory)'
           steps:
-          - template: ../templates/validate-release-crates.yml
+          - template: /.pipeline/templates/validate-release-crates.yml@self
 
         - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true)) }}:
           - job: RegistryPreflight
@@ -255,7 +255,7 @@ extends:
               vmImage: windows-2022
             steps:
             - checkout: self
-            - template: ../templates/validate-release-crates.yml
+            - template: /.pipeline/templates/validate-release-crates.yml@self
 
             - ${{ if eq(parameters.publishMssqlTds, true) }}:
               - pwsh: >
@@ -298,7 +298,7 @@ extends:
             - name: ob_outputDirectory
               value: '$(Build.ArtifactStagingDirectory)'
             steps:
-            - template: ../templates/validate-release-crates.yml
+            - template: /.pipeline/templates/validate-release-crates.yml@self
             - task: EsrpRelease@12
               displayName: 'Publish mssql-tds to crates.io'
               inputs:
@@ -328,7 +328,7 @@ extends:
               vmImage: windows-2022
             steps:
             - checkout: self
-            - template: ../templates/validate-release-crates.yml
+            - template: /.pipeline/templates/validate-release-crates.yml@self
             - pwsh: >
                 & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
                 -CrateName 'mssql-tds'
@@ -353,7 +353,7 @@ extends:
             - name: ob_outputDirectory
               value: '$(Build.ArtifactStagingDirectory)'
             steps:
-            - template: ../templates/validate-release-crates.yml
+            - template: /.pipeline/templates/validate-release-crates.yml@self
             - task: EsrpRelease@12
               displayName: 'Publish mssql-mock-tds to crates.io'
               inputs:
@@ -383,7 +383,7 @@ extends:
               vmImage: windows-2022
             steps:
             - checkout: self
-            - template: ../templates/validate-release-crates.yml
+            - template: /.pipeline/templates/validate-release-crates.yml@self
             - pwsh: >
                 & "$(Build.SourcesDirectory)/.pipeline/scripts/test-cratesio-package.ps1"
                 -CrateName 'mssql-mock-tds'
