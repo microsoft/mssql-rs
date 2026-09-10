@@ -72,6 +72,7 @@ Tracing is disabled by default. Enable it with environment variables:
 |---|---|---|
 | `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing output |
 | `MSSQL_TDS_TRACE_LEVEL` | `warn` | Tracing filter expression (`tracing_subscriber::EnvFilter`) |
+| `MSSQL_TDS_TRACE_DIR` | unset | Non-empty directory for a per-process trace file; when unset, tracing uses stderr |
 
 Examples:
 
@@ -84,7 +85,21 @@ MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug" cargo btest -p
 
 # Full filter syntax is supported
 MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_LEVEL="warn,mssqlodbc=debug,mssql_tds=off" cargo btest -p mssqlodbc
+
+# Write to a timestamped file in an explicit directory
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_DIR=/var/log/myapp cargo btest -p mssqlodbc
+
+# Write to the current directory explicitly
+MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_DIR=. cargo btest -p mssqlodbc
 ```
+
+Trace filenames have the form `mssql_tds_trace_<timestamp>_<pid>.log`. Trace files can contain
+SQL text and parameter values; configure a directory whose permissions are appropriate for
+sensitive data. The driver warns when the configured directory is the system temporary directory
+and, on Unix, refuses directories writable by group or other users. Relative directories, including
+`.`, are resolved when the first ODBC call captures the configuration and are unaffected by later
+changes to the host process's current directory. Configuration cannot be changed while the driver
+remains loaded. Trace files are not rotated or removed automatically.
 
 ## Architecture
 
