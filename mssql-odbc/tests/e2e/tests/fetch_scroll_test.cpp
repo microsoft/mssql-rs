@@ -1095,17 +1095,24 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxDoesNotSplitASurrogatePair) {
     SQLCloseCursor(stmt_);
 }
 
-// Bound binary delivery is unimplemented for every type, not just the max ones
-// (AB#47239), so this asserts our own answer rather than parity -- msodbcsql
-// delivers it.
-TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
-    SKIP_IF_COMPARING_MSODBCSQL();
-    // Two rows and a trailing scalar: the refused target takes the drain path
-    // rather than the fill loop, so proving the row ended is not enough --
-    // the value after it, and the row after that, have to decode correctly.
+// Bound VARBINARY(MAX) delivery across a rowset with a trailing scalar, so a
+// mis-sized drain would corrupt the following column and row.
+TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
+    // Two rows and a trailing scalar: a bound LOB is drained into the caller's
+    // buffer, and the value after it -- and the row after that -- still have to
+    // decode, which is what a mis-sized drain would break.
+    //
+    // 1,100,000 bytes, not a few thousand: a value small enough to arrive inside
+    // the already-buffered wire bytes is materialized and delivered by the bound
+    // non-PLP path, which would leave deliver_bound_plp untested.
     ExecDirect(
-        "SELECT n, REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 5000) AS lob, n * 11 AS tail "
+        "SELECT n, CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 1100000) AS VARBINARY(MAX)) "
+        "AS lob, n * 11 AS tail "
         "FROM (VALUES (1),(2)) AS t(n) ORDER BY n");
+    SQLSMALLINT lobType = 0;
+    ASSERT_SQL_OK(SQLDescribeCol(stmt_, 2, nullptr, 0, nullptr, &lobType, nullptr, nullptr, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_VARBINARY, lobType);
 
     SQLINTEGER n = -1;
     unsigned char buf[32] = {};
@@ -1118,12 +1125,17 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxIsStillUnsupported) {
     ASSERT_SQL_OK(SQLBindCol(stmt_, 3, SQL_C_SLONG, &tail, sizeof(tail), &tailInd),
                   SQL_HANDLE_STMT, stmt_);
 
-    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
-    EXPECT_EQ(11, tail) << "the column after a refused LOB must still decode";
+    // The LOB does not fit, so the row truncates and reports the full length.
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
+    EXPECT_EQ(1, n);
+    EXPECT_EQ(1100000, ind) << "the untruncated byte count";
+    // Every byte of the slot is payload: a terminator would cost the last one.
+    for (size_t i = 0; i < sizeof(buf); ++i) {
+        EXPECT_EQ(0x41, buf[i]) << "byte " << i << " of the bound binary slot";
+    }
+    EXPECT_EQ(11, tail) << "the column after the LOB must still decode";
 
-    // And the next row too: a drain that stopped short would misread it.
-    EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_EQ(2, n);
     EXPECT_EQ(22, tail);
 

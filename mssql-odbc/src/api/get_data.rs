@@ -33,7 +33,7 @@ use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::fetch_convert::{
     convert_datetime_c, convert_float_c, convert_guid_c, convert_integer_c, date_parts,
     datetime2_parts, datetimeoffset_parts, extract_datetime_parts, format_datetime_parts,
-    is_datetime_c_target, is_float_c_target, is_integer_c_target, money_scaled, sql_string_to_text,
+    is_float_c_target, is_integer_c_target, is_typed_c_target, money_scaled, sql_string_to_text,
     time_parts,
 };
 use mssql_tds::datatypes::column_values::ColumnValues;
@@ -287,6 +287,12 @@ fn sql_get_data_safe(
     if let Some(row) = stmt_state.buffered_get_data_row.as_mut() {
         row.discard_before(col_index - 1);
         let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
+        // No partial-read offset to subtract here, unlike `write_captured_column`:
+        // a binary continuation leaves the value in `last_captured`, so it takes
+        // the `already_captured` branch above and never reaches this site. Any
+        // offset still set for this column belongs to a text continuation and is
+        // not in bytes.
+        //
         // Length and base type are lifted out of the row before any
         // `stmt_state` mutation, so the row borrow ends here.
         let probe = if binary_probe {
@@ -993,26 +999,20 @@ fn finish_get_data(
 /// Refusing costs nothing an application had before: the same call answered
 /// `HYC00` prior to AB#47815.
 ///
-/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which neither
-/// delivery path implements yet (AB#47239), so a real read keeps returning
-/// `HYC00` through the resolved target. That matches the posture the bound path
-/// took in AB#47481; msodbcsql resolves identically and delivers the bytes.
+/// A `varbinary` / `image` column resolves to `SQL_C_BINARY`, which both
+/// delivery paths now implement (AB#47239), so a real read through the resolved
+/// target returns the bytes, matching msodbcsql. The zero-length length probe
+/// works on both too: non-PLP through [`write_captured_column`]'s `binary_probe`,
+/// PLP through [`stream_active_plp_chunk`]. A NULL never enters the streaming
+/// path at all.
 ///
-/// **How much the resolved `SQL_C_BINARY` still answers depends on the path**,
-/// so the two are worth stating separately:
+/// Only kinds whose byte form is fixed by the value alone are delivered -- see
+/// [`column_value_to_bytes`]. A fixed-width scalar (`int`, `money`,
+/// `uniqueidentifier`, `date`) is still `HYC00`; that was never part of this
+/// target's contract here, and msodbcsql's own answers for those are
+/// inconsistent enough to need their own decision.
 ///
-/// - Non-PLP (`varbinary(n)`, `binary(n)`): the zero-length length probe works.
-///   [`write_captured_column`]'s `binary_probe` reports the byte count and
-///   leaves the value resident; only a read with a real buffer is `HYC00`.
-/// - PLP (`varbinary(max)`, `image`): even the probe is `HYC00`.
-///   [`stream_active_plp_chunk`] admits only `SQL_C_CHAR` / `SQL_C_WCHAR` and
-///   rejects everything else before it looks at `buffer_length`, so there is no
-///   probe branch to reach. A NULL is the exception — it never enters the
-///   streaming path at all.
-///
-/// Both are pre-existing for an explicit `SQL_C_BINARY` read; resolution only
-/// makes them reachable without the application naming the C type. The width
-/// check above never fires for either, since `SQL_C_BINARY` is
+/// The width check above never fires for `SQL_C_BINARY`, which is
 /// application-sized and so has no fixed width to test.
 fn resolve_default_target(
     stmt_state: &StmtState,
@@ -1122,11 +1122,14 @@ fn write_captured_column(
     // A zero-length SQL_C_BINARY read is a length probe rather than a data read;
     // mssql-python issues one per sql_variant column to expose the underlying
     // type to SQLColAttribute, and one per binary column on its Arrow fetch
-    // path. Binary data delivery is still unimplemented (AB#47239).
+    // path. It is kept separate from delivery because a zero-length read must
+    // report the length without consuming the value.
     let binary_probe = target_type == SQL_C_BINARY && buffer_length == 0;
     let typed_target = is_typed_c_target(target_type);
-    let deliverable_target =
-        typed_target || target_type == SQL_C_CHAR || target_type == SQL_C_WCHAR || binary_probe;
+    let deliverable_target = typed_target
+        || target_type == SQL_C_CHAR
+        || target_type == SQL_C_WCHAR
+        || target_type == SQL_C_BINARY;
 
     // Rejected before the value is borrowed, so it stays resident and the caller
     // can retry with a target this driver does deliver.
@@ -1161,7 +1164,12 @@ fn write_captured_column(
         // `SQLGetData(SQL_C_BINARY, NULL, 0)` with `SQL_SUCCESS_WITH_INFO` /
         // `01004` / indicator 9, while an empty `varbinary` answers
         // `SQL_SUCCESS` and reports `SQL_NO_DATA` on a repeat.
-        let available = binary_length(value);
+        let offset = stmt_state
+            .partial_text_offset
+            .filter(|(column, _)| *column == col_index)
+            .map(|(_, offset)| offset)
+            .unwrap_or(0);
+        let available = remaining_binary_length(value, offset);
         // SAFETY: `strlen_or_ind_ptr` is null or valid for one `SqlLen` write
         // per the SQLGetData contract.
         let rc = unsafe { answer_binary_probe(stmt_state, available, strlen_or_ind_ptr) };
@@ -1176,6 +1184,21 @@ fn write_captured_column(
         // Otherwise bytes remain and the value stays resident, so the caller can
         // grow its buffer and read it for real.
         return rc;
+    }
+
+    if target_type == SQL_C_BINARY {
+        // SAFETY: `target_value_ptr` is null or writable for `buffer_length`
+        // bytes per the SQLGetData contract, and `strlen_or_ind_ptr` is null or
+        // writable for one `SqlLen`. Neither aliases the captured value.
+        return unsafe {
+            deliver_captured_binary(
+                stmt_state,
+                col_index,
+                target_value_ptr,
+                buffer_length,
+                strlen_or_ind_ptr,
+            )
+        };
     }
 
     if typed_target {
@@ -1233,9 +1256,9 @@ fn write_captured_column(
     let as_text = match column_value_to_text(value) {
         Ok(t) => t,
         Err(TextError::Malformed) => {
-            // Leave the value resident so the column stays re-readable. There is no
-            // raw-bytes fallback today: SQL_C_BINARY only answers the zero-length
-            // probe, it does not deliver data (AB#47239).
+            // Leave the value resident so the column stays re-readable. A caller
+            // that wants the undecodable bytes can re-read the column as
+            // SQL_C_BINARY, which delivers them verbatim.
             error!("SQLGetData: column payload could not be decoded as text");
             post_diag(stmt_state, ERR_INVALID_CHARACTER_VALUE);
             return SQL_ERROR;
@@ -1607,7 +1630,7 @@ fn stream_active_plp_chunk<'a>(
     prepared_stream: Option<(PlpEncoding, usize, usize, bool)>,
     mut retained_stmt_state: Option<MutexGuard<'a, StmtState>>,
 ) -> SqlReturn {
-    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR {
+    if target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR && target_type != SQL_C_BINARY {
         if let Some(mut state) = retained_stmt_state.take() {
             post_sql_error(
                 &mut state,
@@ -1640,6 +1663,10 @@ fn stream_active_plp_chunk<'a>(
                 SQL_C_CHAR,
                 PlpEncoding::SingleByteText | PlpEncoding::Utf8Text | PlpEncoding::Utf16Text,
             ) => true,
+            // Mirrors the first-chunk gate: binary is the wire bytes whatever
+            // the encoding. The two must agree or a chunked read is admitted on
+            // its first call and refused on its second.
+            (SQL_C_BINARY, _) => true,
             _ => false,
         };
         if !compatible {
@@ -1729,8 +1756,8 @@ fn stream_active_plp_chunk<'a>(
         //   SQL_C_WCHAR  <- varchar(max)/json, widened through the column's
         //                   collation (or UTF-8 for json, which has none)
         //   SQL_C_CHAR   <- any of the three, as UTF-8
-        // Binary columns have no delivery path yet and return HYC00
-        // (AB#47239).
+        // Binary columns stream through this same loop, with no terminator
+        // and the raw wire bytes (AB#47239).
         //
         // Codepage note: as in the non-PLP path, SQL_C_CHAR output is UTF-8
         // unconditionally, where msodbcsql converts to the client codepage it
@@ -1750,6 +1777,10 @@ fn stream_active_plp_chunk<'a>(
                 SQL_C_CHAR,
                 Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text | PlpEncoding::Utf16Text),
             ) => true,
+            // Binary delivery is the wire bytes whatever the column holds, so
+            // every encoding qualifies -- varbinary(max) and image, and the UDT
+            // types (hierarchyid, geometry, geography) that arrive as PLP.
+            (SQL_C_BINARY, Some(_)) => true,
             _ => false,
         };
         if !compatible {
@@ -1785,6 +1816,9 @@ fn stream_active_plp_chunk<'a>(
     // target needs is set aside.
     let terminator_bytes = if target_type == SQL_C_WCHAR {
         std::mem::size_of::<SqlWChar>()
+    } else if target_type == SQL_C_BINARY {
+        // Binary is not a string: the whole buffer is payload.
+        0
     } else {
         1
     };
@@ -1871,8 +1905,13 @@ fn stream_active_plp_chunk<'a>(
         return SQL_ERROR;
     }
 
+    // The first binary read may discover an empty PLP value. Use temporary
+    // storage for that read so initializing a Rust byte slice cannot overwrite
+    // a caller buffer when no payload is delivered. Later chunks can stream
+    // directly because a prior read established that the value is non-empty.
     let direct_wire_output = max_read > 0
         && !target_value_ptr.is_null()
+        && !(target_type == SQL_C_BINARY && starting_new_stream)
         && matches!(
             (target_type, plp_encoding),
             (SQL_C_WCHAR, Some(PlpEncoding::Utf16Text))
@@ -1880,6 +1919,7 @@ fn stream_active_plp_chunk<'a>(
                     SQL_C_CHAR,
                     Some(PlpEncoding::SingleByteText | PlpEncoding::Utf8Text)
                 )
+                | (SQL_C_BINARY, Some(_))
         );
     let mut inline_payload = [0_u8; 256];
     let mut heap_payload = Vec::new();
@@ -2220,6 +2260,25 @@ fn stream_active_plp_chunk<'a>(
                 "UTF-16 to UTF-8 transcode made no forward progress"
             );
         };
+    } else if target_type == SQL_C_BINARY {
+        // Binary delivery is a straight byte copy with no terminator, whatever
+        // the column's encoding. The first chunk uses temporary storage so an
+        // empty value leaves the caller's buffer untouched; subsequent chunks
+        // are read directly into that buffer.
+        debug_assert!(
+            direct_wire_output || (starting_new_stream && !target_value_ptr.is_null()) || read == 0,
+            "binary chunk read {read} bytes without a caller buffer to put them in"
+        );
+        unsafe {
+            if !direct_wire_output && !target_value_ptr.is_null() {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    target_value_ptr.cast::<u8>(),
+                    read,
+                );
+            }
+            write_if_some(strlen_or_ind_ptr, read as SqlLen);
+        }
     } else {
         // SQL_C_CHAR delivery of a non-UTF-16 text PLP column: the wire bytes are
         // copied verbatim. `SingleByteText` and `Utf8Text` have identical bodies
@@ -2510,10 +2569,33 @@ pub(crate) enum TextError {
 }
 
 /// `true` for the C targets served by the shared conversion core in one call.
+/// Raw bytes a value delivers for `SQL_C_BINARY`, or `None` when this driver
+/// has no byte form for it.
+///
+/// Only the byte-shaped kinds are answered: these are the columns whose
+/// `SQL_C_BINARY` form is the payload itself, so there is nothing to decide.
+/// msodbcsql additionally converts the fixed-width kinds, and does so
+/// inconsistently -- `int` and `money` deliver their wire bytes, `date` and
+/// `datetime2` deliver the ODBC C *struct* (6 and 16 bytes), and `decimal` is
+/// refused outright with 22003. Guessing that per-type table is how a
+/// conversion silently goes wrong, so those keep returning `HYC00` until each
+/// is measured (AB#47239 follow-up).
+pub(crate) fn column_value_to_bytes(value: &ColumnValues) -> Option<&[u8]> {
+    match value {
+        ColumnValues::Bytes(b) => Some(b),
+        // The wire bytes, which is what msodbcsql delivers here: UTF-16LE for
+        // the wide types and codepage bytes for the narrow ones.
+        ColumnValues::String(s) => Some(&s.bytes),
+        ColumnValues::Xml(x) => Some(&x.bytes),
+        ColumnValues::Json(j) => Some(&j.bytes),
+        _ => None,
+    }
+}
+
 /// Byte count a value would occupy in its `SQL_C_BINARY` form, for the length
 /// probe. `SQL_NO_TOTAL` where the binary encoding is not fixed by the value
-/// alone — this driver does not deliver binary data yet (AB#47239), so there is
-/// no length to promise for those.
+/// alone, so there is no length to promise for those; `column_value_to_bytes`
+/// refuses the same kinds at delivery time.
 fn binary_length(value: &ColumnValues) -> SqlLen {
     let len = match value {
         ColumnValues::Bytes(b) => b.len(),
@@ -2528,6 +2610,92 @@ fn binary_length(value: &ColumnValues) -> SqlLen {
         _ => return SQL_NO_TOTAL,
     };
     SqlLen::try_from(len).unwrap_or(SqlLen::MAX)
+}
+
+fn remaining_binary_length(value: &ColumnValues, offset: usize) -> SqlLen {
+    let length = binary_length(value);
+    if length == SQL_NO_TOTAL || column_value_to_bytes(value).is_none() {
+        return length;
+    }
+    length.saturating_sub(SqlLen::try_from(offset).unwrap_or(SqlLen::MAX))
+}
+
+/// Delivers a captured column as `SQL_C_BINARY`, chunking across calls.
+///
+/// The contract is the one msodbcsql answers, measured against 18.6: the
+/// indicator carries the bytes remaining *before* this call rather than the
+/// bytes written, truncation is `01004` with the value left resident, and the
+/// final chunk returns `SQL_SUCCESS`. Binary carries no terminator, so the
+/// whole buffer is payload.
+///
+/// # Safety
+/// `target_value_ptr` is null or valid for `buffer_length` bytes;
+/// `strlen_or_ind_ptr` is null or valid for one `SqlLen`.
+unsafe fn deliver_captured_binary(
+    stmt_state: &mut StmtState,
+    col_index: usize,
+    target_value_ptr: SqlPointer,
+    buffer_length: SqlLen,
+    strlen_or_ind_ptr: *mut SqlLen,
+) -> SqlReturn {
+    let Some((_, value)) = stmt_state.last_captured.as_ref() else {
+        post_sql_error(
+            stmt_state,
+            SQLSTATE_24000,
+            0,
+            "Requested column is not available in the current row",
+        );
+        return SQL_ERROR;
+    };
+    let Some(bytes) = column_value_to_bytes(value) else {
+        // Left resident so a retry with a target this driver delivers can work.
+        post_sql_error(
+            stmt_state,
+            SQLSTATE_HYC00,
+            0,
+            "Target type not yet implemented for this column",
+        );
+        return SQL_ERROR;
+    };
+
+    let offset = stmt_state
+        .partial_text_offset
+        .filter(|(c, _)| *c == col_index)
+        .map(|(_, o)| o)
+        .unwrap_or(0)
+        .min(bytes.len());
+    let remaining = bytes.len() - offset;
+    let capacity = usize::try_from(buffer_length).unwrap_or(0);
+    let take = remaining.min(capacity);
+
+    if take > 0 && !target_value_ptr.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes[offset..].as_ptr(),
+                target_value_ptr.cast::<u8>(),
+                take,
+            );
+        }
+    }
+    unsafe {
+        write_if_some(
+            strlen_or_ind_ptr,
+            SqlLen::try_from(remaining).unwrap_or(SqlLen::MAX),
+        )
+    };
+
+    if take < remaining {
+        stmt_state.partial_text_offset = Some((col_index, offset + take));
+        stmt_state.direct_text_target = None;
+        post_diag(stmt_state, WARN_STRING_TRUNCATION);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
+    stmt_state.current_row_last_col = col_index;
+    stmt_state.last_captured = None;
+    stmt_state.partial_text_offset = None;
+    stmt_state.direct_text_target = None;
+    SQL_SUCCESS
 }
 
 /// Answers a zero-length `SQL_C_BINARY` length probe: writes the indicator and
@@ -2566,13 +2734,6 @@ unsafe fn answer_binary_probe(
     }
     post_diag(stmt_state, WARN_STRING_TRUNCATION);
     SQL_SUCCESS_WITH_INFO
-}
-
-pub(crate) fn is_typed_c_target(target_type: SqlSmallInt) -> bool {
-    is_integer_c_target(target_type)
-        || is_float_c_target(target_type)
-        || target_type == SQL_C_GUID
-        || is_datetime_c_target(target_type)
 }
 
 /// Routes a captured value to the matching converter.
@@ -4254,6 +4415,19 @@ mod tests {
     }
 
     #[test]
+    fn remaining_binary_length_applies_offsets_only_to_deliverable_bytes() {
+        assert_eq!(
+            remaining_binary_length(&ColumnValues::Bytes(vec![1, 2, 3, 4, 5]), 2),
+            3
+        );
+        assert_eq!(remaining_binary_length(&ColumnValues::Int(1), 2), 4);
+        assert_eq!(
+            remaining_binary_length(&ColumnValues::Null, 2),
+            SQL_NO_TOTAL
+        );
+    }
+
+    #[test]
     fn complete_buffered_strings_copy_only_for_matching_full_buffers() {
         use mssql_tds::datatypes::sql_string::SqlString;
 
@@ -4602,6 +4776,61 @@ mod tests {
             unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
         assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
         assert_eq!(ind, 9);
+    }
+
+    #[test]
+    fn get_data_binary_probe_after_a_partial_read_reports_remaining_bytes() {
+        let h = TestHandles::with_env_dbc_stmt();
+        stmt_with_captured(&h, ColumnValues::Bytes(b"asdfghjkl".to_vec()));
+
+        let mut out = [0_u8; 4];
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                out.as_mut_ptr().cast(),
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 9);
+        assert_eq!(&out, b"asdf");
+
+        let ret =
+            unsafe { sql_get_data(h.stmt, 1, SQL_C_BINARY, std::ptr::null_mut(), 0, &mut ind) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 5);
+
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                out.as_mut_ptr().cast(),
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        assert_eq!(ind, 5);
+        assert_eq!(&out, b"ghjk");
+
+        let ret = unsafe {
+            sql_get_data(
+                h.stmt,
+                1,
+                SQL_C_BINARY,
+                out.as_mut_ptr().cast(),
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 1);
+        assert_eq!(out[0], b'l');
     }
 
     /// `SQL_NO_TOTAL` is a third case, distinct from both a byte count and
@@ -5068,14 +5297,70 @@ mod tests {
         );
     }
 
-    /// The zero-length `SQL_C_BINARY` probe still works through the resolved
-    /// target: a `varbinary` column resolves to an application-sized C type, so
-    /// the width check has nothing to refuse. Since AB#47537 the probe reports
-    /// `01004` / `SQL_SUCCESS_WITH_INFO` when bytes are available but none were
-    /// written, so this pins the resolved path agreeing with that rule rather
-    /// than the plain `SQL_SUCCESS` it answered before.
+    /// `xml` and `json` arrive as their wire bytes, so `SQL_C_BINARY` hands
+    /// them over untouched rather than going through the text decode. The two
+    /// differ in encoding -- UTF-16LE for xml, UTF-8 for json -- which is
+    /// exactly why the raw form is worth pinning.
     #[test]
-    fn get_data_default_on_a_binary_column_answers_the_length_probe() {
+    fn column_value_to_bytes_passes_xml_and_json_through_verbatim() {
+        use mssql_tds::datatypes::column_values::SqlXml;
+        use mssql_tds::datatypes::sql_json::SqlJson;
+
+        let xml = ColumnValues::Xml(SqlXml {
+            bytes: vec![0x3C, 0x00, 0x61, 0x00],
+        });
+        assert_eq!(
+            column_value_to_bytes(&xml),
+            Some([0x3C, 0x00, 0x61, 0x00].as_slice()),
+            "xml delivers its UTF-16LE wire bytes"
+        );
+
+        let json = ColumnValues::Json(SqlJson {
+            bytes: b"{\"a\":1}".to_vec(),
+        });
+        assert_eq!(
+            column_value_to_bytes(&json),
+            Some(b"{\"a\":1}".as_slice()),
+            "json delivers its UTF-8 wire bytes"
+        );
+    }
+
+    /// A binary delivery with no value captured for the row is `24000`, not a
+    /// panic or a silent success. `SQLGetData` guards this earlier (an unfetched
+    /// column is `HY000` before dispatch), so the branch is exercised directly:
+    /// it is the contract for any future caller that reaches delivery without a
+    /// captured value.
+    #[test]
+    fn deliver_captured_binary_without_a_value_reports_24000() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut s = stmt_handle.inner.lock().unwrap();
+        s.last_captured = None;
+
+        let mut out = [0u8; 8];
+        let mut ind: SqlLen = -99;
+        let ret = unsafe {
+            deliver_captured_binary(
+                &mut s,
+                1,
+                out.as_mut_ptr() as SqlPointer,
+                out.len() as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_24000);
+    }
+
+    /// The zero-length `SQL_C_BINARY` probe and the read that follows it, both
+    /// through the resolved target: a `varbinary` column resolves to an
+    /// application-sized C type, so the width check has nothing to refuse.
+    /// Since AB#47537 the probe reports `01004` / `SQL_SUCCESS_WITH_INFO` when
+    /// bytes are available but none were written, so this pins the resolved
+    /// path agreeing with that rule rather than the plain `SQL_SUCCESS` it
+    /// answered before, and then pins the delivery AB#47239 added behind it.
+    #[test]
+    fn get_data_default_on_a_binary_column_delivers_through_the_probe() {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_captured_column(
             &h,
@@ -5110,7 +5395,8 @@ mod tests {
             );
         }
 
-        // Delivering the bytes for real is still unimplemented (AB#47239).
+        // The probe did not consume the value: the read behind it delivers all
+        // five bytes and reports the untruncated length (AB#47239).
         let ret = unsafe {
             sql_get_data(
                 h.stmt,
@@ -5121,10 +5407,9 @@ mod tests {
                 &mut ind,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let s = sh.inner.lock().unwrap();
-        assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HYC00);
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(ind, 5);
+        assert_eq!(&out[..5], &[1, 2, 3, 4, 5]);
     }
 
     /// AB#47507 regression: a NULL value with no indicator must be SQLSTATE

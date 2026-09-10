@@ -1,7 +1,7 @@
 #################################################################################
 #                        OneBranch Pipelines - Official                         #
-# Official build pipeline for Python wheels. Builds across all platforms       #
-# with SDL enforcement (BinSkim, CredScan, PoliCheck) and approval gates.     #
+# Official build pipeline for Python wheels and Rust crates. Builds across     #
+# all platforms with SDL enforcement and approval gates.                       #
 # This pipeline does NOT publish to any feed — publishing is handled by a      #
 # separate Release pipeline.                                                    #
 # Documentation:  https://aka.ms/obpipelines                                    #
@@ -51,4 +51,5 @@ extends:
         buildAllTargets: true
         buildPythonWheels: true
         buildOdbcNative: true
+        buildRustCrates: true
         isOfficial: true

@@ -24,6 +24,7 @@ use crate::api::odbc_types::{
     SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET,
     SQL_NEED_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen,
 };
+use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
     ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
 };
@@ -119,12 +120,16 @@ fn unwind_dae_inner(
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
+/// A pre-DAE truncation is posted before `SQL_NEED_DATA`, matching
+/// `AddRPCUserParameters` and its caller in `sqlccmd.cpp`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn park_dae_client(
     stmt: &StmtHandle,
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
     dae_params: Vec<DaeParam>,
+    fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -134,6 +139,9 @@ pub(super) fn park_dae_client(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
     SQL_NEED_DATA
 }
 
@@ -516,6 +524,9 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
+    /// Whether a parameter before the first DAE marker lost fractional digits.
+    /// With no DAE marker, covers the full parameter list.
+    pub(super) fractional_truncated: bool,
 }
 
 pub(super) enum ParamRowBuildError {
@@ -702,6 +713,7 @@ pub(super) unsafe fn build_named_params_for_row(
 
     let mut params = Vec::with_capacity(marker_count + usize::from(!named));
     let mut dae_params = Vec::new();
+    let mut fractional_truncated = false;
     for i in 0..marker_count {
         let Some(Some(bound_param)) = bound_params.get(i) else {
             return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
@@ -738,18 +750,45 @@ pub(super) unsafe fn build_named_params_for_row(
                 sql_type: bound_param.sql_type,
             });
         } else {
-            params.push(
+            let (param, outcome) =
                 unsafe { bound_param_to_rpc(name, &bound_param) }.map_err(|source| {
                     ParamRowBuildError::Conversion {
                         parameter: i + 1,
                         source,
                     }
-                })?,
-            );
+                })?;
+            if outcome == ConvOk::Truncated && dae_params.is_empty() {
+                fractional_truncated = true;
+            }
+            params.push(param);
         }
     }
 
-    Ok(ParamsWithDae { params, dae_params })
+    Ok(ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    })
+}
+
+pub(super) fn finish_execute_with_param_warning(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    client: TdsClient,
+    op: &str,
+    fractional_truncated: bool,
+) -> SqlReturn {
+    let rc = finish_execute(dbc, stmt, statement_handle, client, op);
+    if !fractional_truncated || !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
+        return rc;
+    }
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned posting parameter truncation");
+        return SQL_ERROR;
+    };
+    post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    SQL_SUCCESS_WITH_INFO
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -1141,6 +1180,50 @@ mod tests {
                 .any(|record| record.native_error == 8153),
             "the warning must be posted under the execute that drained it"
         );
+    }
+
+    #[test]
+    fn finish_execute_posts_numeric_fractional_truncation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1".to_string(), ()))
+            .unwrap();
+
+        let rc = finish_execute_with_param_warning(dbc, stmt, h.stmt, client, "SQLExecute", true);
+
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+    }
+
+    #[test]
+    fn park_dae_client_posts_numeric_fractional_truncation() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let rc = park_dae_client(
+            stmt,
+            tds_client_from_tokens(Vec::new()),
+            None,
+            None,
+            Vec::new(),
+            true,
+            "SQLExecute",
+        );
+
+        assert_eq!(rc, SQL_NEED_DATA);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
     }
 
     /// Builds a scripted client positioned on a row-returning result (empty
@@ -1547,6 +1630,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: ind as *mut SqlLen,
@@ -1688,6 +1774,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
@@ -1711,6 +1800,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_named_params_ignores_truncation_after_first_dae_param() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        // 123.45 rescaled to scale 1 drops the trailing "5" (`Truncated`)
+        // without overflowing `decimal(5,1)`'s magnitude bound.
+        let mut numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 2,
+            sign: 1,
+            val: {
+                let mut v = [0u8; 16];
+                v[..2].copy_from_slice(&12345u16.to_le_bytes());
+                v
+            },
+        };
+        let mut numeric_ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_NUMERIC,
+            sql_type: SQL_DECIMAL,
+            column_size: 5,
+            decimal_digits: 1,
+            app_precision: 38,
+            app_scale: 2,
+            precision_scale_explicit: false,
+            parameter_value_ptr: (&mut numeric as *mut SqlNumericStruct).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut numeric_ind as *mut SqlLen,
+            octet_length_ptr: &mut numeric_ind as *mut SqlLen,
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        assert_eq!(built.dae_params.len(), 1);
+        assert!(!built.fractional_truncated);
+    }
+
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
     /// `SQLParamData` enforces; `SQL_DATA_AT_EXEC` promises nothing.
     #[test]
@@ -1727,6 +1873,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
@@ -1762,6 +1911,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: std::ptr::null_mut(),
@@ -1791,6 +1943,9 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
@@ -1839,6 +1994,9 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
@@ -1887,6 +2045,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: value.as_mut_ptr().cast(),
             buffer_length: value.len() as SqlLen,
             strlen_or_ind_ptr: indicator_storage.as_mut_ptr(),
@@ -1920,6 +2081,9 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
@@ -1973,6 +2137,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                false,
                 "test",
             ),
             crate::api::odbc_types::SQL_NEED_DATA

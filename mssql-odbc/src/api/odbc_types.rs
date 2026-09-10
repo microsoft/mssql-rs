@@ -229,23 +229,49 @@ pub const SQL_API_SQLPROCEDURES: SqlUSmallInt = 67;
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
 pub const SQL_ACTIVE_STATEMENTS: SqlUSmallInt = 1;
+pub const SQL_DATA_SOURCE_NAME: SqlUSmallInt = 2;
 pub const SQL_DRIVER_NAME: SqlUSmallInt = 6;
 pub const SQL_DRIVER_VER: SqlUSmallInt = 7;
 pub const SQL_ODBC_API_CONFORMANCE: SqlUSmallInt = 9;
 pub const SQL_ODBC_VER: SqlUSmallInt = 10;
+pub const SQL_SERVER_NAME: SqlUSmallInt = 13;
 pub const SQL_ODBC_SQL_CONFORMANCE: SqlUSmallInt = 15;
 pub const SQL_DBMS_NAME: SqlUSmallInt = 17;
 pub const SQL_DBMS_VER: SqlUSmallInt = 18;
+pub const SQL_ACCESSIBLE_TABLES: SqlUSmallInt = 19;
+pub const SQL_ACCESSIBLE_PROCEDURES: SqlUSmallInt = 20;
+pub const SQL_PROCEDURES: SqlUSmallInt = 21;
 pub const SQL_CURSOR_COMMIT_BEHAVIOR: SqlUSmallInt = 23;
 pub const SQL_CURSOR_ROLLBACK_BEHAVIOR: SqlUSmallInt = 24;
+pub const SQL_DATA_SOURCE_READ_ONLY: SqlUSmallInt = 25;
 pub const SQL_DEFAULT_TXN_ISOLATION: SqlUSmallInt = 26;
+pub const SQL_EXPRESSIONS_IN_ORDERBY: SqlUSmallInt = 27;
 pub const SQL_IDENTIFIER_QUOTE_CHAR: SqlUSmallInt = 29;
+pub const SQL_MAX_COLUMN_NAME_LEN: SqlUSmallInt = 30;
+/// ODBC 2.x name `SQL_MAX_OWNER_NAME_LEN`.
+pub const SQL_MAX_SCHEMA_NAME_LEN: SqlUSmallInt = 32;
+pub const SQL_MAX_TABLE_NAME_LEN: SqlUSmallInt = 35;
 pub const SQL_MULTIPLE_ACTIVE_TXN: SqlUSmallInt = 37;
+/// ODBC 2.x name `SQL_OWNER_TERM`.
+pub const SQL_SCHEMA_TERM: SqlUSmallInt = 39;
+/// ODBC 2.x name `SQL_QUALIFIER_NAME_SEPARATOR`.
+pub const SQL_CATALOG_NAME_SEPARATOR: SqlUSmallInt = 41;
+/// ODBC 2.x name `SQL_QUALIFIER_TERM`.
+pub const SQL_CATALOG_TERM: SqlUSmallInt = 42;
 pub const SQL_TXN_CAPABLE: SqlUSmallInt = 46;
+pub const SQL_USER_NAME: SqlUSmallInt = 47;
+pub const SQL_NUMERIC_FUNCTIONS: SqlUSmallInt = 49;
+pub const SQL_STRING_FUNCTIONS: SqlUSmallInt = 50;
+pub const SQL_SYSTEM_FUNCTIONS: SqlUSmallInt = 51;
+pub const SQL_TIMEDATE_FUNCTIONS: SqlUSmallInt = 52;
 pub const SQL_TXN_ISOLATION_OPTION: SqlUSmallInt = 72;
 pub const SQL_DRIVER_ODBC_VER: SqlUSmallInt = 77;
 pub const SQL_GETDATA_EXTENSIONS: SqlUSmallInt = 81;
+pub const SQL_KEYWORDS: SqlUSmallInt = 89;
+pub const SQL_SPECIAL_CHARACTERS: SqlUSmallInt = 94;
+pub const SQL_MAX_STATEMENT_LEN: SqlUSmallInt = 105;
 pub const SQL_NEED_LONG_DATA_LEN: SqlUSmallInt = 111;
+pub const SQL_SQL_CONFORMANCE: SqlUSmallInt = 118;
 pub const SQL_DM_VER: SqlUSmallInt = 171;
 pub const SQL_ASYNC_DBC_FUNCTIONS: SqlUSmallInt = 10023;
 pub const SQL_ASYNC_NOTIFICATION: SqlUSmallInt = 10025;
@@ -254,6 +280,14 @@ pub const SQL_ASYNC_NOTIFICATION: SqlUSmallInt = 10025;
 pub const SQL_OAC_LEVEL2: u16 = 0x0002;
 pub const SQL_OSC_CORE: u16 = 0x0001;
 pub const SQL_CB_CLOSE: u16 = 1;
+/// `SQL_SQL_CONFORMANCE`: entry-level SQL-92, matching msodbcsql18.
+pub const SQL_SC_SQL92_ENTRY: u32 = 0x00000001;
+/// The scalar-function masks (`SQL_NUMERIC_FUNCTIONS`, `SQL_STRING_FUNCTIONS`,
+/// `SQL_SYSTEM_FUNCTIONS`, `SQL_TIMEDATE_FUNCTIONS`) report the functions
+/// reachable through the ODBC `{fn ...}` escape. This driver does not translate
+/// escape sequences yet, so ODBC's "none supported" is the only honest answer;
+/// msodbcsql18 advertises real masks. Tracked by AB#46384.
+pub const SQL_FN_NONE_SUPPORTED: u32 = 0x00000000;
 /// `SQL_TXN_CAPABLE`: DML and DDL are both transactable (msodbcsql `sqlcinfo.cpp:323`).
 pub const SQL_TC_ALL: u16 = 2;
 /// `SQL_TXN_ISOLATION_OPTION` bitmask — the five levels this driver accepts
