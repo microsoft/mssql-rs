@@ -1590,10 +1590,10 @@ mod tests {
         );
     }
 
-    /// Output parameters are refused by `SQLBindParameter` itself, so nothing
-    /// non-input ever reaches `bound_params` and the array path's own
-    /// input-only guard is unreachable. Pins that, so the guard is not mistaken
-    /// for an array-specific deviation (AB#47945).
+    /// Output parameters bind fine now that `{call ...}` needs them, so the
+    /// array path's input-only guard is genuinely reachable: one output buffer
+    /// cannot receive a value per parameter set. Pins that it refuses with
+    /// HYC00 rather than silently writing one set's value (AB#47945).
     #[test]
     fn output_parameters_are_refused_before_the_array_path_sees_them() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -1615,19 +1615,13 @@ mod tests {
             )
         };
 
-        assert_eq!(rc, SQL_ERROR, "binding an output parameter must fail");
+        assert_eq!(rc, SQL_SUCCESS, "binding an output parameter must succeed");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_eq!(
-            stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            SQLSTATE_HYC00
-        );
         stmt.inner.lock().unwrap().paramset_size = 2;
-        // The marker is still unbound, so staging stops at 07002 - it never
-        // reaches the input-only check.
         assert!(stage_execution(stmt).is_err());
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            SQLSTATE_07002
+            SQLSTATE_HYC00
         );
     }
 

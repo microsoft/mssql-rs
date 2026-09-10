@@ -10,6 +10,8 @@
 
 use tracing::{debug, error};
 
+use crate::api::output_params::write_back_output_params;
+
 use mssql_tds::connection::tds_client::{ResultSet, StatementResult};
 
 use super::close_cursor::reset_cursor_state;
@@ -302,9 +304,16 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             // Drain INFO only after the lock is held.
             let info_messages = client.take_info_messages();
             post_tds_info_messages(&mut stmt_state, &info_messages);
+            // ODBC makes output parameters and the return status readable only
+            // once every result set the procedure produced has been consumed,
+            // which is exactly here. Writing back earlier would let an
+            // application read a value the spec says is not available yet.
+            let return_values = client.get_return_values();
+            let return_status = client.get_return_status();
+            unsafe {
+                write_back_output_params(&mut stmt_state, &return_values, return_status);
+            }
             drop(stmt_state);
-            // TODO: surface output-param availability here once output
-            // params land.
             if let Ok(mut dbc_state) = dbc.inner.lock() {
                 dbc_state.client = Some(client);
                 if dbc_state.active_stmt == Some(statement_handle) {

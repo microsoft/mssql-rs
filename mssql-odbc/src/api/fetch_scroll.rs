@@ -309,7 +309,7 @@ pub(crate) unsafe fn sql_fetch_scroll_impl(
 /// Why a bound column write did not land exactly, so the row can report the
 /// same SQLSTATE `SQLGetData` would have for the identical value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RowIssue {
+pub(crate) enum RowIssue {
     /// 01004 — the value did not fit the bound buffer.
     StringTruncated,
     /// 01S07 — fractional digits were dropped to fit the target.
@@ -327,7 +327,7 @@ enum RowIssue {
 }
 
 impl RowIssue {
-    fn post(self, stmt_state: &mut StmtState) {
+    pub(crate) fn post(self, stmt_state: &mut StmtState) {
         match self {
             RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
@@ -2135,6 +2135,28 @@ unsafe fn deliver_encoded_string(
 /// The binding's pointers, displaced by `bind_offset`, must address at least
 /// `row_index + 1` elements — the contract `SQLBindCol` places on the
 /// application together with `SQL_ATTR_ROW_ARRAY_SIZE`.
+/// Delivers one value into a bound buffer outside the rowset machinery.
+///
+/// Used for procedure output parameters, which are the same conversion problem
+/// as a fetched column but arrive on a RETURNVALUE token instead of a row.
+/// Returns whether the value was truncated.
+///
+/// # Safety
+/// `binding`'s buffers must be valid for one element.
+pub(crate) unsafe fn deliver_bound_value(
+    binding: &ColumnBinding,
+    value: &ColumnValues,
+) -> Result<bool, RowIssue> {
+    match unsafe { deliver_bound(binding, 0, 0, value) } {
+        RowOutcome::Success => Ok(false),
+        RowOutcome::Info(issue) => Ok(matches!(
+            issue,
+            RowIssue::StringTruncated | RowIssue::FractionalTruncated
+        )),
+        RowOutcome::Error(issue) => Err(issue),
+    }
+}
+
 unsafe fn deliver_bound(
     binding: &ColumnBinding,
     row_index: usize,

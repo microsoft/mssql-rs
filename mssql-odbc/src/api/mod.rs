@@ -38,6 +38,7 @@ mod native_sql;
 mod num_params;
 mod num_result_cols;
 pub(crate) mod odbc_types;
+mod output_params;
 mod param_data;
 mod prepare;
 mod put_data;

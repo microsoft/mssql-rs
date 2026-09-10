@@ -390,6 +390,10 @@ pub const SQL_PARAM_TYPE_UNKNOWN: SqlSmallInt = 0;
 pub const SQL_PARAM_INPUT: SqlSmallInt = 1;
 pub const SQL_PARAM_INPUT_OUTPUT: SqlSmallInt = 2;
 pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
+/// The `{? = call ...}` return-status parameter. ODBC 3.5+.
+pub const SQL_PARAM_INPUT_OUTPUT_STREAM: SqlSmallInt = 8;
+pub const SQL_PARAM_OUTPUT_STREAM: SqlSmallInt = 16;
+pub const SQL_RETURN_VALUE: SqlSmallInt = 5;
 
 // Parameter-array operation and status values.
 pub const SQL_PARAM_PROCEED: SqlUSmallInt = 0;

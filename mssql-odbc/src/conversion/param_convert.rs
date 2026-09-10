@@ -149,12 +149,33 @@ impl ParamBuildError {
 ///
 /// # Safety
 /// See [`bound_param_to_value_with_outcome`].
+/// True for the ODBC directions whose value the server has to send back.
+///
+/// `SQL_PARAM_INPUT_OUTPUT` and `SQL_PARAM_OUTPUT` are both `OUTPUT` on the
+/// wire; msodbcsql likewise promotes a plain `SQL_PARAM_OUTPUT` inside a
+/// canonical call to input-output (`sqlcmisc.cpp:8455`). The `{? = call ...}`
+/// return status is not an RPC parameter at all and never reaches here.
+pub(crate) fn is_output_direction(input_output_type: SqlSmallInt) -> bool {
+    matches!(
+        input_output_type,
+        crate::api::odbc_types::SQL_PARAM_OUTPUT | crate::api::odbc_types::SQL_PARAM_INPUT_OUTPUT
+    )
+}
+
 pub(crate) unsafe fn bound_param_to_rpc(
     name: impl Into<Option<String>>,
     param: &BoundParam,
 ) -> Result<(RpcParameter, ConvOk), ParamBuildError> {
     let ((value, type_metadata), outcome) = unsafe { bound_param_to_value_with_outcome(param) }?;
-    let parameter = RpcParameter::new(name.into(), StatusFlags::NONE, value);
+    // BY_REF_VALUE is what makes the server send a RETURNVALUE token back for
+    // this parameter; without it an OUTPUT binding would be sent as a plain
+    // input and silently produce nothing.
+    let status = if is_output_direction(param.input_output_type) {
+        StatusFlags::BY_REF_VALUE
+    } else {
+        StatusFlags::NONE
+    };
+    let parameter = RpcParameter::new(name.into(), status, value);
     let parameter = match type_metadata {
         Some(metadata) => parameter.with_type_metadata(metadata),
         None => parameter,
