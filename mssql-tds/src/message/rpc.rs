@@ -21,6 +21,8 @@ use super::{
 use crate::message::headers::write_headers;
 
 pub(crate) const PROC_ID_SWITCH: u16 = 0xffff;
+/// TDS 7.2+ delimiter between RPC requests carried in one RPC message.
+pub(crate) const RPC_BATCH_DELIMITER: u8 = 0xff;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +59,29 @@ impl<'a> SqlRpc<'a> {
         Self {
             rpc_type,
             headers: Vec::from([transaction_descriptor_header.into()]),
+            positional_parameters,
+            named_parameters,
+            db_collation,
+            proc_options: ProcOptions::None,
+        }
+    }
+
+    pub(crate) fn new_batch_command(
+        rpc_type: RpcType,
+        positional_parameters: Option<Vec<RpcParameter>>,
+        named_parameters: Option<Vec<RpcParameter>>,
+        db_collation: &'a SqlCollation,
+        execution_context: &ExecutionContext,
+        first: bool,
+    ) -> Self {
+        let headers = if first {
+            Vec::from([TransactionDescriptorHeader::from(execution_context).into()])
+        } else {
+            Vec::new()
+        };
+        Self {
+            rpc_type,
+            headers,
             positional_parameters,
             named_parameters,
             db_collation,
@@ -117,6 +142,27 @@ impl<'a> SqlRpc<'a> {
         self.write_positional_parameters(packet_writer).await?;
         self.write_named_parameters(packet_writer).await?;
         Ok(())
+    }
+
+    /// Serializes one command inside an RPC batch.
+    ///
+    /// The first command owns the message's `ALL_HEADERS`; later commands are
+    /// introduced by the TDS 7.2+ `0xff` RPC delimiter and contain only their
+    /// procedure and parameters. The caller finalizes the packet writer once
+    /// after the last command.
+    pub(crate) async fn serialize_batch_command(
+        &self,
+        packet_writer: &mut PacketWriter<'_>,
+        first: bool,
+    ) -> TdsResult<()> {
+        if first {
+            write_headers(&self.headers, packet_writer).await?;
+        } else {
+            packet_writer.write_byte_async(RPC_BATCH_DELIMITER).await?;
+        }
+        self.write_proc(packet_writer).await?;
+        self.write_positional_parameters(packet_writer).await?;
+        self.write_named_parameters(packet_writer).await
     }
 
     async fn write_proc(&self, packet_writer: &mut PacketWriter<'_>) -> TdsResult<()> {

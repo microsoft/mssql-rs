@@ -16,16 +16,18 @@ use mssql_tds::connection::tds_client::{
     CursorPoll, ExecuteOptions, ResultSet, StatementId, TdsClient,
 };
 use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
-use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
+use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StreamedSqlType};
 
 use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_NEED_DATA, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+    SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET,
+    SQL_NEED_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen,
 };
+use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
-    ParamBuildError, bound_param_to_rpc, dae_placeholder_type, is_data_at_exec_indicator,
+    DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
+    dae_length_limit, dae_plan, dae_streamed_declaration, is_data_at_exec_indicator,
 };
 use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
@@ -36,7 +38,7 @@ use crate::handles::stmt::{
 use crate::handles::{
     DbcHandle, DescHandle, StmtHandle, handle_from_raw, process_is_shutting_down,
 };
-use crate::params::BoundParam;
+use crate::params::{BoundParam, ParamArrayLayoutError};
 
 /// Clears the in-flight `EXEC_STARTED` flag on an execution failure so the
 /// statement is reusable.
@@ -119,14 +121,38 @@ fn unwind_dae_inner(
 ///
 /// `prepared` is `None` for `SQLExecDirect`, which runs ad-hoc `sp_executesql`
 /// and has no plan to restore when the sequence completes.
+/// A pre-DAE truncation is posted before `SQL_NEED_DATA`, matching
+/// `AddRPCUserParameters` and its caller in `sqlccmd.cpp`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn park_dae_client(
     stmt: &StmtHandle,
     client: TdsClient,
     prepared: Option<PreparedPlan>,
     orphaned: Option<StatementId>,
-    dae_params: Vec<DaeParam>,
+    mut dae_params: Vec<DaeParam>,
+    fractional_truncated: bool,
     op: &str,
 ) -> SqlReturn {
+    // The wire encoding of a narrow target comes from the database collation,
+    // which is only knowable with the connection in hand — `write_streamed_chunk`
+    // writes bytes verbatim, so the re-encoding has to happen before them
+    // (AB#47590).
+    let collation = client.get_collation();
+    for param in &mut dae_params {
+        if !param.plan.is_buffered() {
+            let transcode =
+                DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
+            // A pairing whose buffer bytes already are the wire's bytes keeps
+            // `None`, so `SQLPutData` forwards its chunks borrowed instead of
+            // copying each one through a conversion that would return them
+            // unchanged. Skipping the transcode also skips the close-time
+            // flush, which is right: a passthrough parameter never holds back a
+            // partial character to carry.
+            if !transcode.is_passthrough() {
+                param.transcode = Some(transcode);
+            }
+        }
+    }
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         // The client has nowhere to go: the statement that owns it is
         // unreachable and the DBC still records it as busy.
@@ -134,6 +160,42 @@ pub(super) fn park_dae_client(
         return SQL_ERROR;
     };
     stmt_state.dae = Some(DaeState::new(client, prepared, orphaned, dae_params));
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
+    SQL_NEED_DATA
+}
+
+/// Parks a sequence whose execute is deferred: at least one parameter buffers,
+/// so no RPC has been opened and the client sits idle on the statement until
+/// the last `SQLParamData` builds the complete parameter list and runs it.
+///
+/// The connection still counts as busy for the duration, exactly as the
+/// streaming sequence does, so an application cannot start another command on it
+/// mid-sequence.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn park_deferred_dae(
+    stmt: &StmtHandle,
+    client: TdsClient,
+    prepared: Option<PreparedPlan>,
+    orphaned: Option<StatementId>,
+    dae_params: Vec<DaeParam>,
+    prebuilt: Vec<RpcParameter>,
+    sql: Option<String>,
+    timeout_secs: u32,
+    fractional_truncated: bool,
+    op: &str,
+) -> SqlReturn {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned while parking deferred DAE state");
+        return SQL_ERROR;
+    };
+    stmt_state.dae = Some(
+        DaeState::new(client, prepared, orphaned, dae_params).deferred(prebuilt, sql, timeout_secs),
+    );
+    if fractional_truncated {
+        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    }
     SQL_NEED_DATA
 }
 
@@ -199,6 +261,27 @@ pub(super) fn claim_connection(
     };
 
     Ok(client)
+}
+
+/// Publishes the processed count for a scalar (single parameter set) execute.
+///
+/// msodbcsql writes this whether or not parameter arrays are in play: the
+/// non-bulk branch sets `iRowEnd = 1` (`sqlccmd.cpp:3203`) and the row loop then
+/// writes `*pRowsProcessed = 1` (`:3212`), with four more explicit `= 1` sites
+/// (`sqlccmd.cpp:1688`, `:3493`, `:6700`, `deprecate.cpp:2114`) covering the
+/// paths that skip that loop. Written before the set is converted or sent, so a
+/// set that then fails is still counted.
+///
+/// Without this, `executemany(sql, [one_row])` - which sets `PARAMSET_SIZE = 1`
+/// and a processed pointer - reads back whatever was in its own buffer.
+pub(super) fn publish_scalar_processed(stmt_state: &crate::handles::stmt::StmtState) {
+    let ptr = stmt_state
+        .inert_attrs
+        .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
+        .unwrap_or(0) as *mut SqlULen;
+    if !ptr.is_null() {
+        unsafe { ptr.write_unaligned(1) };
+    }
 }
 
 /// Returns `client` to the DBC and releases the busy claim. Used on the
@@ -495,6 +578,40 @@ pub(super) struct ParamsWithDae {
     pub(super) params: Vec<RpcParameter>,
     /// Every DAE entry, in original parameter order.
     pub(super) dae_params: Vec<DaeParam>,
+    /// Whether a parameter before the first DAE marker lost fractional digits.
+    /// With no DAE marker, covers the full parameter list.
+    pub(super) fractional_truncated: bool,
+}
+
+pub(super) enum ParamRowBuildError {
+    Unbound {
+        parameter: usize,
+    },
+    Layout {
+        parameter: usize,
+    },
+    Conversion {
+        parameter: usize,
+        source: ParamBuildError,
+    },
+}
+
+impl ParamRowBuildError {
+    pub(super) fn diag(&self) -> DiagMsg {
+        match self {
+            Self::Unbound { .. } => ERR_UNBOUND_PARAMETER,
+            Self::Layout { .. } => ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+            Self::Conversion { source, .. } => source.diag(),
+        }
+    }
+
+    pub(super) fn parameter(&self) -> usize {
+        match self {
+            Self::Unbound { parameter }
+            | Self::Layout { parameter }
+            | Self::Conversion { parameter, .. } => *parameter,
+        }
+    }
 }
 
 /// The byte total an application declared with `SQL_LEN_DATA_AT_EXEC(n)`, or
@@ -607,35 +724,60 @@ pub(super) unsafe fn build_named_params(
     marker_count: usize,
     op: &str,
 ) -> Result<ParamsWithDae, SqlReturn> {
-    use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
-
-    let mut params = Vec::with_capacity(marker_count);
-    let mut dae_params = Vec::new();
     // Read once per execution: the attribute holds a pointer, and every
     // binding shifts by the same amount.
     let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+    match unsafe {
+        build_named_params_for_row(
+            &stmt_state.bound_params,
+            marker_count,
+            bind_offset,
+            crate::api::odbc_types::SQL_BIND_BY_COLUMN,
+            0,
+            true,
+        )
+    } {
+        Ok(params) => Ok(params),
+        Err(error) => {
+            error!(
+                "{op}: parameter {} could not be built: {}",
+                error.parameter(),
+                error.diag().text
+            );
+            post_diag(stmt_state, error.diag());
+            Err(SQL_ERROR)
+        }
+    }
+}
 
+/// Builds one row of an ODBC parameter array without retaining any other row.
+///
+/// # Safety
+/// Every pointer in `bound_params`, after applying `bind_offset` and the
+/// row-specific stride, must satisfy the original `SQLBindParameter` contract.
+pub(super) unsafe fn build_named_params_for_row(
+    bound_params: &[Option<BoundParam>],
+    marker_count: usize,
+    bind_offset: isize,
+    param_bind_type: crate::api::odbc_types::SqlULen,
+    row: usize,
+    named: bool,
+) -> Result<ParamsWithDae, ParamRowBuildError> {
+    use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+    let mut params = Vec::with_capacity(marker_count + usize::from(!named));
+    let mut dae_params = Vec::new();
+    let mut fractional_truncated = false;
     for i in 0..marker_count {
-        let Some(Some(bound_param)) = stmt_state.bound_params.get(i) else {
-            error!("{op}: parameter {} has no bound value", i + 1);
-            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
-            return Err(SQL_ERROR);
+        let Some(Some(bound_param)) = bound_params.get(i) else {
+            return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
         };
-        // Applied before anything reads the binding: ODBC shifts the
-        // indicator pointer alongside the value pointer, so the
-        // data-at-execution check below has to see the shifted indicator.
-        let bound_param = bound_param.with_bind_offset(bind_offset);
-
-        let name = format!("@P{}", i + 1);
-
-        // Check for a data-at-execution indicator before dereferencing the
-        // value buffer: DAE params carry no value at bind time. Read from
-        // `octet_length_ptr`, not `strlen_or_ind_ptr`: per ODBC's "Deferred
-        // Fields" spec, SQL_DESC_OCTET_LENGTH_PTR carries the length or a DAE
-        // sentinel, while SQL_DESC_INDICATOR_PTR carries only SQL_NULL_DATA
-        // status. `SQLBindParameter` writes the same pointer to both, so this
-        // is unchanged for the common case; `SQLSetDescFieldW`/`SQLSetDescRec`
-        // can set them independently.
+        let bound_param = bound_param
+            .for_row(row, bind_offset, param_bind_type)
+            .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
+                ParamRowBuildError::Layout { parameter: i + 1 }
+            })?;
+        let name = named.then(|| parameter_name(i));
         let dae_indicator = if !bound_param.octet_length_ptr.is_null() {
             let ind = unsafe { bound_param.octet_length_ptr.read_unaligned() };
             is_data_at_exec_indicator(ind).then_some(ind)
@@ -644,50 +786,178 @@ pub(super) unsafe fn build_named_params(
         };
 
         if let Some(indicator) = dae_indicator {
-            let dae_stream = match dae_placeholder_type(bound_param.c_type, bound_param.sql_type) {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(
-                        "{op}: parameter {} DAE type not streamable: {}",
-                        i + 1,
-                        e.diag().text
-                    );
-                    post_diag(stmt_state, e.diag());
-                    return Err(SQL_ERROR);
+            let plan = dae_plan(bound_param.c_type, bound_param.sql_type).map_err(|source| {
+                ParamRowBuildError::Conversion {
+                    parameter: i + 1,
+                    source,
                 }
+            })?;
+            let length_limit = dae_length_limit(
+                bound_param.c_type,
+                bound_param.sql_type,
+                bound_param.column_size,
+            )
+            .map_err(|source| ParamRowBuildError::Conversion {
+                parameter: i + 1,
+                source,
+            })?;
+            dae_params.push(DaeParam::new(
+                i,
+                dae_expected_length(indicator),
+                plan,
+                length_limit,
+                bound_param,
+            ));
+            // Nothing to declare for a buffered parameter yet: its bytes are
+            // not in, so its type and length are not known. The slot is filled
+            // to keep parameter positions lined up and is rebuilt by
+            // `rebuild_deferred_params` before anything reaches the wire.
+            let rpc = match plan {
+                DaePlan::Stream(streamed) => {
+                    let param = RpcParameter::data_at_exec(name, StatusFlags::NONE, streamed);
+                    // The body is PLP whatever `ColumnSize` says, but the
+                    // variable it lands in is declared from `ParameterType`,
+                    // matching the materialized path and msodbcsql (AB#47590).
+                    //
+                    // Only narrowed when the bound above can actually be
+                    // enforced. A streamed parameter never reaches a close-time
+                    // conversion, so an unenforced bound would have the client
+                    // declare `varchar(n)` and then stream past it, leaving the
+                    // overflow to the server instead of the `22001` the
+                    // declaration implies. Staying `max` keeps the value intact
+                    // until the bound is measurable on this path too
+                    // (AB#47590).
+                    let declaration = if length_limit.is_some() {
+                        dae_streamed_declaration(bound_param.sql_type, bound_param.column_size)
+                    } else {
+                        Ok(None)
+                    };
+                    match declaration {
+                        Ok(Some(declaration)) => param.with_streamed_declaration(declaration),
+                        Ok(None) => param,
+                        Err(source) => {
+                            return Err(ParamRowBuildError::Conversion {
+                                parameter: i + 1,
+                                source,
+                            });
+                        }
+                    }
+                }
+                DaePlan::Buffer => RpcParameter::data_at_exec(
+                    name,
+                    StatusFlags::NONE,
+                    StreamedSqlType::VarBinaryMax,
+                ),
             };
-            let rpc =
-                RpcParameter::data_at_exec(Some(name), StatusFlags::NONE, dae_stream.sql_type);
-            dae_params.push(DaeParam {
-                value_ptr: bound_param.parameter_value_ptr,
-                expected_len: dae_expected_length(indicator),
-                needs_transcode: dae_stream.needs_transcode,
-                c_type: bound_param.c_type,
-                sql_type: bound_param.sql_type,
-            });
             params.push(rpc);
         } else {
-            match unsafe { bound_param_to_rpc(name, &bound_param) } {
-                Ok(param) => params.push(param),
-                Err(ParamBuildError::InvalidLength(len)) => {
-                    error!("{op}: parameter {} has invalid StrLen_or_Ind {len}", i + 1);
-                    post_diag(stmt_state, ParamBuildError::InvalidLength(len).diag());
-                    return Err(SQL_ERROR);
-                }
-                Err(e) => {
-                    error!(
-                        "{op}: parameter {} conversion failed: {}",
-                        i + 1,
-                        e.diag().text
-                    );
-                    post_diag(stmt_state, e.diag());
-                    return Err(SQL_ERROR);
-                }
+            let (param, outcome) =
+                unsafe { bound_param_to_rpc(name, &bound_param) }.map_err(|source| {
+                    ParamRowBuildError::Conversion {
+                        parameter: i + 1,
+                        source,
+                    }
+                })?;
+            if outcome == ConvOk::Truncated && dae_params.is_empty() {
+                fractional_truncated = true;
+            }
+            params.push(param);
+        }
+    }
+
+    Ok(ParamsWithDae {
+        params,
+        dae_params,
+        fractional_truncated,
+    })
+}
+
+fn parameter_name(index: usize) -> String {
+    format!("@P{}", index + 1)
+}
+
+pub(super) fn finish_execute_with_param_warning(
+    dbc: &DbcHandle,
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    client: TdsClient,
+    op: &str,
+    fractional_truncated: bool,
+) -> SqlReturn {
+    let rc = finish_execute(dbc, stmt, statement_handle, client, op);
+    if !fractional_truncated || !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
+        return rc;
+    }
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        error!("{op}: stmt mutex poisoned posting parameter truncation");
+        return SQL_ERROR;
+    };
+    post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+    SQL_SUCCESS_WITH_INFO
+}
+
+/// Rebuilds the RPC parameter list once every data-at-execution value has been
+/// collected, for a sequence that deferred its execute.
+///
+/// Only the data-at-execution slots are rebuilt, from the bytes
+/// [`buffered_dae_to_rpc`] converts; every other parameter is the one
+/// `build_named_params` already materialized at execute time and is kept
+/// verbatim. A buffered value therefore still goes through the same conversion
+/// the materialized path uses, so it is declared and bounded exactly like a
+/// value supplied in a single buffer (AB#47590).
+///
+/// Nothing here reads application memory. Re-reading it would be unsound rather
+/// than merely redundant: `bound_params` is an execute-time snapshot that
+/// `SQLFreeStmt(SQL_RESET_PARAMS)` leaves in place while releasing the bindings
+/// it describes, so an application that resets its parameters mid-sequence --
+/// which this driver explicitly supports -- would have freed buffers
+/// dereferenced here.
+pub(super) fn rebuild_deferred_params(
+    stmt_state: &mut StmtState,
+    prebuilt: Vec<RpcParameter>,
+    collected: &[(usize, Vec<u8>, bool)],
+    dae_params: &[DaeParam],
+    op: &str,
+) -> Result<(Vec<RpcParameter>, bool), SqlReturn> {
+    let mut params = prebuilt;
+    let mut fractional_truncated = false;
+
+    for (index, bytes, is_null) in collected {
+        let Some(dae) = dae_params.iter().find(|p| p.bound_index == *index) else {
+            error!(
+                "{op}: collected value for parameter {} has no binding",
+                index + 1
+            );
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+        let Some(slot) = params.get_mut(*index) else {
+            error!(
+                "{op}: collected value for parameter {} has no slot",
+                index + 1
+            );
+            post_diag(stmt_state, ERR_UNBOUND_PARAMETER);
+            return Err(SQL_ERROR);
+        };
+        let name = parameter_name(*index);
+        match buffered_dae_to_rpc(name, &dae.binding, bytes, *is_null) {
+            Ok((param, outcome)) => {
+                *slot = param;
+                fractional_truncated |= outcome == ConvOk::Truncated;
+            }
+            Err(e) => {
+                error!(
+                    "{op}: parameter {} conversion failed: {}",
+                    index + 1,
+                    e.diag().text
+                );
+                post_diag(stmt_state, e.diag());
+                return Err(SQL_ERROR);
             }
         }
     }
 
-    Ok(ParamsWithDae { params, dae_params })
+    Ok((params, fractional_truncated))
 }
 
 /// Captures result metadata after a successful execution and finalizes the
@@ -1079,6 +1349,50 @@ mod tests {
                 .any(|record| record.native_error == 8153),
             "the warning must be posted under the execute that drained it"
         );
+    }
+
+    #[test]
+    fn finish_execute_posts_numeric_fractional_truncation() {
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut client = tds_client_from_tokens(vec![done_no_more()]);
+        dbc.runtime
+            .block_on(client.execute("SELECT 1".to_string(), ()))
+            .unwrap();
+
+        let rc = finish_execute_with_param_warning(dbc, stmt, h.stmt, client, "SQLExecute", true);
+
+        assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+    }
+
+    #[test]
+    fn park_dae_client_posts_numeric_fractional_truncation() {
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let rc = park_dae_client(
+            stmt,
+            tds_client_from_tokens(Vec::new()),
+            None,
+            None,
+            Vec::new(),
+            true,
+            "SQLExecute",
+        );
+
+        assert_eq!(rc, SQL_NEED_DATA);
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
     }
 
     /// Builds a scripted client positioned on a row-returning result (empty
@@ -1485,6 +1799,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: ind as *mut SqlLen,
@@ -1626,6 +1943,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
@@ -1637,16 +1957,191 @@ mod tests {
 
         let dae = unsafe { build_named_params(&mut state, 3, "test") }.unwrap();
         assert_eq!(dae.params.len(), 3);
-        assert_eq!(
-            dae.dae_params,
-            vec![DaeParam {
-                value_ptr: std::ptr::null_mut(),
-                expected_len: None,
-                needs_transcode: false,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR
-            }]
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 1);
+        assert_eq!(dae.dae_params[0].expected_len, None);
+    }
+
+    #[test]
+    fn build_named_params_ignores_truncation_after_first_dae_param() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+        let mut streamed_ind: SqlLen = SQL_DATA_AT_EXEC;
+        // 123.45 rescaled to scale 1 drops the trailing "5" (`Truncated`)
+        // without overflowing `decimal(5,1)`'s magnitude bound.
+        let mut numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 2,
+            sign: 1,
+            val: {
+                let mut v = [0u8; 16];
+                v[..2].copy_from_slice(&12345u16.to_le_bytes());
+                v
+            },
+        };
+        let mut numeric_ind: SqlLen = std::mem::size_of::<SqlNumericStruct>() as SqlLen;
+
+        let mut state = stmt.inner.lock().unwrap();
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_CHAR,
+            sql_type: SQL_VARCHAR,
+            column_size: 0,
+            decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
+            parameter_value_ptr: std::ptr::null_mut(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut streamed_ind as *mut SqlLen,
+            octet_length_ptr: &mut streamed_ind as *mut SqlLen,
+        }));
+        state.bound_params.push(Some(BoundParam {
+            input_output_type: SQL_PARAM_INPUT,
+            c_type: SQL_C_NUMERIC,
+            sql_type: SQL_DECIMAL,
+            column_size: 5,
+            decimal_digits: 1,
+            app_precision: 38,
+            app_scale: 2,
+            precision_scale_explicit: false,
+            parameter_value_ptr: (&mut numeric as *mut SqlNumericStruct).cast(),
+            buffer_length: 0,
+            strlen_or_ind_ptr: &mut numeric_ind as *mut SqlLen,
+            octet_length_ptr: &mut numeric_ind as *mut SqlLen,
+        }));
+
+        let built = unsafe { build_named_params(&mut state, 2, "test") }.unwrap();
+        assert_eq!(built.dae_params.len(), 1);
+        assert!(!built.fractional_truncated);
+    }
+
+    fn buffered_decimal_param(bound_index: usize) -> DaeParam {
+        use crate::api::odbc_types::SQL_DECIMAL;
+
+        let mut param = DaeParam::unbounded(bound_index, std::ptr::null_mut(), None);
+        param.plan = DaePlan::Buffer;
+        param.binding.c_type = SQL_C_CHAR;
+        param.binding.sql_type = SQL_DECIMAL;
+        param.binding.column_size = 5;
+        param.binding.decimal_digits = 1;
+        param
+    }
+
+    fn deferred_slot() -> RpcParameter {
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+
+        RpcParameter::data_at_exec(
+            Some("@P1".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarBinaryMax,
+        )
+    }
+
+    #[test]
+    fn rebuild_deferred_params_reports_fractional_truncation() {
+        use crate::api::odbc_types::{SQL_C_NUMERIC, SQL_DECIMAL, SqlNumericStruct};
+
+        assert!(matches!(
+            dae_plan(SQL_C_NUMERIC, SQL_DECIMAL),
+            Err(ParamBuildError::UnsupportedCType(SQL_C_NUMERIC))
+        ));
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        let mut param = buffered_decimal_param(0);
+        param.binding.c_type = SQL_C_NUMERIC;
+        param.binding.column_size = 10;
+        param.binding.app_scale = 3;
+        param.binding.precision_scale_explicit = true;
+        let numeric = SqlNumericStruct {
+            precision: 38,
+            scale: 0,
+            sign: 1,
+            val: {
+                let mut value = [0; 16];
+                value[..2].copy_from_slice(&1551u16.to_le_bytes());
+                value
+            },
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const numeric).cast::<u8>(),
+                std::mem::size_of::<SqlNumericStruct>(),
+            )
+        }
+        .to_vec();
+        let dae_params = vec![param];
+        let collected = vec![(0, bytes, false)];
+
+        let (params, fractional_truncated) = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &collected,
+            &dae_params,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(params.len(), 1);
+        assert!(fractional_truncated);
+        assert!(state.diag_records.is_empty());
+    }
+
+    #[test]
+    fn rebuild_deferred_params_rejects_missing_binding_and_slot() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let missing_binding = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, Vec::new(), false)],
+            &[],
+            "test",
         );
+        assert_eq!(missing_binding.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+
+        state.diag_records.clear();
+        let missing_slot = rebuild_deferred_params(
+            &mut state,
+            Vec::new(),
+            &[(0, Vec::new(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+        assert_eq!(missing_slot.unwrap_err(), SQL_ERROR);
+        assert_eq!(
+            state.diag_records.last().unwrap().sql_state,
+            ERR_UNBOUND_PARAMETER.state
+        );
+    }
+
+    #[test]
+    fn rebuild_deferred_params_posts_conversion_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        let result = rebuild_deferred_params(
+            &mut state,
+            vec![deferred_slot()],
+            &[(0, b"not-a-number".to_vec(), false)],
+            &[buffered_decimal_param(0)],
+            "test",
+        );
+
+        assert_eq!(result.unwrap_err(), SQL_ERROR);
+        assert!(!state.diag_records.is_empty());
     }
 
     /// `SQL_LEN_DATA_AT_EXEC(n)` promises `n` bytes, which the closing
@@ -1665,6 +2160,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: std::ptr::null_mut(),
             buffer_length: 0,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
@@ -1672,16 +2170,66 @@ mod tests {
         }));
 
         let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
-        assert_eq!(
-            dae.dae_params,
-            vec![DaeParam {
-                value_ptr: std::ptr::null_mut(),
-                expected_len: Some(7),
-                needs_transcode: false,
-                c_type: SQL_C_CHAR,
-                sql_type: SQL_VARCHAR
-            }]
-        );
+        assert_eq!(dae.dae_params.len(), 1);
+        assert_eq!(dae.dae_params[0].bound_index, 0);
+        assert_eq!(dae.dae_params[0].expected_len, Some(7));
+    }
+
+    /// A streamed parameter is only declared at a narrowed length when the
+    /// bound that length implies is one `SQLPutData` can actually enforce.
+    ///
+    /// The two decisions are made independently, so nothing but this guard stops
+    /// them disagreeing. Where they would, the cost is real: a streamed value
+    /// never reaches the close-time conversion that bounds a buffered one, so a
+    /// narrowed declaration with no bound behind it has the client promise the
+    /// server a length and then stream past it.
+    #[test]
+    fn build_named_params_only_narrows_a_declaration_it_can_enforce() {
+        for (c_type, sql_type, expect_narrowed) in [
+            // Same unit on both sides: measurable, so narrowing is honoured.
+            (SQL_C_CHAR, SQL_VARCHAR, true),
+            // A wideness mismatch is measurable too - the unit is the
+            // declaration's and the count is of the source.
+            (crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR, true),
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_WVARCHAR, true),
+            // Cross-family is not: a binary byte is not a character, so the
+            // declaration stays `max` rather than claiming a bound.
+            (SQL_C_CHAR, crate::api::odbc_types::SQL_VARBINARY, false),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+
+            let mut ind: SqlLen = SQL_DATA_AT_EXEC;
+            let mut state = stmt.inner.lock().unwrap();
+            state.bound_params.push(Some(BoundParam {
+                input_output_type: SQL_PARAM_INPUT,
+                c_type,
+                sql_type,
+                column_size: 10,
+                decimal_digits: 0,
+                app_precision: 0,
+                app_scale: 0,
+                precision_scale_explicit: false,
+                parameter_value_ptr: std::ptr::null_mut(),
+                buffer_length: 0,
+                strlen_or_ind_ptr: &mut ind as *mut SqlLen,
+                octet_length_ptr: &mut ind as *mut SqlLen,
+            }));
+
+            let dae = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+            let bounded = dae.dae_params[0].length_limit.is_some();
+            assert_eq!(
+                bounded, expect_narrowed,
+                "{c_type} -> {sql_type}: the bound decides whether narrowing is honest"
+            );
+            // The declaration is only narrowed when the bound backs it, so the
+            // two travel together rather than being decided apart.
+            let narrowed = format!("{:?}", dae.params[0]).contains("streamed_declaration: Some");
+            assert_eq!(
+                narrowed, expect_narrowed,
+                "{c_type} -> {sql_type}: declaration narrowing must follow the bound"
+            );
+        }
     }
 
     /// Without an indicator pointer there is nothing to carry a
@@ -1700,6 +2248,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: buf.as_mut_ptr() as *mut c_void,
             buffer_length: buf.len() as SqlLen,
             strlen_or_ind_ptr: std::ptr::null_mut(),
@@ -1729,6 +2280,9 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: &mut value as *mut i32 as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: &mut ind as *mut SqlLen,
@@ -1777,6 +2331,9 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
@@ -1825,6 +2382,9 @@ mod tests {
             sql_type: SQL_VARCHAR,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: value.as_mut_ptr().cast(),
             buffer_length: value.len() as SqlLen,
             strlen_or_ind_ptr: indicator_storage.as_mut_ptr(),
@@ -1858,6 +2418,9 @@ mod tests {
             sql_type: SQL_INTEGER,
             column_size: 0,
             decimal_digits: 0,
+            app_precision: 0,
+            app_scale: 0,
+            precision_scale_explicit: false,
             parameter_value_ptr: values.as_mut_ptr() as *mut c_void,
             buffer_length: 4,
             strlen_or_ind_ptr: inds.as_mut_ptr(),
@@ -1911,6 +2474,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                false,
                 "test",
             ),
             crate::api::odbc_types::SQL_NEED_DATA

@@ -241,6 +241,15 @@ does not grow every time a new msodbcsql build is measured.
    type but not the other would be worse than the divergence.
    `ABoundUtf8VarcharMaxDoesNotSplitASurrogatePairWhenWidening` carries
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
+
+   The same rule applies to a bound UTF-8-collation `varchar(max)` delivered as
+   `SQL_C_CHAR`, which is verbatim on both drivers because the wire bytes are
+   already UTF-8. Measured on build 173919 with a 3-byte character against an
+   8-byte payload slot: msodbcsql fills all 8 and returns
+   `"\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD"`, ending mid-character, where this driver
+   stops at 6. `ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary`
+   splits per-leg on `ODBC_TEST_TARGET` rather than skipping, so the shared part
+   — both truncate, report `01004`, and deliver a prefix — stays measured.
 9. A bound `time` / `datetimeoffset` column strides by
     `sizeof(SQL_SS_TIME2_STRUCT)` (12) and
     `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by `BufferLength`.
@@ -353,6 +362,21 @@ does not grow every time a new msodbcsql build is measured.
     `ColAttributeLiveTest.EmptyVariantProbeConsumesValueButKeepsBaseType`
     accepts either so the parity leg still compares the base type and the
     `SQL_NO_DATA` re-read.
+14. A numeric parameter truncated before a later data-at-execution parameter
+    posts `01S07` while `SQLExecute` / `SQLExecDirect` returns `SQL_NEED_DATA`.
+    This matches msodbcsql on Windows: `AddRPCUserParameters` posts the
+    `IDS_01_S07` returned by `ParamToSQLType` (`odbc/sqlcmisc.cpp`), and its
+    caller restores `SQL_NEED_DATA` without clearing that diagnostic
+    (`odbc/sqlccmd.cpp`). This driver stores the diagnostic on every platform,
+    pinned by `park_dae_client_posts_numeric_fractional_truncation`. On
+    unixODBC platforms (Linux and macOS), `function_return_ex`
+    (`DriverManager/__info.c`) extracts driver diagnostics for
+    `SQL_SUCCESS_WITH_INFO`, `SQL_ERROR`, and `SQL_NO_DATA`, but not
+    `SQL_NEED_DATA`; therefore the E2E tests key off `_WIN32` and expect no
+    visible diagnostic for either driver everywhere else. Windows expects
+    `01S07`. Build 173710 confirms both outcomes against retail msodbcsql
+    18.6.2.1. Truncation after the first DAE parameter remains silent. Signed
+    off by Theekshna Kotian on 2026-09-09. Tracked in AB#47946.
 
 ## No panics
 

@@ -34,7 +34,7 @@ use crate::conversion::fetch_convert::{
     is_integer_c_target, is_typed_c_target,
 };
 use crate::conversion::numeric::{narrow_i128, parse_numeric_text};
-use crate::conversion::param_convert::{bound_param_to_value, transcode_dae_bytes};
+use crate::conversion::param_convert::{DaeTranscode, bound_param_to_rpc};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, handle_from_raw};
 use crate::params::BoundParam;
@@ -108,7 +108,12 @@ pub fn fuzz_transcode_dae_bytes(input: &[u8], mode: u8) {
         },
         _ => SqlCollation::default(),
     };
-    let _ = transcode_dae_bytes(c_type, sql_type, input.to_vec(), collation);
+    let transcode = DaeTranscode::new(c_type, sql_type, collation);
+    let mut carry = Vec::new();
+    let (head, tail) = input.split_at(input.len() / 2);
+    let _ = transcode.push(&mut carry, head);
+    let _ = transcode.push(&mut carry, tail);
+    let _ = transcode.finish(&mut carry);
 }
 
 /// Drive the unsafe UTF-16 buffer readers over a real, bounded slice.
@@ -373,7 +378,7 @@ pub fn fuzz_fetch_convert(data: &[u8]) {
 /// all five date/time C structs, and every `type_rules::is_integer_c_type`
 /// variant (including the legacy `SQL_C_TINYINT`/`SQL_C_SHORT`/`SQL_C_LONG`
 /// spellings). `sql_type` is drawn independently, so an unsupported pairing
-/// falls through `bound_param_to_value`'s own unsupported-conversion arm — an
+/// falls through `bound_param_to_rpc`'s own unsupported-conversion arm — an
 /// unrecognized `sql_type` fails `sql_family`, a recognized one with no matching
 /// C type hits the `_ =>` arm. That is the post-bind fallback, not the
 /// `is_supported_conversion` gate `SQLBindParameter` applies, which this harness
@@ -409,7 +414,7 @@ const PARAM_C_TYPES: [SqlSmallInt; 23] = [
 /// than a hand-copied list, so a newly implemented conversion is fuzzed the
 /// moment the matrix accepts it. `sql_type` is still drawn independently in
 /// `fuzz_bound_param`, so an unsupported pairing keeps falling through
-/// `bound_param_to_value`'s post-bind unsupported-conversion arm (the
+/// `bound_param_to_rpc`'s post-bind unsupported-conversion arm (the
 /// `sql_family`/`_ =>` rejection), not the `SQLBindParameter` bind-time gate.
 static PARAM_SQL_TYPES: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
     (SqlSmallInt::MIN..=SqlSmallInt::MAX)
@@ -421,7 +426,7 @@ static PARAM_SQL_TYPES: LazyLock<Vec<SqlSmallInt>> = LazyLock::new(|| {
         .collect()
 });
 
-/// Drive the bind-parameter read + convert path (`bound_param_to_value`) that
+/// Drive the bind-parameter read + convert path (`bound_param_to_rpc`) that
 /// `SQLExecute` runs over an application's value and indicator buffers.
 ///
 /// The value buffer is the fuzz input plus trailing zero padding wide enough to
@@ -477,12 +482,15 @@ pub fn fuzz_bound_param(data: &[u8]) {
         sql_type,
         column_size,
         decimal_digits,
+        app_precision: 0,
+        app_scale: 0,
+        precision_scale_explicit: false,
         parameter_value_ptr: value_ptr,
         buffer_length: fuzz_len,
         strlen_or_ind_ptr: ind_ptr,
         octet_length_ptr: ind_ptr,
     };
-    let _ = unsafe { bound_param_to_value(&param) };
+    let _ = unsafe { bound_param_to_rpc("@P1".to_string(), &param) };
 }
 
 /// Drive the real ODBC result path end to end — `SQLExecDirectW` → `SQLFetch` →

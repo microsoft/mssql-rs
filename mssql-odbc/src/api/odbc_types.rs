@@ -229,31 +229,67 @@ pub const SQL_API_SQLPROCEDURES: SqlUSmallInt = 67;
 // SQLGetInfo info-type identifiers.
 pub const SQL_MAX_DRIVER_CONNECTIONS: SqlUSmallInt = 0;
 pub const SQL_ACTIVE_STATEMENTS: SqlUSmallInt = 1;
+pub const SQL_DATA_SOURCE_NAME: SqlUSmallInt = 2;
 pub const SQL_DRIVER_NAME: SqlUSmallInt = 6;
 pub const SQL_DRIVER_VER: SqlUSmallInt = 7;
 pub const SQL_ODBC_API_CONFORMANCE: SqlUSmallInt = 9;
 pub const SQL_ODBC_VER: SqlUSmallInt = 10;
+pub const SQL_SERVER_NAME: SqlUSmallInt = 13;
 pub const SQL_ODBC_SQL_CONFORMANCE: SqlUSmallInt = 15;
 pub const SQL_DBMS_NAME: SqlUSmallInt = 17;
 pub const SQL_DBMS_VER: SqlUSmallInt = 18;
+pub const SQL_ACCESSIBLE_TABLES: SqlUSmallInt = 19;
+pub const SQL_ACCESSIBLE_PROCEDURES: SqlUSmallInt = 20;
+pub const SQL_PROCEDURES: SqlUSmallInt = 21;
 pub const SQL_CURSOR_COMMIT_BEHAVIOR: SqlUSmallInt = 23;
 pub const SQL_CURSOR_ROLLBACK_BEHAVIOR: SqlUSmallInt = 24;
+pub const SQL_DATA_SOURCE_READ_ONLY: SqlUSmallInt = 25;
 pub const SQL_DEFAULT_TXN_ISOLATION: SqlUSmallInt = 26;
+pub const SQL_EXPRESSIONS_IN_ORDERBY: SqlUSmallInt = 27;
 pub const SQL_IDENTIFIER_QUOTE_CHAR: SqlUSmallInt = 29;
+pub const SQL_MAX_COLUMN_NAME_LEN: SqlUSmallInt = 30;
+/// ODBC 2.x name `SQL_MAX_OWNER_NAME_LEN`.
+pub const SQL_MAX_SCHEMA_NAME_LEN: SqlUSmallInt = 32;
+pub const SQL_MAX_TABLE_NAME_LEN: SqlUSmallInt = 35;
 pub const SQL_MULTIPLE_ACTIVE_TXN: SqlUSmallInt = 37;
+/// ODBC 2.x name `SQL_OWNER_TERM`.
+pub const SQL_SCHEMA_TERM: SqlUSmallInt = 39;
+/// ODBC 2.x name `SQL_QUALIFIER_NAME_SEPARATOR`.
+pub const SQL_CATALOG_NAME_SEPARATOR: SqlUSmallInt = 41;
+/// ODBC 2.x name `SQL_QUALIFIER_TERM`.
+pub const SQL_CATALOG_TERM: SqlUSmallInt = 42;
 pub const SQL_TXN_CAPABLE: SqlUSmallInt = 46;
+pub const SQL_USER_NAME: SqlUSmallInt = 47;
+pub const SQL_NUMERIC_FUNCTIONS: SqlUSmallInt = 49;
+pub const SQL_STRING_FUNCTIONS: SqlUSmallInt = 50;
+pub const SQL_SYSTEM_FUNCTIONS: SqlUSmallInt = 51;
+pub const SQL_TIMEDATE_FUNCTIONS: SqlUSmallInt = 52;
 pub const SQL_TXN_ISOLATION_OPTION: SqlUSmallInt = 72;
 pub const SQL_DRIVER_ODBC_VER: SqlUSmallInt = 77;
 pub const SQL_GETDATA_EXTENSIONS: SqlUSmallInt = 81;
+pub const SQL_KEYWORDS: SqlUSmallInt = 89;
+pub const SQL_SPECIAL_CHARACTERS: SqlUSmallInt = 94;
+pub const SQL_MAX_STATEMENT_LEN: SqlUSmallInt = 105;
 pub const SQL_NEED_LONG_DATA_LEN: SqlUSmallInt = 111;
+pub const SQL_SQL_CONFORMANCE: SqlUSmallInt = 118;
 pub const SQL_DM_VER: SqlUSmallInt = 171;
 pub const SQL_ASYNC_DBC_FUNCTIONS: SqlUSmallInt = 10023;
 pub const SQL_ASYNC_NOTIFICATION: SqlUSmallInt = 10025;
+pub const SQL_PARAM_ARRAY_ROW_COUNTS: SqlUSmallInt = 153;
+pub const SQL_PARAM_ARRAY_SELECTS: SqlUSmallInt = 154;
 
 // SQLGetInfo return values.
 pub const SQL_OAC_LEVEL2: u16 = 0x0002;
 pub const SQL_OSC_CORE: u16 = 0x0001;
 pub const SQL_CB_CLOSE: u16 = 1;
+/// `SQL_SQL_CONFORMANCE`: entry-level SQL-92, matching msodbcsql18.
+pub const SQL_SC_SQL92_ENTRY: u32 = 0x00000001;
+/// The scalar-function masks (`SQL_NUMERIC_FUNCTIONS`, `SQL_STRING_FUNCTIONS`,
+/// `SQL_SYSTEM_FUNCTIONS`, `SQL_TIMEDATE_FUNCTIONS`) report the functions
+/// reachable through the ODBC `{fn ...}` escape. This driver does not translate
+/// escape sequences yet, so ODBC's "none supported" is the only honest answer;
+/// msodbcsql18 advertises real masks. Tracked by AB#46384.
+pub const SQL_FN_NONE_SUPPORTED: u32 = 0x00000000;
 /// `SQL_TXN_CAPABLE`: DML and DDL are both transactable (msodbcsql `sqlcinfo.cpp:323`).
 pub const SQL_TC_ALL: u16 = 2;
 /// `SQL_TXN_ISOLATION_OPTION` bitmask — the five levels this driver accepts
@@ -267,6 +303,24 @@ pub const SQL_GD_ANY_COLUMN: u32 = 0x00000001;
 pub const SQL_GD_ANY_ORDER: u32 = 0x00000002;
 pub const SQL_ASYNC_DBC_NOT_CAPABLE: u32 = 0x00000000;
 pub const SQL_ASYNC_NOTIFICATION_NOT_CAPABLE: u32 = 0x00000000;
+/// `SQL_PARAM_ARRAY_ROW_COUNTS`: one rolled-up `SQLRowCount` for the whole
+/// array rather than one per set (`SQLGetInfo` never reports `SQL_PARC_BATCH`
+/// here — `SQLRowCount` already sums every set's affected rows).
+/// `sqlext.h`: `#define SQL_PARC_NO_BATCH 2`.
+pub const SQL_PARC_NO_BATCH: u32 = 2;
+/// `SQL_PARAM_ARRAY_SELECTS`: per spec, a driver reporting this value does
+/// not allow a result-set-generating statement to be executed with an array
+/// of parameters. This driver actually *does* execute one and discards the
+/// result sets instead of refusing it (divergence 3 in `parameters_plan.md`),
+/// so the value is not literally true here. It is reported anyway because the
+/// alternative misleads in a more damaging direction: `SQL_PAS_BATCH` would
+/// promise OUTPUT rows this driver never delivers. msodbcsql 18.6.2.1 does
+/// report `SQL_PAS_BATCH`, measured, and backs it - an `INSERT ... OUTPUT` at
+/// `PARAMSET_SIZE` 3 hands back three result sets - so this is a divergence,
+/// not a match. Making it literally true means refusing such statements,
+/// which belongs to AB#47944.
+/// `sqlext.h`: `#define SQL_PAS_NO_SELECT 3`.
+pub const SQL_PAS_NO_SELECT: u32 = 3;
 
 // ODBC-SQL-type identifiers.
 pub const SQL_UNKNOWN_TYPE: SqlSmallInt = 0;
@@ -335,6 +389,16 @@ pub const SQL_PARAM_INPUT: SqlSmallInt = 1;
 pub const SQL_PARAM_INPUT_OUTPUT: SqlSmallInt = 2;
 pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
 
+// Parameter-array operation and status values.
+pub const SQL_PARAM_PROCEED: SqlUSmallInt = 0;
+pub const SQL_PARAM_IGNORE: SqlUSmallInt = 1;
+pub const SQL_PARAM_SUCCESS: SqlUSmallInt = 0;
+pub const SQL_PARAM_SUCCESS_WITH_INFO: SqlUSmallInt = 6;
+pub const SQL_PARAM_ERROR: SqlUSmallInt = 5;
+pub const SQL_PARAM_UNUSED: SqlUSmallInt = 7;
+
+pub const SQL_NO_ROWCOUNT_TOTAL: i64 = -1;
+
 // Values of NULLABLE field in descriptor
 pub const SQL_NO_NULLS: SqlSmallInt = 0;
 pub const SQL_NULLABLE: SqlSmallInt = 1;
@@ -357,9 +421,16 @@ pub const SQL_DIAG_SUBCLASS_ORIGIN: SqlSmallInt = 9;
 pub const SQL_DIAG_CONNECTION_NAME: SqlSmallInt = 10;
 pub const SQL_DIAG_SERVER_NAME: SqlSmallInt = 11;
 pub const SQL_DIAG_DYNAMIC_FUNCTION_CODE: SqlSmallInt = 12;
+/// `sqlext.h`: `#define SQL_DIAG_ROW_NUMBER (-1248)`.
+pub const SQL_DIAG_ROW_NUMBER: SqlSmallInt = -1248;
 
 // Dynamic-function-code value: statement type is unknown/unclassified.
 pub const SQL_DIAG_UNKNOWN_STATEMENT: SqlInteger = 0;
+
+// SQL_DIAG_ROW_NUMBER sentinels: the record is not associated with any row
+// (`SQL_NO_ROW_NUMBER`), or the driver cannot say which row (`SQL_ROW_NUMBER_UNKNOWN`).
+pub const SQL_NO_ROW_NUMBER: SqlLen = -1;
+pub const SQL_ROW_NUMBER_UNKNOWN: SqlLen = -2;
 
 // Special length/indicator constants.
 pub const SQL_NULL_DATA: SqlLen = -1;

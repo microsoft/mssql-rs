@@ -43,6 +43,10 @@ constexpr char kDefaultPacketSize[] = "16192";
 // columns go NULL on the same rows. Realistic sparsity without making the payload
 // dominated by NULLs.
 constexpr std::uint64_t kNullPeriod = 7;
+constexpr std::size_t kParameterArrayRows = 2000;
+constexpr std::size_t kParameterTextCapacity = 16;
+constexpr char kParameterArrayTable[] = "[dbo].[mssql_odbc_bench_param_array]";
+constexpr char kParameterArrayBenchmark[] = "write/insert_2000_c3/executemany";
 // Repeating source text for every generated string. A pure function of position,
 // so a delivered value can be checked without storing an expected copy.
 constexpr std::string_view kTextCycle = "abcdefghij";
@@ -873,6 +877,8 @@ Config Config::from_environment() {
     config.packet_size_keyword =
         environment_value_or("ODBC_BENCH_PACKET_SIZE_KEYWORD", "PacketSize");
     config.scenario = environment_value("ODBC_BENCH_SCENARIO");
+    config.write_mode =
+        environment_value_or("ODBC_BENCH_WRITE_MODE", "parameter_array");
 
     std::vector<std::string> missing;
     if (config.driver.empty()) {
@@ -913,15 +919,19 @@ Config Config::from_environment() {
         // Reject an unknown scenario instead of silently registering nothing: a
         // leg that measures zero benchmarks would fail the comparator's
         // benchmark-set check much further downstream.
-        const bool known = std::any_of(
+        const bool known = config.scenario == "write" || std::any_of(
             workloads().begin(), workloads().end(), [&config](const WorkloadSpec& spec) {
                 return config.scenario == spec.scenario;
             });
         if (!known) {
             throw std::runtime_error(
                 "ODBC_BENCH_SCENARIO must be one of narrow, wide, rowset, varwidth, "
-                "getdata, or unset");
+                "getdata, write, or unset");
         }
+    }
+    if (config.write_mode != "parameter_array" && config.write_mode != "sequential") {
+        throw std::runtime_error(
+            "ODBC_BENCH_WRITE_MODE must be parameter_array or sequential");
     }
     return config;
 }
@@ -986,6 +996,9 @@ OdbcSession::OdbcSession(const Config& config) {
         rc = SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt_);
         require_exact_success(rc, "SQLAllocHandle(SQL_HANDLE_STMT)", SQL_HANDLE_DBC,
                               dbc_);
+        rc = SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &admin_stmt_);
+        require_exact_success(rc, "SQLAllocHandle(SQL_HANDLE_STMT admin)",
+                              SQL_HANDLE_DBC, dbc_);
     } catch (...) {
         release();
         throw;
@@ -999,6 +1012,10 @@ OdbcSession::~OdbcSession() {
 
 // ODBC requires child handles to be released before their parents.
 void OdbcSession::release() noexcept {
+    if (admin_stmt_ != SQL_NULL_HSTMT) {
+        SQLFreeHandle(SQL_HANDLE_STMT, admin_stmt_);
+        admin_stmt_ = SQL_NULL_HSTMT;
+    }
     if (stmt_ != SQL_NULL_HSTMT) {
         SQLFreeHandle(SQL_HANDLE_STMT, stmt_);
         stmt_ = SQL_NULL_HSTMT;
@@ -1019,22 +1036,44 @@ SQLHSTMT OdbcSession::statement() const {
     return stmt_;
 }
 
-// Drain all results so the shared statement is clean for the next setup operation.
+SQLHSTMT OdbcSession::admin_statement() const {
+    return admin_stmt_;
+}
+
+// Drain all results so the administrative statement is clean for its next use.
 void OdbcSession::execute_non_query(const std::string& sql) {
     auto text = to_sql_string(sql);
     try {
-        require_exact_success(SQLExecDirect(stmt_, text.data(), SQL_NTS),
-                              "SQLExecDirect", SQL_HANDLE_STMT, stmt_);
+        require_exact_success(SQLExecDirect(admin_stmt_, text.data(), SQL_NTS),
+                              "SQLExecDirect", SQL_HANDLE_STMT, admin_stmt_);
         for (;;) {
-            const SQLRETURN rc = SQLMoreResults(stmt_);
+            const SQLRETURN rc = SQLMoreResults(admin_stmt_);
             if (rc == SQL_NO_DATA) {
                 break;
             }
-            require_exact_success(rc, "SQLMoreResults", SQL_HANDLE_STMT, stmt_);
+            require_exact_success(rc, "SQLMoreResults", SQL_HANDLE_STMT, admin_stmt_);
         }
     } catch (...) {
-        SQLFreeStmt(stmt_, SQL_CLOSE);
+        SQLFreeStmt(admin_stmt_, SQL_CLOSE);
         throw;
+    }
+}
+
+void OdbcSession::set_autocommit(bool enabled) {
+    const SQLULEN value = enabled ? SQL_AUTOCOMMIT_ON : SQL_AUTOCOMMIT_OFF;
+    require_exact_success(
+        SQLSetConnectAttr(dbc_, SQL_ATTR_AUTOCOMMIT, attribute_value(value), 0),
+        "SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT)", SQL_HANDLE_DBC, dbc_);
+}
+
+void OdbcSession::commit() {
+    require_exact_success(SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT),
+                          "SQLEndTran(SQL_COMMIT)", SQL_HANDLE_DBC, dbc_);
+}
+
+void OdbcSession::rollback_noexcept() noexcept {
+    if (dbc_ != SQL_NULL_HDBC) {
+        SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_ROLLBACK);
     }
 }
 
@@ -1046,35 +1085,35 @@ std::uint64_t OdbcSession::query_count(const std::string& table) {
     SQLBIGINT count = -1;
     SQLLEN indicator = kIndicatorSentinel;
     try {
-        require_exact_success(SQLExecDirect(stmt_, text.data(), SQL_NTS),
-                              "SQLExecDirect(COUNT_BIG)", SQL_HANDLE_STMT, stmt_);
+        require_exact_success(SQLExecDirect(admin_stmt_, text.data(), SQL_NTS),
+                              "SQLExecDirect(COUNT_BIG)", SQL_HANDLE_STMT, admin_stmt_);
         SQLSMALLINT columns = 0;
-        require_exact_success(SQLNumResultCols(stmt_, &columns), "SQLNumResultCols",
-                              SQL_HANDLE_STMT, stmt_);
+        require_exact_success(SQLNumResultCols(admin_stmt_, &columns), "SQLNumResultCols",
+                              SQL_HANDLE_STMT, admin_stmt_);
         if (columns != 1) {
             throw std::runtime_error("COUNT_BIG query returned the wrong column count");
         }
         require_exact_success(
-            SQLBindCol(stmt_, 1, SQL_C_SBIGINT, &count, sizeof(count), &indicator),
-            "SQLBindCol(COUNT_BIG)", SQL_HANDLE_STMT, stmt_);
-        require_exact_success(SQLFetch(stmt_), "SQLFetch(COUNT_BIG)",
-                              SQL_HANDLE_STMT, stmt_);
+            SQLBindCol(admin_stmt_, 1, SQL_C_SBIGINT, &count, sizeof(count), &indicator),
+            "SQLBindCol(COUNT_BIG)", SQL_HANDLE_STMT, admin_stmt_);
+        require_exact_success(SQLFetch(admin_stmt_), "SQLFetch(COUNT_BIG)",
+                              SQL_HANDLE_STMT, admin_stmt_);
         if (indicator != static_cast<SQLLEN>(sizeof(count)) || count < 0) {
             throw std::runtime_error("COUNT_BIG query returned an invalid value");
         }
-        const SQLRETURN final_fetch = SQLFetch(stmt_);
+        const SQLRETURN final_fetch = SQLFetch(admin_stmt_);
         if (final_fetch != SQL_NO_DATA) {
             throw_odbc_error("SQLFetch(COUNT_BIG final)", final_fetch,
-                             SQL_HANDLE_STMT, stmt_);
+                             SQL_HANDLE_STMT, admin_stmt_);
         }
-        require_exact_success(SQLCloseCursor(stmt_), "SQLCloseCursor(COUNT_BIG)",
-                              SQL_HANDLE_STMT, stmt_);
-        require_exact_success(SQLFreeStmt(stmt_, SQL_UNBIND),
+        require_exact_success(SQLCloseCursor(admin_stmt_), "SQLCloseCursor(COUNT_BIG)",
+                              SQL_HANDLE_STMT, admin_stmt_);
+        require_exact_success(SQLFreeStmt(admin_stmt_, SQL_UNBIND),
                               "SQLFreeStmt(SQL_UNBIND COUNT_BIG)",
-                              SQL_HANDLE_STMT, stmt_);
+                              SQL_HANDLE_STMT, admin_stmt_);
     } catch (...) {
-        SQLFreeStmt(stmt_, SQL_CLOSE);
-        SQLFreeStmt(stmt_, SQL_UNBIND);
+        SQLFreeStmt(admin_stmt_, SQL_CLOSE);
+        SQLFreeStmt(admin_stmt_, SQL_UNBIND);
         throw;
     }
     return static_cast<std::uint64_t>(count);
@@ -1082,6 +1121,8 @@ std::uint64_t OdbcSession::query_count(const std::string& table) {
 
 // Drop in reverse catalog order to keep cleanup safe if dependencies are added later.
 void cleanup_benchmark_tables(OdbcSession& session) {
+    session.execute_non_query("DROP TABLE IF EXISTS " +
+                              std::string(kParameterArrayTable));
     for (auto iterator = tables().rbegin(); iterator != tables().rend(); ++iterator) {
         session.execute_non_query("DROP TABLE IF EXISTS " + qualified_table(*iterator));
     }
@@ -1091,6 +1132,10 @@ void cleanup_benchmark_tables(OdbcSession& session) {
 // Recreate and count each table before any timed process can consume it.
 void setup_benchmark_tables(OdbcSession& session) {
     cleanup_benchmark_tables(session);
+    session.execute_non_query(
+        "CREATE TABLE " + std::string(kParameterArrayTable) +
+        " ([id] INT NOT NULL PRIMARY KEY, [payload] NVARCHAR(15) NOT NULL, "
+        "[value] BIGINT NOT NULL)");
     for (const auto& table : tables()) {
         std::cout << "Creating " << qualified_table(table) << " with " << table.row_count
                   << " rows and " << table.column_count() << " columns\n";
@@ -1110,6 +1155,11 @@ void setup_benchmark_tables(OdbcSession& session) {
 // Emit the whole catalog as replayable T-SQL, batch-separated so it can be piped
 // straight into sqlcmd. The statements are byte-identical to what setup sends.
 void print_benchmark_sql(std::ostream& output) {
+    output << "-- parameter-array write target: initially empty\n";
+    output << "DROP TABLE IF EXISTS " << kParameterArrayTable << ";\nGO\n";
+    output << "CREATE TABLE " << kParameterArrayTable
+           << " ([id] INT NOT NULL PRIMARY KEY, [payload] NVARCHAR(15) NOT NULL, "
+              "[value] BIGINT NOT NULL);\nGO\n";
     for (const auto& table : tables()) {
         output << "-- table " << table.table_name << ": " << table.row_count
                << " rows, " << table.column_count() << " columns\n";
@@ -2206,6 +2256,335 @@ private:
     std::array<unsigned char, 8> probe_sink_{};
 };
 
+// Manual commit stops the sequential leg paying one implicit transaction per row,
+// which is what makes it comparable to the single array execute. Scope it to the
+// run so it cannot leak into read benchmarks sharing the session.
+class AutocommitOffScope {
+public:
+    explicit AutocommitOffScope(OdbcSession& session) : session_(session) {
+        session_.set_autocommit(false);
+    }
+
+    ~AutocommitOffScope() {
+        try {
+            session_.set_autocommit(true);
+        } catch (...) {
+            // A destructor cannot report this, and the run already has its result.
+        }
+    }
+
+    AutocommitOffScope(const AutocommitOffScope&) = delete;
+    AutocommitOffScope& operator=(const AutocommitOffScope&) = delete;
+
+private:
+    OdbcSession& session_;
+};
+
+class ParameterArrayWriteRunner::Impl {
+public:
+    struct SequentialRow {
+        SQLINTEGER id = 0;
+        SQLLEN id_indicator = sizeof(SQLINTEGER);
+        std::array<SQLWCHAR, kParameterTextCapacity> payload = {};
+        SQLLEN payload_indicator = 0;
+        SQLBIGINT value = 0;
+        SQLLEN value_indicator = sizeof(SQLBIGINT);
+    };
+
+    Impl(OdbcSession& session, std::string mode)
+        : session_(session),
+          mode_(std::move(mode)),
+          ids_(kParameterArrayRows),
+          payloads_(kParameterArrayRows),
+          values_(kParameterArrayRows),
+          id_indicators_(kParameterArrayRows, sizeof(SQLINTEGER)),
+          payload_indicators_(kParameterArrayRows),
+          value_indicators_(kParameterArrayRows, sizeof(SQLBIGINT)),
+          statuses_(kParameterArrayRows, SQL_PARAM_UNUSED),
+          sequential_rows_(kParameterArrayRows) {
+        for (std::size_t row = 0; row < kParameterArrayRows; ++row) {
+            ids_[row] = static_cast<SQLINTEGER>(row + 1);
+            values_[row] = static_cast<SQLBIGINT>((row + 1) * 17);
+            sequential_rows_[row].id = ids_[row];
+            sequential_rows_[row].value = values_[row];
+
+            char text[kParameterTextCapacity] = {};
+            const int written =
+                std::snprintf(text, sizeof(text), "row-%06zu", row + 1);
+            if (written <= 0 ||
+                static_cast<std::size_t>(written) >= kParameterTextCapacity) {
+                throw std::logic_error("failed to format parameter-array payload");
+            }
+            for (int index = 0; index < written; ++index) {
+                payloads_[row][static_cast<std::size_t>(index)] =
+                    static_cast<SQLWCHAR>(
+                        static_cast<unsigned char>(text[static_cast<std::size_t>(index)]));
+                sequential_rows_[row].payload[static_cast<std::size_t>(index)] =
+                    payloads_[row][static_cast<std::size_t>(index)];
+            }
+            payload_indicators_[row] =
+                static_cast<SQLLEN>(written * sizeof(SQLWCHAR));
+            sequential_rows_[row].payload_indicator = payload_indicators_[row];
+        }
+        prepare();
+        if (mode_ == "parameter_array") {
+            bind_array();
+        } else {
+            bind_sequential_rows();
+        }
+    }
+
+    const char* name() const {
+        return kParameterArrayBenchmark;
+    }
+
+    void preflight() {
+        const auto metrics = run();
+        std::cerr << "Preflight passed for " << name() << " (" << mode_ << "): "
+                  << metrics.rows << " rows, " << metrics.execute_calls
+                  << " SQLExecute calls\n";
+    }
+
+    RetrievalMetrics execute() {
+        return run();
+    }
+
+private:
+    SQLHSTMT stmt() const {
+        return session_.statement();
+    }
+
+    void reset_statement_noexcept() noexcept {
+        SQLSetStmtAttr(stmt(), SQL_ATTR_PARAMSET_SIZE, attribute_value(1), 0);
+        SQLSetStmtAttr(stmt(), SQL_ATTR_PARAM_STATUS_PTR, nullptr, 0);
+        SQLSetStmtAttr(stmt(), SQL_ATTR_PARAMS_PROCESSED_PTR, nullptr, 0);
+        SQLSetStmtAttr(stmt(), SQL_ATTR_PARAM_BIND_OFFSET_PTR, nullptr, 0);
+        SQLSetStmtAttr(stmt(), SQL_ATTR_PARAM_BIND_TYPE,
+                       attribute_value(SQL_BIND_BY_COLUMN), 0);
+        SQLFreeStmt(stmt(), SQL_RESET_PARAMS);
+        SQLFreeStmt(stmt(), SQL_CLOSE);
+    }
+
+    void prepare() {
+        auto sql = to_sql_string(
+            "INSERT INTO [dbo].[mssql_odbc_bench_param_array] "
+            "([id], [payload], [value]) VALUES (?, ?, ?)");
+        require_exact_success(SQLPrepare(stmt(), sql.data(), SQL_NTS), "SQLPrepare(write)",
+                              SQL_HANDLE_STMT, stmt());
+    }
+
+    void bind_array() {
+        processed_ = 0;
+        std::fill(statuses_.begin(), statuses_.end(), SQL_PARAM_UNUSED);
+        require_exact_success(
+            SQLSetStmtAttr(stmt(), SQL_ATTR_PARAM_BIND_TYPE,
+                           attribute_value(SQL_BIND_BY_COLUMN), 0),
+            "SQLSetStmtAttr(SQL_ATTR_PARAM_BIND_TYPE)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLSetStmtAttr(stmt(), SQL_ATTR_PARAMSET_SIZE,
+                           attribute_value(kParameterArrayRows), 0),
+            "SQLSetStmtAttr(SQL_ATTR_PARAMSET_SIZE)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLSetStmtAttr(stmt(), SQL_ATTR_PARAM_STATUS_PTR, statuses_.data(), 0),
+            "SQLSetStmtAttr(SQL_ATTR_PARAM_STATUS_PTR)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLSetStmtAttr(stmt(), SQL_ATTR_PARAMS_PROCESSED_PTR, &processed_, 0),
+            "SQLSetStmtAttr(SQL_ATTR_PARAMS_PROCESSED_PTR)", SQL_HANDLE_STMT, stmt());
+
+        bind_row(0, true);
+    }
+
+    void bind_sequential_rows() {
+        sequential_offset_ = 0;
+        require_exact_success(
+            SQLSetStmtAttr(stmt(), SQL_ATTR_PARAMSET_SIZE, attribute_value(1), 0),
+            "SQLSetStmtAttr(SQL_ATTR_PARAMSET_SIZE)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLSetStmtAttr(stmt(), SQL_ATTR_PARAM_BIND_TYPE,
+                           attribute_value(sizeof(SequentialRow)), 0),
+            "SQLSetStmtAttr(SQL_ATTR_PARAM_BIND_TYPE)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLSetStmtAttr(stmt(), SQL_ATTR_PARAM_BIND_OFFSET_PTR,
+                           &sequential_offset_, 0),
+            "SQLSetStmtAttr(SQL_ATTR_PARAM_BIND_OFFSET_PTR)", SQL_HANDLE_STMT,
+            stmt());
+
+        auto& first = sequential_rows_.front();
+        require_exact_success(
+            SQLBindParameter(stmt(), 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                             &first.id, sizeof(first.id), &first.id_indicator),
+            "SQLBindParameter(id)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLBindParameter(
+                stmt(), 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                kParameterTextCapacity - 1, 0, first.payload.data(),
+                static_cast<SQLLEN>(sizeof(first.payload)), &first.payload_indicator),
+            "SQLBindParameter(payload)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLBindParameter(stmt(), 3, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                             &first.value, sizeof(first.value), &first.value_indicator),
+            "SQLBindParameter(value)", SQL_HANDLE_STMT, stmt());
+    }
+
+    void bind_row(std::size_t row, bool array) {
+        SQLINTEGER* ids = array ? ids_.data() : &ids_[row];
+        SQLBIGINT* values = array ? values_.data() : &values_[row];
+        auto* payloads = array ? payloads_.data() : &payloads_[row];
+        SQLLEN* id_indicators =
+            array ? id_indicators_.data() : &id_indicators_[row];
+        SQLLEN* payload_indicators =
+            array ? payload_indicators_.data() : &payload_indicators_[row];
+        SQLLEN* value_indicators =
+            array ? value_indicators_.data() : &value_indicators_[row];
+
+        require_exact_success(
+            SQLBindParameter(stmt(), 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                             ids, sizeof(SQLINTEGER), id_indicators),
+            "SQLBindParameter(id)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLBindParameter(
+                stmt(), 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                kParameterTextCapacity - 1, 0, payloads,
+                static_cast<SQLLEN>(sizeof(payloads_[0])), payload_indicators),
+            "SQLBindParameter(payload)", SQL_HANDLE_STMT, stmt());
+        require_exact_success(
+            SQLBindParameter(stmt(), 3, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                             values, sizeof(SQLBIGINT), value_indicators),
+            "SQLBindParameter(value)", SQL_HANDLE_STMT, stmt());
+    }
+
+    void validate_written_rows() {
+        const SQLHSTMT validation_stmt = session_.admin_statement();
+        auto query = to_sql_string(
+            "SELECT COUNT_BIG(*), COALESCE(SUM(CAST([id] AS BIGINT)), 0), "
+            "COALESCE(SUM([value]), 0), COALESCE(SUM(CAST(LEN([payload]) AS BIGINT)), 0) "
+            "FROM [dbo].[mssql_odbc_bench_param_array]");
+        std::array<SQLBIGINT, 4> actual = {};
+        std::array<SQLLEN, 4> indicators = {};
+        require_exact_success(SQLExecDirect(validation_stmt, query.data(), SQL_NTS),
+                              "SQLExecDirect(write validation)", SQL_HANDLE_STMT,
+                              validation_stmt);
+        for (std::size_t column = 0; column < actual.size(); ++column) {
+            require_exact_success(
+                SQLBindCol(validation_stmt, static_cast<SQLUSMALLINT>(column + 1), SQL_C_SBIGINT,
+                           &actual[column], sizeof(SQLBIGINT), &indicators[column]),
+                "SQLBindCol(write validation)", SQL_HANDLE_STMT, validation_stmt);
+        }
+        require_exact_success(SQLFetch(validation_stmt), "SQLFetch(write validation)",
+                              SQL_HANDLE_STMT, validation_stmt);
+        if (SQLFetch(validation_stmt) != SQL_NO_DATA) {
+            throw std::runtime_error("write validation returned more than one row");
+        }
+        require_exact_success(SQLCloseCursor(validation_stmt), "SQLCloseCursor(write validation)",
+                              SQL_HANDLE_STMT, validation_stmt);
+        require_exact_success(SQLFreeStmt(validation_stmt, SQL_UNBIND),
+                              "SQLFreeStmt(SQL_UNBIND write validation)",
+                              SQL_HANDLE_STMT, validation_stmt);
+
+        const auto rows = static_cast<SQLBIGINT>(kParameterArrayRows);
+        const std::array<SQLBIGINT, 4> expected = {
+            rows,
+            rows * (rows + 1) / 2,
+            17 * rows * (rows + 1) / 2,
+            10 * rows,
+        };
+        if (actual != expected ||
+            !std::all_of(indicators.begin(), indicators.end(), [](SQLLEN indicator) {
+                return indicator == static_cast<SQLLEN>(sizeof(SQLBIGINT));
+            })) {
+            throw std::runtime_error("parameter-array write correctness check failed");
+        }
+    }
+
+    RetrievalMetrics run() {
+        const AutocommitOffScope manual_commit(session_);
+        session_.execute_non_query("TRUNCATE TABLE " +
+                                   std::string(kParameterArrayTable));
+        session_.commit();
+
+        std::uint64_t execute_calls = 0;
+        SQLLEN affected = 0;
+        if (mode_ == "parameter_array") {
+            processed_ = 0;
+            std::fill(statuses_.begin(), statuses_.end(), SQL_PARAM_UNUSED);
+        } else {
+            sequential_offset_ = 0;
+        }
+        double execute_seconds = 0.0;
+        try {
+            if (mode_ == "parameter_array") {
+                const auto start = std::chrono::steady_clock::now();
+                require_exact_success(SQLExecute(stmt()), "SQLExecute(parameter array)",
+                                      SQL_HANDLE_STMT, stmt());
+                execute_seconds +=
+                    seconds_between(start, std::chrono::steady_clock::now());
+                execute_calls = 1;
+                require_exact_success(SQLRowCount(stmt(), &affected), "SQLRowCount",
+                                      SQL_HANDLE_STMT, stmt());
+                if (affected != static_cast<SQLLEN>(kParameterArrayRows) ||
+                    processed_ != kParameterArrayRows ||
+                    !std::all_of(statuses_.begin(), statuses_.end(), [](SQLUSMALLINT status) {
+                        return status == SQL_PARAM_SUCCESS;
+                    })) {
+                    throw std::runtime_error(
+                        "parameter-array status, processed count, or row count was incorrect");
+                }
+            } else {
+                for (std::size_t row = 0; row < kParameterArrayRows; ++row) {
+                    sequential_offset_ =
+                        static_cast<SQLLEN>(row * sizeof(SequentialRow));
+                    const auto start = std::chrono::steady_clock::now();
+                    require_exact_success(SQLExecute(stmt()), "SQLExecute(sequential)",
+                                          SQL_HANDLE_STMT, stmt());
+                    execute_seconds +=
+                        seconds_between(start, std::chrono::steady_clock::now());
+                    ++execute_calls;
+                    require_exact_success(SQLRowCount(stmt(), &affected), "SQLRowCount",
+                                          SQL_HANDLE_STMT, stmt());
+                    if (affected != 1) {
+                        throw std::runtime_error(
+                            "sequential write returned an incorrect row count");
+                    }
+                }
+                affected = static_cast<SQLLEN>(kParameterArrayRows);
+            }
+            session_.commit();
+            validate_written_rows();
+            session_.commit();
+
+            RetrievalMetrics metrics;
+            metrics.rows = kParameterArrayRows;
+            metrics.cells = kParameterArrayRows * 3;
+            metrics.logical_bytes =
+                kParameterArrayRows * (sizeof(SQLINTEGER) + 10 * sizeof(SQLWCHAR) +
+                                       sizeof(SQLBIGINT));
+            metrics.total_seconds = execute_seconds;
+            metrics.execute_seconds = execute_seconds;
+            metrics.metadata_bind_seconds = -1.0;
+            metrics.fetch_seconds = 0.0;
+            metrics.execute_calls = execute_calls;
+            return metrics;
+        } catch (...) {
+            session_.rollback_noexcept();
+            reset_statement_noexcept();
+            throw;
+        }
+    }
+
+    OdbcSession& session_;
+    std::string mode_;
+    std::vector<SQLINTEGER> ids_;
+    std::vector<std::array<SQLWCHAR, kParameterTextCapacity>> payloads_;
+    std::vector<SQLBIGINT> values_;
+    std::vector<SQLLEN> id_indicators_;
+    std::vector<SQLLEN> payload_indicators_;
+    std::vector<SQLLEN> value_indicators_;
+    std::vector<SQLUSMALLINT> statuses_;
+    std::vector<SequentialRow> sequential_rows_;
+    SQLULEN processed_ = 0;
+    SQLLEN sequential_offset_ = 0;
+};
+
 // Allocate descriptors once per catalog workload; each iteration still rebinds.
 WorkloadRunner::WorkloadRunner(OdbcSession& session, const WorkloadSpec& spec)
     : impl_(std::make_unique<Impl>(session, spec)) {}
@@ -2225,6 +2604,24 @@ void WorkloadRunner::preflight() {
 // Return all phase metrics from one complete result-set consumption.
 RetrievalMetrics WorkloadRunner::retrieve() {
     return impl_->retrieve();
+}
+
+ParameterArrayWriteRunner::ParameterArrayWriteRunner(OdbcSession& session,
+                                                     std::string mode)
+    : impl_(std::make_unique<Impl>(session, std::move(mode))) {}
+
+ParameterArrayWriteRunner::~ParameterArrayWriteRunner() = default;
+
+const char* ParameterArrayWriteRunner::name() const {
+    return impl_->name();
+}
+
+void ParameterArrayWriteRunner::preflight() {
+    impl_->preflight();
+}
+
+RetrievalMetrics ParameterArrayWriteRunner::execute() {
+    return impl_->execute();
 }
 
 }  // namespace mssql::odbc::bench
