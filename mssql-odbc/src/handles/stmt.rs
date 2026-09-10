@@ -453,6 +453,7 @@ pub(crate) struct StmtState {
     /// this: it is what keeps a live orphan from being discarded on the
     /// `sp_execute` reuse path.
     pub(crate) pending_unprepare: Option<StatementId>,
+    pub(crate) parameter_array: Option<crate::api::execute::BatchClientResults>,
     /// `true` when SQLFetch has positioned the cursor on a row ready for SQLGetData.
     pub(crate) row_positioned: bool,
     /// The column value captured by the most recent resume_row_to_column call, with its 1-based column index.
@@ -1270,6 +1271,7 @@ impl StmtHandle {
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
                 pending_unprepare: None,
+                parameter_array: None,
                 row_positioned: false,
                 last_captured: None,
                 buffered_get_data_row: None,

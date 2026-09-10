@@ -9,8 +9,8 @@ use tracing::{debug, error};
 use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
-    ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, StatementId, StatementResult,
-    StreamedParamStatus,
+    ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, ResultSet, StatementId,
+    StatementResult, StreamedParamStatus,
 };
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -123,17 +123,20 @@ struct BatchExecution {
     query_timeout: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct ParamArrayOutputs {
     paramset_size: SqlULen,
     param_status_ptr: *mut SqlUSmallInt,
     params_processed_ptr: *mut SqlULen,
 }
 
-struct BatchClientResults {
+#[derive(Debug)]
+pub(crate) struct BatchClientResults {
     outputs: ParamArrayOutputs,
     client_side_failures: usize,
     truncated_rows: Vec<usize>,
+    rows_affected: Option<i64>,
+    processed: SqlULen,
 }
 
 enum ExecutionStaging {
@@ -506,7 +509,7 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 failures: Vec::new(),
                 truncated_rows: Vec::new(),
             };
-            let batch_result = dbc.runtime.block_on(client.execute_prepared_batch(
+            let batch_result = dbc.runtime.block_on(client.begin_execute_prepared_batch(
                 &mut prepared.stmt,
                 &mut rows,
                 &mut orphaned,
@@ -573,6 +576,8 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     outputs,
                     client_side_failures: failures.len(),
                     truncated_rows,
+                    rows_affected: None,
+                    processed: 0,
                 },
             )
         }
@@ -607,44 +612,117 @@ fn finish_parameter_array(
     statement_handle: SqlHandle,
     mut client: mssql_tds::connection::tds_client::TdsClient,
     result: PreparedBatchResult,
-    batch: BatchClientResults,
+    mut batch: BatchClientResults,
 ) -> SqlReturn {
-    let mut failed_sets = batch.client_side_failures;
-    let mut had_info = false;
-    let complete = result.complete;
-    let total_rows = result
-        .total_rows_affected()
-        .unwrap_or(SQL_NO_ROWCOUNT_TOTAL);
-    let processed = params_processed(complete, batch.outputs.paramset_size, &result.rows);
+    let has_more = client.has_open_batch();
+    let metadata = client.get_metadata().clone();
+    let ird_ok = super::ird::populate_ird(stmt, &metadata).is_ok();
     let info_messages = client.take_info_messages();
-
     let Ok(mut stmt_state) = stmt.inner.lock() else {
-        return_client_idle(dbc, statement_handle, client);
+        super::exec_common::return_client_busy(dbc, client);
         return SQL_ERROR;
     };
-    let mut truncated_rows = batch.truncated_rows;
-    truncated_rows.sort_unstable();
+    stmt_state.begin_batch(metadata);
+    let mut rc = report_parameter_array(
+        &mut stmt_state,
+        result,
+        &mut batch,
+        client.current_parameter_set(),
+        has_more,
+    );
+    if post_tds_info_messages(&mut stmt_state, &info_messages) && rc == SQL_SUCCESS {
+        rc = SQL_SUCCESS_WITH_INFO;
+    }
+    stmt_state.clear_exhaustion_state();
+    stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
+    stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
+    if has_more {
+        stmt_state.row_count = SQL_NO_ROWCOUNT_TOTAL;
+        stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
+        stmt_state.parameter_array = Some(batch);
+    } else {
+        stmt_state.row_count = batch.rows_affected.unwrap_or(SQL_NO_ROWCOUNT_TOTAL);
+        stmt_state.clear_state(STMT_STATE_CURSOR_OPEN);
+    }
+    if !ird_ok {
+        post_sql_error(
+            &mut stmt_state,
+            SQLSTATE_HY000,
+            0,
+            "Internal error refreshing result-set metadata",
+        );
+        rc = SQL_ERROR;
+    }
+    drop(stmt_state);
+    if has_more {
+        super::exec_common::return_client_busy(dbc, client);
+    } else {
+        return_client_idle(dbc, statement_handle, client);
+    }
+    rc
+}
+
+pub(super) fn update_parameter_array(
+    stmt: &StmtHandle,
+    client: &mut mssql_tds::connection::tds_client::TdsClient,
+) -> SqlReturn {
+    let Ok(mut stmt_state) = stmt.inner.lock() else {
+        return SQL_ERROR;
+    };
+    let Some(mut batch) = stmt_state.parameter_array.take() else {
+        return SQL_SUCCESS;
+    };
+    batch.outputs.param_status_ptr = stmt_state
+        .inert_attrs
+        .get(SQL_ATTR_PARAM_STATUS_PTR)
+        .unwrap_or(0) as *mut SqlUSmallInt;
+    batch.outputs.params_processed_ptr = stmt_state
+        .inert_attrs
+        .get(SQL_ATTR_PARAMS_PROCESSED_PTR)
+        .unwrap_or(0) as *mut SqlULen;
+    let has_more = client.has_open_batch();
+    let rc = match client.take_prepared_batch_results() {
+        Some(result) => report_parameter_array(
+            &mut stmt_state,
+            result,
+            &mut batch,
+            client.current_parameter_set(),
+            has_more,
+        ),
+        None => SQL_SUCCESS,
+    };
+    if has_more {
+        stmt_state.parameter_array = Some(batch);
+    }
+    rc
+}
+
+fn report_parameter_array(
+    stmt_state: &mut crate::handles::stmt::StmtState,
+    result: PreparedBatchResult,
+    batch: &mut BatchClientResults,
+    current_set: Option<usize>,
+    has_more: bool,
+) -> SqlReturn {
+    let mut failed_sets = std::mem::take(&mut batch.client_side_failures);
+    let mut had_info = false;
+    let complete = result.complete;
+    if let Some(count) = result.total_rows_affected() {
+        batch.rows_affected = Some(batch.rows_affected.unwrap_or(0).saturating_add(count));
+    }
+    batch.processed = current_set.map_or_else(
+        || {
+            params_processed(complete, batch.outputs.paramset_size, &result.rows)
+                .max(batch.processed)
+        },
+        |index| index.saturating_add(1),
+    );
+    let processed = batch.processed;
+    batch.truncated_rows.sort_unstable();
     let mut had_fractional_truncation = false;
     for row in result.rows {
-        let row_truncated = truncated_rows.binary_search(&row.row_index).is_ok();
-        // A set that returned rows still ran: the OUTPUT rows are dropped
-        // because one statement handle cannot hold N result sets (AB#47944),
-        // but reporting it SQL_PARAM_ERROR would invite a retry that
-        // double-inserts.
-        let status = if row.has_result_set && row.errors.is_empty() {
-            had_info = true;
-            had_fractional_truncation |= row_truncated;
-            post_sql_error(
-                &mut stmt_state,
-                SQLSTATE_01000,
-                0,
-                format!(
-                    "Parameter-array row {} produced a result set; its rows were discarded",
-                    row.row_index + 1
-                ),
-            );
-            SQL_PARAM_SUCCESS_WITH_INFO
-        } else if row.errors.is_empty() {
+        let row_truncated = batch.truncated_rows.binary_search(&row.row_index).is_ok();
+        let status = if row.errors.is_empty() {
             if row.has_info || row_truncated {
                 had_info = true;
                 had_fractional_truncation |= row_truncated;
@@ -655,7 +733,7 @@ fn finish_parameter_array(
         } else {
             failed_sets += 1;
             post_tds_error(
-                &mut stmt_state,
+                stmt_state,
                 &TdsError::from_sql_errors(row.errors),
                 SQLSTATE_HY000,
             );
@@ -665,9 +743,9 @@ fn finish_parameter_array(
             write_param_status(batch.outputs.param_status_ptr, row.row_index, status);
         }
     }
-    if !complete {
+    if !complete && !has_more {
         post_sql_error(
-            &mut stmt_state,
+            stmt_state,
             SQLSTATE_01000,
             0,
             format!(
@@ -677,19 +755,12 @@ fn finish_parameter_array(
         );
     }
     if had_fractional_truncation {
-        post_diag(&mut stmt_state, WARN_FRACTIONAL_TRUNCATION);
+        post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION);
     }
-    post_tds_info_messages(&mut stmt_state, &info_messages);
-    stmt_state.row_count = total_rows;
-    stmt_state.clear_exhaustion_state();
-    stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
-    stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
-    drop(stmt_state);
 
     unsafe {
         write_params_processed(batch.outputs.params_processed_ptr, processed);
     }
-    return_client_idle(dbc, statement_handle, client);
 
     // One rule, whether the set failed client-side before it reached the wire or
     // server-side after: a status array can carry the per-set detail, so the
@@ -709,8 +780,8 @@ fn finish_parameter_array(
     // because it has no SQL_PARAM_UNUSED pre-fill. AB#47945.
     parameter_array_return_code(
         failed_sets,
-        complete,
-        had_info || !info_messages.is_empty(),
+        complete || has_more,
+        had_info,
         !batch.outputs.param_status_ptr.is_null(),
     )
 }
