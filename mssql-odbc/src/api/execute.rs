@@ -18,7 +18,7 @@ use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use super::exec_common::{
     ParamsWithDae, build_named_params, build_named_params_for_row, claim_connection,
     deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning, park_dae_client,
-    publish_scalar_processed, query_timeout_expired_error, return_client_idle,
+    park_deferred_dae, publish_scalar_processed, query_timeout_expired_error, return_client_idle,
     snapshot_bound_params,
 };
 use super::sqlstate::*;
@@ -374,6 +374,25 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                     );
                 }
             };
+
+            // A buffered parameter's declaration is not known until its bytes
+            // are all in, so the RPC cannot be opened yet: park the sequence
+            // with no request in flight and run the execute from the last
+            // `SQLParamData`, once every value can be built (AB#47590).
+            if dae_params.iter().any(|param| param.plan.is_buffered()) {
+                return park_deferred_dae(
+                    stmt,
+                    client,
+                    Some(prepared),
+                    orphaned,
+                    dae_params,
+                    params,
+                    None,
+                    query_timeout,
+                    fractional_truncated,
+                    "SQLExecute",
+                );
+            }
 
             // Data-at-execution keeps the prepared path: `begin_execute_prepared`
             // streams the values into the same `sp_execute` / `sp_prepexec` RPC a
@@ -1971,16 +1990,9 @@ mod tests {
         match staging {
             ExecutionStaging::NeedData(dae) => {
                 // The single param is DAE: its index is in dae_indices.
-                assert_eq!(
-                    dae.dae_params,
-                    vec![DaeParam {
-                        value_ptr: std::ptr::null_mut(),
-                        expected_len: None,
-                        needs_transcode: false,
-                        c_type: SQL_C_CHAR,
-                        sql_type: SQL_VARCHAR
-                    }]
-                );
+                assert_eq!(dae.dae_params.len(), 1);
+                assert_eq!(dae.dae_params[0].bound_index, 0);
+                assert_eq!(dae.dae_params[0].expected_len, None);
                 assert_eq!(dae.params.len(), 1, "one param in list");
             }
             ExecutionStaging::Ready(_) | ExecutionStaging::Batch(_) => {
