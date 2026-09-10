@@ -15,6 +15,9 @@ use crate::datatypes::sqldatatypes::TdsDataType;
 use crate::datatypes::tds_value_serializer::{TdsTypeContext, TdsValueSerializer};
 use crate::error::Error;
 use crate::io::packet_writer::{PacketWriter, TdsPacketWriter};
+use crate::sql_identifier::{
+    TABLE_INDEX, build_multipart_name, escape_identifier, parse_multipart_identifier,
+};
 use crate::token::tokens::SqlCollation;
 use tracing::{debug, trace};
 
@@ -1041,6 +1044,16 @@ pub(crate) fn build_insert_bulk_command(
     column_metadata: &[BulkCopyColumnMetadata],
     options: &BulkCopyOptions,
 ) -> crate::core::TdsResult<String> {
+    let parts = parse_multipart_identifier(table_name, true)?;
+    if parts[TABLE_INDEX]
+        .as_ref()
+        .is_none_or(|part| part.is_empty())
+    {
+        return Err(Error::UsageError(format!(
+            "Invalid table name: {table_name}"
+        )));
+    }
+    let table_name = build_multipart_name(&parts);
     let mut command = format!("INSERT BULK {table_name} (");
 
     for (i, col_meta) in column_metadata.iter().enumerate() {
@@ -1049,7 +1062,8 @@ pub(crate) fn build_insert_bulk_command(
         }
 
         // Column name
-        command.push_str(&format!("[{}] ", col_meta.column_name));
+        command.push_str(&escape_identifier(&col_meta.column_name));
+        command.push(' ');
 
         // Type definition
         let type_def = col_meta.get_sql_type_definition()?;
@@ -1058,6 +1072,19 @@ pub(crate) fn build_insert_bulk_command(
         // Add COLLATE clause if the column needs collation and has a collation name
         if let (true, Some(collation_name)) = (col_meta.needs_collation(), &col_meta.collation_name)
         {
+            if collation_name.len() > 128
+                || !collation_name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphabetic)
+                || !collation_name
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+            {
+                return Err(Error::UsageError(format!(
+                    "Invalid collation name: {collation_name}"
+                )));
+            }
             command.push_str(&format!(" COLLATE {}", collation_name));
         }
     }

@@ -471,6 +471,8 @@ pub struct BulkCopyColumnMetadata {
     /// Collation name (e.g., "SQL_Latin1_General_CP1_CI_AS")
     /// This is the collation name retrieved from sp_tablecollations_100
     /// and used in the INSERT BULK SQL command.
+    /// Custom names must be 1-128 ASCII letters, digits, or underscores, starting
+    /// with a letter. Invalid tokens return `Error::UsageError` during bulk copy.
     pub collation_name: Option<String>,
 
     /// Character encoding (for character types)
@@ -555,6 +557,7 @@ impl BulkCopyColumnMetadata {
 
     /// Set collation name (for character types).
     /// This is used in the INSERT BULK SQL command.
+    /// See [`Self::collation_name`] for the accepted token format.
     pub fn with_collation_name(mut self, collation_name: impl Into<String>) -> Self {
         self.collation_name = Some(collation_name.into());
         self
