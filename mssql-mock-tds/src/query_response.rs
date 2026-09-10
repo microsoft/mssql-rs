@@ -311,6 +311,20 @@ impl QueryResponse {
 /// ignored, since `Begin` always acknowledges with an `EnvChange` + `DONE`.
 pub const TM_BEGIN_DELAY_KEY: &str = "__MOCK_TDS_TM_BEGIN_DELAY__";
 
+/// Reserved [`QueryRegistry`] key that delays the mock server's answer to an
+/// RPC request that matched no specific registration.
+///
+/// RPC responses are otherwise matched by finding the registered (upper-cased)
+/// query text inside the request body, which works for `sp_prepexec`-style
+/// calls that carry caller-controlled SQL. It cannot address a call whose
+/// wire text the test does not choose — a catalog procedure, `sp_datatype_info`
+/// or `sp_describe_undeclared_parameters` — because the driver sends those
+/// proc names in lower case. This key delays those instead, so a test can
+/// prove `SQL_ATTR_QUERY_TIMEOUT` bounds the RPC itself rather than only the
+/// steps around it. Like [`TM_BEGIN_DELAY_KEY`], only its
+/// [`QueryResponse::delay`] is consulted.
+pub const RPC_DELAY_KEY: &str = "__MOCK_TDS_RPC_DELAY__";
+
 /// Registry of query responses
 pub struct QueryRegistry {
     responses: HashMap<String, QueryResponse>,

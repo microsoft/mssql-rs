@@ -283,6 +283,24 @@ impl MockServer {
             );
         });
     }
+
+    /// Registers a delay for the server's answer to any RPC request that
+    /// matched no specific registration.
+    ///
+    /// The substring match `connect_mock_server`'s `query` relies on can only
+    /// address RPCs whose wire text the test chooses (`sp_prepexec`'s `@stmt`).
+    /// Catalog procedures, `sp_datatype_info_100` and
+    /// `sp_describe_undeclared_parameters` are named by the driver in lower
+    /// case, so this is how a test holds *those* responses back long enough to
+    /// prove `SQL_ATTR_QUERY_TIMEOUT` bounds the RPC itself.
+    pub(crate) fn set_rpc_delay(&self, delay: std::time::Duration) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(
+                mssql_mock_tds::RPC_DELAY_KEY,
+                mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+            );
+        });
+    }
 }
 
 impl Drop for MockServer {

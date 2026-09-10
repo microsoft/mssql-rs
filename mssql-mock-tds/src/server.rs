@@ -11,7 +11,7 @@ use crate::protocol::{
     build_routing_response, build_transaction_manager_response, parse_fedauth_token,
     parse_login7_auth, parse_sql_batch, parse_transaction_manager_request,
 };
-use crate::query_response::{QueryRegistry, TM_BEGIN_DELAY_KEY};
+use crate::query_response::{QueryRegistry, RPC_DELAY_KEY, TM_BEGIN_DELAY_KEY};
 use bytes::BytesMut;
 use native_tls::Identity;
 use std::collections::BTreeMap;
@@ -512,6 +512,23 @@ impl ConnectionProcessor {
                         Some(build_query_result(&response_data))
                     } else {
                         info!("No registered response for RPC request, returning empty result");
+                        // A test can still delay this answer via the reserved
+                        // `RPC_DELAY_KEY`, which is how a catalog /
+                        // `sp_datatype_info` / `sp_describe_undeclared_parameters`
+                        // call — whose lower-case proc name the substring match
+                        // cannot address — is held back long enough to prove
+                        // SQL_ATTR_QUERY_TIMEOUT bounds the RPC itself.
+                        let delay = self
+                            .query_registry
+                            .lock()
+                            .await
+                            .get(RPC_DELAY_KEY)
+                            .and_then(|r| r.delay);
+                        match self.wait_out_delay_or_attention(socket, delay).await? {
+                            DelayOutcome::Attention(ack) => return Ok(Some(ack)),
+                            DelayOutcome::Closed => return Ok(None),
+                            DelayOutcome::Elapsed => {}
+                        }
                         let response = build_done_token(0);
                         let total_length = (PACKET_HEADER_SIZE + response.len()) as u16;
                         let mut packet = BytesMut::with_capacity(total_length as usize);

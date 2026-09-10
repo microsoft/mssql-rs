@@ -11,13 +11,17 @@
 //! reference driver so this crate is a drop-in replacement behind the same
 //! Driver Manager.
 
+use std::time::Instant;
+
 use tracing::{debug, error};
 
+use mssql_tds::connection::tds_client::ExecuteOptions;
 use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
 use super::exec_common::{
-    claim_connection, fail_with_tds, finish_execute, flush_pending_unprepare,
+    claim_connection, deduct_query_timeout, fail_with_tds, finish_execute, flush_pending_unprepare,
+    query_timeout_expired_error,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
@@ -114,7 +118,7 @@ fn sql_get_type_info_w_safe(
     // Validate the requested type and reset prior context under the stmt lock.
     // Validation runs before any state mutation so an invalid type leaves the
     // statement unchanged, matching msodbcsql.
-    {
+    let query_timeout = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLGetTypeInfoW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -157,7 +161,8 @@ fn sql_get_type_info_w_safe(
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-    }
+        stmt_state.query_timeout
+    };
 
     // `@data_type` is positional; 2.x applications receive the 2.x date/time id.
     let positional = vec![RpcParameter::new(
@@ -181,21 +186,52 @@ fn sql_get_type_info_w_safe(
         Ok(client) => client,
         Err(rc) => return rc,
     };
+    let budget = query_timeout;
+    let started = Instant::now();
 
     // Release any handle orphaned by the reset above before running the RPC.
-    // Not SQLExecute/SQLExecDirectW, so out of scope for the
-    // SQL_ATTR_QUERY_TIMEOUT wiring; `0` keeps existing unbounded behavior.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLGetTypeInfoW", 0);
+    // `SQL_ATTR_QUERY_TIMEOUT` bounds this call: msodbcsql runs SQLGetTypeInfo
+    // through `SQLExecDirectW` itself (`sqlcdd.cpp:2239`), inheriting
+    // `GetQueryTimeOut(lpstmt)`, and the function's documented SQLSTATE table
+    // lists `HYT00` naming this attribute. `0` (the default) stays unlimited.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLGetTypeInfoW", query_timeout);
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLGetTypeInfoW", 0) {
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLGetTypeInfoW", query_timeout)
+    {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
 
     let exec_result = dbc.runtime.block_on(client.execute_stored_procedure(
         DATATYPE_INFO_PROC.to_string(),
         Some(positional),
         named,
-        (),
+        ExecuteOptions::new().timeout_secs(query_timeout),
     ));
     if let Err(e) = exec_result {
         error!(%e, "SQLGetTypeInfoW: execution failed");
@@ -357,6 +393,57 @@ mod tests {
     fn null_handle_returns_invalid_handle() {
         let ret = unsafe { sql_get_type_info_w(SQL_NULL_HANDLE, SQL_ALL_TYPES) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must bound `SQLGetTypeInfo`, not just
+    /// `SQLExecute`/`SQLExecDirectW`. msodbcsql runs this function through
+    /// `SQLExecDirectW` itself (`sqlcdd.cpp:2239`), so it inherits
+    /// `GetQueryTimeOut(lpstmt)`, and the function's documented SQLSTATE table
+    /// lists `HYT00` naming this attribute.
+    ///
+    /// The delay is applied to the `sp_datatype_info_100` RPC response itself
+    /// (via `RPC_DELAY_KEY`), not to the transaction begin, so this fails if
+    /// the timeout stops reaching the RPC's own `ExecuteOptions` — the exact
+    /// regression mssql-rs#466 describes, where passing `()` left
+    /// `remaining_request_timeout` unset for the whole batch.
+    #[test]
+    fn get_type_info_query_timeout_bounds_a_longer_server_delay() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        let started = Instant::now();
+        let ret = sql_get_type_info_w_safe(h.stmt, stmt, SQL_ALL_TYPES);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ret, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLGetTypeInfoW took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the wait well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
     }
 
     #[test]
