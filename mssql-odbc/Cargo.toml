@@ -6,7 +6,10 @@ publish = false
 
 [lib]
 name = "mssqlodbc"
-crate-type = ["cdylib"]
+# `rlib` is added alongside `cdylib` so the `fuzz/` crate can link the driver as
+# an ordinary Rust dependency (a cdylib-only crate can't be used with `extern
+# crate`). It has no effect on the shipped dynamic library.
+crate-type = ["cdylib", "rlib"]
 
 [lints]
 workspace = true
