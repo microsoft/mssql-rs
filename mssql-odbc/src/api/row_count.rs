@@ -10,7 +10,7 @@ use crate::api::odbc_types::{
 };
 use crate::api::util::write_if_some;
 use crate::error::free_errors;
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, get_handle};
 
 /// Returns the number of rows affected by the last INSERT, UPDATE, or DELETE.
 ///
@@ -44,13 +44,13 @@ unsafe fn sql_row_count_impl(statement_handle: SqlHandle, row_count_ptr: *mut Sq
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
         "SQLRowCount: handle is not a STMT"
     );
-    sql_row_count_safe(stmt, row_count_ptr)
+    sql_row_count_safe(&stmt, row_count_ptr)
 }
 
 fn sql_row_count_safe(stmt: &StmtHandle, row_count_ptr: *mut SqlLen) -> SqlReturn {
@@ -109,7 +109,7 @@ mod tests {
     fn reports_stored_dml_count() {
         let h = TestHandles::with_env_dbc_stmt();
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         stmt_handle.inner.lock().unwrap().row_count = 7;
 
         let mut count: SqlLen = -1;
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn poisoned_mutex_returns_error() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
 
         // Poison the stmt mutex by panicking while it is held.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

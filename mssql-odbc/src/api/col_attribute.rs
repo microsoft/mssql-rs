@@ -35,7 +35,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, get_handle};
 
 /// Gets a descriptor field for a result-set column.
 ///
@@ -98,7 +98,7 @@ unsafe fn sql_col_attribute_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -106,7 +106,7 @@ unsafe fn sql_col_attribute_w_impl(
     );
 
     sql_col_attribute_w_safe(
-        stmt,
+        &stmt,
         column_number,
         field_identifier,
         character_attribute_ptr,
@@ -739,12 +739,13 @@ mod tests {
     };
     use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_FIELD;
     use crate::handles::OdbcVersion;
+    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sqldatatypes::TypeInfo;
     use mssql_tds::test_client_support::{int_columns, udt_column, udt_column_with_metadata};
 
     fn stmt_with_columns(h: &TestHandles, columns: Vec<ColumnMetadata>) {
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut s = stmt_handle.inner.lock().unwrap();
         s.set_state(STMT_STATE_EXEC_CONTEXT);
         s.column_metadata = columns;
@@ -825,7 +826,7 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
@@ -851,7 +852,7 @@ mod tests {
                 )
             };
             assert_eq!(rc, SQL_ERROR, "column {col}");
-            let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = sh.inner.lock().unwrap();
             assert_eq!(
                 s.diag_records.last().unwrap().sql_state,
@@ -878,7 +879,7 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
@@ -954,7 +955,7 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_SUCCESS_WITH_INFO);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
@@ -981,7 +982,7 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
@@ -993,7 +994,7 @@ mod tests {
     /// metadata constructor available here, and the fields are public, so this
     /// is how the per-type mapping tables get exercised without a live server.
     fn retype_column(h: &TestHandles, col: usize, data_type: TdsDataType, length: usize) {
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let mut s = stmt_handle.inner.lock().unwrap();
         let meta = &mut s.column_metadata[col - 1];
         meta.data_type = data_type;
@@ -1032,7 +1033,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_int_columns(&h, 1);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.column_metadata[0].column_name.clear();
         }
@@ -1046,7 +1047,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_int_columns(&h, 1);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.column_metadata[0].flags &= !0x01;
         }
@@ -1335,7 +1336,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_int_columns(&h, 1);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.column_metadata[0].flags |= 0x10;
         }
@@ -1349,7 +1350,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_int_columns(&h, 1);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.column_metadata[0].column_name = "alias".to_string();
         }
@@ -1405,7 +1406,7 @@ mod tests {
         stmt_with_int_columns(&h, 2);
         retype_column(&h, 1, TdsDataType::SsVariant, 8);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.last_variant_base = Some((1, TdsDataType::NVarChar));
         }
@@ -1421,7 +1422,7 @@ mod tests {
         stmt_with_int_columns(&h, 1);
         retype_column(&h, 1, TdsDataType::SsVariant, 8);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             stmt_handle.inner.lock().unwrap().last_variant_base = Some((1, TdsDataType::TimeN));
         }
 
@@ -1433,7 +1434,9 @@ mod tests {
         {
             // Directly mutating the ENV after DBC allocation is test-only; a
             // Driver Manager rejects this state transition.
-            let env_handle = unsafe { handle_from_raw::<crate::handles::EnvHandle>(h.env) };
+            let env_handle = handle_from_raw::<crate::handles::EnvHandle>(h.env)
+                .unwrap()
+                .into_arc();
             env_handle.inner.lock().unwrap().odbc_version = OdbcVersion::Odbc3;
         }
         assert_eq!(
@@ -1450,7 +1453,7 @@ mod tests {
         retype_column(&h, 1, TdsDataType::SsVariant, 8);
         retype_column(&h, 2, TdsDataType::SsVariant, 8);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             s.last_variant_base = Some((1, TdsDataType::Int4));
         }
@@ -1467,7 +1470,7 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_ERROR);
-        let sh = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let sh = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let s = sh.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
@@ -1536,7 +1539,7 @@ mod tests {
         ];
         for (ty, len, name) in cases {
             retype_column(&h, 1, *ty, *len);
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let s = stmt_handle.inner.lock().unwrap();
             assert_eq!(type_name(&s.column_metadata[0]), *name, "{ty:?} len {len}");
         }
@@ -1549,7 +1552,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_int_columns(&h, 1);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             let meta = &mut s.column_metadata[0];
             meta.data_type = TdsDataType::BigVarChar;
@@ -1578,7 +1581,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         stmt_with_int_columns(&h, 1);
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let mut s = stmt_handle.inner.lock().unwrap();
             let meta = &mut s.column_metadata[0];
             meta.data_type = TdsDataType::DecimalN;

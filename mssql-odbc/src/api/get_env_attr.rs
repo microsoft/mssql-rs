@@ -12,7 +12,7 @@ use crate::api::odbc_types::{
 use crate::api::sqlstate::{ERR_INVALID_ATTRIBUTE_IDENTIFIER, post_diag};
 use crate::api::util::write_if_some;
 use crate::error::free_errors;
-use crate::handles::{EnvHandle, HandleType, OdbcVersion, handle_from_raw};
+use crate::handles::{EnvHandle, HandleType, OdbcVersion, get_handle};
 
 /// Returns an environment attribute value.
 ///
@@ -55,13 +55,13 @@ unsafe fn sql_get_env_attr_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let env = unsafe { handle_from_raw::<EnvHandle>(environment_handle) };
+    let env = get_handle!(EnvHandle, environment_handle);
     debug_assert_eq!(
         env.object_type,
         HandleType::Env,
         "SQLGetEnvAttr: handle is not an ENV"
     );
-    sql_get_env_attr_safe(env, attribute, value_ptr, string_length_ptr)
+    sql_get_env_attr_safe(&env, attribute, value_ptr, string_length_ptr)
 }
 
 fn sql_get_env_attr_safe(

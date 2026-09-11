@@ -20,7 +20,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_utf16_with_nul, copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, get_handle};
 
 /// Gets metadata for a result-set column.
 ///
@@ -91,7 +91,7 @@ unsafe fn sql_describe_col_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -99,7 +99,7 @@ unsafe fn sql_describe_col_w_impl(
     );
 
     sql_describe_col_w_safe(
-        stmt,
+        &stmt,
         column_number,
         column_name,
         buffer_length,
@@ -340,6 +340,7 @@ mod tests {
     use std::ptr;
 
     use super::*;
+    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
     use mssql_tds::test_client_support::{int_columns, udt_column};
 
@@ -416,7 +417,7 @@ mod tests {
         let rc = unsafe { describe(stmt, 1) };
         assert_eq!(rc, SQL_ERROR);
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(stmt).unwrap().into_arc();
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert_eq!(stmt_state.diag_records.len(), 1);
         assert_eq!(
@@ -430,7 +431,7 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = h.stmt;
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(stmt).unwrap().into_arc();
         stmt_handle
             .inner
             .lock()
@@ -456,7 +457,7 @@ mod tests {
         // EXEC_CONTEXT is set but column_metadata is empty (e.g., the prior
         // statement was DML/DDL with zero result columns). Any column_number
         // >= 1 must yield 07009.
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(stmt) };
+        let stmt_handle = handle_from_raw::<StmtHandle>(stmt).unwrap().into_arc();
         stmt_handle
             .inner
             .lock()
@@ -477,7 +478,7 @@ mod tests {
     #[test]
     fn uncached_column_name_is_encoded_on_demand() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_EXEC_CONTEXT);

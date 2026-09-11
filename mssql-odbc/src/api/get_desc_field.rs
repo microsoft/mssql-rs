@@ -30,7 +30,7 @@ use crate::api::sqlstate::{
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{HasDiagnostics, free_errors};
 use crate::handles::desc::{DescHeader, DescRecord, FieldScope, classify_field};
-use crate::handles::{DescHandle, HandleType, handle_from_raw};
+use crate::handles::{DescHandle, HandleType, get_handle};
 
 /// Implementation of [`SQLGetDescFieldW`](super::exports::SQLGetDescFieldW).
 ///
@@ -90,7 +90,7 @@ unsafe fn sql_get_desc_field_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let desc = unsafe { handle_from_raw::<DescHandle>(descriptor_handle) };
+    let desc = get_handle!(DescHandle, descriptor_handle);
     debug_assert_eq!(
         desc.object_type,
         HandleType::Desc,
@@ -98,7 +98,7 @@ unsafe fn sql_get_desc_field_w_impl(
     );
 
     sql_get_desc_field_w_safe(
-        desc,
+        &desc,
         record_number,
         field_identifier,
         value_ptr,
@@ -361,7 +361,7 @@ mod tests {
     }
 
     fn desc_diags(handle: SqlHandle) -> Vec<DiagRecord> {
-        let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
+        let desc = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
         desc.inner.lock().unwrap().diag_records.clone()
     }
 

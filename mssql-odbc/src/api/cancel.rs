@@ -17,7 +17,7 @@ use super::exec_common::unwind_dae;
 use super::sqlstate::{ERR_FUNCTION_SEQUENCE, post_diag};
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::error::free_errors;
-use crate::handles::{HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle, get_handle};
 
 /// Cancels processing on a statement.
 ///
@@ -42,7 +42,7 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
         return SQL_INVALID_HANDLE;
     }
 
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(
         stmt.object_type,
         HandleType::Stmt,
@@ -78,7 +78,7 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
 
     if needs_data {
         debug!("SQLCancel: abandoning data-at-execution sequence");
-        unwind_dae(stmt.parent_dbc(), stmt, statement_handle, None);
+        unwind_dae(stmt.parent_dbc(), &stmt, statement_handle, None);
     }
 
     SQL_SUCCESS
@@ -88,6 +88,7 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_INVALID_HANDLE;
+    use crate::handles::handle_from_raw;
     use crate::handles::stmt::{DaeParam, DaeState, STMT_STATE_EXEC_STARTED};
     use crate::test_support::TestHandles;
 
@@ -114,7 +115,7 @@ mod tests {
     #[test]
     fn cancel_clears_need_data_and_restores_prepared_plan() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_EXEC_STARTED);
@@ -137,7 +138,7 @@ mod tests {
     #[test]
     fn cancel_during_in_flight_dae_call_reports_hy010() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_EXEC_STARTED);

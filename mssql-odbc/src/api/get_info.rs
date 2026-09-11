@@ -36,7 +36,7 @@ use crate::api::sqlstate::{
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
-use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+use crate::handles::{DbcHandle, HandleType, get_handle};
 
 /// `sysname`, the type of every identifier column in the catalog views, which
 /// bounds `SQL_MAX_COLUMN_NAME_LEN`, `SQL_MAX_SCHEMA_NAME_LEN`, and
@@ -384,14 +384,14 @@ unsafe fn sql_get_info_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
+    let dbc = get_handle!(DbcHandle, connection_handle);
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
         "SQLGetInfoW: handle is not a DBC"
     );
     sql_get_info_w_safe(
-        dbc,
+        &dbc,
         info_type,
         info_value_ptr,
         buffer_length,
@@ -802,6 +802,7 @@ mod tests {
 
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     fn get_u16(dbc: SqlHandle, info_type: SqlUSmallInt) -> (SqlReturn, u16, SqlSmallInt) {
@@ -1262,7 +1263,7 @@ mod tests {
         assert_eq!(buf[2], 0);
         assert_eq!(String::from_utf16_lossy(&buf[..2]), "Mi");
 
-        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_ref = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(
@@ -1298,7 +1299,7 @@ mod tests {
         let (rc, _, _) = get_u16(h.dbc, 65000);
         assert_eq!(rc, SQL_ERROR);
 
-        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_ref = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, ERR_INVALID_INFO_TYPE.state);
@@ -1381,7 +1382,7 @@ mod tests {
                 "info_type {info_type}"
             );
 
-            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc_ref = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
             let state = dbc_ref.inner.lock().unwrap();
             assert_eq!(
                 state.diag_records.last().map(|d| d.sql_state),
@@ -1406,7 +1407,7 @@ mod tests {
     fn identity_info_types_report_connected_session() {
         let h = TestHandles::with_env_dbc();
         {
-            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc_ref = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
             let mut state = dbc_ref.inner.lock().unwrap();
             state.identity = crate::handles::dbc::ConnectionIdentity {
                 data_source_name: "ReportingDsn".to_string(),
@@ -1435,7 +1436,7 @@ mod tests {
     fn identity_info_types_truncate_with_01004() {
         let h = TestHandles::with_env_dbc();
         {
-            let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc_ref = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
             let mut state = dbc_ref.inner.lock().unwrap();
             state.identity.server_name = "SQLPROD01".to_string();
         }

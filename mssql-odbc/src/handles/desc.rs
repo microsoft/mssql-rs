@@ -61,9 +61,10 @@
 //! data), unlike `SQLGetDescRecW`'s `Name` output.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use super::{HandleType, HasObjectType};
+use super::bindings::BindingUse;
+use super::{DbcHandle, Handle, HandleActivity, HandleType};
 use crate::api::odbc_types::{
     SQL_C_DEFAULT, SQL_DESC_ALLOC_AUTO, SQL_DESC_ALLOC_TYPE, SQL_DESC_ALLOC_USER,
     SQL_DESC_ARRAY_SIZE, SQL_DESC_ARRAY_STATUS_PTR, SQL_DESC_BIND_OFFSET_PTR, SQL_DESC_BIND_TYPE,
@@ -112,6 +113,8 @@ impl DescKind {
 #[derive(Debug)]
 pub(crate) struct DescHandle {
     pub(crate) object_type: HandleType,
+    pub(crate) activity: Arc<HandleActivity>,
+    parent: Arc<DbcHandle>,
     pub(crate) kind: DescKind,
     /// `SQL_DESC_ALLOC_TYPE`: `SQL_DESC_ALLOC_AUTO` for the four implicit
     /// descriptors, `SQL_DESC_ALLOC_USER` for one allocated by
@@ -133,6 +136,7 @@ pub(crate) struct DescHandle {
     /// once at construction, never mutated — same soundness rationale as
     /// `StmtHandle::parent_dbc`.
     pub(crate) parent_dbc: *mut c_void,
+    pub(crate) binding_use: BindingUse,
     pub(crate) inner: Mutex<DescState>,
 }
 
@@ -370,12 +374,21 @@ impl DescState {
 }
 
 impl DescHandle {
-    pub(crate) fn new(kind: DescKind, alloc_type: SqlSmallInt, parent_dbc: *mut c_void) -> Self {
+    pub(crate) fn new(
+        kind: DescKind,
+        alloc_type: SqlSmallInt,
+        parent_dbc: *mut c_void,
+        parent: Arc<DbcHandle>,
+        activity: Arc<HandleActivity>,
+    ) -> Self {
         Self {
             object_type: HandleType::Desc,
+            activity,
+            parent,
             kind,
             alloc_type,
             parent_dbc,
+            binding_use: BindingUse::default(),
             inner: Mutex::new(DescState {
                 diag_records: Vec::new(),
                 header: DescHeader {
@@ -393,11 +406,17 @@ impl DescHandle {
     pub(crate) fn is_explicit(&self) -> bool {
         self.alloc_type == SQL_DESC_ALLOC_USER
     }
+
+    pub(crate) fn parent_dbc(&self) -> &DbcHandle {
+        &self.parent
+    }
 }
 
-impl HasObjectType for DescHandle {
-    fn object_type_mut(&mut self) -> &mut HandleType {
-        &mut self.object_type
+impl Handle for DescHandle {
+    const TYPE: HandleType = HandleType::Desc;
+
+    fn activity(&self) -> &Arc<HandleActivity> {
+        &self.activity
     }
 }
 
@@ -689,11 +708,10 @@ mod tests {
 
     #[test]
     fn new_descriptor_starts_with_no_records_and_default_header() {
-        let handle = DescHandle::new(
-            DescKind::AppParam,
-            SQL_DESC_ALLOC_AUTO,
-            std::ptr::null_mut(),
-        );
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        let handle = crate::handles::handle_from_raw::<DescHandle>(h.apd())
+            .unwrap()
+            .into_arc();
         let state = handle.inner.lock().unwrap();
         assert!(state.records.is_empty());
         assert_eq!(state.header.alloc_type, SQL_DESC_ALLOC_AUTO);
@@ -702,10 +720,13 @@ mod tests {
 
     #[test]
     fn new_explicit_descriptor_reports_alloc_user_on_both_copies() {
-        let dbc = 0x1234_usize as *mut c_void;
-        let handle = DescHandle::new(DescKind::Ad, SQL_DESC_ALLOC_USER, dbc);
+        let mut h = crate::test_support::TestHandles::with_env_dbc();
+        let raw = h.alloc_explicit_desc();
+        let handle = crate::handles::handle_from_raw::<DescHandle>(raw)
+            .unwrap()
+            .into_arc();
         assert!(handle.is_explicit());
-        assert_eq!(handle.parent_dbc, dbc);
+        assert_eq!(handle.parent_dbc, h.dbc);
         assert_eq!(
             handle.inner.lock().unwrap().header.alloc_type,
             SQL_DESC_ALLOC_USER

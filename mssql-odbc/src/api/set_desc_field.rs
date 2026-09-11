@@ -13,12 +13,6 @@
 //! not its address) — the same convention this crate already uses for
 //! `SQLSetStmtAttrW` (`set_stmt_attr.rs`) and confirmed against msodbcsql's
 //! `SetADHeaderField` (`(SIZE_T)Value`, `sqlcdesc.cpp:4129-4149`).
-//!
-//! Unlike `SQLBindCol`/`SQLFreeStmt(SQL_UNBIND)`/`SQLSetStmtAttr`, this
-//! entry point does not check `STMT_STATE_FETCH_IN_PROGRESS` before writing
-//! `SQL_DESC_DATA_PTR`/`SQL_DESC_OCTET_LENGTH`/`SQL_DESC_CONCISE_TYPE` on an
-//! ARD/APD record a fetch may still be reading through — a known, deferred
-//! gap tracked in [#472](https://github.com/microsoft/mssql-rs/issues/472).
 
 use std::mem::size_of;
 
@@ -49,7 +43,7 @@ use crate::api::type_rules::{
 use crate::api::util::read_utf16;
 use crate::error::free_errors;
 use crate::handles::desc::{DescKind, DescRecord, DescState, FieldScope, classify_field};
-use crate::handles::{DescHandle, HandleType, handle_from_raw};
+use crate::handles::{DescHandle, HandleType};
 
 /// Implementation of [`SQLSetDescFieldW`](super::exports::SQLSetDescFieldW).
 ///
@@ -101,7 +95,8 @@ unsafe fn sql_set_desc_field_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let desc = unsafe { handle_from_raw::<DescHandle>(descriptor_handle) };
+    let desc_owner = crate::handles::get_handle!(DescHandle, descriptor_handle);
+    let desc = &*desc_owner;
     debug_assert_eq!(
         desc.object_type,
         HandleType::Desc,
@@ -124,6 +119,10 @@ fn sql_set_desc_field_w_safe(
     value_ptr: SqlPointer,
     buffer_length: SqlInteger,
 ) -> SqlReturn {
+    let Ok(gate) = desc.parent_dbc().inner.lock() else {
+        error!("SQLSetDescFieldW: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
     let Ok(mut state) = desc.inner.lock() else {
         error!("SQLSetDescFieldW: desc mutex poisoned");
         return SQL_ERROR;
@@ -165,6 +164,10 @@ fn sql_set_desc_field_w_safe(
         error!(field, "SQLSetDescFieldW: field is not writable");
         post_diag(&mut state, ERR_INVALID_DESCRIPTOR_FIELD);
         return SQL_ERROR;
+    }
+
+    if let Err(error) = desc.binding_use.ensure_idle(&gate) {
+        return error.post(&mut *state);
     }
 
     match access.scope {
@@ -781,7 +784,8 @@ mod tests {
     }
 
     fn desc_diags(handle: SqlHandle) -> Vec<DiagRecord> {
-        let desc = unsafe { handle_from_raw::<DescHandle>(handle) };
+        let desc_owner = handle_from_raw::<DescHandle>(handle).unwrap().into_arc();
+        let desc = &*desc_owner;
         desc.inner.lock().unwrap().diag_records.clone()
     }
 
@@ -931,7 +935,8 @@ mod tests {
             SQL_SUCCESS
         );
 
-        let desc = unsafe { handle_from_raw::<DescHandle>(h.apd()) };
+        let desc_owner = handle_from_raw::<DescHandle>(h.apd()).unwrap().into_arc();
+        let desc = &*desc_owner;
         let state = desc.inner.lock().unwrap();
         let record = state.record(1).unwrap();
         assert!(record.data_ptr.is_null());
@@ -988,7 +993,8 @@ mod tests {
             SQL_SUCCESS
         );
 
-        let desc = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let desc_owner = handle_from_raw::<DescHandle>(h.ard()).unwrap().into_arc();
+        let desc = &*desc_owner;
         let state = desc.inner.lock().unwrap();
         let record = state.record(1).unwrap();
         assert!(record.data_ptr.is_null());
@@ -1043,7 +1049,8 @@ mod tests {
             SQL_SUCCESS
         );
 
-        let desc_handle = unsafe { handle_from_raw::<DescHandle>(desc) };
+        let desc_handle_owner = handle_from_raw::<DescHandle>(desc).unwrap().into_arc();
+        let desc_handle = &*desc_handle_owner;
         let state = desc_handle.inner.lock().unwrap();
         let record = state.record(1).unwrap();
         assert!(record.data_ptr.is_null());

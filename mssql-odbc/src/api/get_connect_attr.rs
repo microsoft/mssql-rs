@@ -27,7 +27,7 @@ use crate::api::odbc_types::{
 use crate::api::util::write_if_some;
 use crate::error::free_errors;
 use crate::handles::dbc::ConnectionState;
-use crate::handles::{DbcHandle, HandleType, handle_from_raw};
+use crate::handles::{DbcHandle, HandleType, get_handle};
 
 /// Login timeout reported when the application has not set
 /// `SQL_ATTR_LOGIN_TIMEOUT`, which is what the connect path falls back to.
@@ -86,14 +86,14 @@ unsafe fn sql_get_connect_attr_w_impl(
         return SQL_INVALID_HANDLE;
     }
 
-    let dbc = unsafe { handle_from_raw::<DbcHandle>(connection_handle) };
+    let dbc = get_handle!(DbcHandle, connection_handle);
     debug_assert_eq!(
         dbc.object_type,
         HandleType::Dbc,
         "SQLGetConnectAttrW: handle is not a DBC"
     );
 
-    sql_get_connect_attr_w_safe(dbc, attribute, value_ptr, buffer_length, string_length_ptr)
+    sql_get_connect_attr_w_safe(&dbc, attribute, value_ptr, buffer_length, string_length_ptr)
 }
 
 fn sql_get_connect_attr_w_safe(
@@ -271,6 +271,7 @@ mod tests {
     };
     use crate::api::set_connect_attr::sql_set_connect_attr_w;
     use crate::handles::dbc::VendorConnOverrides;
+    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -343,7 +344,7 @@ mod tests {
             )
         };
         assert_eq!(get, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
     }
@@ -370,7 +371,7 @@ mod tests {
             )
         };
         assert_eq!(get, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY092);
     }
@@ -469,7 +470,7 @@ mod tests {
             )
         };
         assert_eq!(get, SQL_ERROR);
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
     }
@@ -524,7 +525,7 @@ mod tests {
 
         let h = TestHandles::with_env_dbc();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         // A replay-transport client has not been observed dead, so the cached
         // liveness read reports ALIVE.
         dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
@@ -554,7 +555,7 @@ mod tests {
 
         let h = TestHandles::with_env_dbc();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         // A connected client whose session was left unusable (e.g. a reset whose
         // round trip failed poisons it) must read DEAD so the pool discards it,
         // even though the DBC is still marked Connected.
@@ -632,7 +633,7 @@ mod tests {
     #[test]
     fn vendor_get_uses_effective_values_only_while_connected() {
         let h = TestHandles::with_env_dbc();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         {
             let mut state = dbc.inner.lock().unwrap();
             state.effective_vendor_settings = Some(VendorConnOverrides {

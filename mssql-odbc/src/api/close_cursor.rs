@@ -15,7 +15,7 @@ use crate::api::odbc_types::{
 };
 use crate::error::free_errors;
 use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
-use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
+use crate::handles::{HandleType, StmtHandle, get_handle, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
 ///
@@ -54,9 +54,9 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
         error!("SQLCloseCursor: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
-    sql_close_cursor_safe(statement_handle, stmt)
+    sql_close_cursor_safe(statement_handle, &stmt)
 }
 
 fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
@@ -123,9 +123,9 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
         error!("SQLFreeStmt(SQL_CLOSE): statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt = get_handle!(StmtHandle, statement_handle);
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
-    sql_free_stmt_close_safe(statement_handle, stmt)
+    sql_free_stmt_close_safe(statement_handle, &stmt)
 }
 
 fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
@@ -380,6 +380,7 @@ fn drain_and_release_inner(
 mod tests {
     use super::*;
     use crate::api::odbc_types::SQL_NULL_HANDLE;
+    use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
 
     #[test]
@@ -423,7 +424,7 @@ mod tests {
         use mssql_tds::error::Error as TdsError;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
@@ -460,7 +461,7 @@ mod tests {
         use mssql_tds::test_client_support::tds_client_from_tokens;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
@@ -480,7 +481,7 @@ mod tests {
         // drain_and_release's own close_query()/take_info_messages() finds
         // nothing new — isolating the assertion to "does the stashed
         // pending_fetch_info alone get surfaced", independent of a fresh drain.
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
         // active_stmt left None: mirrors release_busy_if_row_exhausted having
         // already released the claim on the zero-row fetch that stashed this.
@@ -511,7 +512,7 @@ mod tests {
         use mssql_tds::error::Error as TdsError;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
@@ -547,7 +548,7 @@ mod tests {
         use mssql_tds::test_client_support::tds_client_from_tokens;
 
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         {
             let mut ss = stmt.inner.lock().unwrap();
             ss.set_state(STMT_STATE_CURSOR_OPEN);
@@ -560,10 +561,10 @@ mod tests {
         // drain_and_release's own close_query() is a real no-op — isolating
         // the assertion to "does a pending fetch error alone force
         // SQL_ERROR", independent of drain success/failure.
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![]));
 
-        let ret = close_cursor_for_connection_op(stmt, h.stmt);
+        let ret = close_cursor_for_connection_op(&stmt, h.stmt);
 
         assert_eq!(ret, SQL_SUCCESS);
         let ss = stmt.inner.lock().unwrap();
@@ -590,7 +591,7 @@ mod tests {
         let stmt_b = h.alloc_extra_stmt();
         h.mark_dbc_connected();
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         // B's live client, positioned on an open result set (has_open_batch) so
         // `close_query()` would genuinely try to drain it if this stole the
         // client — with an empty token queue left, that drain would error.
@@ -604,7 +605,7 @@ mod tests {
             ds.active_stmt = Some(stmt_b);
         }
         {
-            let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_a = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             stmt_a
                 .inner
                 .lock()
@@ -612,7 +613,8 @@ mod tests {
                 .set_state(STMT_STATE_CURSOR_OPEN);
         }
 
-        let outcome = drain_and_release(unsafe { handle_from_raw::<StmtHandle>(h.stmt) }, h.stmt);
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let outcome = drain_and_release(&stmt, h.stmt);
 
         assert!(matches!(outcome, DrainOutcome::Clean));
         let ds = dbc.inner.lock().unwrap();
@@ -642,7 +644,7 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
 
         // Positioned on an open result set with an empty token queue behind it,
         // so an actual drain would error rather than silently succeed.
@@ -656,11 +658,8 @@ mod tests {
             ds.active_stmt = Some(h.stmt);
         }
 
-        let outcome = drain_and_release_inner(
-            unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
-            h.stmt,
-            true,
-        );
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let outcome = drain_and_release_inner(&stmt, h.stmt, true);
 
         assert!(
             matches!(outcome, DrainOutcome::Clean),
@@ -689,7 +688,7 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
 
         let mut client = tds_client_from_tokens(vec![col_metadata_empty(), done_no_more()]);
         dbc.runtime
@@ -701,11 +700,8 @@ mod tests {
             ds.active_stmt = Some(h.stmt);
         }
 
-        let _ = drain_and_release_inner(
-            unsafe { handle_from_raw::<StmtHandle>(h.stmt) },
-            h.stmt,
-            false,
-        );
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let _ = drain_and_release_inner(&stmt, h.stmt, false);
 
         let ds = dbc.inner.lock().unwrap();
         assert!(

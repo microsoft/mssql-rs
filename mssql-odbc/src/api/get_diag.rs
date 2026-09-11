@@ -25,7 +25,33 @@ use crate::api::odbc_types::{
 };
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::{DiagRecord, HasDiagnostics};
-use crate::handles::{DbcHandle, DescHandle, EnvHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{DbcHandle, DescHandle, EnvHandle, HandleRef, StmtHandle, handle_from_raw};
+
+enum DiagHandle {
+    Env(HandleRef<EnvHandle>),
+    Dbc(HandleRef<DbcHandle>),
+    Stmt(HandleRef<StmtHandle>),
+    Desc(HandleRef<DescHandle>),
+}
+
+impl DiagHandle {
+    fn from_raw(handle_type: SqlSmallInt, handle: SqlHandle) -> Result<Self, SqlReturn> {
+        let result = match handle_type {
+            SQL_HANDLE_ENV => handle_from_raw::<EnvHandle>(handle).map(Self::Env),
+            SQL_HANDLE_DBC => handle_from_raw::<DbcHandle>(handle).map(Self::Dbc),
+            SQL_HANDLE_STMT => handle_from_raw::<StmtHandle>(handle).map(Self::Stmt),
+            SQL_HANDLE_DESC => handle_from_raw::<DescHandle>(handle).map(Self::Desc),
+            _ => {
+                error!(handle_type, "diagnostic lookup: unsupported handle type");
+                return Err(SQL_INVALID_HANDLE);
+            }
+        };
+        result.map_err(|err| {
+            error!(?handle, ?err, "diagnostic lookup failed");
+            err.sql_return()
+        })
+    }
+}
 
 /// Implementation of [`SQLGetDiagRecW`](super::exports::SQLGetDiagRecW).
 ///
@@ -66,12 +92,16 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
             );
             return SQL_ERROR;
         }
+        let handle = match DiagHandle::from_raw(handle_type, handle) {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
 
         // Per spec, the text-length out-param is initialized to 0.
         unsafe { write_if_some(text_length_ptr, 0) };
 
         // TODO: Do we need to snapshot here? Copy to user buffer directly?
-        let snapshot = match unsafe { snapshot_record(handle_type, handle, rec_number) } {
+        let snapshot = match snapshot_record(&handle, rec_number) {
             Ok(s) => s,
             Err(rc) => return rc,
         };
@@ -124,22 +154,18 @@ pub(crate) unsafe fn sql_get_diag_field_w(
             error!("SQLGetDiagFieldW: handle is null");
             return SQL_INVALID_HANDLE;
         }
+        let handle = match DiagHandle::from_raw(handle_type, handle) {
+            Ok(handle) => handle,
+            Err(rc) => return rc,
+        };
 
         if is_diag_header_field(diag_identifier) {
-            unsafe {
-                handle_header_field(
-                    handle_type,
-                    handle,
-                    rec_number,
-                    diag_identifier,
-                    diag_info_ptr,
-                )
-            }
+            unsafe { handle_header_field(&handle, rec_number, diag_identifier, diag_info_ptr) }
         } else {
             unsafe {
                 handle_record_field(
                     handle_type,
-                    handle,
+                    &handle,
                     rec_number,
                     diag_identifier,
                     diag_info_ptr,
@@ -165,10 +191,9 @@ fn is_diag_header_field(diag_identifier: SqlSmallInt) -> bool {
 /// `is_diag_header_field(diag_identifier)` is true.
 ///
 /// # Safety
-/// `handle` must be a valid, non-null handle of `handle_type`.
+/// `diag_info_ptr`, when non-null, must be writable for one `SqlInteger`.
 unsafe fn handle_header_field(
-    handle_type: SqlSmallInt,
-    handle: SqlHandle,
+    handle: &DiagHandle,
     rec_number: SqlSmallInt,
     diag_identifier: SqlSmallInt,
     diag_info_ptr: SqlPointer,
@@ -184,7 +209,7 @@ unsafe fn handle_header_field(
     match diag_identifier {
         SQL_DIAG_NUMBER => {
             if !diag_info_ptr.is_null() {
-                let count = match unsafe { diag_record_count(handle_type, handle) } {
+                let count = match diag_record_count(handle) {
                     Ok(c) => c,
                     Err(rc) => return rc,
                 };
@@ -235,11 +260,11 @@ fn diag_origin(sql_state: &[u8; SQL_SQLSTATE_SIZE], is_subclass: bool) -> &'stat
 /// snapshots the record, and dispatches by identifier.
 ///
 /// # Safety
-/// `handle` must be a valid, non-null handle of `handle_type`. `diag_info_ptr`
-/// and `string_length_ptr` must satisfy the contract of the underlying writers.
+/// `diag_info_ptr` and `string_length_ptr` must satisfy the contract of the
+/// underlying writers.
 unsafe fn handle_record_field(
     handle_type: SqlSmallInt,
-    handle: SqlHandle,
+    handle: &DiagHandle,
     rec_number: SqlSmallInt,
     diag_identifier: SqlSmallInt,
     diag_info_ptr: SqlPointer,
@@ -254,7 +279,7 @@ unsafe fn handle_record_field(
         return SQL_ERROR;
     }
 
-    let snapshot = match unsafe { snapshot_record(handle_type, handle, rec_number) } {
+    let snapshot = match snapshot_record(handle, rec_number) {
         Ok(s) => s,
         Err(rc) => return rc,
     };
@@ -352,19 +377,13 @@ unsafe fn write_utf16_field_bytes(
 }
 
 /// Returns the number of diagnostic records stored on a handle.
-///
-/// # Safety
-/// `handle` must be a valid, non-null handle pointer of the given `handle_type`.
-unsafe fn diag_record_count(
-    handle_type: SqlSmallInt,
-    handle: SqlHandle,
-) -> Result<SqlInteger, SqlReturn> {
-    unsafe { with_locked_diag_records(handle_type, handle, |records| records.len() as SqlInteger) }
+fn diag_record_count(handle: &DiagHandle) -> Result<SqlInteger, SqlReturn> {
+    with_locked_diag_records(handle, |records| records.len() as SqlInteger)
 }
 
 /// Clones the requested record out from under the handle's diag mutex.
 /// Returns `Ok(None)` if the index is past the end of the list.
-/// Returns `Err(SQL_INVALID_HANDLE)` for unsupported handle types.
+/// Returns `Err(SQL_ERROR)` on a poisoned diagnostic mutex.
 ///
 /// TODO: For ODBC 3.x parity with msodbcsql, diagnostic records should be
 /// sorted by priority before indexing (as msodbcsql does). We currently
@@ -372,89 +391,48 @@ unsafe fn diag_record_count(
 /// TODO: Add an OOM-resilient fallback diagnostic path for out-of-memory:
 /// store a non-allocating OOM flag on the handle and return
 /// static HY001 text for record 1 without heap allocation.
-///
-/// # Safety
-/// `handle` must be a valid, non-null handle pointer of the type identified by
-/// `handle_type`.
-unsafe fn snapshot_record(
-    handle_type: SqlSmallInt,
-    handle: SqlHandle,
+fn snapshot_record(
+    handle: &DiagHandle,
     rec_number: SqlSmallInt,
 ) -> Result<Option<DiagRecord>, SqlReturn> {
     let idx = (rec_number - 1) as usize;
-    unsafe { with_locked_diag_records(handle_type, handle, |records| records.get(idx).cloned()) }
+    with_locked_diag_records(handle, |records| records.get(idx).cloned())
 }
 
 /// Dispatches to the correct handle type, locks its state, and passes the
-/// diagnostic records to `f`. Returns `Err(SQL_INVALID_HANDLE)` for
-/// unrecognized handle types, `Err(SQL_ERROR)` on poisoned mutex.
-///
-/// # Safety
-/// `handle` must be a valid, non-null handle pointer of the given `handle_type`.
-unsafe fn with_locked_diag_records<T>(
-    handle_type: SqlSmallInt,
-    handle: SqlHandle,
+/// diagnostic records to `f`. Returns `Err(SQL_ERROR)` on a poisoned mutex.
+fn with_locked_diag_records<T>(
+    handle: &DiagHandle,
     f: impl Fn(&[DiagRecord]) -> T,
 ) -> Result<T, SqlReturn> {
-    match handle_type {
-        SQL_HANDLE_ENV => {
-            let h = unsafe { handle_from_raw::<EnvHandle>(handle) };
-            debug_assert_eq!(
-                h.object_type,
-                HandleType::Env,
-                "with_locked_diag_records: handle is not ENV"
-            );
+    match handle {
+        DiagHandle::Env(h) => {
             let guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: ENV mutex poisoned");
                 SQL_ERROR
             })?;
             Ok(f(guard.diag_records()))
         }
-        SQL_HANDLE_DBC => {
-            let h = unsafe { handle_from_raw::<DbcHandle>(handle) };
-            debug_assert_eq!(
-                h.object_type,
-                HandleType::Dbc,
-                "with_locked_diag_records: handle is not DBC"
-            );
+        DiagHandle::Dbc(h) => {
             let guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: DBC mutex poisoned");
                 SQL_ERROR
             })?;
             Ok(f(guard.diag_records()))
         }
-        SQL_HANDLE_STMT => {
-            let h = unsafe { handle_from_raw::<StmtHandle>(handle) };
-            debug_assert_eq!(
-                h.object_type,
-                HandleType::Stmt,
-                "with_locked_diag_records: handle is not STMT"
-            );
+        DiagHandle::Stmt(h) => {
             let guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: STMT mutex poisoned");
                 SQL_ERROR
             })?;
             Ok(f(guard.diag_records()))
         }
-        SQL_HANDLE_DESC => {
-            let h = unsafe { handle_from_raw::<DescHandle>(handle) };
-            debug_assert_eq!(
-                h.object_type,
-                HandleType::Desc,
-                "with_locked_diag_records: handle is not DESC"
-            );
+        DiagHandle::Desc(h) => {
             let guard = h.inner.lock().map_err(|_| {
                 error!("with_locked_diag_records: DESC mutex poisoned");
                 SQL_ERROR
             })?;
             Ok(f(guard.diag_records()))
-        }
-        _ => {
-            error!(
-                handle_type,
-                "with_locked_diag_records: unsupported handle type"
-            );
-            Err(SQL_INVALID_HANDLE)
         }
     }
 }
@@ -529,7 +507,7 @@ mod tests {
     }
 
     fn push_diag(env: SqlHandle, sql_state: [u8; 5], native: i32, msg: &str) {
-        let env_ref = unsafe { handle_from_raw::<EnvHandle>(env) };
+        let env_ref = handle_from_raw::<EnvHandle>(env).unwrap().into_arc();
         env_ref
             .inner
             .lock()
@@ -753,6 +731,59 @@ mod tests {
     }
 
     #[test]
+    fn wrong_handle_type_preserves_diagnostics_and_output() {
+        let h = crate::test_support::TestHandles::with_env();
+        push_diag(h.env, *b"HY024", 42, "Invalid attribute value");
+
+        for handle_type in [SQL_HANDLE_DBC, SQL_HANDLE_STMT, SQL_HANDLE_DESC] {
+            let mut length = -1;
+            assert_eq!(
+                unsafe {
+                    sql_get_diag_rec_w(
+                        handle_type,
+                        h.env,
+                        1,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        0,
+                        &mut length,
+                    )
+                },
+                SQL_INVALID_HANDLE
+            );
+            assert_eq!(length, -1);
+
+            for identifier in [SQL_DIAG_NUMBER, SQL_DIAG_DYNAMIC_FUNCTION_CODE] {
+                let mut value: SqlInteger = -1;
+                for out in [ptr::null_mut(), (&mut value as *mut SqlInteger).cast()] {
+                    assert_eq!(
+                        unsafe {
+                            sql_get_diag_field_w(
+                                handle_type,
+                                h.env,
+                                0,
+                                identifier,
+                                out,
+                                0,
+                                ptr::null_mut(),
+                            )
+                        },
+                        SQL_INVALID_HANDLE
+                    );
+                }
+                assert_eq!(value, -1);
+            }
+        }
+
+        let env = handle_from_raw::<EnvHandle>(h.env).unwrap().into_arc();
+        let state = env.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, *b"HY024");
+        assert_eq!(state.diag_records[0].native_error, 42);
+    }
+
+    #[test]
     fn desc_handle_without_diagnostics_returns_no_data() {
         use crate::handles::StmtHandle;
         use crate::test_support::TestHandles;
@@ -761,7 +792,7 @@ mod tests {
         // SQLGetStmtAttrW, so SQLGetDiagRecW must accept them. With no records
         // posted, record 1 yields SQL_NO_DATA (not SQL_INVALID_HANDLE).
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
         let desc: SqlHandle = stmt.ard;
 
         let ret = unsafe {
@@ -998,7 +1029,7 @@ mod tests {
 
         let h = TestHandles::with_env_dbc_stmt();
         {
-            let stmt_ref = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_ref = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             stmt_ref
                 .inner
                 .lock()

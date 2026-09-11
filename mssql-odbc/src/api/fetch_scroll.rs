@@ -68,7 +68,7 @@ use crate::handles::stmt::{
     BufferedGetDataRow, ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS,
     StmtState,
 };
-use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
+use crate::handles::{HandleType, StmtHandle};
 
 #[derive(Clone, Copy)]
 struct PlpColumnInfo {
@@ -301,7 +301,8 @@ pub(crate) unsafe fn sql_fetch_scroll_impl(
         error!("SQLFetchScroll: statement_handle is null");
         return SQL_INVALID_HANDLE;
     }
-    let stmt = unsafe { handle_from_raw::<StmtHandle>(statement_handle) };
+    let stmt_owner = crate::handles::get_handle!(StmtHandle, statement_handle);
+    let stmt = &*stmt_owner;
     debug_assert_eq!(stmt.object_type, HandleType::Stmt);
     fetch_scroll_safe(statement_handle, stmt, fetch_orientation, fetch_offset)
 }
@@ -825,10 +826,11 @@ fn fetch_scroll_safe(
         env_state.odbc_version
     };
 
-    // Snapshot the rowset controls and the effective ARD, then release the
-    // statement lock: the fill loop below blocks on the network and must not
-    // hold it. The application is not allowed to rebind concurrently with a
-    // fetch on the same statement, so the snapshot cannot go stale under us.
+    let Ok(gate) = stmt.parent_dbc().inner.lock() else {
+        error!("SQLFetchScroll: dbc mutex poisoned");
+        return SQL_ERROR;
+    };
+    let _row_use;
     let (
         ard,
         column_sql_types,
@@ -838,6 +840,7 @@ fn fetch_scroll_safe(
         column_count,
         row_bind_offset_ptr,
         trailing_utf16_plp,
+        exhausted,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
@@ -858,7 +861,7 @@ fn fetch_scroll_safe(
             post_diag(&mut stmt_state, ERR_INVALID_CURSOR_STATE);
             return SQL_ERROR;
         }
-        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) {
+        if stmt_state.has_state(STMT_STATE_FETCH_IN_PROGRESS) || stmt.row_binding_use.is_active() {
             error!("SQLFetchScroll: a fetch is already in progress on this statement");
             post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
             return SQL_ERROR;
@@ -877,14 +880,16 @@ fn fetch_scroll_safe(
             return SQL_ERROR;
         }
 
+        _row_use = match stmt.row_binding_use.acquire(&gate) {
+            Ok(guard) => guard,
+            Err(error) => return error.post(&mut *stmt_state),
+        };
+
         // A previous fetch already confirmed (possibly via a peek past the
         // last row it delivered) that this cursor has no more rows. The
         // answer is already known and needs no connection access at all —
         // report it even if another statement currently owns the connection.
-        if stmt_state.result_set_exhausted {
-            let rows_fetched_ptr = stmt_state.rows_fetched_ptr;
-            let row_status_ptr = stmt_state.row_status_ptr;
-            let row_array_size = stmt_state.row_array_size;
+        let exhausted = if stmt_state.result_set_exhausted {
             stmt_state.reset_row_stream();
             // That same peek can have found a trailing SQL Server error
             // instead of a clean end of set (see
@@ -906,18 +911,19 @@ fn fetch_scroll_safe(
             } else {
                 SQL_NO_DATA
             };
-            drop(stmt_state);
-            unsafe { write_if_some(rows_fetched_ptr, 0) };
-            mark_no_rows(row_status_ptr, 0, row_array_size);
-            debug!(?rc, "SQLFetchScroll: result set already known exhausted");
-            return rc;
-        }
+            Some(rc)
+        } else {
+            None
+        };
 
         // The ARD lock is taken after this one is released (below), never
         // while it is held — see ".github/instructions/mssql-odbc.instructions.md",
         // "Locking rules": a STMT lock must never be held while acquiring a
         // DESC lock.
-        let ard = stmt_state.effective_ard(stmt);
+        let ard = match crate::handles::bindings::owned_descriptor(stmt_state.effective_ard(stmt)) {
+            Ok(ard) => ard,
+            Err(error) => return error.post(&mut *stmt_state),
+        };
         // Resolving SQL_C_DEFAULT needs this result set's SQL types, which live
         // under the STMT lock, but the bindings it applies to are read from the
         // ARD after this lock is released. Snapshot the types here and carry
@@ -927,11 +933,6 @@ fn fetch_scroll_safe(
             .iter()
             .map(odbc_sql_type)
             .collect();
-        // Claiming the statement here is what stops a concurrent SQLBindCol
-        // from freeing an application buffer the fill loop is still reading
-        // through after this lock is released; the mutating entry points
-        // refuse while this is set.
-        stmt_state.set_state(STMT_STATE_FETCH_IN_PROGRESS);
         let trailing_utf16_plp = stmt_state
             .column_metadata
             .last()
@@ -946,55 +947,40 @@ fn fetch_scroll_safe(
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
             trailing_utf16_plp,
+            exhausted,
         )
     };
 
-    // AB#47437: the ARD is the fill loop's single source of truth, derived
-    // fresh from its records every fetch rather than cached, so a
-    // descriptor-field bind (`SQLSetDescFieldW`) and a `SQLBindCol` bind are
-    // indistinguishable here. A poisoned ARD mutex now fails the fetch
-    // outright (SQL_ERROR), clearing STMT_STATE_FETCH_IN_PROGRESS so the
-    // statement is not left permanently stuck mid-fetch: silently treating it
-    // as "nothing bound" would advance the cursor and report success for a
-    // rowset the application never actually got the columns it asked for.
-    let bindings: Vec<ColumnBinding> = {
-        // `ard` can be an explicit descriptor resolved under the STMT lock,
-        // already dropped by now — re-check liveness right before
-        // dereferencing to narrow (not fully close) the race against a
-        // concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` on that same
-        // descriptor.
-        if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
-            error!("SQLFetchScroll: ard freed concurrently; failing the fetch");
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
-                post_sql_error(
-                    &mut stmt_state,
-                    SQLSTATE_HY000,
-                    0,
-                    "Internal error reading column bindings",
-                );
+    let snapshot = (|| {
+        use crate::handles::bindings::{BindingError, BindingLease};
+        let state = ard.inner.lock().map_err(|_| BindingError::Poisoned)?;
+        let lease = BindingLease::acquire(&ard, &gate, &state)?;
+        Ok::<_, BindingError>((lease, ColumnBinding::all_from_ard_state(&state)))
+    })();
+    let (_binding_lease, mut bindings) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if let Ok(mut state) = stmt.inner.lock() {
+                error.post(&mut *state);
             }
             return SQL_ERROR;
         }
-        let desc = unsafe { handle_from_raw::<DescHandle>(ard) };
-        let Ok(desc_state) = desc.inner.lock() else {
-            error!("SQLFetchScroll: ard mutex poisoned; failing the fetch");
-            if let Ok(mut stmt_state) = stmt.inner.lock() {
-                stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
-                post_sql_error(
-                    &mut stmt_state,
-                    SQLSTATE_HY000,
-                    0,
-                    "Internal error reading column bindings",
-                );
-            }
-            return SQL_ERROR;
-        };
-        let mut bindings = ColumnBinding::all_from_ard_state(&desc_state);
-        drop(desc_state);
-        resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
-        bindings
     };
+    drop(gate);
+    #[cfg(test)]
+    crate::handles::bindings::snapshot_test_hook::pause(
+        stmt,
+        crate::handles::bindings::snapshot_test_hook::Phase::Fetch,
+    );
+
+    if let Some(rc) = exhausted {
+        unsafe { write_if_some(rows_fetched_ptr, 0) };
+        mark_no_rows(row_status_ptr, 0, row_array_size);
+        debug!(?rc, "SQLFetchScroll: result set already known exhausted");
+        return rc;
+    }
+
+    resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
     let get_data_fetch = row_array_size == 1 && bindings.is_empty();
     let reusable_get_data_row = if get_data_fetch {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -1020,11 +1006,6 @@ fn fetch_scroll_safe(
         buffer_trailing_utf16_plp,
     );
 
-    // Single clearing point for the guard, so every early return inside the
-    // fill loop still releases it.
-    if let Ok(mut stmt_state) = stmt.inner.lock() {
-        stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
-    }
     debug!(?rc, "SQLFetchScroll returning");
     rc
 }
@@ -2373,9 +2354,9 @@ mod tests {
     };
     use crate::api::sqlstate::SQLSTATE_HY106;
     use crate::api::sqlstate::{ERR_CONNECTION_BUSY, SQLSTATE_24000, SQLSTATE_HY000};
-    use crate::handles::EnvHandle;
     use crate::handles::dbc::DbcHandle;
     use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+    use crate::handles::{DescHandle, EnvHandle, handle_from_raw};
     use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
     use mssql_tds::test_client_support::{
@@ -2402,13 +2383,15 @@ mod tests {
     }
 
     fn open_cursor(h: &TestHandles) {
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let mut s = stmt.inner.lock().unwrap();
         s.set_state(STMT_STATE_CURSOR_OPEN);
     }
 
     fn last_state(h: &TestHandles) -> [u8; 5] {
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let s = stmt.inner.lock().unwrap();
         s.diag_records.last().unwrap().sql_state
     }
@@ -2599,7 +2582,8 @@ mod tests {
     fn stmt_at_max_rows(h: &TestHandles, max_rows: SqlULen, rows_returned: SqlULen) {
         use mssql_tds::test_client_support::{done_no_more, tds_client_from_tokens};
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt_handle = &*stmt_handle_owner;
         {
             let mut stmt_state = stmt_handle.inner.lock().unwrap();
             stmt_state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -2612,7 +2596,8 @@ mod tests {
             stmt_state.row_positioned = rows_returned > 0;
         }
 
-        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_handle_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_handle = &*dbc_handle_owner;
         let mut dbc_state = dbc_handle.inner.lock().unwrap();
         dbc_state.client = Some(tds_client_from_tokens(vec![done_no_more()]));
         dbc_state.active_stmt = Some(h.stmt);
@@ -2628,7 +2613,8 @@ mod tests {
 
         let mut rows_fetched: SqlULen = 99;
         {
-            let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_handle_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt_handle = &*stmt_handle_owner;
             let mut s = stmt_handle.inner.lock().unwrap();
             s.rows_fetched_ptr = &mut rows_fetched;
         }
@@ -2639,7 +2625,8 @@ mod tests {
         );
         assert_eq!(rows_fetched, 0, "the cutoff still reports its rowset size");
 
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt_handle = &*stmt_handle_owner;
         let stmt_state = stmt_handle.inner.lock().unwrap();
         assert!(stmt_state.diag_records.is_empty(), "cap is not an error");
         // The cursor stays open and the connection stays busy on this statement
@@ -2651,7 +2638,8 @@ mod tests {
         assert!(!stmt_state.row_positioned);
         drop(stmt_state);
 
-        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_handle_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_handle = &*dbc_handle_owner;
         let dbc_state = dbc_handle.inner.lock().unwrap();
         assert!(dbc_state.client.is_some());
         assert_eq!(dbc_state.active_stmt, Some(h.stmt));
@@ -2669,7 +2657,8 @@ mod tests {
 
         unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
 
-        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_handle_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_handle = &*dbc_handle_owner;
         let dbc_state = dbc_handle.inner.lock().unwrap();
         assert_eq!(
             dbc_state.active_stmt, None,
@@ -2686,7 +2675,8 @@ mod tests {
 
         unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
 
-        let dbc_handle = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_handle_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc_handle = &*dbc_handle_owner;
         let dbc_state = dbc_handle.inner.lock().unwrap();
         assert_eq!(
             dbc_state.active_stmt, None,
@@ -2723,7 +2713,8 @@ mod tests {
         let mut indicators = [0 as SqlLen; 4];
         let mut statuses = [SQL_ROW_NOROW; 4];
         let mut rows_fetched = 0;
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -2747,7 +2738,8 @@ mod tests {
             },
             SQL_SUCCESS
         );
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_int_rows(vec![vec![10], vec![20], vec![30]]);
         dbc.runtime
             .block_on(client.execute("SELECT buffered rows".to_string(), ()))
@@ -2792,7 +2784,8 @@ mod tests {
         h.mark_dbc_connected();
         let mut value = 0_i32;
         let mut indicator = 0;
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -2811,7 +2804,8 @@ mod tests {
             },
             SQL_SUCCESS
         );
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_int_rows(vec![vec![10, 20]]);
         dbc.runtime
             .block_on(client.execute("SELECT partial binding".to_string(), ()))
@@ -2851,13 +2845,15 @@ mod tests {
     fn mixed_lob_stmt(h: &TestHandles, rows: Vec<Vec<i32>>) {
         h.mark_dbc_connected();
         let prefix_columns = rows.first().map_or(0, Vec::len);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(mixed_lob_columns(prefix_columns));
         }
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_mixed_lob_prefix_rows(rows);
         dbc.runtime
             .block_on(client.execute("SELECT mixed LOB row".to_string(), ()))
@@ -2877,7 +2873,8 @@ mod tests {
             SQL_SUCCESS
         );
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let state = stmt.inner.lock().unwrap();
         let row = state.buffered_get_data_row.as_ref().unwrap();
         assert_eq!(
@@ -2895,7 +2892,8 @@ mod tests {
     fn fetch_clears_recycled_value_when_lob_remains_deferred() {
         let h = TestHandles::with_env_dbc_stmt();
         mixed_lob_stmt(&h, vec![vec![10, 20, 30, 40, 50, 60, 70]]);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.spare_get_data_row = Some(BufferedGetDataRow {
@@ -2940,7 +2938,8 @@ mod tests {
             SQL_SUCCESS
         );
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         assert!(stmt.inner.lock().unwrap().buffered_get_data_row.is_none());
     }
 
@@ -2950,7 +2949,10 @@ mod tests {
         mixed_lob_stmt(&bound, vec![vec![10, 20]]);
         let mut value = 0_i32;
         let mut indicator = 0;
-        let bound_stmt = unsafe { handle_from_raw::<StmtHandle>(bound.stmt) };
+        let bound_stmt_owner = handle_from_raw::<StmtHandle>(bound.stmt)
+            .unwrap()
+            .into_arc();
+        let bound_stmt = &*bound_stmt_owner;
         assert_eq!(
             unsafe {
                 sql_bind_col(
@@ -2980,7 +2982,10 @@ mod tests {
 
         let multi = TestHandles::with_env_dbc_stmt();
         mixed_lob_stmt(&multi, vec![vec![10, 20], vec![30, 40]]);
-        let multi_stmt = unsafe { handle_from_raw::<StmtHandle>(multi.stmt) };
+        let multi_stmt_owner = handle_from_raw::<StmtHandle>(multi.stmt)
+            .unwrap()
+            .into_arc();
+        let multi_stmt = &*multi_stmt_owner;
         multi_stmt.inner.lock().unwrap().row_array_size = 2;
         assert_eq!(
             unsafe { sql_fetch_scroll(multi.stmt, SQL_FETCH_NEXT, 0) },
@@ -3000,13 +3005,15 @@ mod tests {
     fn terminal_fetch_invalidates_fetch_buffered_get_data_row() {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
             state.begin_result_set(int_columns(2));
         }
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_int_rows(vec![vec![10, 17]]);
         dbc.runtime
             .block_on(client.execute("SELECT buffered row".to_string(), ()))
@@ -3073,7 +3080,8 @@ mod tests {
         h.mark_dbc_connected();
         let mut values = [0_i32; 2];
         let mut indicators = [0 as SqlLen; 2];
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3093,7 +3101,8 @@ mod tests {
             },
             SQL_SUCCESS
         );
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_int_rows(vec![vec![10], vec![20]]);
         dbc.runtime
             .block_on(client.execute("SELECT default binding".to_string(), ()))
@@ -3112,7 +3121,8 @@ mod tests {
         assert_eq!(indicators, [4, 4]);
         // The ARD record keeps the placeholder: resolution happens on the
         // fetch's own snapshot, so a later result set resolves it again.
-        let ard = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let ard_owner = handle_from_raw::<DescHandle>(h.ard()).unwrap().into_arc();
+        let ard = &*ard_owner;
         let stored = ColumnBinding::all_from_ard_state(&ard.inner.lock().unwrap());
         assert_eq!(
             stored[0].target_type, SQL_C_DEFAULT,
@@ -3137,7 +3147,8 @@ mod tests {
         h.mark_dbc_connected();
         let mut values = [0_i32; 2];
         let mut indicators = [0 as SqlLen; 2];
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3175,7 +3186,8 @@ mod tests {
             );
         }
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_int_rows(vec![vec![10], vec![20]]);
         dbc.runtime
             .block_on(client.execute("SELECT descriptor default binding".to_string(), ()))
@@ -3216,7 +3228,8 @@ mod tests {
 
         let mut value = 0_i32;
         let mut indicator = 0;
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3235,7 +3248,8 @@ mod tests {
             },
             SQL_SUCCESS
         );
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_int_rows(vec![vec![42]]);
         dbc.runtime
             .block_on(client.execute("SELECT reassociated ard".to_string(), ()))
@@ -3253,7 +3267,8 @@ mod tests {
         assert_eq!(value, 42, "the fetch must read the reassociated ARD");
         assert_eq!(indicator, 4);
 
-        let implicit = unsafe { handle_from_raw::<DescHandle>(h.ard()) };
+        let implicit_owner = handle_from_raw::<DescHandle>(h.ard()).unwrap().into_arc();
+        let implicit = &*implicit_owner;
         assert_eq!(
             implicit.inner.lock().unwrap().records.len(),
             0,
@@ -3300,7 +3315,8 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         h.mark_dbc_connected();
         {
-            let env = unsafe { handle_from_raw::<EnvHandle>(h.env) };
+            let env_owner = handle_from_raw::<EnvHandle>(h.env).unwrap().into_arc();
+            let env = &*env_owner;
             env.inner.lock().unwrap().odbc_version = version;
         }
 
@@ -3310,7 +3326,8 @@ mod tests {
 
         let mut value = [0u8; 32];
         let mut indicator = [0 as SqlLen; 1];
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3329,7 +3346,8 @@ mod tests {
             },
             SQL_SUCCESS
         );
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_int_rows(vec![vec![10]]);
         dbc.runtime
             .block_on(client.execute("SELECT time column".to_string(), ()))
@@ -3463,7 +3481,8 @@ mod tests {
         let mut second = [0_i32; 2];
         let mut first_indicators = [0 as SqlLen; 2];
         let mut second_indicators = [0 as SqlLen; 2];
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         {
             let mut state = stmt.inner.lock().unwrap();
             state.set_state(STMT_STATE_CURSOR_OPEN);
@@ -3495,7 +3514,8 @@ mod tests {
             },
             SQL_SUCCESS
         );
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client =
             tds_client_from_partial_int_rows(vec![vec![10, 20]], buffered_prefix_columns);
         dbc.runtime
@@ -3532,7 +3552,8 @@ mod tests {
     #[test]
     fn begin_result_set_restarts_the_max_rows_budget() {
         let h = TestHandles::with_env_dbc_stmt();
-        let stmt_handle = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_handle_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt_handle = &*stmt_handle_owner;
         let mut stmt_state = stmt_handle.inner.lock().unwrap();
 
         stmt_state.max_rows = 3;
@@ -3562,7 +3583,8 @@ mod tests {
         ] {
             let rc = unsafe { sql_fetch_scroll(h.stmt, orientation, 0) };
             assert_eq!(rc, SQL_ERROR, "orientation {orientation}");
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let s = stmt.inner.lock().unwrap();
             assert_eq!(s.diag_records.last().unwrap().sql_state, SQLSTATE_HY106);
         }
@@ -3573,7 +3595,8 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let s = stmt.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
@@ -3590,7 +3613,8 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         open_cursor(&h);
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut s = stmt.inner.lock().unwrap();
             s.result_set_exhausted = true;
         }
@@ -3614,7 +3638,8 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         open_cursor(&h);
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut s = stmt.inner.lock().unwrap();
             s.result_set_exhausted = true;
             s.pending_fetch_error = Some(TdsError::ProtocolError(
@@ -3626,7 +3651,8 @@ mod tests {
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_ERROR);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let s = stmt.inner.lock().unwrap();
         assert!(
             s.diag_records
@@ -3659,7 +3685,8 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         open_cursor(&h);
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut s = stmt.inner.lock().unwrap();
             s.result_set_exhausted = true;
             s.pending_fetch_error = Some(TdsError::ProtocolError(
@@ -3678,7 +3705,8 @@ mod tests {
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_ERROR);
 
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let s = stmt.inner.lock().unwrap();
         assert!(
             s.diag_records
@@ -3710,20 +3738,23 @@ mod tests {
         let stmt_b = h.alloc_extra_stmt();
         h.mark_dbc_connected();
 
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         {
             let mut ds = dbc.inner.lock().unwrap();
             ds.client = Some(tds_client_from_tokens(vec![]));
             // active_stmt is None: statement A's fetch already released it.
         }
         {
-            let stmt_a = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_a_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt_a = &*stmt_a_owner;
             let mut sa = stmt_a.inner.lock().unwrap();
             sa.set_state(STMT_STATE_CURSOR_OPEN);
             sa.result_set_exhausted = true;
         }
 
-        let stmt_b_handle = unsafe { handle_from_raw::<StmtHandle>(stmt_b) };
+        let stmt_b_handle_owner = handle_from_raw::<StmtHandle>(stmt_b).unwrap().into_arc();
+        let stmt_b_handle = &*stmt_b_handle_owner;
         let claimed = crate::api::exec_common::claim_connection(dbc, stmt_b_handle, stmt_b, "test");
         assert!(
             claimed.is_ok(),
@@ -3759,13 +3790,15 @@ mod tests {
     fn real_zero_row_fetch_through_fill_rowset_releases_active_stmt() {
         let h = TestHandles::with_env_dbc_stmt();
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut s = stmt.inner.lock().unwrap();
             s.set_state(STMT_STATE_CURSOR_OPEN);
             s.column_metadata = int_columns(1);
         }
         h.mark_dbc_connected();
-        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let dbc = &*dbc_owner;
         let mut client = tds_client_from_tokens(vec![col_metadata_empty(), done_no_more()]);
         dbc.runtime
             .block_on(client.execute("SELECT 1 WHERE 1=0;".to_string(), ()))
@@ -3785,7 +3818,8 @@ mod tests {
              already exhausted must release active_stmt itself (AB#47508) — \
              this never happens on main"
         );
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         assert!(stmt.inner.lock().unwrap().result_set_exhausted);
     }
 
@@ -3796,13 +3830,15 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         open_cursor(&h);
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut s = stmt.inner.lock().unwrap();
             s.row_bind_type = 64; // a row-struct size
         }
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let s = stmt.inner.lock().unwrap();
         assert_eq!(s.diag_records.last().unwrap().sql_state, *b"HYC00");
     }
@@ -4455,7 +4491,8 @@ mod tests {
         let mut rows_fetched: SqlULen = 999;
         let mut status = [SQL_ROW_SUCCESS; 3];
         {
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut s = stmt.inner.lock().unwrap();
             s.row_array_size = 3;
             s.rows_fetched_ptr = &mut rows_fetched;
@@ -4476,13 +4513,15 @@ mod tests {
         let other_stmt = h.alloc_extra_stmt();
         open_cursor(&h);
         {
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = &*dbc_owner;
             let mut d = dbc.inner.lock().unwrap();
             d.active_stmt = Some(other_stmt);
         }
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let s = stmt.inner.lock().unwrap();
         assert_eq!(
             s.diag_records.last().unwrap().sql_state,
@@ -4497,13 +4536,15 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         open_cursor(&h);
         {
-            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let dbc_owner = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+            let dbc = &*dbc_owner;
             let mut d = dbc.inner.lock().unwrap();
             d.active_stmt = Some(h.stmt);
         }
         let rc = unsafe { sql_fetch_scroll(h.stmt, SQL_FETCH_NEXT, 0) };
         assert_eq!(rc, SQL_ERROR);
-        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let stmt = &*stmt_owner;
         let s = stmt.inner.lock().unwrap();
         // No TDS client is attached either, so the no-client guard fires first;
         // both are cursor-state failures rather than a silent empty rowset.
@@ -4668,7 +4709,8 @@ mod tests {
         ];
         for (issue, state) in cases {
             let h = TestHandles::with_env_dbc_stmt();
-            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let stmt_owner = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+            let stmt = &*stmt_owner;
             let mut s = stmt.inner.lock().unwrap();
             issue.post(&mut s);
             assert_eq!(
