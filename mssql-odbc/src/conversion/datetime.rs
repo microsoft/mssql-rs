@@ -371,8 +371,25 @@ pub(crate) fn current_local_date() -> Option<(i16, u16, u16)> {
     }
     #[cfg(windows)]
     {
-        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-        Some((i16::try_from(st.wYear).ok()?, st.wMonth, st.wDay))
+        unsafe extern "C" {
+            #[link_name = "_time64"]
+            fn crt_time64(timer: *mut i64) -> i64;
+            #[link_name = "_localtime64_s"]
+            fn crt_localtime64_s(tm: *mut libc::tm, timer: *const i64) -> libc::errno_t;
+        }
+
+        let now = unsafe { crt_time64(std::ptr::null_mut()) };
+        if now == -1 {
+            return None;
+        }
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { crt_localtime64_s(&mut tm, &now) } != 0 {
+            return None;
+        }
+        let year = i16::try_from(tm.tm_year.checked_add(1900)?).ok()?;
+        let month = u16::try_from(tm.tm_mon.checked_add(1)?).ok()?;
+        let day = u16::try_from(tm.tm_mday).ok()?;
+        Some((year, month, day))
     }
 }
 

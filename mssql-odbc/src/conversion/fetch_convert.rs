@@ -1897,6 +1897,71 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_timezone_controls_timestamp_date() {
+        const CHILD_ENV: &str = "MSSQL_ODBC_TZ_DATE_CHILD";
+        const TEST_NAME: &str =
+            "conversion::fetch_convert::tests::windows_process_timezone_controls_timestamp_date";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            for timezone in ["UTC-12", "UTC+12"] {
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("test executable should have a path"),
+                )
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TZ", timezone)
+                .output()
+                .expect("child test process should start");
+                assert!(
+                    output.status.success(),
+                    "child failed for {timezone}:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if String::from_utf8_lossy(&output.stdout).contains("TZ_DATE_VERIFIED") {
+                    return;
+                }
+            }
+            panic!("neither extreme TZ setting differed from the machine-local calendar date");
+        }
+
+        let crt_date = current_local_date().expect("CRT should provide the process-local date");
+        let machine = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        let machine_date = (
+            i16::try_from(machine.wYear).expect("SYSTEMTIME year should fit"),
+            machine.wMonth,
+            machine.wDay,
+        );
+        if crt_date == machine_date {
+            return;
+        }
+
+        use mssql_tds::datatypes::column_values::SqlTime;
+        for value in [
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: 0,
+                scale: 0,
+            }),
+            utf8_col("00:00:00"),
+        ] {
+            let mut out = SqlTimestampStruct::default();
+            let mut ind: SqlLen = 0;
+            unsafe {
+                convert_datetime_c(
+                    &value,
+                    SQL_C_TYPE_TIMESTAMP,
+                    (&mut out as *mut SqlTimestampStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .expect("time-to-timestamp conversion should succeed");
+            assert_eq!((out.year, out.month, out.day), crt_date);
+            assert_ne!((out.year, out.month, out.day), machine_date);
+        }
+        println!("TZ_DATE_VERIFIED");
+    }
+
     #[test]
     fn datetime2_to_timestamp_struct() {
         use mssql_tds::datatypes::column_values::{SqlDateTime2, SqlTime};
