@@ -1323,9 +1323,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
 // refused before any conversion is attempted. Same AB#47239 gap as above, so it
 // likewise asserts our own answer rather than parity.
 //
-// PLP metadata selects the streaming path regardless of the value's size. A
-// binary PLP column is refused before typed conversion, so varbinary(max) into
-// SQL_C_SLONG answers HYC00 here even for a small value.
+// PLP metadata selects the streaming path regardless of the value's size. This
+// test keeps a large value to verify that refusing a binary PLP before typed
+// conversion still drains every chunk before the trailing column and next row.
 TEST_F(FetchScrollLiveTest, ABoundStreamedVarbinaryMaxToTypedCTargetIsStillUnsupported) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(
