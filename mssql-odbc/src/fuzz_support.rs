@@ -34,7 +34,7 @@ use crate::conversion::fetch_convert::{
     is_integer_c_target, is_typed_c_target,
 };
 use crate::conversion::numeric::{narrow_i128, parse_numeric_text};
-use crate::conversion::param_convert::{bound_param_to_rpc, transcode_dae_bytes};
+use crate::conversion::param_convert::{DaeTranscode, bound_param_to_rpc};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, handle_from_raw};
 use crate::params::BoundParam;
@@ -108,7 +108,12 @@ pub fn fuzz_transcode_dae_bytes(input: &[u8], mode: u8) {
         },
         _ => SqlCollation::default(),
     };
-    let _ = transcode_dae_bytes(c_type, sql_type, input.to_vec(), collation);
+    let transcode = DaeTranscode::new(c_type, sql_type, collation);
+    let mut carry = Vec::new();
+    let (head, tail) = input.split_at(input.len() / 2);
+    let _ = transcode.push(&mut carry, head);
+    let _ = transcode.push(&mut carry, tail);
+    let _ = transcode.finish(&mut carry);
 }
 
 /// Drive the unsafe UTF-16 buffer readers over a real, bounded slice.

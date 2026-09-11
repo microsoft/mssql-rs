@@ -429,28 +429,6 @@ steps:
       targetPath: $(Build.SourcesDirectory)/target/cobertura-odbc-e2e.xml
       artifactName: CoberturaCoverageOdbcE2E_Linux
 
-- task: CopyFiles@2
-  displayName: Copy Rust Debug Build
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), or(eq('${{parameters.buildType}}', 'Debug'), eq('${{parameters.buildType}}', 'Both')))
-  inputs:
-    SourceFolder: '$(Build.SourcesDirectory)/target/debug'
-    Contents: |
-      *
-      !.cargo-lock
-      !libmssqlodbc.so
-    TargetFolder: '$(Build.ArtifactStagingDirectory)/debug'
-
-- task: CopyFiles@2
-  displayName: Copy Rust Release Build
-  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), or(eq('${{parameters.buildType}}', 'Release'), eq('${{parameters.buildType}}', 'Both')))
-  inputs:
-    SourceFolder: '$(Build.SourcesDirectory)/target/release'
-    Contents: |
-      *
-      !.cargo-lock
-      !libmssqlodbc.so
-    TargetFolder: '$(Build.ArtifactStagingDirectory)/release'
-
 - script: |
     if [ -f "$(Build.SourcesDirectory)/tdslib-nextest.tar.zst" ]; then
       cp $(Build.SourcesDirectory)/tdslib-nextest.tar.zst $(Build.ArtifactStagingDirectory)/
