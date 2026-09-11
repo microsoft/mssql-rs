@@ -152,11 +152,31 @@ impl CommandTimeoutBudget {
 
 /// Quotes a possibly multi-part procedure name for interpolation into T-SQL.
 ///
-/// Each part is bracketed unless it is already delimited, and any `]` inside a
-/// part is doubled, so no separator, comment or statement terminator can escape
-/// the identifier. The optional `;n` procedure group number is preserved.
+/// Each decoded part is bracketed, so no separator, comment or statement
+/// terminator can escape the identifier. The optional `;n` group is preserved.
 fn quote_procedure_name(name: &str) -> TdsResult<String> {
-    let (body, group) = match name.split_once(';') {
+    let mut chars = name.char_indices().peekable();
+    let mut delimiter = None;
+    let mut group_separator = None;
+    while let Some((i, c)) = chars.next() {
+        match (delimiter, c) {
+            (None, '[') => delimiter = Some(']'),
+            (None, '"') => delimiter = Some('"'),
+            (None, ';') => {
+                group_separator = Some(i);
+                break;
+            }
+            (Some(close), c) if c == close => {
+                if chars.peek().is_some_and(|&(_, next)| next == close) {
+                    chars.next();
+                } else {
+                    delimiter = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let (body, group) = match group_separator.map(|i| (&name[..i], &name[i + 1..])) {
         Some((body, group)) if !group.is_empty() && group.bytes().all(|b| b.is_ascii_digit()) => {
             (body, Some(group))
         }
@@ -166,61 +186,21 @@ fn quote_procedure_name(name: &str) -> TdsResult<String> {
         None => (name, None),
     };
 
-    let mut quoted = String::with_capacity(body.len() + 8);
-    for (i, part) in split_identifier_parts(body)?.into_iter().enumerate() {
-        if i > 0 {
-            quoted.push('.');
-        }
-        // An empty part is legal in a qualified name (`db..proc`).
-        if part.is_empty() {
-            continue;
-        }
-        if (part.starts_with('[') && part.ends_with(']') && part.len() >= 2)
-            || (part.starts_with('"') && part.ends_with('"') && part.len() >= 2)
-        {
-            quoted.push_str(part);
-        } else {
-            quoted.push('[');
-            quoted.push_str(&part.replace(']', "]]"));
-            quoted.push(']');
-        }
+    let parts = crate::sql_identifier::parse_multipart_identifier(body, true)?;
+    if parts.iter().flatten().next().is_none_or(String::is_empty)
+        || parts
+            .last()
+            .and_then(Option::as_ref)
+            .is_none_or(String::is_empty)
+    {
+        return Err(UsageError(format!("Invalid procedure name '{name}'")));
     }
+    let mut quoted = crate::sql_identifier::build_multipart_name(&parts);
     if let Some(group) = group {
         quoted.push(';');
         quoted.push_str(group);
     }
     Ok(quoted)
-}
-
-/// Splits a qualified name on the dots that are outside `[...]` and `"..."`.
-fn split_identifier_parts(body: &str) -> TdsResult<Vec<&str>> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut delimiter: Option<char> = None;
-    for (i, c) in body.char_indices() {
-        match (delimiter, c) {
-            (None, '[') => delimiter = Some(']'),
-            (None, '"') => delimiter = Some('"'),
-            (None, '.') => {
-                parts.push(&body[start..i]);
-                start = i + 1;
-            }
-            (Some(close), c) if c == close => delimiter = None,
-            _ => {}
-        }
-    }
-    if delimiter.is_some() {
-        return Err(UsageError(format!(
-            "Unterminated quoted identifier in procedure name '{body}'"
-        )));
-    }
-    parts.push(&body[start..]);
-    if parts.len() > 4 {
-        return Err(UsageError(format!(
-            "Procedure name '{body}' has more than four parts"
-        )));
-    }
-    Ok(parts)
 }
 
 /// State of the `ReturnStatus` token observed while draining the most recent
@@ -17449,7 +17429,7 @@ mod tests {
 
 #[cfg(test)]
 mod procedure_name_quoting_tests {
-    use super::{quote_procedure_name, split_identifier_parts};
+    use super::quote_procedure_name;
 
     #[test]
     fn regular_parts_are_bracketed() {
@@ -17461,13 +17441,15 @@ mod procedure_name_quoting_tests {
     }
 
     #[test]
-    fn already_delimited_parts_are_left_alone() {
+    fn delimited_parts_are_decoded_and_requoted() {
         assert_eq!(quote_procedure_name("[my proc]").unwrap(), "[my proc]");
         assert_eq!(
             quote_procedure_name("[db].[dbo].[my proc]").unwrap(),
             "[db].[dbo].[my proc]"
         );
-        assert_eq!(quote_procedure_name("\"q p\"").unwrap(), "\"q p\"");
+        assert_eq!(quote_procedure_name("\"q p\"").unwrap(), "[q p]");
+        assert_eq!(quote_procedure_name("[p]];q]").unwrap(), "[p]];q]");
+        assert_eq!(quote_procedure_name("\"p\"\";q\"").unwrap(), "[p\";q]");
     }
 
     #[test]
@@ -17475,6 +17457,13 @@ mod procedure_name_quoting_tests {
         assert_eq!(quote_procedure_name("p;2").unwrap(), "[p];2");
         assert!(quote_procedure_name("p;").is_err());
         assert!(quote_procedure_name("p;x").is_err());
+        assert_eq!(quote_procedure_name("[p;q]").unwrap(), "[p;q]");
+        assert_eq!(quote_procedure_name("[p;q];2").unwrap(), "[p;q];2");
+        assert_eq!(quote_procedure_name("\"p;q\";2").unwrap(), "[p;q];2");
+        assert_eq!(quote_procedure_name("[p]];q];2").unwrap(), "[p]];q];2");
+        for name in ["[p;q];", "[p;q];x", "[p;q];2;3", "[p;q];2--x"] {
+            assert!(quote_procedure_name(name).is_err(), "{name}");
+        }
     }
 
     /// The point of the quoting: nothing an application can put in a procedure
@@ -17508,7 +17497,17 @@ mod procedure_name_quoting_tests {
 
     #[test]
     fn unterminated_and_overlong_names_are_rejected() {
-        assert!(split_identifier_parts("[unclosed").is_err());
-        assert!(split_identifier_parts("a.b.c.d.e").is_err());
+        for name in [
+            "[unclosed",
+            "a.b.c.d.e",
+            "[p]x",
+            "[p]/*x*/",
+            "\"p\"x",
+            "",
+            ".p",
+            "p.",
+        ] {
+            assert!(quote_procedure_name(name).is_err(), "{name}");
+        }
     }
 }

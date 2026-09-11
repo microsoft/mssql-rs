@@ -27,7 +27,7 @@ use crate::api::odbc_types::{
 use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
     DaePlan, DaeTranscode, ParamBuildError, bound_param_to_rpc, buffered_dae_to_rpc,
-    dae_length_limit, dae_plan, dae_streamed_declaration, is_data_at_exec_indicator,
+    dae_length_limit, dae_plan, dae_streamed_declaration,
 };
 use crate::error::post_sql_error;
 use crate::handles::dbc::ConnectionState;
@@ -432,16 +432,11 @@ pub(super) fn release_busy_if_row_exhausted(
         Vec::new()
     };
 
-    if let Ok(mut dbc_state) = dbc.inner.lock() {
-        dbc_state.client = Some(client);
-        dbc_state.active_stmt = if release {
-            None
-        } else {
-            Some(statement_handle)
-        };
-    }
-
     if let Ok(mut stmt_state) = stmt.inner.lock() {
+        if release {
+            stmt_state.pending_output_params =
+                Some((client.get_return_values(), client.get_return_status()));
+        }
         if row_delivered {
             post_tds_info_messages(&mut stmt_state, &drained_info);
         } else {
@@ -459,6 +454,16 @@ pub(super) fn release_busy_if_row_exhausted(
         if release {
             stmt_state.batch_exhausted = true;
         }
+    }
+    // Capture outputs before publishing the idle client: another statement's
+    // execution clears the client's RETURNVALUE/RETURNSTATUS collections.
+    if let Ok(mut dbc_state) = dbc.inner.lock() {
+        dbc_state.client = Some(client);
+        dbc_state.active_stmt = if release {
+            None
+        } else {
+            Some(statement_handle)
+        };
     }
 }
 
@@ -824,12 +829,8 @@ pub(super) unsafe fn build_named_params_for_row(
                 ParamRowBuildError::Layout { parameter: i + 1 }
             })?;
         let name = named.then(|| parameter_name(i));
-        let dae_indicator = if !bound_param.octet_length_ptr.is_null() {
-            let ind = unsafe { bound_param.octet_length_ptr.read_unaligned() };
-            is_data_at_exec_indicator(ind).then_some(ind)
-        } else {
-            None
-        };
+        let dae_indicator =
+            unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
 
         if let Some(indicator) = dae_indicator {
             let plan = dae_plan(bound_param.c_type, bound_param.sql_type).map_err(|source| {
@@ -858,9 +859,16 @@ pub(super) unsafe fn build_named_params_for_row(
             // not in, so its type and length are not known. The slot is filled
             // to keep parameter positions lined up and is rebuilt by
             // `rebuild_deferred_params` before anything reaches the wire.
+            let status = if crate::conversion::param_convert::is_output_direction(
+                bound_param.input_output_type,
+            ) {
+                StatusFlags::BY_REF_VALUE
+            } else {
+                StatusFlags::NONE
+            };
             let rpc = match plan {
                 DaePlan::Stream(streamed) => {
-                    let param = RpcParameter::data_at_exec(name, StatusFlags::NONE, streamed);
+                    let param = RpcParameter::data_at_exec(name, status, streamed);
                     // The body is PLP whatever `ColumnSize` says, but the
                     // variable it lands in is declared from `ParameterType`,
                     // matching the materialized path and msodbcsql (AB#47590).
@@ -889,11 +897,9 @@ pub(super) unsafe fn build_named_params_for_row(
                         }
                     }
                 }
-                DaePlan::Buffer => RpcParameter::data_at_exec(
-                    name,
-                    StatusFlags::NONE,
-                    StreamedSqlType::VarBinaryMax,
-                ),
+                DaePlan::Buffer => {
+                    RpcParameter::data_at_exec(name, status, StreamedSqlType::VarBinaryMax)
+                }
             };
             params.push(rpc);
         } else {
@@ -1093,6 +1099,7 @@ pub(super) fn finish_execute(
         // step through, matching msodbcsql's one result set per DML statement.
         let mut dml_counts: VecDeque<i64> = client.take_dml_result_counts().into();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
+        let bound_params = snapshot_bound_params(stmt);
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("{op}: stmt mutex poisoned");
             return_client_idle(dbc, statement_handle, client);
@@ -1103,13 +1110,26 @@ pub(super) fn finish_execute(
         // become available -- SQLMoreResults never runs for it.
         let return_values = client.get_return_values();
         let return_status = client.get_return_status();
-        unsafe {
-            crate::api::output_params::write_back_output_params(
+        let output_rc = if let Ok(bound_params) = bound_params {
+            // Fresh descriptor snapshot; execute-time input pointers may have
+            // been reset or rebound while the results were being consumed.
+            unsafe {
+                crate::api::output_params::write_back_output_params(
+                    &mut stmt_state,
+                    &bound_params,
+                    &return_values,
+                    return_status,
+                )
+            }
+        } else {
+            post_sql_error(
                 &mut stmt_state,
-                &return_values,
-                return_status,
+                SQLSTATE_HY000,
+                0,
+                "Internal error snapshotting output parameter bindings",
             );
-        }
+            SQL_ERROR
+        };
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
@@ -1130,7 +1150,9 @@ pub(super) fn finish_execute(
             }
             return SQL_ERROR;
         }
-        return if has_server_info {
+        return if output_rc != SQL_SUCCESS {
+            output_rc
+        } else if has_server_info {
             SQL_SUCCESS_WITH_INFO
         } else {
             SQL_SUCCESS
@@ -1918,6 +1940,25 @@ mod tests {
         let built = unsafe { build_named_params(&mut state, 0, "test") }.unwrap();
         assert!(built.params.is_empty());
         assert!(built.dae_params.is_empty());
+    }
+
+    #[test]
+    fn output_only_indicators_never_stage_data_at_execution() {
+        use crate::api::odbc_types::{SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        for direction in [SQL_PARAM_OUTPUT, SQL_RETURN_VALUE] {
+            let mut buffer = vec![b'x'; 8];
+            let mut indicator = SQL_DATA_AT_EXEC;
+            let mut param = char_param(&mut buffer, &mut indicator);
+            param.input_output_type = direction;
+            param.column_size = 8;
+            state.bound_params = vec![Some(param)];
+            let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+            assert!(built.dae_params.is_empty());
+            assert_eq!(built.params.len(), 1);
+        }
     }
 
     #[test]

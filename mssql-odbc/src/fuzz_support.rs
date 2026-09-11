@@ -11,7 +11,9 @@
 //! panics, hangs, and (for the pointer readers) out-of-bounds reads, not for a
 //! particular result.
 
-use crate::api::escape::{describe_text, translate_and_rewrite, translate_escapes};
+use crate::api::escape::{
+    describe_text, executable_marker_count, translate_and_rewrite, translate_escapes,
+};
 use crate::api::odbc_types::{
     SQL_ATTR_ODBC_VERSION, SQL_C_BINARY, SQL_C_BIT, SQL_C_CHAR, SQL_C_DATE, SQL_C_DOUBLE,
     SQL_C_FLOAT, SQL_C_GUID, SQL_C_LONG, SQL_C_NUMERIC, SQL_C_SBIGINT, SQL_C_SHORT, SQL_C_SLONG,
@@ -67,13 +69,12 @@ pub fn fuzz_connection_string(input: &str) {
 /// translation never invents or loses a parameter marker, and the NOSCAN path
 /// is byte-identical to marker rewriting on its own.
 pub fn fuzz_escape_sequences(input: &str) {
-    let markers = input.matches('?').count();
+    let markers = executable_marker_count(input);
 
     if let Ok(translated) = translate_escapes(input) {
-        // Phase 1 must leave every `?` exactly where it was: SQLNativeSql
-        // returns markers untranslated.
+        // Literal question marks may disappear, e.g. in {encrypt N'?'}.
         assert_eq!(
-            translated.sql.matches('?').count(),
+            executable_marker_count(&translated.sql),
             markers,
             "escape translation changed the marker count: {input:?} -> {:?}",
             translated.sql

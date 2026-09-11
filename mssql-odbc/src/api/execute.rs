@@ -9,8 +9,8 @@ use tracing::{debug, error};
 use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
-    ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, ResultSet, StatementId,
-    StatementResult, StreamedParamStatus,
+    ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, PreparedStatement, ResultSet,
+    StatementId, StatementResult, StreamedParamStatus,
 };
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -30,7 +30,7 @@ use crate::api::odbc_types::{
     SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn, SqlULen, SqlUSmallInt,
 };
-use crate::conversion::param_convert::is_data_at_exec_indicator;
+use crate::conversion::param_convert::{is_data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::{
@@ -911,16 +911,57 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         return Err(SQL_ERROR);
     }
 
-    let marker_count = stmt_state
-        .prepared
-        .as_ref()
-        .expect("prepared checked non-None above")
-        .marker_count;
-
     // All state-sequencing checks passed: this is a real new execute, so the
     // fresh snapshot now becomes the one `build_named_params` and any DAE
     // sequence it opens will read for the rest of this execute.
     stmt_state.bound_params = bound_params;
+    stmt_state.call_returns_status = false;
+    let output_flags: Vec<bool> = stmt_state
+        .bound_params
+        .iter()
+        .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+        .collect();
+    let Some(plan) = stmt_state.prepared.as_ref() else {
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return Err(SQL_ERROR);
+    };
+    if !plan.original_sql.is_empty() {
+        let (sql, marker_count, call) = match super::escape::translate_for_execution(
+            &plan.original_sql,
+            stmt_state.inert_attrs.noscan(),
+            &output_flags,
+        ) {
+            Ok(parts) => parts,
+            Err(error) => {
+                post_sql_error(&mut stmt_state, error.state(), 0, error.message());
+                return Err(SQL_ERROR);
+            }
+        };
+        if call.as_ref().is_some_and(|call| call.returns_status) {
+            match stmt_state.bound_params.first().and_then(Option::as_ref) {
+                None => {
+                    post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
+                    return Err(SQL_ERROR);
+                }
+                Some(param) if !is_output_direction(param.input_output_type) => {
+                    post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                    return Err(SQL_ERROR);
+                }
+                Some(_) => {}
+            }
+        }
+        if sql != plan.stmt.sql() {
+            stmt_state.orphan_prepared_handle();
+            if let Some(plan) = stmt_state.prepared.as_mut() {
+                plan.stmt = PreparedStatement::new(sql);
+                plan.marker_count = marker_count;
+            }
+        }
+    }
+    let Some(marker_count) = stmt_state.prepared.as_ref().map(|plan| plan.marker_count) else {
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return Err(SQL_ERROR);
+    };
 
     if stmt_state.paramset_size > 1 {
         let paramset_size = stmt_state.paramset_size;

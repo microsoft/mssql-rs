@@ -292,7 +292,7 @@ Translation policy:
 
 | Escape | Behaviour |
 | --- | --- |
-| `{fn …}`, `{d …}`, `{t …}`, `{ts …}`, `{oj …}`, `{guid …}` | validated, then **passed through verbatim** |
+| `{fn …}`, `{d …}`, `{t …}`, `{ts …}`, `{oj …}`, `{guid …}` | preserve the native outer escape, translating nested escapes first |
 | `{escape 'c'}` | → `ESCAPE 'c'` |
 | `{interval …}` | → T-SQL string literal, §5.3 |
 | `{encrypt N'…'}` | → `0x…`, §5.4 |
@@ -300,6 +300,8 @@ Translation policy:
 | anything else | `42000`, statement not sent |
 
 Whitespace: match msodbcsql — a translated escape is emitted as `" " + text + " "`.
+Nesting is limited to 64 levels and checked before recursive translation. Excessive nesting
+returns `42000` rather than overflowing the process stack.
 
 ### 5.2 `SQL_ATTR_NOSCAN`, and retaining the original SQL
 
@@ -394,7 +396,7 @@ security primitive.
 Two paths, mirroring msodbcsql:
 
 - **RPC path** — the trimmed statement is exactly one `{[?=]call name[(args…)]}` and every argument
-  is `?`, `DEFAULT`, or empty. Dispatch through `execute_stored_procedure(name, …)`. Output
+  is `?`, with no data-at-execution input. Dispatch through `execute_stored_procedure(name, …)`. Output
   parameters need only `StatusFlags::BY_REF_VALUE`.
 
   Parameters go in **positionally**, not as `@P1..@Pn`. The server matches an RPC's *named*
@@ -402,9 +404,14 @@ Two paths, mirroring msodbcsql:
   '@a', which was not supplied" — found by the e2e tests, not by unit tests. The `{? = call …}`
   return-status binding is skipped entirely: it travels on the RETURNSTATUS token, not as an
   argument.
-- **Text path** — everything else (a call inside a batch, literal or nested-escape arguments,
-  multiple calls): rewrite to `EXEC name @P1, @P2 OUTPUT, DEFAULT, …` and run through
-  `sp_executesql`.
+- **Text path** — everything else (a call inside a batch, literal, default, omitted or nested-escape arguments,
+  multiple calls, data-at-execution input), and prepared executions: rewrite to `EXEC name @P1, @P2 OUTPUT, DEFAULT, …` and run through
+  the named text execution path. Default and omitted arguments stay in their original positions.
+
+Select the route before building parameters. Data-at-execution text keeps the complete named list,
+including the return-assignment variable; it must never receive the unnamed direct-RPC list.
+`SQLExecute` renders call-site annotations from the current bindings and invalidates a cached
+server handle if that changes the prepared text. `SQLNativeSql` remains binding-independent.
 
 The text path has to carry binding direction into **both** halves of the generated statement:
 
@@ -429,16 +436,24 @@ of the change and must be reviewed as such.
 - `SQLBindParameter` accepts `SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`, `SQL_PARAM_RETURN_VALUE`
   with the validation ODBC requires; the `HYC00` rejection at `bind_param.rs:258` goes away.
 - `build_named_params` marks them `StatusFlags::BY_REF_VALUE`.
+- Output-only parameters send typed NULL without reading value or length buffers, even when an
+  old indicator contains a data-at-execution sentinel. Only input and input/output bindings supply input data.
 - ODBC requires output values to be invisible until every result set the procedure produced has been
   consumed. `get_return_values()` fills as tokens arrive, so writeback is gated on batch exhaustion
-  rather than written back eagerly at execute time. There are **two** such points, not one: the
-  `SQLMoreResults` batch-end arm (the existing TODO), and `finish_execute`'s no-result-set path — a
-  procedure that returns no rows is already exhausted there and `SQLMoreResults` never runs for it.
+  rather than written back eagerly at execute time. Delivery covers `SQLMoreResults`' normal and
+  already-exhausted paths, and `finish_execute`'s no-result-set path. Fetch exhaustion retains return
+  tokens on the statement before releasing the client, so another statement cannot overwrite them.
+- Delivery snapshots the current effective APD/IPD bindings and applies the current parameter bind
+  offset. Resetting bindings prevents writes; rebinding redirects them. Execute-time buffer pointers
+  are not a valid source for delayed output delivery.
 - Matching follows msodbcsql: **by name first, then by ordinal**. Honour `StrLen_or_IndPtr`
-  including `SQL_NULL_DATA`; report truncation as `01004`.
+  including `SQL_NULL_DATA`; report string truncation as `01004`, fractional truncation as `01S07`,
+  and conversion failures as errors in both diagnostics and the API return code.
 - `{? = call …}` binds the return status to parameter 1, identified from the *statement form*
   rather than the bound direction — msodbcsql forces that parameter to OUTPUT and rejects an input
   binding (`sqlcmisc.cpp:8310`), so the direction the application chose does not identify it.
+  Only the direct RPC route reads RETURNSTATUS. Text routes read their named output variable,
+  not the enclosing `sp_executesql` status. This mapping is reset on every execution.
 
 ### 5.7 mssql-tds changes
 

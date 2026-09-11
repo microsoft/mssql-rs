@@ -119,8 +119,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // Store the SQL text and defer the server-side prepare to SQLExecute.
     // Re-preparing discards any prior prepared text and stale result metadata.
     // A prior prepared handle is orphaned for release at the next execute.
-    // Markers are rewritten to `@P1..@Pn` once here so `SQLExecute` re-prepares
-    // (after a reconnect) without re-scanning the SQL.
+    // Execution adds binding-dependent OUTPUT annotations to the retained SQL.
     let (rewritten_sql, marker_count, _) =
         match translate_and_rewrite(&sql, stmt_state.inert_attrs.noscan()) {
             Ok(parts) => parts,
@@ -140,6 +139,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+    stmt_state.call_returns_status = false;
     stmt_state.set_state(STMT_STATE_PREPARED);
 
     debug!("SQLPrepareW: statement prepared (deferred)");

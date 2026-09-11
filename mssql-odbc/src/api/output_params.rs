@@ -15,14 +15,18 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::result::ReturnValue;
 use mssql_tds::token::tokenitems::ReturnValueStatus;
 
-use crate::api::fetch_scroll::{RowIssue, deliver_bound_value};
-use crate::api::odbc_types::{SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
-use crate::api::sqlstate::{WARN_STRING_TRUNCATION, post_diag};
+use crate::api::fetch_scroll::{RowOutcome, deliver_bound_value};
+use crate::api::odbc_types::{
+    SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_PARAM_INPUT_OUTPUT,
+    SQL_PARAM_OUTPUT, SQL_RETURN_VALUE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlReturn,
+};
+use crate::api::sqlstate::{ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag};
 use crate::handles::stmt::{ColumnBinding, StmtState};
 use crate::params::BoundParam;
 
 /// Copies every output value the server returned into the buffers the
-/// application bound, and reports truncation as `01004`.
+/// application currently bound, preserving conversion diagnostics and the
+/// aggregate return code.
 ///
 /// Matching follows msodbcsql's `GetReturnValue` (`sqlctokn.cpp`): a returned
 /// value is matched to a binding **by name when the server supplied one, and by
@@ -31,16 +35,17 @@ use crate::params::BoundParam;
 ///
 /// # Safety
 /// Every bound output parameter's value and indicator buffers must still be
-/// valid, which is the application's obligation until it rebinds or frees the
-/// statement.
+/// writable at the current parameter binding offset. `bound_params` must be a
+/// fresh effective APD/IPD snapshot, taken before acquiring the STMT lock, not
+/// the execution-time input snapshot.
 pub(crate) unsafe fn write_back_output_params(
     stmt_state: &mut StmtState,
+    bound_params: &[Option<BoundParam>],
     return_values: &[ReturnValue],
     return_status: Option<i32>,
-) {
+) -> SqlReturn {
     let returns_status = stmt_state.call_returns_status;
-    let bound: Vec<(usize, BoundParam)> = stmt_state
-        .bound_params
+    let bound = bound_params
         .iter()
         .enumerate()
         .filter_map(|(i, p)| p.map(|p| (i, p)))
@@ -49,11 +54,13 @@ pub(crate) unsafe fn write_back_output_params(
                 p.input_output_type,
                 SQL_PARAM_OUTPUT | SQL_PARAM_INPUT_OUTPUT | SQL_RETURN_VALUE
             )
-        })
-        .collect();
-    if bound.is_empty() {
-        return;
-    }
+        });
+    // The application can change the pointed-to offset after execution.
+    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+    let bind_type = stmt_state
+        .inert_attrs
+        .get(SQL_ATTR_PARAM_BIND_TYPE)
+        .unwrap_or(SQL_BIND_BY_COLUMN);
 
     // Output parameters only; a UDF return value is not one of them.
     let outputs: Vec<&ReturnValue> = return_values
@@ -61,14 +68,16 @@ pub(crate) unsafe fn write_back_output_params(
         .filter(|v| v.status == ReturnValueStatus::OutputParam)
         .collect();
 
-    let mut truncated = false;
-    let mut issues: Vec<RowIssue> = Vec::new();
-    let mut consumed = 0usize;
+    let mut result = SQL_SUCCESS;
     for (index, param) in bound {
-        // The `{? = call ...}` return status comes from the RETURNSTATUS token,
-        // not from a RETURNVALUE, and is always an integer. Parameter 1 of that
-        // form is the status whatever direction the application bound it with.
-        if param.input_output_type == SQL_RETURN_VALUE || (returns_status && index == 0) {
+        let Ok(param) = param.for_row(0, bind_offset, bind_type) else {
+            post_diag(stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+            result = SQL_ERROR;
+            continue;
+        };
+        // Only a direct RPC uses RETURNSTATUS. Text/prepared calls return
+        // their status variable as @P1, like every other output binding.
+        let value = if returns_status && index == 0 {
             let Some(status) = return_status else {
                 debug!(
                     parameter = index + 1,
@@ -76,46 +85,43 @@ pub(crate) unsafe fn write_back_output_params(
                 );
                 continue;
             };
-            match unsafe { write_value(&param, &ColumnValues::Int(status)) } {
-                Ok(true) => truncated = true,
-                Ok(false) => {}
-                Err(issue) => issues.push(issue),
-            }
-            continue;
-        }
-
-        let name = format!("@P{}", index + 1);
-        let matched = outputs
-            .iter()
-            .find(|v| !v.param_name.is_empty() && v.param_name.eq_ignore_ascii_case(&name))
-            .or_else(|| outputs.get(consumed))
-            .copied();
-
-        let Some(value) = matched else {
-            debug!(
-                parameter = index + 1,
-                "no output value was returned for this parameter"
-            );
-            continue;
+            &ColumnValues::Int(status)
+        } else {
+            let name = format!("@P{}", index + 1);
+            let matched = outputs.iter().find(|v| {
+                if v.param_name.is_empty() {
+                    usize::from(v.param_ordinal) == index - usize::from(returns_status)
+                } else {
+                    v.param_name.eq_ignore_ascii_case(&name)
+                }
+            });
+            let Some(value) = matched else {
+                debug!(
+                    parameter = index + 1,
+                    "no output value was returned for this parameter"
+                );
+                continue;
+            };
+            &value.value
         };
-        consumed += 1;
-        match unsafe { write_value(&param, &value.value) } {
-            Ok(true) => truncated = true,
-            Ok(false) => {}
-            Err(issue) => issues.push(issue),
+        match unsafe { write_value(&param, value) } {
+            RowOutcome::Success => {}
+            RowOutcome::Info(issue) => {
+                issue.post(stmt_state);
+                if result == SQL_SUCCESS {
+                    result = SQL_SUCCESS_WITH_INFO;
+                }
+            }
+            RowOutcome::Error(issue) => {
+                issue.post(stmt_state);
+                result = SQL_ERROR;
+            }
         }
     }
-
-    if truncated {
-        post_diag(stmt_state, WARN_STRING_TRUNCATION);
-    }
-    for issue in issues {
-        issue.post(stmt_state);
-    }
+    result
 }
 
-/// Writes one value into a bound parameter buffer, returning whether it was
-/// truncated.
+/// Writes one value into a bound parameter buffer.
 ///
 /// The parameter binding is adapted to a [`ColumnBinding`] so the delivery goes
 /// through exactly the same conversion, indicator and truncation handling that
@@ -125,7 +131,7 @@ pub(crate) unsafe fn write_back_output_params(
 /// # Safety
 /// The parameter's value, indicator, and octet-length buffers must be writable
 /// for one element according to its bound C type and buffer length.
-unsafe fn write_value(param: &BoundParam, value: &ColumnValues) -> Result<bool, RowIssue> {
+unsafe fn write_value(param: &BoundParam, value: &ColumnValues) -> RowOutcome {
     let binding = ColumnBinding {
         column_number: 1,
         target_type: param.c_type,
@@ -140,10 +146,16 @@ unsafe fn write_value(param: &BoundParam, value: &ColumnValues) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::bind_param::{sql_bind_parameter, sql_free_stmt_reset_params};
+    use crate::api::exec_common::snapshot_bound_params;
+    use crate::api::more_results::sql_more_results;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_SLONG, SQL_INTEGER, SQL_NULL_DATA, SQL_VARCHAR,
+        SQL_C_CHAR, SQL_C_SLONG, SQL_INTEGER, SQL_NO_DATA, SQL_NULL_DATA, SQL_VARCHAR,
     };
+    use crate::handles::{DbcHandle, StmtHandle, handle_from_raw};
+    use crate::test_support::TestHandles;
     use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+    use mssql_tds::test_client_support::{int_columns, tds_client_from_tokens};
     use std::ffi::c_void;
 
     fn output_param(
@@ -169,6 +181,252 @@ mod tests {
         }
     }
 
+    fn returned(name: &str, ordinal: u16, value: ColumnValues) -> ReturnValue {
+        ReturnValue {
+            param_ordinal: ordinal,
+            param_name: name.to_owned(),
+            value,
+            column_metadata: Box::new(int_columns(1).remove(0)),
+            status: ReturnValueStatus::OutputParam,
+        }
+    }
+
+    fn bind(h: &TestHandles, param: BoundParam) {
+        assert_eq!(
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    1,
+                    param.input_output_type,
+                    param.c_type,
+                    param.sql_type,
+                    8,
+                    0,
+                    param.parameter_value_ptr,
+                    param.buffer_length,
+                    param.strlen_or_ind_ptr,
+                )
+            },
+            SQL_SUCCESS
+        );
+    }
+
+    #[test]
+    fn pending_outputs_use_current_bindings_and_survive_another_busy_statement() {
+        for reset in [false, true] {
+            let mut h = TestHandles::with_env_dbc_stmt();
+            let other = h.alloc_extra_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let mut old = -1i32;
+            let mut new = -2i32;
+            let old_param = output_param(
+                SQL_C_SLONG,
+                SQL_INTEGER,
+                (&raw mut old).cast(),
+                0,
+                std::ptr::null_mut(),
+            );
+            bind(&h, old_param);
+            let stale = snapshot_bound_params(stmt).unwrap();
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.bound_params = stale;
+                state.batch_exhausted = true;
+                state.pending_output_params =
+                    Some((vec![returned("@P1", 0, ColumnValues::Int(73))], None));
+            }
+            {
+                let mut state = dbc.inner.lock().unwrap();
+                state.active_stmt = Some(other);
+                state.client = Some(tds_client_from_tokens(Vec::new()));
+            }
+            if reset {
+                assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_SUCCESS);
+            } else {
+                bind(
+                    &h,
+                    BoundParam {
+                        parameter_value_ptr: (&raw mut new).cast(),
+                        ..old_param
+                    },
+                );
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert_eq!(old, -1);
+            assert_eq!(new, if reset { -2 } else { 73 });
+            assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+            new = -3;
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert_eq!(new, -3);
+            assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
+        }
+    }
+
+    #[test]
+    fn pending_output_diagnostics_preserve_severity_and_fractional_sqlstate() {
+        for (value, c_type, expected_rc, expected_state) in [
+            (
+                ColumnValues::String(SqlString::new(b"abcdefgh".to_vec(), EncodingType::Utf8)),
+                SQL_C_CHAR,
+                SQL_SUCCESS_WITH_INFO,
+                *b"01004",
+            ),
+            (
+                ColumnValues::Float(12.75),
+                SQL_C_SLONG,
+                SQL_SUCCESS_WITH_INFO,
+                *b"01S07",
+            ),
+            (
+                ColumnValues::String(SqlString::new(b"invalid".to_vec(), EncodingType::Utf8)),
+                SQL_C_SLONG,
+                SQL_ERROR,
+                *b"22018",
+            ),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut value_buffer = [0u8; 4];
+            bind(
+                &h,
+                output_param(
+                    c_type,
+                    SQL_VARCHAR,
+                    value_buffer.as_mut_ptr().cast(),
+                    4,
+                    std::ptr::null_mut(),
+                ),
+            );
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.batch_exhausted = true;
+                state.pending_output_params = Some((vec![returned("@P1", 0, value)], None));
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, expected_rc);
+            assert_eq!(
+                stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                expected_state
+            );
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
+    }
+
+    #[test]
+    fn return_status_requires_the_direct_rpc_route_even_for_return_value_direction() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut value = -1i32;
+        let mut param = output_param(
+            SQL_C_SLONG,
+            SQL_INTEGER,
+            (&raw mut value).cast(),
+            0,
+            std::ptr::null_mut(),
+        );
+        param.input_output_type = SQL_RETURN_VALUE;
+        let values = [returned("@P1", 0, ColumnValues::Int(37))];
+        let mut state = stmt.inner.lock().unwrap();
+        for direct_rpc in [false, true] {
+            state.call_returns_status = direct_rpc;
+            assert_eq!(
+                unsafe { write_back_output_params(&mut state, &[Some(param)], &values, Some(19)) },
+                SQL_SUCCESS
+            );
+            assert_eq!(value, if direct_rpc { 19 } else { 37 });
+        }
+    }
+
+    #[test]
+    fn unmatched_named_output_never_falls_back_to_another_binding() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut value = -1i32;
+        let param = output_param(
+            SQL_C_SLONG,
+            SQL_INTEGER,
+            (&raw mut value).cast(),
+            0,
+            std::ptr::null_mut(),
+        );
+        let mut state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            unsafe {
+                write_back_output_params(
+                    &mut state,
+                    &[None, Some(param)],
+                    &[returned("@P1", 0, ColumnValues::Int(7))],
+                    None,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, -1);
+        assert_eq!(
+            unsafe {
+                write_back_output_params(
+                    &mut state,
+                    &[None, Some(param)],
+                    &[returned("", 1, ColumnValues::Int(9))],
+                    None,
+                )
+            },
+            SQL_SUCCESS
+        );
+        assert_eq!(value, 9);
+    }
+
+    #[test]
+    fn output_error_dominates_warnings_without_losing_diagnostics() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut invalid = -1i32;
+        let mut truncated = [0u8; 4];
+        let mut fractional = -1i32;
+        let bindings = [
+            Some(output_param(
+                SQL_C_SLONG,
+                SQL_INTEGER,
+                (&raw mut invalid).cast(),
+                0,
+                std::ptr::null_mut(),
+            )),
+            Some(output_param(
+                SQL_C_CHAR,
+                SQL_VARCHAR,
+                truncated.as_mut_ptr().cast(),
+                4,
+                std::ptr::null_mut(),
+            )),
+            Some(output_param(
+                SQL_C_SLONG,
+                SQL_INTEGER,
+                (&raw mut fractional).cast(),
+                0,
+                std::ptr::null_mut(),
+            )),
+        ];
+        let values = [
+            returned("@P1", 0, ColumnValues::Null),
+            returned(
+                "@P2",
+                1,
+                ColumnValues::String(SqlString::new(b"abcdefgh".to_vec(), EncodingType::Utf8)),
+            ),
+            returned("@P3", 2, ColumnValues::Float(12.75)),
+        ];
+        let mut state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            unsafe { write_back_output_params(&mut state, &bindings, &values, None) },
+            SQL_ERROR
+        );
+        let states: Vec<_> = state.diag_records.iter().map(|r| r.sql_state).collect();
+        assert_eq!(states, [*b"22002", *b"01004", *b"01S07"]);
+        assert_eq!(fractional, 12);
+        assert_eq!(&truncated, b"abc\0");
+    }
+
     #[test]
     fn an_integer_output_lands_in_the_bound_buffer() {
         let mut buf = 0i32;
@@ -180,8 +438,8 @@ mod tests {
             size_of::<i32>() as crate::api::odbc_types::SqlLen,
             &raw mut ind,
         );
-        let truncated = unsafe { write_value(&param, &ColumnValues::Int(4711)) }.unwrap();
-        assert!(!truncated);
+        let outcome = unsafe { write_value(&param, &ColumnValues::Int(4711)) };
+        assert_eq!(outcome, RowOutcome::Success);
         assert_eq!(buf, 4711);
         assert_eq!(ind, size_of::<i32>() as crate::api::odbc_types::SqlLen);
     }
@@ -199,7 +457,10 @@ mod tests {
             size_of::<i32>() as crate::api::odbc_types::SqlLen,
             &raw mut ind,
         );
-        unsafe { write_value(&param, &ColumnValues::Null) }.unwrap();
+        assert_eq!(
+            unsafe { write_value(&param, &ColumnValues::Null) },
+            RowOutcome::Success
+        );
         assert_eq!(ind, SQL_NULL_DATA as crate::api::odbc_types::SqlLen);
     }
 
@@ -214,7 +475,10 @@ mod tests {
             size_of::<i32>() as crate::api::odbc_types::SqlLen,
             std::ptr::null_mut(),
         );
-        assert!(unsafe { write_value(&param, &ColumnValues::Null) }.is_err());
+        assert!(matches!(
+            unsafe { write_value(&param, &ColumnValues::Null) },
+            RowOutcome::Error(_)
+        ));
     }
 
     /// An output value too long for the bound buffer truncates and says so, so
@@ -231,10 +495,9 @@ mod tests {
             &raw mut ind,
         );
         let value = ColumnValues::String(SqlString::new(b"abcdefgh".to_vec(), EncodingType::Utf8));
-        let truncated = unsafe { write_value(&param, &value) }.unwrap();
-        assert!(
-            truncated,
-            "a value longer than the buffer must report truncation"
+        assert_eq!(
+            unsafe { write_value(&param, &value) },
+            RowOutcome::Info(crate::api::fetch_scroll::RowIssue::StringTruncated)
         );
     }
 }

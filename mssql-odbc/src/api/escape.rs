@@ -120,10 +120,11 @@ pub(crate) struct CallSite {
 impl CallSite {
     /// True when every argument can be carried as an RPC parameter, i.e. the
     /// call needs no `EXEC` text at all.
+    /// DEFAULT stays textual so omission cannot shift later positional bindings.
     pub(crate) fn is_rpc_eligible(&self) -> bool {
         self.args
             .iter()
-            .all(|a| matches!(a, CallArg::Marker { .. } | CallArg::Default))
+            .all(|a| matches!(a, CallArg::Marker { .. }))
     }
 }
 
@@ -392,31 +393,52 @@ fn classify(body: &str) -> Result<(EscapeKind, &str), EscapeError> {
     Ok((kind, remainder))
 }
 
-/// Validates escapes nested inside another escape's body.
-///
-/// msodbcsql processes the innermost escape first, so a malformed nested
-/// sequence fails the whole statement even when the outer one is passed
-/// through. `{fn …}` inside a canonical call is rejected outright
-/// (`SubstituteECodes`, `sqlcmisc.cpp:4712` — `ECODE_FUNCTION` with
-/// `fNestedInCall` posts `IDS_37_000`).
-fn validate_nested(body: &str, inside_call: bool) -> Result<(), EscapeError> {
-    let mut at = 0usize;
-    while let Some((open, close)) = find_escape(body, at) {
-        let inner = &body[open + 1..close - 1];
-        let (kind, _) = classify(inner)?;
-        if inside_call && kind == EscapeKind::Fn {
-            return Err(EscapeError::syntax(
-                "The {fn ...} escape is not allowed inside a canonical procedure call",
-            ));
+/// Rejects excessive nesting before entering the recursive translator.
+fn validate_nesting(sql: &str) -> Result<(), EscapeError> {
+    // Bound stack use before any recursive translation, including unmatched braces.
+    const MAX_ESCAPE_DEPTH: usize = 64;
+    let mut depth = 0usize;
+    let mut scan = CodeScan::new(sql);
+    while let Some(step) = scan.next_step() {
+        if step.code {
+            match step.ch {
+                '{' => {
+                    depth += 1;
+                    if depth > MAX_ESCAPE_DEPTH {
+                        return Err(EscapeError::syntax("ODBC escape nesting exceeds 64 levels"));
+                    }
+                }
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
         }
-        validate_nested(inner, inside_call)?;
-        at = close;
     }
     Ok(())
 }
 
+pub(crate) fn executable_marker_count(sql: &str) -> usize {
+    let mut count = 0;
+    let mut scan = CodeScan::new(sql);
+    while let Some(step) = scan.next_step() {
+        if step.code && step.ch == '?' {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Phase 1 — translate ODBC escape sequences, leaving `?` markers alone.
 pub(crate) fn translate_escapes(sql: &str) -> Result<Translated, EscapeError> {
+    validate_nesting(sql)?;
+    translate_escapes_inner(sql, false, &[], &mut 0)
+}
+
+fn translate_escapes_inner(
+    sql: &str,
+    inside_call: bool,
+    outputs: &[bool],
+    marker: &mut usize,
+) -> Result<Translated, EscapeError> {
     let mut out = String::with_capacity(sql.len() + 16);
     let mut at = 0usize;
     let mut only_call: Option<CallSite> = None;
@@ -426,6 +448,7 @@ pub(crate) fn translate_escapes(sql: &str) -> Result<Translated, EscapeError> {
     while let Some((open, close)) = find_escape(sql, at) {
         let before = &sql[at..open];
         out.push_str(before);
+        *marker += executable_marker_count(before);
         if !is_blank_or_separator(before) {
             outside_is_blank = false;
         }
@@ -436,12 +459,19 @@ pub(crate) fn translate_escapes(sql: &str) -> Result<Translated, EscapeError> {
 
         match kind {
             EscapeKind::Fn | EscapeKind::PassThrough => {
-                validate_nested(body, false)?;
-                // Native to SQL Server: emit the escape exactly as written.
-                out.push_str(&sql[open..close]);
+                if inside_call && kind == EscapeKind::Fn {
+                    return Err(EscapeError::syntax(
+                        "The {fn ...} escape is not allowed inside a canonical procedure call",
+                    ));
+                }
+                let nested = translate_escapes_inner(body, inside_call, outputs, marker)?;
+                out.push('{');
+                out.push_str(&nested.sql);
+                out.push('}');
             }
             EscapeKind::Escape => {
                 push_translated(&mut out, &translate_escape_clause(remainder));
+                *marker += executable_marker_count(remainder);
             }
             EscapeKind::Interval => {
                 push_translated(&mut out, &translate_interval(body)?);
@@ -450,9 +480,16 @@ pub(crate) fn translate_escapes(sql: &str) -> Result<Translated, EscapeError> {
                 push_translated(&mut out, &translate_encrypt(remainder)?);
             }
             EscapeKind::Call { returns_status } => {
-                validate_nested(remainder, true)?;
-                let call = parse_call(remainder, returns_status)?;
-                push_translated(&mut out, &call_to_exec_text(&call));
+                if returns_status {
+                    *marker += 1;
+                }
+                let first_arg_marker = *marker;
+                let nested = translate_escapes_inner(remainder, true, outputs, marker)?;
+                let call = parse_call(&nested.sql, returns_status)?;
+                push_translated(
+                    &mut out,
+                    &call_to_exec_text_with_outputs(&call, outputs, first_arg_marker),
+                );
                 if escape_count == 1 {
                     only_call = Some(call);
                 }
@@ -463,6 +500,7 @@ pub(crate) fn translate_escapes(sql: &str) -> Result<Translated, EscapeError> {
 
     let tail = &sql[at..];
     out.push_str(tail);
+    *marker += executable_marker_count(tail);
     if !is_blank_or_separator(tail) {
         outside_is_blank = false;
     }
@@ -489,11 +527,25 @@ pub(crate) fn translate_and_rewrite(
     sql: &str,
     noscan: bool,
 ) -> Result<(String, usize, Option<CallSite>), EscapeError> {
+    translate_for_execution(sql, noscan, &[])
+}
+
+/// Renders bound output arguments at canonical call sites, then rewrites markers.
+///
+/// Flags use original executable marker ordinals, including return assignments.
+/// Missing flags mean input-only; return assignments never receive `OUTPUT`.
+/// SQLNativeSql deliberately uses the binding-independent `translate_escapes`.
+pub(crate) fn translate_for_execution(
+    sql: &str,
+    noscan: bool,
+    outputs: &[bool],
+) -> Result<(String, usize, Option<CallSite>), EscapeError> {
     if noscan {
         let (rewritten, count) = super::util::rewrite_param_markers(sql);
         return Ok((rewritten, count, None));
     }
-    let translated = translate_escapes(sql)?;
+    validate_nesting(sql)?;
+    let translated = translate_escapes_inner(sql, false, outputs, &mut 0)?;
     let (rewritten, count) = super::util::rewrite_param_markers(&translated.sql);
     Ok((rewritten, count, translated.call))
 }
@@ -621,6 +673,10 @@ pub(crate) fn describe_text(original_sql: &str) -> Result<(String, bool), Escape
 /// The argument list is comma-separated with no spaces, and the final separator
 /// becomes a space — msodbcsql overwrites it in place (`sqlcmisc.cpp:8560`).
 fn call_to_exec_text(call: &CallSite) -> String {
+    call_to_exec_text_with_outputs(call, &[], 0)
+}
+
+fn call_to_exec_text_with_outputs(call: &CallSite, outputs: &[bool], mut marker: usize) -> String {
     let mut text = String::from("EXEC ");
     if call.returns_status {
         text.push_str("?=");
@@ -632,7 +688,17 @@ fn call_to_exec_text(call: &CallSite) -> String {
             text.push(',');
         }
         match arg {
-            CallArg::Marker { text: t, .. } | CallArg::Text(t) => text.push_str(t),
+            CallArg::Marker { text: t, .. } => {
+                text.push_str(t);
+                if outputs.get(marker).copied().unwrap_or(false) {
+                    text.push_str(" OUTPUT");
+                }
+                marker += 1;
+            }
+            CallArg::Text(t) => {
+                text.push_str(t);
+                marker += executable_marker_count(t);
+            }
             CallArg::Default => text.push_str("DEFAULT"),
         }
     }
@@ -766,7 +832,15 @@ fn classify_call_arg(arg: &str) -> Result<CallArg, EscapeError> {
 pub(crate) fn validate_procedure_name(raw: &str) -> Result<String, EscapeError> {
     let invalid = || EscapeError::syntax(format!("Invalid procedure name '{raw}' in {{call ...}}"));
 
-    let (name, group) = match raw.split_once(';') {
+    let mut scan = CodeScan::new(raw);
+    let mut group_separator = None;
+    while let Some(step) = scan.next_step() {
+        if step.code && step.ch == ';' {
+            group_separator = Some(step.start);
+            break;
+        }
+    }
+    let (name, group) = match group_separator.map(|i| (&raw[..i], &raw[i + 1..])) {
         Some((name, group)) => {
             if group.is_empty() || !group.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(invalid());
@@ -1476,7 +1550,7 @@ mod tests {
         let t = translate_escapes("{? = call dbo.p(?, DEFAULT)}").unwrap();
         let call = t.call.unwrap();
         assert!(call.returns_status);
-        assert!(call.is_rpc_eligible());
+        assert!(!call.is_rpc_eligible());
     }
 
     /// Only a statement that is *nothing but* one canonical call can go over
@@ -1543,6 +1617,7 @@ mod tests {
     fn empty_argument_is_default() {
         let call = translate_escapes("{call p(?,,?)}").unwrap().call.unwrap();
         assert_eq!(call.args[1], CallArg::Default);
+        assert!(!call.is_rpc_eligible());
         assert_eq!(tr("{call p(?,,?)}"), " EXEC p ?,DEFAULT,?  ");
     }
 
@@ -1592,6 +1667,10 @@ mod tests {
             "#temp_proc",
             "p;2",
             "[weird]]name]",
+            "[p;q]",
+            "[p;q];2",
+            "\"p;q\";2",
+            "[p]];q];2",
         ] {
             assert!(
                 validate_procedure_name(name).is_ok(),
@@ -1619,6 +1698,10 @@ mod tests {
             "a.b.c.d.e",
             "[unclosed",
             "p+q",
+            "[p;q];",
+            "[p;q];2x",
+            "[p;q];2;3",
+            "\"p;q\";DROP TABLE t",
         ] {
             assert!(
                 validate_procedure_name(name).is_err(),
@@ -1730,11 +1813,13 @@ mod tests {
             "{interval '1' DAY",
             "{ }",
             "select 1 -- {fn x}\n{fn UCASE('a')}",
+            "SELECT {encrypt N'?'}, ?",
+            "SELECT {fn CONCAT({encrypt N'?'},?)}, '?'",
         ] {
-            let markers = input.matches('?').count();
+            let markers = executable_marker_count(input);
             if let Ok(t) = translate_escapes(input) {
                 assert_eq!(
-                    t.sql.matches('?').count(),
+                    executable_marker_count(&t.sql),
                     markers,
                     "marker count changed for {input:?} -> {:?}",
                     t.sql
@@ -1757,6 +1842,99 @@ mod tests {
         let t = translate_escapes("").unwrap();
         assert_eq!(t.sql, "");
         assert!(t.call.is_none());
+    }
+
+    #[test]
+    fn native_escapes_translate_nested_nonnative_escapes() {
+        assert_eq!(
+            tr("SELECT {fn CONCAT({interval '1' DAY},'x')}"),
+            "SELECT {fn CONCAT( 'INTERVAL +''1'' DAY(2)' ,'x')}"
+        );
+        assert_eq!(
+            tr("SELECT {fn CONCAT({fn CONCAT({encrypt N'?'},?)},'x')}"),
+            "SELECT {fn CONCAT({fn CONCAT( 0x56A5 ,?)},'x')}"
+        );
+        assert_eq!(
+            tr("{call p({interval '1' DAY},?)}"),
+            " EXEC p 'INTERVAL +''1'' DAY(2)',?  "
+        );
+    }
+
+    #[test]
+    fn execution_renderer_annotates_only_call_argument_markers() {
+        let input = "SELECT ?, '?'; {? = call [p;q](?, @b = ?, DEFAULT, 'x?')} ; {call q(?)}";
+        let (sql, count, call) =
+            translate_for_execution(input, false, &[true, true, false, true, true]).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT @P1, '?';  EXEC @P2=[p;q] @P3,@b = @P4 OUTPUT,DEFAULT,'x?'   ;  EXEC q @P5 OUTPUT  "
+        );
+        assert_eq!(count, 5);
+        assert!(call.is_none());
+        assert!(!translate_escapes(input).unwrap().sql.contains("OUTPUT"));
+
+        let input = "{? = call p(?,?)}";
+        let (sql, count, call) = translate_for_execution(input, false, &[true, true]).unwrap();
+        assert_eq!(sql, " EXEC @P1=p @P2 OUTPUT,@P3  ");
+        assert_eq!(count, 3);
+        assert!(call.unwrap().returns_status);
+        assert_eq!(
+            translate_for_execution(input, true, &[true; 3]).unwrap(),
+            translate_and_rewrite(input, true).unwrap()
+        );
+        let (sql, count, _) = translate_for_execution(
+            "SELECT {encrypt N'?'}; {call p({ts '?'},?)}",
+            false,
+            &[true],
+        )
+        .unwrap();
+        assert_eq!(sql, "SELECT  0x56A5 ;  EXEC p {ts '?'},@P1 OUTPUT  ");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn excessive_escape_nesting_is_rejected_in_subprocess() {
+        const CHILD: &str = "MSSQLODBC_ESCAPE_NESTING_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            for prefix in ["{fn ", "{call p(", "{oj "] {
+                let suffix = if prefix == "{call p(" { ")}" } else { "}" };
+                let sql = format!("{}?{}", prefix.repeat(10_000), suffix.repeat(10_000));
+                assert_eq!(translate_escapes(&sql).unwrap_err().state(), SQLSTATE_42000);
+                assert_eq!(
+                    translate_for_execution(&sql, false, &[true])
+                        .unwrap_err()
+                        .state(),
+                    SQLSTATE_42000
+                );
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api::escape::tests::excessive_escape_nesting_is_rejected_in_subprocess",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn escape_nesting_limit_counts_only_executable_braces() {
+        let at_limit = format!("{}?{}", "{fn ".repeat(64), "}".repeat(64));
+        assert_eq!(tr(&at_limit), at_limit);
+        let over_limit = format!("{{fn {at_limit}}}");
+        assert_eq!(err(&over_limit).state(), SQLSTATE_42000);
+        assert!(translate_and_rewrite(&over_limit, true).is_ok());
+        let quoted = format!("SELECT '{}', /* {} */ ?", "{".repeat(100), "{".repeat(100));
+        assert_eq!(tr(&quoted), quoted);
     }
 
     /// An escape with no body after the keyword is legal for {escape} and for

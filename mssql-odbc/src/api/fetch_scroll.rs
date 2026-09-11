@@ -350,7 +350,7 @@ impl RowIssue {
 
 /// The per-row outcome recorded in the row status array.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RowOutcome {
+pub(crate) enum RowOutcome {
     Success,
     Info(RowIssue),
     Error(RowIssue),
@@ -2176,22 +2176,15 @@ unsafe fn deliver_encoded_string(
 ///
 /// Used for procedure output parameters, which are the same conversion problem
 /// as a fetched column but arrive on a RETURNVALUE token instead of a row.
-/// Returns whether the value was truncated.
+/// Preserves the conversion's warning or error, including its SQLSTATE.
 ///
 /// # Safety
 /// `binding`'s buffers must be valid for one element.
 pub(crate) unsafe fn deliver_bound_value(
     binding: &ColumnBinding,
     value: &ColumnValues,
-) -> Result<bool, RowIssue> {
-    match unsafe { deliver_bound(binding, 0, 0, value) } {
-        RowOutcome::Success => Ok(false),
-        RowOutcome::Info(issue) => Ok(matches!(
-            issue,
-            RowIssue::StringTruncated | RowIssue::FractionalTruncated
-        )),
-        RowOutcome::Error(issue) => Err(issue),
-    }
+) -> RowOutcome {
+    unsafe { deliver_bound(binding, 0, 0, value) }
 }
 
 /// Writes one column value into its bound buffer slot for row `row_index`.

@@ -25,6 +25,7 @@ use mssql_tds::encoding_rs;
 use mssql_tds::encoding_rs::Decoder;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
 use mssql_tds::query::metadata::{ColumnMetadata, PlpEncoding};
+use mssql_tds::query::result::ReturnValue;
 use mssql_tds::token::tokens::SqlCollation;
 
 /// State for a PLP column being streamed across repeated SQLGetData calls.
@@ -434,6 +435,9 @@ pub(crate) struct StmtState {
     /// Cleared by [`StmtState::clear_exhaustion_state`] alongside
     /// `batch_exhausted`.
     pub(crate) pending_fetch_info: Vec<SqlInfoMessage>,
+    /// Owned before the drained client can be reused by another statement.
+    /// Delivered once by SQLMoreResults using the bindings current at that call.
+    pub(crate) pending_output_params: Option<(Vec<ReturnValue>, Option<i32>)>,
     /// The prepared statement (rewritten SQL + server handle once materialized)
     /// stored by `SQLPrepare`, bundled with its `@P1..@Pn` marker count so the
     /// two can only be set together. The server-side prepare is deferred to
@@ -543,13 +547,9 @@ pub(crate) struct StmtState {
     /// for every `execute*` call, so a non-zero value bounds the wait and
     /// surfaces `HYT00` on expiry, matching msodbcsql.
     pub(crate) query_timeout: u32,
-    /// True when the statement being executed is the `{? = call ...}` form, so
-    /// its first bound parameter carries the procedure's return status rather
-    /// than an argument value.
-    ///
-    /// msodbcsql forces that parameter to OUTPUT and errors if the application
-    /// bound it as input (`sqlcmisc.cpp:8310`), so the direction the
-    /// application chose does not identify it -- the statement text does.
+    /// True only for a direct procedure RPC whose first binding consumes
+    /// RETURNSTATUS. Text/prepared calls receive their return binding through
+    /// a named RETURNVALUE instead of the wrapper RPC's status.
     pub(crate) call_returns_status: bool,
     /// `SQL_ATTR_MAX_ROWS`: cap on the number of rows returned from each result
     /// set; `0` (the ODBC default) means no cap.
@@ -1288,6 +1288,7 @@ impl StmtState {
         self.batch_exhausted = false;
         self.pending_fetch_error = None;
         self.pending_fetch_info.clear();
+        self.pending_output_params = None;
     }
 
     /// The statement's currently *effective* ARD: the explicit descriptor
@@ -1508,6 +1509,7 @@ impl StmtHandle {
                 batch_exhausted: false,
                 pending_fetch_error: None,
                 pending_fetch_info: Vec::new(),
+                pending_output_params: None,
                 prepared: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),

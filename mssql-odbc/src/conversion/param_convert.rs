@@ -160,15 +160,33 @@ pub(crate) fn reserve_dae_buffer(
 
 /// True for the ODBC directions whose value the server has to send back.
 ///
-/// `SQL_PARAM_INPUT_OUTPUT` and `SQL_PARAM_OUTPUT` are both `OUTPUT` on the
-/// wire; msodbcsql likewise promotes a plain `SQL_PARAM_OUTPUT` inside a
-/// canonical call to input-output (`sqlcmisc.cpp:8455`). The `{? = call ...}`
-/// return status is not an RPC parameter at all and never reaches here.
+/// A text-route return assignment is an output variable; direct RPC return
+/// status is omitted from the argument list by the execution router.
 pub(crate) fn is_output_direction(input_output_type: SqlSmallInt) -> bool {
     matches!(
         input_output_type,
-        crate::api::odbc_types::SQL_PARAM_OUTPUT | crate::api::odbc_types::SQL_PARAM_INPUT_OUTPUT
+        crate::api::odbc_types::SQL_PARAM_INPUT_OUTPUT
+    ) || is_output_only(input_output_type)
+}
+
+pub(crate) fn is_output_only(input_output_type: SqlSmallInt) -> bool {
+    matches!(
+        input_output_type,
+        crate::api::odbc_types::SQL_PARAM_OUTPUT | crate::api::odbc_types::SQL_RETURN_VALUE
     )
+}
+
+/// Output-only length buffers are destinations, never input indicators.
+///
+/// # Safety
+/// For an input or input/output binding, each non-null octet-length pointer
+/// must be readable for one `SqlLen`.
+pub(crate) unsafe fn data_at_exec_indicator(param: &BoundParam) -> Option<SqlLen> {
+    if is_output_only(param.input_output_type) || param.octet_length_ptr.is_null() {
+        return None;
+    }
+    let indicator = unsafe { param.octet_length_ptr.read_unaligned() };
+    is_data_at_exec_indicator(indicator).then_some(indicator)
 }
 
 /// Converts a bound parameter into an RPC parameter, optionally named
@@ -210,11 +228,16 @@ pub(crate) unsafe fn bound_param_to_value(
 }
 
 /// # Safety
-/// The value buffer must be readable for the indicated length. Each non-null
-/// indicator pointer must point to a valid `SqlLen`.
+/// Input and input/output value buffers must be readable for the indicated
+/// length, and their non-null indicator pointers must address an initialized
+/// `SqlLen`. Output-only buffers are not read.
 unsafe fn bound_param_to_value_with_outcome(
     param: &BoundParam,
 ) -> Result<(TypedValue, ConvOk), ParamBuildError> {
+    if is_output_only(param.input_output_type) {
+        return typed_null(param.sql_type, param.column_size, param.decimal_digits)
+            .map(|value| (value, ConvOk::Exact));
+    }
     // NULL is settled from the indicator alone, so a typed NULL never reads the
     // value buffer.
     let len_spec = match unsafe { read_indicator(param) }? {
@@ -5579,6 +5602,58 @@ mod tests {
         p.sql_type = SQL_VARCHAR;
         let (value, _) = unsafe { bound_param_to_value(&p) }.unwrap();
         assert!(matches!(value, SqlType::VarcharMax(None)));
+    }
+
+    #[test]
+    fn output_only_does_not_read_uninitialized_buffers() {
+        use crate::api::odbc_types::{SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
+        for direction in [SQL_PARAM_OUTPUT, SQL_RETURN_VALUE] {
+            let mut value = std::mem::MaybeUninit::<[u8; 8]>::uninit();
+            let mut indicator = std::mem::MaybeUninit::<SqlLen>::uninit();
+            let mut p = param(
+                SQL_C_CHAR,
+                value.as_mut_ptr().cast(),
+                indicator.as_mut_ptr(),
+            );
+            p.input_output_type = direction;
+            p.sql_type = SQL_VARCHAR;
+            p.column_size = 8;
+            p.buffer_length = 8;
+            assert!(unsafe { data_at_exec_indicator(&p) }.is_none());
+            let (_, outcome) = unsafe { bound_param_to_rpc(Some("@P1".into()), &p) }.unwrap();
+            assert_eq!(outcome, ConvOk::Exact);
+            assert!(matches!(
+                unsafe { bound_param_to_value(&p) }.unwrap().0,
+                SqlType::Varchar(None, 8)
+            ));
+        }
+    }
+
+    #[test]
+    fn output_only_ignores_length_contents_and_retains_null_metadata() {
+        use crate::api::odbc_types::SQL_PARAM_OUTPUT;
+        for length in [SQL_NTS as SqlLen, SQL_DATA_AT_EXEC, SQL_NO_TOTAL, 99] {
+            let mut indicator = length;
+            let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), &mut indicator);
+            p.input_output_type = SQL_PARAM_OUTPUT;
+            p.sql_type = SQL_DECIMAL;
+            p.column_size = 12;
+            p.decimal_digits = 3;
+            assert!(unsafe { data_at_exec_indicator(&p) }.is_none());
+            let ((value, metadata), outcome) =
+                unsafe { bound_param_to_value_with_outcome(&p) }.unwrap();
+            assert!(matches!(value, SqlType::Decimal(None)));
+            assert_eq!(metadata.unwrap().precision, Some(12));
+            assert_eq!(metadata.unwrap().scale, Some(3));
+            assert_eq!(outcome, ConvOk::Exact);
+        }
+        let mut p = param(SQL_C_CHAR, std::ptr::null_mut(), std::ptr::null_mut());
+        p.input_output_type = SQL_PARAM_OUTPUT;
+        p.sql_type = SQL_VARCHAR;
+        assert!(matches!(
+            unsafe { bound_param_to_value(&p) }.unwrap().0,
+            SqlType::VarcharMax(None)
+        ));
     }
 
     /// `SQL_C_SS_VECTOR` is a real ODBC C type with no matrix row yet
