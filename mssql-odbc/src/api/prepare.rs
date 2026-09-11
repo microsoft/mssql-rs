@@ -121,7 +121,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // A prior prepared handle is orphaned for release at the next execute.
     // Markers are rewritten to `@P1..@Pn` once here so `SQLExecute` re-prepares
     // (after a reconnect) without re-scanning the SQL.
-    let (rewritten_sql, marker_count, call) =
+    let (rewritten_sql, marker_count, _) =
         match translate_and_rewrite(&sql, stmt_state.inert_attrs.noscan()) {
             Ok(parts) => parts,
             Err(e) => {
@@ -135,7 +135,6 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
         stmt: PreparedStatement::new(rewritten_sql),
         marker_count,
         original_sql: sql,
-        call,
     });
     stmt_state.parameter_metadata.clear();
     stmt_state.clear_result_metadata();
@@ -201,7 +200,6 @@ mod tests {
                 ),
                 marker_count: 0,
                 original_sql: String::new(),
-                call: None,
             });
             state.set_state(STMT_STATE_PREPARED);
             state.parameter_metadata.push(ParameterDescription {

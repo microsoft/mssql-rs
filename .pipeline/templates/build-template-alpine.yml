@@ -37,16 +37,21 @@ steps:
       -v "$PWD:/workspace" \
       -e "ARCHIVE_NAME=tdslib-nextest-musl.tar.zst" \
       ${{ parameters.alpineimagetag }} /workspace/scripts/dockerentry/alpine-build.sh
-    cp tdslib-nextest-musl.tar.zst $(Build.ArtifactStagingDirectory)
   displayName: Rust Alpine container build
   condition: succeeded()
   env:
     CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
     CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
 
+# Only non-PR distro-matrix and full Kerberos tests consume this drop.
+- script: |
+    cp tdslib-nextest-musl.tar.zst "$(Build.ArtifactStagingDirectory)/"
+  displayName: Copy musl nextest archive
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
 
 - task: PublishBuildArtifacts@1
   displayName: Publish Build Drop
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
   inputs:
     PathtoPublish: '$(Build.ArtifactStagingDirectory)'
     ArtifactName: $(System.PhaseName)

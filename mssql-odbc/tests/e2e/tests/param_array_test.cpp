@@ -39,7 +39,7 @@
 //  14b. ExecDirectArrayWithNoMarkersIsRefused     - same refusal, no markers
 //  15.  ArrayRollsBackWithTheTransaction          - manual-commit semantics
 //  16.  ArrayCommitsEveryRowUnderAutocommit       - partial-failure durability
-//       (17 was removed: it asserted nothing the other cases did not)
+//  17.  SelectArrayPreservesEmptyAndNullResults   - one result per set
 //  18.  ArrayWithZeroBufferLengthAliasesOneValue  - inherited msodbcsql quirk
 //  19.  DataAtExecutionWithArrayIsRefused         - documented divergence
 //  20.  QueryTimeoutBoundsTheWholeArray           - one budget for all sets
@@ -47,16 +47,24 @@
 //  22.  RowWiseArrayWalksMixedTypeStructures      - msodbcsql RowStruct shape
 //  23.  ParamsProcessedCountsTheFailingSet        - msodbcsql Variation_76
 //  24.  RowWiseArrayHonorsIgnoreForSkippedSets    - row-wise x SQL_PARAM_IGNORE
-//  25.  RowReturningArrayOnThePreparedPath        - divergence: AB#47944
+//  25.  RowReturningArrayOnThePreparedPath        - OUTPUT rows: AB#47944
 //  26.  ConversionFailureIsReportedPerSetWhereverItSits - divergence: AB#47945
 //  26b. EverySetFailingToConvertIsError          - total client-side failure
 //  27.  AnInfoMessageDegradesTheBatchOnBothDrivers - info-token parity
 //  28.  ArrayOfAThousandSetsWritesEveryRowInOrder  - depth: packing, drain, order
 //  29.  ThousandSetArrayCorrelatesFailuresToTheirOwnSets - boundary sets 0/499/999
 //  30.  CursorApiAfterARowReturningArrayExecute    - AB#47944 as the app sees it
+//  30b. PendingArrayResultKeepsConnectionBusy     - unread sets retain the wire
+//  30c. ClosingArrayCursorReleasesConnection      - close drains unread sets
 //  31.  PreparedStatementReExecutesAtDifferentArraySizes - 4 -> 7 -> 2
 //  32.  TimestampoffsetArrayStridesByItsStructSize - fixed struct, not BufferLength
 //  32b. Time2ArrayStridesByItsStructSize          - the sibling C type
+//  33.  ProcedureArrayDeliversEveryResultSet      - two rowsets per set
+//  34.  RowReturningArraySkipsIgnoredSets         - no phantom results
+//  35.  RowReturningArrayContinuesAfterASetError  - errors remain per set
+//  36.  RowReturningArrayWithoutStatusReportsErrors - no lost next rowset
+//  37.  RowReturningArrayDrainsPartialLobOnAdvance - streaming cleanup
+//  38.  RowReturningArrayTimeoutDuringNavigation - cancel and reuse
 
 #include "odbc_test_fixture.h"
 
@@ -188,6 +196,30 @@ protected:
             SQLExecDirect(probe, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS),
             SQL_HANDLE_STMT, probe);
         FreeStmt(probe);
+    }
+
+    void BindIntArray(SQLINTEGER* values, SQLLEN* indicators, SQLULEN count,
+                      SQLUSMALLINT* status = nullptr, SQLULEN* processed = nullptr) {
+        ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                       SQL_INTEGER, 10, 0, values, 0, indicators),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_PARAMSET_SIZE, count));
+        ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status));
+        ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, processed));
+    }
+
+    void FetchIntResult(SQLINTEGER expected) {
+        SQLSMALLINT columns = -1;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        ASSERT_EQ(1, columns);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER value = -1;
+        SQLLEN length = -1;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &length),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(expected, value);
+        EXPECT_EQ(static_cast<SQLLEN>(sizeof(value)), length);
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
     }
 };
 
@@ -1013,6 +1045,37 @@ TEST_F(ParamArrayTest, ArrayCommitsEveryRowUnderAutocommit) {
     EXPECT_EQ(2, ScalarInt("SELECT COUNT(*) FROM #pa"));
 }
 
+TEST_F(ParamArrayTest, SelectArrayPreservesEmptyAndNullResults) {
+    Prepare("SELECT value FROM (VALUES (CAST(? AS int))) AS source(value) "
+            "WHERE value IS NULL OR value > 0");
+    SQLINTEGER values[3] = {0, 7, 9};
+    SQLLEN indicators[3] = {0, SQL_NULL_DATA, 0};
+    SQLUSMALLINT status[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+    SQLULEN processed = 0;
+    BindIntArray(values, indicators, 3, status, &processed);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+
+    SQLSMALLINT columns = -1;
+    ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, columns);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    SQLINTEGER value = -1;
+    SQLLEN length = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NULL_DATA, length);
+    EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(9);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(3u, processed);
+    for (const auto item : status) {
+        EXPECT_EQ(SQL_PARAM_SUCCESS, item);
+    }
+}
+
 // -------------------------------------------------------------------
 // 19. DIVERGENCE (mssql-odbc only): data-at-execution needs
 // SQLParamData/SQLPutData to drive one set at a time, which cannot be
@@ -1378,15 +1441,10 @@ TEST_F(ParamArrayTest, RowWiseArrayHonorsIgnoreForSkippedSets) {
 // back the id it just wrote - so three runs produce three result sets,
 // while ODBC exposes only one current result set per statement handle.
 //
-// Both drivers run every set, so no set is silently skipped. mssql-odbc
-// discards the OUTPUT rows and reports each set SQL_PARAM_SUCCESS_WITH_INFO
-// with a 01000 warning; delivering the rows is AB#47944. Measured on
-// msodbcsql 18.6.2.1: SQL_SUCCESS, the status array never written, and
-// *PARAMS_PROCESSED_PTR left at the scalar value 1 despite three sets
-// running - hence the skip rather than a shared assertion.
+// Retail msodbcsql 18.6.2.1 (SQL_DRIVER_VER 18.06.0002) delivers all
+// three result sets. Bookkeeping is deferred until navigation completes.
 // -------------------------------------------------------------------
 TEST_F(ParamArrayTest, RowReturningArrayOnThePreparedPath) {
-    SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("CREATE TABLE #pa_out2 (id int)");
     Prepare("INSERT INTO #pa_out2 (id) OUTPUT inserted.id VALUES (?)");
 
@@ -1404,21 +1462,24 @@ TEST_F(ParamArrayTest, RowReturningArrayOnThePreparedPath) {
     const SQLRETURN rc = SQLExecute(stmt_);
     // Any later call on this handle clears its diagnostics, so read them first.
     const std::string diag = ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
-    SQLFreeStmt(stmt_, SQL_CLOSE);
+    ASSERT_EQ(SQL_SUCCESS, rc);
+    EXPECT_TRUE(diag.empty());
+    for (int expected = 1; expected <= 3; ++expected) {
+        FetchIntResult(expected);
+        if (expected < 3) {
+            ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+        }
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    EXPECT_EQ(3u, processed);
+    for (const auto item : status) {
+        EXPECT_EQ(SQL_PARAM_SUCCESS, item);
+    }
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
 
-    // Every set ran, and the connection survives the discarded result sets.
     EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa_out2"));
     EXPECT_EQ(1, ScalarInt("SELECT 1"));
-
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
-    EXPECT_EQ(3u, processed);
-    // The set ran - its row is in the table asserted above - so it is a success
-    // carrying a 01000 warning that the OUTPUT rows were discarded. Reporting
-    // SQL_PARAM_ERROR would invite a retry that double-inserts.
-    EXPECT_EQ(SQL_PARAM_SUCCESS_WITH_INFO, status[0]);
-    EXPECT_EQ(SQL_PARAM_SUCCESS_WITH_INFO, status[1]);
-    EXPECT_EQ(SQL_PARAM_SUCCESS_WITH_INFO, status[2]);
-    EXPECT_EQ("01000", diag);
 }
 
 // -------------------------------------------------------------------
@@ -1720,18 +1781,10 @@ TEST_F(ParamArrayTest, ThousandSetArrayCorrelatesFailuresToTheirOwnSets) {
 }
 
 // -------------------------------------------------------------------
-// 30. What an application actually sees on the cursor API after a
-// row-returning array execute. Case 25 asserts the statuses and that the
-// connection survives, but nothing in this suite touches
-// SQLNumResultCols / SQLFetch / SQLMoreResults afterwards - which is the
-// app-visible shape of the AB#47944 divergence.
-//
-// Pins measured behaviour rather than a desired contract: mssql-odbc
-// discards the OUTPUT rows, so the handle carries no result set and the
-// cursor calls report exactly that.
+// 30. SQLMoreResults skips unread rows, and closing before the final
+// result releases the connection without executing any parameter set twice.
 // -------------------------------------------------------------------
 TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
-    SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("CREATE TABLE #pa_out3 (id int)");
     Prepare("INSERT INTO #pa_out3 (id) OUTPUT inserted.id VALUES (?)");
 
@@ -1746,36 +1799,236 @@ TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
     ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_STATUS_PTR, status));
     ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAMS_PROCESSED_PTR, &processed));
 
-    ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
-
-    SQLSMALLINT columns = -1;
-    const SQLRETURN cols_rc = SQLNumResultCols(stmt_, &columns);
-    const std::string cols_diag =
-        ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
-
-    const SQLRETURN fetch_rc = SQLFetch(stmt_);
-    const std::string fetch_diag =
-        ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
-
-    const SQLRETURN more_rc = SQLMoreResults(stmt_);
-    const std::string more_diag =
-        ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_);
-
-    SQLFreeStmt(stmt_, SQL_CLOSE);
-
-    // The OUTPUT rows were discarded, so the handle has no result set left.
-    EXPECT_EQ(SQL_SUCCESS, cols_rc);
-    EXPECT_EQ(0, columns) << "no result set is current after the array execute";
-    EXPECT_TRUE(cols_diag.empty()) << "unexpected diagnostic: " << cols_diag;
-
-    EXPECT_EQ(SQL_ERROR, fetch_rc) << "there is no cursor to fetch from";
-    EXPECT_EQ("24000", fetch_diag);
-
-    EXPECT_EQ(SQL_NO_DATA, more_rc) << "no further result sets are queued";
-    EXPECT_TRUE(more_diag.empty()) << "unexpected diagnostic: " << more_diag;
-
-    // The statement is still usable and every set really ran.
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(2);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(3, ScalarInt("SELECT COUNT(*) FROM #pa_out3"));
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(6, ScalarInt("SELECT COUNT(*) FROM #pa_out3"));
+}
+
+TEST_F(ParamArrayTest, PendingArrayResultKeepsConnectionBusy) {
+    Prepare("SELECT CAST(? AS int)");
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    BindIntArray(values, indicators, 2);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+
+    SQLHSTMT probe = AllocStmt();
+    SqlTString select = ODBCTestUtils::ToSqlTStr("SELECT 20");
+    EXPECT_EQ(SQL_ERROR,
+              SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, probe, "HY000");
+
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(2);
+    ASSERT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    ASSERT_SQL_OK(
+        SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS),
+        SQL_HANDLE_STMT, probe);
+    FreeStmt(probe);
+}
+
+TEST_F(ParamArrayTest, ClosingArrayCursorReleasesConnection) {
+    Prepare("SELECT CAST(? AS int)");
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    BindIntArray(values, indicators, 2);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+
+    SQLHSTMT probe = AllocStmt();
+    SqlTString select = ODBCTestUtils::ToSqlTStr("SELECT 20");
+    EXPECT_EQ(SQL_ERROR,
+              SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, probe, "HY000");
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS),
+        SQL_HANDLE_STMT, probe);
+    FreeStmt(probe);
+}
+
+TEST_F(ParamArrayTest, ProcedureArrayDeliversEveryResultSet) {
+    ExecDirect("CREATE PROCEDURE #pa_results @value int AS "
+               "BEGIN SET NOCOUNT ON; SELECT @value; SELECT @value + 10; END");
+    Prepare("EXEC #pa_results ?");
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLUSMALLINT status[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+    SQLULEN processed = 0;
+    BindIntArray(values, indicators, 3, status, &processed);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    for (int parameter_set = 1; parameter_set <= 3; ++parameter_set) {
+        FetchIntResult(parameter_set);
+        ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+        FetchIntResult(parameter_set + 10);
+        EXPECT_EQ(parameter_set == 3 ? SQL_NO_DATA : SQL_SUCCESS, SQLMoreResults(stmt_));
+    }
+    EXPECT_EQ(3u, processed);
+    for (const auto item : status) {
+        EXPECT_EQ(SQL_PARAM_SUCCESS, item);
+    }
+}
+
+TEST_F(ParamArrayTest, PriorArrayInfoDoesNotWarnAgainDuringNavigationOrClose) {
+    Prepare("DECLARE @value int = ?; IF @value = 1 PRINT 'first set info'; SELECT @value");
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLUSMALLINT status[3] = {};
+    SQLULEN processed = 0;
+    BindIntArray(values, indicators, 3, status, &processed);
+
+    for (const bool close_early : {false, true}) {
+        SCOPED_TRACE(close_early ? "close" : "navigate");
+        ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLExecute(stmt_));
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01000");
+        FetchIntResult(1);
+        if (close_early) {
+            EXPECT_EQ(SQL_SUCCESS, SQLCloseCursor(stmt_));
+            EXPECT_TRUE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+        } else {
+            for (int expected = 2; expected <= 3; ++expected) {
+                ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+                EXPECT_TRUE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+                FetchIntResult(expected);
+            }
+            EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+            EXPECT_TRUE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+            EXPECT_EQ(3u, processed);
+        }
+    }
+}
+
+TEST_F(ParamArrayTest, RowReturningArraySkipsIgnoredSets) {
+    Prepare("SELECT CAST(? AS int)");
+    SQLINTEGER values[4] = {1, 2, 3, 4};
+    SQLLEN indicators[4] = {};
+    SQLUSMALLINT operations[4] = {SQL_PARAM_PROCEED, SQL_PARAM_IGNORE,
+                                 SQL_PARAM_PROCEED, SQL_PARAM_IGNORE};
+    BindIntArray(values, indicators, 4);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtPtr(SQL_ATTR_PARAM_OPERATION_PTR, operations));
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(3);
+    EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+}
+
+TEST_F(ParamArrayTest, RowReturningArrayContinuesAfterASetError) {
+    Prepare("DECLARE @value int = ?; IF @value = 2 "
+            "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    SQLUSMALLINT status[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+    SQLULEN processed = 0;
+    BindIntArray(values, indicators, 3, status, &processed);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+    SQLRETURN rc = SQLMoreResults(stmt_);
+    bool saw_error = false;
+    bool saw_last_result = false;
+    for (int boundary = 0; boundary < 8 && rc != SQL_NO_DATA; ++boundary) {
+        ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+        if (rc == SQL_SUCCESS_WITH_INFO) {
+            saw_error = true;
+            EXPECT_FALSE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+        }
+        SQLSMALLINT columns = -1;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        if (columns > 0) {
+            EXPECT_FALSE(saw_last_result);
+            FetchIntResult(3);
+            saw_last_result = true;
+        }
+        rc = SQLMoreResults(stmt_);
+    }
+    EXPECT_EQ(SQL_NO_DATA, rc);
+    EXPECT_TRUE(saw_error);
+    EXPECT_TRUE(saw_last_result);
+    EXPECT_EQ(3u, processed);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_PARAM_ERROR, status[1]);
+    EXPECT_EQ(SQL_PARAM_SUCCESS, status[2]);
+    EXPECT_EQ(1, ScalarInt("SELECT 1"));
+}
+
+TEST_F(ParamArrayTest, RowReturningArrayWithoutStatusReportsErrors) {
+    Prepare("DECLARE @value int = ?; IF @value = 2 "
+            "RAISERROR ('parameter set rejected', 16, 1); ELSE SELECT @value");
+    SQLINTEGER values[3] = {1, 2, 3};
+    SQLLEN indicators[3] = {};
+    BindIntArray(values, indicators, 3);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+    SQLRETURN rc = SQLMoreResults(stmt_);
+    bool saw_error = false;
+    bool saw_last_result = false;
+    for (int boundary = 0; boundary < 8 && rc != SQL_NO_DATA; ++boundary) {
+        ASSERT_TRUE(SQL_SUCCEEDED(rc) || rc == SQL_ERROR);
+        if (rc == SQL_ERROR) {
+            saw_error = true;
+            EXPECT_FALSE(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_).empty());
+        }
+        SQLSMALLINT columns = -1;
+        ASSERT_SQL_OK(SQLNumResultCols(stmt_, &columns), SQL_HANDLE_STMT, stmt_);
+        if (columns > 0) {
+            EXPECT_FALSE(saw_last_result);
+            FetchIntResult(3);
+            saw_last_result = true;
+        }
+        rc = SQLMoreResults(stmt_);
+    }
+    EXPECT_EQ(SQL_NO_DATA, rc);
+    EXPECT_TRUE(saw_error);
+    EXPECT_TRUE(saw_last_result);
+    EXPECT_EQ(1, ScalarInt("SELECT 1"));
+}
+
+TEST_F(ParamArrayTest, RowReturningArrayDrainsPartialLobOnAdvance) {
+    Prepare("SELECT CAST(? AS int), REPLICATE(CAST('x' AS varchar(max)), 1048576)");
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    BindIntArray(values, indicators, 2);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    char prefix[16] = {};
+    SQLLEN length = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO,
+              SQLGetData(stmt_, 2, SQL_C_CHAR, prefix, sizeof(prefix), &length));
+    ASSERT_GT(std::strlen(prefix), 0u);
+    EXPECT_EQ(std::string(std::strlen(prefix), 'x'), std::string(prefix));
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    ASSERT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), &length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2, value);
+    ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, ScalarInt("SELECT 1"));
+}
+
+TEST_F(ParamArrayTest, RowReturningArrayTimeoutDuringNavigation) {
+    Prepare("SELECT CAST(? AS int); "
+            "RAISERROR ('result available', 0, 1) WITH NOWAIT; "
+            "WAITFOR DELAY '00:00:04'");
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    SQLUSMALLINT status[2] = {0xFFFF, 0xFFFF};
+    SQLULEN processed = 0;
+    BindIntArray(values, indicators, 2, status, &processed);
+    ASSERT_EQ(SQL_SUCCESS, SetStmtULen(SQL_ATTR_QUERY_TIMEOUT, 2));
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    FetchIntResult(1);
+    EXPECT_EQ(SQL_ERROR, SQLMoreResults(stmt_));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYT00");
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1, ScalarInt("SELECT 1"));
 }
 
 // -------------------------------------------------------------------

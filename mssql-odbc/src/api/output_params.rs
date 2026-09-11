@@ -121,6 +121,10 @@ pub(crate) unsafe fn write_back_output_params(
 /// through exactly the same conversion, indicator and truncation handling that
 /// bound columns use on the fetch path; an output parameter is the same problem
 /// as a fetched column, only reached from a different token.
+///
+/// # Safety
+/// The parameter's value, indicator, and octet-length buffers must be writable
+/// for one element according to its bound C type and buffer length.
 unsafe fn write_value(param: &BoundParam, value: &ColumnValues) -> Result<bool, RowIssue> {
     let binding = ColumnBinding {
         column_number: 1,

@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import io
 import itertools
 import json
 import re
 import shutil
 import subprocess
+import tarfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -74,6 +77,9 @@ def expand(value, parameters):
                 result.append(expanded)
         return result
     if isinstance(value, dict):
+        if value.get("template") == "/.pipeline/templates/validate-release-crates.yml@self":
+            template = _ROOT / value["template"].removeprefix("/").removesuffix("@self")
+            return expand(yaml.safe_load(template.read_text(encoding="utf-8"))["steps"], parameters)
         result = {}
         matched = False
         for key, item in value.items():
@@ -103,6 +109,17 @@ def test_release_defaults_are_safe():
     assert pipeline["trigger"] == "none"
     assert pipeline["pr"] == "none"
     assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
+
+
+def test_crate_templates_resolve_in_self_repository():
+    # StageList steps are expanded inside GovernedTemplates, so relative paths
+    # without @self can resolve against the wrong repository.
+    templates = re.findall(
+        r"^\s*-\s*template:\s*(.*validate-release-crates.*)$",
+        _PIPELINE.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
 
 
 @pytest.mark.parametrize(
@@ -179,12 +196,29 @@ def test_release_switch_graph(values):
     nuget, core, mock, dry_run, tag = values
     for stage in stages.values():
         for job in stage["jobs"]:
-            assert not any("checkout" in step or "target" in step for step in job["steps"])
+            custom = job["pool"].get("isCustom", False)
+            assert not any("target" in step for step in job["steps"])
+            assert sum("checkout" in step for step in job["steps"]) == int(custom)
+            if custom:
+                assert stage["stage"] == "ReleaseCrates"
+                assert job["pool"] == {
+                    "type": "windows", "isCustom": True,
+                    "name": "Azure Pipelines", "vmImage": "windows-2022",
+                }
+                assert "ESRP Federated" not in str(job)
+                assert not any(step.get("task") in ("EsrpRelease@12", "NuGetCommand@2")
+                               for step in job["steps"])
+            else:
+                assert "test-cratesio-package.ps1" not in str(job)
+            assert "continueOnError" not in job
+            assert all("continueOnError" not in step for step in job["steps"])
 
     release = stages["Release"]
     assert release["dependsOn"] == []
     assert evaluate(release.get("condition", "succeeded()"), flags)
     assert not evaluate(release.get("condition", "succeeded()"), flags, succeeded=False)
+    assert len(release["jobs"]) == 1
+    assert release["jobs"][0]["job"] == "PublishRelease"
     assert release["jobs"][0]["variables"]["ob_nugetPublishing_enabled"] == str(nuget).lower()
     release_steps = release["jobs"][0]["steps"]
     release_names = [step.get("displayName") for step in release_steps]
@@ -198,6 +232,9 @@ def test_release_switch_graph(values):
     if not nuget:
         assert ".nuspec" not in str(release_steps)
         assert ".nupkg" not in str(release_steps)
+    assert pipeline["extends"]["parameters"]["nugetPublishing"]["feeds"] == [
+        {"name": "public/mssql-rs_Public", "continueOnConflict": True}
+    ]
     for name, stage in stages.items():
         if name != "Release":
             assert "verify-python-wheels" not in str(stage)
@@ -212,21 +249,60 @@ def test_release_switch_graph(values):
         crates = stages["ReleaseCrates"]
         # Explicitly empty: wheel validation or NuGet failure cannot block crates.
         assert crates["dependsOn"] == []
-        steps = crates["jobs"][0]["steps"]
+        jobs = {job["job"]: job for job in crates["jobs"]}
+        expected_jobs = {"ValidateCrates"}
+        if core or mock:
+            expected_jobs.add("RegistryPreflight")
+        if not dry_run:
+            if core:
+                expected_jobs.update(("PublishCore", "CoreAvailable"))
+            if mock:
+                expected_jobs.update(("PublishMock", "MockAvailable"))
+        assert set(jobs) == expected_jobs
+        steps = [step for job in jobs.values() for step in job["steps"]]
         tasks = [step["displayName"] for step in steps if step.get("task") == "EsrpRelease@12"]
         assert tasks == (
             (["Publish mssql-tds to crates.io"] if core and not dry_run else [])
             + (["Publish mssql-mock-tds to crates.io"] if mock and not dry_run else [])
         )
         names = [step.get("displayName") for step in steps]
-        assert "Validate Rust crate release artifact" in names
+        for job in jobs.values():
+            downloads = [step for step in job["steps"] if "download" in step]
+            assert len(downloads) == 1
+            assert downloads[0]["download"] == "officialBuild"
+            assert downloads[0]["artifact"] == "drop_Build_RustCrates"
+            job_names = [step.get("displayName") for step in job["steps"]]
+            validation_index = job_names.index("Validate Rust crate release artifact")
+            assert validation_index == (2 if job["pool"].get("isCustom") else 1)
+            validation = job["steps"][validation_index]
+            assert "$(Pipeline.Workspace)/officialBuild/drop_Build_RustCrates" in validation["pwsh"]
+        if core or mock:
+            assert jobs["RegistryPreflight"]["dependsOn"] == "ValidateCrates"
         assert ("Preflight mssql-tds version" in names) == core
         assert ("Preflight mssql-mock-tds version" in names) == mock
         assert ("Verify mssql-tds dependency is published" in names) == (mock and not core)
-        if core and mock and not dry_run:
-            assert names.index("Publish mssql-tds to crates.io") < names.index(
-                "Wait for mssql-tds on crates.io"
-            ) < names.index("Publish mssql-mock-tds to crates.io")
+        assert ("Wait for mssql-tds on crates.io" in names) == (core and not dry_run)
+        assert ("Verify mssql-mock-tds on crates.io" in names) == (mock and not dry_run)
+        if core and not dry_run:
+            assert jobs["PublishCore"]["dependsOn"] == "RegistryPreflight"
+            assert jobs["CoreAvailable"]["dependsOn"] == "PublishCore"
+        if mock and not dry_run:
+            assert jobs["PublishMock"]["dependsOn"] == ("CoreAvailable" if core else "RegistryPreflight")
+            assert jobs["MockAvailable"]["dependsOn"] == "PublishMock"
+        for job in jobs.values():
+            for step in job["steps"]:
+                if step.get("task") == "EsrpRelease@12":
+                    assert job["templateContext"] == {"type": "releaseJob", "isProduction": True}
+                    assert job["variables"][0] == {"group": "ESRP Federated Creds (AME)"}
+                    assert step["inputs"]["waitforreleasecompletion"] is True
+                    assert step["inputs"]["usemanagedidentity"] is True
+                    assert step["inputs"]["contenttype"] == "Rust"
+                    assert step["inputs"]["intent"] == "PackageDistribution"
+                    assert step["inputs"]["connectedservicename"] == (
+                        "ESRP Managed Identity federated auth - AME tenant-mssql-rs"
+                    )
+                    assert step["inputs"]["mainpublisher"] == "ESRPRELPACMAN"
+                    assert step["inputs"]["domaintenantid"] == "975f013f-7f24-47e8-a7d3-abc4752bf346"
 
     assert ("Tag" in stages) == tag
     if tag:
@@ -268,6 +344,161 @@ def test_release_switch_graph(values):
             git_commands = re.findall(r"^\s*git .+$", step["pwsh"], re.MULTILINE)
             assert len(git_commands) == 4
             assert all('git -C "$(Build.SourcesDirectory)"' in line for line in git_commands)
+
+
+@pytest.mark.parametrize(("core", "failed_gate"), [
+    (core, gate)
+    for core in (False, True)
+    for gate in (
+        "PublishRelease", "ValidateCrates", "RegistryPreflight",
+        "PublishCore", "CoreAvailable", "PublishMock", "MockAvailable",
+    )
+    if core or gate not in ("PublishCore", "CoreAvailable")
+])
+@pytest.mark.parametrize("result", ["Failed", "Canceled", "Skipped"])
+def test_release_gate_failure_propagation(core, failed_gate, result):
+    flags = dict.fromkeys(_SWITCHES, True) | {
+        "publishMssqlTds": core, "validateCratesOnly": False,
+    }
+    pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
+    stages = {stage["stage"]: stage for stage in pipeline["extends"]["parameters"]["stages"]}
+    results = {}
+    for name in ("Release", "ReleaseCrates"):
+        assert stages[name]["dependsOn"] == []
+        for job in stages[name]["jobs"]:
+            # These jobs use the native succeeded() default, not always() or a
+            # flag-only condition that could run after a skipped/failed gate.
+            assert "condition" not in job
+            dependency = job.get("dependsOn")
+            if job["job"] == failed_gate:
+                results[job["job"]] = result
+            elif dependency and results[dependency] != "Succeeded":
+                results[job["job"]] = "Skipped"
+            else:
+                results[job["job"]] = "Succeeded"
+    if failed_gate == "PublishRelease":
+        assert results["MockAvailable"] == "Succeeded"
+    else:
+        assert results["PublishRelease"] == "Succeeded"
+        assert results["MockAvailable"] != "Succeeded"
+        if failed_gate not in ("PublishMock", "MockAvailable"):
+            assert results["PublishMock"] == "Skipped"
+        if core and failed_gate in ("ValidateCrates", "RegistryPreflight"):
+            assert results["PublishCore"] == "Skipped"
+    assert stages["Tag"]["dependsOn"] == "Release"
+
+
+def run_cratesio_script(tmp_path, responses, arguments):
+    # Shadow HTTP and sleep only; execute the real PowerShell gate, never a
+    # Python reimplementation of its response handling.
+    data = json.dumps(responses).replace("'", "''")
+    script = str(_ROOT / ".pipeline" / "scripts" / "test-cratesio-package.ps1").replace("'", "''")
+    command = f"""
+    $ErrorActionPreference = 'Stop'
+    $global:Responses = @('{data}' | ConvertFrom-Json)
+    $global:RequestCount = 0
+    function Invoke-WebRequest {{
+        param($Uri, $Headers, [switch]$SkipHttpErrorCheck, $TimeoutSec)
+        Write-Host "REQUEST:$Uri"
+        if ($global:RequestCount -ge $global:Responses.Count) {{ throw 'Unexpected HTTP request' }}
+        $response = $global:Responses[$global:RequestCount++]
+        if ($response.error) {{ throw $response.error }}
+        return $response
+    }}
+    function Start-Sleep {{ param($Seconds) Write-Host "SLEEP:$Seconds" }}
+    & '{script}' {arguments}
+    """
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", command], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    )
+
+
+@pytest.mark.parametrize(("state", "responses", "success", "requests"), [
+    ("Absent", [404], True, 1),
+    ("Absent", [200], False, 1),
+    ("Absent", [401], False, 1),
+    ("Absent", [403], False, 1),
+    ("Absent", [429], False, 1),
+    ("Absent", [503], False, 1),
+    ("Absent", ["socket access forbidden"], False, 1),
+    ("Available", [200], True, 1),
+    ("Available", [404, 200], True, 2),
+    ("Available", [429, 503, 200], True, 3),
+    ("Available", ["temporary transport failure", 200], True, 2),
+    ("Available", [404, 404, 404], False, 3),
+    ("Available", [503, 503, 503], False, 3),
+    ("Available", ["socket access forbidden"] * 3, False, 3),
+    ("Available", [301], False, 1),
+    ("Available", [401], False, 1),
+    ("Available", [403], False, 1),
+])
+def test_cratesio_http_states(tmp_path, state, responses, success, requests):
+    responses = [
+        {"StatusCode": item} if isinstance(item, int) else {"error": item}
+        for item in responses
+    ]
+    result = run_cratesio_script(
+        tmp_path, responses,
+        f"-CrateName mssql-tds -Version 0.1.0 -ExpectedState {state} -MaxAttempts 3 -DelaySeconds 1",
+    )
+    assert (result.returncode == 0) == success, result.stderr
+    assert result.stdout.count("REQUEST:") == requests
+    if not success:
+        assert "is not published" not in result.stdout
+        assert "is available" not in result.stdout
+
+
+@pytest.mark.parametrize(("damage", "damaged_name"), [
+    (None, None),
+    ("hash", "mssql-tds"),
+    ("hash", "mssql-mock-tds"),
+    ("dependency", "mssql-mock-tds"),
+    ("missing", "mssql-tds"),
+    ("missing", "mssql-mock-tds"),
+    ("extra", None),
+    ("order", None),
+])
+def test_crate_artifact_revalidation(tmp_path, damage, damaged_name):
+    entries = []
+    for name in ("mssql-tds", "mssql-mock-tds"):
+        folder = tmp_path / name
+        folder.mkdir()
+        crate = folder / f"{name}-0.1.0.crate"
+        dependency = "9.9.9" if damage == "dependency" else "0.1.0"
+        manifest = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
+        if name == "mssql-mock-tds":
+            manifest += f'\n[dependencies.mssql-tds]\nversion = "{dependency}"\n'
+        with tarfile.open(crate, "w:gz") as archive:
+            content = manifest.encode("utf-8")
+            member = tarfile.TarInfo(f"{name}-0.1.0/Cargo.toml")
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+        entries.append({
+            "name": name, "version": "0.1.0", "file": f"{name}/{crate.name}",
+            "sha256": hashlib.sha256(crate.read_bytes()).hexdigest(),
+        })
+    if damage in ("hash", "missing"):
+        damaged_crate = tmp_path / damaged_name / f"{damaged_name}-0.1.0.crate"
+        if damage == "hash":
+            damaged_crate.write_bytes(b"replaced after preflight")
+        else:
+            damaged_crate.unlink()
+    elif damage == "extra":
+        (tmp_path / "extra.crate").write_bytes(b"unexpected")
+    elif damage == "order":
+        entries.reverse()
+    (tmp_path / "release-manifest.json").write_text(
+        json.dumps({"schemaVersion": 1, "crates": entries}), encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-File",
+         str(_ROOT / ".pipeline" / "scripts" / "validate-crate-release-artifact.ps1"),
+         "-ArtifactDirectory", str(tmp_path)],
+        capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode == 0) == (damage is None), result.stderr
+    assert ("Rust crate release artifact is valid." in result.stdout) == (damage is None)
 
 
 def git(directory, *arguments):

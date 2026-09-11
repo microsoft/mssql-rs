@@ -36,13 +36,6 @@ const SUGGESTED_SCALE: usize = 6;
 const SUGGESTED_TDS_TYPE_ID: usize = 22;
 const SUGGESTED_TDS_LENGTH: usize = 23;
 
-/// Describes a prepared statement parameter.
-///
-/// # Safety
-/// `statement_handle` must be null or point to a live `StmtHandle`. Every output
-/// pointer, when non-null, must be writable for one value of its pointed-to
-/// type.
-#[allow(clippy::too_many_arguments)]
 /// The description msodbcsql reports for the return-status parameter of
 /// `{? = call ...}`: a nullable `SQL_INTEGER` of precision 10, scale 0.
 /// Measured against msodbcsql 18.6.2.1.
@@ -53,6 +46,13 @@ const RETURN_STATUS_DESCRIPTION: ParameterDescription = ParameterDescription {
     nullable: SQL_NULLABLE,
 };
 
+/// Describes a prepared statement parameter.
+///
+/// # Safety
+/// `statement_handle` must be null or point to a live `StmtHandle`. Every output
+/// pointer, when non-null, must be writable for one value of its pointed-to
+/// type.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sql_describe_param(
     statement_handle: SqlHandle,
     parameter_number: SqlUSmallInt,
@@ -829,7 +829,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
-                call: None,
             });
         }
 
@@ -860,7 +859,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
-                call: None,
             });
             state.parameter_metadata.push(ParameterDescription {
                 data_type: SQL_INTEGER,
@@ -917,7 +915,6 @@ mod tests {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
                 original_sql: String::new(),
-                call: None,
             });
         }
 
