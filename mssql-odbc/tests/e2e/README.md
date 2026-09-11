@@ -133,6 +133,8 @@ CI runs this comparison on the Linux x64 PR build, which owns a SQL Server in
 docker. `.pipeline/scripts/containerized-odbc-e2e.sh` installs a pinned
 `msodbcsql18` from `packages.microsoft.com` when `ODBC_E2E_COMPARE=1`.
 
+Run new or changed parity tests against both drivers before pushing. For output-parameter tests, change pending bindings before fetching can consume the return tokens, and inspect diagnostics immediately after each result-draining API call. A later `SQLMoreResults` call need not preserve a diagnostic already reported by `SQLFetch`. Keep exact SQLSTATE and output-value assertions, including single-delivery checks, rather than skipping the reference leg.
+
 ### Failure modes that are never silently green
 
 Both runners abort — locally and in CI — when:

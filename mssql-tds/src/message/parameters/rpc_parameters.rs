@@ -722,7 +722,12 @@ fn build_parameter_list_string_impl(
             } else {
                 params_list.push_str(", ");
             }
-            params_list.push_str(&format!("{param_name} {param_type_name} "));
+            // OUTPUT has to appear in the declaration as well as at the call
+            // site; sp_executesql silently drops the value if either is
+            // missing, which is why an output parameter over the text path
+            // used to come back unset.
+            let output = if param.is_output() { "OUTPUT " } else { "" };
+            params_list.push_str(&format!("{param_name} {param_type_name} {output}"));
         }
     }
     Ok(())

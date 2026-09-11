@@ -24,6 +24,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_escape_sequences"
+path = "fuzz_targets/fuzz_escape_sequences.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_numeric_parse"
 path = "fuzz_targets/fuzz_numeric_parse.rs"
 test = false

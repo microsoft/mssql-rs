@@ -309,7 +309,7 @@ pub(crate) unsafe fn sql_fetch_scroll_impl(
 /// Why a bound column write did not land exactly, so the row can report the
 /// same SQLSTATE `SQLGetData` would have for the identical value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RowIssue {
+pub(crate) enum RowIssue {
     /// 01004 — the value did not fit the bound buffer.
     StringTruncated,
     /// 01S07 — fractional digits were dropped to fit the target.
@@ -329,7 +329,7 @@ enum RowIssue {
 }
 
 impl RowIssue {
-    fn post(self, stmt_state: &mut StmtState) {
+    pub(crate) fn post(self, stmt_state: &mut StmtState) {
         match self {
             RowIssue::StringTruncated => post_diag(stmt_state, WARN_STRING_TRUNCATION),
             RowIssue::FractionalTruncated => post_diag(stmt_state, WARN_FRACTIONAL_TRUNCATION),
@@ -350,7 +350,7 @@ impl RowIssue {
 
 /// The per-row outcome recorded in the row status array.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RowOutcome {
+pub(crate) enum RowOutcome {
     Success,
     Info(RowIssue),
     Error(RowIssue),
@@ -2170,6 +2170,21 @@ unsafe fn deliver_encoded_string(
     } else {
         RowOutcome::Success
     }
+}
+
+/// Delivers one value into a bound buffer outside the rowset machinery.
+///
+/// Used for procedure output parameters, which are the same conversion problem
+/// as a fetched column but arrive on a RETURNVALUE token instead of a row.
+/// Preserves the conversion's warning or error, including its SQLSTATE.
+///
+/// # Safety
+/// `binding`'s buffers must be valid for one element.
+pub(crate) unsafe fn deliver_bound_value(
+    binding: &ColumnBinding,
+    value: &ColumnValues,
+) -> RowOutcome {
+    unsafe { deliver_bound(binding, 0, 0, value) }
 }
 
 /// Writes one column value into its bound buffer slot for row `row_index`.

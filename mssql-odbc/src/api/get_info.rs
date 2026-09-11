@@ -9,20 +9,25 @@ use crate::api::odbc_types::{
     SQL_ACCESSIBLE_PROCEDURES, SQL_ACCESSIBLE_TABLES, SQL_ACTIVE_STATEMENTS,
     SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE, SQL_ASYNC_NOTIFICATION,
     SQL_ASYNC_NOTIFICATION_NOT_CAPABLE, SQL_CATALOG_NAME_SEPARATOR, SQL_CATALOG_TERM, SQL_CB_CLOSE,
-    SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DATA_SOURCE_NAME,
-    SQL_DATA_SOURCE_READ_ONLY, SQL_DBMS_NAME, SQL_DBMS_VER, SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER,
-    SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER, SQL_ERROR, SQL_EXPRESSIONS_IN_ORDERBY,
-    SQL_FN_NONE_SUPPORTED, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS,
-    SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_KEYWORDS, SQL_MAX_COLUMN_NAME_LEN,
-    SQL_MAX_DRIVER_CONNECTIONS, SQL_MAX_SCHEMA_NAME_LEN, SQL_MAX_STATEMENT_LEN,
-    SQL_MAX_TABLE_NAME_LEN, SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_NUMERIC_FUNCTIONS,
-    SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE, SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE,
-    SQL_PARAM_ARRAY_ROW_COUNTS, SQL_PARAM_ARRAY_SELECTS, SQL_PARC_NO_BATCH, SQL_PAS_BATCH,
-    SQL_PROCEDURES, SQL_SC_SQL92_ENTRY, SQL_SCHEMA_TERM, SQL_SERVER_NAME, SQL_SPECIAL_CHARACTERS,
-    SQL_SQL_CONFORMANCE, SQL_STRING_FUNCTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_SYSTEM_FUNCTIONS, SQL_TC_ALL, SQL_TIMEDATE_FUNCTIONS, SQL_TXN_CAPABLE,
-    SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT, SQL_TXN_READ_COMMITTED, SQL_USER_NAME,
-    SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_CONVERT_FUNCTIONS, SQL_CONVERT_FUNCTIONS_SUPPORTED, SQL_CURSOR_COMMIT_BEHAVIOR,
+    SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DATA_SOURCE_NAME, SQL_DATA_SOURCE_READ_ONLY, SQL_DBMS_NAME,
+    SQL_DBMS_VER, SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER, SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER,
+    SQL_DRIVER_VER, SQL_ERROR, SQL_EXPRESSIONS_IN_ORDERBY, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER,
+    SQL_GETDATA_EXTENSIONS, SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_KEYWORDS,
+    SQL_LIKE_ESCAPE_CLAUSE, SQL_MAX_COLUMN_NAME_LEN, SQL_MAX_DRIVER_CONNECTIONS,
+    SQL_MAX_SCHEMA_NAME_LEN, SQL_MAX_STATEMENT_LEN, SQL_MAX_TABLE_NAME_LEN,
+    SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_NUMERIC_FUNCTIONS,
+    SQL_NUMERIC_FUNCTIONS_SUPPORTED, SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE,
+    SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OJ_CAPABILITIES, SQL_OJ_CAPABILITIES_SUPPORTED,
+    SQL_OSC_CORE, SQL_OUTER_JOINS, SQL_PARAM_ARRAY_ROW_COUNTS, SQL_PARAM_ARRAY_SELECTS,
+    SQL_PARC_NO_BATCH, SQL_PAS_BATCH, SQL_PROCEDURES, SQL_SC_SQL92_ENTRY, SQL_SCHEMA_TERM,
+    SQL_SERVER_NAME, SQL_SPECIAL_CHARACTERS, SQL_SQL_CONFORMANCE, SQL_STRING_FUNCTIONS,
+    SQL_STRING_FUNCTIONS_SUPPORTED, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_SYSTEM_FUNCTIONS,
+    SQL_SYSTEM_FUNCTIONS_SUPPORTED, SQL_TC_ALL, SQL_TIMEDATE_ADD_INTERVALS,
+    SQL_TIMEDATE_DIFF_INTERVALS, SQL_TIMEDATE_FUNCTIONS, SQL_TIMEDATE_FUNCTIONS_SUPPORTED,
+    SQL_TIMEDATE_INTERVALS_SUPPORTED, SQL_TXN_CAPABLE, SQL_TXN_ISOLATION_OPTION,
+    SQL_TXN_ISOLATION_OPTION_SPT, SQL_TXN_READ_COMMITTED, SQL_USER_NAME, SqlHandle, SqlPointer,
+    SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
 };
 use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, WARN_STRING_TRUNCATION, post_diag};
 use crate::api::util::{copy_with_nul, write_if_some};
@@ -326,12 +331,60 @@ fn sql_get_info_w_safe(
             max_statement_len(state.client.as_ref().map(|client| client.packet_size())),
             string_length_ptr,
         ),
-        SQL_NUMERIC_FUNCTIONS
-        | SQL_STRING_FUNCTIONS
-        | SQL_SYSTEM_FUNCTIONS
-        | SQL_TIMEDATE_FUNCTIONS => {
-            write_u32(info_value_ptr, SQL_FN_NONE_SUPPORTED, string_length_ptr)
-        }
+        // The `{fn ...}` escape is translated (validated and forwarded; SQL
+        // Server parses it natively), so these advertise the sets msodbcsql
+        // advertises rather than "none supported".
+        SQL_NUMERIC_FUNCTIONS => write_u32(
+            info_value_ptr,
+            SQL_NUMERIC_FUNCTIONS_SUPPORTED,
+            string_length_ptr,
+        ),
+        SQL_STRING_FUNCTIONS => write_u32(
+            info_value_ptr,
+            SQL_STRING_FUNCTIONS_SUPPORTED,
+            string_length_ptr,
+        ),
+        SQL_SYSTEM_FUNCTIONS => write_u32(
+            info_value_ptr,
+            SQL_SYSTEM_FUNCTIONS_SUPPORTED,
+            string_length_ptr,
+        ),
+        SQL_TIMEDATE_FUNCTIONS => write_u32(
+            info_value_ptr,
+            SQL_TIMEDATE_FUNCTIONS_SUPPORTED,
+            string_length_ptr,
+        ),
+        SQL_CONVERT_FUNCTIONS => write_u32(
+            info_value_ptr,
+            SQL_CONVERT_FUNCTIONS_SUPPORTED,
+            string_length_ptr,
+        ),
+        SQL_TIMEDATE_ADD_INTERVALS | SQL_TIMEDATE_DIFF_INTERVALS => write_u32(
+            info_value_ptr,
+            SQL_TIMEDATE_INTERVALS_SUPPORTED,
+            string_length_ptr,
+        ),
+        SQL_OJ_CAPABILITIES => write_u32(
+            info_value_ptr,
+            SQL_OJ_CAPABILITIES_SUPPORTED,
+            string_length_ptr,
+        ),
+        // Deprecated ODBC 1.0 spelling of the same capability: "F" is full
+        // outer join support.
+        SQL_OUTER_JOINS => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "F",
+        ),
+        SQL_LIKE_ESCAPE_CLAUSE => write_wide_str(
+            &mut state,
+            info_value_ptr,
+            buffer_length,
+            string_length_ptr,
+            "Y",
+        ),
         // Matching msodbcsql18: SQL Server grants the catalog views to public,
         // so what `SQLTables` / `SQLProcedures` list back is what the caller may
         // use.
@@ -490,6 +543,9 @@ mod tests {
         (SQL_CATALOG_NAME_SEPARATOR, "."),
         (SQL_SCHEMA_TERM, "owner"),
         (SQL_PROCEDURES, "Y"),
+        // The {oj ...} and {escape ...} escapes both reach the server.
+        (SQL_OUTER_JOINS, "F"),
+        (SQL_LIKE_ESCAPE_CLAUSE, "Y"),
         (SQL_ACCESSIBLE_TABLES, "Y"),
         (SQL_ACCESSIBLE_PROCEDURES, "Y"),
         (SQL_EXPRESSIONS_IN_ORDERBY, "Y"),
@@ -535,10 +591,18 @@ mod tests {
             (SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT),
             (SQL_SQL_CONFORMANCE, SQL_SC_SQL92_ENTRY),
             (SQL_MAX_STATEMENT_LEN, 512 * 1024),
-            (SQL_NUMERIC_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
-            (SQL_STRING_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
-            (SQL_SYSTEM_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
-            (SQL_TIMEDATE_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
+            // Escape capability masks, measured from msodbcsql18 18.6.2.1.
+            (SQL_NUMERIC_FUNCTIONS, SQL_NUMERIC_FUNCTIONS_SUPPORTED),
+            (SQL_STRING_FUNCTIONS, SQL_STRING_FUNCTIONS_SUPPORTED),
+            (SQL_SYSTEM_FUNCTIONS, SQL_SYSTEM_FUNCTIONS_SUPPORTED),
+            (SQL_TIMEDATE_FUNCTIONS, SQL_TIMEDATE_FUNCTIONS_SUPPORTED),
+            (SQL_CONVERT_FUNCTIONS, SQL_CONVERT_FUNCTIONS_SUPPORTED),
+            (SQL_TIMEDATE_ADD_INTERVALS, SQL_TIMEDATE_INTERVALS_SUPPORTED),
+            (
+                SQL_TIMEDATE_DIFF_INTERVALS,
+                SQL_TIMEDATE_INTERVALS_SUPPORTED,
+            ),
+            (SQL_OJ_CAPABILITIES, SQL_OJ_CAPABILITIES_SUPPORTED),
         ] {
             let (rc, val, len) = get_u32(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");

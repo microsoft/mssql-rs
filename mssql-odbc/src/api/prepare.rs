@@ -7,13 +7,14 @@ use tracing::{debug, error};
 
 use mssql_tds::connection::tds_client::PreparedStatement;
 
+use super::escape::translate_and_rewrite;
 use super::sqlstate::*;
-use super::util::{read_utf16, rewrite_param_markers};
+use super::util::read_utf16;
 use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS, SqlHandle, SqlReturn, SqlSmallInt,
     SqlWChar,
 };
-use crate::error::free_errors;
+use crate::error::{free_errors, post_sql_error};
 use crate::handles::dbc::ConnectionState;
 use crate::handles::stmt::{
     PreparedPlan, STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, STMT_STATE_EXEC_STARTED,
@@ -118,18 +119,27 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
     // Store the SQL text and defer the server-side prepare to SQLExecute.
     // Re-preparing discards any prior prepared text and stale result metadata.
     // A prior prepared handle is orphaned for release at the next execute.
-    // Markers are rewritten to `@P1..@Pn` once here so `SQLExecute` re-prepares
-    // (after a reconnect) without re-scanning the SQL.
-    let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+    // Execution adds binding-dependent OUTPUT annotations to the retained SQL.
+    let (rewritten_sql, marker_count, _) =
+        match translate_and_rewrite(&sql, stmt_state.inert_attrs.noscan()) {
+            Ok(parts) => parts,
+            Err(e) => {
+                error!(error = %e, "SQLPrepareW: escape translation failed");
+                post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                return SQL_ERROR;
+            }
+        };
     stmt_state.orphan_prepared_handle();
     stmt_state.prepared = Some(PreparedPlan {
         stmt: PreparedStatement::new(rewritten_sql),
         marker_count,
+        original_sql: sql,
     });
     stmt_state.parameter_metadata.clear();
     stmt_state.clear_result_metadata();
     stmt_state.reset_row_stream();
     stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
+    stmt_state.call_returns_status = false;
     stmt_state.set_state(STMT_STATE_PREPARED);
 
     debug!("SQLPrepareW: statement prepared (deferred)");
@@ -189,6 +199,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
             state.set_state(STMT_STATE_PREPARED);
             state.parameter_metadata.push(ParameterDescription {

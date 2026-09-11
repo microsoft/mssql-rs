@@ -194,6 +194,8 @@ pub const SQL_API_SQLGETFUNCTIONS: SqlUSmallInt = 44;
 pub const SQL_API_SQLGETINFO: SqlUSmallInt = 45;
 pub const SQL_API_SQLGETTYPEINFO: SqlUSmallInt = 47;
 pub const SQL_API_SQLDESCRIBEPARAM: SqlUSmallInt = 58;
+pub const SQL_API_SQLNATIVESQL: SqlUSmallInt = 62;
+pub const SQL_API_SQLNUMPARAMS: SqlUSmallInt = 63;
 pub const SQL_API_SQLBINDCOL: SqlUSmallInt = 4;
 pub const SQL_API_SQLBINDPARAMETER: SqlUSmallInt = 72;
 pub const SQL_API_SQLMORERESULTS: SqlUSmallInt = 61;
@@ -284,12 +286,30 @@ pub const SQL_OSC_CORE: u16 = 0x0001;
 pub const SQL_CB_CLOSE: u16 = 1;
 /// `SQL_SQL_CONFORMANCE`: entry-level SQL-92, matching msodbcsql18.
 pub const SQL_SC_SQL92_ENTRY: u32 = 0x00000001;
-/// The scalar-function masks (`SQL_NUMERIC_FUNCTIONS`, `SQL_STRING_FUNCTIONS`,
-/// `SQL_SYSTEM_FUNCTIONS`, `SQL_TIMEDATE_FUNCTIONS`) report the functions
-/// reachable through the ODBC `{fn ...}` escape. This driver does not translate
-/// escape sequences yet, so ODBC's "none supported" is the only honest answer;
-/// msodbcsql18 advertises real masks. Tracked by AB#46384.
-pub const SQL_FN_NONE_SUPPORTED: u32 = 0x00000000;
+/// The scalar-function masks report the functions reachable through the ODBC
+/// `{fn ...}` escape. Every value below is **measured from msodbcsql18
+/// 18.6.2.1**, the build CI pins for the parity comparison, rather than derived
+/// from the ODBC headers — the same rule `attributes_plan.md` section 8
+/// established for statement attributes. SQL Server parses `{fn ...}` natively
+/// and this driver validates and forwards it, so the reachable set is
+/// msodbcsql's (AB#46384).
+pub const SQL_NUMERIC_FUNCTIONS_SUPPORTED: u32 = 0x00FF_FFFF;
+pub const SQL_STRING_FUNCTIONS_SUPPORTED: u32 = 0x004F_FFFF;
+pub const SQL_SYSTEM_FUNCTIONS_SUPPORTED: u32 = 0x0000_0007;
+pub const SQL_TIMEDATE_FUNCTIONS_SUPPORTED: u32 = 0x001F_FFFF;
+pub const SQL_CONVERT_FUNCTIONS_SUPPORTED: u32 = 0x0000_0003;
+/// `SQL_TIMEDATE_ADD_INTERVALS` / `SQL_TIMEDATE_DIFF_INTERVALS`: the
+/// `SQL_TSI_*` intervals `{fn TIMESTAMPADD}` / `{fn TIMESTAMPDIFF}` accept.
+pub const SQL_TIMEDATE_INTERVALS_SUPPORTED: u32 = 0x0000_01FF;
+/// `SQL_OJ_CAPABILITIES`: the `{oj ...}` forms the server accepts.
+pub const SQL_OJ_CAPABILITIES_SUPPORTED: u32 = 0x0000_007F;
+
+pub const SQL_CONVERT_FUNCTIONS: SqlUSmallInt = 48;
+pub const SQL_TIMEDATE_ADD_INTERVALS: SqlUSmallInt = 109;
+pub const SQL_TIMEDATE_DIFF_INTERVALS: SqlUSmallInt = 110;
+pub const SQL_OJ_CAPABILITIES: SqlUSmallInt = 115;
+pub const SQL_OUTER_JOINS: SqlUSmallInt = 38;
+pub const SQL_LIKE_ESCAPE_CLAUSE: SqlUSmallInt = 113;
 /// `SQL_TXN_CAPABLE`: DML and DDL are both transactable (msodbcsql `sqlcinfo.cpp:323`).
 pub const SQL_TC_ALL: u16 = 2;
 /// `SQL_TXN_ISOLATION_OPTION` bitmask — the five levels this driver accepts
@@ -379,6 +399,10 @@ pub const SQL_PARAM_TYPE_UNKNOWN: SqlSmallInt = 0;
 pub const SQL_PARAM_INPUT: SqlSmallInt = 1;
 pub const SQL_PARAM_INPUT_OUTPUT: SqlSmallInt = 2;
 pub const SQL_PARAM_OUTPUT: SqlSmallInt = 4;
+/// The `{? = call ...}` return-status parameter. ODBC 3.5+.
+pub const SQL_PARAM_INPUT_OUTPUT_STREAM: SqlSmallInt = 8;
+pub const SQL_PARAM_OUTPUT_STREAM: SqlSmallInt = 16;
+pub const SQL_RETURN_VALUE: SqlSmallInt = 5;
 
 // Parameter-array operation and status values.
 pub const SQL_PARAM_PROCEED: SqlUSmallInt = 0;
@@ -578,6 +602,10 @@ pub const SQL_ATTR_CURSOR_SENSITIVITY: SqlInteger = -2;
 pub const SQL_ATTR_QUERY_TIMEOUT: SqlInteger = 0;
 pub const SQL_ATTR_MAX_ROWS: SqlInteger = 1;
 pub const SQL_ATTR_NOSCAN: SqlInteger = 2;
+/// `SQL_ATTR_NOSCAN` values: scan for escape sequences (the ODBC default), or
+/// send the statement text through untouched.
+pub const SQL_NOSCAN_OFF: SqlULen = 0;
+pub const SQL_NOSCAN_ON: SqlULen = 1;
 pub const SQL_ATTR_MAX_LENGTH: SqlInteger = 3;
 pub const SQL_ATTR_ASYNC_ENABLE: SqlInteger = 4;
 pub const SQL_ATTR_ROW_BIND_TYPE: SqlInteger = 5;

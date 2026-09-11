@@ -9,18 +9,21 @@ use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
+use super::escape::translate_for_execution;
 use super::exec_common::{
-    ParamsWithDae, build_named_params, claim_connection, deduct_query_timeout, fail_with_tds,
-    finish_execute_with_param_warning, flush_pending_unprepare, park_dae_client, park_deferred_dae,
-    publish_scalar_processed, query_timeout_expired_error, snapshot_bound_params,
+    ParamsWithDae, build_named_params, build_positional_params, claim_connection,
+    deduct_query_timeout, fail_with_tds, finish_execute_with_param_warning,
+    flush_pending_unprepare, park_dae_client, park_deferred_dae, publish_scalar_processed,
+    query_timeout_expired_error, snapshot_bound_params,
 };
 use super::sqlstate::*;
 use super::txn::begin_transaction_if_manual;
-use super::util::{read_utf16, rewrite_param_markers};
+use super::util::read_utf16;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn, SqlSmallInt,
-    SqlWChar,
+    SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NO_ROWCOUNT_TOTAL, SqlHandle, SqlReturn,
+    SqlSmallInt, SqlWChar,
 };
+use crate::conversion::param_convert::{data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::{
@@ -130,7 +133,7 @@ fn sql_exec_direct_w_safe(
     };
 
     // Check STMT state, gather parameter values, and reset prior context.
-    let (named_params, rewritten_sql, marker_count, query_timeout) = {
+    let (named_params, rewritten_sql, marker_count, call, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLExecDirectW: stmt mutex poisoned");
             return SQL_ERROR;
@@ -151,10 +154,24 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         }
         stmt_state.bound_params = bound_params;
-        // Rewrite markers and read the bound parameter buffers before mutating
-        // any state, so a binding error (07002 / HYC00) leaves the statement
-        // unchanged.
-        let (rewritten_sql, marker_count) = rewrite_param_markers(&sql);
+        // Translate escapes and rewrite markers, then read the bound parameter
+        // buffers, all before mutating any state — so a malformed escape
+        // (42000 / 22018 / 22001) or a binding error (07002 / HYC00) leaves the
+        // statement unchanged and nothing reaches the wire.
+        let output_flags: Vec<bool> = stmt_state
+            .bound_params
+            .iter()
+            .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+            .collect();
+        let (rewritten_sql, marker_count, mut call) =
+            match translate_for_execution(&sql, stmt_state.inert_attrs.noscan(), &output_flags) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    error!(error = %e, "SQLExecDirectW: escape translation failed");
+                    post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                    return SQL_ERROR;
+                }
+            };
         // msodbcsql batches one sp_executesql per set here (sqlccmd.cpp:3310).
         // Refused until AB#47939 wires that up: no shipped consumer drives it -
         // mssql-python's executemany always uses the prepare + execute path
@@ -174,11 +191,50 @@ fn sql_exec_direct_w_safe(
             return SQL_ERROR;
         }
         publish_scalar_processed(&stmt_state);
-        let named_params =
-            match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") } {
-                Ok(params) => params,
-                Err(rc) => return rc,
+        let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
+        let mut has_dae = false;
+        for index in 0..marker_count {
+            let Some(Some(bound)) = stmt_state.bound_params.get(index) else {
+                post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
+                return SQL_ERROR;
             };
+            if index == 0
+                && call.as_ref().is_some_and(|c| c.returns_status)
+                && !is_output_direction(bound.input_output_type)
+            {
+                post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                return SQL_ERROR;
+            }
+            let Ok(positioned) = bound.for_row(0, bind_offset, SQL_BIND_BY_COLUMN) else {
+                post_diag(&mut stmt_state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
+                return SQL_ERROR;
+            };
+            has_dae |= unsafe { data_at_exec_indicator(&positioned) }.is_some();
+        }
+        // Both streaming implementations execute text, so they need every named
+        // variable, including a return assignment, rather than RPC arguments.
+        call = call.filter(|c| c.is_rpc_eligible() && !has_dae);
+        // A canonical call binds its parameters by position; everything else
+        // binds them by the `@P1..@Pn` names the rewritten text declares.
+        let rpc_call = call.as_ref();
+        let named_params = match rpc_call {
+            Some(c) => {
+                let skip = usize::from(c.returns_status);
+                match unsafe {
+                    build_positional_params(&mut stmt_state, marker_count, skip, "SQLExecDirectW")
+                } {
+                    Ok(params) => params,
+                    Err(rc) => return rc,
+                }
+            }
+            None => {
+                match unsafe { build_named_params(&mut stmt_state, marker_count, "SQLExecDirectW") }
+                {
+                    Ok(params) => params,
+                    Err(rc) => return rc,
+                }
+            }
+        };
         // A new execute invalidates prior metadata/context immediately, so a
         // later execute failure cannot expose stale SQLNumResultCols/DescribeCol state.
         stmt_state.clear_state(STMT_STATE_EXEC_CONTEXT);
@@ -192,11 +248,13 @@ fn sql_exec_direct_w_safe(
         stmt_state.prepared = None;
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
+        stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
         (
             named_params,
             rewritten_sql,
             marker_count,
+            call,
             stmt_state.query_timeout,
         )
     };
@@ -323,7 +381,21 @@ fn sql_exec_direct_w_safe(
     // handle); unparameterized text runs as a plain SQL batch. Neither DBC nor
     // STMT lock is held during I/O. `query_timeout` (already deducted above)
     // bounds either call; `0` means unlimited, matching the ODBC default.
-    let exec_result: Result<(), mssql_tds::error::Error> = if marker_count > 0 {
+    let exec_result: Result<(), mssql_tds::error::Error> = if let Some(call) = call.as_ref() {
+        // A statement that is nothing but `{call proc(?)}` goes out as a TDS
+        // RPC rather than as text, which is what makes output parameters and
+        // the return status available. Anything less strict — a call inside a
+        // batch, or with a literal argument — took the EXEC text form during
+        // translation and runs through sp_executesql below.
+        dbc.runtime
+            .block_on(client.execute_stored_procedure(
+                call.proc_name.clone(),
+                Some(params),
+                None,
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ))
+            .map(|_| ())
+    } else if marker_count > 0 {
         dbc.runtime
             .block_on(client.execute_sp_executesql(
                 rewritten_sql,
@@ -335,9 +407,13 @@ fn sql_exec_direct_w_safe(
         // Statement-wise navigation: position on the batch's first statement
         // (msodbcsql parity) so no-row statements (PRINT / RAISERROR / DML) are
         // individually navigable via SQLMoreResults. finish_execute inspects the
-        // resulting client state.
+        // resulting client state. The *translated* text is sent: a statement
+        // with no parameter markers can still carry escapes.
         dbc.runtime
-            .block_on(client.execute(sql, ExecuteOptions::new().timeout_secs(query_timeout)))
+            .block_on(client.execute(
+                rewritten_sql,
+                ExecuteOptions::new().timeout_secs(query_timeout),
+            ))
             .map(|_| ())
     };
     if let Err(e) = exec_result {
@@ -463,6 +539,7 @@ mod tests {
                     mssql_tds::connection::tds_client::StatementId::from_raw_for_test(42),
                 ),
                 marker_count: 0,
+                original_sql: String::new(),
             });
             state.set_state(STMT_STATE_PREPARED);
         }

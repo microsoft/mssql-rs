@@ -3,6 +3,7 @@
 
 use std::slice;
 
+use crate::api::escape::CodeScan;
 use crate::api::odbc_types::{
     SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlInteger, SqlReturn, SqlSmallInt, SqlWChar,
 };
@@ -234,132 +235,24 @@ pub(crate) unsafe fn write_wide_attr(
 ///   through rather than starting a line comment. A shared consequence is that
 ///   `COUNT(*)--…` is *not* treated as a line comment (a `?` inside it is
 ///   counted), matching msodbcsql.
+///
+/// This is phase 2 of statement preparation. Phase 1,
+/// [`crate::api::escape::translate_escapes`], runs first on the execution path
+/// and shares the same [`CodeScan`] lexer, so the two cannot disagree about
+/// what is a comment. `SQLNativeSql` runs phase 1 only.
 pub(crate) fn rewrite_param_markers(sql: &str) -> (String, usize) {
-    #[derive(PartialEq)]
-    enum State {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        Bracket,
-        LineComment,
-        BlockComment,
-    }
-
     let mut out = String::with_capacity(sql.len() + 8);
     let mut count: usize = 0;
-    let mut state = State::Normal;
-    // The two preceding characters, used to detect the `*)--` close of an ODBC
-    // canonical-extension escape
-    let mut prev1: Option<char> = None;
-    let mut prev2: Option<char> = None;
-    let mut chars = sql.chars().peekable();
+    let mut scan = CodeScan::new(sql);
 
-    while let Some(c) = chars.next() {
-        match state {
-            State::Normal => match c {
-                '?' => {
-                    count += 1;
-                    out.push_str("@P");
-                    out.push_str(&count.to_string());
-                }
-                '\'' => {
-                    state = State::SingleQuote;
-                    out.push(c);
-                }
-                '"' => {
-                    state = State::DoubleQuote;
-                    out.push(c);
-                }
-                '[' => {
-                    state = State::Bracket;
-                    out.push(c);
-                }
-                '-' if chars.peek() == Some(&'-') => {
-                    // A `--` is a line comment unless it opens (`--(*`) or closes
-                    // (`*)--`, detected via the two preceding chars) an ODBC vendor
-                    // canonical extension, which is passed through as normal text.
-                    let starts_canonical_extension = matches!(chars.clone().nth(1), Some('('))
-                        && matches!(chars.clone().nth(2), Some('*'));
-                    let ends_canonical_extension =
-                        matches!(prev2, Some('*')) && matches!(prev1, Some(')'));
-
-                    if !starts_canonical_extension && !ends_canonical_extension {
-                        out.push(c);
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                        state = State::LineComment;
-                    } else {
-                        out.push(c);
-                    }
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    out.push(c);
-                    if let Some(n) = chars.next() {
-                        out.push(n);
-                    }
-                    state = State::BlockComment;
-                }
-                _ => out.push(c),
-            },
-            State::SingleQuote => {
-                out.push(c);
-                if c == '\'' {
-                    // Doubled single quotes -> escaped quote, not the end of the literal
-                    if chars.peek() == Some(&'\'') {
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                    } else {
-                        // lone quote → end of literal
-                        state = State::Normal;
-                    }
-                }
-            }
-            State::DoubleQuote => {
-                out.push(c);
-                if c == '"' {
-                    if chars.peek() == Some(&'"') {
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                    } else {
-                        state = State::Normal;
-                    }
-                }
-            }
-            State::Bracket => {
-                out.push(c);
-                if c == ']' {
-                    if chars.peek() == Some(&']') {
-                        if let Some(n) = chars.next() {
-                            out.push(n);
-                        }
-                    } else {
-                        state = State::Normal;
-                    }
-                }
-            }
-            State::LineComment => {
-                out.push(c);
-                if c == '\n' || c == '\r' {
-                    state = State::Normal;
-                }
-            }
-            State::BlockComment => {
-                // Non-nesting: the first `*/` closes the comment (msodbcsql parity).
-                out.push(c);
-                if c == '*' && chars.peek() == Some(&'/') {
-                    if let Some(n) = chars.next() {
-                        out.push(n);
-                    }
-                    state = State::Normal;
-                }
-            }
+    while let Some(step) = scan.next_step() {
+        if step.code && step.ch == '?' {
+            count += 1;
+            out.push_str("@P");
+            out.push_str(&count.to_string());
+        } else {
+            out.push_str(&sql[step.start..step.end]);
         }
-
-        prev2 = prev1;
-        prev1 = Some(c);
     }
 
     (out, count)

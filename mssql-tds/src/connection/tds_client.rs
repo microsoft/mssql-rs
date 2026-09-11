@@ -150,6 +150,59 @@ impl CommandTimeoutBudget {
     }
 }
 
+/// Quotes a possibly multi-part procedure name for interpolation into T-SQL.
+///
+/// Each decoded part is bracketed, so no separator, comment or statement
+/// terminator can escape the identifier. The optional `;n` group is preserved.
+fn quote_procedure_name(name: &str) -> TdsResult<String> {
+    let mut chars = name.char_indices().peekable();
+    let mut delimiter = None;
+    let mut group_separator = None;
+    while let Some((i, c)) = chars.next() {
+        match (delimiter, c) {
+            (None, '[') => delimiter = Some(']'),
+            (None, '"') => delimiter = Some('"'),
+            (None, ';') => {
+                group_separator = Some(i);
+                break;
+            }
+            (Some(close), c) if c == close => {
+                if chars.peek().is_some_and(|&(_, next)| next == close) {
+                    chars.next();
+                } else {
+                    delimiter = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let (body, group) = match group_separator.map(|i| (&name[..i], &name[i + 1..])) {
+        Some((body, group)) if !group.is_empty() && group.bytes().all(|b| b.is_ascii_digit()) => {
+            (body, Some(group))
+        }
+        Some(_) => {
+            return Err(UsageError(format!("Invalid procedure name '{name}'")));
+        }
+        None => (name, None),
+    };
+
+    let parts = crate::sql_identifier::parse_multipart_identifier(body, true)?;
+    if parts.iter().flatten().next().is_none_or(String::is_empty)
+        || parts
+            .last()
+            .and_then(Option::as_ref)
+            .is_none_or(String::is_empty)
+    {
+        return Err(UsageError(format!("Invalid procedure name '{name}'")));
+    }
+    let mut quoted = crate::sql_identifier::build_multipart_name(&parts);
+    if let Some(group) = group {
+        quoted.push(';');
+        quoted.push_str(group);
+    }
+    Ok(quoted)
+}
+
 /// State of the `ReturnStatus` token observed while draining the most recent
 /// cursor RPC response. Distinguishes "no token was sent" from an actual raw
 /// status value, so neither case is silently collapsed at interpretation time.
@@ -6057,7 +6110,11 @@ impl TdsClient {
             }
         }
 
-        let mut tsql = format!("EXEC {stored_procedure_name}");
+        // Quoted rather than interpolated raw: with the ODBC {call ...}
+        // escape the procedure name is text lifted straight out of an
+        // application's SQL, so an unquoted name here would be a T-SQL
+        // injection point on Always Encrypted connections.
+        let mut tsql = format!("EXEC {}", quote_procedure_name(stored_procedure_name)?);
         let mut params_decl = String::new();
         let mut first = true;
 
@@ -7527,6 +7584,20 @@ impl TdsClient {
     /// or after [`advance_to_rows()`](Self::advance_to_rows) returns `false`).
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
+    }
+
+    /// Returns the procedure's `RETURN` value from the most recent RPC, or
+    /// `None` when the server sent no `ReturnStatus` (0x79) token.
+    ///
+    /// Like [`get_return_values()`](Self::get_return_values) this is only
+    /// populated once the token stream has been read, so call it after the
+    /// result sets are consumed. ODBC surfaces it as the `{? = call ...}`
+    /// return-status parameter.
+    pub fn get_return_status(&self) -> Option<i32> {
+        match self.last_return_status {
+            ReturnStatus::Received(value) => Some(value),
+            ReturnStatus::NotReceived => None,
+        }
     }
 
     /// Returns the informational (INFO-token) messages captured from the
@@ -13447,7 +13518,9 @@ mod tests {
             TdsClient::build_stored_procedure_describe_request("dbo.my_proc", &[], &params)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC dbo.my_proc @id=@id, @count=@count OUTPUT");
+        // The name is bracketed per part: it is application text on the
+        // ODBC {call ...} path.
+        assert_eq!(tsql, "EXEC [dbo].[my_proc] @id=@id, @count=@count OUTPUT");
         assert_eq!(params_decl, "@id int, @count bigint OUTPUT");
     }
 
@@ -13472,7 +13545,7 @@ mod tests {
             TdsClient::build_stored_procedure_describe_request("proc", &positional, &named)
                 .expect("building the describe request should succeed");
 
-        assert_eq!(tsql, "EXEC proc @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
+        assert_eq!(tsql, "EXEC [proc] @ce_pos_0, @ce_pos_1 OUTPUT, @b=@b");
         assert_eq!(
             params_decl,
             "@ce_pos_0 int, @ce_pos_1 bigint OUTPUT, @b int"
@@ -17351,5 +17424,90 @@ mod tests {
             !client.is_connection_dead(),
             "a class < 20 error must not mark the connection dead"
         );
+    }
+}
+
+#[cfg(test)]
+mod procedure_name_quoting_tests {
+    use super::quote_procedure_name;
+
+    #[test]
+    fn regular_parts_are_bracketed() {
+        assert_eq!(quote_procedure_name("p").unwrap(), "[p]");
+        assert_eq!(quote_procedure_name("dbo.p").unwrap(), "[dbo].[p]");
+        assert_eq!(quote_procedure_name("db.dbo.p").unwrap(), "[db].[dbo].[p]");
+        // An empty middle part is legal: db..proc.
+        assert_eq!(quote_procedure_name("db..p").unwrap(), "[db]..[p]");
+    }
+
+    #[test]
+    fn delimited_parts_are_decoded_and_requoted() {
+        assert_eq!(quote_procedure_name("[my proc]").unwrap(), "[my proc]");
+        assert_eq!(
+            quote_procedure_name("[db].[dbo].[my proc]").unwrap(),
+            "[db].[dbo].[my proc]"
+        );
+        assert_eq!(quote_procedure_name("\"q p\"").unwrap(), "[q p]");
+        assert_eq!(quote_procedure_name("[p]];q]").unwrap(), "[p]];q]");
+        assert_eq!(quote_procedure_name("\"p\"\";q\"").unwrap(), "[p\";q]");
+    }
+
+    #[test]
+    fn group_numbers_survive() {
+        assert_eq!(quote_procedure_name("p;2").unwrap(), "[p];2");
+        assert!(quote_procedure_name("p;").is_err());
+        assert!(quote_procedure_name("p;x").is_err());
+        assert_eq!(quote_procedure_name("[p;q]").unwrap(), "[p;q]");
+        assert_eq!(quote_procedure_name("[p;q];2").unwrap(), "[p;q];2");
+        assert_eq!(quote_procedure_name("\"p;q\";2").unwrap(), "[p;q];2");
+        assert_eq!(quote_procedure_name("[p]];q];2").unwrap(), "[p]];q];2");
+        for name in ["[p;q];", "[p;q];x", "[p;q];2;3", "[p;q];2--x"] {
+            assert!(quote_procedure_name(name).is_err(), "{name}");
+        }
+    }
+
+    /// The point of the quoting: nothing an application can put in a procedure
+    /// name may escape the identifier and become a second statement.
+    #[test]
+    fn injection_attempts_stay_inside_the_identifier() {
+        for name in [
+            "p; DROP TABLE t",
+            "p--comment",
+            "p'x'",
+            "p]; DROP TABLE t--",
+            "p /* c */",
+        ] {
+            // Either outcome is safe: a name that cannot be a group number is
+            // rejected outright, and anything else is bracketed so the payload
+            // stays inside the identifier.
+            let Ok(quoted) = quote_procedure_name(name) else {
+                continue;
+            };
+            assert!(quoted.starts_with('['), "{name} -> {quoted}");
+            assert!(quoted.ends_with(']'), "{name} -> {quoted}");
+            let inner = &quoted[1..quoted.len() - 1];
+            assert!(
+                !inner.contains(']') || inner.contains("]]"),
+                "{name} -> {quoted} leaves an unescaped bracket"
+            );
+        }
+        // A closing bracket is doubled, not passed through.
+        assert_eq!(quote_procedure_name("a]b").unwrap(), "[a]]b]");
+    }
+
+    #[test]
+    fn unterminated_and_overlong_names_are_rejected() {
+        for name in [
+            "[unclosed",
+            "a.b.c.d.e",
+            "[p]x",
+            "[p]/*x*/",
+            "\"p\"x",
+            "",
+            ".p",
+            "p.",
+        ] {
+            assert!(quote_procedure_name(name).is_err(), "{name}");
+        }
     }
 }
