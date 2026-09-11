@@ -91,6 +91,27 @@ extends:
           persistCredentials: true
           fetchDepth: 0
 
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+
+            $runId = 0
+            if (-not [int]::TryParse($env:OFFICIAL_BUILD_RUN_ID, [ref]$runId)) {
+              throw "Invalid Official Build run ID: $env:OFFICIAL_BUILD_RUN_ID"
+            }
+            $uri = "$env:SYSTEM_COLLECTIONURI$env:SYSTEM_TEAMPROJECTID/_apis/build/builds/${runId}?api-version=7.1"
+            $headers = @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }
+            $build = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+            if ($build.status -cne 'completed' -or $build.result -cne 'succeeded') {
+              throw "Official Build $runId is not eligible for release: status='$($build.status)', result='$($build.result)'."
+            }
+            Write-Host "Selected Official Build $runId is completed and succeeded."
+          displayName: 'Require successful Official Build'
+          env:
+            OFFICIAL_BUILD_RUN_ID: $(resources.pipeline.officialBuild.runID)
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+            SYSTEM_TEAMPROJECTID: $(System.TeamProjectId)
+
         - download: officialBuild
           displayName: 'Download all artifacts from Official Build'
 
