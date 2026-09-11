@@ -8,6 +8,12 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Opt-in buffer tests that do not start Tokio or call native libraries.
+[profile.miri-odbc]
+default-filter = 'package(mssqlodbc) & (test(::memory_safety::) | test(conversion::param_buffer::tests::misaligned_))'
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 3 }
+
 # Test groups for tests that need to run sequentially
 # TLS tests have race conditions with macOS Security.framework when creating
 # PKCS12 identities in parallel, so they must run one at a time.

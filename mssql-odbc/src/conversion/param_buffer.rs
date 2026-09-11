@@ -447,6 +447,181 @@ mod tests {
     use crate::api::odbc_types::{SQL_C_DEFAULT, SQL_NO_TOTAL, SQL_PARAM_INPUT, SQL_TINYINT};
     use std::ffi::c_void;
 
+    mod memory_safety {
+        use super::*;
+        use crate::test_support::AlignedBuffer;
+        use std::mem::MaybeUninit;
+
+        fn check_fixed<T: Copy>(c_type: SqlSmallInt, value: T, expected: AppValue) {
+            let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 32]);
+            assert!(size_of::<T>() < storage.0.len());
+            let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<T>();
+            if align_of::<T>() > 1 {
+                assert!(!ptr.is_aligned());
+            }
+            // Initialize only the C type's storage, leaving any over-read visible to Miri.
+            unsafe { ptr.write_unaligned(value) };
+            let mut ind = 0;
+            let p = param(c_type, ptr.cast(), &mut ind);
+            for _ in 0..2 {
+                assert_eq!(read(&p).unwrap().as_ref(), Some(&expected));
+            }
+        }
+
+        #[test]
+        fn fixed_width_reads_use_only_the_initialized_unaligned_value() {
+            check_fixed(SQL_C_STINYINT, -7i8, AppValue::Integer(-7));
+            check_fixed(SQL_C_UTINYINT, u8::MAX, AppValue::Integer(255));
+            check_fixed(
+                SQL_C_SSHORT,
+                i16::MIN,
+                AppValue::Integer(i128::from(i16::MIN)),
+            );
+            check_fixed(
+                SQL_C_USHORT,
+                u16::MAX,
+                AppValue::Integer(i128::from(u16::MAX)),
+            );
+            check_fixed(
+                SQL_C_SLONG,
+                i32::MIN,
+                AppValue::Integer(i128::from(i32::MIN)),
+            );
+            check_fixed(
+                SQL_C_ULONG,
+                u32::MAX,
+                AppValue::Integer(i128::from(u32::MAX)),
+            );
+            check_fixed(
+                SQL_C_SBIGINT,
+                i64::MIN,
+                AppValue::Integer(i128::from(i64::MIN)),
+            );
+            check_fixed(
+                SQL_C_UBIGINT,
+                u64::MAX,
+                AppValue::Integer(i128::from(u64::MAX)),
+            );
+            check_fixed(SQL_C_BIT, 0xFFu8, AppValue::Bit(true));
+            check_fixed(SQL_C_FLOAT, 1.5f32, AppValue::Float(1.5));
+            check_fixed(SQL_C_DOUBLE, -2.5f64, AppValue::Double(-2.5));
+            let guid = SqlGuid {
+                data1: 0x12345678,
+                data2: 0x9ABC,
+                data3: 0xDEF0,
+                data4: [1, 2, 3, 4, 5, 6, 7, 8],
+            };
+            check_fixed(SQL_C_GUID, guid, AppValue::Guid(guid));
+            let numeric = SqlNumericStruct {
+                precision: 38,
+                scale: 2,
+                sign: 1,
+                val: [0x12; 16],
+            };
+            check_fixed(SQL_C_NUMERIC, numeric, AppValue::Numeric(numeric));
+        }
+
+        #[test]
+        fn explicit_byte_lengths_preserve_nuls_without_reading_the_tail() {
+            let mut storage = [MaybeUninit::<u8>::uninit(); 8];
+            for (slot, value) in storage.iter_mut().zip(*b"a\0b") {
+                slot.write(value);
+            }
+            for c_type in [SQL_C_CHAR, SQL_C_BINARY] {
+                let mut ind = 3;
+                let p = param(c_type, storage.as_mut_ptr().cast(), &mut ind);
+                let expected = if c_type == SQL_C_CHAR {
+                    AppValue::NarrowText(b"a\0b".to_vec())
+                } else {
+                    AppValue::Binary(b"a\0b".to_vec())
+                };
+                assert_eq!(read(&p).unwrap(), Some(expected));
+            }
+        }
+
+        #[test]
+        fn explicit_wide_lengths_read_only_complete_unaligned_units() {
+            let mut storage = AlignedBuffer([MaybeUninit::<u8>::uninit(); 16]);
+            let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<u16>();
+            assert!(!ptr.is_aligned());
+            for (i, value) in [u16::from(b'a'), 0, u16::from(b'b')]
+                .into_iter()
+                .enumerate()
+            {
+                // Only these three complete units are initialized.
+                unsafe { ptr.wrapping_add(i).write_unaligned(value) };
+            }
+            for (length, expected) in [(6, &b"a\0\0\0b\0"[..]), (5, &b"a\0\0\0"[..])] {
+                let mut ind = length;
+                let p = param(SQL_C_WCHAR, ptr.cast(), &mut ind);
+                assert_eq!(
+                    read(&p).unwrap(),
+                    Some(AppValue::WideText(expected.to_vec()))
+                );
+            }
+        }
+
+        #[test]
+        fn nts_reads_stop_before_uninitialized_storage() {
+            let mut narrow = [MaybeUninit::<u8>::uninit(); 8];
+            narrow[0].write(b'a');
+            narrow[1].write(0);
+            let mut ind = SqlLen::from(SQL_NTS);
+            let p = param(SQL_C_CHAR, narrow.as_mut_ptr().cast(), &mut ind);
+            assert_eq!(read(&p).unwrap(), Some(AppValue::NarrowText(b"a".to_vec())));
+
+            let mut wide = AlignedBuffer([MaybeUninit::<u8>::uninit(); 16]);
+            let ptr = wide.0.as_mut_ptr().wrapping_add(1).cast::<u16>();
+            assert!(!ptr.is_aligned());
+            // The terminator is the last initialized unit in the caller's string.
+            unsafe {
+                ptr.write_unaligned(u16::from(b'a'));
+                ptr.wrapping_add(1).write_unaligned(0);
+            }
+            let p = param(SQL_C_WCHAR, ptr.cast(), &mut ind);
+            assert_eq!(read(&p).unwrap(), Some(AppValue::WideText(b"a\0".to_vec())));
+        }
+
+        #[test]
+        fn null_parameters_do_not_read_the_value_buffer() {
+            let mut value = MaybeUninit::<SqlTimestampStruct>::uninit();
+            for c_type in [SQL_C_SLONG, SQL_C_DOUBLE, SQL_C_TYPE_TIMESTAMP, SQL_C_WCHAR] {
+                let mut ind = SQL_NULL_DATA;
+                let p = param(c_type, value.as_mut_ptr().cast(), &mut ind);
+                assert_eq!(read(&p).unwrap(), None);
+            }
+        }
+
+        #[test]
+        fn split_indicator_and_length_slots_are_read_unaligned() {
+            let mut slots = AlignedBuffer([0u8; 32]);
+            let base = slots.0.as_mut_ptr();
+            let indicator = base.wrapping_add(1).cast::<SqlLen>();
+            let length = base.wrapping_add(1 + size_of::<SqlLen>()).cast::<SqlLen>();
+            assert!(!indicator.is_aligned());
+            assert!(!length.is_aligned());
+            let mut value = *b"a\0b";
+            let mut p = param(SQL_C_CHAR, value.as_mut_ptr().cast(), indicator);
+            p.octet_length_ptr = length;
+            // Both slots are disjoint and valid for a SqlLen; neither is aligned.
+            unsafe {
+                indicator.write_unaligned(0);
+                length.write_unaligned(3);
+            }
+            assert_eq!(
+                read(&p).unwrap(),
+                Some(AppValue::NarrowText(b"a\0b".to_vec()))
+            );
+            unsafe { indicator.write_unaligned(SQL_NULL_DATA) };
+            assert_eq!(read(&p).unwrap(), None);
+            unsafe {
+                indicator.write_unaligned(0);
+                length.write_unaligned(1);
+            }
+            assert_eq!(read(&p).unwrap(), Some(AppValue::NarrowText(b"a".to_vec())));
+        }
+    }
+
     #[test]
     fn parameter_array_variable_width_strides_use_buffer_length_bytes() {
         for c_type in [SQL_C_CHAR, SQL_C_WCHAR, SQL_C_BINARY] {

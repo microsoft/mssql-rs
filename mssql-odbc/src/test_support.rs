@@ -21,6 +21,10 @@ use crate::api::set_env_attr::sql_set_env_attr;
 use crate::handles::dbc::ConnectionState;
 use crate::handles::{DbcHandle, handle_from_raw};
 
+/// Known alignment for tests that deliberately displace application pointers.
+#[repr(align(8))]
+pub(crate) struct AlignedBuffer<T, const N: usize>(pub(crate) [T; N]);
+
 /// Rebuild an ODBC connection string from a template, expanding the credential
 /// placeholders `<PW>` → `PWD` and `<PASS>` → `PASSWORD`.
 ///

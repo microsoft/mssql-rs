@@ -373,6 +373,118 @@ mod tests {
     };
     use crate::api::odbc_types::{SQL_NTS, SqlInteger, SqlWChar};
 
+    mod memory_safety {
+        use super::*;
+        use crate::api::odbc_types::SqlLen;
+        use crate::test_support::AlignedBuffer;
+        use std::mem::MaybeUninit;
+
+        #[test]
+        fn wide_copies_respect_capacity_at_a_byte_offset() {
+            for text in ["", "a", "a\u{1f600}b"] {
+                let source: Vec<u16> = text.encode_utf16().collect();
+                for direct_encoding in [false, true] {
+                    for capacity in 0..=source.len() + 2 {
+                        let mut storage = AlignedBuffer([0xA5u8; 17]);
+                        assert!(capacity * size_of::<u16>() < storage.0.len());
+                        for _ in 0..2 {
+                            let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<u16>();
+                            assert!(!ptr.is_aligned());
+                            // The displaced destination has room for every declared unit.
+                            let truncated = unsafe {
+                                if direct_encoding {
+                                    copy_utf16_with_nul(ptr, capacity, text)
+                                } else {
+                                    copy_with_nul(ptr, capacity, &source)
+                                }
+                            };
+                            assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
+                            let mut expected = [0xA5; 17];
+                            if capacity != 0 {
+                                for (i, unit) in source
+                                    .iter()
+                                    .copied()
+                                    .take(capacity - 1)
+                                    .chain(std::iter::once(0))
+                                    .enumerate()
+                                {
+                                    expected[1 + i * 2..1 + (i + 1) * 2]
+                                        .copy_from_slice(&unit.to_ne_bytes());
+                                }
+                            }
+                            assert_eq!(storage.0, expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn wide_copies_initialize_only_the_written_prefix() {
+            let text = "a\u{1f600}b";
+            let source: Vec<u16> = text.encode_utf16().collect();
+            for direct_encoding in [false, true] {
+                for capacity in [0usize, 1, 2, 5] {
+                    let mut storage = [MaybeUninit::<u16>::uninit(); 5];
+                    let ptr = storage.as_mut_ptr().cast::<u16>();
+                    // The output is writable but has no initialized value to read.
+                    let truncated = unsafe {
+                        if direct_encoding {
+                            copy_utf16_with_nul(ptr, capacity, text)
+                        } else {
+                            copy_with_nul(ptr, capacity, &source)
+                        }
+                    };
+                    assert_eq!(truncated, source.len() > capacity.saturating_sub(1));
+                    if capacity != 0 {
+                        let expected = source
+                            .iter()
+                            .copied()
+                            .take(capacity - 1)
+                            .chain(std::iter::once(0));
+                        for (actual, expected) in storage.iter().zip(expected) {
+                            // Only the copied prefix and its terminator are initialized.
+                            assert_eq!(unsafe { actual.assume_init() }, expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn scalar_out_parameter_writes_stay_inside_the_unaligned_slot() {
+            let mut storage = AlignedBuffer([0xA5u8; 24]);
+            for value in [SqlLen::MIN, 42, SqlLen::MAX] {
+                let ptr = storage.0.as_mut_ptr().wrapping_add(1).cast::<SqlLen>();
+                assert!(!ptr.is_aligned());
+                // The slot is writable for one SqlLen, independently of its alignment.
+                unsafe { write_if_some(ptr, value) };
+                let mut expected = [0xA5; 24];
+                expected[1..1 + size_of::<SqlLen>()].copy_from_slice(&value.to_ne_bytes());
+                assert_eq!(storage.0, expected);
+            }
+        }
+
+        #[test]
+        fn utf16_reads_stop_at_the_initialized_extent() {
+            let mut storage = [MaybeUninit::<u16>::uninit(); 4];
+            storage[0].write(u16::from(b'a'));
+            storage[1].write(0);
+            let ptr = storage.as_ptr().cast::<u16>();
+            for _ in 0..2 {
+                // Two initialized units, including the terminator; the tail is unreadable.
+                unsafe {
+                    assert_eq!(read_utf16(ptr, SQL_NTS), "a");
+                    assert_eq!(read_utf16_long(ptr, SqlInteger::from(SQL_NTS)), "a");
+                    assert_eq!(read_utf16_attr(ptr, SqlInteger::from(SQL_NTS)), "a");
+                    assert_eq!(read_utf16(ptr, 2), "a\0");
+                    assert_eq!(read_utf16_long(ptr, 2), "a\0");
+                    assert_eq!(read_utf16_attr(ptr, 4), "a\0");
+                }
+            }
+        }
+    }
+
     #[test]
     fn rewrite_no_markers_is_unchanged() {
         let (out, n) = rewrite_param_markers("SELECT 1");
