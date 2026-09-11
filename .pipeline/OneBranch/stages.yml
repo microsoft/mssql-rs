@@ -302,6 +302,7 @@ stages:
             --drivers-dir "$(Build.SourcesDirectory)/drivers"
         displayName: 'Inject ODBC driver into wheels (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    - ${{ if eq(parameters.buildPythonWheels, true) }}:
       - script: |
           set -e
           sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
@@ -439,6 +440,7 @@ stages:
               --drivers-dir "$(Build.SourcesDirectory)/drivers"
           displayName: 'Inject ODBC driver into wheels (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if eq(parameters.buildPythonWheels, true) }}:
         - script: |
             set -e
             sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"

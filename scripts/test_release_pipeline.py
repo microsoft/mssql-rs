@@ -133,6 +133,10 @@ def test_pypi_release_switch_graph(publish: bool) -> None:
     job = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]
     steps = job["steps"]
     names = [step.get("displayName") for step in steps]
+    assert names.count("Require successful Official Build") == 1
+    assert names.index("Require successful Official Build") < names.index(
+        "Download all artifacts from Official Build"
+    )
     assert names.count("Verify and stage official wheels") == 1
     assert ("Require stable branch for publish" in names) == publish
     assert ("ESRP Release mssql-python-rs wheels to PyPI" in names) == publish
@@ -148,6 +152,72 @@ def test_pypi_release_switch_graph(publish: bool) -> None:
     else:
         esrp = next(step for step in steps if step.get("task", "").startswith("EsrpRelease@"))
         assert esrp["inputs"]["FolderLocation"] == "$(Agent.TempDirectory)/pypi-publish"
+
+
+@pytest.mark.parametrize(
+    ("status", "result", "succeeds"),
+    [
+        ("completed", "succeeded", True),
+        ("completed", "failed", False),
+        ("completed", "partiallySucceeded", False),
+        ("completed", "canceled", False),
+        ("inProgress", "", False),
+        ("notStarted", "", False),
+    ],
+)
+def test_pypi_release_requires_successful_official_build(
+    status: str, result: str, succeeds: bool
+) -> None:
+    pipeline = expand(
+        yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8")),
+        {"publishToPyPI": False},
+    )
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    script = next(
+        step["pwsh"]
+        for step in steps
+        if step.get("displayName") == "Require successful Official Build"
+    )
+    stub = r"""
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers)
+        if ($Method -cne 'Get') { throw "Unexpected method: $Method" }
+        if ($Uri -cne 'https://dev.azure.com/test/project-id/_apis/build/builds/123?api-version=7.1') {
+            throw "Unexpected URI: $Uri"
+        }
+        if ($Headers.Authorization -cne 'Bearer test-token') {
+            throw "Unexpected authorization header"
+        }
+        [pscustomobject]@{
+            status = $env:MOCK_BUILD_STATUS
+            result = $env:MOCK_BUILD_RESULT
+        }
+    }
+    """
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_RUN_ID": "123",
+            "SYSTEM_ACCESSTOKEN": "test-token",
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/test/",
+            "SYSTEM_TEAMPROJECTID": "project-id",
+            "MOCK_BUILD_STATUS": status,
+            "MOCK_BUILD_RESULT": result,
+        },
+    )
+
+    assert (completed.returncode == 0) == succeeds
+    if succeeds:
+        assert "Selected Official Build 123 is completed and succeeded." in completed.stdout
+    else:
+        assert (
+            f"Official Build 123 is not eligible for release: status='{status}', "
+            f"result='{result}'."
+        ) in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -304,6 +374,30 @@ def test_crate_templates_resolve_in_self_repository():
         re.MULTILINE,
     )
     assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
+
+
+@pytest.mark.parametrize("architecture", ("x64", "ARM64"))
+@pytest.mark.parametrize("build_odbc", (False, True))
+def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc: bool) -> None:
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": build_odbc,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": True,
+    }
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job["job"] == f"Linux_{architecture}")
+    names = [step.get("displayName") for step in job["steps"]]
+    repair = f"Repair glibc wheels into manylinux (Linux {architecture})"
+    injection = f"Inject ODBC driver into wheels (Linux {architecture})"
+
+    assert names.count(repair) == 1
+    assert (injection in names) == build_odbc
+    if build_odbc:
+        assert names.index(injection) < names.index(repair)
 
 
 @pytest.mark.parametrize(
