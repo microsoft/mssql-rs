@@ -54,6 +54,8 @@
 //  28.  ArrayOfAThousandSetsWritesEveryRowInOrder  - depth: packing, drain, order
 //  29.  ThousandSetArrayCorrelatesFailuresToTheirOwnSets - boundary sets 0/499/999
 //  30.  CursorApiAfterARowReturningArrayExecute    - AB#47944 as the app sees it
+//  30b. PendingArrayResultKeepsConnectionBusy     - unread sets retain the wire
+//  30c. ClosingArrayCursorReleasesConnection      - close drains unread sets
 //  31.  PreparedStatementReExecutesAtDifferentArraySizes - 4 -> 7 -> 2
 //  32.  TimestampoffsetArrayStridesByItsStructSize - fixed struct, not BufferLength
 //  32b. Time2ArrayStridesByItsStructSize          - the sibling C type
@@ -1806,6 +1808,50 @@ TEST_F(ParamArrayTest, CursorApiAfterARowReturningArrayExecute) {
     FetchIntResult(1);
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(6, ScalarInt("SELECT COUNT(*) FROM #pa_out3"));
+}
+
+TEST_F(ParamArrayTest, PendingArrayResultKeepsConnectionBusy) {
+    Prepare("SELECT CAST(? AS int)");
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    BindIntArray(values, indicators, 2);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+
+    SQLHSTMT probe = AllocStmt();
+    SqlTString select = ODBCTestUtils::ToSqlTStr("SELECT 20");
+    EXPECT_EQ(SQL_ERROR,
+              SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, probe, "HY000");
+
+    ASSERT_EQ(SQL_SUCCESS, SQLMoreResults(stmt_));
+    FetchIntResult(2);
+    ASSERT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
+    ASSERT_SQL_OK(
+        SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS),
+        SQL_HANDLE_STMT, probe);
+    FreeStmt(probe);
+}
+
+TEST_F(ParamArrayTest, ClosingArrayCursorReleasesConnection) {
+    Prepare("SELECT CAST(? AS int)");
+    SQLINTEGER values[2] = {1, 2};
+    SQLLEN indicators[2] = {};
+    BindIntArray(values, indicators, 2);
+    ASSERT_EQ(SQL_SUCCESS, SQLExecute(stmt_));
+    FetchIntResult(1);
+
+    SQLHSTMT probe = AllocStmt();
+    SqlTString select = ODBCTestUtils::ToSqlTStr("SELECT 20");
+    EXPECT_EQ(SQL_ERROR,
+              SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, probe, "HY000");
+
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        SQLExecDirect(probe, const_cast<SQLTCHAR*>(select.c_str()), SQL_NTS),
+        SQL_HANDLE_STMT, probe);
+    FreeStmt(probe);
 }
 
 TEST_F(ParamArrayTest, ProcedureArrayDeliversEveryResultSet) {
