@@ -42,6 +42,12 @@ _OTHERS = [
 _FAKE_PRODUCE = r"""#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >> "$AUDITWHEEL_LOG"
+# Mirror auditwheel: AUDITWHEEL_PLAT feeds --plat's default and is validated as an
+# arch-suffixed tag, so an arch-less value aborts the tool.
+if [ -n "${AUDITWHEEL_PLAT:-}" ] && [[ "$AUDITWHEEL_PLAT" != *_x86_64 && "$AUDITWHEEL_PLAT" != *_aarch64 ]]; then
+  echo "auditwheel: invalid --plat from AUDITWHEEL_PLAT=$AUDITWHEEL_PLAT" >&2
+  exit 1
+fi
 plat=""; wheeldir=""; wheel=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -96,10 +102,11 @@ def _setup(tmp_path: Path, names: list[str], fake_body: str) -> None:
     (tmp_path / "auditwheel.log").write_text("")
 
 
-def _run(tmp_path: Path) -> subprocess.CompletedProcess[str]:
+def _run(tmp_path: Path, extra_exports: str = "") -> subprocess.CompletedProcess[str]:
     # Export inside the shell: WSL does not inherit custom Windows env vars, and
     # relative paths resolve identically under WSL, Git bash, and native Linux.
     command = (
+        f"{extra_exports}"
         "export AUDITWHEEL_BIN=./bin/auditwheel AUDITWHEEL_LOG=./auditwheel.log; "
         "chmod +x ./bin/auditwheel && exec bash ./repair.sh wheels"
     )
@@ -162,3 +169,17 @@ def test_fails_when_auditwheel_emits_lower_tag(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "expected platform tag" in result.stderr
+
+
+def test_ignores_stray_auditwheel_plat_env(tmp_path: Path) -> None:
+    # AUDITWHEEL_PLAT is auditwheel's own reserved variable; an arch-less value
+    # aborts auditwheel at parser construction. The script must clear it so the
+    # fake (which mirrors that validation) is never handed the stray value.
+    _setup(tmp_path, _GLIBC, _FAKE_PRODUCE)
+
+    result = _run(tmp_path, extra_exports="export AUDITWHEEL_PLAT=manylinux_2_34; ")
+
+    assert result.returncode == 0, result.stderr
+    present = {p.name for p in (tmp_path / "wheels").glob("*.whl")}
+    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_x86_64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_aarch64.whl" in present

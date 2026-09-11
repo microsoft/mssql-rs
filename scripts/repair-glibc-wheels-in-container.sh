@@ -10,8 +10,13 @@
 set -euo pipefail
 
 WHEELS_DIR="${1:?usage: repair-glibc-wheels-in-container.sh <wheels-dir>}"
-PLAT="${AUDITWHEEL_PLAT:-manylinux_2_34}"
+PLAT="${REPAIR_PLAT:-manylinux_2_34}"
 AUDITWHEEL_BIN="${AUDITWHEEL_BIN:-auditwheel}"
+
+# auditwheel reads AUDITWHEEL_PLAT as the default for --plat and validates it at
+# parser-construction time, so a stray/arch-less value aborts before our explicit
+# --plat is seen. We always pass --plat, so clear it.
+unset AUDITWHEEL_PLAT
 
 if ! command -v "$AUDITWHEEL_BIN" >/dev/null 2>&1; then
     echo "ERROR: auditwheel not found in container" >&2
