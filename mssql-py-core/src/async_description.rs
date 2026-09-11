@@ -111,7 +111,7 @@ fn imported_python_type<'py>(
 }
 
 fn column_size(metadata: &ColumnMetadata) -> u64 {
-    if metadata.is_plp() {
+    if metadata.effective_is_plp() {
         return 0;
     }
 
