@@ -306,6 +306,30 @@ def test_crate_templates_resolve_in_self_repository():
     assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
 
 
+@pytest.mark.parametrize("architecture", ("x64", "ARM64"))
+@pytest.mark.parametrize("build_odbc", (False, True))
+def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc: bool) -> None:
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": build_odbc,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": True,
+    }
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job["job"] == f"Linux_{architecture}")
+    names = [step.get("displayName") for step in job["steps"]]
+    repair = f"Repair glibc wheels into manylinux (Linux {architecture})"
+    injection = f"Inject ODBC driver into wheels (Linux {architecture})"
+
+    assert names.count(repair) == 1
+    assert (injection in names) == build_odbc
+    if build_odbc:
+        assert names.index(injection) < names.index(repair)
+
+
 @pytest.mark.parametrize(
     ("build_reason", "is_official", "expected_version"),
     [
