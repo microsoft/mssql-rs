@@ -264,14 +264,9 @@ fn validate_trace_directory(dir: &Path) -> Result<(), String> {
             .metadata()
             .map_err(|error| format!("could not inspect trace directory {dir:?}: {error}"))?;
         let mode = metadata.permissions().mode();
-        if mode & 0o002 != 0 && mode & 0o1000 == 0 {
-            return Err(format!(
-                "{ENV_TRACE_DIR} must not be world-writable without the sticky bit: {dir:?}"
-            ));
-        }
-        if mode & 0o020 != 0 {
+        if mode & 0o022 != 0 {
             report(format_args!(
-                "[mssql-odbc] WARNING: {ENV_TRACE_DIR} is group-writable. Ensure every user with write access is trusted: {dir:?}"
+                "[mssql-odbc] WARNING: {ENV_TRACE_DIR} is writable by group or other users. Ensure every user with write access is trusted: {dir:?}"
             ));
         }
     }
@@ -451,24 +446,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn group_writable_trace_directory_is_allowed() {
+    fn group_and_world_writable_trace_directories_are_allowed() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = test_directory("group-writable");
+        let dir = test_directory("writable");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
-
         assert!(validate_trace_directory(&dir).is_ok());
-        remove_dir_all(dir).unwrap();
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn world_writable_trace_directory_requires_sticky_bit() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = test_directory("world-writable");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(validate_trace_directory(&dir).is_err());
+        assert!(validate_trace_directory(&dir).is_ok());
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
         assert!(validate_trace_directory(&dir).is_ok());

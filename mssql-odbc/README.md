@@ -99,11 +99,11 @@ continue onto subsequent lines. General span fields are excluded because they ca
 and parameter values. Event fields may still contain sensitive data; configure a trusted directory
 whose permissions are appropriate for it.
 
-On Unix, trace files are created with mode `0600`. The driver rejects world-writable directories
-without the sticky bit, warns for group-writable directories, and warns when the directory is inside
-the system temporary directory. Relative directories, including `.`, are resolved when the first
-ODBC call captures the configuration and are unaffected by later changes to the host process's
-current directory. Configuration cannot be changed while the driver remains loaded.
+On Unix, trace files are created with mode `0600`. The driver warns for directories writable by
+group or other users and when the directory is inside the system temporary directory. Relative
+directories, including `.`, are resolved when the first ODBC call captures the configuration and
+are unaffected by later changes to the host process's current directory. Configuration cannot be
+changed while the driver remains loaded.
 
 File tracing is intended for diagnostics. The driver opens and closes the file for each event so it
 does not retain an operating-system handle after the unloadable driver library is released. This
