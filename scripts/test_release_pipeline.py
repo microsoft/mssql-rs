@@ -346,13 +346,20 @@ def test_release_switch_graph(values):
             assert all('git -C "$(Build.SourcesDirectory)"' in line for line in git_commands)
 
 
-@pytest.mark.parametrize("failed_gate", [
-    "PublishRelease", "ValidateCrates", "RegistryPreflight",
-    "PublishCore", "CoreAvailable", "PublishMock", "MockAvailable",
+@pytest.mark.parametrize(("core", "failed_gate"), [
+    (core, gate)
+    for core in (False, True)
+    for gate in (
+        "PublishRelease", "ValidateCrates", "RegistryPreflight",
+        "PublishCore", "CoreAvailable", "PublishMock", "MockAvailable",
+    )
+    if core or gate not in ("PublishCore", "CoreAvailable")
 ])
 @pytest.mark.parametrize("result", ["Failed", "Canceled", "Skipped"])
-def test_release_gate_failure_propagation(failed_gate, result):
-    flags = dict.fromkeys(_SWITCHES, True) | {"validateCratesOnly": False}
+def test_release_gate_failure_propagation(core, failed_gate, result):
+    flags = dict.fromkeys(_SWITCHES, True) | {
+        "publishMssqlTds": core, "validateCratesOnly": False,
+    }
     pipeline = expand(yaml.safe_load(_PIPELINE.read_text(encoding="utf-8")), flags)
     stages = {stage["stage"]: stage for stage in pipeline["extends"]["parameters"]["stages"]}
     results = {}
@@ -376,7 +383,7 @@ def test_release_gate_failure_propagation(failed_gate, result):
         assert results["MockAvailable"] != "Succeeded"
         if failed_gate not in ("PublishMock", "MockAvailable"):
             assert results["PublishMock"] == "Skipped"
-        if failed_gate in ("ValidateCrates", "RegistryPreflight"):
+        if core and failed_gate in ("ValidateCrates", "RegistryPreflight"):
             assert results["PublishCore"] == "Skipped"
     assert stages["Tag"]["dependsOn"] == "Release"
 
@@ -442,8 +449,17 @@ def test_cratesio_http_states(tmp_path, state, responses, success, requests):
         assert "is available" not in result.stdout
 
 
-@pytest.mark.parametrize("damage", [None, "hash", "dependency", "missing", "extra", "order"])
-def test_crate_artifact_revalidation(tmp_path, damage):
+@pytest.mark.parametrize(("damage", "damaged_name"), [
+    (None, None),
+    ("hash", "mssql-tds"),
+    ("hash", "mssql-mock-tds"),
+    ("dependency", "mssql-mock-tds"),
+    ("missing", "mssql-tds"),
+    ("missing", "mssql-mock-tds"),
+    ("extra", None),
+    ("order", None),
+])
+def test_crate_artifact_revalidation(tmp_path, damage, damaged_name):
     entries = []
     for name in ("mssql-tds", "mssql-mock-tds"):
         folder = tmp_path / name
@@ -462,10 +478,12 @@ def test_crate_artifact_revalidation(tmp_path, damage):
             "name": name, "version": "0.1.0", "file": f"{name}/{crate.name}",
             "sha256": hashlib.sha256(crate.read_bytes()).hexdigest(),
         })
-    if damage == "hash":
-        crate.write_bytes(b"replaced after preflight")
-    elif damage == "missing":
-        crate.unlink()
+    if damage in ("hash", "missing"):
+        damaged_crate = tmp_path / damaged_name / f"{damaged_name}-0.1.0.crate"
+        if damage == "hash":
+            damaged_crate.write_bytes(b"replaced after preflight")
+        else:
+            damaged_crate.unlink()
     elif damage == "extra":
         (tmp_path / "extra.crate").write_bytes(b"unexpected")
     elif damage == "order":

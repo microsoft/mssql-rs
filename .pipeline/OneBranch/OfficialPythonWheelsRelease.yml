@@ -229,12 +229,14 @@ extends:
     ###########################################################################
     # Rust: offline integrity -> registry preflight -> ESRP -> availability.
     # Read-only custom jobs run on Azure Pipelines, never in isolated containers.
+    # They publish no artifacts, so ob_outputDirectory is not required.
     ###########################################################################
     - ${{ if or(eq(parameters.publishMssqlTds, true), eq(parameters.publishMssqlMockTds, true), eq(parameters.validateCratesOnly, true)) }}:
       - stage: ReleaseCrates
         displayName: 'Release Rust Crates'
         dependsOn: []
         jobs:
+        # Keep an isolated integrity gate before artifacts reach a network job.
         - job: ValidateCrates
           displayName: 'Validate Rust crate artifacts'
           pool:

@@ -319,8 +319,9 @@ Governed Git jobs configure OneBranch's built-in checkout with `ob_git_fetchDept
 checkout can relocate the repository while governed task restrictions prevent
 updating the source path. Git commands use the explicit source directory, and
 wheel validation and packaging remain inside the governed build container.
-Custom registry jobs have one explicit `checkout: self`, since their template
-does not inject a checkout.
+Custom registry jobs declare an explicit `checkout: self`, which replaces Azure
+Pipelines' implicit checkout rather than adding a second one. Native template
+preview confirms exactly one checkout per job.
 
 For release-pipeline changes, use the ADO Preview API first to inspect expanded
 gates and OneBranch policy/checkout settings without queuing a run. Preview proves
