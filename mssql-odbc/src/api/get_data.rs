@@ -3154,6 +3154,19 @@ mod tests {
     }
 
     #[test]
+    fn internal_typed_conversion_failure_posts_driver_error() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+
+        assert_eq!(
+            finish_typed_conv(&mut state, Err(ConvError::Internal)),
+            SQL_ERROR
+        );
+        assert_last_diag(&state.diag_records, ERR_INTERNAL_CONVERSION);
+    }
+
+    #[test]
     fn direct_captured_utf8_chunks_without_transcoding() {
         let value = ColumnValues::String(SqlString::new(b"abcdef".to_vec(), EncodingType::Utf8));
         let mut first = [0_u8; 4];

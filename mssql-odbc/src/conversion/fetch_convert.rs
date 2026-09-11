@@ -576,12 +576,10 @@ pub(crate) unsafe fn convert_datetime_c(
                 strlen_or_ind_ptr,
             )
         },
-        // Reached when the value lacks the component the target needs. Two
-        // cases land here: `time` into `SQL_C_TYPE_DATE`, which is correct, and
-        // `time` into `SQL_C_TYPE_TIMESTAMP`, which Appendix D says should fill
-        // in the current date instead (AB#47247). For character input the
-        // pairing is legal and it is the text that is wrong for this target, so
-        // that stays 22018 rather than becoming 07006.
+        // Reached when the value lacks the component the target needs, such as
+        // `time` into `SQL_C_TYPE_DATE`. For character input the pairing is
+        // legal and it is the text that is wrong for this target, so that stays
+        // 22018 rather than becoming 07006.
         _ => {
             return Err(if from_character {
                 ConvError::InvalidCharacterValue

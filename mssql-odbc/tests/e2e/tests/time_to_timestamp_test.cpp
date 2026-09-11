@@ -91,6 +91,10 @@ TEST_F(TimeToTimestampLiveTest, TimeColumnWidensToTodaysDate) {
                          56, 789000000);
 }
 
+TEST_F(TimeToTimestampLiveTest, ZeroScaleTimeColumnWidensToTodaysDate) {
+    ExpectWidenedToToday("SELECT CAST('12:34:56' AS TIME(0))", SQL_C_TYPE_TIMESTAMP, 12, 34, 56, 0);
+}
+
 // time(7) carries 100ns resolution, which the timestamp struct keeps.
 TEST_F(TimeToTimestampLiveTest, TimeColumnKeepsHundredNanosecondResolution) {
     ExpectWidenedToToday("SELECT CAST('12:34:56.1234567' AS TIME(7))", SQL_C_TYPE_TIMESTAMP, 12,

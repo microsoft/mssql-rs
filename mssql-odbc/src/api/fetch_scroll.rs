@@ -2193,15 +2193,7 @@ unsafe fn deliver_bound(
         let converted = unsafe {
             convert_typed_c(value, binding.target_type, slot as SqlPointer, octet_length)
         };
-        return match converted {
-            Ok(ConvOk::Exact) => RowOutcome::Success,
-            Ok(ConvOk::Truncated) => RowOutcome::Info(RowIssue::FractionalTruncated),
-            Err(ConvError::OutOfRange) => RowOutcome::Error(RowIssue::OutOfRange),
-            Err(ConvError::Restricted) => RowOutcome::Error(RowIssue::Restricted),
-            Err(ConvError::InvalidCharacterValue) => RowOutcome::Error(RowIssue::InvalidCharacter),
-            Err(ConvError::Internal) => RowOutcome::Error(RowIssue::Internal),
-            Err(ConvError::NotHandledHere) => RowOutcome::Error(RowIssue::Unsupported),
-        };
+        return typed_conv_outcome(converted);
     }
 
     if binding.target_type == SQL_C_BINARY {
@@ -2249,6 +2241,18 @@ unsafe fn deliver_bound(
         }
     }
     RowOutcome::Success
+}
+
+fn typed_conv_outcome(converted: Result<ConvOk, ConvError>) -> RowOutcome {
+    match converted {
+        Ok(ConvOk::Exact) => RowOutcome::Success,
+        Ok(ConvOk::Truncated) => RowOutcome::Info(RowIssue::FractionalTruncated),
+        Err(ConvError::OutOfRange) => RowOutcome::Error(RowIssue::OutOfRange),
+        Err(ConvError::Restricted) => RowOutcome::Error(RowIssue::Restricted),
+        Err(ConvError::InvalidCharacterValue) => RowOutcome::Error(RowIssue::InvalidCharacter),
+        Err(ConvError::Internal) => RowOutcome::Error(RowIssue::Internal),
+        Err(ConvError::NotHandledHere) => RowOutcome::Error(RowIssue::Unsupported),
+    }
 }
 
 /// Writes one exact fixed-width value and its byte-count indicator.
@@ -4610,6 +4614,14 @@ mod tests {
                 "{issue:?}"
             );
         }
+    }
+
+    #[test]
+    fn internal_typed_conversion_failure_is_a_row_error() {
+        assert_eq!(
+            typed_conv_outcome(Err(ConvError::Internal)),
+            RowOutcome::Error(RowIssue::Internal)
+        );
     }
 
     /// The rows the fetch did not fill must be marked, or the application reads
