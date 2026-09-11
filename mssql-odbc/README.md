@@ -155,6 +155,32 @@ unread results without executing any parameter set again.
 `SQLGetInfo(SQL_PARAM_ARRAY_SELECTS)` reports `SQL_PAS_BATCH`. Non-row-returning
 arrays still complete during `SQLExecute` and report their aggregate row count.
 
+## Handle and binding lifetimes
+
+Driver handles are nonreused, pointer-sized IDs, not allocation addresses.
+Typed registry acquisition returns an owned guard that keeps the handle and
+its parents alive through the call. Free retires the ID; storage is released
+after its remaining owners finish. A statement's four implicit descriptor IDs
+retire with the statement, even if its allocation is still retained.
+
+Binding snapshots also hold use leases. Changing or freeing an in-use
+descriptor, including one shared by several statements, returns `HY010`
+rather than allowing an application to reclaim a buffer still being accessed.
+Association changes, snapshot admission, and binding mutations share a short
+DBC lock; that lock is released before network I/O. Close/disconnect admission
+separately excludes executing dependent calls, without treating an idle cursor
+or parked data-at-execution sequence as a permanently active API call.
+
+The public ODBC ABI is unchanged. Applications must still keep bound buffers
+valid and must not unload the driver while calls are executing. Normal final
+ENV cleanup still joins driver-owned runtime workers before returning.
+
+Ownership uses standard `Arc` behind the internal handle registry. It does not
+select a custom allocator or implement SQL OS hosting. A future embedded DLL
+may use a module-scoped allocator, but its memory services must outlive all
+allocations and reference-count control blocks, not merely the last public
+handle ID.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read

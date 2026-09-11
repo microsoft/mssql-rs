@@ -1471,10 +1471,8 @@ impl HasDiagnostics for StmtState {
     }
 }
 
-// SAFETY: The raw pointer `parent_dbc` prevents auto-impl of Send/Sync.
-// `parent_dbc` is set once at construction and never mutated. The parent DBC
-// is guaranteed alive because the DM ensures all STMTs are freed before
-// calling SQLFreeConnect on the parent DBC.
+// SAFETY: handle values are opaque IDs. The parent is strongly retained,
+// mutable state is mutex-protected, and application-buffer use is leased.
 unsafe impl Send for StmtHandle {}
 unsafe impl Sync for StmtHandle {}
 

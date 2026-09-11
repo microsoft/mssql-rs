@@ -439,10 +439,8 @@ impl HasDiagnostics for DescState {
 // opaque application-owned address: copied in by
 // `SQLSetDescFieldW`/`SQLSetStmtAttrW`, copied out by
 // `SQLGetDescFieldW`/`SQLGetStmtAttrW`, and never dereferenced by this
-// module. `parent_dbc` is set once at construction and never mutated, and the
-// parent DBC is guaranteed alive because the DM ensures every descriptor —
-// implicit (freed with its owning statement) or explicit (freed by
-// `SQLFreeHandle(SQL_HANDLE_DESC)`) — is freed before its connection. The
+// module. `parent_dbc` is an immutable ID; the parent DBC is strongly retained.
+// Binding-use leases exclude mutation while snapshots use application buffers. The
 // Driver Manager may legitimately call ODBC entry points for the same handle
 // from different threads (serialized by `inner`'s mutex), so the handle
 // itself must be `Send + Sync`.

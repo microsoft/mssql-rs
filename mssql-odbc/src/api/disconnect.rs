@@ -7,8 +7,7 @@ use tracing::{debug, error};
 
 use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
 use crate::api::sqlstate::{
-    ERR_CONNECTION_DOES_NOT_EXIST, ERR_FUNCTION_SEQUENCE, ERR_INVALID_TRANSACTION_STATE,
-    ERR_MEMORY_ALLOCATION, post_diag,
+    ERR_CONNECTION_DOES_NOT_EXIST, ERR_INVALID_TRANSACTION_STATE, ERR_MEMORY_ALLOCATION, post_diag,
 };
 use crate::api::txn::rollback_before_disconnect;
 use crate::error::free_errors;
@@ -98,7 +97,7 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
                 Ok(stmt) => statements.push((raw, stmt.into_arc())),
                 Err(error) => {
                     error!(?error, "SQLDisconnect: statement acquisition failed");
-                    post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+                    error.post(&mut state);
                     return SQL_ERROR;
                 }
             }
@@ -108,7 +107,7 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
                 Ok(desc) => descriptors.push((raw, desc.into_arc())),
                 Err(error) => {
                     error!(?error, "SQLDisconnect: descriptor acquisition failed");
-                    post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+                    error.post(&mut state);
                     return SQL_ERROR;
                 }
             }
@@ -117,7 +116,7 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
             Ok(closing) => closing,
             Err(error) => {
                 error!(?error, "SQLDisconnect: dependent operation is active");
-                post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+                error.post(&mut state);
                 return SQL_ERROR;
             }
         };
@@ -145,6 +144,7 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
         }
         if let Err(error) = retire_handle(&**stmt, *stmt_ptr) {
             error!(?error, "SQLDisconnect: statement retirement failed");
+            error.post(&mut state);
             return SQL_ERROR;
         }
         state.statements.retain(|raw| raw != stmt_ptr);
@@ -170,6 +170,7 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
         }
         if let Err(error) = retire_handle(&**desc, *desc_ptr) {
             error!(?error, "SQLDisconnect: descriptor retirement failed");
+            error.post(&mut state);
             return SQL_ERROR;
         }
         state.descriptors.retain(|raw| raw != desc_ptr);

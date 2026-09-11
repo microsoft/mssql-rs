@@ -203,10 +203,14 @@ mod tests {
         done_no_more, int_columns, tds_client_from_int_rows, tds_client_from_tokens,
     };
 
+    /// # Safety
+    /// `stmt` must be a live statement owned by the test fixture.
     unsafe fn sql_free_stmt_unbind(stmt: SqlHandle) -> SqlReturn {
         unsafe { SQLFreeStmt(stmt, SQL_UNBIND) }
     }
 
+    /// # Safety
+    /// `stmt` must be a live statement owned by the test fixture.
     unsafe fn sql_free_stmt_reset_params(stmt: SqlHandle) -> SqlReturn {
         unsafe { SQLFreeStmt(stmt, SQL_RESET_PARAMS) }
     }
@@ -491,13 +495,16 @@ mod tests {
     fn parameter_leases_cover_snapshot_reads_and_array_staging() {
         for (phase, array) in [(Phase::Parameters, false), (Phase::ParameterRows, true)] {
             let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
             let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
             let apd = owned_descriptor(h.apd()).unwrap();
             let ipd = owned_descriptor(h.ipd()).unwrap();
             let sql: Vec<u16> = "SELECT ?\0".encode_utf16().collect();
             assert_eq!(
                 unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) },
-                SQL_SUCCESS
+                SQL_SUCCESS,
+                "{:?}",
+                stmt.inner.lock().unwrap().diag_records,
             );
             let mut values = [7_i32, 8];
             let mut indicators = [4_isize; 2];
@@ -786,13 +793,28 @@ mod tests {
             SQL_SUCCESS
         );
         assert_eq!(
-            bind_int(h.stmt, 2, token_ptr, &raw mut dae_length),
+            unsafe {
+                sql_bind_parameter(
+                    h.stmt,
+                    2,
+                    SQL_PARAM_INPUT,
+                    SQL_C_CHAR,
+                    SQL_INTEGER,
+                    10,
+                    0,
+                    token_ptr,
+                    1,
+                    &raw mut dae_length,
+                )
+            },
             SQL_SUCCESS
         );
         let sql: Vec<u16> = "SELECT ?, ?\0".encode_utf16().collect();
         assert_eq!(
             unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
-            SQL_NEED_DATA
+            SQL_NEED_DATA,
+            "{:?}",
+            stmt.inner.lock().unwrap().diag_records,
         );
         assert!(!stmt.param_binding_use.is_active());
         assert!(!apd.binding_use.is_active());
@@ -800,16 +822,33 @@ mod tests {
         assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_SUCCESS);
         first = 99;
         first_length = SQL_NULL_DATA;
+        {
+            let state = stmt.inner.lock().unwrap();
+            let dae = state.dae.as_ref().unwrap();
+            assert!(dae.deferred);
+            let expected = mssql_tds::message::parameters::rpc_parameters::RpcParameter::new(
+                Some("@P1".into()),
+                mssql_tds::message::parameters::rpc_parameters::StatusFlags::NONE,
+                mssql_tds::datatypes::sqltypes::SqlType::Int(Some(7)),
+            );
+            assert_eq!(format!("{:?}", dae.prebuilt[0]), format!("{expected:?}"));
+        }
         let mut returned = ptr::null_mut();
         assert_eq!(
             unsafe { sql_param_data(h.stmt, &raw mut returned) },
             SQL_NEED_DATA
         );
         assert_eq!(returned, token_ptr);
-        assert_eq!(unsafe { sql_put_data(h.stmt, token_ptr, 4) }, SQL_SUCCESS);
+        let mut chunk = *b"8";
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, chunk.as_mut_ptr().cast(), 1) },
+            SQL_SUCCESS
+        );
         assert_eq!(
             unsafe { sql_param_data(h.stmt, &raw mut returned) },
-            SQL_SUCCESS
+            SQL_SUCCESS,
+            "{:?}",
+            stmt.inner.lock().unwrap().diag_records,
         );
         assert_eq!(first, 99);
         assert_eq!(first_length, SQL_NULL_DATA);

@@ -51,6 +51,19 @@ impl RegistryError {
             _ => SQL_ERROR,
         }
     }
+
+    pub(crate) fn post(&self, state: &mut impl crate::error::HasDiagnostics) {
+        use crate::api::sqlstate::{
+            ERR_FUNCTION_SEQUENCE, ERR_MEMORY_ALLOCATION, SQLSTATE_HY000, post_diag,
+        };
+        match self {
+            Self::Busy => post_diag(state, ERR_FUNCTION_SEQUENCE),
+            Self::IdExhausted | Self::Capacity | Self::ActivityOverflow => {
+                post_diag(state, ERR_MEMORY_ALLOCATION);
+            }
+            _ => crate::error::post_sql_error(state, SQLSTATE_HY000, 0, self.to_string()),
+        }
+    }
 }
 
 pub(crate) fn handle_to_raw<T: Handle>(handle: Arc<T>) -> Result<SqlHandle, RegistryError> {
@@ -103,7 +116,7 @@ pub(crate) fn is_live(raw: SqlHandle) -> bool {
 /// Test-only forced retirement for exercising an acquired-before-free ordering.
 #[cfg(test)]
 pub(crate) fn free_handle<T: Handle>(raw: SqlHandle) -> Result<(), RegistryError> {
-    let handle = handle_from_raw::<T>(raw)?;
+    let handle = HANDLES.inspect_for_test::<T>(HandleId::from_raw(raw)?, T::TYPE)?;
     retire_handle(&*handle, raw)
 }
 
@@ -187,5 +200,43 @@ mod tests {
             .unwrap()
             .descriptors
             .retain(|&id| id != raw);
+    }
+
+    #[test]
+    fn disconnect_then_stale_frees_leave_replacements_live() {
+        let mut h = TestHandles::with_env_dbc();
+        let old_stmt = h.alloc_extra_stmt();
+        let old_desc = h.alloc_explicit_desc();
+        assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_SUCCESS);
+        assert!(!is_live(old_stmt));
+        assert!(!is_live(old_desc));
+
+        h.mark_dbc_connected();
+        let new_stmt = h.alloc_extra_stmt();
+        let new_desc = h.alloc_explicit_desc();
+        assert_ne!(old_stmt, new_stmt);
+        assert_ne!(old_desc, new_desc);
+        assert_eq!(h.free_extra_stmt(old_stmt), SQL_SUCCESS);
+        assert_eq!(h.free_explicit_desc(old_desc), SQL_SUCCESS);
+        assert!(is_live(new_stmt));
+        assert!(is_live(new_desc));
+    }
+
+    #[test]
+    fn disconnect_refuses_an_acquired_child_then_succeeds_after_release() {
+        let mut h = TestHandles::with_env_dbc();
+        let raw = h.alloc_extra_stmt();
+        h.mark_dbc_connected();
+        let active = handle_from_raw::<StmtHandle>(raw).unwrap();
+        assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_ERROR);
+        assert!(is_live(raw));
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        assert_eq!(
+            dbc.inner.lock().unwrap().diag_records[0].sql_state,
+            crate::api::sqlstate::ERR_FUNCTION_SEQUENCE.state
+        );
+        drop(active);
+        assert_eq!(unsafe { crate::api::SQLDisconnect(h.dbc) }, SQL_SUCCESS);
+        assert!(!is_live(raw));
     }
 }

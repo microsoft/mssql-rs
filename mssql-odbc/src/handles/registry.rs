@@ -319,6 +319,24 @@ impl HandleRegistry {
         Ok(self.lock()?.entries.get(&id).map(|entry| entry.kind))
     }
 
+    /// Only for fixture cleanup after deliberately violating parent-free order.
+    #[cfg(test)]
+    pub(crate) fn inspect_for_test<T: Any + Send + Sync>(
+        &self,
+        id: HandleId,
+        expected: HandleType,
+    ) -> Result<Arc<T>, RegistryError> {
+        let value = {
+            let state = self.lock()?;
+            let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
+            if entry.kind != expected {
+                return Err(RegistryError::WrongType);
+            }
+            Arc::clone(&entry.value)
+        };
+        value.downcast().map_err(|_| RegistryError::WrongType)
+    }
+
     pub(crate) fn begin_close<T: Any + Send + Sync>(
         &self,
         handle: &HandleRef<T>,

@@ -30,7 +30,7 @@ macro_rules! claim_close {
                 error!(?error, "SQLFreeHandle: close admission failed");
                 if let Ok(mut state) = $handle.inner.lock() {
                     free_errors(&mut state);
-                    post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+                    error.post(&mut state);
                 }
                 return SQL_ERROR;
             }
@@ -71,15 +71,8 @@ pub(crate) unsafe fn sql_free_handle(handle_type: SqlSmallInt, handle: SqlHandle
     })
 }
 
-/// Mirrors msodbcsql's `SQLFreeEnv` behavior.
-///
-/// No mutex is acquired - per the ODBC spec, the DM guarantees the
-/// connection count on this ENV is 0 before calling `SQLFreeEnv`. DM also
-/// ensures no concurrent SQLFreeHandle calls on the same handle. Returns
-/// `SQL_INVALID_HANDLE`, per spec, if the handle is live but of some other
-/// type — matches `free_stmt`/`free_desc`'s identical check; unlike those
-/// two, an ENV is never cascade-freed behind the DM's back, so there is no
-/// legitimate stale-handle case here to distinguish from "wrong type."
+/// Retires an ENV after excluding dependent calls. The DM still guarantees
+/// child DBCs are freed first; final allocation release joins its runtime.
 ///
 /// # Safety
 /// `handle` must be a live `EnvHandle` created by `alloc_env`.
@@ -106,6 +99,9 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
 
     if let Err(error) = retire_handle(&*env, handle) {
         error!(?error, "SQLFreeHandle(ENV): retirement failed");
+        if let Ok(mut state) = env.inner.lock() {
+            error.post(&mut state);
+        }
         return SQL_ERROR;
     }
     drop(env);
@@ -115,17 +111,8 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
     SQL_SUCCESS
 }
 
-/// Mirrors msodbcsql's `SQLFreeConnect` behavior.
-///
-/// No DBC mutex is acquired — the DM guarantees the DBC is disconnected
-/// before calling `SQLFreeConnect`, and `SQLDisconnect` drops all child
-/// handles (statements, and their implicit descriptors, plus any explicit
-/// descriptors — `sql_disconnect_safe`). msodbcsql's `SQLFreeConnect` doesn't
-/// lock the connection mutex either. Returns `SQL_INVALID_HANDLE`, per spec,
-/// if the handle is live but of some other type — matches `free_stmt`/
-/// `free_desc`'s identical check; unlike those two, a DBC is never
-/// cascade-freed behind the DM's back, so there is no legitimate
-/// stale-handle case here to distinguish from "wrong type."
+/// Retires a disconnected DBC and unregisters it from its retained ENV.
+/// The DM guarantees disconnect and child cleanup precede this call.
 ///
 /// # Safety
 /// `handle` must be a live `DbcHandle` created by `alloc_dbc`.
@@ -181,6 +168,9 @@ unsafe fn free_dbc(handle: SqlHandle) -> SqlReturn {
         };
         if let Err(error) = retire_handle(&*dbc, handle) {
             error!(?error, "SQLFreeHandle(DBC): retirement failed");
+            if let Ok(mut state) = dbc.inner.lock() {
+                error.post(&mut state);
+            }
             return SQL_ERROR;
         }
         if let Some(i) = env_state.connections.iter().position(|&p| p == handle) {
@@ -252,7 +242,7 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
         };
         let Some(i) = dbc_state.statements.iter().position(|&p| p == handle) else {
             // Live but untracked: not the post-SQLDisconnect case (caught by
-            // `live_type` above), so something removed it from the parent
+            // owned acquisition above), so something removed it from the parent
             // without freeing it — an invariant break, not an expected path.
             error!(
                 ?handle,
@@ -263,6 +253,9 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
         };
         if let Err(error) = retire_handle(&*stmt, handle) {
             error!(?error, "SQLFreeHandle(STMT): retirement failed");
+            if let Ok(mut state) = stmt.inner.lock() {
+                error.post(&mut state);
+            }
             return SQL_ERROR;
         }
         dbc_state.statements.swap_remove(i);
@@ -361,7 +354,7 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
 
     let Some(i) = dbc_state.descriptors.iter().position(|&p| p == handle) else {
         // Live but untracked: not the post-SQLDisconnect case (caught by
-        // `live_type` above), so something removed it from the parent
+        // owned acquisition above), so something removed it from the parent
         // without freeing it — an invariant break, not an expected path.
         error!(
             ?handle,
@@ -387,7 +380,7 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
             Err(error) => {
                 error!(?error, "SQLFreeHandle(DESC): statement acquisition failed");
                 if let Ok(mut state) = desc.inner.lock() {
-                    post_diag(&mut state, ERR_FUNCTION_SEQUENCE);
+                    error.post(&mut state);
                 }
                 return SQL_ERROR;
             }
@@ -412,7 +405,11 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         }
     }
     if let Err(error) = retire_handle(&*desc, handle) {
+        drop(states);
         error!(?error, "SQLFreeHandle(DESC): retirement failed");
+        if let Ok(mut state) = desc.inner.lock() {
+            error.post(&mut state);
+        }
         return SQL_ERROR;
     }
     for state in &mut states {

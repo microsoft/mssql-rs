@@ -171,7 +171,7 @@ unsafe fn alloc_dbc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> S
         Ok(dbc) => dbc,
         Err(error) => {
             error!(?error, "SQLAllocHandle(DBC): registration failed");
-            post_diag(&mut env_state, ERR_MEMORY_ALLOCATION);
+            error.post(&mut env_state);
             return SQL_ERROR;
         }
     };
@@ -240,7 +240,7 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
                     ?error,
                     "SQLAllocHandle(STMT): implicit descriptor registration failed"
                 );
-                post_diag(&mut dbc_state, ERR_MEMORY_ALLOCATION);
+                error.post(&mut dbc_state);
                 return SQL_ERROR;
             }
         }
@@ -265,7 +265,7 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
         Ok(stmt) => stmt,
         Err(error) => {
             error!(?error, "SQLAllocHandle(STMT): registration failed");
-            post_diag(&mut dbc_state, ERR_MEMORY_ALLOCATION);
+            error.post(&mut dbc_state);
             return SQL_ERROR;
         }
     };
@@ -344,7 +344,7 @@ unsafe fn alloc_desc(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
         Ok(desc) => desc.publish(),
         Err(error) => {
             error!(?error, "SQLAllocHandle(DESC): registration failed");
-            post_diag(&mut dbc_state, ERR_MEMORY_ALLOCATION);
+            error.post(&mut dbc_state);
             return SQL_ERROR;
         }
     };

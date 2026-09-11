@@ -25,7 +25,7 @@ pub(crate) enum ConnectionState {
 /// Connection handle
 ///
 /// Created by `SQLAllocHandle(SQL_HANDLE_DBC, henv, ...)`.
-/// Holds a back-pointer to the parent environment and connection-level state.
+/// Retains its parent environment and connection-level state.
 ///
 /// Thread-safety: The `inner` mutex protects mutable state, mirroring
 /// msodbcsql's connection-level critical section.
