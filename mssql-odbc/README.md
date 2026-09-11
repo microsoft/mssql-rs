@@ -117,6 +117,18 @@ but returning row N can now wait on row N+1's header arriving. See
 `release_busy_if_row_exhausted` in `src/api/exec_common.rs` for the full
 trade-off and why it was accepted as-is.
 
+## Parameter array results
+
+Prepared parameter arrays can return rows from `SELECT`, `INSERT ... OUTPUT`,
+and procedures. Fetch the current result normally and use `SQLMoreResults` to
+advance through the results in parameter-set order. Completion counts and
+statuses are deferred until the corresponding sets finish; inspect the final
+bookkeeping after navigation reaches `SQL_NO_DATA`. Closing the cursor drains
+unread results without executing any parameter set again.
+
+`SQLGetInfo(SQL_PARAM_ARRAY_SELECTS)` reports `SQL_PAS_BATCH`. Non-row-returning
+arrays still complete during `SQLExecute` and report their aggregate row count.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read

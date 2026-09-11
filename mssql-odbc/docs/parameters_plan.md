@@ -858,8 +858,9 @@ accept/store contract itself belongs to AB#46377 and is documented in
 [attributes_plan.md](attributes_plan.md).
 
 - **Batching.** One RPC per set in a single request, separated by
-  `RPC_BATCH_DELIMITER` (`0xff`), drained set by set (`execute_prepared_batch`,
-  `drain_prepared_batch`). 1000-row prepared `INSERT` over loopback: 21.2 ms
+  `RPC_BATCH_DELIMITER` (`0xff`), read set by set (`begin_execute_prepared_batch`).
+  The original `execute_prepared_batch` TDS API still drains all results for
+  callers that only need completion records. 1000-row prepared `INSERT` over loopback: 21.2 ms
   batched, 204.2 ms looped, 22.4 ms for msodbcsql. `mssql-odbc-bench`'s
   `executemany` scenario (`kParameterArrayRows` in `odbc_bench.cpp`) measures a
   single fixed shape - 2,000 rows, 3 narrow fixed-width columns - and that is
@@ -872,8 +873,24 @@ accept/store contract itself belongs to AB#46377 and is documented in
 - **Reporting.** `SQL_ATTR_PARAMS_PROCESSED_PTR` counts sets reached,
   `SQL_ATTR_PARAM_STATUS_PTR` is pre-filled `SQL_PARAM_UNUSED` and written per
   set, `SQL_ATTR_PARAM_OPERATION_PTR` skips a set marked `SQL_PARAM_IGNORE`, and
-  `SQLRowCount` sums the sets' affected rows, reporting
+  for non-row-returning arrays `SQLRowCount` sums the sets' affected rows, reporting
   `SQL_NO_ROWCOUNT_TOTAL` only when no set produced a count.
+- **Result delivery (AB#47944).** `SELECT`, `INSERT ... OUTPUT`, and procedures
+  can return rows for each parameter set. `SQLExecute` positions the first
+  result; `SQLFetch` / `SQLGetData` read its rows, and `SQLMoreResults` advances
+  through the remaining results in parameter-set order. Empty result sets and
+  multiple results from one procedure remain distinct. Rows are streamed, not
+  buffered for the whole array. Advancing discards any unread rows of the
+  current result; closing drains the rest of the batch without executing any
+  set again.
+- **Deferred completion.** A row-returning array is not finished when execute
+  returns. Statuses are written as RPC completions are consumed by navigation
+  or close; inspect the final processed count and status array after
+  `SQLMoreResults` reaches `SQL_NO_DATA`. A successful set is never marked
+  `SQL_PARAM_ERROR` merely for returning rows. A real per-set error retains its
+  status and diagnostic while later results remain fetchable, including when
+  `SQLMoreResults` reports `SQL_ERROR` without a status array. Pending results
+  keep the connection claimed until they are navigated or closed.
 - **Failure handling.** A set that fails to build client-side does not abort the
   batch - the request serializes as it streams, so earlier sets are already on
   the wire. The return code is decided once, from one rule, whether the set
@@ -892,7 +909,6 @@ work items. Not restated here.
 |---|---|---|---|
 | 1 | a set that fails **client-side** conversion | sets already serialized still commit and the call is partial success; msodbcsql materializes first, sends nothing, and reports total failure | AB#47945 |
 | 2 | `SQLExecDirect` with `PARAMSET_SIZE > 1` | `HYC00`, with or without markers | AB#47939 |
-| 3 | array over a **row-returning** statement | executes, discards the result sets | AB#47944 |
 | 4 | data-at-execution combined with an array | `HYC00` at execute | AB#47958 |
 | 5 | output / `InputOutput` parameters | refused at `SQLBindParameter` | driver-wide gap, not array-specific |
 | 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | AB#47790 |
@@ -908,20 +924,12 @@ row-attribution is deferred.
 
 `SQL_PARAM_ARRAY_ROW_COUNTS` and `SQL_PARAM_ARRAY_SELECTS` (`SQLGetInfo`) are
 both implemented: `SQL_PARC_NO_BATCH` (one rolled-up `SQLRowCount`, matching
-the "Reporting" behaviour above) and `SQL_PAS_NO_SELECT`. Both differ from
-msodbcsql 18.6.2.1, measured: it reports `SQL_PARC_BATCH` and `SQL_PAS_BATCH`,
-and its behaviour backs the claim - an `INSERT ... OUTPUT` at `PARAMSET_SIZE` 3
-hands back three result sets through `SQLMoreResults`.
-
-`SQL_PAS_NO_SELECT` is the one value here that is not literally true of this
-driver. The spec meaning is "a result-set generating statement is not allowed
-with an array of parameters", and this driver does allow one: divergence 3 runs
-every set and discards the result sets with a `01000`. It is reported anyway
-because the alternatives mislead in a more damaging direction - `SQL_PAS_BATCH`
-would tell an application the OUTPUT rows are retrievable when zero are
-delivered, which is exactly the silent data loss the value exists to warn
-about. Making it literally true means refusing such statements outright, which
-belongs to AB#47944 rather than to `SQLGetInfo`.
+the "Reporting" behaviour above) and `SQL_PAS_BATCH`. The SELECT capability and
+row delivery match retail msodbcsql 18.6.2.1 (`SQL_DRIVER_VER` `18.06.0002`):
+case 25 in `param_array_test.cpp` fetches all three OUTPUT results and verifies
+the final processed count is 3 with three `SQL_PARAM_SUCCESS` statuses. An
+execute-only observation misses that deferred bookkeeping. The row-count
+capability difference remains: msodbcsql reports `SQL_PARC_BATCH`.
 
 Divergence 8 is defence-in-depth, not a live bug: no server behaviour is known
 to produce it. msodbcsql cannot report it because it never compares the reported
