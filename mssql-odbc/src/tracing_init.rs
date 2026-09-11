@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use chrono::{Local, Utc};
+use chrono::Utc;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{OpenOptions, create_dir_all, remove_file};
@@ -256,7 +256,7 @@ fn init_file_tracing(dir: OsString) -> Result<(), String> {
 
     let dir = prepare_trace_directory(PathBuf::from(dir))?;
 
-    let timestamp = Local::now().format("%Y%m%d%H%M%S%3f").to_string();
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
     let (log_path, file) = reserve_trace_file(&dir, &timestamp, std::process::id())
         .map_err(|error| format!("could not create a trace file in {dir:?}: {error}"))?;
     let writer = Arc::new(TraceFileWriter::new(log_path.clone(), file));
@@ -531,7 +531,7 @@ mod tests {
             .make_writer_for_env_state(writer.file(), false)
             .write_all(b"first\n")
             .unwrap();
-        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+        assert!(writer.file().is_none());
 
         remove_dir_all(dir).unwrap();
     }

@@ -72,7 +72,7 @@ Tracing is disabled by default. Enable it with environment variables:
 |---|---|---|
 | `MSSQL_TDS_TRACE` | `false` | Set to `true` to enable tracing output |
 | `MSSQL_TDS_TRACE_LEVEL` | `warn` | Tracing filter expression (`tracing_subscriber::EnvFilter`) |
-| `MSSQL_TDS_TRACE_DIR` | unset | Non-empty directory for a per-process trace file; when unset, tracing uses stderr |
+| `MSSQL_TDS_TRACE_DIR` | unset | When tracing is enabled, non-empty directory for a per-process trace file; when unset, tracing uses stderr |
 
 Examples:
 
