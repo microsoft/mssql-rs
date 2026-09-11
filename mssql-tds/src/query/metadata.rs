@@ -2,11 +2,12 @@
 // Licensed under the MIT License.
 
 use crate::{
-    datatypes::sqldatatypes::{
-        PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, VariableLengthTypes,
-    },
+    datatypes::sqldatatypes::{TdsDataType, TypeInfo, TypeInfoVariant},
     token::tokens::SqlCollation,
 };
+
+#[cfg(feature = "test-util")]
+use crate::datatypes::sqldatatypes::{PartialLengthType, VariableLengthTypes};
 
 use std::fmt;
 
