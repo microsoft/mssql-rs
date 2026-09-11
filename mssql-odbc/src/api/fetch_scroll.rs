@@ -41,7 +41,7 @@ use super::sqlstate::*;
 use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
-    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c,
+    TextError, column_value_to_bytes, column_value_to_text, convert_typed_c, hex_buffer_elements,
     transcode_narrow_into_pending, utf16le_chunk_to_utf8, widen_into_pending,
 };
 use crate::api::odbc_types::{
@@ -1802,6 +1802,10 @@ unsafe fn deliver_bound_plp(
             | (SQL_C_CHAR, PlpEncoding::Utf16Text)
             // Binary delivers the wire bytes whatever the column holds.
             | (SQL_C_BINARY, _)
+            // A binary column read as characters is rendered as hex (AB#47240),
+            // on this path as well as SQLGetData's, so delivery does not depend
+            // on whether the value was small enough to arrive buffered.
+            | (SQL_C_CHAR | SQL_C_WCHAR, PlpEncoding::Binary)
     ) || narrow_decoder.is_some();
     if !compatible {
         // The stream still has to be consumed, or the next column decodes from
@@ -1836,6 +1840,8 @@ unsafe fn deliver_bound_plp(
     // legs.
     let transcode = transcode_utf16_to_utf8 || widen_narrow_to_utf16;
     let buf_elements = char_buf_elements(target, stride);
+    let hex_stream =
+        matches!(encoding, PlpEncoding::Binary) && (target == SQL_C_CHAR || target == SQL_C_WCHAR);
     // Room for the payload. Character targets always write a terminator; binary
     // is not a string, so the whole slot is payload.
     let capacity_elements = if target == SQL_C_BINARY {
@@ -1866,7 +1872,27 @@ unsafe fn deliver_bound_plp(
             continue;
         }
 
-        if transcode_narrow_to_utf8 {
+        // Binary hex expansion and SingleByteText transcoding are mutually exclusive.
+        if hex_stream {
+            for b in &scratch[..chunk.read] {
+                let filled = if target == SQL_C_WCHAR {
+                    out_units.len()
+                } else {
+                    out_bytes.len()
+                };
+                // Append both hex digits or leave the trailing slot unused.
+                if filled + 2 > capacity_elements {
+                    truncated = true;
+                    break;
+                }
+                let hex = crate::api::get_data::hex_pair(*b);
+                if target == SQL_C_WCHAR {
+                    out_units.extend(hex.iter().map(|c| u16::from(*c)));
+                } else {
+                    out_bytes.extend_from_slice(&hex);
+                }
+            }
+        } else if transcode_narrow_to_utf8 {
             // Codepage text into a UTF-8 SQL_C_CHAR slot. The decoder carries a
             // multi-byte sequence split across a PLP chunk boundary; unlike the
             // streaming SQLGetData path there is no continuation call, so the
@@ -1999,10 +2025,24 @@ unsafe fn deliver_bound_plp(
     } else {
         out_bytes.len()
     };
+    // Two characters per wire byte, and twice that again in bytes for a wide
+    // target, so the reported total has to be scaled to match.
+    let hex_scale: u64 = if !hex_stream {
+        1
+    } else if target == SQL_C_WCHAR {
+        2 * std::mem::size_of::<SqlWChar>() as u64
+    } else {
+        2
+    };
     unsafe {
         write_if_some(
             octet_length,
-            plp_indicator(produced_bytes, truncated, transcode, wire_total),
+            plp_indicator(
+                produced_bytes,
+                truncated,
+                transcode,
+                wire_total.map(|t| t.saturating_mul(hex_scale)),
+            ),
         )
     };
 
@@ -2229,6 +2269,11 @@ unsafe fn deliver_bound(
     };
 
     let buf_elements = char_buf_elements(binding.target_type, stride);
+    let buf_elements = if matches!(value, ColumnValues::Bytes(_)) {
+        hex_buffer_elements(buf_elements)
+    } else {
+        buf_elements
+    };
     if binding.target_type == SQL_C_WCHAR {
         let utf16: Vec<u16> = text.encode_utf16().collect();
         unsafe { write_if_some(octet_length, (utf16.len() * 2) as SqlLen) };

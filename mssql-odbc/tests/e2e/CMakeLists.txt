@@ -137,6 +137,7 @@ add_odbc_test(param_binary_conversions_test tests/param_binary_conversions_test.
 add_odbc_test(describe_param_test tests/describe_param_test.cpp)
 add_odbc_test(get_data_test      tests/get_data_test.cpp)
 add_odbc_test(binary_fetch_test tests/binary_fetch_test.cpp)
+add_odbc_test(bin_to_char_test tests/bin_to_char_test.cpp)
 add_odbc_test(get_type_info_test tests/get_type_info_test.cpp)
 add_odbc_test(get_info_test      tests/get_info_test.cpp)
 add_odbc_test(catalog_test       tests/catalog_test.cpp)
