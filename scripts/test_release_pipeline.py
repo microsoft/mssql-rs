@@ -402,6 +402,33 @@ def test_manylinux_228_builds_use_isolated_cargo_targets(
     )
 
 
+@pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
+def test_manylinux_228_odbc_builds_enforce_glibc_ceiling(job_name: str) -> None:
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": False,
+    }
+    pipeline = expand(
+        yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
+    )
+    build = next(
+        stage for stage in pipeline["stages"] if stage["stage"] == "Build"
+    )
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    odbc_step = next(
+        step
+        for step in job["steps"]
+        if step.get("parameters", {}).get("displaySuffix", "").startswith(
+            "glibc-2.28"
+        )
+    )
+    assert odbc_step["parameters"]["maxGlibcVersion"] == "2.28"
+
+
 def test_wheel_image_odbc_builds_use_isolated_cargo_target() -> None:
     template = (
         _ROOT
@@ -414,6 +441,18 @@ def test_wheel_image_odbc_builds_use_isolated_cargo_target() -> None:
     )
     script = odbc_template["steps"][0]["script"]
     assert "-e CARGO_TARGET_DIR=/tmp/mssql-odbc-target" in script
+    assert "-e MAX_GLIBC_VERSION=${{ parameters.maxGlibcVersion }}" in script
+    parameters = {
+        parameter["name"]: parameter
+        for parameter in odbc_template["parameters"]
+    }
+    assert parameters["maxGlibcVersion"]["default"] == "2.34"
+
+    build_script = (_ROOT / "scripts" / "build-odbc-driver-only.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'MAX_GLIBC_VERSION="${MAX_GLIBC_VERSION:-2.34}"' in build_script
+    assert 'ceiling="GLIBC_$MAX_GLIBC_VERSION"' in build_script
 
 
 @pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=5)))
