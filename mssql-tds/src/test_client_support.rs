@@ -19,6 +19,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+/// Metadata strategy for testing bulk copy with custom or cached metadata.
+pub use crate::connection::metadata_retriever::MetadataRetriever;
+/// Quote identifiers used in test setup SQL.
+pub use crate::sql_identifier::escape_identifier;
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;
