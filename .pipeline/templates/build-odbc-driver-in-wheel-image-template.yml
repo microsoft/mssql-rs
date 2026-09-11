@@ -23,6 +23,7 @@ steps:
         -v "$HOME/.cargo/registry:/root/.cargo/registry" \
         -v "$HOME/.cargo/git:/root/.cargo/git" \
         -e ODBC_DROP_DIR=/workspace/odbc-drop \
+        -e CARGO_TARGET_DIR=/tmp/mssql-odbc-target \
         -w /workspace \
         ${{ parameters.image }} \
         sh /workspace/scripts/build-odbc-driver-only.sh ${{ parameters.libc }}

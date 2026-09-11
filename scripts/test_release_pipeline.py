@@ -372,6 +372,50 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
     assert metadata.findtext("version") == expected_version
 
 
+@pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
+def test_manylinux_228_builds_use_isolated_cargo_targets(
+    job_name: str,
+) -> None:
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": False,
+    }
+    pipeline = expand(
+        yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
+    )
+    build = next(
+        stage for stage in pipeline["stages"] if stage["stage"] == "Build"
+    )
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    wheel_step = next(
+        step
+        for step in job["steps"]
+        if step.get("displayName", "").startswith("Build glibc-2.28 wheels")
+    )
+    assert (
+        '-e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28"'
+        in wheel_step["script"]
+    )
+
+
+def test_wheel_image_odbc_builds_use_isolated_cargo_target() -> None:
+    template = (
+        _ROOT
+        / ".pipeline"
+        / "templates"
+        / "build-odbc-driver-in-wheel-image-template.yml"
+    )
+    odbc_template = yaml.safe_load(
+        template.read_text(encoding="utf-8")
+    )
+    script = odbc_template["steps"][0]["script"]
+    assert "-e CARGO_TARGET_DIR=/tmp/mssql-odbc-target" in script
+
+
 @pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=5)))
 def test_release_switch_graph(values):
     flags = dict(zip(_SWITCHES, values))
