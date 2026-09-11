@@ -7,13 +7,14 @@ use std::fmt;
 use std::fs::{OpenOptions, create_dir_all, remove_file};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once, Weak};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::registry::LookupSpan;
 
 static INIT_TRACING: Once = Once::new();
+static TRACE_FILE_WRITER: Mutex<Option<Weak<TraceFileWriter>>> = Mutex::new(None);
 
 const ENV_TRACE: &str = "MSSQL_TDS_TRACE";
 const ENV_TRACE_LEVEL: &str = "MSSQL_TDS_TRACE_LEVEL";
@@ -56,13 +57,42 @@ where
 
 struct TraceFileWriter {
     path: PathBuf,
-    write_lock: Mutex<()>,
+    file: Mutex<Option<std::fs::File>>,
+    #[cfg(test)]
+    open_count: std::sync::atomic::AtomicU32,
+}
+
+#[derive(Clone)]
+struct SharedTraceFileWriter(Arc<TraceFileWriter>);
+
+impl TraceFileWriter {
+    fn new(path: PathBuf, file: std::fs::File) -> Self {
+        Self {
+            path,
+            file: Mutex::new(Some(file)),
+            #[cfg(test)]
+            open_count: std::sync::atomic::AtomicU32::new(1),
+        }
+    }
+
+    fn file(&self) -> MutexGuard<'_, Option<std::fs::File>> {
+        self.file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn close(&self) {
+        self.file().take();
+    }
 }
 
 enum TraceWriter<'writer> {
-    File {
+    Cached {
+        file: MutexGuard<'writer, Option<std::fs::File>>,
+    },
+    Transient {
         file: std::fs::File,
-        _guard: MutexGuard<'writer, ()>,
+        _guard: MutexGuard<'writer, Option<std::fs::File>>,
     },
     Sink(io::Sink),
 }
@@ -70,45 +100,106 @@ enum TraceWriter<'writer> {
 impl Write for TraceWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Self::File { file, .. } => file.write(buf),
+            Self::Cached { file } => file
+                .as_mut()
+                .ok_or_else(|| io::Error::other("trace file is closed"))?
+                .write(buf),
+            Self::Transient { file, .. } => file.write(buf),
             Self::Sink(sink) => sink.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::File { file, .. } => file.flush(),
+            Self::Cached { file } => file
+                .as_mut()
+                .ok_or_else(|| io::Error::other("trace file is closed"))?
+                .flush(),
+            Self::Transient { file, .. } => file.flush(),
             Self::Sink(sink) => sink.flush(),
         }
     }
 }
 
-impl<'writer> MakeWriter<'writer> for TraceFileWriter {
+impl<'writer> MakeWriter<'writer> for SharedTraceFileWriter {
     type Writer = TraceWriter<'writer>;
 
     fn make_writer(&'writer self) -> Self::Writer {
-        let guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match OpenOptions::new().append(true).open(&self.path) {
-            Ok(file) => TraceWriter::File {
-                file,
-                _guard: guard,
-            },
-            Err(error) => {
-                drop(guard);
-                report(format_args!(
-                    "[mssql-odbc] ERROR: could not write trace file {:?}: {error}",
-                    self.path
-                ));
-                TraceWriter::Sink(io::sink())
+        if crate::handles::process_is_shutting_down() {
+            return TraceWriter::Sink(io::sink());
+        }
+
+        let file = self.0.file();
+        let has_live_env = crate::handles::live_env_count() != 0;
+        self.make_writer_for_env_state(file, has_live_env)
+    }
+}
+
+impl SharedTraceFileWriter {
+    fn make_writer_for_env_state<'writer>(
+        &'writer self,
+        mut cached_file: MutexGuard<'writer, Option<std::fs::File>>,
+        has_live_env: bool,
+    ) -> TraceWriter<'writer> {
+        if !has_live_env {
+            return match OpenOptions::new().append(true).open(&self.0.path) {
+                Ok(file) => TraceWriter::Transient {
+                    file,
+                    _guard: cached_file,
+                },
+                Err(error) => {
+                    report(format_args!(
+                        "[mssql-odbc] ERROR: could not reopen trace file {:?}: {error}",
+                        self.0.path
+                    ));
+                    TraceWriter::Sink(io::sink())
+                }
+            };
+        }
+
+        if cached_file.is_none() {
+            match OpenOptions::new().append(true).open(&self.0.path) {
+                Ok(reopened) => {
+                    *cached_file = Some(reopened);
+                    #[cfg(test)]
+                    self.0
+                        .open_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) => {
+                    drop(cached_file);
+                    report(format_args!(
+                        "[mssql-odbc] ERROR: could not reopen trace file {:?}: {error}",
+                        self.0.path
+                    ));
+                    return TraceWriter::Sink(io::sink());
+                }
             }
         }
+        TraceWriter::Cached { file: cached_file }
+    }
+}
+
+pub(crate) fn close_trace_file() {
+    if crate::handles::process_is_shutting_down() {
+        return;
+    }
+
+    let writer = TRACE_FILE_WRITER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(Weak::upgrade);
+    if let Some(writer) = writer {
+        writer.close();
     }
 }
 
 pub(crate) fn init_tracing() {
+    if crate::handles::process_is_shutting_down() {
+        return;
+    }
+
     if std::panic::catch_unwind(init_tracing_once).is_err() {
         report(format_args!(
             "[mssql-odbc] ERROR: panic while initializing tracing"
@@ -166,22 +257,24 @@ fn init_file_tracing(dir: OsString) -> Result<(), String> {
     let dir = prepare_trace_directory(PathBuf::from(dir))?;
 
     let timestamp = Local::now().format("%Y%m%d%H%M%S%3f").to_string();
-    let log_path = reserve_trace_file(&dir, &timestamp, std::process::id())
+    let (log_path, file) = reserve_trace_file(&dir, &timestamp, std::process::id())
         .map_err(|error| format!("could not create a trace file in {dir:?}: {error}"))?;
+    let writer = Arc::new(TraceFileWriter::new(log_path.clone(), file));
 
     let init_result = tracing_subscriber::fmt()
         .with_env_filter(trace_filter())
         .with_ansi(false)
-        .with_writer(TraceFileWriter {
-            path: log_path.clone(),
-            write_lock: Mutex::new(()),
-        })
+        .with_writer(SharedTraceFileWriter(Arc::clone(&writer)))
         .event_format(LogFormatter)
         .try_init();
     if let Err(error) = init_result {
         let _ = remove_file(&log_path);
         return Err(format!("could not install tracing subscriber: {error}"));
     }
+    *TRACE_FILE_WRITER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::downgrade(&writer));
+    writer.close();
 
     report(format_args!("[mssql-odbc] Tracing to {log_path:?}"));
     Ok(())
@@ -211,7 +304,11 @@ fn prepare_trace_directory(dir: PathBuf) -> Result<PathBuf, String> {
     Ok(resolved_dir)
 }
 
-fn reserve_trace_file(dir: &Path, timestamp: &str, pid: u32) -> io::Result<PathBuf> {
+fn reserve_trace_file(
+    dir: &Path,
+    timestamp: &str,
+    pid: u32,
+) -> io::Result<(PathBuf, std::fs::File)> {
     for attempt in 0..MAX_FILENAME_ATTEMPTS {
         let log_path = trace_log_path(dir, timestamp, pid, attempt);
         let mut options = OpenOptions::new();
@@ -224,7 +321,7 @@ fn reserve_trace_file(dir: &Path, timestamp: &str, pid: u32) -> io::Result<PathB
         }
 
         match options.open(&log_path) {
-            Ok(_) => return Ok(log_path),
+            Ok(file) => return Ok((log_path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -288,6 +385,19 @@ mod tests {
 
     static NEXT_TEST_DIR: AtomicU32 = AtomicU32::new(0);
 
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn test_directory(test_name: &str) -> PathBuf {
         let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -347,8 +457,8 @@ mod tests {
     #[test]
     fn reserve_trace_file_retries_a_filename_collision() {
         let dir = test_directory("collision");
-        let first_path = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
-        let second_path = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let (first_path, first_file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let (second_path, second_file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
 
         assert_eq!(
             first_path.file_name().unwrap(),
@@ -368,54 +478,111 @@ mod tests {
             );
         }
 
+        drop((first_file, second_file));
         remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn trace_file_writer_appends_and_releases_each_handle() {
+    fn trace_file_writer_reuses_the_handle_until_closed() {
         let dir = test_directory("writer");
-        let path = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
-        let make_writer = TraceFileWriter {
-            path: path.clone(),
-            write_lock: Mutex::new(()),
-        };
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
 
-        make_writer.make_writer().write_all(b"first\n").unwrap();
-        make_writer.make_writer().write_all(b"second\n").unwrap();
+        make_writer
+            .make_writer_for_env_state(writer.file(), true)
+            .write_all(b"first\n")
+            .unwrap();
+        make_writer
+            .make_writer_for_env_state(writer.file(), true)
+            .write_all(b"second\n")
+            .unwrap();
 
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "first\nsecond\n");
+        assert_eq!(writer.open_count.load(Ordering::Relaxed), 1);
+        writer.close();
+
+        let moved_path = path.with_extension("moved");
+        std::fs::rename(&path, &moved_path).unwrap();
+        std::fs::rename(&moved_path, &path).unwrap();
+
+        make_writer
+            .make_writer_for_env_state(writer.file(), true)
+            .write_all(b"third\n")
+            .unwrap();
+        assert_eq!(writer.open_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first\nsecond\nthird\n"
+        );
+
+        writer.close();
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trace_file_writer_does_not_cache_without_an_environment() {
+        let dir = test_directory("transient-writer");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file));
+        writer.close();
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+
+        make_writer
+            .make_writer_for_env_state(writer.file(), false)
+            .write_all(b"first\n")
+            .unwrap();
+        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+
         remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn trace_file_writer_recovers_a_poisoned_lock() {
         let dir = test_directory("poison");
-        let path = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
-        let make_writer = TraceFileWriter {
-            path: path.clone(),
-            write_lock: Mutex::new(()),
-        };
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path.clone(), file));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
         let _ = std::panic::catch_unwind(|| {
-            let _guard = make_writer.write_lock.lock().unwrap();
+            let _guard = writer.file.lock().unwrap();
             panic!("poison the trace serialization lock");
         });
 
         make_writer
-            .make_writer()
+            .make_writer_for_env_state(writer.file(), true)
             .write_all(b"after poison\n")
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "after poison\n");
+        writer.close();
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn event_writer_serializes_close_until_it_is_dropped() {
+        let dir = test_directory("close-serialization");
+        let (path, file) = reserve_trace_file(&dir, "20260910123456789", 42).unwrap();
+        let writer = Arc::new(TraceFileWriter::new(path, file));
+        let make_writer = SharedTraceFileWriter(Arc::clone(&writer));
+        let event_writer = make_writer.make_writer_for_env_state(writer.file(), true);
+
+        assert!(matches!(
+            writer.file.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(event_writer);
+        writer.close();
+        assert!(writer.file().is_none());
         remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn formatter_emits_stable_fields_without_span_context() {
         let output = Arc::new(Mutex::new(Vec::new()));
+        let test_output = Arc::clone(&output);
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(output.clone())
+                .with_writer(move || TestWriter(Arc::clone(&test_output)))
                 .event_format(LogFormatter),
         );
 

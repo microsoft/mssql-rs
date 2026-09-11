@@ -105,9 +105,11 @@ directories, including `.`, are resolved when the first ODBC call captures the c
 are unaffected by later changes to the host process's current directory. Configuration cannot be
 changed while the driver remains loaded.
 
-File tracing is intended for diagnostics. The driver opens and closes the file for each event so it
-does not retain an operating-system handle after the unloadable driver library is released. This
-adds filesystem overhead, particularly at `debug` and `trace` levels. Trace files are not rotated or
+File tracing is intended for diagnostics. The driver keeps one synchronized file handle open while
+an ODBC environment is live and closes it after the last environment is freed, before the host may
+unload the driver. Events emitted without a live environment use transient handles. If another
+environment is later allocated in the same process, the file is reopened lazily. Writes are
+synchronous; the driver does not create a background logging thread. Trace files are not rotated or
 removed automatically.
 
 ## Architecture
