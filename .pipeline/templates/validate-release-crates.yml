@@ -3,6 +3,7 @@
 
 # Re-download the immutable selected build artifact in every job, never an
 # intermediate artifact or a directory supplied by the registry-check agent.
+# Also sets mssqlTdsCrateVersion and mssqlMockTdsCrateVersion from the manifest for later steps in the same job.
 steps:
 - download: officialBuild
   artifact: 'drop_Build_RustCrates'
