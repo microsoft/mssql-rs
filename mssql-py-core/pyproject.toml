@@ -32,9 +32,9 @@ features = ["pyo3/extension-module"]
 # Skip maturin's build-time auditwheel: the mssql-odbc driver is injected into
 # the wheel after the build, so repair must run on the final wheel. The pipeline
 # runs `auditwheel repair` post-injection (scripts/repair-glibc-wheels-in-container.sh)
-# to resolve the native dependencies of both the extension and mssqlodbc.so and
-# retag the glibc wheels manylinux_*. macOS (Security.framework) and Windows
-# (SChannel) have no OpenSSL dependency.
+# only to retag the glibc wheels manylinux_*; libssl/libcrypto are excluded from
+# vendoring, so the wheel keeps expecting the OS to provide OpenSSL 3 at runtime.
+# macOS (Security.framework) and Windows (SChannel) have no OpenSSL dependency.
 auditwheel = "skip"
 
 [project.optional-dependencies]

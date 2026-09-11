@@ -152,7 +152,7 @@ extends:
               $sourceHash = (Get-FileHash $wheel.FullName -Algorithm SHA256).Hash
               $destinationHash = (Get-FileHash $destination -Algorithm SHA256).Hash
               if ($sourceHash -ne $destinationHash) {
-                throw "Staged wheel differs from Official Build artifact: $($wheel.Name)"
+                throw "Staged wheel copy does not match the downloaded artifact: $($wheel.Name)"
               }
               Write-Host "$($wheel.Name)  SHA256=$sourceHash"
             }

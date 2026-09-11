@@ -48,12 +48,33 @@ while [ $# -gt 0 ]; do
     repair) shift ;;
     --plat) plat="$2"; shift 2 ;;
     --wheel-dir) wheeldir="$2"; shift 2 ;;
+    --exclude) shift 2 ;;
     *) wheel="$1"; shift ;;
   esac
 done
 base="$(basename "$wheel")"
 stem="${base%-*}"
 printf 'repaired' > "$wheeldir/${stem}-${plat}.whl"
+"""
+
+# Fake auditwheel that emits a lower tag than requested (auditwheel >= 5.3 can),
+# to exercise the produced-tag assertion.
+_FAKE_WRONG_TAG = r"""#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "$AUDITWHEEL_LOG"
+plat=""; wheeldir=""; wheel=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    repair) shift ;;
+    --plat) plat="$2"; shift 2 ;;
+    --wheel-dir) wheeldir="$2"; shift 2 ;;
+    --exclude) shift 2 ;;
+    *) wheel="$1"; shift ;;
+  esac
+done
+base="$(basename "$wheel")"
+stem="${base%-*}"
+printf 'repaired' > "$wheeldir/${stem}-${plat/2_34/2_17}.whl"
 """
 
 # Fake auditwheel that produces no wheel, to exercise the count guard.
@@ -109,6 +130,8 @@ def test_repairs_bare_glibc_and_leaves_others(tmp_path: Path) -> None:
     invocations = (tmp_path / "auditwheel.log").read_text()
     assert "--plat manylinux_2_34_x86_64" in invocations
     assert "--plat manylinux_2_34_aarch64" in invocations
+    assert "--exclude libssl.so.3" in invocations
+    assert "--exclude libcrypto.so.3" in invocations
 
 
 def test_fails_when_no_bare_glibc_wheels(tmp_path: Path) -> None:
@@ -130,3 +153,12 @@ def test_fails_when_auditwheel_produces_no_wheel(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "expected exactly one repaired wheel" in result.stderr
+
+
+def test_fails_when_auditwheel_emits_lower_tag(tmp_path: Path) -> None:
+    _setup(tmp_path, _GLIBC, _FAKE_WRONG_TAG)
+
+    result = _run(tmp_path)
+
+    assert result.returncode != 0
+    assert "expected platform tag" in result.stderr
