@@ -93,13 +93,22 @@ MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_DIR=/var/log/myapp cargo btest -p mssqlodbc
 MSSQL_TDS_TRACE=true MSSQL_TDS_TRACE_DIR=. cargo btest -p mssqlodbc
 ```
 
-Trace filenames have the form `mssql_tds_trace_<timestamp>_<pid>.log`. Trace files can contain
-SQL text and parameter values; configure a directory whose permissions are appropriate for
-sensitive data. The driver warns when the configured directory is the system temporary directory
-and, on Unix, refuses directories writable by group or other users. Relative directories, including
-`.`, are resolved when the first ODBC call captures the configuration and are unaffected by later
-changes to the host process's current directory. Configuration cannot be changed while the driver
-remains loaded. Trace files are not rotated or removed automatically.
+Trace filenames have the form `mssql_tds_trace_<timestamp>_<pid>.log`. Each event starts with an
+RFC 3339 UTC timestamp, thread ID, level, target, and event fields. Multiline event values can
+continue onto subsequent lines. General span fields are excluded because they can contain SQL text
+and parameter values. Event fields may still contain sensitive data; configure a trusted directory
+whose permissions are appropriate for it.
+
+On Unix, trace files are created with mode `0600`. The driver rejects world-writable directories
+without the sticky bit, warns for group-writable directories, and warns when the directory is inside
+the system temporary directory. Relative directories, including `.`, are resolved when the first
+ODBC call captures the configuration and are unaffected by later changes to the host process's
+current directory. Configuration cannot be changed while the driver remains loaded.
+
+File tracing is intended for diagnostics. The driver opens and closes the file for each event so it
+does not retain an operating-system handle after the unloadable driver library is released. This
+adds filesystem overhead, particularly at `debug` and `trace` levels. Trace files are not rotated or
+removed automatically.
 
 ## Architecture
 

@@ -1,15 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{OpenOptions, create_dir_all, remove_file};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, Once};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
+use tracing_subscriber::registry::LookupSpan;
 
 static INIT_TRACING: Once = Once::new();
 
@@ -19,6 +21,38 @@ const ENV_TRACE_DIR: &str = "MSSQL_TDS_TRACE_DIR";
 const DEFAULT_TRACE_LEVEL: &str = "warn";
 const LOG_FILE_PREFIX: &str = "mssql_tds_trace";
 const MAX_FILENAME_ATTEMPTS: u32 = 100;
+
+struct LogFormatter;
+
+impl<S, N> FormatEvent<S, N> for LogFormatter
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let thread_id = thread_id
+            .strip_prefix("ThreadId(")
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or("unknown");
+        let metadata = event.metadata();
+
+        write!(
+            writer,
+            "{timestamp}, {thread_id}, {}, {}, ",
+            metadata.level(),
+            metadata.target()
+        )?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
 
 struct TraceFileWriter {
     path: PathBuf,
@@ -119,6 +153,7 @@ fn init_stderr_tracing() -> Result<(), String> {
         .with_env_filter(trace_filter())
         .with_ansi(false)
         .with_writer(std::io::stderr)
+        .event_format(LogFormatter)
         .try_init()
         .map_err(|error| format!("could not install tracing subscriber: {error}"))
 }
@@ -141,6 +176,7 @@ fn init_file_tracing(dir: OsString) -> Result<(), String> {
             path: log_path.clone(),
             write_lock: Mutex::new(()),
         })
+        .event_format(LogFormatter)
         .try_init();
     if let Err(error) = init_result {
         let _ = remove_file(&log_path);
@@ -227,9 +263,15 @@ fn validate_trace_directory(dir: &Path) -> Result<(), String> {
         let metadata = dir
             .metadata()
             .map_err(|error| format!("could not inspect trace directory {dir:?}: {error}"))?;
-        if metadata.permissions().mode() & 0o022 != 0 {
+        let mode = metadata.permissions().mode();
+        if mode & 0o002 != 0 && mode & 0o1000 == 0 {
             return Err(format!(
-                "{ENV_TRACE_DIR} must not be writable by group or other users: {dir:?}"
+                "{ENV_TRACE_DIR} must not be world-writable without the sticky bit: {dir:?}"
+            ));
+        }
+        if mode & 0o020 != 0 {
+            report(format_args!(
+                "[mssql-odbc] WARNING: {ENV_TRACE_DIR} is group-writable. Ensure every user with write access is trusted: {dir:?}"
             ));
         }
     }
@@ -245,7 +287,9 @@ fn report(args: fmt::Arguments<'_>) {
 mod tests {
     use super::*;
     use std::fs::remove_dir_all;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
 
     static NEXT_TEST_DIR: AtomicU32 = AtomicU32::new(0);
 
@@ -272,12 +316,11 @@ mod tests {
 
     #[test]
     fn current_directory_is_an_explicit_trace_directory() {
-        let path = trace_log_path(Path::new("."), "20260910123456789", 42, 0);
+        let expected = std::env::current_dir().unwrap().canonicalize().unwrap();
 
-        assert_eq!(
-            path,
-            Path::new(".").join("mssql_tds_trace_20260910123456789_42.log")
-        );
+        let resolved = prepare_trace_directory(PathBuf::from(".")).unwrap();
+
+        assert_eq!(resolved, expected);
     }
 
     #[test]
@@ -368,6 +411,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "after poison\n");
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn formatter_emits_stable_fields_without_span_context() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(output.clone())
+                .event_format(LogFormatter),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "mssql_tds::connection::tds_client",
+                "execute",
+                sql_command = "SELECT 'SECRET_SQL_LITERAL'"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "mssqlodbc::test", operation_id = 42_u64, "completed");
+        });
+
+        let output = output.lock().unwrap();
+        let output = std::str::from_utf8(&output).unwrap();
+        let fields: Vec<_> = output.splitn(5, ',').collect();
+        assert_eq!(fields.len(), 5);
+        assert!(fields[0].contains('T'));
+        assert!(fields[0].ends_with('Z'));
+        assert!(fields[1].trim().parse::<u64>().is_ok());
+        assert_eq!(fields[2].trim(), "INFO");
+        assert_eq!(fields[3].trim(), "mssqlodbc::test");
+        assert!(fields[4].contains("completed"));
+        assert!(fields[4].contains("operation_id=42"));
+        assert!(!output.contains("sql_command"));
+        assert!(!output.contains("SECRET_SQL_LITERAL"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_trace_directory_is_allowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_directory("group-writable");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        assert!(validate_trace_directory(&dir).is_ok());
+        remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_trace_directory_requires_sticky_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_directory("world-writable");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(validate_trace_directory(&dir).is_err());
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(validate_trace_directory(&dir).is_ok());
         remove_dir_all(dir).unwrap();
     }
 }
