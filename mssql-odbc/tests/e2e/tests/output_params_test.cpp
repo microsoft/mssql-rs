@@ -12,6 +12,10 @@ protected:
         ODBCTest::SetUp();
         ASSERT_TRUE(ODBCTestConfig::Instance().HasConnection());
         Connect();
+        SQLCHAR version[32] = {};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("driver_version", reinterpret_cast<const char*>(version));
     }
 
     SQLRETURN Direct(const std::string& sql, SQLHSTMT stmt = SQL_NULL_HSTMT) {
@@ -52,9 +56,9 @@ TEST_F(OutputParamsTest, PendingValuesSurviveAnotherStatementUsingTheConnection)
     BindInt(1, status, status_length);
     BindInt(2, output, output_length);
     ASSERT_SQL_OK(Direct("{?=call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
-    FetchOnlyRow();
     EXPECT_EQ(-1, output);
     EXPECT_EQ(-1, status);
+    FetchOnlyRow();
 
     SQLHSTMT other = AllocStmt();
     ASSERT_NE(nullptr, other);
@@ -79,8 +83,10 @@ TEST_F(OutputParamsTest, ResetBindingsDiscardsPendingWrites) {
     SQLLEN length = -1;
     BindInt(1, output, length);
     ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
-    FetchOnlyRow();
+    EXPECT_EQ(-1, output);
+    // Change bindings before fetching can consume the RPC return tokens.
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+    FetchOnlyRow();
     EXPECT_EQ(SQL_NO_DATA, Exhaust());
     EXPECT_EQ(-1, output);
     EXPECT_EQ(-1, length);
@@ -93,8 +99,9 @@ TEST_F(OutputParamsTest, RebindingRedirectsPendingWrites) {
     SQLLEN old_length = -1, new_length = -2;
     BindInt(1, old_output, old_length);
     ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
-    FetchOnlyRow();
+    EXPECT_EQ(-1, old_output);
     BindInt(1, new_output, new_length);
+    FetchOnlyRow();
     EXPECT_EQ(SQL_NO_DATA, Exhaust());
     EXPECT_EQ(-1, old_output);
     EXPECT_EQ(-1, old_length);
@@ -117,8 +124,9 @@ TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
     ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_PARAM_BIND_OFFSET_PTR, &offset, 0),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
-    FetchOnlyRow();
+    EXPECT_EQ(-1, values[0]);
     offset = sizeof(SQLLEN);
+    FetchOnlyRow();
     EXPECT_EQ(SQL_NO_DATA, Exhaust());
     EXPECT_EQ(-1, values[0]);
     EXPECT_EQ(73, values[sizeof(SQLLEN) / sizeof(SQLINTEGER)]);
@@ -165,9 +173,11 @@ TEST_F(OutputParamsTest, FractionalTruncationIsNotStringTruncation) {
                                   SQL_DOUBLE, 15, 0, &original_output, 0, &length),
                   SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
-    FetchOnlyRow();
+    EXPECT_EQ(-1, original_output);
     BindInt(1, output, length);
-    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLMoreResults(stmt_));
+    const SQLRETURN fractional_rc = Exhaust();
+    // Retail 18.06.0001 reports the warning alongside SQL_NO_DATA.
+    EXPECT_TRUE(fractional_rc == SQL_SUCCESS_WITH_INFO || fractional_rc == SQL_NO_DATA);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
     EXPECT_EQ(12, output);
 }
@@ -185,10 +195,35 @@ TEST_F(OutputParamsTest, ExhaustedFastPathReportsConversionWarningsAndErrorsOnce
                           SQL_VARCHAR, 8, 0, output.data(), output.size(), &length),
                       SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
-        FetchOnlyRow();
-        EXPECT_EQ(invalid_conversion ? SQL_ERROR : SQL_SUCCESS_WITH_INFO,
-                  SQLMoreResults(stmt_));
-        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, invalid_conversion ? "22018" : "01004");
+        const SQLRETURN expected = invalid_conversion ? SQL_ERROR : SQL_SUCCESS_WITH_INFO;
+        int outcomes = 0;
+        // Inspect diagnostics at the call that consumes the return tokens:
+        // retail msodbcsql can do that during fetch, before SQLMoreResults.
+        auto observe = [&](SQLRETURN rc) {
+            const auto state = StmtDiagState();
+            if (!state.empty()) {
+                EXPECT_EQ(invalid_conversion ? "22018" : "01004", state);
+                EXPECT_TRUE(rc == expected || (!invalid_conversion && rc == SQL_NO_DATA));
+                ++outcomes;
+            } else {
+                EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_NO_DATA);
+            }
+        };
+        SQLRETURN rc;
+        do {
+            rc = SQLFetch(stmt_);
+            observe(rc);
+        } while (SQL_SUCCEEDED(rc));
+        rc = SQLMoreResults(stmt_);
+        observe(rc);
+        EXPECT_TRUE(rc == expected || rc == SQL_NO_DATA);
+        EXPECT_EQ(1, outcomes);
+        if (invalid_conversion) {
+            EXPECT_EQ((std::array<char, 4>{}), output);
+        } else {
+            EXPECT_STREQ("abc", output.data());
+            EXPECT_EQ(8, length);
+        }
         EXPECT_EQ(SQL_NO_DATA, SQLMoreResults(stmt_));
         ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
     }
