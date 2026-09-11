@@ -40,6 +40,9 @@ url = "2"
 sha2 = "0.11.0"
 # `RowWriter` exposes UUID values without first boxing them as `ColumnValues`.
 uuid = "1"
+# msodbcsql widens a time-only value with the process-local current date
+# (`localtime_s` in sqlccnvt.cpp), which std cannot supply on every platform.
+libc = "0.2"
 
 # `ActiveDirectoryInteractive` delegates the sign-in UI to `mssql-auth.dll`
 # (OneAuth), the same library msodbcsql loads. The `windows` crate supplies the
@@ -57,10 +60,6 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-# msodbcsql widens a time-only value with the process-local current date
-# (`localtime_s` in sqlccnvt.cpp), which std cannot supply on every platform.
-libc = "0.2"
 
 [dev-dependencies]
 # Enable the `test-util` feature on mssql-tds so unit tests can build a
