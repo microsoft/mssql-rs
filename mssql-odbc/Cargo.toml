@@ -19,6 +19,7 @@ mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tracing = { version = "0.1.43", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono = { version = "0.4", features = ["clock"] }
 async-trait = "0.1"
 # The azure SDK only ships a rustls-based reqwest transport (its `reqwest_rustls`
 # default), which drags in the vulnerable `ring` crate. Disable those defaults and

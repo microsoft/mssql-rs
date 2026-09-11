@@ -51,7 +51,9 @@
 #include <sqlext.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -64,6 +66,29 @@ using SQLExecDirectWFn = SQLRETURN(SQL_API*)(SQLHSTMT, SQLWCHAR*, SQLINTEGER);
 using SQLFetchFn = SQLRETURN(SQL_API*)(SQLHSTMT);
 using SQLDisconnectFn = SQLRETURN(SQL_API*)(SQLHDBC);
 using SQLFreeHandleFn = SQLRETURN(SQL_API*)(SQLSMALLINT, SQLHANDLE);
+
+class ScopedEnvironmentVariable {
+   public:
+    ScopedEnvironmentVariable(const char* name, const char* value) : name_(name) {
+        const DWORD length = GetEnvironmentVariableA(name, nullptr, 0);
+        if (length != 0) {
+            previous_.resize(length);
+            GetEnvironmentVariableA(name, previous_.data(), length);
+            previous_.resize(length - 1);
+            existed_ = true;
+        }
+        SetEnvironmentVariableA(name, value);
+    }
+
+    ~ScopedEnvironmentVariable() {
+        SetEnvironmentVariableA(name_.c_str(), existed_ ? previous_.c_str() : nullptr);
+    }
+
+   private:
+    std::string name_;
+    std::string previous_;
+    bool existed_ = false;
+};
 
 std::string GetEnvOr(const char* name, const char* fallback) {
     char* buf = nullptr;
@@ -205,6 +230,86 @@ TEST(DllUnloadStress, FreeEnvThenUnloadRepeatedly) {
     for (int i = 1; i <= iterations; ++i) {
         ASSERT_NO_FATAL_FAILURE(LoadUseUnload(dll_path, wide_conn, i));
     }
+}
+
+TEST(DllUnloadStress, TraceFileClosesAfterLastEnvironment) {
+    const std::string dll_path = GetEnvOr("MSSQL_ODBC_DLL", "");
+    if (dll_path.empty()) {
+        GTEST_SKIP() << "MSSQL_ODBC_DLL is not set; skipping the DLL unload stress test";
+    }
+
+    const std::filesystem::path trace_dir =
+        std::filesystem::temp_directory_path() /
+        ("mssqlodbc-trace-unload-" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::remove_all(trace_dir);
+    ASSERT_TRUE(std::filesystem::create_directory(trace_dir));
+
+    ScopedEnvironmentVariable trace_enabled("MSSQL_TDS_TRACE", "true");
+    ScopedEnvironmentVariable trace_level("MSSQL_TDS_TRACE_LEVEL", "trace");
+    ScopedEnvironmentVariable trace_directory("MSSQL_TDS_TRACE_DIR",
+                                                trace_dir.string().c_str());
+
+    for (int iteration = 1; iteration <= 20; ++iteration) {
+        HMODULE driver = LoadLibraryA(dll_path.c_str());
+        ASSERT_NE(driver, nullptr) << "iteration " << iteration << ": LoadLibraryA failed";
+
+        auto alloc_handle =
+            reinterpret_cast<SQLAllocHandleFn>(GetProcAddress(driver, "SQLAllocHandle"));
+        auto free_handle =
+            reinterpret_cast<SQLFreeHandleFn>(GetProcAddress(driver, "SQLFreeHandle"));
+        ASSERT_TRUE(alloc_handle && free_handle)
+            << "iteration " << iteration << ": driver is missing handle exports";
+
+        EXPECT_EQ(alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, nullptr), SQL_INVALID_HANDLE);
+        std::vector<std::filesystem::path> trace_files;
+        for (const auto& entry : std::filesystem::directory_iterator(trace_dir)) {
+            if (entry.is_regular_file()) {
+                trace_files.push_back(entry.path());
+            }
+        }
+        ASSERT_EQ(trace_files.size(), 1u) << "iteration " << iteration;
+        const std::filesystem::path trace_file = trace_files.front();
+
+        HANDLE exclusive = CreateFileW(trace_file.c_str(), GENERIC_READ, 0, nullptr,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ASSERT_NE(exclusive, INVALID_HANDLE_VALUE)
+            << "tracing retained a file handle without a live ENV; error="
+            << GetLastError();
+        CloseHandle(exclusive);
+
+        SQLHANDLE first_env = SQL_NULL_HANDLE;
+        SQLHANDLE second_env = SQL_NULL_HANDLE;
+        ASSERT_TRUE(SQL_SUCCEEDED(
+            alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &first_env)));
+        ASSERT_TRUE(SQL_SUCCEEDED(
+            alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &second_env)));
+
+        ASSERT_TRUE(SQL_SUCCEEDED(free_handle(SQL_HANDLE_ENV, first_env)));
+        SetLastError(ERROR_SUCCESS);
+        exclusive = CreateFileW(trace_file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+        const DWORD exclusive_error = GetLastError();
+        EXPECT_EQ(exclusive, INVALID_HANDLE_VALUE)
+            << "trace file closed while an ENV was still live";
+        EXPECT_EQ(exclusive_error, ERROR_SHARING_VIOLATION)
+            << "exclusive open failed for an unexpected reason";
+        if (exclusive != INVALID_HANDLE_VALUE) {
+            CloseHandle(exclusive);
+        }
+
+        ASSERT_TRUE(SQL_SUCCEEDED(free_handle(SQL_HANDLE_ENV, second_env)));
+        exclusive = CreateFileW(trace_file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+        ASSERT_NE(exclusive, INVALID_HANDLE_VALUE)
+            << "trace file remained open after the last ENV was freed; error="
+            << GetLastError();
+        CloseHandle(exclusive);
+
+        ASSERT_NE(FreeLibrary(driver), 0) << "iteration " << iteration;
+        ASSERT_TRUE(std::filesystem::remove(trace_file)) << "iteration " << iteration;
+    }
+
+    std::filesystem::remove_all(trace_dir);
 }
 
 }  // namespace

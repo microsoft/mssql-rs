@@ -97,6 +97,9 @@ unsafe fn free_env(handle: SqlHandle) -> SqlReturn {
     );
 
     unsafe { free_handle::<EnvHandle>(handle) };
+    if crate::handles::live_env_count() == 0 {
+        crate::tracing_init::close_trace_file();
+    }
     SQL_SUCCESS
 }
 
