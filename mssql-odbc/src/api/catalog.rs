@@ -613,15 +613,25 @@ fn run_catalog(
         debug!(%proc, "{name}: qualified catalog call failed, retrying unqualified");
         let _ = client.take_info_messages();
         // The retry is part of the same application-visible call, so it shares
-        // the original budget rather than restarting it.
+        // the original budget with whole-second accounting, rather than
+        // restarting the full configured timeout.
+        //
+        // "Shares the budget" is not an exact 1x wall-clock cap:
+        // `deduct_query_timeout` floors elapsed time to whole seconds, so a
+        // first attempt that fails after 900ms charges nothing and the retry
+        // gets another full second — about 1.9s against a 1s timeout. What is
+        // guaranteed is that the retry draws down the *same* budget, so the
+        // overshoot is bounded by the sub-second remainder rather than
+        // doubling.
         //
         // DIVERGES from msodbcsql, deliberately: its retry is a recursive
         // `DoDD` (`sqlcdd.cpp:1894`) whose re-entered `SQLExecDirectW` re-reads
         // the *undeducted* `GetQueryTimeOut(lpstmt)`, so there the retry starts
-        // from a fresh full budget and a two-attempt call can take 2x the
-        // configured timeout. Capping at 1x keeps the attribute's documented
-        // meaning — the caller's deadline for the call they made — rather than
-        // letting a driver-internal fallback double it. Tracked by mssql-rs#547.
+        // from a genuinely fresh budget and a two-attempt call can take a full
+        // 2x the configured timeout. Sharing the budget keeps the attribute's
+        // documented meaning — the caller's deadline for the call they made —
+        // rather than letting a driver-internal fallback double it. Tracked by
+        // mssql-rs#547.
         //
         // The gate above, by contrast, MATCHES msodbcsql: only a server error
         // retries, never a timeout or transport failure, mirroring its
@@ -2003,6 +2013,87 @@ mod tests {
             "the budget must be found exhausted before the RPC is sent, not by the RPC's own \
              timeout: {}",
             state.diag_records[0].message
+        );
+    }
+
+    /// The catalog dispatcher's unqualified retry must share the original
+    /// budget, and must report the qualified attempt's own server error when
+    /// that budget is gone.
+    ///
+    /// Reaching this needs a first attempt that *returns a server error* (only
+    /// that enters the retry branch) while cumulative elapsed time still floors
+    /// to the whole budget. Those pull in opposite directions — an RPC that
+    /// outlives its own remaining budget times out instead of returning — so it
+    /// is only reachable when an earlier step contributes a *fractional* second:
+    /// the pending unprepare spends ~0.6s of the 1s budget (flooring to 0, so
+    /// the qualified call still gets a full second), that call then fails at
+    /// ~0.6s, and the ~1.2s total floors to 1 and exhausts the budget before
+    /// the retry is sent.
+    ///
+    /// The two attempts are told apart without any new mock surface: only the
+    /// qualified name carries the catalog (`[CATALOG].sys.sp_tables` vs the
+    /// retry's `[sys].sp_tables`), so a response registered under the catalog
+    /// name answers the first call only and the retry would fall through to the
+    /// unmatched bare-DONE success. That is what makes this mutation-resistant
+    /// in both directions: letting the retry restart from the full budget
+    /// (msodbcsql's behavior — see mssql-rs#547) makes the call *succeed*,
+    /// failing the `SQL_ERROR` assertion, while reporting `HYT00` here instead
+    /// of the original error fails the native-error assertion.
+    #[test]
+    fn catalog_retry_budget_exhausted_reports_the_original_server_error() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::{QueryResponse, TerminalError};
+        use std::time::Duration;
+
+        // Spends a sub-second slice of the budget per wire call: one call
+        // floors to 0 (so the qualified call still gets the full second and can
+        // return), but two together floor to 1 and exhaust it.
+        const WIRE_DELAY: Duration = Duration::from_millis(600);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        const INVALID_OBJECT_NAME: u32 = 208;
+        // Upper-case because `QueryRegistry::register` upper-cases its key and
+        // then matches it against the raw request bytes.
+        const CATALOG: &str = "ZZQUALIFIEDZZ";
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        // Answers the qualified `[ZZQUALIFIEDZZ].sys.sp_tables` call only.
+        let mock_server = crate::test_support::connect_mock_server(
+            dbc,
+            CATALOG,
+            QueryResponse::error_only(TerminalError::new(
+                INVALID_OBJECT_NAME,
+                16,
+                "Invalid object name 'sp_tables'.",
+            ))
+            .with_delay(WIRE_DELAY),
+        );
+        // Everything else — the pending unprepare, and the retry if it were
+        // ever sent — is unmatched, and only delayed.
+        mock_server.set_rpc_delay(WIRE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        stmt.inner.lock().unwrap().query_timeout = STMT_TIMEOUT_SECS;
+
+        // A non-blank catalog is what turns the unqualified retry on.
+        let ret = sql_tables_w_safe(h.stmt, stmt, Some(CATALOG.to_string()), None, None, None);
+
+        assert_eq!(
+            ret, SQL_ERROR,
+            "the retry must not run on an exhausted budget; had it run, the \
+             unmatched mock would have answered it with success"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].native_error, INVALID_OBJECT_NAME as i32,
+            "the qualified attempt's own server error must be reported, not the \
+             budget expiry that stopped the retry: {:?} / {}",
+            state.diag_records[0].sql_state, state.diag_records[0].message
+        );
+        assert_ne!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a server error must not be replaced by HYT00"
         );
     }
 
