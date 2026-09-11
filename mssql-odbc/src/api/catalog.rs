@@ -2047,7 +2047,12 @@ mod tests {
 
         // Spends a sub-second slice of the budget per wire call: one call
         // floors to 0 (so the qualified call still gets the full second and can
-        // return), but two together floor to 1 and exhaust it.
+        // return), but two together floor to 1 and exhaust it. That confines
+        // this to `0.5s <= delay + overhead < 1s`; measured here at 606ms after
+        // the unprepare and 1217ms at the retry check, i.e. ~6ms of overhead
+        // per call, so the sleeps dominate. Only the first bound is
+        // load-sensitive — a slow machine grows both figures, which pushes the
+        // second one further past its floor.
         const WIRE_DELAY: Duration = Duration::from_millis(600);
         const STMT_TIMEOUT_SECS: u32 = 1;
         const INVALID_OBJECT_NAME: u32 = 208;
