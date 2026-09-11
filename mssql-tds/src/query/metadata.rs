@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 
 use crate::{
-    datatypes::sqldatatypes::{TdsDataType, TypeInfo, TypeInfoVariant},
+    datatypes::sqldatatypes::{
+        PartialLengthType, TdsDataType, TypeInfo, TypeInfoVariant, VariableLengthTypes,
+    },
     token::tokens::SqlCollation,
 };
 
@@ -205,6 +207,105 @@ impl ColumnMetadata {
             self.effective_type_info().type_info_variant,
             TypeInfoVariant::PartialLen(_, _, _, _, _)
         )
+    }
+
+    /// Creates encrypted `nvarchar(4000)` column metadata for testing consumers
+    /// of logical column metadata.
+    #[cfg(feature = "test-util")]
+    pub fn test_encrypted_nvarchar_4000() -> Self {
+        let collation = SqlCollation {
+            info: 0,
+            sort_id: 0,
+            col_flags: 0,
+            lcid_language_id: 0,
+        };
+
+        let mut metadata = Self {
+            user_type: 0,
+            flags: 0x0800,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::BigVarBinary,
+                length: 4,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarBinary,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            data_type: TdsDataType::BigVarBinary,
+            column_name: "test_column".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+
+        metadata.crypto_metadata = Some(CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: TdsDataType::NVarChar,
+            base_type_info: TypeInfo {
+                tds_type: TdsDataType::NVarChar,
+                length: 8000,
+                type_info_variant: TypeInfoVariant::VarLenString(
+                    VariableLengthTypes::NVarChar,
+                    8000,
+                    Some(collation),
+                ),
+            },
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        });
+
+        metadata
+    }
+
+    /// Creates encrypted `nvarchar(max)` column metadata for testing consumers
+    /// of logical column metadata.
+    #[cfg(feature = "test-util")]
+    pub fn test_encrypted_nvarchar_max() -> Self {
+        let mut metadata = Self {
+            user_type: 0,
+            flags: 0x0800,
+            type_info: TypeInfo {
+                tds_type: TdsDataType::BigVarBinary,
+                length: 4,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarBinary,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            data_type: TdsDataType::BigVarBinary,
+            column_name: "test_column".to_string(),
+            multi_part_name: None,
+            crypto_metadata: None,
+        };
+
+        metadata.crypto_metadata = Some(CryptoMetadata {
+            cek_table_ordinal: 0,
+            base_data_type: TdsDataType::NVarChar,
+            base_type_info: TypeInfo {
+                tds_type: TdsDataType::NVarChar,
+                length: 0,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::NVarChar,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+            cipher_algorithm_id: 2,
+            cipher_algorithm_name: None,
+            encryption_type: 1,
+            normalization_rule_version: 1,
+        });
+
+        metadata
     }
 }
 
@@ -898,6 +999,7 @@ mod tests {
 
         assert!(metadata.is_plp());
         assert!(!metadata.effective_is_plp());
+        assert_eq!(metadata.get_collation(), Some(collation));
     }
 
     #[test]
