@@ -270,6 +270,23 @@ stages:
           osType: Alpine
           architecture: x64
           publishArtifacts: false
+      # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
+      - script: |
+          set -e
+          mkdir -p "$(Build.SourcesDirectory)/wheels-228"
+          bash .pipeline/scripts/docker-cargo-run.sh --rm \
+            -v "$(Build.SourcesDirectory):/workspace" \
+            -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \
+            -e "WORKSPACE_DIR=/workspace" \
+            -e "OUTPUT_DIR=/workspace/target/wheels" \
+            -e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28" \
+            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest \
+            bash /workspace/scripts/build-python-wheels-in-container.sh
+        displayName: 'Build glibc-2.28 wheels (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        env:
+          CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+          CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
     - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
       - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
         parameters:
@@ -302,40 +319,6 @@ stages:
             --drivers-dir "$(Build.SourcesDirectory)/drivers"
         displayName: 'Inject ODBC driver into wheels (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-    - ${{ if eq(parameters.buildPythonWheels, true) }}:
-      - script: |
-          set -e
-          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
-          docker run --rm \
-            -v "$(ob_outputDirectory)/wheels:/wheels" \
-            -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
-            -e REPAIR_PLAT=manylinux_2_34 \
-            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest \
-            bash /scripts/repair-glibc-wheels-in-container.sh /wheels
-          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
-        displayName: 'Repair glibc wheels into manylinux (Linux x64)'
-        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-      # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
-      # Built on the manylinux_2_28 image so they link libssl.so.1.1 and carry a
-      # glibc-2.28 floor; injected with the OpenSSL-1.1 (glibc-2.28) ODBC driver
-      # and repaired to manylinux_2_28. pip picks these on older distros and the
-      # 2.34 wheels on modern ones.
-      - script: |
-          set -e
-          mkdir -p "$(Build.SourcesDirectory)/wheels-228"
-          bash .pipeline/scripts/docker-cargo-run.sh --rm \
-            -v "$(Build.SourcesDirectory):/workspace" \
-            -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \
-            -e "WORKSPACE_DIR=/workspace" \
-            -e "OUTPUT_DIR=/workspace/target/wheels" \
-            -e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28" \
-            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest \
-            bash /workspace/scripts/build-python-wheels-in-container.sh
-        displayName: 'Build glibc-2.28 wheels (Linux x64)'
-        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-        env:
-          CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-          CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
       - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
         parameters:
           image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest'
@@ -350,6 +333,28 @@ stages:
           python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
             --wheels-dir "$(Build.SourcesDirectory)/wheels-228" \
             --drivers-dir "$(Build.SourcesDirectory)/drivers-228"
+        displayName: 'Inject ODBC driver into glibc-2.28 wheels (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    - ${{ if eq(parameters.buildPythonWheels, true) }}:
+      - script: |
+          set -e
+          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+          docker run --rm \
+            -v "$(ob_outputDirectory)/wheels:/wheels" \
+            -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+            -e REPAIR_PLAT=manylinux_2_34 \
+            ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_x86_64_rust:latest \
+            bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+          sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+        displayName: 'Repair glibc wheels into manylinux (Linux x64)'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      # Built on the manylinux_2_28 image so they link libssl.so.1.1 and carry a
+      # glibc-2.28 floor; optionally injected with the matching ODBC driver, then
+      # repaired to manylinux_2_28. pip picks these on older distros and the 2.34
+      # wheels on modern ones.
+      - script: |
+          set -e
+          sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
           docker run --rm \
             -v "$(Build.SourcesDirectory)/wheels-228:/wheels" \
             -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
@@ -359,7 +364,7 @@ stages:
             bash /scripts/repair-glibc-wheels-in-container.sh /wheels
           sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
           cp "$(Build.SourcesDirectory)/wheels-228"/*.whl "$(ob_outputDirectory)/wheels/"
-        displayName: 'Inject + repair glibc-2.28 wheels (Linux x64)'
+        displayName: 'Repair glibc-2.28 wheels (Linux x64)'
         condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Linux x64 Artifacts'
@@ -408,6 +413,23 @@ stages:
             osType: Alpine
             architecture: arm64
             publishArtifacts: false
+        # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
+        - script: |
+            set -e
+            mkdir -p "$(Build.SourcesDirectory)/wheels-228"
+            bash .pipeline/scripts/docker-cargo-run.sh --rm \
+              -v "$(Build.SourcesDirectory):/workspace" \
+              -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \
+              -e "WORKSPACE_DIR=/workspace" \
+              -e "OUTPUT_DIR=/workspace/target/wheels" \
+              -e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28" \
+              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest \
+              bash /workspace/scripts/build-python-wheels-in-container.sh
+          displayName: 'Build glibc-2.28 wheels (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+          env:
+            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
+            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
       - ${{ if and(eq(parameters.buildOdbcNative, true), eq(parameters.buildPythonWheels, true)) }}:
         - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
           parameters:
@@ -440,36 +462,6 @@ stages:
               --drivers-dir "$(Build.SourcesDirectory)/drivers"
           displayName: 'Inject ODBC driver into wheels (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-      - ${{ if eq(parameters.buildPythonWheels, true) }}:
-        - script: |
-            set -e
-            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
-            docker run --rm \
-              -v "$(ob_outputDirectory)/wheels:/wheels" \
-              -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
-              -e REPAIR_PLAT=manylinux_2_34 \
-              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest \
-              bash /scripts/repair-glibc-wheels-in-container.sh /wheels
-            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
-          displayName: 'Repair glibc wheels into manylinux (Linux ARM64)'
-          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-        # --- glibc-2.28 wheels (OpenSSL 1.1) for RHEL 8 / Ubuntu 20.04 ---
-        - script: |
-            set -e
-            mkdir -p "$(Build.SourcesDirectory)/wheels-228"
-            bash .pipeline/scripts/docker-cargo-run.sh --rm \
-              -v "$(Build.SourcesDirectory):/workspace" \
-              -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \
-              -e "WORKSPACE_DIR=/workspace" \
-              -e "OUTPUT_DIR=/workspace/target/wheels" \
-              -e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28" \
-              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest \
-              bash /workspace/scripts/build-python-wheels-in-container.sh
-          displayName: 'Build glibc-2.28 wheels (Linux ARM64)'
-          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
-          env:
-            CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_PUBLIC_TOKEN)
-            CARGO_REGISTRIES_MSSQL_RS_TOKEN: $(CARGO_REGISTRIES_MSSQL_RS_TOKEN)
         - template: /.pipeline/templates/build-odbc-driver-in-wheel-image-template.yml
           parameters:
             image: 'ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest'
@@ -484,6 +476,24 @@ stages:
             python3 "$(Build.SourcesDirectory)/scripts/inject-odbc-into-wheels.py" \
               --wheels-dir "$(Build.SourcesDirectory)/wheels-228" \
               --drivers-dir "$(Build.SourcesDirectory)/drivers-228"
+          displayName: 'Inject ODBC driver into glibc-2.28 wheels (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+      - ${{ if eq(parameters.buildPythonWheels, true) }}:
+        - script: |
+            set -e
+            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+            docker run --rm \
+              -v "$(ob_outputDirectory)/wheels:/wheels" \
+              -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
+              -e REPAIR_PLAT=manylinux_2_34 \
+              ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_34_aarch64_rust:latest \
+              bash /scripts/repair-glibc-wheels-in-container.sh /wheels
+            sudo chown -R $(whoami):$(whoami) "$(ob_outputDirectory)/wheels"
+          displayName: 'Repair glibc wheels into manylinux (Linux ARM64)'
+          condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        - script: |
+            set -e
+            sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
             docker run --rm \
               -v "$(Build.SourcesDirectory)/wheels-228:/wheels" \
               -v "$(Build.SourcesDirectory)/scripts:/scripts:ro" \
@@ -493,7 +503,7 @@ stages:
               bash /scripts/repair-glibc-wheels-in-container.sh /wheels
             sudo chown -R $(whoami):$(whoami) "$(Build.SourcesDirectory)/wheels-228"
             cp "$(Build.SourcesDirectory)/wheels-228"/*.whl "$(ob_outputDirectory)/wheels/"
-          displayName: 'Inject + repair glibc-2.28 wheels (Linux ARM64)'
+          displayName: 'Repair glibc-2.28 wheels (Linux ARM64)'
           condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
       - task: PublishPipelineArtifact@1
         displayName: 'Publish Linux ARM64 Artifacts'

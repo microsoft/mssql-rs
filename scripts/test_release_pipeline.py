@@ -393,11 +393,23 @@ def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc:
     names = [step.get("displayName") for step in job["steps"]]
     repair = f"Repair glibc wheels into manylinux (Linux {architecture})"
     injection = f"Inject ODBC driver into wheels (Linux {architecture})"
+    build_228 = f"Build glibc-2.28 wheels (Linux {architecture})"
+    repair_228 = f"Repair glibc-2.28 wheels (Linux {architecture})"
+    injection_228 = (
+        f"Inject ODBC driver into glibc-2.28 wheels (Linux {architecture})"
+    )
 
     assert names.count(repair) == 1
+    assert names.count(build_228) == 1
+    assert names.count(repair_228) == 1
     assert (injection in names) == build_odbc
+    assert (injection_228 in names) == build_odbc
     if build_odbc:
         assert names.index(injection) < names.index(repair)
+        assert names.index(build_228) < names.index(injection_228)
+        assert names.index(injection_228) < names.index(repair_228)
+    else:
+        assert names.index(build_228) < names.index(repair_228)
 
 
 @pytest.mark.parametrize(
