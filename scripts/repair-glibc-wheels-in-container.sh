@@ -1,17 +1,27 @@
 #!/bin/bash
 # Repair glibc Linux wheels into manylinux wheels AFTER the ODBC driver has been
 # injected. PyPI rejects bare linux_* tags; auditwheel retags the repaired wheels
-# manylinux_*, which PyPI accepts. libssl/libcrypto are excluded from the graft so
-# the wheels keep using the OS-provided OpenSSL 3: native-tls resolves CA paths from
-# the loaded libcrypto's compiled-in OPENSSLDIR, so vendoring AlmaLinux 9's OpenSSL
-# would break server-certificate validation on Debian/Ubuntu. musllinux and
-# non-linux wheels are left untouched. Run inside the matching manylinux build
-# image (has auditwheel and the OpenSSL 3 runtime).
+# manylinux_*, which PyPI accepts. The OS-provided OpenSSL is excluded from the
+# graft (REPAIR_EXCLUDE_LIBS) so the wheels keep using the system OpenSSL:
+# native-tls resolves CA paths from the loaded libcrypto's compiled-in OPENSSLDIR,
+# so vendoring the build image's OpenSSL would break server-certificate validation
+# on the target distro. The floor is set by the build image and passed here:
+#   manylinux_2_34 (AlmaLinux 9, OpenSSL 3)   -> exclude libssl.so.3 / libcrypto.so.3
+#   manylinux_2_28 (AlmaLinux 8, OpenSSL 1.1) -> exclude libssl.so.1.1 / libcrypto.so.1.1
+# musllinux and non-linux wheels are left untouched. Run inside the matching
+# manylinux build image (has auditwheel and the matching OpenSSL runtime).
 set -euo pipefail
 
 WHEELS_DIR="${1:?usage: repair-glibc-wheels-in-container.sh <wheels-dir>}"
 PLAT="${REPAIR_PLAT:-manylinux_2_34}"
+EXCLUDE_LIBS="${REPAIR_EXCLUDE_LIBS:-libssl.so.3 libcrypto.so.3}"
 AUDITWHEEL_BIN="${AUDITWHEEL_BIN:-auditwheel}"
+
+# Build the auditwheel --exclude args from the space-separated soname list.
+exclude_args=()
+for lib in $EXCLUDE_LIBS; do
+    exclude_args+=(--exclude "$lib")
+done
 
 # auditwheel reads AUDITWHEEL_PLAT as the default for --plat and validates it at
 # parser-construction time, so a stray/arch-less value aborts before our explicit
@@ -39,7 +49,7 @@ for wheel in "$WHEELS_DIR"/*.whl; do
     echo "==> Repairing $name -> $plat"
     tmp="$(mktemp -d)"
     "$AUDITWHEEL_BIN" repair --plat "$plat" \
-        --exclude libssl.so.3 --exclude libcrypto.so.3 \
+        "${exclude_args[@]}" \
         --wheel-dir "$tmp" "$wheel"
     count=$(find "$tmp" -maxdepth 1 -name '*.whl' | wc -l)
     if [ "$count" -ne 1 ]; then

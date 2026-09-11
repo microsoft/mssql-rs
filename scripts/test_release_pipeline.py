@@ -280,7 +280,7 @@ def test_pypi_release_stages_selected_commit_wheels_unchanged(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     assert f"Selected source commit: {selected}" in result.stdout
-    assert "Staged 34 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
+    assert "Staged 44 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
     staged = sorted(staging.glob("*.whl"))
     assert [wheel.name for wheel in staged] == sorted(wheel.name for wheel in originals)
     for wheel in originals:
@@ -771,7 +771,7 @@ def test_wheel_validation_and_optional_nuspec(source_repositories, tmp_path, nug
         return
 
     assert result.returncode == 0, result.stderr
-    assert "Validated 34 mssql-python-rs wheels" in result.stdout
+    assert "Validated 44 mssql-python-rs wheels" in result.stdout
     variables.update(re.findall(r"##vso\[task.setvariable variable=(\w+)\](.*)", result.stdout))
     assert variables["releaseVersion"] == "0.1.0"
     assert variables["sourceCommit"] == selected

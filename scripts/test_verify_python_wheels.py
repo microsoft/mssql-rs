@@ -16,6 +16,8 @@ _PLATFORM_DRIVERS = {
     "win_arm64": (f"{_LIBS}/windows/arm64/mssqlodbc.dll",),
     "manylinux_2_34_x86_64": (f"{_LIBS}/linux/glibc/x86_64/lib/mssqlodbc.so",),
     "manylinux_2_34_aarch64": (f"{_LIBS}/linux/glibc/arm64/lib/mssqlodbc.so",),
+    "manylinux_2_28_x86_64": (f"{_LIBS}/linux/glibc/x86_64/lib/mssqlodbc.so",),
+    "manylinux_2_28_aarch64": (f"{_LIBS}/linux/glibc/arm64/lib/mssqlodbc.so",),
     "musllinux_1_2_x86_64": (f"{_LIBS}/linux/musl/x86_64/lib/mssqlodbc.so",),
     "musllinux_1_2_aarch64": (f"{_LIBS}/linux/musl/arm64/lib/mssqlodbc.so",),
     "macosx_15_0_universal2": (
@@ -104,7 +106,7 @@ def test_validator_accepts_expected_wheel_matrix(tmp_path: Path) -> None:
     result = run_validator(tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert "Validated 34 mssql-python-rs wheels" in result.stdout
+    assert "Validated 44 mssql-python-rs wheels" in result.stdout
 
 
 def test_validator_rejects_missing_odbc_driver(tmp_path: Path) -> None:
@@ -164,14 +166,14 @@ def test_validator_rejects_incomplete_matrix(tmp_path: Path) -> None:
     result = run_validator(tmp_path)
 
     assert result.returncode != 0
-    assert "Expected 34 wheels, found 1" in result.stderr
+    assert "Expected 44 wheels, found 1" in result.stderr
 
 
 def test_validator_rejects_no_wheels(tmp_path: Path) -> None:
     result = run_validator(tmp_path)
 
     assert result.returncode != 0
-    assert "Expected 34 wheels, found 0" in result.stderr
+    assert "Expected 44 wheels, found 0" in result.stderr
 
 
 @pytest.mark.parametrize(
