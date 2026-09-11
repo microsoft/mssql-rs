@@ -30,6 +30,7 @@ arrow = { version = "55", default-features = false, features = ["ffi"] }
 # initialized interpreter. Resolver v2 keeps this out of the cdylib/wheel build.
 [dev-dependencies]
 pyo3 = { version = "0.29.0", features = ["auto-initialize"] }
+mssql-tds = { path = "../mssql-tds", features = ["test-util"] }
 
 [build-dependencies]
 pyo3-build-config = "0.29.0"
