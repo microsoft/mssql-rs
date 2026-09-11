@@ -126,7 +126,10 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
     // Manual-commit mode leaves a driver-begun transaction open between
     // statements. It holds no user work, so roll it back explicitly instead of
     // relying on the server's cleanup when the socket closes.
-    rollback_before_disconnect(dbc);
+    rollback_before_disconnect(
+        dbc,
+        statements.iter().map(|(raw, stmt)| (*raw, stmt.as_ref())),
+    );
 
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLDisconnect: dbc mutex poisoned");
@@ -257,6 +260,25 @@ mod tests {
         let ret = unsafe { sql_disconnect(SQL_NULL_HANDLE) };
         assert_eq!(ret, SQL_INVALID_HANDLE);
         // TODO: verify SQLSTATE HY009 via SQLGetDiagRec
+    }
+
+    #[test]
+    fn disconnect_sweeps_idle_statements_without_posting_lookup_errors() {
+        let h = crate::test_support::TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        crate::error::post_sql_error(
+            &mut stmt.inner.lock().unwrap(),
+            crate::api::sqlstate::SQLSTATE_HY000,
+            0,
+            "old statement diagnostic",
+        );
+
+        assert_eq!(unsafe { sql_disconnect(h.dbc) }, SQL_SUCCESS);
+        assert!(dbc.inner.lock().unwrap().diag_records.is_empty());
+        assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        assert!(!crate::handles::is_live(h.stmt));
     }
 
     /// `SQLDisconnect` must free any outstanding explicitly-allocated

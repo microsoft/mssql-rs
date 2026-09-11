@@ -19,7 +19,7 @@ use super::close_cursor::close_cursor_for_connection_op;
 use super::odbc_types::{
     SQL_AUTOCOMMIT_OFF, SQL_AUTOCOMMIT_ON, SQL_ERROR, SQL_RESET_CONNECTION_YES, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SQL_TXN_READ_COMMITTED, SQL_TXN_READ_UNCOMMITTED,
-    SQL_TXN_REPEATABLE_READ, SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlReturn,
+    SQL_TXN_REPEATABLE_READ, SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlHandle, SqlReturn,
 };
 use super::sqlstate::{
     ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_BUSY, ERR_CONNECTION_DOES_NOT_EXIST,
@@ -784,20 +784,35 @@ pub(super) fn set_txn_isolation(dbc: &DbcHandle, value: u64) -> SqlReturn {
 /// below. `SQLDisconnect` sits between `SQLFreeHandle(SQL_HANDLE_STMT)` and
 /// `SQLFreeHandle(SQL_HANDLE_ENV)` in a host's teardown sequence, so it is on
 /// the same `DLL_PROCESS_DETACH` path those two already guard.
-pub(super) fn rollback_before_disconnect(dbc: &DbcHandle) {
-    rollback_before_disconnect_inner(dbc, process_is_shutting_down())
+pub(super) fn rollback_before_disconnect<'a>(
+    dbc: &DbcHandle,
+    statements: impl IntoIterator<Item = (SqlHandle, &'a StmtHandle)>,
+) {
+    rollback_before_disconnect_inner(dbc, statements, process_is_shutting_down())
 }
 
 /// The body of [`rollback_before_disconnect`], with the loader's shutdown flag
 /// passed in rather than read, so the skip arm below — unreachable in a live
 /// process — is testable.
-fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: bool) {
+fn rollback_before_disconnect_inner<'a>(
+    dbc: &DbcHandle,
+    statements: impl IntoIterator<Item = (SqlHandle, &'a StmtHandle)>,
+    process_is_shutting_down: bool,
+) {
     const OP: &str = "SQLDisconnect(rollback)";
 
+    // The caller already closed DBC admission. Reacquiring statement IDs would
+    // reject our own cleanup, so sweep the owners retained before that claim.
+    let mut sweep_failed = false;
+    for (raw, stmt) in statements {
+        if close_cursor_for_connection_op(stmt, raw) == SQL_ERROR {
+            sweep_failed = true;
+        }
+    }
     // A cursor that will not close leaves the connection mid-batch, so the
     // rollback below cannot be sent. Disconnecting anyway is still correct:
     // the server rolls the transaction back when the socket closes.
-    if close_all_cursors(dbc) == SQL_ERROR {
+    if sweep_failed {
         error!("{OP}: could not close all cursors; the server will roll back on disconnect");
         return;
     }
@@ -1649,6 +1664,65 @@ mod tests {
     /// The transaction is left open on the client, which is what proves no
     /// rollback was sent — the server discards it when the socket closes.
     #[test]
+    fn rollback_before_disconnect_drains_and_rolls_back_with_admission_closed() {
+        use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
+        use crate::handles::{RegistryError, begin_close};
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::{
+            col_metadata_empty, done_no_more, env_change_rollback_transaction,
+            tds_client_from_tokens_in_transaction,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let mut client = tds_client_from_tokens_in_transaction(
+            vec![
+                col_metadata_empty(),
+                done_no_more(),
+                env_change_rollback_transaction(),
+                done_no_more(),
+            ],
+            1,
+        );
+        dbc.runtime
+            .block_on(client.execute("SELECT 1".to_string(), ()))
+            .unwrap();
+        {
+            let mut state = dbc.inner.lock().unwrap();
+            state.client = Some(client);
+            state.active_stmt = Some(h.stmt);
+        }
+        stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
+        let _closing = begin_close(&dbc).unwrap();
+        assert!(matches!(
+            handle_from_raw::<StmtHandle>(h.stmt),
+            Err(RegistryError::Busy)
+        ));
+
+        rollback_before_disconnect_inner(&dbc, [(h.stmt, stmt.as_ref())], false);
+
+        let state = dbc.inner.lock().unwrap();
+        let client = state.client.as_ref().unwrap();
+        assert!(
+            !client.has_open_batch(),
+            "the cursor must drain before rollback"
+        );
+        assert!(
+            !client.has_active_transaction(),
+            "the rollback acknowledgement must be read"
+        );
+        assert!(state.active_stmt.is_none());
+        assert!(state.diag_records.is_empty());
+        assert!(!stmt.inner.lock().unwrap().has_state(STMT_STATE_CURSOR_OPEN));
+        assert!(matches!(
+            handle_from_raw::<StmtHandle>(h.stmt),
+            Err(RegistryError::Busy)
+        ));
+    }
+
+    #[test]
     fn rollback_before_disconnect_skips_the_round_trip_while_the_process_is_exiting() {
         use crate::test_support::TestHandles;
         use mssql_tds::test_client_support::{
@@ -1670,7 +1744,7 @@ mod tests {
             state.local_tran_started = true;
         }
 
-        rollback_before_disconnect_inner(&dbc, true);
+        rollback_before_disconnect_inner(&dbc, [], true);
 
         let state = dbc.inner.lock().unwrap();
         let client = state

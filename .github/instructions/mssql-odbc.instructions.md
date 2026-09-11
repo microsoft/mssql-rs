@@ -597,6 +597,10 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   API blocks close/disconnect; an idle cursor or parked DAE sequence can still
   be cleaned up. Do not let late client hand-back repopulate a disconnected
   connection. RAII guards must release use on all error/unwind paths.
+  Cleanup beneath a close claim must use retained owners, not reacquire child
+  IDs through public admission. Test that the cursor drain and rollback really
+  execute while new acquisitions remain blocked; `SQL_SUCCESS` from disconnect
+  alone does not prove its best-effort cleanup ran.
 - **APD before IPD**: `SQLBindParameter`'s `bind_param_records` is the only
   place in this crate that holds two DESC locks at once (writing a
   parameter's APD and IPD records together). It locks APD before IPD, and
