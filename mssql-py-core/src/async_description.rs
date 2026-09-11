@@ -212,7 +212,9 @@ fn description_to_python<'py>(
 
 #[cfg(test)]
 mod tests {
+    use super::description_to_python;
     use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
+    use mssql_tds::query::metadata::ColumnMetadata;
     use pyo3::Python;
     use pyo3::types::{PyAnyMethods, PyList, PyString};
 
@@ -230,6 +232,40 @@ mod tests {
                     .is(py.get_type::<PyString>())
             );
             assert!(vector_python_type(py, None).is(py.get_type::<PyString>()));
+        });
+    }
+
+    #[test]
+    fn test_description_to_python_uses_effective_plp_for_bounded_encrypted_string() {
+        Python::attach(|py| {
+            let metadata = ColumnMetadata::test_encrypted_nvarchar_4000();
+
+            assert!(metadata.is_plp());
+            assert!(!metadata.effective_is_plp());
+
+            let description = description_to_python(py, &[metadata]).unwrap();
+            let column = description.get_item(0).unwrap();
+
+            assert!(column.get_item(1).unwrap().is(py.get_type::<PyString>()));
+            assert_eq!(column.get_item(3).unwrap().extract::<u64>().unwrap(), 4000);
+            assert_eq!(column.get_item(4).unwrap().extract::<u64>().unwrap(), 4000);
+        });
+    }
+
+    #[test]
+    fn test_description_to_python_uses_effective_plp_for_encrypted_max_string() {
+        Python::attach(|py| {
+            let metadata = ColumnMetadata::test_encrypted_nvarchar_max();
+
+            assert!(metadata.is_plp());
+            assert!(metadata.effective_is_plp());
+
+            let description = description_to_python(py, &[metadata]).unwrap();
+            let column = description.get_item(0).unwrap();
+
+            assert!(column.get_item(1).unwrap().is(py.get_type::<PyString>()));
+            assert_eq!(column.get_item(3).unwrap().extract::<u64>().unwrap(), 0);
+            assert_eq!(column.get_item(4).unwrap().extract::<u64>().unwrap(), 0);
         });
     }
 }
