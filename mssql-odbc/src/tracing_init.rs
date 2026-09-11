@@ -200,14 +200,6 @@ pub(crate) fn init_tracing() {
         return;
     }
 
-    if std::panic::catch_unwind(init_tracing_once).is_err() {
-        report(format_args!(
-            "[mssql-odbc] ERROR: panic while initializing tracing"
-        ));
-    }
-}
-
-fn init_tracing_once() {
     INIT_TRACING.call_once(|| {
         let enabled = std::env::var(ENV_TRACE)
             .map(|value| value.eq_ignore_ascii_case("true"))

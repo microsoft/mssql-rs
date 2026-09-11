@@ -21,16 +21,17 @@ pub(crate) mod test_support;
 
 pub(crate) use tracing_init::init_tracing;
 
-/// Wraps an FFI entry-point body in `catch_unwind` so a Rust panic crossing
-/// the C ABI is converted into `SQL_ERROR` rather than unwinding into C
-/// (which is undefined behaviour). `$name` is the SQL function's display name
-/// used in the panic-caught error log and the trailing trace log.
-///
-/// Caller is responsible for `crate::init_tracing()` — already done at the
-/// export-layer call site in `api::exports`.
+/// Initializes tracing and wraps an FFI entry-point body in `catch_unwind` so
+/// a Rust panic crossing the C ABI is converted into `SQL_ERROR` rather than
+/// unwinding into C (which is undefined behaviour). `$name` is the SQL
+/// function's display name used in the panic-caught error log and the trailing
+/// trace log.
 macro_rules! ffi_entry {
     ($name:literal, $body:expr $(,)?) => {{
-        let ret = match ::std::panic::catch_unwind(|| $body) {
+        let ret = match ::std::panic::catch_unwind(|| {
+            $crate::init_tracing();
+            $body
+        }) {
             ::std::result::Result::Ok(rc) => rc,
             ::std::result::Result::Err(_) => {
                 ::tracing::error!(concat!($name, ": panic caught at FFI boundary"));
