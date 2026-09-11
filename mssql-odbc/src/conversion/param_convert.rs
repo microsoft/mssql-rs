@@ -44,12 +44,12 @@ use crate::api::odbc_types::{
     SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt, SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
-    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INVALID_CHARACTER_VALUE,
-    ERR_INVALID_DATETIME_FORMAT, ERR_INVALID_NULL_POINTER, ERR_INVALID_PARAM_PRECISION_OR_SCALE,
-    ERR_INVALID_STRING_OR_BUFFER_LENGTH, ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION,
-    ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
-    ERR_PARAM_CONVERSION_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
-    ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
+    DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INTERNAL_CONVERSION,
+    ERR_INVALID_CHARACTER_VALUE, ERR_INVALID_DATETIME_FORMAT, ERR_INVALID_NULL_POINTER,
+    ERR_INVALID_PARAM_PRECISION_OR_SCALE, ERR_INVALID_STRING_OR_BUFFER_LENGTH,
+    ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION, ERR_NUMERIC_OUT_OF_RANGE,
+    ERR_PARAM_C_TYPE_NOT_IMPLEMENTED, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
+    ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED, ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
 };
 use crate::api::type_rules::{
     SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
@@ -138,6 +138,7 @@ impl ParamBuildError {
             Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
             Self::Value(ConvError::InvalidCharacterValue) => ERR_INVALID_CHARACTER_VALUE,
+            Self::Value(ConvError::Internal) => ERR_INTERNAL_CONVERSION,
             // Backstop only: parameter legality is settled by the bind-time
             // matrix, and `NotHandledHere` is an internal routing signal that is
             // never meant to reach an application.
@@ -4516,6 +4517,13 @@ mod tests {
             ParamBuildError::DataAtExecNotStaged.diag().state,
             ERR_DATA_AT_EXEC_NOT_STAGED.state
         );
+    }
+
+    #[test]
+    fn internal_conversion_failure_maps_to_a_driver_error() {
+        let diag = ParamBuildError::Value(ConvError::Internal).diag();
+        assert_eq!(diag.state, ERR_INTERNAL_CONVERSION.state);
+        assert_eq!(diag.text, ERR_INTERNAL_CONVERSION.text);
     }
 
     #[test]
