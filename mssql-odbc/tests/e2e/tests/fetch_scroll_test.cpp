@@ -1321,7 +1321,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
 // The typed-conversion path reaches the same refusal by a different route: a
 // binary PLP column has no source encoding to convert from, so it is drained and
 // refused before any conversion is attempted. Same AB#47239 gap as above, so it
-// likewise asserts our own answer rather than parity.
+// likewise asserts our own answer rather than parity. Measured on msodbcsql
+// 18.06.0001, varbinary(max) into SQL_C_SLONG answers 07006 instead of this
+// driver's HYC00; AB#47239 tracks implementing the missing conversion here.
 //
 // PLP metadata selects the streaming path regardless of the value's size. This
 // test keeps a large value to verify that refusing a binary PLP before typed
