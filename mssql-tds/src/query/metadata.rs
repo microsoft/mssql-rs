@@ -167,9 +167,9 @@ impl ColumnMetadata {
 
     /// Returns the logical SQL Server data type of the column.
     ///
-    /// For an Always Encrypted column, this is the plaintext type stored in the
-    /// column before encryption. For non-encrypted columns, this is the same as
-    /// [`ColumnMetadata::data_type`].
+    /// For an Always Encrypted column, this is the plaintext type defined by the
+    /// column's encryption metadata. For non-encrypted columns, this is the same
+    /// as [`ColumnMetadata::data_type`].
     ///
     /// [`ColumnMetadata::data_type`] describes the type used for the value on the
     /// TDS wire, which may be a ciphertext/binary type for encrypted columns.
@@ -180,19 +180,31 @@ impl ColumnMetadata {
             .unwrap_or(self.data_type)
     }
 
-    /// Returns type information for the logical value delivered to consumers.
+    /// Returns type information for the logical SQL Server column.
     ///
-    /// For an Always Encrypted column, this is the plaintext type information from
-    /// the column's encryption metadata. For non-encrypted columns, this is the
-    /// same as [`ColumnMetadata::type_info`].
+    /// For an Always Encrypted column, this is the plaintext type information
+    /// defined by the column's encryption metadata. For non-encrypted columns,
+    /// this is the same as [`ColumnMetadata::type_info`].
     ///
-    /// The wire-level [`ColumnMetadata::type_info`] remains available for decoding
-    /// the ciphertext internally.
+    /// [`ColumnMetadata::type_info`] describes the type information used for the
+    /// value on the TDS wire.
     pub fn effective_type_info(&self) -> &TypeInfo {
         self.crypto_metadata
             .as_ref()
             .map(|c| &c.base_type_info)
             .unwrap_or(&self.type_info)
+    }
+
+    /// Returns whether the logical SQL Server column type uses PLP encoding.
+    ///
+    /// For an Always Encrypted column, this is determined from the plaintext
+    /// type information in the column's encryption metadata. For non-encrypted
+    /// columns, this is equivalent to [`ColumnMetadata::is_plp`].
+    pub fn effective_is_plp(&self) -> bool {
+        matches!(
+            self.effective_type_info().type_info_variant,
+            TypeInfoVariant::PartialLen(_, _, _, _, _)
+        )
     }
 }
 
@@ -859,5 +871,54 @@ mod tests {
             metadata.effective_type_info().type_info_variant,
             TypeInfoVariant::FixedLen(FixedLengthTypes::Int4)
         ));
+    }
+
+    #[test]
+    fn test_effective_is_plp_uses_logical_type() {
+        let collation = SqlCollation {
+            info: 0,
+            sort_id: 0,
+            col_flags: 0,
+            lcid_language_id: 0,
+        };
+
+        let metadata = create_encrypted_test_column_metadata(
+            TdsDataType::BigVarBinary,
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarBinary, None, None, None, None),
+            TypeInfo {
+                tds_type: TdsDataType::BigVarChar,
+                length: 50,
+                type_info_variant: TypeInfoVariant::VarLenString(
+                    VariableLengthTypes::BigVarChar,
+                    50,
+                    Some(collation),
+                ),
+            },
+        );
+
+        assert!(metadata.is_plp());
+        assert!(!metadata.effective_is_plp());
+    }
+
+    #[test]
+    fn test_effective_is_plp_uses_logical_type_when_logical_type_is_plp() {
+        let metadata = create_encrypted_test_column_metadata(
+            TdsDataType::BigVarBinary,
+            TypeInfoVariant::PartialLen(PartialLengthType::BigVarBinary, None, None, None, None),
+            TypeInfo {
+                tds_type: TdsDataType::BigVarChar,
+                length: 0,
+                type_info_variant: TypeInfoVariant::PartialLen(
+                    PartialLengthType::BigVarChar,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            },
+        );
+
+        assert!(metadata.is_plp());
+        assert!(metadata.effective_is_plp());
     }
 }
