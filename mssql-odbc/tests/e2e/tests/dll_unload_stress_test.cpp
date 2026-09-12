@@ -66,6 +66,8 @@ using SQLExecDirectWFn = SQLRETURN(SQL_API*)(SQLHSTMT, SQLWCHAR*, SQLINTEGER);
 using SQLFetchFn = SQLRETURN(SQL_API*)(SQLHSTMT);
 using SQLGetDescFieldWFn = SQLRETURN(SQL_API*)(SQLHDESC, SQLSMALLINT, SQLSMALLINT,
                                               SQLPOINTER, SQLINTEGER, SQLINTEGER*);
+using SQLGetDiagRecWFn = SQLRETURN(SQL_API*)(SQLSMALLINT, SQLHANDLE, SQLSMALLINT, SQLWCHAR*,
+                                            SQLINTEGER*, SQLWCHAR*, SQLSMALLINT, SQLSMALLINT*);
 using SQLDisconnectFn = SQLRETURN(SQL_API*)(SQLHDBC);
 using SQLFreeHandleFn = SQLRETURN(SQL_API*)(SQLSMALLINT, SQLHANDLE);
 
@@ -171,10 +173,12 @@ void LoadUseUnload(const std::string& dll_path, const std::wstring& conn_str, in
     auto fetch = reinterpret_cast<SQLFetchFn>(GetProcAddress(driver, "SQLFetch"));
     auto get_desc_field =
         reinterpret_cast<SQLGetDescFieldWFn>(GetProcAddress(driver, "SQLGetDescFieldW"));
+    auto get_diag_rec =
+        reinterpret_cast<SQLGetDiagRecWFn>(GetProcAddress(driver, "SQLGetDiagRecW"));
     auto disconnect = reinterpret_cast<SQLDisconnectFn>(GetProcAddress(driver, "SQLDisconnect"));
     auto free_handle = reinterpret_cast<SQLFreeHandleFn>(GetProcAddress(driver, "SQLFreeHandle"));
     ASSERT_TRUE(alloc_handle && set_env_attr && driver_connect && exec_direct && fetch &&
-                get_desc_field && disconnect && free_handle)
+                get_desc_field && get_diag_rec && disconnect && free_handle)
         << "iteration " << iteration << ": driver is missing a required export";
 
     SQLHANDLE env = SQL_NULL_HANDLE;
@@ -210,6 +214,9 @@ void LoadUseUnload(const std::string& dll_path, const std::wstring& conn_str, in
             << "iteration " << iteration << ": SQLAllocHandle(DESC) failed";
         ASSERT_TRUE(SQL_SUCCEEDED(disconnect(dbc)))
             << "iteration " << iteration << ": SQLDisconnect with live children failed";
+        EXPECT_EQ(get_diag_rec(SQL_HANDLE_DBC, dbc, 1, nullptr, nullptr, nullptr, 0, nullptr),
+                  SQL_NO_DATA)
+            << "iteration " << iteration << ": successful disconnect left cleanup diagnostics";
 
         conn_mutable = conn_str;
         ASSERT_TRUE(SQL_SUCCEEDED(driver_connect(dbc, nullptr, conn_mutable.data(), SQL_NTS,
