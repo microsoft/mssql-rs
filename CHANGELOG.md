@@ -121,6 +121,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-odbc`: `SQL_ATTR_QUERY_TIMEOUT` is now enforced for the implemented
+  catalog functions (`SQLTables`, `SQLColumns`, `SQLPrimaryKeys`,
+  `SQLForeignKeys`, `SQLSpecialColumns`, `SQLStatistics`, `SQLProcedures`),
+  `SQLGetTypeInfo` and `SQLDescribeParam`. These passed a hard-coded "no
+  timeout" to both their pre-execute steps and the RPC itself, so a configured
+  timeout bounded nothing — including the row reads on the result set they
+  open, because the budget is carried on the connection for the lifetime of the
+  batch. A blocked catalog query could therefore wait forever where msodbcsql
+  returns `HYT00`. msodbcsql runs these through `SQLExecDirectW`
+  (`sqlcdd.cpp:1866`, `:2239`) and `AutoFillIPD` (`sqlcdesc.cpp:9379`), all
+  applying the same statement timeout; the ODBC reference also documents
+  `HYT00` for every catalog function and `SQLGetTypeInfo`, naming this
+  attribute as its source. `0` (the ODBC default) still means unlimited.
+
 - `mssql-odbc`: the `APP` connection-string keyword is now sent as the TDS login
   application name. It was recognized but ignored, so `APP_NAME()` reported the
   default `TDSX Rust Client` value without warning that `APP` had been dropped.
