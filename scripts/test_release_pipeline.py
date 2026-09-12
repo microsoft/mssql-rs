@@ -350,7 +350,7 @@ def test_pypi_release_stages_selected_commit_wheels_unchanged(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     assert f"Selected source commit: {selected}" in result.stdout
-    assert "Staged 34 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
+    assert "Staged 44 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
     staged = sorted(staging.glob("*.whl"))
     assert [wheel.name for wheel in staged] == sorted(wheel.name for wheel in originals)
     for wheel in originals:
@@ -393,11 +393,23 @@ def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc:
     names = [step.get("displayName") for step in job["steps"]]
     repair = f"Repair glibc wheels into manylinux (Linux {architecture})"
     injection = f"Inject ODBC driver into wheels (Linux {architecture})"
+    build_228 = f"Build glibc-2.28 wheels (Linux {architecture})"
+    repair_228 = f"Repair glibc-2.28 wheels (Linux {architecture})"
+    injection_228 = (
+        f"Inject ODBC driver into glibc-2.28 wheels (Linux {architecture})"
+    )
 
     assert names.count(repair) == 1
+    assert names.count(build_228) == 1
+    assert names.count(repair_228) == 1
     assert (injection in names) == build_odbc
+    assert (injection_228 in names) == build_odbc
     if build_odbc:
         assert names.index(injection) < names.index(repair)
+        assert names.index(build_228) < names.index(injection_228)
+        assert names.index(injection_228) < names.index(repair_228)
+    else:
+        assert names.index(build_228) < names.index(repair_228)
 
 
 @pytest.mark.parametrize(
@@ -464,6 +476,89 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
     assert f"Package version: {expected_version}" in result.stdout
     metadata = ET.parse(staging / "mssql-python-rs-wheels.nuspec").find("metadata")
     assert metadata.findtext("version") == expected_version
+
+
+@pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
+def test_manylinux_228_builds_use_isolated_cargo_targets(
+    job_name: str,
+) -> None:
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": False,
+    }
+    pipeline = expand(
+        yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
+    )
+    build = next(
+        stage for stage in pipeline["stages"] if stage["stage"] == "Build"
+    )
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    wheel_step = next(
+        step
+        for step in job["steps"]
+        if step.get("displayName", "").startswith("Build glibc-2.28 wheels")
+    )
+    assert (
+        '-e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28"'
+        in wheel_step["script"]
+    )
+
+
+@pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
+def test_manylinux_228_odbc_builds_enforce_glibc_ceiling(job_name: str) -> None:
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": True,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": False,
+    }
+    pipeline = expand(
+        yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags
+    )
+    build = next(
+        stage for stage in pipeline["stages"] if stage["stage"] == "Build"
+    )
+    job = next(job for job in build["jobs"] if job.get("job") == job_name)
+    odbc_step = next(
+        step
+        for step in job["steps"]
+        if step.get("parameters", {}).get("displaySuffix", "").startswith(
+            "glibc-2.28"
+        )
+    )
+    assert odbc_step["parameters"]["maxGlibcVersion"] == "2.28"
+
+
+def test_wheel_image_odbc_builds_use_isolated_cargo_target() -> None:
+    template = (
+        _ROOT
+        / ".pipeline"
+        / "templates"
+        / "build-odbc-driver-in-wheel-image-template.yml"
+    )
+    odbc_template = yaml.safe_load(
+        template.read_text(encoding="utf-8")
+    )
+    script = odbc_template["steps"][0]["script"]
+    assert "-e CARGO_TARGET_DIR=/tmp/mssql-odbc-target" in script
+    assert "-e MAX_GLIBC_VERSION=${{ parameters.maxGlibcVersion }}" in script
+    parameters = {
+        parameter["name"]: parameter
+        for parameter in odbc_template["parameters"]
+    }
+    assert parameters["maxGlibcVersion"]["default"] == "2.34"
+
+    build_script = (_ROOT / "scripts" / "build-odbc-driver-only.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'MAX_GLIBC_VERSION="${MAX_GLIBC_VERSION:-2.34}"' in build_script
+    assert 'ceiling="GLIBC_$MAX_GLIBC_VERSION"' in build_script
 
 
 @pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=5)))
@@ -865,7 +960,7 @@ def test_wheel_validation_and_optional_nuspec(source_repositories, tmp_path, nug
         return
 
     assert result.returncode == 0, result.stderr
-    assert "Validated 34 mssql-python-rs wheels" in result.stdout
+    assert "Validated 44 mssql-python-rs wheels" in result.stdout
     variables.update(re.findall(r"##vso\[task.setvariable variable=(\w+)\](.*)", result.stdout))
     assert variables["releaseVersion"] == "0.1.0"
     assert variables["sourceCommit"] == selected

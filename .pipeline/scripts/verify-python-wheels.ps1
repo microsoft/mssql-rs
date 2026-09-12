@@ -79,6 +79,8 @@ function Get-ExpectedWheelNames {
         'win_amd64',
         'manylinux_2_34_x86_64',
         'manylinux_2_34_aarch64',
+        'manylinux_2_28_x86_64',
+        'manylinux_2_28_aarch64',
         'musllinux_1_2_x86_64',
         'musllinux_1_2_aarch64',
         'macosx_15_0_universal2'
