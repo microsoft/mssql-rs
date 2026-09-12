@@ -18,6 +18,7 @@
 //! shot at a fixed-size buffer and reports `01004` if the value does not fit.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use tracing::{debug, error};
 
@@ -29,7 +30,7 @@ use mssql_tds::datatypes::column_values::{
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::row_writer::RowWriter;
 use mssql_tds::datatypes::sql_json::SqlJson;
-use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, get_encoding_type};
+use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
 use mssql_tds::datatypes::sql_vector::SqlVector;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
 use mssql_tds::encoding_rs;
@@ -65,16 +66,10 @@ use crate::conversion::fetch_convert::{
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::OdbcVersion;
 use crate::handles::stmt::{
-    BufferedGetDataRow, ColumnBinding, STMT_STATE_CURSOR_OPEN, STMT_STATE_FETCH_IN_PROGRESS,
-    StmtState,
+    BufferedGetDataRow, ColumnBinding, PlpColumnInfo, STMT_STATE_CURSOR_OPEN,
+    STMT_STATE_FETCH_IN_PROGRESS, StmtState,
 };
 use crate::handles::{DescHandle, HandleType, StmtHandle, handle_from_raw};
-
-#[derive(Clone, Copy)]
-struct PlpColumnInfo {
-    wire_encoding: PlpEncoding,
-    text_encoding: Option<EncodingType>,
-}
 
 impl BufferedGetDataRow {
     /// Creates an empty row, reusing the supplied row's allocations when its
@@ -806,38 +801,19 @@ fn fetch_scroll_safe(
     fetch_orientation: SqlSmallInt,
     _fetch_offset: SqlLen,
 ) -> SqlReturn {
-    // The declared ODBC version selects the SQL_C_DEFAULT table. Read it before
-    // the stmt lock to preserve parent-before-child lock ordering (the same
-    // order as `bind_param.rs` and `catalog.rs`).
-    //
-    // Read per fetch, deliberately, not cached on the DBC at alloc. Gating it on
-    // "does any binding use SQL_C_DEFAULT" would need the bindings first, which
-    // inverts the lock order; caching at alloc would instead bake in a value
-    // that `SQLSetEnvAttr` can still overwrite afterwards. It is an uncontended
-    // read of one `Copy` field, taken before validation so there is exactly one
-    // acquisition site rather than one per early-return path.
-    let odbc_version = {
-        let env = stmt.parent_dbc().parent_env();
-        let Ok(env_state) = env.inner.lock() else {
-            error!("SQLFetchScroll: env mutex poisoned");
-            return SQL_ERROR;
-        };
-        env_state.odbc_version
-    };
-
     // Snapshot the rowset controls and the effective ARD, then release the
     // statement lock: the fill loop below blocks on the network and must not
     // hold it. The application is not allowed to rebind concurrently with a
     // fetch on the same statement, so the snapshot cannot go stale under us.
     let (
         ard,
-        column_sql_types,
         row_array_size,
         rows_fetched_ptr,
         row_status_ptr,
         column_count,
         row_bind_offset_ptr,
         trailing_utf16_plp,
+        plp_columns,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
@@ -918,15 +894,6 @@ fn fetch_scroll_safe(
         // "Locking rules": a STMT lock must never be held while acquiring a
         // DESC lock.
         let ard = stmt_state.effective_ard(stmt);
-        // Resolving SQL_C_DEFAULT needs this result set's SQL types, which live
-        // under the STMT lock, but the bindings it applies to are read from the
-        // ARD after this lock is released. Snapshot the types here and carry
-        // them out rather than re-locking the statement.
-        let column_sql_types: Vec<SqlSmallInt> = stmt_state
-            .column_metadata
-            .iter()
-            .map(odbc_sql_type)
-            .collect();
         // Claiming the statement here is what stops a concurrent SQLBindCol
         // from freeing an application buffer the fill loop is still reading
         // through after this lock is released; the mutating entry points
@@ -939,13 +906,13 @@ fn fetch_scroll_safe(
             == Some(PlpEncoding::Utf16Text);
         (
             ard,
-            column_sql_types,
             stmt_state.row_array_size,
             stmt_state.rows_fetched_ptr,
             stmt_state.row_status_ptr,
             stmt_state.column_metadata.len(),
             stmt_state.row_bind_offset_ptr,
             trailing_utf16_plp,
+            stmt_state.plp_columns.clone(),
         )
     };
 
@@ -957,12 +924,13 @@ fn fetch_scroll_safe(
     // statement is not left permanently stuck mid-fetch: silently treating it
     // as "nothing bound" would advance the cursor and report success for a
     // rowset the application never actually got the columns it asked for.
-    let bindings: Vec<ColumnBinding> = {
-        // `ard` can be an explicit descriptor resolved under the STMT lock,
-        // already dropped by now — re-check liveness right before
-        // dereferencing to narrow (not fully close) the race against a
-        // concurrent `SQLFreeHandle(SQL_HANDLE_DESC)` on that same
-        // descriptor.
+    let mut bindings: Vec<ColumnBinding> = {
+        // `ard` was resolved under the STMT lock and may already be dropped by
+        // now — re-check liveness right before dereferencing to narrow (not
+        // fully close) the race against a concurrent
+        // `SQLFreeHandle(SQL_HANDLE_DESC)` on an explicit descriptor, or a
+        // `SQLDisconnect` that frees the statement along with the four
+        // implicit descriptors it owns.
         if crate::handles::live_type(ard) != Some(crate::handles::HandleType::Desc) {
             error!("SQLFetchScroll: ard freed concurrently; failing the fetch");
             if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -990,11 +958,44 @@ fn fetch_scroll_safe(
             }
             return SQL_ERROR;
         };
-        let mut bindings = ColumnBinding::all_from_ard_state(&desc_state);
-        drop(desc_state);
-        resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
-        bindings
+        ColumnBinding::all_from_ard_state(&desc_state)
     };
+    if bindings
+        .iter()
+        .any(|binding| binding.target_type == SQL_C_DEFAULT)
+    {
+        // These locks are needed only for deferred default bindings and are
+        // acquired sequentially, after the ARD snapshot has been released.
+        let odbc_version = {
+            let env = stmt.parent_dbc().parent_env();
+            let Ok(env_state) = env.inner.lock() else {
+                error!("SQLFetchScroll: env mutex poisoned");
+                if let Ok(mut stmt_state) = stmt.inner.lock() {
+                    stmt_state.clear_state(STMT_STATE_FETCH_IN_PROGRESS);
+                    post_sql_error(
+                        &mut stmt_state,
+                        SQLSTATE_HY000,
+                        0,
+                        "Internal error reading column bindings",
+                    );
+                }
+                return SQL_ERROR;
+            };
+            env_state.odbc_version
+        };
+        let column_sql_types: Vec<SqlSmallInt> = {
+            let Ok(stmt_state) = stmt.inner.lock() else {
+                error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
+                return SQL_ERROR;
+            };
+            stmt_state
+                .column_metadata
+                .iter()
+                .map(odbc_sql_type)
+                .collect()
+        };
+        resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
+    }
     let get_data_fetch = row_array_size == 1 && bindings.is_empty();
     let reusable_get_data_row = if get_data_fetch {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -1018,6 +1019,7 @@ fn fetch_scroll_safe(
         row_bind_offset_ptr,
         reusable_get_data_row,
         buffer_trailing_utf16_plp,
+        plp_columns,
     );
 
     // Single clearing point for the guard, so every early return inside the
@@ -1041,6 +1043,7 @@ fn fill_rowset(
     row_bind_offset_ptr: *mut SqlULen,
     mut reusable_get_data_row: Option<BufferedGetDataRow>,
     buffer_trailing_utf16_plp: bool,
+    plp_columns: Option<Arc<[Option<PlpColumnInfo>]>>,
 ) -> SqlReturn {
     // The application asked for at most `SQL_ATTR_MAX_ROWS` rows from this
     // result set. Once that many have been returned the cursor stops without
@@ -1136,35 +1139,6 @@ fn fill_rowset(
     let mut last_column_read = 0usize;
     let mut buffered_get_data_row = None;
 
-    // Snapshot the per-column PLP encodings once. Taking the statement lock
-    // inside the fill loop would make a poisoned mutex indistinguishable from a
-    // column that simply is not PLP, which would silently downgrade a supported
-    // column to "unsupported" and drain it.
-    let plp_columns: Vec<Option<PlpColumnInfo>> = {
-        let Ok(ss) = stmt.inner.lock() else {
-            error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
-            if let Ok(mut ds) = dbc.inner.lock() {
-                ds.client = Some(client);
-            }
-            return SQL_ERROR;
-        };
-        ss.column_metadata
-            .iter()
-            .map(|metadata| {
-                let wire_encoding = metadata.plp_encoding()?;
-                let text_encoding = match wire_encoding {
-                    PlpEncoding::Utf16Text => Some(EncodingType::Utf16),
-                    PlpEncoding::Utf8Text => Some(EncodingType::Utf8),
-                    PlpEncoding::SingleByteText => Some(get_encoding_type(metadata)),
-                    PlpEncoding::Binary => None,
-                };
-                Some(PlpColumnInfo {
-                    wire_encoding,
-                    text_encoding,
-                })
-            })
-            .collect()
-    };
     // Allocate only if a bound PLP value is actually reached. Fixed rowsets,
     // especially row-array size 1, otherwise paid this zero-fill per fetch.
     let mut plp_scratch = None;
@@ -1365,7 +1339,11 @@ fn fill_rowset(
                                 binding,
                                 rows_filled as usize,
                                 bind_offset,
-                                plp_columns.get(column - 1).copied().flatten(),
+                                plp_columns
+                                    .as_ref()
+                                    .and_then(|columns| columns.get(column - 1))
+                                    .copied()
+                                    .flatten(),
                                 scratch,
                             )
                         };
@@ -1717,15 +1695,17 @@ unsafe fn deliver_bound_plp(
 ) -> Result<RowOutcome, TdsError> {
     // Unreachable today, kept as a guard rather than an `unreachable!()`.
     // Getting here means the cursor classified this column as
-    // `CursorColumn::PlpStreaming` while `plp_encoding()` answered `None` for
-    // the same column. Both decide on `ColumnMetadata::is_plp()` over the same
-    // COLMETADATA (`plp_columns` snapshots the statement's copy, whose length
-    // also fixes `column_count`, so the lookup is always in range), and
-    // `plp_encoding` maps every PLP type to `Some` -- new ones included, via its
-    // catch-all to `Binary`. So the two cannot disagree unless a future type
-    // makes PLP-ness visible only in the wire framing and not in TYPE_INFO.
-    // Draining keeps the row synchronized if that day comes; a panic would take
-    // the application down for a column it could simply refuse.
+    // `CursorColumn::PlpStreaming` while the cache answered `None` for the same
+    // column. Both decide on `ColumnMetadata::is_plp()` over the same
+    // COLMETADATA (`plp_columns` is built from the statement's copy, and is
+    // `Some` only when some column is PLP -- when it is, its length matches
+    // `column_count`, and when it is `None` no column reaches this path at
+    // all), and `plp_encoding` maps every PLP type to `Some` -- new ones
+    // included, via its catch-all to `Binary`. So the two cannot disagree
+    // unless a future type makes PLP-ness visible only in the wire framing and
+    // not in TYPE_INFO. Draining keeps the row synchronized if that day comes;
+    // a panic would take the application down for a column it could simply
+    // refuse.
     let Some(column_info) = column_info else {
         drain_plp_to_end(client, runtime, scratch)?;
         return Ok(RowOutcome::Error(RowIssue::Unsupported));
