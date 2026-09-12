@@ -5,7 +5,7 @@ import { SqlJsConnection } from '.';
 import { DataType } from './datatypes';
 import { JsSqlDataTypes } from './datatypes/enums';
 import { SqlDataTypes, Parameter } from './generated';
-import { decodeRawResult, RawResult } from './decode';
+import { decodeProjectedResult, RawColumnInfo, RawResult } from './decode';
 
 type ColumnValue = number | string | boolean | Buffer | null | Date | bigint;
 
@@ -136,18 +136,13 @@ export class Request {
   }
 
   async query(command: string): Promise<IResult> {
-    if (this.params.length === 0) {
-      return this.queryFast(command);
-    }
-    await this.connection.execute(command, this.params);
-    let result: IResult = await this.createResultFast();
-    await this.connection.closeQuery();
-    return result;
-  }
-
-  private async queryFast(command: string): Promise<IResult> {
-    const buffers = await this.connection.queryRaw(command);
-    const rawResults = buffers.map((buf) => decodeRawResult(buf));
+    const buffers = await this.connection.queryRaw(
+      command,
+      this.params.length > 0 ? this.params : undefined,
+    );
+    const rawResults = buffers.map((buf) =>
+      decodeProjectedResult(buf, createRowProjector),
+    );
     return reshapeRawToIResult(rawResults);
   }
 
@@ -178,16 +173,16 @@ export class Request {
 
   private async createResultFast(): Promise<IResult> {
     const BYTE_BUDGET = 256 * 1024;
-    const rawResults: RawResult[] = [];
+    const rawResults: RawResult<RecordSetRow>[] = [];
 
     while (true) {
-      let merged: RawResult | null = null;
+      let merged: RawResult<RecordSetRow> | null = null;
 
       while (true) {
         const chunk = await this.connection.fetchChunk(BYTE_BUDGET);
         if (!chunk) break;
 
-        const decoded = decodeRawResult(chunk.data);
+        const decoded = decodeProjectedResult(chunk.data, createRowProjector);
         if (!merged) {
           merged = decoded;
         } else {
@@ -211,8 +206,29 @@ export class Request {
   }
 }
 
+function createRowProjector(columns: RawColumnInfo[]) {
+  const names = columns.map((column) => column.name);
+  return (values: readonly unknown[]): RecordSetRow => {
+    const row: RecordSetRow = {};
+    for (let c = 0; c < names.length; c++) {
+      const name = names[c];
+      const val = values[c] as ColumnValue;
+      if (name === '' && '' in row) {
+        if (Array.isArray(row[''])) {
+          (row[''] as ColumnValue[]).push(val);
+        } else {
+          row[''] = [row[''], val];
+        }
+      } else {
+        row[name] = val;
+      }
+    }
+    return row;
+  };
+}
+
 /** Convert decoded result sets into an `IResult`. */
-function reshapeRawToIResult(rawResults: RawResult[]): IResult {
+function reshapeRawToIResult(rawResults: RawResult<RecordSetRow>[]): IResult {
   const recordSets: RecordSet[] = [];
   let totalRowCount = 0;
 
@@ -232,35 +248,15 @@ function reshapeRawToIResult(rawResults: RawResult[]): IResult {
       columns.push({
         index: i,
         name,
-        type: name.length > 0 ? (raw.columns[i].typeId as SqlDataTypes) : undefined,
+        type:
+          name.length > 0 ? (raw.columns[i].typeId as SqlDataTypes) : undefined,
       });
     }
 
-    const recordSet: RecordSet = Object.assign([] as RecordSetRow[], {
+    const recordSet: RecordSet = Object.assign(raw.rows, {
       columns,
       rowCount: raw.rowCount,
     });
-
-    for (let r = 0; r < raw.rowCount; r++) {
-      const rawRow = raw.rows[r];
-      const row: RecordSetRow = {};
-
-      for (let c = 0; c < colCount; c++) {
-        const name = colNames[c];
-        const val = rawRow[c] as ColumnValue;
-
-        if (name === '' && '' in row) {
-          if (Array.isArray(row[''])) {
-            (row[''] as ColumnValue[]).push(val);
-          } else {
-            row[''] = [row[''] as ColumnValue, val];
-          }
-        } else {
-          row[name] = val;
-        }
-      }
-      recordSet.push(row);
-    }
 
     recordSets.push(recordSet);
     totalRowCount += raw.rowCount;
