@@ -10,6 +10,7 @@ import hashlib
 import io
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from test_verify_python_wheels import write_wheel_matrix
 
 _ROOT = Path(__file__).parents[1]
 _PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "OfficialPythonWheelsRelease.yml"
+_PYPI_PIPELINE = _ROOT / ".pipeline" / "OneBranch" / "PyPIRelease.yml"
 _BUILD_STAGES = _ROOT / ".pipeline" / "OneBranch" / "stages.yml"
 _METADATA = _ROOT / ".pipeline" / "scripts" / "get-python-release-metadata.ps1"
 _SWITCHES = (
@@ -111,6 +113,258 @@ def test_release_defaults_are_safe():
     assert pipeline["resources"]["pipelines"][0]["source"] == "Official Python Wheels Build"
 
 
+@pytest.mark.parametrize("publish", [False, True])
+def test_pypi_release_switch_graph(publish: bool) -> None:
+    source = yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8"))
+    assert source["parameters"] == [
+        {
+            "name": "publishToPyPI",
+            "displayName": (
+                "Publish selected official wheels to PyPI via ESRP. " "Leave false for a dry run."
+            ),
+            "type": "boolean",
+            "default": False,
+        }
+    ]
+    assert source["trigger"] == "none"
+    assert source["pr"] == "none"
+
+    pipeline = expand(source, {"publishToPyPI": publish})
+    job = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]
+    steps = job["steps"]
+    names = [step.get("displayName") for step in steps]
+    assert names.count("Require successful Official Build") == 1
+    assert names.index("Require successful Official Build") < names.index(
+        "Download all artifacts from Official Build"
+    )
+    assert names.count("Verify and stage official wheels") == 1
+    assert ("Require stable branch for publish" in names) == publish
+    assert ("ESRP Release mssql-python-rs wheels to PyPI" in names) == publish
+    assert ("Release summary" in names) == publish
+    assert any(step.get("download") == "officialBuild" for step in steps)
+    assert any(step.get("checkout") == "self" for step in steps)
+    stage_step = next(
+        step for step in steps if step.get("displayName") == "Verify and stage official wheels"
+    )
+    assert "-RequireOdbc" in stage_step["pwsh"]
+    if not publish:
+        assert not any(step.get("task", "").startswith("EsrpRelease@") for step in steps)
+    else:
+        esrp = next(step for step in steps if step.get("task", "").startswith("EsrpRelease@"))
+        assert esrp["inputs"]["FolderLocation"] == "$(Agent.TempDirectory)/pypi-publish"
+
+
+@pytest.mark.parametrize(
+    ("status", "result", "succeeds"),
+    [
+        ("completed", "succeeded", True),
+        ("completed", "failed", False),
+        ("completed", "partiallySucceeded", False),
+        ("completed", "canceled", False),
+        ("inProgress", "", False),
+        ("notStarted", "", False),
+    ],
+)
+def test_pypi_release_requires_successful_official_build(
+    status: str, result: str, succeeds: bool
+) -> None:
+    pipeline = expand(
+        yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8")),
+        {"publishToPyPI": False},
+    )
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    script = next(
+        step["pwsh"]
+        for step in steps
+        if step.get("displayName") == "Require successful Official Build"
+    )
+    stub = r"""
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers)
+        if ($Method -cne 'Get') { throw "Unexpected method: $Method" }
+        if ($Uri -cne 'https://dev.azure.com/test/project-id/_apis/build/builds/123?api-version=7.1') {
+            throw "Unexpected URI: $Uri"
+        }
+        if ($Headers.Authorization -cne 'Bearer test-token') {
+            throw "Unexpected authorization header"
+        }
+        [pscustomobject]@{
+            status = $env:MOCK_BUILD_STATUS
+            result = $env:MOCK_BUILD_RESULT
+        }
+    }
+    """
+    completed = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", stub + script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_RUN_ID": "123",
+            "SYSTEM_ACCESSTOKEN": "test-token",
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/test/",
+            "SYSTEM_TEAMPROJECTID": "project-id",
+            "MOCK_BUILD_STATUS": status,
+            "MOCK_BUILD_RESULT": result,
+        },
+    )
+
+    assert (completed.returncode == 0) == succeeds
+    if succeeds:
+        assert "Selected Official Build 123 is completed and succeeded." in completed.stdout
+    else:
+        assert (
+            f"Official Build 123 is not eligible for release: status='{status}', "
+            f"result='{result}'."
+        ) in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("release_branch", "build_branch", "succeeds"),
+    [
+        ("refs/heads/stable", "refs/heads/stable", True),
+        ("refs/heads/main", "refs/heads/stable", False),
+        ("refs/heads/stable", "refs/heads/main", False),
+        ("refs/heads/stable", "refs/heads/STABLE", False),
+        ("refs/heads/STABLE", "refs/heads/stable", False),
+    ],
+)
+def test_pypi_publish_requires_both_stable_branches(
+    release_branch: str, build_branch: str, succeeds: bool
+) -> None:
+    pipeline = expand(
+        yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8")),
+        {"publishToPyPI": True},
+    )
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    script = next(
+        step["pwsh"]
+        for step in steps
+        if step.get("displayName") == "Require stable branch for publish"
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "RELEASE_SOURCE_BRANCH": release_branch,
+            "OFFICIAL_BUILD_SOURCE_BRANCH": build_branch,
+        },
+    )
+
+    assert (result.returncode == 0) == succeeds
+
+
+def prepare_pypi_release(tmp_path: Path, *, duplicate: bool = False):
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    git(remote, "init", "-b", "stable")
+    commit_metadata(remote, "0.1.10")
+    pyproject = remote / "mssql-py-core" / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "mssql-python-rs"\nversion = "0.1.0"\n', encoding="utf-8"
+    )
+    git(remote, "add", ".")
+    git(
+        remote,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Selected Python release",
+    )
+    selected = git(remote, "rev-parse", "HEAD")
+    pyproject.write_text(
+        '[project]\nname = "mssql-python-rs"\nversion = "9.9.9"\n', encoding="utf-8"
+    )
+    git(remote, "add", ".")
+    git(
+        remote,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Advance branch tip",
+    )
+
+    workspace = tmp_path / "workspace"
+    checkout = workspace / "s" / "mssql-rs"
+    checkout.parent.mkdir(parents=True)
+    git(checkout.parent, "clone", str(remote), str(checkout))
+    scripts = checkout / ".pipeline" / "scripts"
+    scripts.mkdir(parents=True)
+    for filename in ("get-python-release-metadata.ps1", "verify-python-wheels.ps1"):
+        shutil.copy2(_ROOT / ".pipeline" / "scripts" / filename, scripts)
+    wheels = workspace / "officialBuild" / "drop" / "wheels"
+    wheels.mkdir(parents=True)
+    originals = write_wheel_matrix(wheels)
+    if duplicate:
+        duplicate_dir = workspace / "officialBuild" / "duplicate" / "wheels"
+        duplicate_dir.mkdir(parents=True)
+        shutil.copy2(originals[0], duplicate_dir / originals[0].name)
+
+    pipeline = expand(
+        yaml.safe_load(_PYPI_PIPELINE.read_text(encoding="utf-8")),
+        {"publishToPyPI": False},
+    )
+    steps = pipeline["extends"]["parameters"]["stages"][0]["jobs"][0]["steps"]
+    script = next(
+        step["pwsh"]
+        for step in steps
+        if step.get("displayName") == "Verify and stage official wheels"
+    )
+    agent_temp = tmp_path / "agent-temp"
+    agent_temp.mkdir()
+    script = script.replace("$(Pipeline.Workspace)", str(workspace)).replace(
+        "$(Agent.TempDirectory)", str(agent_temp)
+    )
+    result = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "OFFICIAL_BUILD_SOURCE_COMMIT": selected,
+            "OFFICIAL_BUILD_SOURCE_BRANCH": "refs/heads/stable",
+            "OFFICIAL_BUILD_RUN_ID": "123",
+        },
+    )
+    return result, originals, agent_temp / "pypi-publish", selected
+
+
+def test_pypi_release_stages_selected_commit_wheels_unchanged(tmp_path: Path) -> None:
+    result, originals, staging, selected = prepare_pypi_release(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert f"Selected source commit: {selected}" in result.stdout
+    assert "Staged 34 mssql-python-rs 0.1.0 wheels unchanged." in result.stdout
+    staged = sorted(staging.glob("*.whl"))
+    assert [wheel.name for wheel in staged] == sorted(wheel.name for wheel in originals)
+    for wheel in originals:
+        assert (staging / wheel.name).read_bytes() == wheel.read_bytes()
+
+
+def test_pypi_release_rejects_duplicate_wheel_names(tmp_path: Path) -> None:
+    result, _, staging, _ = prepare_pypi_release(tmp_path, duplicate=True)
+
+    assert result.returncode != 0
+    assert "Duplicate wheel filenames in Official Build artifacts" in result.stderr
+    assert not list(staging.glob("*.whl"))
+
+
 def test_crate_templates_resolve_in_self_repository():
     # StageList steps are expanded inside GovernedTemplates, so relative paths
     # without @self can resolve against the wrong repository.
@@ -120,6 +374,30 @@ def test_crate_templates_resolve_in_self_repository():
         re.MULTILINE,
     )
     assert templates == ["/.pipeline/templates/validate-release-crates.yml@self"] * 6
+
+
+@pytest.mark.parametrize("architecture", ("x64", "ARM64"))
+@pytest.mark.parametrize("build_odbc", (False, True))
+def test_manylinux_repair_does_not_depend_on_odbc(architecture: str, build_odbc: bool) -> None:
+    flags = {
+        "buildAllTargets": True,
+        "buildPythonWheels": True,
+        "buildOdbcNative": build_odbc,
+        "buildRustCrates": False,
+        "isOfficial": False,
+        "publishToFeed": True,
+    }
+    pipeline = expand(yaml.safe_load(_BUILD_STAGES.read_text(encoding="utf-8")), flags)
+    build = next(stage for stage in pipeline["stages"] if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job["job"] == f"Linux_{architecture}")
+    names = [step.get("displayName") for step in job["steps"]]
+    repair = f"Repair glibc wheels into manylinux (Linux {architecture})"
+    injection = f"Inject ODBC driver into wheels (Linux {architecture})"
+
+    assert names.count(repair) == 1
+    assert (injection in names) == build_odbc
+    if build_odbc:
+        assert names.index(injection) < names.index(repair)
 
 
 @pytest.mark.parametrize(
@@ -639,6 +917,32 @@ def test_missing_commit_does_not_use_checkout(source_repositories, tmp_path):
     result = read_metadata(checkout, "0" * 40, tmp_path)
     assert result.returncode != 0
     assert "was not found after fetching" in result.stderr
+
+
+def test_metadata_rejects_commit_outside_selected_branch(source_repositories, tmp_path):
+    _, checkout, _ = source_repositories
+    git(checkout, "checkout", "--orphan", "unrelated")
+    git(checkout, "rm", "-rf", ".")
+    (checkout / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    git(checkout, "add", ".")
+    git(
+        checkout,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Unrelated commit",
+    )
+    unrelated = git(checkout, "rev-parse", "HEAD")
+
+    result = read_metadata(checkout, unrelated, tmp_path)
+
+    assert result.returncode != 0
+    assert "reachable from refs/heads/main" in result.stderr
 
 
 def test_missing_git_context_fails_explicitly(source_repositories, tmp_path):

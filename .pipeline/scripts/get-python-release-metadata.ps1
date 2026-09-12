@@ -19,6 +19,10 @@ git -C $RepositoryDirectory cat-file -e "${CommitSha}^{commit}"
 if ($LASTEXITCODE -ne 0) {
     throw "Selected build commit $CommitSha was not found after fetching $SourceBranch"
 }
+git -C $RepositoryDirectory merge-base --is-ancestor $CommitSha FETCH_HEAD
+if ($LASTEXITCODE -ne 0) {
+    throw "Selected build commit $CommitSha is not reachable from $SourceBranch"
+}
 
 function Get-BuildSourceFile {
     param([string]$Path)

@@ -86,7 +86,9 @@ done
 # auditwheel=skip in pyproject.toml means maturin won't vendor shared libs
 # (libssl, libcrypto) into the wheel. The native extension links against
 # standard sonames and expects the OS to provide them at runtime.
-# Run auditwheel show for diagnostic info only.
+# Run auditwheel show for diagnostic info only. The glibc wheels are retagged
+# manylinux_* downstream by scripts/repair-glibc-wheels-in-container.sh, which
+# keeps OpenSSL OS-provided (--exclude libssl/libcrypto).
 if command -v auditwheel &> /dev/null; then
     echo ""
     echo "==> Running auditwheel show (diagnostic only — bundling is disabled)..."

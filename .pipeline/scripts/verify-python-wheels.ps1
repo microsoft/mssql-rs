@@ -18,6 +18,25 @@ function ConvertTo-CanonicalName {
     return [regex]::Replace($Name.ToLowerInvariant(), '[-_.]+', '-')
 }
 
+function Assert-PyPICompatiblePlatformTag {
+    param([string]$WheelName)
+
+    $platformTag = [System.IO.Path]::GetFileNameWithoutExtension($WheelName).Split('-')[-1]
+    $accepted = @(
+        '^win_amd64$',
+        '^win_arm64$',
+        '^macosx_\d+_\d+_universal2$',
+        '^manylinux_\d+_\d+_(x86_64|aarch64)$',
+        '^musllinux_\d+_\d+_(x86_64|aarch64)$'
+    )
+    foreach ($pattern in $accepted) {
+        if ($platformTag -match $pattern) {
+            return
+        }
+    }
+    throw "$WheelName has platform tag '$platformTag' which PyPI rejects. Linux wheels must carry a manylinux or musllinux tag, not a bare linux tag."
+}
+
 function Get-ExpectedOdbcMembers {
     param([string]$WheelName)
 
@@ -58,8 +77,8 @@ function Get-ExpectedWheelNames {
     $pythonTags = 'cp310', 'cp311', 'cp312', 'cp313', 'cp314'
     $platforms = @(
         'win_amd64',
-        'linux_x86_64',
-        'linux_aarch64',
+        'manylinux_2_34_x86_64',
+        'manylinux_2_34_aarch64',
         'musllinux_1_2_x86_64',
         'musllinux_1_2_aarch64',
         'macosx_15_0_universal2'
@@ -81,6 +100,9 @@ $filenamePrefix = $ExpectedName.Replace('-', '_')
 $expectedFilenamePrefix = "$filenamePrefix-$ExpectedVersion-"
 $expectedWheelNames = @(Get-ExpectedWheelNames $filenamePrefix $ExpectedVersion)
 $wheels = @(Get-ChildItem -Path $WheelsDir -Filter '*.whl' -File)
+foreach ($wheel in $wheels) {
+    Assert-PyPICompatiblePlatformTag $wheel.Name
+}
 if ($wheels.Count -ne $expectedWheelNames.Count) {
     throw "Expected $($expectedWheelNames.Count) wheels, found $($wheels.Count)"
 }
@@ -116,11 +138,15 @@ foreach ($wheel in $wheels) {
 
         $nameMatch = [regex]::Match($metadata, '(?m)^Name:\s*(.+?)\r?$')
         $versionMatch = [regex]::Match($metadata, '(?m)^Version:\s*(.+?)\r?$')
+        $requiresPythonMatch = [regex]::Match($metadata, '(?m)^Requires-Python:\s*(.+?)\r?$')
         if (-not $nameMatch.Success) {
             throw "$($wheel.Name): METADATA has no Name field"
         }
         if (-not $versionMatch.Success) {
             throw "$($wheel.Name): METADATA has no Version field"
+        }
+        if (-not $requiresPythonMatch.Success) {
+            throw "$($wheel.Name): METADATA has no Requires-Python field"
         }
 
         $actualName = ConvertTo-CanonicalName $nameMatch.Groups[1].Value
@@ -129,6 +155,9 @@ foreach ($wheel in $wheels) {
         }
         if ($versionMatch.Groups[1].Value -ne $ExpectedVersion) {
             throw "$($wheel.Name): metadata Version is '$($versionMatch.Groups[1].Value)', expected '$ExpectedVersion'"
+        }
+        if ($requiresPythonMatch.Groups[1].Value -ne '>=3.10') {
+            throw "$($wheel.Name): metadata Requires-Python is '$($requiresPythonMatch.Groups[1].Value)', expected '>=3.10'"
         }
 
         if ($RequireOdbc) {
