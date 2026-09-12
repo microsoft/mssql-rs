@@ -634,6 +634,226 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::SqlPointer;
 
+    mod memory_safety {
+        use super::*;
+        use crate::test_support::AlignedBuffer;
+        use std::fmt::Debug;
+        use std::mem::MaybeUninit;
+
+        fn check_write<T: Copy + Debug + PartialEq>(
+            expected: T,
+            convert: impl Fn(SqlPointer, *mut SqlLen) -> Result<ConvOk, ConvError>,
+        ) {
+            let width = size_of::<T>();
+            let mut output = AlignedBuffer([0xA5u8; 64]);
+            let mut indicator = AlignedBuffer([0xA5u8; 24]);
+            assert!(width < output.0.len());
+            for _ in 0..2 {
+                let ptr = output.0.as_mut_ptr().wrapping_add(1).cast::<T>();
+                let ind = indicator.0.as_mut_ptr().wrapping_add(1).cast::<SqlLen>();
+                if align_of::<T>() > 1 {
+                    assert!(!ptr.is_aligned());
+                }
+                assert!(!ind.is_aligned());
+                assert_eq!(convert(ptr.cast(), ind), Ok(ConvOk::Exact));
+                // Success initializes the value and indicator, but not struct padding.
+                assert_eq!(unsafe { ptr.read_unaligned() }, expected);
+                assert_eq!(
+                    unsafe { ind.read_unaligned() },
+                    SqlLen::try_from(width).unwrap()
+                );
+                assert_eq!(output.0[0], 0xA5);
+                assert!(output.0[1 + width..].iter().all(|&b| b == 0xA5));
+                assert_eq!(indicator.0[0], 0xA5);
+                assert!(
+                    indicator.0[1 + size_of::<SqlLen>()..]
+                        .iter()
+                        .all(|&b| b == 0xA5)
+                );
+            }
+
+            let mut output = MaybeUninit::<T>::uninit();
+            let mut indicator = MaybeUninit::<SqlLen>::uninit();
+            assert_eq!(
+                convert(output.as_mut_ptr().cast(), indicator.as_mut_ptr()),
+                Ok(ConvOk::Exact)
+            );
+            // Neither output had an initial value; the converter must only write them.
+            assert_eq!(unsafe { output.assume_init() }, expected);
+            assert_eq!(
+                unsafe { indicator.assume_init() },
+                SqlLen::try_from(width).unwrap()
+            );
+
+            let mut indicator = MaybeUninit::<SqlLen>::uninit();
+            assert_eq!(
+                convert(std::ptr::null_mut(), indicator.as_mut_ptr()),
+                Ok(ConvOk::Exact)
+            );
+            assert_eq!(
+                unsafe { indicator.assume_init() },
+                SqlLen::try_from(width).unwrap()
+            );
+            let mut output = MaybeUninit::<T>::uninit();
+            assert_eq!(
+                convert(output.as_mut_ptr().cast(), std::ptr::null_mut()),
+                Ok(ConvOk::Exact)
+            );
+            assert_eq!(unsafe { output.assume_init() }, expected);
+        }
+
+        #[test]
+        fn integer_targets_write_only_their_own_slots() {
+            macro_rules! check {
+                ($ty:ty, $($target:ident),+ $(,)?) => {
+                    $(
+                        let expected: $ty = 7;
+                        check_write(expected, |ptr, ind| unsafe {
+                            convert_integer_c(&ColumnValues::Int(7), $target, ptr, ind)
+                        });
+                    )+
+                };
+            }
+            check!(i8, SQL_C_TINYINT, SQL_C_STINYINT);
+            check!(u8, SQL_C_UTINYINT);
+            check!(i16, SQL_C_SHORT, SQL_C_SSHORT);
+            check!(u16, SQL_C_USHORT);
+            check!(i32, SQL_C_LONG, SQL_C_SLONG);
+            check!(u32, SQL_C_ULONG);
+            check!(i64, SQL_C_SBIGINT);
+            check!(u64, SQL_C_UBIGINT);
+            check_write(1u8, |ptr, ind| unsafe {
+                convert_integer_c(&ColumnValues::Bit(true), SQL_C_BIT, ptr, ind)
+            });
+        }
+
+        #[test]
+        fn floating_targets_write_only_their_own_slots() {
+            check_write(1.5f32, |ptr, ind| unsafe {
+                convert_float_c(&ColumnValues::Real(1.5), SQL_C_FLOAT, ptr, ind)
+            });
+            check_write(-2.5f64, |ptr, ind| unsafe {
+                convert_float_c(&ColumnValues::Float(-2.5), SQL_C_DOUBLE, ptr, ind)
+            });
+        }
+
+        #[test]
+        fn guid_target_writes_only_its_own_slot() {
+            let expected = SqlGuid {
+                data1: 0x12345678,
+                data2: 0x9ABC,
+                data3: 0xDEF0,
+                data4: [1, 2, 3, 4, 5, 6, 7, 8],
+            };
+            let source = ColumnValues::Uuid(uuid::Uuid::from_fields(
+                expected.data1,
+                expected.data2,
+                expected.data3,
+                &expected.data4,
+            ));
+            check_write(expected, |ptr, ind| unsafe {
+                convert_guid_c(&source, SQL_C_GUID, ptr, ind)
+            });
+        }
+
+        #[test]
+        fn temporal_targets_initialize_fields_without_reading_padding() {
+            let source = ColumnValues::DateTime2(SqlDateTime2 {
+                days: 0,
+                time: SqlTime {
+                    time_nanoseconds: 0,
+                    scale: 7,
+                },
+            });
+            for target in [SQL_C_TYPE_DATE, SQL_C_DATE] {
+                check_write(
+                    SqlDateStruct {
+                        year: 1,
+                        month: 1,
+                        day: 1,
+                    },
+                    |ptr, ind| unsafe { convert_datetime_c(&source, target, ptr, ind) },
+                );
+            }
+            for target in [SQL_C_TYPE_TIME, SQL_C_TIME] {
+                check_write(SqlTimeStruct::default(), |ptr, ind| unsafe {
+                    convert_datetime_c(&source, target, ptr, ind)
+                });
+            }
+            check_write(SqlSsTime2Struct::default(), |ptr, ind| unsafe {
+                convert_datetime_c(&source, SQL_C_SS_TIME2, ptr, ind)
+            });
+            for target in [SQL_C_TYPE_TIMESTAMP, SQL_C_TIMESTAMP] {
+                check_write(
+                    SqlTimestampStruct {
+                        year: 1,
+                        month: 1,
+                        day: 1,
+                        ..Default::default()
+                    },
+                    |ptr, ind| unsafe { convert_datetime_c(&source, target, ptr, ind) },
+                );
+            }
+            check_write(
+                SqlSsTimestampoffsetStruct {
+                    year: 1,
+                    month: 1,
+                    day: 1,
+                    ..Default::default()
+                },
+                |ptr, ind| unsafe {
+                    convert_datetime_c(&source, SQL_C_SS_TIMESTAMPOFFSET, ptr, ind)
+                },
+            );
+        }
+
+        #[test]
+        fn rejected_conversions_leave_both_buffers_untouched() {
+            type Convert = unsafe fn(
+                &ColumnValues,
+                SqlSmallInt,
+                SqlPointer,
+                *mut SqlLen,
+            ) -> Result<ConvOk, ConvError>;
+            let cases: [(Convert, ColumnValues, SqlSmallInt, ConvError); 4] = [
+                (
+                    convert_integer_c,
+                    ColumnValues::Int(40000),
+                    SQL_C_SSHORT,
+                    ConvError::OutOfRange,
+                ),
+                (
+                    convert_float_c,
+                    ColumnValues::Float(f64::MAX),
+                    SQL_C_FLOAT,
+                    ConvError::OutOfRange,
+                ),
+                (
+                    convert_guid_c,
+                    ColumnValues::Int(7),
+                    SQL_C_GUID,
+                    ConvError::Restricted,
+                ),
+                (
+                    convert_datetime_c,
+                    ColumnValues::Int(7),
+                    SQL_C_TYPE_DATE,
+                    ConvError::Restricted,
+                ),
+            ];
+            for (convert, source, target, expected) in cases {
+                let mut output = [0xA5u8; 64];
+                let mut indicator: SqlLen = -99;
+                // Both outputs are valid even though these conversions must not write.
+                let result =
+                    unsafe { convert(&source, target, output.as_mut_ptr().cast(), &mut indicator) };
+                assert_eq!(result, Err(expected));
+                assert_eq!(output, [0xA5; 64]);
+                assert_eq!(indicator, -99);
+            }
+        }
+    }
+
     fn conv(
         v: &ColumnValues,
         target: SqlSmallInt,
