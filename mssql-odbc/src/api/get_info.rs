@@ -39,7 +39,6 @@ use crate::handles::{DbcHandle, HandleType, handle_from_raw};
 /// `SQL_MAX_TABLE_NAME_LEN` alike.
 const MAX_IDENTIFIER_LEN: u16 = 128;
 
-const DEFAULT_PACKET_SIZE: u32 = 4096;
 const MAX_SQL_BLOCKS: u32 = 128;
 const NO_CAPABILITIES: u32 = 0;
 const NO_STATED_U16_LIMIT: u16 = 0;
@@ -634,7 +633,12 @@ fn sql_get_info_w_safe(
         | odbc::SQL_MAX_CHAR_LITERAL_LEN
         | SQL_MAX_STATEMENT_LEN => write_u32(
             info_value_ptr,
-            max_statement_len(state.client.as_ref().map(|client| client.packet_size())),
+            max_statement_len(
+                state
+                    .client
+                    .as_ref()
+                    .map_or(state.packet_size, |client| client.packet_size()),
+            ),
             string_length_ptr,
         ),
         SQL_NUMERIC_FUNCTIONS
@@ -677,8 +681,8 @@ fn sql_get_info_w_safe(
     }
 }
 
-fn max_statement_len(packet_size: Option<u32>) -> u32 {
-    MAX_SQL_BLOCKS * packet_size.unwrap_or(DEFAULT_PACKET_SIZE)
+fn max_statement_len(packet_size: u32) -> u32 {
+    MAX_SQL_BLOCKS * packet_size
 }
 
 fn write_u16(
@@ -913,9 +917,18 @@ mod tests {
             (SQL_DEFAULT_TXN_ISOLATION, SQL_TXN_READ_COMMITTED),
             (SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT),
             (SQL_SQL_CONFORMANCE, SQL_SC_SQL92_ENTRY),
-            (odbc::SQL_MAX_BINARY_LITERAL_LEN, 512 * 1024),
-            (odbc::SQL_MAX_CHAR_LITERAL_LEN, 512 * 1024),
-            (SQL_MAX_STATEMENT_LEN, 512 * 1024),
+            (
+                odbc::SQL_MAX_BINARY_LITERAL_LEN,
+                MAX_SQL_BLOCKS * odbc::DEFAULT_PACKET_SIZE,
+            ),
+            (
+                odbc::SQL_MAX_CHAR_LITERAL_LEN,
+                MAX_SQL_BLOCKS * odbc::DEFAULT_PACKET_SIZE,
+            ),
+            (
+                SQL_MAX_STATEMENT_LEN,
+                MAX_SQL_BLOCKS * odbc::DEFAULT_PACKET_SIZE,
+            ),
             (SQL_NUMERIC_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_STRING_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_SYSTEM_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
@@ -947,10 +960,27 @@ mod tests {
 
     #[test]
     fn max_statement_len_tracks_negotiated_packet_size() {
-        assert_eq!(max_statement_len(None), 512 * 1024);
-        assert_eq!(max_statement_len(Some(4096)), 512 * 1024);
-        assert_eq!(max_statement_len(Some(8192)), 1024 * 1024);
-        assert_eq!(max_statement_len(Some(32768)), 4 * 1024 * 1024);
+        assert_eq!(max_statement_len(4096), 512 * 1024);
+        assert_eq!(max_statement_len(8192), 1024 * 1024);
+        assert_eq!(max_statement_len(32768), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sql_text_limits_use_preconnect_packet_size() {
+        let h = TestHandles::with_env_dbc();
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc_ref.inner.lock().unwrap().packet_size = 16_384;
+
+        for info_type in [
+            odbc::SQL_MAX_BINARY_LITERAL_LEN,
+            odbc::SQL_MAX_CHAR_LITERAL_LEN,
+            SQL_MAX_STATEMENT_LEN,
+        ] {
+            let (rc, value, len) = get_u32(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(value, MAX_SQL_BLOCKS * 16_384, "info_type {info_type}");
+            assert_eq!(len, 4, "info_type {info_type}");
+        }
     }
 
     #[test]
