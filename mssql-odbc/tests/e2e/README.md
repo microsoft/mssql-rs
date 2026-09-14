@@ -42,6 +42,13 @@ tests/e2e/
 
 ### Linux / macOS
 
+macOS PR validation runs this suite natively in `Test_MacOS`, using unixODBC
+and the SQL Server container already running under Colima. The job builds the
+Rust `.dylib` and C++ tests, retries failing test executables up to three times,
+and publishes JUnit results even when tests fail. Failed tests or missing results
+fail the job. This leg tests the Rust driver only, without msodbcsql comparison
+or C++ e2e coverage collection.
+
 ```bash
 # From mssql-odbc/tests/e2e/
 ./run_e2e.sh

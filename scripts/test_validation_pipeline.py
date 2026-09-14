@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Regression tests for Linux validation artifact publication."""
+"""Regression tests for validation pipeline builds, tests, and artifacts."""
 
 from pathlib import Path
 
@@ -96,3 +96,65 @@ def test_linux_compilation_and_pr_tests_remain_enabled(architecture):
     )
     assert tests["condition"] == _PR
     assert "/workspace/.pipeline/scripts/containerized-test.sh" in tests["script"]
+
+
+def test_macos_pr_runs_native_odbc_e2e_against_existing_sql():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    job = next(job for job in build["jobs"] if job.get("job") == "Test_MacOS")
+    assert job["pool"]["vmImage"] == "macOS-latest"
+    steps = job["steps"]
+    sql = next(step for step in steps if step.get("template") == "sql-setup-template.yml")
+    assert sql["parameters"]["buildTarget"] == "MacOS"
+    verify = next(
+        step for step in steps
+        if step.get("displayName") == "Verify macOS SQL Server before tests"
+    )
+    rust = next(step for step in steps if step.get("template") == "build-template.yml")
+    assert rust["parameters"].get("enableTests", True) is True
+    install = next(
+        step for step in steps
+        if step.get("displayName") == "Install ODBC C++ e2e dependencies (macOS)"
+    )
+    run = next(
+        step for step in steps
+        if step.get("displayName") == "Run ODBC C++ e2e tests (macOS)"
+    )
+    publish = next(
+        step for step in steps
+        if step.get("displayName") == "Publish ODBC e2e test results (macOS)"
+    )
+    order = [steps.index(step) for step in (sql, verify, rust, install, run, publish)]
+    assert order == sorted(order)
+    for step in (install, run):
+        assert step["condition"] == _PR
+        assert "set -euo pipefail" in step["script"]
+        assert not step.get("continueOnError", False)
+    assert "command -v cmake" in install["script"]
+    assert "brew install cmake" in install["script"]
+    assert "brew install unixodbc" in install["script"]
+    assert 'CMAKE_PREFIX_PATH="$(brew --prefix unixodbc)' in run["script"]
+    assert "export CMAKE_PREFIX_PATH\n" in run["script"]
+    assert "bash mssql-odbc/tests/e2e/run_e2e.sh --retries=3" in run["script"]
+    assert "docker" not in run["script"]
+    assert run["env"] == {
+        "ODBC_TEST_SERVER": "127.0.0.1,1433",
+        "ODBC_TEST_UID": "sa",
+        "ODBC_TEST_PWD": "$(SQL_PASSWORD)",
+        "ODBC_TEST_TRUST_CERT": "Yes",
+        "RUST_BACKTRACE": "full",
+    }
+    assert publish["task"] == "PublishTestResults@2"
+    assert publish["condition"] == (
+        "and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))"
+    )
+    assert not publish.get("continueOnError", False)
+    assert publish["inputs"] == {
+        "testResultsFormat": "JUnit",
+        "testResultsFiles": (
+            "$(Build.SourcesDirectory)/mssql-odbc/tests/e2e/build/junit-mssql-odbc.xml"
+        ),
+        "testRunTitle": "$(System.PhaseName)-OdbcE2E",
+        "failTaskOnFailedTests": True,
+        "failTaskOnMissingResultsFile": True,
+    }
