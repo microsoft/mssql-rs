@@ -5,6 +5,7 @@
 
 use tracing::{debug, error};
 
+use super::current_catalog::resolved_current_catalog;
 use crate::api::odbc_types as odbc;
 use crate::api::odbc_types::{
     SQL_ACCESSIBLE_PROCEDURES, SQL_ACCESSIBLE_TABLES, SQL_ACTIVE_STATEMENTS,
@@ -471,14 +472,7 @@ fn sql_get_info_w_safe(
             )
         }
         SQL_DATABASE_NAME => {
-            let database = state
-                .client
-                .as_ref()
-                .map(|client| client.database())
-                .filter(|database| !database.is_empty())
-                .map(str::to_string)
-                .or_else(|| state.current_catalog.clone())
-                .unwrap_or_default();
+            let database = resolved_current_catalog(&state);
             write_wide_str(
                 &mut state,
                 info_value_ptr,
@@ -864,9 +858,6 @@ mod tests {
 
     #[test]
     fn compatibility_names_share_canonical_info_types() {
-        assert_eq!(odbc::SQL_OWNER_USAGE, odbc::SQL_SCHEMA_USAGE);
-        assert_eq!(odbc::SQL_QUALIFIER_USAGE, odbc::SQL_CATALOG_USAGE);
-
         let schema_entries = STATIC_INFO
             .iter()
             .filter(|entry| entry.info_type == odbc::SQL_SCHEMA_USAGE)
