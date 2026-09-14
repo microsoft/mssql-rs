@@ -405,7 +405,13 @@ pub const SQL_CONVERT_FUNCTIONS_SUPPORTED: u32 = 0x0000_0003;
 /// `SQL_TSI_*` intervals `{fn TIMESTAMPADD}` / `{fn TIMESTAMPDIFF}` accept.
 pub const SQL_TIMEDATE_INTERVALS_SUPPORTED: u32 = 0x0000_01FF;
 /// `SQL_OJ_CAPABILITIES`: the `{oj ...}` forms the server accepts.
-pub const SQL_OJ_CAPABILITIES_SUPPORTED: u32 = 0x0000_007F;
+pub const SQL_OJ_CAPABILITIES_SUPPORTED: u32 = SQL_OJ_LEFT
+    | SQL_OJ_RIGHT
+    | SQL_OJ_FULL
+    | SQL_OJ_NESTED
+    | SQL_OJ_NOT_ORDERED
+    | SQL_OJ_INNER
+    | SQL_OJ_ALL_COMPARISON_OPS;
 
 /// `SQL_TXN_CAPABLE`: DML and DDL are both transactable (msodbcsql `sqlcinfo.cpp:323`).
 pub const SQL_TC_ALL: u16 = 2;

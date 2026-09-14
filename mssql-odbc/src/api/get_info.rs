@@ -414,25 +414,6 @@ fn sql_get_info_w_safe(
 
     unsafe { write_if_some(string_length_ptr, 0) };
 
-    if let Some(entry) = STATIC_INFO
-        .iter()
-        .find(|entry| entry.info_type == info_type)
-    {
-        return match entry.value {
-            InfoValue::String(value) => write_wide_str(
-                &mut state,
-                info_value_ptr,
-                buffer_length,
-                string_length_ptr,
-                value,
-            ),
-            InfoValue::U16(value) => write_u16(info_value_ptr, value, string_length_ptr),
-            InfoValue::U32(value) | InfoValue::Bitmask(value) => {
-                write_u32(info_value_ptr, value, string_length_ptr)
-            }
-        };
-    }
-
     match info_type {
         SQL_DATA_SOURCE_NAME | SQL_SERVER_NAME | SQL_USER_NAME => {
             let value = if info_type == SQL_DATA_SOURCE_NAME {
@@ -711,11 +692,29 @@ fn sql_get_info_w_safe(
             write_u32(info_value_ptr, SQL_PARC_NO_BATCH, string_length_ptr)
         }
         SQL_PARAM_ARRAY_SELECTS => write_u32(info_value_ptr, SQL_PAS_BATCH, string_length_ptr),
-        _ => {
-            error!(info_type, "SQLGetInfoW: unsupported info type");
-            post_diag(&mut state, ERR_INVALID_INFO_TYPE);
-            SQL_ERROR
-        }
+        _ => match STATIC_INFO
+            .iter()
+            .find(|entry| entry.info_type == info_type)
+        {
+            Some(entry) => match entry.value {
+                InfoValue::String(value) => write_wide_str(
+                    &mut state,
+                    info_value_ptr,
+                    buffer_length,
+                    string_length_ptr,
+                    value,
+                ),
+                InfoValue::U16(value) => write_u16(info_value_ptr, value, string_length_ptr),
+                InfoValue::U32(value) | InfoValue::Bitmask(value) => {
+                    write_u32(info_value_ptr, value, string_length_ptr)
+                }
+            },
+            None => {
+                error!(info_type, "SQLGetInfoW: unsupported info type");
+                post_diag(&mut state, ERR_INVALID_INFO_TYPE);
+                SQL_ERROR
+            }
+        },
     }
 }
 
