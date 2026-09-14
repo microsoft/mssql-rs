@@ -5,26 +5,30 @@
 
 use tracing::{debug, error};
 
+use crate::api::odbc_types as odbc;
 use crate::api::odbc_types::{
     SQL_ACCESSIBLE_PROCEDURES, SQL_ACCESSIBLE_TABLES, SQL_ACTIVE_STATEMENTS,
     SQL_ASYNC_DBC_FUNCTIONS, SQL_ASYNC_DBC_NOT_CAPABLE, SQL_ASYNC_NOTIFICATION,
     SQL_ASYNC_NOTIFICATION_NOT_CAPABLE, SQL_CATALOG_NAME_SEPARATOR, SQL_CATALOG_TERM, SQL_CB_CLOSE,
     SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_DATA_SOURCE_NAME,
-    SQL_DATA_SOURCE_READ_ONLY, SQL_DBMS_NAME, SQL_DBMS_VER, SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER,
-    SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER, SQL_ERROR, SQL_EXPRESSIONS_IN_ORDERBY,
-    SQL_FN_NONE_SUPPORTED, SQL_GD_ANY_COLUMN, SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS,
-    SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE, SQL_KEYWORDS, SQL_MAX_COLUMN_NAME_LEN,
-    SQL_MAX_DRIVER_CONNECTIONS, SQL_MAX_SCHEMA_NAME_LEN, SQL_MAX_STATEMENT_LEN,
-    SQL_MAX_TABLE_NAME_LEN, SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN, SQL_NUMERIC_FUNCTIONS,
-    SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE, SQL_ODBC_SQL_CONFORMANCE, SQL_ODBC_VER, SQL_OSC_CORE,
-    SQL_PARAM_ARRAY_ROW_COUNTS, SQL_PARAM_ARRAY_SELECTS, SQL_PARC_NO_BATCH, SQL_PAS_BATCH,
-    SQL_PROCEDURES, SQL_SC_SQL92_ENTRY, SQL_SCHEMA_TERM, SQL_SERVER_NAME, SQL_SPECIAL_CHARACTERS,
-    SQL_SQL_CONFORMANCE, SQL_STRING_FUNCTIONS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
-    SQL_SYSTEM_FUNCTIONS, SQL_TC_ALL, SQL_TIMEDATE_FUNCTIONS, SQL_TXN_CAPABLE,
-    SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT, SQL_TXN_READ_COMMITTED, SQL_USER_NAME,
-    SqlHandle, SqlPointer, SqlReturn, SqlSmallInt, SqlUSmallInt, SqlWChar,
+    SQL_DATA_SOURCE_READ_ONLY, SQL_DATABASE_NAME, SQL_DBMS_NAME, SQL_DBMS_VER,
+    SQL_DEFAULT_TXN_ISOLATION, SQL_DM_VER, SQL_DRIVER_NAME, SQL_DRIVER_ODBC_VER, SQL_DRIVER_VER,
+    SQL_ERROR, SQL_EXPRESSIONS_IN_ORDERBY, SQL_FN_NONE_SUPPORTED, SQL_GD_ANY_COLUMN,
+    SQL_GD_ANY_ORDER, SQL_GETDATA_EXTENSIONS, SQL_IDENTIFIER_QUOTE_CHAR, SQL_INVALID_HANDLE,
+    SQL_KEYWORDS, SQL_MAX_COLUMN_NAME_LEN, SQL_MAX_DRIVER_CONNECTIONS, SQL_MAX_SCHEMA_NAME_LEN,
+    SQL_MAX_STATEMENT_LEN, SQL_MAX_TABLE_NAME_LEN, SQL_MULTIPLE_ACTIVE_TXN, SQL_NEED_LONG_DATA_LEN,
+    SQL_NUMERIC_FUNCTIONS, SQL_OAC_LEVEL2, SQL_ODBC_API_CONFORMANCE, SQL_ODBC_SQL_CONFORMANCE,
+    SQL_ODBC_VER, SQL_OSC_CORE, SQL_PARAM_ARRAY_ROW_COUNTS, SQL_PARAM_ARRAY_SELECTS,
+    SQL_PARC_NO_BATCH, SQL_PAS_BATCH, SQL_PROCEDURES, SQL_SC_SQL92_ENTRY, SQL_SCHEMA_TERM,
+    SQL_SERVER_NAME, SQL_SPECIAL_CHARACTERS, SQL_SQL_CONFORMANCE, SQL_STRING_FUNCTIONS,
+    SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SQL_SYSTEM_FUNCTIONS, SQL_TC_ALL, SQL_TIMEDATE_FUNCTIONS,
+    SQL_TXN_CAPABLE, SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT,
+    SQL_TXN_READ_COMMITTED, SQL_USER_NAME, SqlHandle, SqlPointer, SqlReturn, SqlSmallInt,
+    SqlUSmallInt, SqlWChar,
 };
-use crate::api::sqlstate::{ERR_INVALID_INFO_TYPE, WARN_STRING_TRUNCATION, post_diag};
+use crate::api::sqlstate::{
+    ERR_INVALID_INFO_TYPE, ERR_INVALID_STRING_OR_BUFFER_LENGTH, WARN_STRING_TRUNCATION, post_diag,
+};
 use crate::api::util::{copy_with_nul, write_if_some};
 use crate::error::free_errors;
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -36,6 +40,295 @@ const MAX_IDENTIFIER_LEN: u16 = 128;
 
 const DEFAULT_PACKET_SIZE: u32 = 4096;
 const MAX_SQL_BLOCKS: u32 = 128;
+const NO_CAPABILITIES: u32 = 0;
+const NO_STATED_U16_LIMIT: u16 = 0;
+const MSODBCSQL_ALTER_TABLE_CAPABILITIES: u32 = 0x0000_9869;
+const SQL_SERVER_MAX_LITERAL_LEN: u32 = 65_536;
+const SQL_SERVER_MAX_INDEX_COLUMNS: u16 = 16;
+const SQL_SERVER_MAX_SELECT_COLUMNS: u16 = 4096;
+const SQL_SERVER_MAX_TABLE_COLUMNS: u16 = 1024;
+const SQL_SERVER_MAX_ROW_SIZE: u32 = 8060;
+const SQL_SERVER_MAX_TABLES_IN_SELECT: u16 = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InfoValue {
+    String(&'static str),
+    U16(u16),
+    U32(u32),
+    Bitmask(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InfoEntry {
+    info_type: SqlUSmallInt,
+    value: InfoValue,
+}
+
+const STATIC_INFO: &[InfoEntry] = &[
+    InfoEntry {
+        info_type: odbc::SQL_ASYNC_MODE,
+        value: InfoValue::U32(odbc::SQL_AM_NONE),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_BATCH_ROW_COUNT,
+        value: InfoValue::Bitmask(odbc::SQL_BRC_EXPLICIT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_BATCH_SUPPORT,
+        value: InfoValue::Bitmask(
+            odbc::SQL_BS_SELECT_EXPLICIT
+                | odbc::SQL_BS_ROW_COUNT_EXPLICIT
+                | odbc::SQL_BS_SELECT_PROC
+                | odbc::SQL_BS_ROW_COUNT_PROC,
+        ),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DYNAMIC_CURSOR_ATTRIBUTES1,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DYNAMIC_CURSOR_ATTRIBUTES2,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1,
+        value: InfoValue::Bitmask(odbc::SQL_CA1_NEXT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2,
+        value: InfoValue::Bitmask(
+            odbc::SQL_CA2_READ_ONLY_CONCURRENCY | odbc::SQL_CA2_MAX_ROWS_SELECT,
+        ),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_KEYSET_CURSOR_ATTRIBUTES1,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_KEYSET_CURSOR_ATTRIBUTES2,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SEARCH_PATTERN_ESCAPE,
+        value: InfoValue::String("\\"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_STATIC_CURSOR_ATTRIBUTES1,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_STATIC_CURSOR_ATTRIBUTES2,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_BOOKMARK_PERSISTENCE,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONCAT_NULL_BEHAVIOR,
+        value: InfoValue::U16(odbc::SQL_CB_NULL),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CURSOR_SENSITIVITY,
+        value: InfoValue::U32(odbc::SQL_UNSPECIFIED),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DESCRIBE_PARAMETER,
+        value: InfoValue::String("Y"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MULT_RESULT_SETS,
+        value: InfoValue::String("Y"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_NULL_COLLATION,
+        value: InfoValue::U16(odbc::SQL_NC_LOW),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_PROCEDURE_TERM,
+        value: InfoValue::String("stored procedure"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SCROLL_OPTIONS,
+        value: InfoValue::Bitmask(odbc::SQL_SO_FORWARD_ONLY),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_TABLE_TERM,
+        value: InfoValue::String("table"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_ALTER_TABLE,
+        value: InfoValue::Bitmask(MSODBCSQL_ALTER_TABLE_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CATALOG_NAME,
+        value: InfoValue::String("Y"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CATALOG_USAGE,
+        value: InfoValue::Bitmask(
+            odbc::SQL_CU_DML_STATEMENTS
+                | odbc::SQL_CU_PROCEDURE_INVOCATION
+                | odbc::SQL_CU_TABLE_DEFINITION,
+        ),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_COLUMN_ALIAS,
+        value: InfoValue::String("Y"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CORRELATION_NAME,
+        value: InfoValue::U16(odbc::SQL_CN_ANY),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CREATE_ASSERTION,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_DDL_INDEX,
+        value: InfoValue::Bitmask(odbc::SQL_DI_CREATE_INDEX | odbc::SQL_DI_DROP_INDEX),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_GROUP_BY,
+        value: InfoValue::U16(odbc::SQL_GB_GROUP_BY_CONTAINS_SELECT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_IDENTIFIER_CASE,
+        value: InfoValue::U16(odbc::SQL_IC_MIXED),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_LIKE_ESCAPE_CLAUSE,
+        value: InfoValue::String("Y"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_OJ_CAPABILITIES,
+        value: InfoValue::Bitmask(
+            odbc::SQL_OJ_LEFT
+                | odbc::SQL_OJ_RIGHT
+                | odbc::SQL_OJ_FULL
+                | odbc::SQL_OJ_NESTED
+                | odbc::SQL_OJ_NOT_ORDERED
+                | odbc::SQL_OJ_INNER
+                | odbc::SQL_OJ_ALL_COMPARISON_OPS,
+        ),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_ORDER_BY_COLUMNS_IN_SELECT,
+        value: InfoValue::String("N"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_OUTER_JOINS,
+        value: InfoValue::String("F"),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_QUOTED_IDENTIFIER_CASE,
+        value: InfoValue::U16(odbc::SQL_IC_MIXED),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SCHEMA_USAGE,
+        value: InfoValue::Bitmask(
+            odbc::SQL_SU_DML_STATEMENTS
+                | odbc::SQL_SU_PROCEDURE_INVOCATION
+                | odbc::SQL_SU_TABLE_DEFINITION
+                | odbc::SQL_SU_INDEX_DEFINITION
+                | odbc::SQL_SU_PRIVILEGE_DEFINITION,
+        ),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SUBQUERIES,
+        value: InfoValue::Bitmask(
+            odbc::SQL_SQ_COMPARISON
+                | odbc::SQL_SQ_EXISTS
+                | odbc::SQL_SQ_IN
+                | odbc::SQL_SQ_QUANTIFIED
+                | odbc::SQL_SQ_CORRELATED_SUBQUERIES,
+        ),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_UNION,
+        value: InfoValue::Bitmask(odbc::SQL_U_UNION | odbc::SQL_U_UNION_ALL),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_BINARY_LITERAL_LEN,
+        value: InfoValue::U32(SQL_SERVER_MAX_LITERAL_LEN),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_CATALOG_NAME_LEN,
+        value: InfoValue::U16(MAX_IDENTIFIER_LEN),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_CHAR_LITERAL_LEN,
+        value: InfoValue::U32(SQL_SERVER_MAX_LITERAL_LEN),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_COLUMNS_IN_GROUP_BY,
+        value: InfoValue::U16(NO_STATED_U16_LIMIT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_COLUMNS_IN_INDEX,
+        value: InfoValue::U16(SQL_SERVER_MAX_INDEX_COLUMNS),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_COLUMNS_IN_ORDER_BY,
+        value: InfoValue::U16(NO_STATED_U16_LIMIT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_COLUMNS_IN_SELECT,
+        value: InfoValue::U16(SQL_SERVER_MAX_SELECT_COLUMNS),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_COLUMNS_IN_TABLE,
+        value: InfoValue::U16(SQL_SERVER_MAX_TABLE_COLUMNS),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_IDENTIFIER_LEN,
+        value: InfoValue::U16(MAX_IDENTIFIER_LEN),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_ROW_SIZE,
+        value: InfoValue::U32(SQL_SERVER_MAX_ROW_SIZE),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_TABLES_IN_SELECT,
+        value: InfoValue::U16(SQL_SERVER_MAX_TABLES_IN_SELECT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_MAX_USER_NAME_LEN,
+        value: InfoValue::U16(MAX_IDENTIFIER_LEN),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_CONVERT_FUNCTIONS,
+        value: InfoValue::Bitmask(0),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_TIMEDATE_ADD_INTERVALS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_TIMEDATE_DIFF_INTERVALS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_FETCH_DIRECTION,
+        value: InfoValue::Bitmask(odbc::SQL_FD_FETCH_NEXT),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_POSITIONED_STATEMENTS,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_SCROLL_CONCURRENCY,
+        value: InfoValue::Bitmask(odbc::SQL_SCCO_READ_ONLY),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_STATIC_SENSITIVITY,
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
+    },
+    InfoEntry {
+        info_type: odbc::SQL_XOPEN_CLI_YEAR,
+        value: InfoValue::String("1995"),
+    },
+];
 
 /// `SQL_KEYWORDS`: SQL Server reserved words that are *not* in the ODBC
 /// interoperable list, which is the only thing ODBC asks this to report.
@@ -126,9 +419,6 @@ unsafe fn sql_get_info_w_impl(
     )
 }
 
-// TODO: This function implements only what is needed for
-//       Windows ODBC Driver Manager to load the driver. Fix
-//       hardcoded values and implement the rest of the info types.
 fn sql_get_info_w_safe(
     dbc: &DbcHandle,
     info_type: SqlUSmallInt,
@@ -144,25 +434,59 @@ fn sql_get_info_w_safe(
 
     unsafe { write_if_some(string_length_ptr, 0) };
 
-    // Identity strings live behind the same borrow `write_wide_str` needs, so
-    // take a copy before the call rather than restructuring the writer.
-    let identity_value = match info_type {
-        SQL_DATA_SOURCE_NAME => Some(state.identity.data_source_name.clone()),
-        SQL_SERVER_NAME => Some(state.identity.server_name.clone()),
-        SQL_USER_NAME => Some(state.identity.user_name.clone()),
-        _ => None,
-    };
-    if let Some(value) = identity_value {
-        return write_wide_str(
-            &mut state,
-            info_value_ptr,
-            buffer_length,
-            string_length_ptr,
-            &value,
-        );
+    if let Some(entry) = STATIC_INFO
+        .iter()
+        .find(|entry| entry.info_type == info_type)
+    {
+        return match entry.value {
+            InfoValue::String(value) => write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                value,
+            ),
+            InfoValue::U16(value) => write_u16(info_value_ptr, value, string_length_ptr),
+            InfoValue::U32(value) | InfoValue::Bitmask(value) => {
+                write_u32(info_value_ptr, value, string_length_ptr)
+            }
+        };
     }
 
     match info_type {
+        SQL_DATA_SOURCE_NAME | SQL_SERVER_NAME | SQL_USER_NAME => {
+            let value = if info_type == SQL_DATA_SOURCE_NAME {
+                state.identity.data_source_name.clone()
+            } else if info_type == SQL_SERVER_NAME {
+                state.identity.server_name.clone()
+            } else {
+                state.identity.user_name.clone()
+            };
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                &value,
+            )
+        }
+        SQL_DATABASE_NAME => {
+            let database = state
+                .client
+                .as_ref()
+                .map(|client| client.database())
+                .filter(|database| !database.is_empty())
+                .map(str::to_string)
+                .or_else(|| state.current_catalog.clone())
+                .unwrap_or_default();
+            write_wide_str(
+                &mut state,
+                info_value_ptr,
+                buffer_length,
+                string_length_ptr,
+                &database,
+            )
+        }
         SQL_MAX_DRIVER_CONNECTIONS => {
             // 0 means "no stated limit" per ODBC.
             write_u16(info_value_ptr, 0, string_length_ptr)
@@ -399,6 +723,7 @@ fn write_wide_str(
 ) -> SqlReturn {
     if buffer_length < 0 {
         error!(buffer_length, "SQLGetInfoW: negative buffer length");
+        post_diag(state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
         return SQL_ERROR;
     }
 
@@ -427,6 +752,7 @@ fn driver_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::ptr;
 
     use super::*;
@@ -495,6 +821,75 @@ mod tests {
         (SQL_EXPRESSIONS_IN_ORDERBY, "Y"),
         (SQL_DATA_SOURCE_READ_ONLY, "N"),
     ];
+
+    #[test]
+    fn static_info_types_are_unique_and_report_typed_values() {
+        let h = TestHandles::with_env_dbc();
+        let mut seen = HashSet::new();
+
+        assert_eq!(STATIC_INFO.len(), 58);
+        for entry in STATIC_INFO {
+            assert!(
+                seen.insert(entry.info_type),
+                "duplicate info_type {}",
+                entry.info_type
+            );
+            match entry.value {
+                InfoValue::String(expected) => {
+                    let (rc, value, len) = get_wide_str(h.dbc, entry.info_type);
+                    assert_eq!(rc, SQL_SUCCESS, "info_type {}", entry.info_type);
+                    assert_eq!(value, expected, "info_type {}", entry.info_type);
+                    assert_eq!(
+                        len,
+                        (expected.encode_utf16().count() * 2) as SqlSmallInt,
+                        "info_type {}",
+                        entry.info_type
+                    );
+                }
+                InfoValue::U16(expected) => {
+                    let (rc, value, len) = get_u16(h.dbc, entry.info_type);
+                    assert_eq!(rc, SQL_SUCCESS, "info_type {}", entry.info_type);
+                    assert_eq!(value, expected, "info_type {}", entry.info_type);
+                    assert_eq!(len, 2, "info_type {}", entry.info_type);
+                }
+                InfoValue::U32(expected) | InfoValue::Bitmask(expected) => {
+                    let (rc, value, len) = get_u32(h.dbc, entry.info_type);
+                    assert_eq!(rc, SQL_SUCCESS, "info_type {}", entry.info_type);
+                    assert_eq!(value, expected, "info_type {}", entry.info_type);
+                    assert_eq!(len, 4, "info_type {}", entry.info_type);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_names_share_canonical_info_types() {
+        assert_eq!(odbc::SQL_OWNER_USAGE, odbc::SQL_SCHEMA_USAGE);
+        assert_eq!(odbc::SQL_QUALIFIER_USAGE, odbc::SQL_CATALOG_USAGE);
+
+        let schema_entries = STATIC_INFO
+            .iter()
+            .filter(|entry| entry.info_type == odbc::SQL_SCHEMA_USAGE)
+            .count();
+        let catalog_entries = STATIC_INFO
+            .iter()
+            .filter(|entry| entry.info_type == odbc::SQL_CATALOG_USAGE)
+            .count();
+        assert_eq!(schema_entries, 1);
+        assert_eq!(catalog_entries, 1);
+    }
+
+    #[test]
+    fn database_name_reports_current_catalog() {
+        let h = TestHandles::with_env_dbc();
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc_ref.inner.lock().unwrap().current_catalog = Some("reporting".to_string());
+
+        let (rc, value, len) = get_wide_str(h.dbc, SQL_DATABASE_NAME);
+        assert_eq!(rc, SQL_SUCCESS);
+        assert_eq!(value, "reporting");
+        assert_eq!(len, 18);
+    }
 
     #[test]
     fn null_handle_returns_invalid_handle() {
@@ -704,6 +1099,10 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_ERROR);
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc_ref.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, *b"HY090");
     }
 
     #[test]
@@ -716,6 +1115,19 @@ mod tests {
         let state = dbc_ref.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, ERR_INVALID_INFO_TYPE.state);
+    }
+
+    #[test]
+    fn successful_call_clears_previous_diagnostic() {
+        let h = TestHandles::with_env_dbc();
+        let (rc, _, _) = get_u16(h.dbc, 65000);
+        assert_eq!(rc, SQL_ERROR);
+
+        let (rc, _, _) = get_u16(h.dbc, SQL_ACTIVE_STATEMENTS);
+        assert_eq!(rc, SQL_SUCCESS);
+
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert!(dbc_ref.inner.lock().unwrap().diag_records.is_empty());
     }
 
     #[test]
