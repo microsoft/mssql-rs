@@ -1,7 +1,6 @@
-# Pre-built glibc-2.28 build image for the mssql-odbc driver (x64).
-# Extends the PyPA manylinux_2_28 base with Rust and the C/C++ toolchain the
-# ODBC e2e build needs (cmake, unixODBC-devel, OpenSSL 1.1 dev, git), so CI does
-# not install them at runtime.
+# Pre-built glibc-2.28 build image (x64) for the mssql-odbc driver AND the
+# glibc-2.28 Python wheels. Extends the PyPA manylinux_2_28 base with Rust,
+# maturin, and the C/C++ toolchain (cmake, unixODBC-devel, OpenSSL 1.1 dev, git).
 #
 # manylinux_2_28 is based on AlmaLinux 8 (glibc 2.28, OpenSSL 1.1.x). Building
 # here links the driver against libssl.so.1.1, so it loads on RHEL 8 / UBI 8 -
@@ -27,6 +26,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 ENV PATH="/root/.cargo/bin:$PATH"
 
 RUN rustc --version && cargo --version
+
+# maturin builds the glibc-2.28 Python wheels here (links OpenSSL 1.1, so they
+# load on RHEL 8 / Ubuntu 20.04). Same base as the ODBC driver build above.
+RUN PYTHON_BIN=$(ls /opt/python/cp312-*/bin/python 2>/dev/null | head -n1) && \
+    "$PYTHON_BIN" -m pip install --no-cache-dir maturin && \
+    "$PYTHON_BIN" -m pip show maturin
 
 WORKDIR /workspace
 

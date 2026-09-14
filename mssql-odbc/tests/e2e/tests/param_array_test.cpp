@@ -189,12 +189,11 @@ protected:
 
     /// Runs `sql` on a throwaway statement so the statement under test keeps its
     /// bindings, array attributes, and prepared plan untouched.
-    void ExecOnProbe(const std::string& sql) {
+    void ExecOnProbe(const std::string& sql, SQLRETURN expected = SQL_SUCCESS) {
         SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
         SQLHSTMT probe = AllocStmt();
-        EXPECT_SQL_OK(
-            SQLExecDirect(probe, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS),
-            SQL_HANDLE_STMT, probe);
+        EXPECT_EQ(expected,
+                  SQLExecDirect(probe, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS));
         FreeStmt(probe);
     }
 
@@ -1511,7 +1510,7 @@ TEST_F(ParamArrayTest, ConversionFailureIsReportedPerSetWhereverItSits) {
 
     constexpr SQLLEN kStride = 8;
     for (int bad_row = 0; bad_row < 3; ++bad_row) {
-        ExecOnProbe("DELETE FROM #pa_cv");
+        ExecOnProbe("DELETE FROM #pa_cv", bad_row == 0 ? SQL_NO_DATA : SQL_SUCCESS);
         ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
         Prepare("INSERT INTO #pa_cv (v) VALUES (?)");
 

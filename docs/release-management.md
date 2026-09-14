@@ -10,7 +10,7 @@ mssql-rs repo (Rust)
 ├── mssql-py-core/      ← PyO3 bindings (cdylib), produces Python wheels
 └── .pipeline/OneBranch/ ← Builds wheels, packages into NuGet
 
-        │  builds 34 wheels (5 Python × 7 platforms)
+        │  builds 44 wheels (5 Python × 9 platforms, minus CPython 3.10/Windows ARM64)
         │  packages into NuGet: mssql-python-rs-wheels
         ▼
 
@@ -26,14 +26,16 @@ mssql-python repo (Python)
 PyPI: mssql-python
 ```
 
-## Wheel Matrix (34 wheels)
+## Wheel Matrix (44 wheels)
 
 | Platform | Python 3.10 | 3.11 | 3.12 | 3.13 | 3.14 |
 |---|---|---|---|---|---|
 | Windows x64 (`win_amd64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Windows ARM64 (`win_arm64`) | — | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc x64 (`manylinux_2_34_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Linux glibc ARM64 (`manylinux_2_34_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc 2.28 x64 (`manylinux_2_28_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc 2.28 ARM64 (`manylinux_2_28_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc 2.34 x64 (`manylinux_2_34_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Linux glibc 2.34 ARM64 (`manylinux_2_34_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Linux musl x64 (`musllinux_1_2_x86_64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Linux musl ARM64 (`musllinux_1_2_aarch64`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | macOS universal2 (`macosx_15_0_universal2`) | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -78,7 +80,7 @@ prerelease across all versions.
 
 ```
 1. Schedule triggers at 2 AM UTC
-2. Pipeline builds 34 wheels across all platforms
+2. Pipeline builds 44 wheels across all platforms
 3. Publish stage:
   - Extracts the Python distribution version from mssql-py-core/pyproject.toml (e.g., 0.2.0)
    - Appends -nightly.YYYYMMDD suffix
@@ -119,7 +121,7 @@ nuget install mssql-python-rs-wheels -Version 0.2.0-nightly.20260217 -Source mss
 ```
 1. Developer merges PR to main or development
 2. CI trigger fires immediately
-3. Pipeline builds 34 wheels
+3. Pipeline builds 44 wheels
 4. Publish stage produces: mssql-python-rs-wheels.0.2.0-dev.20260217.140071
    (BuildId ensures uniqueness even with multiple merges per day)
 5. Developer tells mssql-python to use this specific version
@@ -129,7 +131,7 @@ nuget install mssql-python-rs-wheels -Version 0.2.0-nightly.20260217 -Source mss
 
 ```
 1. Developer triggers pipeline manually from any branch
-2. Pipeline builds 34 wheels
+2. Pipeline builds 44 wheels
 3. Publish stage produces: mssql-python-rs-wheels.0.2.0-dev.20260217.140095
 4. Developer uses this version in mssql-python for testing
 ```
@@ -370,6 +372,8 @@ mssql-python-rs-wheels.0.1.0.nupkg
 ├── mssql-python-rs-wheels.nuspec
 └── wheels/
   ├── mssql_python_rs-0.1.0-cp310-cp310-win_amd64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_x86_64.whl
+  ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_aarch64.whl
   ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_x86_64.whl
   ├── mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_34_aarch64.whl
   ├── mssql_python_rs-0.1.0-cp310-cp310-musllinux_1_2_x86_64.whl
@@ -377,7 +381,7 @@ mssql-python-rs-wheels.0.1.0.nupkg
   ├── mssql_python_rs-0.1.0-cp310-cp310-macosx_15_0_universal2.whl
   ├── mssql_python_rs-0.1.0-cp311-cp311-win_amd64.whl
   ├── mssql_python_rs-0.1.0-cp311-cp311-win_arm64.whl
-    ├── ... (34 wheels total)
+  ├── ... (44 wheels total)
   └── mssql_python_rs-0.1.0-cp314-cp314-macosx_15_0_universal2.whl
 ```
 

@@ -141,6 +141,30 @@ def test_repairs_bare_glibc_and_leaves_others(tmp_path: Path) -> None:
     assert "--exclude libcrypto.so.3" in invocations
 
 
+def test_repairs_manylinux_228_with_openssl_11_exclusions(tmp_path: Path) -> None:
+    _setup(tmp_path, _GLIBC, _FAKE_PRODUCE)
+
+    result = _run(
+        tmp_path,
+        extra_exports=(
+            "export REPAIR_PLAT=manylinux_2_28; "
+            "export REPAIR_EXCLUDE_LIBS='libssl.so.1.1 libcrypto.so.1.1'; "
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    present = {p.name for p in (tmp_path / "wheels").glob("*.whl")}
+    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_x86_64.whl" in present
+    assert "mssql_python_rs-0.1.0-cp310-cp310-manylinux_2_28_aarch64.whl" in present
+    invocations = (tmp_path / "auditwheel.log").read_text()
+    assert "--plat manylinux_2_28_x86_64" in invocations
+    assert "--plat manylinux_2_28_aarch64" in invocations
+    assert "--exclude libssl.so.1.1" in invocations
+    assert "--exclude libcrypto.so.1.1" in invocations
+    assert "--exclude libssl.so.3" not in invocations
+    assert "--exclude libcrypto.so.3" not in invocations
+
+
 def test_fails_when_no_bare_glibc_wheels(tmp_path: Path) -> None:
     _setup(tmp_path, _OTHERS, _FAKE_PRODUCE)
 
