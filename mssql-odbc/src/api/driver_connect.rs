@@ -400,11 +400,13 @@ fn do_connect(
     };
 
     seed_and_apply_connection_params(&mut context, state.packet_size, &params);
-    // Persist the fully-resolved pre-negotiation size (attr seed, then any
-    // `PacketSize=` override) so `SQLGetConnectAttr`/`SQLGetInfo` report it
-    // even when only the connection string set it — never the negotiated
-    // value client.packet_size() would give, matching msodbcsql.
-    state.packet_size = u32::from(context.packet_size);
+    // Capture the fully-resolved pre-negotiation size (attr seed, then any
+    // `PacketSize=` override) before `context` is moved into
+    // `create_client` below; only published to `state.packet_size` once the
+    // connection actually succeeds (see the success path), so a failed
+    // attempt does not leave a reusable DBC requesting a size it never
+    // actually established.
+    let resolved_packet_size = u32::from(context.packet_size);
 
     // Connect via mssql-tds. The caller's DBC lock is still held across this
     // I/O, so other entry points block here rather than observing 'Connecting'.
@@ -455,6 +457,8 @@ fn do_connect(
             .to_string(),
         user_name: params.uid.clone(),
     };
+    // Published here (not right after resolving it above) for the same
+    // failed-connect reason as the other fields in this block:
     // `state.packet_size` deliberately stays at whatever was requested
     // (`SQLSetConnectAttr`/`PacketSize=`, or the default) and is never
     // overwritten with the ENVCHANGE-negotiated value: msodbcsql's own
@@ -464,6 +468,7 @@ fn do_connect(
     // back) — nothing in msodbcsql writes the negotiated size into that
     // slot; the negotiated value only resizes msodbcsql's own TDS buffer
     // (`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a separate internal detail.
+    state.packet_size = resolved_packet_size;
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
@@ -1239,5 +1244,72 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = server_runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
+    /// A connect attempt that fails after resolving its packet size (but
+    /// before mssql-tds returns a client) must not leave that attempted size
+    /// behind on the DBC: a subsequent connect on the same handle should
+    /// still request the handle's prior value, not the failed attempt's.
+    #[test]
+    fn failed_connect_does_not_persist_the_attempted_packet_size() {
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{
+            DEFAULT_PACKET_SIZE, SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer,
+        };
+
+        let h = TestHandles::with_env_dbc();
+
+        // Reserve a port, then drop the listener so nothing accepts on it —
+        // `create_client` fails quickly with a real connection error, well
+        // past connection-string validation and packet-size resolution.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;PacketSize=16384",
+            addr.ip(),
+            addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR, "connect to an unused port must fail");
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        assert_eq!(
+            dbc.inner.lock().unwrap().connection_state,
+            ConnectionState::Disconnected
+        );
+
+        let mut reported: u32 = 0;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, DEFAULT_PACKET_SIZE,
+            "a failed connect must not leave the attempted PacketSize= behind"
+        );
     }
 }
