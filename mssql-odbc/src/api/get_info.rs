@@ -838,6 +838,31 @@ mod tests {
         (SQL_DATA_SOURCE_READ_ONLY, "N"),
     ];
 
+    /// Info types the ODBC 3.x spec documents as `SQLUSMALLINT`-width
+    /// (2 bytes), transcribed independently from `sql.h`/`sqlext.h` rather
+    /// than read off `STATIC_INFO::value`'s variant. If a `STATIC_INFO`
+    /// entry ever used the wrong `InfoValue` variant for its info type (e.g.
+    /// `U32` for something the spec defines as `SQLUSMALLINT`), asserting
+    /// against `entry.value`'s own variant would validate `table == table`
+    /// and miss it; this independent list is what actually pins the width.
+    const SPEC_U16_INFO_TYPES: &[SqlUSmallInt] = &[
+        odbc::SQL_CONCAT_NULL_BEHAVIOR,
+        odbc::SQL_NULL_COLLATION,
+        odbc::SQL_CORRELATION_NAME,
+        odbc::SQL_GROUP_BY,
+        odbc::SQL_IDENTIFIER_CASE,
+        odbc::SQL_QUOTED_IDENTIFIER_CASE,
+        odbc::SQL_MAX_CATALOG_NAME_LEN,
+        odbc::SQL_MAX_COLUMNS_IN_GROUP_BY,
+        odbc::SQL_MAX_COLUMNS_IN_INDEX,
+        odbc::SQL_MAX_COLUMNS_IN_ORDER_BY,
+        odbc::SQL_MAX_COLUMNS_IN_SELECT,
+        odbc::SQL_MAX_COLUMNS_IN_TABLE,
+        odbc::SQL_MAX_IDENTIFIER_LEN,
+        odbc::SQL_MAX_TABLES_IN_SELECT,
+        odbc::SQL_MAX_USER_NAME_LEN,
+    ];
+
     #[test]
     fn static_info_types_are_unique_and_report_typed_values() {
         let h = TestHandles::with_env_dbc();
@@ -850,6 +875,20 @@ mod tests {
                 "duplicate info_type {}",
                 entry.info_type
             );
+            let spec_says_u16 = SPEC_U16_INFO_TYPES.contains(&entry.info_type);
+            match entry.value {
+                InfoValue::U16(_) => assert!(
+                    spec_says_u16,
+                    "info_type {} uses InfoValue::U16 but the ODBC spec defines it wider",
+                    entry.info_type
+                ),
+                InfoValue::U32(_) | InfoValue::Bitmask(_) => assert!(
+                    !spec_says_u16,
+                    "info_type {} uses InfoValue::U32/Bitmask but the ODBC spec defines it as SQLUSMALLINT",
+                    entry.info_type
+                ),
+                InfoValue::String(_) => {}
+            }
             match entry.value {
                 InfoValue::String(expected) => {
                     let (rc, value, len) = get_wide_str(h.dbc, entry.info_type);
@@ -875,6 +914,16 @@ mod tests {
                     assert_eq!(len, 4, "info_type {}", entry.info_type);
                 }
             }
+        }
+
+        // Every entry in the independent spec list must exist in
+        // STATIC_INFO, or it is silently not exercising anything above.
+        for &info_type in SPEC_U16_INFO_TYPES {
+            assert!(
+                STATIC_INFO.iter().any(|e| e.info_type == info_type),
+                "SPEC_U16_INFO_TYPES entry {} has no matching STATIC_INFO entry",
+                info_type
+            );
         }
     }
 

@@ -50,10 +50,14 @@ SQLUINTEGER GetInfoU32(SQLHDBC dbc, SQLUSMALLINT infoType, SQLRETURN* rc,
 }
 
 // A connection string with `extra` appended. Reuses the shared builder so the
-// credential handling stays in one place.
+// credential handling stays in one place. `BuildConnectionString()` returns
+// `ODBC_TEST_CONNSTR` verbatim when that env var is set, which is not
+// guaranteed to end in `;`, so normalize the separator here rather than
+// assuming one.
 SqlTString ConnStrWith(const std::string& extra) {
-    return ODBCTestUtils::ToSqlTStr(
-        ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString()) + extra);
+    std::string base = ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString());
+    if (!base.empty() && base.back() != ';') base += ';';
+    return ODBCTestUtils::ToSqlTStr(base + extra);
 }
 
 }  // namespace

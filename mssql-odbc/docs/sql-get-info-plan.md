@@ -109,9 +109,14 @@ Driver Manager interaction difference is recorded in
 
 ## Test inventory
 
-Rust unit tests validate all 56 static table entries, their ODBC
-representation, the two aliases, dynamic connection state, probes, truncation,
-diagnostic clearing, and `HY096`.
+Rust unit tests validate all 56 static table entries' uniqueness and dispatch
+(each is fetched through the real `SQLGetInfoW` path and compared against its
+table value), an independent ODBC-spec width list that catches an entry using
+the wrong `InfoValue` variant, the two aliases, dynamic connection state,
+probes, truncation, diagnostic clearing, and `HY096`. The E2E suite is what
+pins the *actual* correct value and width against msodbcsql for entries the
+comparison leg covers; the Rust suite alone cannot prove a value is right,
+only that the code returns whatever the table says.
 
 The public E2E suite validates every implemented name in the two mssql-python
 slices, retail parity, the truthful capability ledger, identity and catalog
