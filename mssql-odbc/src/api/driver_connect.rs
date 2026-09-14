@@ -1328,6 +1328,7 @@ mod tests {
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
     }
 
+    /// A connect attempt that fails after resolving its packet size (but
     /// before mssql-tds returns a client) must not leave that attempted size
     /// behind on the DBC: a subsequent connect on the same handle should
     /// still request the handle's prior value, not the failed attempt's.
