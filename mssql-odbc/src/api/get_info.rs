@@ -710,6 +710,13 @@ fn max_statement_len(packet_size: u32) -> u32 {
     // leaves the context's own nonzero default in place for a zero seed), so
     // this can never actually overflow — kept saturating anyway as cheap
     // defense-in-depth against a future caller passing an unclamped value.
+    //
+    // A `0` here therefore reports `0`, matching msodbcsql: it computes this
+    // same product directly from its stored packet-size dwOption
+    // (sqlcinfo.cpp: `MAXSQLBLOCKSSPHINX * dwOptions[SQL_PACKET_SIZE]`), and
+    // its clamp (sqlcmisc.cpp) only runs on a truthy `vParam`, so an
+    // explicitly-set `0` is stored verbatim and yields the same `0` there —
+    // not a resolved connection default.
     MAX_SQL_BLOCKS.saturating_mul(packet_size)
 }
 
@@ -1088,6 +1095,31 @@ mod tests {
             let (rc, value, len) = get_u32(h.dbc, info_type);
             assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
             assert_eq!(value, MAX_SQL_BLOCKS * 16_384, "info_type {info_type}");
+            assert_eq!(len, 4, "info_type {info_type}");
+        }
+    }
+
+    #[test]
+    fn sql_text_limits_report_zero_for_the_zero_packet_size_sentinel() {
+        // msodbcsql reads these limits straight out of its stored packet-size
+        // dwOption (sqlcinfo.cpp: `MAXSQLBLOCKSSPHINX * dwOptions[SQL_PACKET_SIZE]`),
+        // and its `SQL_ATTR_PACKET_SIZE` clamp (sqlcmisc.cpp) only fires when the
+        // requested value is truthy, so an explicit 0 is stored verbatim and
+        // this multiplication reports 0 for retail too — not the connection's
+        // eventual default. A disconnected handle with the zero sentinel must
+        // report the same 0, matching that measured behavior exactly.
+        let h = TestHandles::with_env_dbc();
+        let dbc_ref = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        dbc_ref.inner.lock().unwrap().packet_size = 0;
+
+        for info_type in [
+            odbc::SQL_MAX_BINARY_LITERAL_LEN,
+            odbc::SQL_MAX_CHAR_LITERAL_LEN,
+            SQL_MAX_STATEMENT_LEN,
+        ] {
+            let (rc, value, len) = get_u32(h.dbc, info_type);
+            assert_eq!(rc, SQL_SUCCESS, "info_type {info_type}");
+            assert_eq!(value, 0, "info_type {info_type}");
             assert_eq!(len, 4, "info_type {info_type}");
         }
     }

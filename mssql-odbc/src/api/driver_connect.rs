@@ -548,7 +548,16 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
             IPAddressPreference::IPv4First
         };
     }
-    if let Some(size) = params.packet_size {
+    // A `PacketSize=0` keyword is msodbcsql's same "unspecified" sentinel as
+    // `SQL_ATTR_PACKET_SIZE, 0` (`sqlcconn.cpp` stores the keyword's parsed
+    // value into the same `dwOptions[SQL_PACKET_SIZE]` slot verbatim, with no
+    // clamp of its own), so it is exempted here too and `context.packet_size`
+    // keeps its `ClientContext::default()` value instead of being forced to
+    // `MIN_PACKET_SIZE` — seeding a literal `0` would fail `ClientContext`'s
+    // `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]` validation regardless.
+    if let Some(size) = params.packet_size
+        && size != 0
+    {
         context.packet_size =
             u16::try_from(size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE)).unwrap_or(u16::MAX);
     }
@@ -1039,6 +1048,35 @@ mod tests {
             },
         );
         assert_eq!(ctx.packet_size, 32768);
+    }
+
+    #[test]
+    fn apply_params_leaves_packet_size_zero_keyword_unseeded() {
+        // `PacketSize=0` is msodbcsql's same "unspecified" sentinel as
+        // `SQL_ATTR_PACKET_SIZE, 0` — both write the same dwOptions slot
+        // verbatim with no clamp — so it must not be forced up to
+        // `MIN_PACKET_SIZE` any more than the attribute path is.
+        let default_packet_size = ClientContext::default().packet_size;
+        let mut ctx = ClientContext::default();
+        ctx.packet_size = 4096; // simulate a prior nonzero seed being left alone
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                packet_size: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.packet_size, 4096, "a zero keyword must not overwrite");
+
+        let mut fresh_ctx = ClientContext::default();
+        apply_connection_params(
+            &mut fresh_ctx,
+            &ConnectionParams {
+                packet_size: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(fresh_ctx.packet_size, default_packet_size);
     }
 
     #[test]

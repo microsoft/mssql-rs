@@ -59,6 +59,18 @@ reports 1024000 instead — a real, unavoidable divergence whenever the
 configured size differs from retail's default, tracked here rather than
 silently matching retail's number.
 
+A `0` (msodbcsql's "let the connection pick its own default" sentinel, from
+either `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE, 0)` or `PacketSize=0`) is
+exempt from the clamp on both the source and this driver, on both the
+attribute and connection-string-keyword paths — `sqlcconn.cpp:1639-1642`
+stores the keyword's value into the same `dwOptions` slot the attribute
+writes, verbatim, with no clamp of its own — and both then report the same
+`128 * 0 = 0` for the three limits above rather than a resolved default.
+This driver matches that: `state.packet_size`/`ConnectionParams::packet_size`
+stay `0` through `SQLGetConnectAttr`/`SQLGetInfo` while disconnected, and only
+`ClientContext` (which cannot hold a literal `0`) resolves to its own default
+at connect time.
+
 ## Capability ledger
 
 Capability masks describe this driver rather than copying features that only
