@@ -646,10 +646,11 @@ fn sql_get_info_w_safe(
         SQL_MAX_COLUMN_NAME_LEN | SQL_MAX_SCHEMA_NAME_LEN | SQL_MAX_TABLE_NAME_LEN => {
             write_u16(info_value_ptr, MAX_IDENTIFIER_LEN, string_length_ptr)
         }
-        // `state.packet_size` is the negotiated value once connected
-        // (synced in `driver_connect.rs` right after login) and the
-        // requested/default value before, so there is no pre/post-connect
-        // split to handle here.
+        // `state.packet_size` is always the requested/configured size (from
+        // `SQLSetConnectAttr`/`PacketSize=`, or the default), never the
+        // ENVCHANGE-negotiated one, matching msodbcsql: its own
+        // `SQLGetConnectAttr`/`SQLGetInfo` read the single slot the LOGIN7
+        // request was built from, which nothing overwrites post-negotiation.
         odbc::SQL_MAX_BINARY_LITERAL_LEN
         | odbc::SQL_MAX_CHAR_LITERAL_LEN
         | SQL_MAX_STATEMENT_LEN => write_u32(
@@ -698,10 +699,11 @@ fn sql_get_info_w_safe(
 }
 
 fn max_statement_len(packet_size: u32) -> u32 {
-    // `packet_size` can be server-controlled (the negotiated ENVCHANGE value,
-    // unrange-checked by `mssql-tds`), so a malicious/misbehaving server
-    // could otherwise overflow this multiplication. Saturate instead of
-    // wrapping or panicking.
+    // `packet_size` is always `state.packet_size`, clamped to
+    // `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]` by `set_connect_attr`/
+    // `apply_connection_params`, so this can never actually overflow — kept
+    // saturating anyway as cheap defense-in-depth against a future caller
+    // passing an unclamped value.
     MAX_SQL_BLOCKS.saturating_mul(packet_size)
 }
 
@@ -1003,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn max_statement_len_tracks_negotiated_packet_size() {
+    fn max_statement_len_scales_with_packet_size() {
         assert_eq!(max_statement_len(4096), 512 * 1024);
         assert_eq!(max_statement_len(8192), 1024 * 1024);
         assert_eq!(max_statement_len(32768), 4 * 1024 * 1024);
@@ -1011,9 +1013,8 @@ mod tests {
 
     #[test]
     fn max_statement_len_saturates_instead_of_overflowing() {
-        // A misbehaving/malicious server can negotiate an arbitrary packet
-        // size via ENVCHANGE (mssql-tds does not range-check it), so this
-        // must not wrap or panic for large values.
+        // `packet_size` is always clamped in practice, but this pure
+        // function must still not wrap or panic for out-of-range inputs.
         assert_eq!(max_statement_len(u32::MAX), u32::MAX);
         assert_eq!(max_statement_len(40_000_000), u32::MAX);
     }

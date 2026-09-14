@@ -399,13 +399,7 @@ fn do_connect(
         server_certificate: None,
     };
 
-    // Seed from any pre-connect `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)`
-    // (msodbcsql applies the attribute to the connect request too); a
-    // connection-string `PacketSize=` keyword below still takes precedence.
-    // `state.packet_size` is always clamped to `[MIN_PACKET_SIZE,
-    // MAX_PACKET_SIZE]` (both well within u16), so this cast never truncates.
-    context.packet_size = state.packet_size as u16;
-    apply_connection_params(&mut context, &params);
+    seed_and_apply_connection_params(&mut context, state.packet_size, &params);
 
     // Connect via mssql-tds. The caller's DBC lock is still held across this
     // I/O, so other entry points block here rather than observing 'Connecting'.
@@ -456,11 +450,15 @@ fn do_connect(
             .to_string(),
         user_name: params.uid.clone(),
     };
-    // Sync the negotiated packet size back onto DbcState so SQLGetConnectAttr
-    // agrees with SQLGetInfo's post-connect max-length values, matching
-    // msodbcsql: both read the same stored value there (`sqlcmisc.cpp:3465`,
-    // `sqlcinfo.cpp:1186`), never a pre-negotiation request.
-    state.packet_size = client.packet_size();
+    // `state.packet_size` deliberately stays at whatever was requested
+    // (`SQLSetConnectAttr`/`PacketSize=`, or the default) and is never
+    // overwritten with the ENVCHANGE-negotiated value: msodbcsql's own
+    // `SQLGetConnectAttr`/`SQLGetInfo` both read the single `dwOptions`
+    // slot that only ever holds the requested size (`sqlcconn.cpp:3326`
+    // builds LOGIN7 from it, `sqlcmisc.cpp:3465`/`sqlcinfo.cpp:1186` read it
+    // back) — nothing in msodbcsql writes the negotiated size into that
+    // slot; the negotiated value only resizes msodbcsql's own TDS buffer
+    // (`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a separate internal detail.
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
@@ -543,6 +541,24 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
         context.packet_size =
             u16::try_from(size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE)).unwrap_or(u16::MAX);
     }
+}
+
+/// Seeds `context.packet_size` from any pre-connect
+/// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)` (msodbcsql applies the attribute
+/// to the connect request too) before applying the rest of the connection
+/// params, so a `PacketSize=` connection-string keyword still overrides it.
+/// `state_packet_size` is always clamped to `[MIN_PACKET_SIZE,
+/// MAX_PACKET_SIZE]` (both well within u16), so this cast never truncates.
+/// Extracted out of `do_connect` so a test can drive it directly rather than
+/// re-typing its two statements, which would silently stop guarding the real
+/// code path the moment the two drifted apart.
+fn seed_and_apply_connection_params(
+    context: &mut ClientContext,
+    state_packet_size: u32,
+    params: &ConnectionParams,
+) {
+    context.packet_size = state_packet_size as u16;
+    apply_connection_params(context, params);
 }
 
 #[cfg(test)]
@@ -1074,25 +1090,25 @@ mod tests {
         assert_eq!(ctx.encryption_options.server_certificate, None);
     }
 
-    /// Mirrors `do_connect`'s exact `context.packet_size = state.packet_size
-    /// as u16;` followed by `apply_connection_params`: a pre-connect
+    /// Drives `do_connect`'s actual `seed_and_apply_connection_params` helper
+    /// (not a re-typed copy of it): a pre-connect
     /// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)` must reach the login
     /// request when the connection string is silent on `PacketSize=`, but a
-    /// `PacketSize=` keyword must still win when both are present.
+    /// `PacketSize=` keyword must still win when both are present. Deleting
+    /// the seeding line inside the helper fails this test.
     #[test]
     fn preconnect_packet_size_attr_seeds_context_but_connection_string_keyword_wins() {
         let mut ctx = ClientContext::default();
-        ctx.packet_size = 16384u32 as u16;
-        apply_connection_params(&mut ctx, &ConnectionParams::default());
+        seed_and_apply_connection_params(&mut ctx, 16384, &ConnectionParams::default());
         assert_eq!(
             ctx.packet_size, 16384,
             "a pre-connect SQL_ATTR_PACKET_SIZE must reach the login request"
         );
 
         let mut ctx = ClientContext::default();
-        ctx.packet_size = 16384u32 as u16;
-        apply_connection_params(
+        seed_and_apply_connection_params(
             &mut ctx,
+            16384,
             &ConnectionParams {
                 packet_size: Some(4096),
                 ..Default::default()
@@ -1105,16 +1121,21 @@ mod tests {
     }
 
     /// `SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE)` and `SQLGetInfo`'s
-    /// `128 * packet_size` limits must agree once connected. Before this was
-    /// synced, `DbcState::packet_size` stayed at its pre-connect value while
-    /// `SQLGetInfo` already read the negotiated size from the live client —
-    /// this mock server always negotiates 4096 regardless of what is
-    /// requested (`mssql-mock-tds/src/protocol.rs`), so a default connection
-    /// reliably exercises the divergence.
+    /// `128 * packet_size` limits must both keep reporting the *requested*
+    /// packet size after connecting, even though the server negotiates a
+    /// different one, matching msodbcsql: its `SQLGetConnectAttr`/
+    /// `SQLGetInfo` read the single `dwOptions` slot the LOGIN7 request was
+    /// built from, and nothing writes the ENVCHANGE-negotiated size back
+    /// into it. This mock server always negotiates down to 4096 regardless
+    /// of what is requested (`mssql-mock-tds/src/protocol.rs`), so
+    /// requesting a different size reliably exercises this.
     #[test]
-    fn connect_syncs_packet_size_to_the_negotiated_value() {
+    fn connect_keeps_reporting_the_requested_packet_size_not_the_negotiated_one() {
         use crate::api::get_connect_attr::sql_get_connect_attr_w;
-        use crate::api::odbc_types::{SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer};
+        use crate::api::get_info::sql_get_info_w;
+        use crate::api::odbc_types::{
+            SQL_ATTR_PACKET_SIZE, SQL_MAX_CHAR_LITERAL_LEN, SqlInteger, SqlPointer, SqlSmallInt,
+        };
         use mssql_mock_tds::MockTdsServer;
         use std::time::Duration;
 
@@ -1134,9 +1155,10 @@ mod tests {
         });
 
         let h = TestHandles::with_env_dbc();
+        let requested_packet_size: u32 = 16384;
         let conn_str: Vec<u16> = cs(&format!(
             "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
-             TrustServerCertificate=yes",
+             TrustServerCertificate=yes;PacketSize={requested_packet_size}",
             server_addr.ip(),
             server_addr.port()
         ))
@@ -1187,8 +1209,26 @@ mod tests {
         };
         assert_eq!(get_ret, SQL_SUCCESS);
         assert_eq!(
-            reported, negotiated,
-            "SQLGetConnectAttr must report the negotiated packet size, not the pre-connect request"
+            reported, requested_packet_size,
+            "SQLGetConnectAttr must keep reporting the requested size, not the negotiated one"
+        );
+
+        let mut max_char_literal_len: u32 = 0;
+        let info_ret = unsafe {
+            sql_get_info_w(
+                h.dbc,
+                SQL_MAX_CHAR_LITERAL_LEN,
+                &mut max_char_literal_len as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlSmallInt,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(info_ret, SQL_SUCCESS);
+        assert_eq!(
+            max_char_literal_len,
+            128 * requested_packet_size,
+            "SQLGetInfo must derive the limit from the requested size too, agreeing with \
+             SQLGetConnectAttr"
         );
 
         let _ = shutdown_tx.send(());

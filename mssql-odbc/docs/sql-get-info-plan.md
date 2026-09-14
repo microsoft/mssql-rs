@@ -36,15 +36,20 @@ Parity evidence has two sources:
 The source and retail build disagree on two values. Runtime behavior is the
 compatibility contract: `SQL_OUTER_JOINS="F"`,
 and `SQL_CONCAT_NULL_BEHAVIOR=SQL_CB_NULL`. The statement, character-literal,
-and binary-literal limits all track the packet size as `128 * packet_size`:
-before connecting (or once connected, the TDS-negotiated value, which can
-differ from what was requested). Retail's 524288 example is for its default
-4096-byte packet; a connection through this driver that negotiates down to
-4096 (as `mssql-mock-tds` always does) reports the same 524288 once
-connected. The pre-connect case is where the two differ: this driver's
-`DEFAULT_PACKET_SIZE` is 8000, so an unconnected handle reports 1024000
-instead of retail's number — a real, unavoidable divergence, tracked here
-rather than silently matching retail's number.
+and binary-literal limits all track the packet size as `128 * packet_size`,
+using the requested/configured packet size (from `SQLSetConnectAttr`,
+`PacketSize=`, or `DEFAULT_PACKET_SIZE`) both before and after connecting —
+never the TDS-negotiated value. This matches msodbcsql: `SQLGetConnectAttr`
+and `SQLGetInfo` both read the same `dwOptions` slot the LOGIN7 request was
+built from (`sqlcconn.cpp:3326`, `sqlcmisc.cpp:3465`, `sqlcinfo.cpp:1186`),
+and nothing in msodbcsql writes the ENVCHANGE-negotiated size back into that
+slot — the negotiated value only resizes msodbcsql's internal TDS buffer
+(`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a detail invisible to the ODBC API.
+Retail's 524288 example is for its default 4096-byte packet; this driver's
+`DEFAULT_PACKET_SIZE` is 8000, so an unconnected or default-configured handle
+reports 1024000 instead — a real, unavoidable divergence whenever the
+configured size differs from retail's default, tracked here rather than
+silently matching retail's number.
 
 ## Capability ledger
 
