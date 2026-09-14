@@ -13,6 +13,7 @@
 use tracing::{debug, error};
 
 use super::current_catalog::set_current_catalog;
+use super::driver_connect::{MAX_PACKET_SIZE, MIN_PACKET_SIZE};
 use super::set_stmt_attr::clamp_query_timeout;
 use super::sqlstate::*;
 use super::txn::{reset_connection, set_autocommit, set_txn_isolation};
@@ -350,8 +351,15 @@ unsafe fn sql_set_connect_attr_w_impl(
                 );
                 return SQL_ERROR;
             }
-            state.packet_size = value_ptr as usize as u32;
-            SQL_SUCCESS
+            let requested = value_ptr as usize as u32;
+            let clamped = requested.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE);
+            state.packet_size = clamped;
+            if clamped != requested {
+                post_diag(&mut state, WARN_PACKET_SIZE_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
         }
         // Set by the Driver Manager only, and not retrievable, so nothing to
         // store.
@@ -976,6 +984,46 @@ mod tests {
             state.packet_size, DEFAULT_PACKET_SIZE,
             "a rejected set must not change the stored value"
         );
+    }
+
+    #[test]
+    fn packet_size_above_maximum_is_clamped() {
+        // Matches msodbcsql's own clamp for an out-of-range packet size
+        // (`sqlcmisc.cpp:1909-1917`, `IDS_01_S02_02` "Packet size changed").
+        // Also guards `get_info::max_statement_len`'s `128 * packet_size`:
+        // an unclamped caller-supplied value here could overflow that
+        // multiplication before the driver ever connects.
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                u32::MAX as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, MAX_PACKET_SIZE);
+        let record = &state.diag_records()[0];
+        assert_eq!(record.sql_state, SQLSTATE_01S02);
+        assert!(
+            record.message.ends_with(WARN_PACKET_SIZE_CHANGED.text),
+            "got: {}",
+            record.message
+        );
+    }
+
+    #[test]
+    fn packet_size_below_minimum_is_clamped() {
+        let h = TestHandles::with_env_dbc();
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 1usize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, MIN_PACKET_SIZE);
     }
 
     #[test]

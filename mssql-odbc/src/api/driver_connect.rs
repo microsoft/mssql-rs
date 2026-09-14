@@ -470,8 +470,12 @@ fn do_connect(
 /// TDS packet-size range accepted by `mssql-tds` (`DefaultClientContextValidator`).
 /// Unlike `ConnectRetryCount` / `ConnectRetryInterval` (which the parser rejects
 /// out-of-range to match msodbcsql), `PacketSize` is clamped to this range.
-const MIN_PACKET_SIZE: u32 = 512;
-const MAX_PACKET_SIZE: u32 = 32768;
+///
+/// Also reused by `set_connect_attr::SQL_ATTR_PACKET_SIZE` to clamp
+/// `DbcState::packet_size` at the point it is set, so no unclamped value can
+/// reach `get_info::max_statement_len`'s `128 * packet_size` before connect.
+pub(super) const MIN_PACKET_SIZE: u32 = 512;
+pub(super) const MAX_PACKET_SIZE: u32 = 32768;
 
 /// Maps parsed [`ConnectionParams`] onto a [`ClientContext`]. `ConnectRetryCount`
 /// and `ConnectRetryInterval` are already range-validated during parsing;
