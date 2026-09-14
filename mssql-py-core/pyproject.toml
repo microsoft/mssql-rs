@@ -35,7 +35,8 @@ features = ["pyo3/extension-module"]
 # the wheel after the build, so repair must run on the final wheel. The pipeline
 # runs `auditwheel repair` post-injection (scripts/repair-glibc-wheels-in-container.sh)
 # only to retag the glibc wheels manylinux_*; libssl/libcrypto are excluded from
-# vendoring, so the wheel keeps expecting the OS to provide OpenSSL 3 at runtime.
+# vendoring, so manylinux_2_28 expects OS-provided OpenSSL 1.1 and manylinux_2_34
+# expects OS-provided OpenSSL 3 at runtime.
 # macOS (Security.framework) and Windows (SChannel) have no OpenSSL dependency.
 auditwheel = "skip"
 

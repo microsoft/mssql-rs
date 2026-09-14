@@ -478,9 +478,22 @@ def test_nonofficial_nuget_versions_follow_python_distribution(
     assert metadata.findtext("version") == expected_version
 
 
-@pytest.mark.parametrize("job_name", ["Linux_x64", "Linux_ARM64"])
+@pytest.mark.parametrize(
+    ("job_name", "image"),
+    [
+        (
+            "Linux_x64",
+            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_x86_64_rust:latest",
+        ),
+        (
+            "Linux_ARM64",
+            "ghcr.io/microsoft/mssql-rs/python-build/" "manylinux_2_28_aarch64_rust:latest",
+        ),
+    ],
+)
 def test_manylinux_228_builds_use_isolated_cargo_targets(
     job_name: str,
+    image: str,
 ) -> None:
     flags = {
         "buildAllTargets": True,
@@ -505,6 +518,10 @@ def test_manylinux_228_builds_use_isolated_cargo_targets(
     assert (
         '-e "CARGO_TARGET_DIR=/tmp/mssql-py-core-manylinux-2-28"'
         in wheel_step["script"]
+    )
+    assert f"docker pull {image}" in wheel_step["script"]
+    assert wheel_step["script"].index(f"docker pull {image}") < wheel_step["script"].index(
+        "docker-cargo-run.sh"
     )
 
 

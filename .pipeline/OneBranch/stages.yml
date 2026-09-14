@@ -274,6 +274,7 @@ stages:
       - script: |
           set -e
           mkdir -p "$(Build.SourcesDirectory)/wheels-228"
+          docker pull ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_x86_64_rust:latest
           bash .pipeline/scripts/docker-cargo-run.sh --rm \
             -v "$(Build.SourcesDirectory):/workspace" \
             -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \
@@ -417,6 +418,7 @@ stages:
         - script: |
             set -e
             mkdir -p "$(Build.SourcesDirectory)/wheels-228"
+            docker pull ghcr.io/microsoft/mssql-rs/python-build/manylinux_2_28_aarch64_rust:latest
             bash .pipeline/scripts/docker-cargo-run.sh --rm \
               -v "$(Build.SourcesDirectory):/workspace" \
               -v "$(Build.SourcesDirectory)/wheels-228:/workspace/target/wheels" \

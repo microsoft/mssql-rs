@@ -1,8 +1,8 @@
 # Build ONLY the mssql-odbc driver inside a given wheel-build container image so
 # the driver's libc floor matches the wheel it is injected into. Unlike
 # build-odbc-template.yml this skips the C++ gtest e2e build (not needed for the
-# injected driver) and runs in the manylinux_2_34 / musllinux_1_2 image rather
-# than ubuntu / alpine. CI (non-PR) only.
+# injected driver) and runs in a manylinux_2_28, manylinux_2_34, or musllinux_1_2
+# image rather than ubuntu / alpine. CI (non-PR) only.
 
 parameters:
   # Wheel-build container image to build the driver in (matches the wheel).
