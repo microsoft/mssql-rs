@@ -125,6 +125,10 @@ pub(crate) struct DbcState {
     /// surviving `SQLDisconnect` so the next connect attempt on this handle
     /// starts from it again. Never overwritten with a resolved or negotiated
     /// value — see [`effective_packet_size`](Self::effective_packet_size).
+    /// `0` is a valid stored value (msodbcsql's "let the connection pick its
+    /// own default" sentinel, exempt from the usual clamp — see
+    /// `set_connect_attr::sql_set_connect_attr_w_impl`); it is resolved to the
+    /// `ClientContext` default at connect time rather than seeded verbatim.
     pub(crate) packet_size: u32,
     /// The packet size actually resolved for the current connection (attribute
     /// seed, then any `PacketSize=` override), kept separate from

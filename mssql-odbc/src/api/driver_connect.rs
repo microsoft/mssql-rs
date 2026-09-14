@@ -558,8 +558,13 @@ fn apply_connection_params(context: &mut ClientContext, params: &ConnectionParam
 /// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)` (msodbcsql applies the attribute
 /// to the connect request too) before applying the rest of the connection
 /// params, so a `PacketSize=` connection-string keyword still overrides it.
+/// Zero is msodbcsql's sentinel for "unspecified" (`sqlcmisc.cpp:1909-1917`
+/// exempts it from the packet-size clamp), so it is left out of the seed
+/// entirely and `context.packet_size` keeps its `ClientContext::default()`
+/// value instead — seeding zero directly would fail `ClientContext`'s
+/// `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]` validation. Any other
 /// `state_packet_size` is always clamped to `[MIN_PACKET_SIZE,
-/// MAX_PACKET_SIZE]` (both well within u16), so this cast never truncates.
+/// MAX_PACKET_SIZE]` (both well within u16), so that cast never truncates.
 /// Extracted out of `do_connect` so a test can drive it directly rather than
 /// re-typing its two statements, which would silently stop guarding the real
 /// code path the moment the two drifted apart.
@@ -568,7 +573,9 @@ fn seed_and_apply_connection_params(
     state_packet_size: u32,
     params: &ConnectionParams,
 ) {
-    context.packet_size = state_packet_size as u16;
+    if state_packet_size != 0 {
+        context.packet_size = state_packet_size as u16;
+    }
     apply_connection_params(context, params);
 }
 
@@ -1131,6 +1138,41 @@ mod tests {
         );
     }
 
+    /// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE, 0)` stores the msodbcsql
+    /// "unspecified" sentinel (`set_connect_attr.rs`), which this helper must
+    /// not seed verbatim: `ClientContext` rejects a zero packet size
+    /// (`client_context.rs`'s `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]`
+    /// validation), so seeding it would turn every connect attempt on a
+    /// zeroed handle into a hard failure instead of falling back to the
+    /// context's own default.
+    #[test]
+    fn zero_state_packet_size_leaves_the_context_default_unseeded() {
+        let default_packet_size = ClientContext::default().packet_size;
+
+        let mut ctx = ClientContext::default();
+        seed_and_apply_connection_params(&mut ctx, 0, &ConnectionParams::default());
+        assert_eq!(
+            ctx.packet_size, default_packet_size,
+            "a zero SQL_ATTR_PACKET_SIZE must not override the context default"
+        );
+
+        // A `PacketSize=` keyword must still be honored even though the
+        // attribute itself is the zero sentinel.
+        let mut ctx = ClientContext::default();
+        seed_and_apply_connection_params(
+            &mut ctx,
+            0,
+            &ConnectionParams {
+                packet_size: Some(4096),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.packet_size, 4096,
+            "PacketSize= must still apply when the pre-connect attribute is the zero sentinel"
+        );
+    }
+
     /// `SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE)` and `SQLGetInfo`'s
     /// `128 * packet_size` limits must both keep reporting the *requested*
     /// packet size after connecting, even though the server negotiates a
@@ -1393,5 +1435,173 @@ mod tests {
             reported, DEFAULT_PACKET_SIZE,
             "a failed connect must not leave the attempted PacketSize= behind"
         );
+    }
+
+    /// A pre-connect `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE, 0)` — the
+    /// msodbcsql "unspecified" sentinel — must survive a failed connect
+    /// attempt exactly like any other stored value: unlike `packet_size`
+    /// itself, `effective_packet_size` is never populated on a failed
+    /// attempt, so the handle must keep reporting the zero it was
+    /// explicitly given, not silently drift to `DEFAULT_PACKET_SIZE`.
+    #[test]
+    fn zero_packet_size_survives_a_failed_connect() {
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer};
+        use crate::api::set_connect_attr::sql_set_connect_attr_w;
+
+        let h = TestHandles::with_env_dbc();
+        let set_ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(set_ret, SQL_SUCCESS);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;ConnectRetryCount=0",
+            addr.ip(),
+            addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR, "connect to an unused port must fail");
+
+        let mut reported: u32 = 0xAAAA_AAAA;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, 0,
+            "a failed connect must not disturb the explicitly-set zero sentinel"
+        );
+    }
+
+    /// The zero sentinel must round-trip through a full successful
+    /// connect/disconnect/reconnect cycle: while connected,
+    /// `SQL_ATTR_PACKET_SIZE` reports the resolved (non-zero) size actually
+    /// used for the login, but after `SQLDisconnect` it must go back to
+    /// reporting the zero the caller explicitly asked for — not
+    /// `DEFAULT_PACKET_SIZE` — and a second connect must resolve the same
+    /// way.
+    #[test]
+    fn zero_packet_size_survives_connect_disconnect_reconnect() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer};
+        use crate::api::set_connect_attr::sql_set_connect_attr_w;
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let set_ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(set_ret, SQL_SUCCESS);
+
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        for _ in 0..2 {
+            let ret = unsafe {
+                sql_driver_connect_w(
+                    h.dbc,
+                    std::ptr::null_mut(),
+                    conn_str.as_ptr(),
+                    SQL_NTS,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    SQL_DRIVER_NOPROMPT,
+                )
+            };
+            assert!(
+                matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+                "connect failed: {ret}"
+            );
+
+            let mut connected_reported: u32 = 0;
+            let get_ret = unsafe {
+                sql_get_connect_attr_w(
+                    h.dbc,
+                    SQL_ATTR_PACKET_SIZE,
+                    &mut connected_reported as *mut u32 as SqlPointer,
+                    std::mem::size_of::<u32>() as SqlInteger,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(get_ret, SQL_SUCCESS);
+            assert_ne!(
+                connected_reported, 0,
+                "while connected the zero sentinel must resolve to an actual size"
+            );
+
+            let disconnect_ret = unsafe { sql_disconnect(h.dbc) };
+            assert_eq!(disconnect_ret, SQL_SUCCESS);
+
+            let mut reported: u32 = 0xAAAA_AAAA;
+            let get_ret = unsafe {
+                sql_get_connect_attr_w(
+                    h.dbc,
+                    SQL_ATTR_PACKET_SIZE,
+                    &mut reported as *mut u32 as SqlPointer,
+                    std::mem::size_of::<u32>() as SqlInteger,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(get_ret, SQL_SUCCESS);
+            assert_eq!(
+                reported, 0,
+                "SQLDisconnect must restore the explicitly-set zero sentinel, not \
+                 DEFAULT_PACKET_SIZE"
+            );
+        }
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
     }
 }
