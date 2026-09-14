@@ -699,11 +699,13 @@ fn sql_get_info_w_safe(
 }
 
 fn max_statement_len(packet_size: u32) -> u32 {
-    // `packet_size` is always `state.packet_size`, clamped to
-    // `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]` by `set_connect_attr`/
-    // `apply_connection_params`, so this can never actually overflow — kept
-    // saturating anyway as cheap defense-in-depth against a future caller
-    // passing an unclamped value.
+    // `packet_size` is always `state.packet_size`. It is clamped to
+    // `[MIN_PACKET_SIZE, MAX_PACKET_SIZE]` either directly by
+    // `set_connect_attr` or via `context.packet_size` (clamped by
+    // `apply_connection_params`, then copied onto `state.packet_size` in
+    // `driver_connect.rs` after connecting), so this can never actually
+    // overflow — kept saturating anyway as cheap defense-in-depth against a
+    // future caller passing an unclamped value.
     MAX_SQL_BLOCKS.saturating_mul(packet_size)
 }
 

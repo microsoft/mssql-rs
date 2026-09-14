@@ -400,6 +400,11 @@ fn do_connect(
     };
 
     seed_and_apply_connection_params(&mut context, state.packet_size, &params);
+    // Persist the fully-resolved pre-negotiation size (attr seed, then any
+    // `PacketSize=` override) so `SQLGetConnectAttr`/`SQLGetInfo` report it
+    // even when only the connection string set it — never the negotiated
+    // value client.packet_size() would give, matching msodbcsql.
+    state.packet_size = u32::from(context.packet_size);
 
     // Connect via mssql-tds. The caller's DBC lock is still held across this
     // I/O, so other entry points block here rather than observing 'Connecting'.

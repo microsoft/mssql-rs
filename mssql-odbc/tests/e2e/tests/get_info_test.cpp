@@ -49,6 +49,13 @@ SQLUINTEGER GetInfoU32(SQLHDBC dbc, SQLUSMALLINT infoType, SQLRETURN* rc,
     return value;
 }
 
+// A connection string with `extra` appended. Reuses the shared builder so the
+// credential handling stays in one place.
+SqlTString ConnStrWith(const std::string& extra) {
+    return ODBCTestUtils::ToSqlTStr(
+        ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString()) + extra);
+}
+
 }  // namespace
 
 class GetInfoLiveTest : public ODBCTest {
@@ -222,6 +229,50 @@ TEST_F(GetInfoLiveTest, MaxStatementLenAndConformance) {
               GetInfoU32(dbc_, SQL_SQL_CONFORMANCE, &rc, &len));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
     EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len);
+}
+
+// The other parity checks in this file re-derive their expectation from
+// SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE), which reads the exact same stored
+// value SQLGetInfo does here — so on this driver `128*x == 128*x` passes
+// regardless of what x actually is, and the shared default connection string
+// never sets `PacketSize=`, so none of them exercise that keyword. Open a
+// second connection with an explicit, non-default `PacketSize=` and assert
+// the literal expected number, so a regression in either the connection's
+// resolved packet size or SQLGetInfo's derivation would be caught.
+TEST_F(GetInfoLiveTest, MaxLengthsUseTheConnectionStringPacketSize) {
+    constexpr SQLUINTEGER kRequestedPacketSize = 16384;
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc), SQL_HANDLE_ENV, env_);
+    SqlTString connstr = ConnStrWith("PacketSize=" + std::to_string(kRequestedPacketSize));
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+    ASSERT_SQL_OK(SQLDriverConnect(dbc, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
+                                   static_cast<SQLSMALLINT>(connstr.size()), outStr,
+                                   static_cast<SQLSMALLINT>(sizeof(outStr) / sizeof(SQLTCHAR)),
+                                   &outLen, SQL_DRIVER_NOPROMPT),
+                  SQL_HANDLE_DBC, dbc);
+
+    SQLUINTEGER packetSize = 0;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc, SQL_ATTR_PACKET_SIZE, &packetSize, SQL_IS_UINTEGER,
+                                    nullptr),
+                  SQL_HANDLE_DBC, dbc);
+    EXPECT_EQ(kRequestedPacketSize, packetSize)
+        << "SQLGetConnectAttr must report the connection string's PacketSize=, not a "
+           "negotiated or default value";
+
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT len = -1;
+    for (SQLUSMALLINT infoType :
+         {SQL_MAX_STATEMENT_LEN, SQL_MAX_CHAR_LITERAL_LEN, SQL_MAX_BINARY_LITERAL_LEN}) {
+        EXPECT_EQ(128u * kRequestedPacketSize, GetInfoU32(dbc, infoType, &rc, &len))
+            << "info_type " << infoType;
+        EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "info_type " << infoType;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << "info_type " << infoType;
+    }
+
+    SQLDisconnect(dbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 }
 
 TEST_F(GetInfoLiveTest, KeywordsAndSpecialCharacters) {
