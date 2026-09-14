@@ -339,6 +339,7 @@ fn drain_and_release_inner(
         return DrainOutcome::Failed;
     }
 
+    let array_rc = super::execute::update_parameter_array(stmt, &mut client);
     let has_server_info = match stmt.inner.lock() {
         Ok(mut stmt_state) => {
             // Drain INFO only after the lock is held so a poisoned mutex cannot
@@ -366,7 +367,9 @@ fn drain_and_release_inner(
         }
     }
 
-    if has_server_info {
+    if array_rc == SQL_ERROR {
+        DrainOutcome::Failed
+    } else if has_server_info || array_rc == SQL_SUCCESS_WITH_INFO {
         DrainOutcome::InfoPosted
     } else {
         DrainOutcome::Clean

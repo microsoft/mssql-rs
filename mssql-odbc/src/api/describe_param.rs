@@ -3,9 +3,11 @@
 
 //! Implementation of SQLDescribeParam.
 
+use std::time::Instant;
+
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::ResultSet;
+use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::SqlString;
 use mssql_tds::datatypes::sqldatatypes::TdsDataType;
@@ -13,7 +15,8 @@ use mssql_tds::datatypes::sqltypes::SqlType;
 use mssql_tds::message::parameters::rpc_parameters::{RpcParameter, StatusFlags};
 
 use super::exec_common::{
-    claim_connection, fail_with_tds, flush_pending_unprepare, return_client_idle,
+    claim_connection, deduct_query_timeout, fail_with_tds, flush_pending_unprepare,
+    query_timeout_expired_error, return_client_idle,
 };
 use super::odbc_types::*;
 use super::sqlstate::*;
@@ -127,7 +130,7 @@ fn sql_describe_param_safe(
         env_state.odbc_version != OdbcVersion::Odbc2
     };
 
-    let (sql, marker_count) = {
+    let (sql, marker_count, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLDescribeParam: stmt mutex poisoned");
             return SQL_ERROR;
@@ -183,27 +186,61 @@ fn sql_describe_param_safe(
 
         let sql = plan.stmt.sql().to_string();
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (sql, marker_count)
+        (sql, marker_count, stmt_state.query_timeout)
     };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLDescribeParam") {
         Ok(client) => client,
         Err(rc) => return rc,
     };
-    // Not SQLExecute/SQLExecDirectW, so out of scope for the
-    // SQL_ATTR_QUERY_TIMEOUT wiring; `0` keeps existing unbounded behavior.
-    flush_pending_unprepare(dbc, stmt, &mut client, "SQLDescribeParam", 0);
+    let budget = query_timeout;
+    let started = Instant::now();
 
-    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLDescribeParam", 0) {
+    // `sp_describe_undeclared_parameters` is a real server round trip, so
+    // `SQL_ATTR_QUERY_TIMEOUT` bounds it. The ODBC reference page for
+    // SQLDescribeParam does not list `HYT00`, but msodbcsql bounds this path
+    // regardless — `SQLDescribeParam` reaches `AutoFillIPD`, which reads
+    // `GetQueryTimeOut(lpstmt)` (`sqlcdesc.cpp:9379`) — so matching it is a
+    // parity requirement, not a discretionary extra. `0` stays unlimited.
+    flush_pending_unprepare(dbc, stmt, &mut client, "SQLDescribeParam", query_timeout);
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
+
+    if let Err(e) = begin_transaction_if_manual(dbc, &mut client, "SQLDescribeParam", query_timeout)
+    {
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
+
+    let query_timeout = match deduct_query_timeout(budget, started.elapsed()) {
+        Ok(remaining) => remaining,
+        Err(()) => {
+            return fail_with_tds(
+                dbc,
+                stmt,
+                statement_handle,
+                client,
+                &query_timeout_expired_error(),
+            );
+        }
+    };
 
     let command = RpcParameter::new(None, StatusFlags::NONE, metadata_request_value(sql));
     let execute_result = dbc.runtime.block_on(client.execute_stored_procedure(
         DESCRIBE_PARAMETERS_PROC.to_string(),
         Some(vec![command]),
         None,
-        (),
+        ExecuteOptions::new().timeout_secs(query_timeout),
     ));
     if let Err(e) = execute_result {
         error!(%e, "SQLDescribeParam: metadata RPC failed");
@@ -784,6 +821,203 @@ mod tests {
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
             SQLSTATE_HY010
+        );
+    }
+
+    /// `SQL_ATTR_QUERY_TIMEOUT` must bound `SQLDescribeParam`'s
+    /// `sp_describe_undeclared_parameters` round trip.
+    ///
+    /// The ODBC reference page for `SQLDescribeParam` does not list `HYT00`,
+    /// but msodbcsql bounds this path anyway — `SQLDescribeParam` reaches
+    /// `AutoFillIPD`, which reads `GetQueryTimeOut(lpstmt)`
+    /// (`sqlcdesc.cpp:9379`) — so matching it is a parity requirement, not a
+    /// discretionary extra. Delays the RPC response itself (via
+    /// `RPC_DELAY_KEY`), so this fails if the timeout stops reaching the RPC's
+    /// own `ExecuteOptions` (mssql-rs#466).
+    #[test]
+    fn describe_param_query_timeout_bounds_a_longer_server_delay() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // Comfortably above STMT_TIMEOUT_SECS plus connection/RTT overhead,
+        // comfortably below RESPONSE_DELAY — the gap is what proves the
+        // statement timeout, not the server delay, ended the wait.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+            });
+            state.query_timeout = STMT_TIMEOUT_SECS;
+        }
+
+        let started = Instant::now();
+        let rc = sql_describe_param_safe(
+            h.stmt,
+            stmt,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLDescribeParam took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the wait well below the server's {RESPONSE_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
+    /// The AC2 counterpart to the test above: `SQL_ATTR_QUERY_TIMEOUT` must
+    /// also bound the implicit transaction begin that precedes the metadata
+    /// RPC. The sibling only delays the RPC response, so reverting the
+    /// pre-execute arguments to `0` left it green; this delays only the Begin
+    /// request.
+    #[test]
+    fn describe_param_query_timeout_bounds_a_delayed_implicit_transaction_begin() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const BEGIN_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_tm_begin_delay(BEGIN_DELAY);
+        dbc.inner.lock().unwrap().autocommit = false;
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+            });
+            state.query_timeout = STMT_TIMEOUT_SECS;
+        }
+
+        let started = Instant::now();
+        let rc = sql_describe_param_safe(
+            h.stmt,
+            stmt,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLDescribeParam took {elapsed:?} — a {STMT_TIMEOUT_SECS}s SQL_ATTR_QUERY_TIMEOUT \
+             must bound the implicit transaction begin well below the server's \
+             {BEGIN_DELAY:?} delay"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "a query-timeout expiry must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+    }
+
+    /// The `SQLDescribeParam` counterpart to `catalog.rs`'s
+    /// `catalog_query_timeout_exhausted_by_unprepare_fails_before_sending`:
+    /// a swallowed best-effort unprepare timeout must leave the budget
+    /// exhausted and stop the call before the metadata RPC is sent.
+    #[test]
+    fn describe_param_query_timeout_exhausted_by_unprepare_fails_before_sending() {
+        use crate::handles::dbc::DbcHandle;
+        use mssql_mock_tds::QueryResponse;
+        use std::time::{Duration, Instant};
+
+        const RESPONSE_DELAY: Duration = Duration::from_secs(8);
+        const STMT_TIMEOUT_SECS: u32 = 1;
+        // A sanity bound, not the discriminator: the call must finish far
+        // inside the server's delay. What this test actually pins down is the
+        // budget-exhausted arm itself — a bypassed deduction also fails fast
+        // here, so that would not show up as a timing difference.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let mock_server =
+            crate::test_support::connect_mock_server(dbc, "SELECT 1", QueryResponse::select_one());
+        mock_server.set_rpc_delay(RESPONSE_DELAY);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        crate::test_support::arm_pending_unprepare(dbc, stmt);
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            state.prepared = Some(crate::handles::stmt::PreparedPlan {
+                stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                marker_count: 1,
+            });
+            state.query_timeout = STMT_TIMEOUT_SECS;
+        }
+
+        let started = Instant::now();
+        let rc = sql_describe_param_safe(
+            h.stmt,
+            stmt,
+            1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            elapsed < BOUND,
+            "SQLDescribeParam took {elapsed:?} — the {STMT_TIMEOUT_SECS}s budget was already \
+             spent by the unprepare, so the metadata RPC must not have been sent at all"
+        );
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(
+            state.diag_records[0].sql_state, *b"HYT00",
+            "an exhausted budget must report HYT00, got {:?}",
+            state.diag_records[0].sql_state
+        );
+        // This is what makes the test mutation-resistant: the two paths carry
+        // different text. Reaching the RPC and timing out there yields
+        // "Elapsed: deadline has elapsed", so only the pre-send budget check
+        // produces this message.
+        assert!(
+            state.diag_records[0]
+                .message
+                .contains("expired before the statement could be sent"),
+            "the budget must be found exhausted before the RPC is sent, not by the RPC's own \
+             timeout: {}",
+            state.diag_records[0].message
         );
     }
 

@@ -1276,9 +1276,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
     // buffer, and the value after it -- and the row after that -- still have to
     // decode, which is what a mis-sized drain would break.
     //
-    // 1,100,000 bytes, not a few thousand: a value small enough to arrive inside
-    // the already-buffered wire bytes is materialized and delivered by the bound
-    // non-PLP path, which would leave deliver_bound_plp untested.
+    // The large value is intentional to exercise repeated PLP chunk reads and
+    // draining across packets. PLP metadata selects deliver_bound_plp regardless
+    // of the value's size.
     ExecDirect(
         "SELECT n, CAST(REPLICATE(CAST(0x41 AS VARBINARY(MAX)), 1100000) AS VARBINARY(MAX)) "
         "AS lob, n * 11 AS tail "
@@ -1321,12 +1321,13 @@ TEST_F(FetchScrollLiveTest, ABoundVarbinaryMaxDeliversAcrossARowset) {
 // The typed-conversion path reaches the same refusal by a different route: a
 // binary PLP column has no source encoding to convert from, so it is drained and
 // refused before any conversion is attempted. Same AB#47239 gap as above, so it
-// likewise asserts our own answer rather than parity.
+// likewise asserts our own answer rather than parity. Measured on msodbcsql
+// 18.06.0001, varbinary(max) into SQL_C_SLONG answers 07006 instead of this
+// driver's HYC00; AB#47239 tracks implementing the missing conversion here.
 //
-// The value has to exceed what the transport can buffer for a whole column,
-// otherwise `try_read_buffered_column` materializes it and the row takes the
-// ordinary non-PLP delivery path instead of the streaming one under test -- a
-// small varbinary(max) here answers 22018 from the typed converter, not HYC00.
+// PLP metadata selects the streaming path regardless of the value's size. This
+// test keeps a large value to verify that refusing a binary PLP before typed
+// conversion still drains every chunk before the trailing column and next row.
 TEST_F(FetchScrollLiveTest, ABoundStreamedVarbinaryMaxToTypedCTargetIsStillUnsupported) {
     SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect(

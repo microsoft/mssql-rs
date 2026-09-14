@@ -170,7 +170,9 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
         client
     };
 
-    match dbc.runtime.block_on(client.advance()) {
+    let result = dbc.runtime.block_on(client.advance());
+    let array_rc = super::execute::update_parameter_array(stmt, &mut client);
+    match result {
         Ok(StatementResult::Rows) => {
             // Positioned on a new row-returning result set. Refresh metadata,
             // clear row state, keep CURSOR_OPEN and active_stmt set.
@@ -225,7 +227,9 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 return SQL_ERROR;
             }
             debug!("SQLMoreResults: advanced to next result set");
-            if has_server_info {
+            if array_rc != SQL_SUCCESS {
+                array_rc
+            } else if has_server_info {
                 SQL_SUCCESS_WITH_INFO
             } else {
                 SQL_SUCCESS
@@ -280,7 +284,9 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 return SQL_ERROR;
             }
             debug!("SQLMoreResults: advanced to a no-row statement result");
-            if has_server_info {
+            if array_rc != SQL_SUCCESS {
+                array_rc
+            } else if has_server_info {
                 SQL_SUCCESS_WITH_INFO
             } else {
                 SQL_SUCCESS
@@ -312,7 +318,11 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
                 }
             }
             debug!("SQLMoreResults: no more result sets");
-            SQL_NO_DATA
+            if array_rc != SQL_SUCCESS {
+                array_rc
+            } else {
+                SQL_NO_DATA
+            }
         }
         Err(e) => {
             error!(%e, "SQLMoreResults: advance failed");

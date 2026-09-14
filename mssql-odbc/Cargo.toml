@@ -19,6 +19,7 @@ mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tracing = { version = "0.1.43", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono = { version = "0.4", features = ["clock"] }
 async-trait = "0.1"
 # The azure SDK only ships a rustls-based reqwest transport (its `reqwest_rustls`
 # default), which drags in the vulnerable `ring` crate. Disable those defaults and
@@ -40,6 +41,9 @@ url = "2"
 sha2 = "0.11.0"
 # `RowWriter` exposes UUID values without first boxing them as `ColumnValues`.
 uuid = "1"
+# msodbcsql widens a time-only value with the process-local current date
+# (`localtime_s` in sqlccnvt.cpp), which std cannot supply on every platform.
+libc = "0.2"
 
 # `ActiveDirectoryInteractive` delegates the sign-in UI to `mssql-auth.dll`
 # (OneAuth), the same library msodbcsql loads. The `windows` crate supplies the
@@ -50,6 +54,9 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    # GetLocalTime, used by the Windows TZ regression test to establish that
+    # the process-local CRT date differs from the machine-local calendar date.
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

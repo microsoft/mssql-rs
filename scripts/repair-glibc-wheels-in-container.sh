@@ -22,7 +22,6 @@ exclude_args=()
 for lib in $EXCLUDE_LIBS; do
     exclude_args+=(--exclude "$lib")
 done
-
 # auditwheel reads AUDITWHEEL_PLAT as the default for --plat and validates it at
 # parser-construction time, so a stray/arch-less value aborts before our explicit
 # --plat is seen. We always pass --plat, so clear it.

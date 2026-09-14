@@ -296,6 +296,13 @@ impl BulkCopyResult {
 /// `BulkCopy` provides a convenient builder-style API for configuring and executing
 /// bulk copy operations. It handles batching, progress reporting, and error handling.
 ///
+/// Destination names are parsed as multipart identifiers and bracket-quoted, not
+/// treated as SQL fragments. Omitted qualifiers (`database..table`), temporary
+/// tables (`#table`, `tempdb..#table`), and bracket- or double-quoted parts are
+/// supported. A missing table part, including a trailing dot, is rejected.
+/// Column names from custom metadata retrievers are also quoted; collation names
+/// must follow the token format documented on [`BulkCopyColumnMetadata::collation_name`].
+///
 /// # Example
 ///
 /// ```rust,ignore

@@ -31,7 +31,7 @@ use crate::api::type_rules::is_integer_c_type;
 use crate::api::util::write_if_some;
 use crate::conversion::datetime::{
     DAYS_0001_TO_1900, DateTimeParts, MAX_DAYS_SINCE_0001, TICKS_PER_DAY,
-    civil_from_days_since_0001, hms_from_ticks_100ns, parse_datetime_literal,
+    civil_from_days_since_0001, current_local_date, hms_from_ticks_100ns, parse_datetime_literal,
 };
 use crate::conversion::error::{ConvError, ConvOk};
 use crate::conversion::numeric::{
@@ -480,6 +480,19 @@ pub(crate) unsafe fn convert_datetime_c(
         // A date/time C target for a non-temporal column is illegal.
         _ => extract_datetime_parts(value).ok_or(ConvError::Restricted)?,
     };
+
+    // Appendix D: a time value converted to a timestamp takes the current date.
+    // Filling it in here lets the timestamp arms keep their `has_date` guard, so
+    // the date-only targets below still refuse a time value.
+    let mut p = p;
+    if p.has_time && !p.has_date && matches!(target_type, SQL_C_TYPE_TIMESTAMP | SQL_C_TIMESTAMP) {
+        let (year, month, day) = current_local_date().ok_or(ConvError::Internal)?;
+        p.year = year;
+        p.month = month;
+        p.day = day;
+        p.has_date = true;
+    }
+
     let ret = match target_type {
         SQL_C_TYPE_DATE | SQL_C_DATE if p.has_date => {
             let written = unsafe {
@@ -563,12 +576,10 @@ pub(crate) unsafe fn convert_datetime_c(
                 strlen_or_ind_ptr,
             )
         },
-        // Reached when the value lacks the component the target needs. Two
-        // cases land here: `time` into `SQL_C_TYPE_DATE`, which is correct, and
-        // `time` into `SQL_C_TYPE_TIMESTAMP`, which Appendix D says should fill
-        // in the current date instead (AB#47247). For character input the
-        // pairing is legal and it is the text that is wrong for this target, so
-        // that stays 22018 rather than becoming 07006.
+        // Reached when the value lacks the component the target needs, such as
+        // `time` into `SQL_C_TYPE_DATE`. For character input the pairing is
+        // legal and it is the text that is wrong for this target, so that stays
+        // 22018 rather than becoming 07006.
         _ => {
             return Err(if from_character {
                 ConvError::InvalidCharacterValue
@@ -1884,6 +1895,71 @@ mod tests {
                 fraction: 123_456_700
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_timezone_controls_timestamp_date() {
+        const CHILD_ENV: &str = "MSSQL_ODBC_TZ_DATE_CHILD";
+        const TEST_NAME: &str =
+            "conversion::fetch_convert::tests::windows_process_timezone_controls_timestamp_date";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            for timezone in ["UTC-12", "UTC+12"] {
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("test executable should have a path"),
+                )
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TZ", timezone)
+                .output()
+                .expect("child test process should start");
+                assert!(
+                    output.status.success(),
+                    "child failed for {timezone}:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if String::from_utf8_lossy(&output.stdout).contains("TZ_DATE_VERIFIED") {
+                    return;
+                }
+            }
+            panic!("neither extreme TZ setting differed from the machine-local calendar date");
+        }
+
+        let crt_date = current_local_date().expect("CRT should provide the process-local date");
+        let machine = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        let machine_date = (
+            i16::try_from(machine.wYear).expect("SYSTEMTIME year should fit"),
+            machine.wMonth,
+            machine.wDay,
+        );
+        if crt_date == machine_date {
+            return;
+        }
+
+        use mssql_tds::datatypes::column_values::SqlTime;
+        for value in [
+            ColumnValues::Time(SqlTime {
+                time_nanoseconds: 0,
+                scale: 0,
+            }),
+            utf8_col("00:00:00"),
+        ] {
+            let mut out = SqlTimestampStruct::default();
+            let mut ind: SqlLen = 0;
+            unsafe {
+                convert_datetime_c(
+                    &value,
+                    SQL_C_TYPE_TIMESTAMP,
+                    (&mut out as *mut SqlTimestampStruct).cast(),
+                    &mut ind,
+                )
+            }
+            .expect("time-to-timestamp conversion should succeed");
+            assert_eq!((out.year, out.month, out.day), crt_date);
+            assert_ne!((out.year, out.month, out.day), machine_date);
+        }
+        println!("TZ_DATE_VERIFIED");
     }
 
     #[test]

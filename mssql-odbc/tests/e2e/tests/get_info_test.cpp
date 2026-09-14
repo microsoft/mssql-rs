@@ -170,13 +170,8 @@ TEST_F(GetInfoLiveTest, YesNoCapabilities) {
     }
 }
 
-// SQL_PARAM_ARRAY_ROW_COUNTS/SELECTS: literal SQL_PARC_NO_BATCH/SQL_PAS_NO_SELECT
-// against <sqlext.h>, so a transcription slip in either value still fails here.
-//
-// mssql-odbc only. Measured on msodbcsql 18.6.2.1: it answers SQL_PARC_BATCH (1)
-// and SQL_PAS_BATCH (1), and its behaviour backs the claim - an INSERT ... OUTPUT
-// at PARAMSET_SIZE 3 hands back three result sets through SQLMoreResults. This
-// driver discards them (divergence 3, AB#47944), so the values differ by design.
+// Non-row arrays return an aggregate count. Retail msodbcsql 18.6.2.1
+// advertises SQL_PARC_BATCH instead, so this assertion remains driver-specific.
 TEST_F(GetInfoLiveTest, ParamArrayCapabilities) {
     SKIP_IF_COMPARING_MSODBCSQL();
 
@@ -187,8 +182,12 @@ TEST_F(GetInfoLiveTest, ParamArrayCapabilities) {
               GetInfoU32(dbc_, SQL_PARAM_ARRAY_ROW_COUNTS, &rc, &len));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
     EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len);
+}
 
-    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_PAS_NO_SELECT),
+TEST_F(GetInfoLiveTest, ParamArraySelectsAreNavigable) {
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT len = -1;
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_PAS_BATCH),
               GetInfoU32(dbc_, SQL_PARAM_ARRAY_SELECTS, &rc, &len));
     EXPECT_TRUE(SQL_SUCCEEDED(rc));
     EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len);
