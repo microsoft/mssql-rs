@@ -139,6 +139,8 @@ Exercise warning-bearing output tails with a nonempty final rowset (for example,
 
 ### Failure modes that are never silently green
 
+Setup DML must account for zero affected rows: deleting from an empty table returns `SQL_NO_DATA` under ODBC 3.x. Assert that result explicitly when zero rows are expected; do not treat it as an execution error or broadly relax the assertions on the operation under test.
+
 Both runners abort — locally and in CI — when:
 
 - `cargo build` or either `cmake` invocation exits non-zero.
