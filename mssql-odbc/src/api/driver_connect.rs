@@ -402,9 +402,9 @@ fn do_connect(
     seed_and_apply_connection_params(&mut context, state.packet_size, &params);
     // Capture the fully-resolved pre-negotiation size (attr seed, then any
     // `PacketSize=` override) before `context` is moved into
-    // `create_client` below; only published to `state.packet_size` once the
-    // connection actually succeeds (see the success path), so a failed
-    // attempt does not leave a reusable DBC requesting a size it never
+    // `create_client` below; only published to `state.effective_packet_size`
+    // once the connection actually succeeds (see the success path), so a
+    // failed attempt does not leave a reusable DBC requesting a size it never
     // actually established.
     let resolved_packet_size = u32::from(context.packet_size);
 
@@ -458,17 +458,18 @@ fn do_connect(
         user_name: params.uid.clone(),
     };
     // Published here (not right after resolving it above) for the same
-    // failed-connect reason as the other fields in this block:
-    // `state.packet_size` deliberately stays at whatever was requested
-    // (`SQLSetConnectAttr`/`PacketSize=`, or the default) and is never
-    // overwritten with the ENVCHANGE-negotiated value: msodbcsql's own
+    // failed-connect reason as the other fields in this block: kept separate
+    // from `state.packet_size` (the app-set attribute/default) so a
+    // connection-string keyword never outlives this connection and leaks
+    // onto the handle's next attempt — cleared again in `sql_disconnect_safe`.
+    // Never the ENVCHANGE-negotiated value: msodbcsql's own
     // `SQLGetConnectAttr`/`SQLGetInfo` both read the single `dwOptions`
     // slot that only ever holds the requested size (`sqlcconn.cpp:3326`
     // builds LOGIN7 from it, `sqlcmisc.cpp:3465`/`sqlcinfo.cpp:1186` read it
     // back) — nothing in msodbcsql writes the negotiated size into that
     // slot; the negotiated value only resizes msodbcsql's own TDS buffer
     // (`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a separate internal detail.
-    state.packet_size = resolved_packet_size;
+    state.effective_packet_size = Some(resolved_packet_size);
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
@@ -1246,7 +1247,87 @@ mod tests {
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
     }
 
-    /// A connect attempt that fails after resolving its packet size (but
+    /// `SQLDisconnect` must reset `SQL_ATTR_PACKET_SIZE` (and the derived
+    /// `SQLGetInfo` limits) back to the handle's pre-connect value: a
+    /// connection-string `PacketSize=` must not outlive the connection it
+    /// came from and leak onto the handle's next connect attempt.
+    #[test]
+    fn packet_size_resets_on_disconnect_to_pre_connect_value() {
+        use crate::api::disconnect::sql_disconnect;
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{
+            DEFAULT_PACKET_SIZE, SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer,
+        };
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes;PacketSize=16384",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert!(
+            matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+            "connect failed: {ret}"
+        );
+
+        let disconnect_ret = unsafe { sql_disconnect(h.dbc) };
+        assert_eq!(disconnect_ret, SQL_SUCCESS);
+
+        let mut reported: u32 = 0;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, DEFAULT_PACKET_SIZE,
+            "a keyword-derived packet size must not survive SQLDisconnect"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
+    }
+
     /// before mssql-tds returns a client) must not leave that attempted size
     /// behind on the DBC: a subsequent connect on the same handle should
     /// still request the handle's prior value, not the failed attempt's.
@@ -1268,7 +1349,7 @@ mod tests {
 
         let conn_str: Vec<u16> = cs(&format!(
             "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
-             TrustServerCertificate=yes;PacketSize=16384",
+             TrustServerCertificate=yes;PacketSize=16384;ConnectRetryCount=0",
             addr.ip(),
             addr.port()
         ))

@@ -162,7 +162,9 @@ fn sql_get_connect_attr_w_safe(
                     }
                 }
                 SQL_ATTR_TXN_ISOLATION | SQL_COPT_SS_TXN_ISOLATION => state.txn_isolation,
-                _ => state.packet_size,
+                // SQL_ATTR_PACKET_SIZE: the resolved value for the live
+                // connection when connected, else the app-set attribute/default.
+                _ => state.effective_packet_size.unwrap_or(state.packet_size),
             };
             unsafe { write_if_some(value_ptr as *mut u32, value) };
             debug!(attribute, value, "SQLGetConnectAttrW: attribute returned");
