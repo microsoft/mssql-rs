@@ -39,12 +39,20 @@ and `SQL_CONCAT_NULL_BEHAVIOR=SQL_CB_NULL`. The statement, character-literal,
 and binary-literal limits all track the packet size as `128 * packet_size`,
 using the requested/configured packet size (from `SQLSetConnectAttr`,
 `PacketSize=`, or `DEFAULT_PACKET_SIZE`) both before and after connecting —
-never the TDS-negotiated value. This matches msodbcsql: `SQLGetConnectAttr`
-and `SQLGetInfo` both read the same `dwOptions` slot the LOGIN7 request was
-built from (`sqlcconn.cpp:3326`, `sqlcmisc.cpp:3465`, `sqlcinfo.cpp:1186`),
-and nothing in msodbcsql writes the ENVCHANGE-negotiated size back into that
-slot — the negotiated value only resizes msodbcsql's internal TDS buffer
-(`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a detail invisible to the ODBC API.
+never the TDS-negotiated value. Source reading supports this for msodbcsql:
+`SQLGetConnectAttr` and `SQLGetInfo` both read the same `dwOptions` slot the
+LOGIN7 request was built from (`sqlcconn.cpp:3326`, `sqlcmisc.cpp:3465`,
+`sqlcinfo.cpp:1186`), and nothing in msodbcsql writes the ENVCHANGE-negotiated
+size back into that slot — the negotiated value only resizes msodbcsql's
+internal TDS buffer (`TdsHlp.cpp: BATCHCTX::NewPacketSize`), a detail
+invisible to the ODBC API in the unencrypted case. Runtime measurement over
+an *encrypted* connection contradicts that for retail msodbcsql18 18.6.2.1,
+though: requesting `PacketSize=16384` reports back 16192, a smaller,
+TLS-driven reduction the static source reading above didn't surface. This
+driver has no such reduction (proven independent of negotiation by the
+`Encrypt=no` mock-server unit test in `driver_connect.rs`), so the two
+diverge whenever `PacketSize=` asks for more than an encrypted session
+allows — see the divergence table below.
 Retail's 524288 example is for its default 4096-byte packet; this driver's
 `DEFAULT_PACKET_SIZE` is 8000, so an unconnected or default-configured handle
 reports 1024000 instead — a real, unavoidable divergence whenever the
@@ -93,6 +101,7 @@ a durable owner:
 | `SQL_USER_NAME` | msodbcsql lazily queries `USER_NAME()` and reports the database user. This driver reports the authenticated login captured at connection time because it has no internal-query facility. | AB#47996 owns residual SQLGetInfo parity; the E2E test keeps the distinction observable. |
 | `SQL_PARAM_ARRAY_ROW_COUNTS` | This driver reports `SQL_PARC_NO_BATCH`; retail msodbcsql reports `SQL_PARC_BATCH`. | Execution semantics and measurement are recorded in `docs/parameters_plan.md`. |
 | Invalid/reserved ID `65000` | Both driver cores return `HY096`. The Windows Driver Manager instead answers `SQL_SUCCESS` before exposing either driver's result; Unix forwards `HY096`. | Residual validation belongs to AB#47996; the Rust unit test pins the driver core and `ReservedInfoTypeFollowsDriverManagerContract` pins the public surface. |
+| `SQL_MAX_STATEMENT_LEN`, `SQL_MAX_CHAR_LITERAL_LEN`, `SQL_MAX_BINARY_LITERAL_LEN` with an explicit `PacketSize=` over an encrypted connection | Measured against retail msodbcsql18 18.6.2.1: requesting `PacketSize=16384` reports back 16192 (`SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE)` and the derived `128*x` limits both reflect the reduced number), a TLS-driven reduction not visible in the static source reading above. mssql-odbc always reports the requested/configured size, never a negotiated one. | AB#47996 owns residual SQLGetInfo parity; `MaxLengthsUseTheConnectionStringPacketSize` is skipped on the msodbcsql comparison leg (`SKIP_IF_COMPARING_MSODBCSQL`) rather than asserting a value retail doesn't guarantee. |
 
 `SQL_CURSOR_COMMIT_BEHAVIOR` predates the pipeline slices. Its deliberate
 Driver Manager interaction difference is recorded in

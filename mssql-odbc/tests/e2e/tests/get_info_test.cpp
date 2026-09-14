@@ -239,7 +239,19 @@ TEST_F(GetInfoLiveTest, MaxStatementLenAndConformance) {
 // second connection with an explicit, non-default `PacketSize=` and assert
 // the literal expected number, so a regression in either the connection's
 // resolved packet size or SQLGetInfo's derivation would be caught.
+//
+// mssql-odbc-specific: skipped on the msodbcsql comparison leg. Measured
+// against retail msodbcsql18 18.6.2.1 over an encrypted connection, it
+// reports a *smaller* value than requested here (16192, not 16384) —
+// contradicting the "never the negotiated value" claim in
+// docs/sql-get-info-plan.md, which was derived from static source reading
+// and evidently misses a TLS-driven reduction path. mssql-odbc's own design
+// (always the requested/configured size, proven independent of negotiation
+// by the `Encrypt=no` mock-server unit test in driver_connect.rs) has no
+// such reduction, so the literal expectation only holds for this driver.
+// See the divergence table entry for `SQL_MAX_STATEMENT_LEN` et al.
 TEST_F(GetInfoLiveTest, MaxLengthsUseTheConnectionStringPacketSize) {
+    SKIP_IF_COMPARING_MSODBCSQL();
     constexpr SQLUINTEGER kRequestedPacketSize = 16384;
 
     SQLHDBC dbc = SQL_NULL_HDBC;
