@@ -158,8 +158,10 @@ All paths under `Sql/Ntdbms/sqlncli/odbc/` in the msodbcsql source.
 Behaviours worth copying:
 
 - Procedure name may carry a group number, `proc;2` (`sqlcmisc.cpp:8215`).
-- `?=` forces the first bound parameter to OUTPUT; `HY105` if bound `SQL_PARAM_INPUT`
-  (`sqlcmisc.cpp:8310`), `07001` if unbound.
+- `?=` forces the first bound parameter to OUTPUT; `HY105` if bound `SQL_PARAM_INPUT` (`sqlcmisc.cpp`, `ProcessCall`). Its unbound error is `IDS_07_001`, **not necessarily SQLSTATE `07001`**: `cli_common/src/clntcomn.cpp`, `GetSqlStateFromOdbcError`, maps that resource to `07001` for ODBC 2.x and `07002` for ODBC 3.x. This driver targets ODBC 3.x and retains `07002`.
+  - **[measured: Windows retail `SQL_DRIVER_VER=18.06.0001`]** For `{?=call #return_binding(?)}`, with parameter 2 correctly bound as integer INPUT, binding parameter 1 as INPUT succeeds; execution then returns `SQL_ERROR` / `HY105` on both direct and prepared routes.
+  - Leaving parameter 1 unbound in that same two-marker call returns `SQL_ERROR` / `HY105` on the reference direct route, but `SQL_ERROR` / `07002` on its prepared route. This driver returns `07002` on both: it **matches** the prepared route and **diverges** on the direct descriptor-hole case, consistently diagnosing an absent binding rather than its default direction. `sqlcdesc.cpp`, `FastSetADRecDefaults` / `FastSetIPDRecDefaults`, defaults newly allocated descriptor records to `SQL_C_DEFAULT` / `SQL_PARAM_INPUT`; `ProcessCall` checks the INPUT direction after checking for `PARM_NOT_SET`. Resource identifiers alone therefore do not establish which diagnostic wins.
+  - `ReturnStatusBoundAsInputIsHy105` and `UnboundReturnStatusIsRejected` exercise both routes without skips, recording `SQL_DRIVER_VER`; the latter pins the measured direct-route difference per driver. **[measured: pinned Linux msodbcsql18 package `18.6.2.1-1`, SQL Server 2022]** The full 22-test escape suite also passes on this build, confirming the same unbound-return diagnostics as Windows retail `18.06.0001`: `HY105` for direct execution and `07002` for prepared execution.
 - A bound `SQL_PARAM_OUTPUT` inside a call is promoted to INPUT_OUTPUT on the wire (`:8455`).
 - Trailing junk after the argument list is a syntax error (`:8570`).
 

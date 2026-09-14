@@ -3,8 +3,8 @@
 // SQL_ATTR_NOSCAN on and off, {call} dispatch, output parameters and
 // SQLNumParams.
 //
-// Golden values are measured against msodbcsql18 18.6.2.1, the build CI pins
-// for the parity comparison, so this file runs unchanged against both drivers.
+// Golden values are measured against msodbcsql18 18.6.2.1 unless a test names
+// another measured build. This file runs unchanged against both drivers.
 
 #include "odbc_test_fixture.h"
 
@@ -45,6 +45,10 @@ protected:
                       "ODBC_TEST_CONNSTR";
         }
         Connect();
+        SQLCHAR version[32] = {};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("driver_version", reinterpret_cast<const char*>(version));
     }
 
     /// Procedures cannot be #temp across connections, so each test creates a
@@ -64,6 +68,49 @@ protected:
             ExecDirectIgnoreError("DROP PROCEDURE " + proc_name_);
         }
         ODBCTest::TearDown();
+    }
+
+    void CheckReturnStatusBinding(bool bind_return_as_input) {
+        ExecDirect("CREATE PROCEDURE #return_binding @a int AS RETURN @a");
+        SqlTString text = ODBCTestUtils::ToSqlTStr("{?=call #return_binding(?)}");
+        for (bool prepared : {false, true}) {
+            SCOPED_TRACE(prepared ? "SQLExecute" : "SQLExecDirect");
+            SQLHSTMT stmt = AllocStmt();
+            if (prepared) {
+                ASSERT_SQL_OK(SQLPrepare(stmt, const_cast<SQLTCHAR*>(text.c_str()),
+                                         SQL_NTS),
+                              SQL_HANDLE_STMT, stmt);
+            }
+            SQLINTEGER input = 7;
+            SQLLEN input_ind = 0;
+            ASSERT_SQL_OK(SQLBindParameter(stmt, 2, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                          SQL_INTEGER, 0, 0, &input, 0, &input_ind),
+                          SQL_HANDLE_STMT, stmt);
+            SQLINTEGER status = -1;
+            SQLLEN status_ind = 0;
+            if (bind_return_as_input) {
+                ASSERT_SQL_OK(SQLBindParameter(stmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG,
+                                              SQL_INTEGER, 0, 0, &status, 0,
+                                              &status_ind),
+                              SQL_HANDLE_STMT, stmt);
+            }
+            SQLRETURN rc = prepared
+                               ? SQLExecute(stmt)
+                               : SQLExecDirect(stmt, const_cast<SQLTCHAR*>(text.c_str()),
+                                               SQL_NTS);
+            EXPECT_EQ(SQL_ERROR, rc);
+            const char* target = std::getenv("ODBC_TEST_TARGET");
+            const bool reference = target && std::string(target) == "msodbcsql";
+            // Retail 18.06.0001: an unbound descriptor hole is HY105 on the
+            // direct route, but 07002 on the prepared route. Rust uses 07002
+            // for both. See the source mapping and measurements in plan §3.3.
+            const char* expected_state =
+                bind_return_as_input || (!prepared && reference) ? "HY105" : "07002";
+            EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt, expected_state);
+            EXPECT_EQ(-1, status);
+            EXPECT_EQ(0, status_ind);
+            FreeStmt(stmt);
+        }
     }
 
     std::string proc_name_;
@@ -283,6 +330,14 @@ TEST_F(EscapeSequenceLiveTest, ReturnStatusIsWrittenBack) {
     while (SQLMoreResults(stmt_) == SQL_SUCCESS) {
     }
     EXPECT_EQ(7, status);
+}
+
+TEST_F(EscapeSequenceLiveTest, ReturnStatusBoundAsInputIsHy105) {
+    CheckReturnStatusBinding(true);
+}
+
+TEST_F(EscapeSequenceLiveTest, UnboundReturnStatusIsRejected) {
+    CheckReturnStatusBinding(false);
 }
 
 // --- SQLNumParams / SQLDescribeParam --------------------------------------

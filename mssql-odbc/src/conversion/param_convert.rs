@@ -5620,12 +5620,45 @@ mod tests {
             p.column_size = 8;
             p.buffer_length = 8;
             assert!(unsafe { data_at_exec_indicator(&p) }.is_none());
-            let (_, outcome) = unsafe { bound_param_to_rpc(Some("@P1".into()), &p) }.unwrap();
+            let (rpc, outcome) = unsafe { bound_param_to_rpc(Some("@P1".into()), &p) }.unwrap();
+            assert!(
+                mssql_tds::test_client_support::rpc_parameter_status(&rpc)
+                    .contains(StatusFlags::BY_REF_VALUE)
+            );
             assert_eq!(outcome, ConvOk::Exact);
             assert!(matches!(
                 unsafe { bound_param_to_value(&p) }.unwrap().0,
                 SqlType::Varchar(None, 8)
             ));
+        }
+    }
+
+    #[test]
+    fn rpc_parameter_direction_sets_only_the_output_flag() {
+        use crate::api::odbc_types::{
+            SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_RETURN_VALUE,
+        };
+        use mssql_tds::test_client_support::rpc_parameter_status;
+
+        for (direction, expected) in [
+            (SQL_PARAM_INPUT, StatusFlags::NONE),
+            (SQL_PARAM_INPUT_OUTPUT, StatusFlags::BY_REF_VALUE),
+            (SQL_PARAM_OUTPUT, StatusFlags::BY_REF_VALUE),
+            (SQL_RETURN_VALUE, StatusFlags::BY_REF_VALUE),
+        ] {
+            for name in [None, Some("@P1".to_string())] {
+                let mut value = *b"42";
+                let mut length = 2;
+                let mut p = param(SQL_C_CHAR, value.as_mut_ptr().cast(), &mut length);
+                p.input_output_type = direction;
+                p.sql_type = SQL_INTEGER;
+                let (rpc, _) = unsafe { bound_param_to_rpc(name, &p) }.unwrap();
+                assert_eq!(
+                    rpc_parameter_status(&rpc).bits(),
+                    expected.bits(),
+                    "{direction}"
+                );
+            }
         }
     }
 

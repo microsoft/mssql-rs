@@ -24,6 +24,8 @@ pub use crate::connection::metadata_retriever::MetadataRetriever;
 /// Quote identifiers used in test setup SQL.
 pub use crate::sql_identifier::escape_identifier;
 
+pub use crate::message::parameters::rpc_parameters::rpc_parameter_status;
+
 use crate::connection::client_context::ClientContext;
 use crate::connection::execution_context::ExecutionContext;
 use crate::connection::tds_client::TdsClient;

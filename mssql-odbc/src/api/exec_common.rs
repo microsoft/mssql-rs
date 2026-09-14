@@ -2053,6 +2053,7 @@ mod tests {
     #[test]
     fn output_only_indicators_never_stage_data_at_execution() {
         use crate::api::odbc_types::{SQL_PARAM_OUTPUT, SQL_RETURN_VALUE};
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
@@ -2066,6 +2067,60 @@ mod tests {
             let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
             assert!(built.dae_params.is_empty());
             assert_eq!(built.params.len(), 1);
+            assert!(
+                mssql_tds::test_client_support::rpc_parameter_status(&built.params[0])
+                    .contains(StatusFlags::BY_REF_VALUE)
+            );
+        }
+    }
+
+    #[test]
+    fn dae_parameter_direction_retains_output_flag_through_rebuild() {
+        use crate::api::odbc_types::{SQL_INTEGER, SQL_PARAM_INPUT_OUTPUT};
+        use mssql_tds::message::parameters::rpc_parameters::StatusFlags;
+        use mssql_tds::test_client_support::rpc_parameter_status;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let mut state = stmt.inner.lock().unwrap();
+        for (direction, expected) in [
+            (SQL_PARAM_INPUT, StatusFlags::NONE),
+            (SQL_PARAM_INPUT_OUTPUT, StatusFlags::BY_REF_VALUE),
+        ] {
+            for (sql_type, plan) in [
+                (SQL_VARCHAR, DaePlan::Stream(StreamedSqlType::VarcharMax)),
+                (SQL_INTEGER, DaePlan::Buffer),
+            ] {
+                let mut buffer = *b"42";
+                let mut indicator = SQL_DATA_AT_EXEC;
+                let mut param = char_param(&mut buffer, &mut indicator);
+                param.input_output_type = direction;
+                param.sql_type = sql_type;
+                state.bound_params = vec![Some(param)];
+                let built = unsafe { build_named_params(&mut state, 1, "test") }.unwrap();
+                assert_eq!(built.dae_params.len(), 1);
+                assert_eq!(built.dae_params[0].plan, plan);
+                assert_eq!(
+                    rpc_parameter_status(&built.params[0]).bits(),
+                    expected.bits(),
+                    "{direction}, {sql_type}"
+                );
+                if plan == DaePlan::Buffer {
+                    let (rebuilt, _) = rebuild_deferred_params(
+                        &mut state,
+                        built.params,
+                        &[(0, b"42".to_vec(), false)],
+                        &built.dae_params,
+                        "test",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        rpc_parameter_status(&rebuilt[0]).bits(),
+                        expected.bits(),
+                        "{direction}, rebuilt"
+                    );
+                }
+            }
         }
     }
 

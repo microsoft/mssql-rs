@@ -689,6 +689,12 @@ impl RpcParameter {
     }
 }
 
+/// Inspect parameter direction flags without exposing them in the production API.
+#[cfg(feature = "test-util")]
+pub fn rpc_parameter_status(parameter: &RpcParameter) -> StatusFlags {
+    parameter.options
+}
+
 /// Builds a comma-separated list of parameter names and types for the RPC call.
 /// This is used to construct the parameter declaration string for sp_executesql.
 #[cfg(fuzzing)]

@@ -587,6 +587,67 @@ mod tests {
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
+    fn assert_return_status_binding_error(bind_return: bool, expected_state: [u8; 5]) {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::odbc_types::{SQL_C_SLONG, SQL_INTEGER, SQL_PARAM_INPUT, SQL_SUCCESS};
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut input = 7_i32;
+        let mut input_ind = 0;
+        let mut status = -1_i32;
+        let mut status_ind = 0;
+        for (ordinal, value, indicator) in [
+            (2, &raw mut input, &raw mut input_ind),
+            (1, &raw mut status, &raw mut status_ind),
+        ] {
+            if ordinal == 1 && !bind_return {
+                continue;
+            }
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        ordinal,
+                        SQL_PARAM_INPUT,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        value.cast(),
+                        0,
+                        indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        let sql: Vec<u16> = "{?=call #return_binding(?)}"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe { sql_exec_direct_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_ERROR
+        );
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, expected_state);
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        assert_eq!(status, -1);
+        assert_eq!(status_ind, 0);
+    }
+
+    #[test]
+    fn return_status_bound_as_input_returns_hy105() {
+        assert_return_status_binding_error(true, SQLSTATE_HY105);
+    }
+
+    #[test]
+    fn unbound_return_status_returns_07002() {
+        assert_return_status_binding_error(false, SQLSTATE_07002);
+    }
+
     /// Panics while holding the APD lock, leaving the mutex poisoned —
     /// mirrors `bind_param.rs`'s own `poison_apd` test helper.
     fn poison_apd(apd: crate::api::odbc_types::SqlHandle) {
