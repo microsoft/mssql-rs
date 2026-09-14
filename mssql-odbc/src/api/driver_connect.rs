@@ -450,6 +450,11 @@ fn do_connect(
             .to_string(),
         user_name: params.uid.clone(),
     };
+    // Sync the negotiated packet size back onto DbcState so SQLGetConnectAttr
+    // agrees with SQLGetInfo's post-connect max-length values, matching
+    // msodbcsql: both read the same stored value there (`sqlcmisc.cpp:3465`,
+    // `sqlcinfo.cpp:1186`), never a pre-negotiation request.
+    state.packet_size = client.packet_size();
     state.client = Some(client);
     state.connection_state = ConnectionState::Connected;
     debug!("SQLDriverConnectW: connected successfully");
@@ -1061,5 +1066,97 @@ mod tests {
         assert_eq!(ctx.application_name, before_app_name);
         assert_eq!(ctx.encryption_options.host_name_in_cert, None);
         assert_eq!(ctx.encryption_options.server_certificate, None);
+    }
+
+    /// `SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE)` and `SQLGetInfo`'s
+    /// `128 * packet_size` limits must agree once connected. Before this was
+    /// synced, `DbcState::packet_size` stayed at its pre-connect value while
+    /// `SQLGetInfo` already read the negotiated size from the live client —
+    /// this mock server always negotiates 4096 regardless of what is
+    /// requested (`mssql-mock-tds/src/protocol.rs`), so a default connection
+    /// reliably exercises the divergence.
+    #[test]
+    fn connect_syncs_packet_size_to_the_negotiated_value() {
+        use crate::api::get_connect_attr::sql_get_connect_attr_w;
+        use crate::api::odbc_types::{SQL_ATTR_PACKET_SIZE, SqlInteger, SqlPointer};
+        use mssql_mock_tds::MockTdsServer;
+        use std::time::Duration;
+
+        let server_runtime =
+            tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
+        let (server_addr, shutdown_tx, server_handle) = server_runtime.block_on(async {
+            let server = MockTdsServer::new("127.0.0.1:0")
+                .await
+                .expect("failed to start mock server");
+            let addr = server.local_addr();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = server.run_with_shutdown(rx).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (addr, tx, handle)
+        });
+
+        let h = TestHandles::with_env_dbc();
+        let conn_str: Vec<u16> = cs(&format!(
+            "Server=tcp:{},{};UID=sa;<PW>=unused;Database=master;Encrypt=no;\
+             TrustServerCertificate=yes",
+            server_addr.ip(),
+            server_addr.port()
+        ))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        let ret = unsafe {
+            sql_driver_connect_w(
+                h.dbc,
+                std::ptr::null_mut(),
+                conn_str.as_ptr(),
+                SQL_NTS,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                SQL_DRIVER_NOPROMPT,
+            )
+        };
+        assert!(
+            matches!(ret, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO),
+            "connect failed: {ret}"
+        );
+
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let negotiated = dbc
+            .inner
+            .lock()
+            .unwrap()
+            .client
+            .as_ref()
+            .expect("connected")
+            .packet_size();
+        assert_eq!(
+            negotiated, 4096,
+            "mock server is expected to always negotiate down to 4096"
+        );
+
+        let mut reported: u32 = 0;
+        let get_ret = unsafe {
+            sql_get_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                &mut reported as *mut u32 as SqlPointer,
+                std::mem::size_of::<u32>() as SqlInteger,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(get_ret, SQL_SUCCESS);
+        assert_eq!(
+            reported, negotiated,
+            "SQLGetConnectAttr must report the negotiated packet size, not the pre-connect request"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server_runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server_handle).await });
     }
 }

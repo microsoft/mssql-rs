@@ -37,7 +37,10 @@ The source and retail build disagree on two values. Runtime behavior is the
 compatibility contract: `SQL_OUTER_JOINS="F"`,
 and `SQL_CONCAT_NULL_BEHAVIOR=SQL_CB_NULL`. The statement, character-literal,
 and binary-literal limits all track the negotiated packet size as
-`128 * packet_size`; retail reports 524288 for the default 4096-byte packet.
+`128 * packet_size`. Retail reports 524288 for its default 4096-byte packet;
+this driver's `DEFAULT_PACKET_SIZE` is 8000, so an unconfigured connection
+reports 1024000 instead — a real, unavoidable divergence rather than a bug,
+tracked here rather than silently matching retail's number.
 
 ## Capability ledger
 

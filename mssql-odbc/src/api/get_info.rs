@@ -42,7 +42,24 @@ const MAX_IDENTIFIER_LEN: u16 = 128;
 const MAX_SQL_BLOCKS: u32 = 128;
 const NO_CAPABILITIES: u32 = 0;
 const NO_STATED_U16_LIMIT: u16 = 0;
-const MSODBCSQL_ALTER_TABLE_CAPABILITIES: u32 = 0x0000_9869;
+// Matches msodbcsql's SQL_ALTER_TABLE_SPT (sqlcinfo.cpp), decomposed from the
+// SQL_AT_* bitmasks in sqlext.h: ADD_COLUMN | ADD_CONSTRAINT |
+// ADD_COLUMN_SINGLE | ADD_COLUMN_DEFAULT | ADD_TABLE_CONSTRAINT |
+// CONSTRAINT_NAME_DEFINITION | DROP_COLUMN_RESTRICT.
+const SQL_AT_ADD_COLUMN: u32 = 0x0000_0001;
+const SQL_AT_ADD_CONSTRAINT: u32 = 0x0000_0008;
+const SQL_AT_ADD_COLUMN_SINGLE: u32 = 0x0000_0020;
+const SQL_AT_ADD_COLUMN_DEFAULT: u32 = 0x0000_0040;
+const SQL_AT_DROP_COLUMN_RESTRICT: u32 = 0x0000_0800;
+const SQL_AT_ADD_TABLE_CONSTRAINT: u32 = 0x0000_1000;
+const SQL_AT_CONSTRAINT_NAME_DEFINITION: u32 = 0x0000_8000;
+const MSODBCSQL_ALTER_TABLE_CAPABILITIES: u32 = SQL_AT_ADD_COLUMN
+    | SQL_AT_ADD_CONSTRAINT
+    | SQL_AT_ADD_COLUMN_SINGLE
+    | SQL_AT_ADD_COLUMN_DEFAULT
+    | SQL_AT_DROP_COLUMN_RESTRICT
+    | SQL_AT_ADD_TABLE_CONSTRAINT
+    | SQL_AT_CONSTRAINT_NAME_DEFINITION;
 const SQL_SERVER_MAX_INDEX_COLUMNS: u16 = 16;
 const SQL_SERVER_MAX_SELECT_COLUMNS: u16 = 4096;
 const SQL_SERVER_MAX_TABLE_COLUMNS: u16 = 1024;
@@ -289,7 +306,7 @@ const STATIC_INFO: &[InfoEntry] = &[
     },
     InfoEntry {
         info_type: odbc::SQL_CONVERT_FUNCTIONS,
-        value: InfoValue::Bitmask(0),
+        value: InfoValue::Bitmask(NO_CAPABILITIES),
     },
     InfoEntry {
         info_type: odbc::SQL_TIMEDATE_ADD_INTERVALS,
@@ -629,16 +646,15 @@ fn sql_get_info_w_safe(
         SQL_MAX_COLUMN_NAME_LEN | SQL_MAX_SCHEMA_NAME_LEN | SQL_MAX_TABLE_NAME_LEN => {
             write_u16(info_value_ptr, MAX_IDENTIFIER_LEN, string_length_ptr)
         }
+        // `state.packet_size` is the negotiated value once connected
+        // (synced in `driver_connect.rs` right after login) and the
+        // requested/default value before, so there is no pre/post-connect
+        // split to handle here.
         odbc::SQL_MAX_BINARY_LITERAL_LEN
         | odbc::SQL_MAX_CHAR_LITERAL_LEN
         | SQL_MAX_STATEMENT_LEN => write_u32(
             info_value_ptr,
-            max_statement_len(
-                state
-                    .client
-                    .as_ref()
-                    .map_or(state.packet_size, |client| client.packet_size()),
-            ),
+            max_statement_len(state.packet_size),
             string_length_ptr,
         ),
         SQL_NUMERIC_FUNCTIONS
@@ -855,6 +871,14 @@ mod tests {
 
     #[test]
     fn compatibility_names_share_canonical_info_types() {
+        // SQL_OWNER_USAGE / SQL_QUALIFIER_USAGE are ODBC 1.0 names kept as
+        // aliases for the ODBC 2.0+ SQL_SCHEMA_USAGE / SQL_CATALOG_USAGE
+        // constants (odbc_types.rs). Pin the alias values themselves, not
+        // just the canonical dispatch entries, so an edit that breaks the
+        // alias is caught here.
+        assert_eq!(odbc::SQL_OWNER_USAGE, odbc::SQL_SCHEMA_USAGE);
+        assert_eq!(odbc::SQL_QUALIFIER_USAGE, odbc::SQL_CATALOG_USAGE);
+
         let schema_entries = STATIC_INFO
             .iter()
             .filter(|entry| entry.info_type == odbc::SQL_SCHEMA_USAGE)
@@ -865,6 +889,22 @@ mod tests {
             .count();
         assert_eq!(schema_entries, 1);
         assert_eq!(catalog_entries, 1);
+
+        // Exercise the aliases through the real SQLGetInfo dispatch to
+        // confirm they resolve to the same reported value as the canonical
+        // info types, not just that the constants are numerically equal.
+        let h = TestHandles::with_env_dbc();
+        let (schema_rc, schema_value, _) = get_u32(h.dbc, odbc::SQL_SCHEMA_USAGE);
+        let (owner_rc, owner_value, _) = get_u32(h.dbc, odbc::SQL_OWNER_USAGE);
+        assert_eq!(schema_rc, SQL_SUCCESS);
+        assert_eq!(owner_rc, SQL_SUCCESS);
+        assert_eq!(owner_value, schema_value);
+
+        let (catalog_rc, catalog_value, _) = get_u32(h.dbc, odbc::SQL_CATALOG_USAGE);
+        let (qualifier_rc, qualifier_value, _) = get_u32(h.dbc, odbc::SQL_QUALIFIER_USAGE);
+        assert_eq!(catalog_rc, SQL_SUCCESS);
+        assert_eq!(qualifier_rc, SQL_SUCCESS);
+        assert_eq!(qualifier_value, catalog_value);
     }
 
     #[test]
