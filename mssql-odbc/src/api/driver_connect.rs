@@ -399,6 +399,12 @@ fn do_connect(
         server_certificate: None,
     };
 
+    // Seed from any pre-connect `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)`
+    // (msodbcsql applies the attribute to the connect request too); a
+    // connection-string `PacketSize=` keyword below still takes precedence.
+    // `state.packet_size` is always clamped to `[MIN_PACKET_SIZE,
+    // MAX_PACKET_SIZE]` (both well within u16), so this cast never truncates.
+    context.packet_size = state.packet_size as u16;
     apply_connection_params(&mut context, &params);
 
     // Connect via mssql-tds. The caller's DBC lock is still held across this
@@ -1066,6 +1072,36 @@ mod tests {
         assert_eq!(ctx.application_name, before_app_name);
         assert_eq!(ctx.encryption_options.host_name_in_cert, None);
         assert_eq!(ctx.encryption_options.server_certificate, None);
+    }
+
+    /// Mirrors `do_connect`'s exact `context.packet_size = state.packet_size
+    /// as u16;` followed by `apply_connection_params`: a pre-connect
+    /// `SQLSetConnectAttr(SQL_ATTR_PACKET_SIZE)` must reach the login
+    /// request when the connection string is silent on `PacketSize=`, but a
+    /// `PacketSize=` keyword must still win when both are present.
+    #[test]
+    fn preconnect_packet_size_attr_seeds_context_but_connection_string_keyword_wins() {
+        let mut ctx = ClientContext::default();
+        ctx.packet_size = 16384u32 as u16;
+        apply_connection_params(&mut ctx, &ConnectionParams::default());
+        assert_eq!(
+            ctx.packet_size, 16384,
+            "a pre-connect SQL_ATTR_PACKET_SIZE must reach the login request"
+        );
+
+        let mut ctx = ClientContext::default();
+        ctx.packet_size = 16384u32 as u16;
+        apply_connection_params(
+            &mut ctx,
+            &ConnectionParams {
+                packet_size: Some(4096),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.packet_size, 4096,
+            "PacketSize= in the connection string must override the pre-connect attribute"
+        );
     }
 
     /// `SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE)` and `SQLGetInfo`'s

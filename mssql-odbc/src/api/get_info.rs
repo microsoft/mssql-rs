@@ -698,7 +698,11 @@ fn sql_get_info_w_safe(
 }
 
 fn max_statement_len(packet_size: u32) -> u32 {
-    MAX_SQL_BLOCKS * packet_size
+    // `packet_size` can be server-controlled (the negotiated ENVCHANGE value,
+    // unrange-checked by `mssql-tds`), so a malicious/misbehaving server
+    // could otherwise overflow this multiplication. Saturate instead of
+    // wrapping or panicking.
+    MAX_SQL_BLOCKS.saturating_mul(packet_size)
 }
 
 fn write_u16(
@@ -1003,6 +1007,15 @@ mod tests {
         assert_eq!(max_statement_len(4096), 512 * 1024);
         assert_eq!(max_statement_len(8192), 1024 * 1024);
         assert_eq!(max_statement_len(32768), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_statement_len_saturates_instead_of_overflowing() {
+        // A misbehaving/malicious server can negotiate an arbitrary packet
+        // size via ENVCHANGE (mssql-tds does not range-check it), so this
+        // must not wrap or panic for large values.
+        assert_eq!(max_statement_len(u32::MAX), u32::MAX);
+        assert_eq!(max_statement_len(40_000_000), u32::MAX);
     }
 
     #[test]

@@ -36,11 +36,15 @@ Parity evidence has two sources:
 The source and retail build disagree on two values. Runtime behavior is the
 compatibility contract: `SQL_OUTER_JOINS="F"`,
 and `SQL_CONCAT_NULL_BEHAVIOR=SQL_CB_NULL`. The statement, character-literal,
-and binary-literal limits all track the negotiated packet size as
-`128 * packet_size`. Retail reports 524288 for its default 4096-byte packet;
-this driver's `DEFAULT_PACKET_SIZE` is 8000, so an unconfigured connection
-reports 1024000 instead — a real, unavoidable divergence rather than a bug,
-tracked here rather than silently matching retail's number.
+and binary-literal limits all track the packet size as `128 * packet_size`:
+before connecting (or once connected, the TDS-negotiated value, which can
+differ from what was requested). Retail's 524288 example is for its default
+4096-byte packet; a connection through this driver that negotiates down to
+4096 (as `mssql-mock-tds` always does) reports the same 524288 once
+connected. The pre-connect case is where the two differ: this driver's
+`DEFAULT_PACKET_SIZE` is 8000, so an unconnected handle reports 1024000
+instead of retail's number — a real, unavoidable divergence, tracked here
+rather than silently matching retail's number.
 
 ## Capability ledger
 
