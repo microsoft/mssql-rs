@@ -11,7 +11,7 @@ Confidence markers: **[measured]** = observed against a live server or a live ms
 
 ### Measurement baseline
 
-Every **[measured]** value below was taken against:
+The original **[measured]** escape tables below were taken against:
 
 - **msodbcsql 18.6.2.1** (`SQL_DRIVER_VER` `18.06.0002`), which is the version CI pins for the
   parity comparison — `msodbcsqlVersion: '18.6.2.1'` in `.pipeline/validation-pipeline.yml:44`,
@@ -22,6 +22,8 @@ The escape tables in §2.2 and §3.5 were first taken on retail 18.6.1.1 (`18.06
 re-run byte-for-byte identically on the pinned 18.6.2.1, so the golden values do not depend on the
 point build. Anything added later must be re-measured on the pinned version, not on whatever the
 developer box happens to have.
+
+Review regressions were also measured on Windows retail `SQL_DRIVER_VER=18.06.0001` and Linux package `18.6.2.1-1` against SQL Server 2022. These runs cover named calls, nested intervals, metadata contracts, indicator-only outputs, and delayed output diagnostics. They supplement rather than replace the original SQL Server 2025 baseline.
 
 ---
 
@@ -393,10 +395,10 @@ security primitive.
 
 ### 5.5 `{call}` routing
 
-Two paths, mirroring msodbcsql:
+Two paths, with a more restrictive direct-RPC eligibility rule than msodbcsql:
 
 - **RPC path** — the trimmed statement is exactly one `{[?=]call name[(args…)]}` and every argument
-  is `?`, with no data-at-execution input. Dispatch through `execute_stored_procedure(name, …)`. Output
+  is an unnamed `?`, with no data-at-execution input. Dispatch through `execute_stored_procedure(name, …)`. Output
   parameters need only `StatusFlags::BY_REF_VALUE`.
 
   Parameters go in **positionally**, not as `@P1..@Pn`. The server matches an RPC's *named*
@@ -404,7 +406,7 @@ Two paths, mirroring msodbcsql:
   '@a', which was not supplied" — found by the e2e tests, not by unit tests. The `{? = call …}`
   return-status binding is skipped entirely: it travels on the RETURNSTATUS token, not as an
   argument.
-- **Text path** — everything else (a call inside a batch, literal, default, omitted or nested-escape arguments,
+- **Text path** — everything else (a call inside a batch, named, literal, default, omitted or nested-escape arguments,
   multiple calls, data-at-execution input), and prepared executions: rewrite to `EXEC name @P1, @P2 OUTPUT, DEFAULT, …` and run through
   the named text execution path. Default and omitted arguments stay in their original positions.
 
@@ -412,6 +414,10 @@ Select the route before building parameters. Data-at-execution text keeps the co
 including the return-assignment variable; it must never receive the unnamed direct-RPC list.
 `SQLExecute` renders call-site annotations from the current bindings and invalidates a cached
 server handle if that changes the prepared text. `SQLNativeSql` remains binding-independent.
+
+Inline named arguments remain named even without IPD names. This exceeds msodbcsql's canonical-RPC behavior: `sqlccmd.cpp::AddRpcSprocParameters` strips inline names, and `sqlcmisc.cpp::ProcessRPCData` supplies descriptor names instead. Both measured retail builds reverse reordered inputs when IPD names are absent; the direct/prepared parity tests set matching `SQL_DESC_NAME` values on both drivers and still exercise the pure canonical-call regression.
+
+An `{interval ...}` nested inside a CALL remains verbatim, matching `SubstituteECodes`' `fNestedInCall` branch in `sqlcmisc.cpp` and both measured retail builds. The standalone interval converter is not applied in this context.
 
 The text path has to carry binding direction into **both** halves of the generated statement:
 
@@ -438,11 +444,13 @@ of the change and must be reviewed as such.
 - `build_named_params` marks them `StatusFlags::BY_REF_VALUE`.
 - Output-only parameters send typed NULL without reading value or length buffers, even when an
   old indicator contains a data-at-execution sentinel. Only input and input/output bindings supply input data.
+- Indicator-only output bindings are accepted. A null value pointer has zero writable capacity regardless of `BufferLength`; fixed values report their size, NULL reports `SQL_NULL_DATA`, and undelivered nonempty character data reports `01004`.
 - ODBC requires output values to be invisible until every result set the procedure produced has been
   consumed. `get_return_values()` fills as tokens arrive, so writeback is gated on batch exhaustion
   rather than written back eagerly at execute time. Delivery covers `SQLMoreResults`' normal and
   already-exhausted paths, and `finish_execute`'s no-result-set path. Fetch exhaustion retains return
   tokens on the statement before releasing the client, so another statement cannot overwrite them.
+  Pending update counts also defer delivery until the application consumes the final count through `SQLMoreResults`; draining the wire alone does not consume those results.
 - Delivery snapshots the current effective APD/IPD bindings and applies the current parameter bind
   offset. Resetting bindings prevents writes; rebinding redirects them. Execute-time buffer pointers
   are not a valid source for delayed output delivery.
@@ -454,6 +462,7 @@ of the change and must be reviewed as such.
   binding (`sqlcmisc.cpp:8310`), so the direction the application chose does not identify it.
   Only the direct RPC route reads RETURNSTATUS. Text routes read their named output variable,
   not the enclosing `sp_executesql` status. This mapping is reset on every execution.
+- Output/input-output parameter arrays and TVPs remain deferred under AB#48148; this is not a driver-wide gap in single-row output support.
 
 ### 5.7 mssql-tds changes
 
@@ -465,12 +474,12 @@ of the change and must be reviewed as such.
 3. Fix `format!("EXEC {stored_procedure_name}")` at `tds_client.rs:5851`. Bracket-quote the
    identifier (doubling any `]`) rather than interpolating raw text, and keep the driver-side
    validation from §5.5 as defence in depth.
+4. Encode RPC procedure-name lengths as checked UTF-16 unit counts, not truncated UTF-8 byte counts. Reject names exceeding MS-TDS section 2.2.6.6's 1046-byte limit (523 UTF-16 units) before serialization; Unicode names remain supported.
 
 ### 5.8 `SQLDescribeParam` / `SQLNumParams`
 
-- `SQLNumParams` returns the marker count for prepared statements (`PreparedPlan::marker_count`),
-  `HY010` when the statement is not prepared. For `{? = call}` the return-status marker counts, so
-  the totals in §3.5 fall out naturally.
+- `SQLNumParams` returns the marker count for prepared statements (`PreparedPlan::marker_count`) or the last accepted direct SQL, retained independently of prepared state. It reports `HY010` before either exists. For `{? = call}` the return-status marker counts, so the totals in §3.5 fall out naturally. This matches `sqlcdesc.cpp::SQLNumParams` reading `cmdp.cparam` populated for both execution forms.
+- `SQLNativeSql` clears diagnostics and rejects negative input lengths other than `SQL_NTS` with `HY090` before decoding. This matches the measured Driver Manager-visible contract and adds validation beyond `sqlccmd.cpp::SQLNativeSqlW`'s internal path.
 - `SQLDescribeParam` translates the **retained original** text (§5.2) — always, ignoring
   `SQL_ATTR_NOSCAN`, matching `AutoFillIPD`'s `lpstmt == NULL` behaviour — and feeds the resulting
   `EXEC proc @P1,…` to the existing `sp_describe_undeclared_parameters` path. For `{? = call}`,

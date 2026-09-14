@@ -7,10 +7,12 @@ use tracing::{debug, error};
 
 use crate::api::escape::translate_escapes;
 use crate::api::odbc_types::{
-    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlInteger,
-    SqlReturn, SqlWChar,
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle,
+    SqlInteger, SqlReturn, SqlWChar,
 };
-use crate::api::sqlstate::{SQLSTATE_HY090, WARN_STRING_TRUNCATION, post_diag};
+use crate::api::sqlstate::{
+    ERR_INVALID_STRING_OR_BUFFER_LENGTH, WARN_STRING_TRUNCATION, post_diag,
+};
 use crate::api::util::{copy_with_nul, read_utf16_long, write_if_some};
 use crate::error::{free_errors, post_sql_error};
 use crate::handles::{DbcHandle, HandleType, handle_from_raw};
@@ -45,9 +47,36 @@ pub(crate) unsafe fn sql_native_sql_w(
 ) -> SqlReturn {
     debug!(
         ?connection_handle,
-        text_length1, buffer_length, "SQLNativeSqlW called",
+        ?in_statement_text,
+        ?out_statement_text,
+        ?text_length2_ptr,
+        text_length1,
+        buffer_length,
+        "SQLNativeSqlW called",
     );
 
+    crate::ffi_entry!("SQLNativeSqlW", unsafe {
+        sql_native_sql_w_impl(
+            connection_handle,
+            in_statement_text,
+            text_length1,
+            out_statement_text,
+            buffer_length,
+            text_length2_ptr,
+        )
+    })
+}
+
+/// # Safety
+/// The handle and input/output buffers must satisfy [`sql_native_sql_w`].
+unsafe fn sql_native_sql_w_impl(
+    connection_handle: SqlHandle,
+    in_statement_text: *const SqlWChar,
+    text_length1: SqlInteger,
+    out_statement_text: *mut SqlWChar,
+    buffer_length: SqlInteger,
+    text_length2_ptr: *mut SqlInteger,
+) -> SqlReturn {
     if connection_handle.is_null() {
         error!("SQLNativeSqlW: connection_handle is null");
         return SQL_INVALID_HANDLE;
@@ -59,30 +88,42 @@ pub(crate) unsafe fn sql_native_sql_w(
         "SQLNativeSqlW: handle is not a DBC"
     );
 
-    // The DM rejects a null input pointer before the driver sees it.
-    debug_assert!(
-        !in_statement_text.is_null(),
-        "SQLNativeSqlW: in_statement_text is null — DM should have rejected this"
-    );
+    sql_native_sql_w_safe(
+        dbc,
+        text_length1,
+        out_statement_text,
+        buffer_length,
+        text_length2_ptr,
+        || {
+            debug_assert!(
+                !in_statement_text.is_null(),
+                "SQLNativeSqlW: in_statement_text is null — DM should have rejected this"
+            );
+            // The core validates lengths before invoking this reader.
+            unsafe { read_utf16_long(in_statement_text, text_length1) }
+        },
+    )
+}
 
-    let sql = unsafe { read_utf16_long(in_statement_text, text_length1) };
-
+fn sql_native_sql_w_safe(
+    dbc: &DbcHandle,
+    text_length1: SqlInteger,
+    out_statement_text: *mut SqlWChar,
+    buffer_length: SqlInteger,
+    text_length2_ptr: *mut SqlInteger,
+    read_sql: impl FnOnce() -> String,
+) -> SqlReturn {
     let Ok(mut state) = dbc.inner.lock() else {
         error!("SQLNativeSqlW: dbc mutex poisoned");
         return SQL_ERROR;
     };
     free_errors(&mut state);
 
-    if buffer_length < 0 {
-        error!(buffer_length, "SQLNativeSqlW: negative buffer length");
-        post_sql_error(
-            &mut state,
-            SQLSTATE_HY090,
-            0,
-            "Invalid string or buffer length",
-        );
+    if (text_length1 < 0 && text_length1 != SqlInteger::from(SQL_NTS)) || buffer_length < 0 {
+        post_diag(&mut state, ERR_INVALID_STRING_OR_BUFFER_LENGTH);
         return SQL_ERROR;
     }
+    let sql = read_sql();
 
     let translated = match translate_escapes(&sql) {
         Ok(t) => t.sql,
@@ -242,5 +283,65 @@ mod tests {
             )
         };
         assert_eq!(rc, SQL_ERROR);
+    }
+
+    #[test]
+    fn invalid_input_lengths_replace_diagnostics_without_reading_or_writing() {
+        use crate::api::sqlstate::SQLSTATE_HY090;
+
+        let h = TestHandles::with_env_dbc();
+        for length in [SqlInteger::MIN, -4, -2, -1] {
+            assert_eq!(native_sql(h.dbc, "SELECT {bogus 1}", 32).0, SQL_ERROR);
+            let mut out = [77u16; 32];
+            let mut len = -42;
+            assert_eq!(
+                unsafe {
+                    sql_native_sql_w(
+                        h.dbc,
+                        std::ptr::null(),
+                        length,
+                        out.as_mut_ptr(),
+                        32,
+                        &mut len,
+                    )
+                },
+                SQL_ERROR
+            );
+            assert_eq!(out, [77u16; 32]);
+            assert_eq!(len, -42);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY090);
+        }
+    }
+
+    #[test]
+    fn explicit_and_zero_input_lengths_clear_prior_errors() {
+        let h = TestHandles::with_env_dbc();
+        let input = wide("SELECT 1 ignored");
+        for (length, expected) in [(8, "SELECT 1"), (0, "")] {
+            assert_eq!(native_sql(h.dbc, "SELECT {bogus 1}", 32).0, SQL_ERROR);
+            let mut out = [77u16; 32];
+            let mut len = -1;
+            assert_eq!(
+                unsafe {
+                    sql_native_sql_w(
+                        h.dbc,
+                        input.as_ptr(),
+                        length,
+                        out.as_mut_ptr(),
+                        32,
+                        &mut len,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            assert_eq!(len, length);
+            assert_eq!(String::from_utf16_lossy(&out[..length as usize]), expected);
+            assert_eq!(out[length as usize], 0);
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            assert!(dbc.inner.lock().unwrap().diag_records.is_empty());
+        }
     }
 }

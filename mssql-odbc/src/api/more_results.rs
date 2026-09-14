@@ -91,14 +91,16 @@ fn sql_more_results_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlR
             post_tds_info_messages(&mut stmt_state, &pending_info);
             return SQL_ERROR;
         }
-        if stmt_state.batch_exhausted {
+        if stmt_state.batch_exhausted && stmt_state.pending_row_counts.is_empty() {
             // A prior fetch's read-ahead peek already confirmed the wire has
             // nothing left anywhere in this batch — not just the current
             // result set, which is all `result_set_exhausted` would prove
             // (see AB#47508's release_busy_if_row_exhausted). The answer is
             // already known and needs no connection access at all: report it
             // even if a different statement has since claimed the
-            // connection. Matches msodbcsql, whose SQLMoreResults has no busy
+            // connection. A drained DML batch uses this path too, after its
+            // application-visible counts have all been consumed.
+            // Matches msodbcsql, whose SQLMoreResults has no busy
             // check of its own (`GetBatchCtxOrRecover` just falls through to
             // `SQL_NO_DATA_FOUND` once the batch context is gone).
             //
@@ -841,6 +843,104 @@ mod tests {
         let h = TestHandles::with_env_dbc_stmt();
         let rc = unsafe { sql_more_results(h.stmt) };
         assert_eq!(rc, SQL_NO_DATA);
+    }
+
+    #[test]
+    fn drained_dml_counts_defer_output_conversion_and_report_it_once() {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::odbc_types::{SQL_C_CHAR, SQL_C_SLONG, SQL_PARAM_OUTPUT, SQL_VARCHAR};
+        use mssql_tds::datatypes::column_values::ColumnValues;
+        use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+        use mssql_tds::query::result::ReturnValue;
+        use mssql_tds::test_client_support::int_columns;
+        use mssql_tds::token::tokenitems::ReturnValueStatus;
+
+        for (value, c_type, expected_rc, expected_state) in [
+            (ColumnValues::Int(73), SQL_C_SLONG, SQL_NO_DATA, None),
+            (
+                ColumnValues::Float(12.75),
+                SQL_C_SLONG,
+                SQL_SUCCESS_WITH_INFO,
+                Some(*b"01S07"),
+            ),
+            (
+                ColumnValues::String(SqlString::new(b"abcdefgh".to_vec(), EncodingType::Utf8)),
+                SQL_C_CHAR,
+                SQL_SUCCESS_WITH_INFO,
+                Some(*b"01004"),
+            ),
+            (
+                ColumnValues::String(SqlString::new(b"invalid".to_vec(), EncodingType::Utf8)),
+                SQL_C_SLONG,
+                SQL_ERROR,
+                Some(*b"22018"),
+            ),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut buffer = [0u8; 4];
+            let mut length = -1;
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        1,
+                        SQL_PARAM_OUTPUT,
+                        c_type,
+                        SQL_VARCHAR,
+                        8,
+                        0,
+                        buffer.as_mut_ptr().cast(),
+                        4,
+                        &raw mut length,
+                    )
+                },
+                SQL_SUCCESS
+            );
+            {
+                let mut state = stmt.inner.lock().unwrap();
+                state.batch_exhausted = true;
+                state.row_count = 2;
+                state.pending_row_counts = VecDeque::from([1]);
+                state.pending_output_params = Some((
+                    vec![ReturnValue {
+                        param_ordinal: 0,
+                        param_name: "@P1".to_owned(),
+                        value,
+                        column_metadata: Box::new(int_columns(1).remove(0)),
+                        status: ReturnValueStatus::OutputParam,
+                    }],
+                    None,
+                ));
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(buffer, [0; 4]);
+            assert_eq!(length, -1);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 1);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, expected_rc);
+            if expected_state.is_none() {
+                assert_eq!(i32::from_ne_bytes(buffer), 73);
+                assert_eq!(length, 4);
+            }
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(
+                    state.diag_records.len(),
+                    usize::from(expected_state.is_some())
+                );
+                if let Some(expected_state) = expected_state {
+                    assert_eq!(state.diag_records[0].sql_state, expected_state);
+                }
+                assert!(state.pending_output_params.is_none());
+            }
+            buffer.fill(0xff);
+            length = -2;
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert_eq!(buffer, [0xff; 4]);
+            assert_eq!(length, -2);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
     }
 
     #[test]

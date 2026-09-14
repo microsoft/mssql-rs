@@ -149,6 +149,32 @@ TEST_F(OutputParamsTest, OutputConversionErrorsReachTheApiReturnCode) {
     EXPECT_EQ(-1, output);
 }
 
+TEST_F(OutputParamsTest, IndicatorOnlyOutputBinding) {
+    ExecDirect("CREATE PROCEDURE #indicator @v int OUTPUT AS SET NOCOUNT ON; SET @v=73");
+    SQLLEN length = -2;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG,
+                                  SQL_INTEGER, 0, 0, nullptr, 0, &length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NO_DATA, Exhaust(Direct("{call #indicator(?)}")));
+    EXPECT_EQ(sizeof(SQLINTEGER), length);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(Direct("ALTER PROCEDURE #indicator @v int OUTPUT AS SET NOCOUNT ON; SET @v=NULL"),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NO_DATA, Exhaust(Direct("{call #indicator(?)}")));
+    EXPECT_EQ(SQL_NULL_DATA, length);
+}
+
+TEST_F(OutputParamsTest, IndicatorOnlyCharacterOutputIgnoresBufferLength) {
+    ExecDirect("CREATE PROCEDURE #indicator @v varchar(8) OUTPUT AS SET NOCOUNT ON; SET @v='hello'");
+    SQLLEN length = -2;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
+                                  SQL_VARCHAR, 8, 0, nullptr, 128, &length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, Exhaust(Direct("{call #indicator(?)}")));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+    EXPECT_EQ(5, length);
+}
+
 TEST_F(OutputParamsTest, StringTruncationReachesTheApiReturnCode) {
     ExecDirect("CREATE PROCEDURE #outputs @v varchar(8) OUTPUT AS "
                "SET NOCOUNT ON; SET @v='abcdefgh'");
@@ -175,9 +201,13 @@ TEST_F(OutputParamsTest, FractionalTruncationIsNotStringTruncation) {
     ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(-1, original_output);
     BindInt(1, output, length);
-    const SQLRETURN fractional_rc = Exhaust();
-    // Retail 18.06.0001 reports the warning alongside SQL_NO_DATA.
-    EXPECT_TRUE(fractional_rc == SQL_SUCCESS_WITH_INFO || fractional_rc == SQL_NO_DATA);
+    // Drain the tail while the final rowset is nonempty: unixODBC does not
+    // expose the reference driver's warning after a SQL_NO_DATA fetch.
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                               reinterpret_cast<SQLPOINTER>(2), 0), SQL_HANDLE_STMT, stmt_);
+    SQLRETURN fractional_rc = SQLFetch(stmt_);
+    if (StmtDiagState().empty()) fractional_rc = Exhaust();
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, fractional_rc);
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01S07");
     EXPECT_EQ(12, output);
 }
@@ -195,6 +225,8 @@ TEST_F(OutputParamsTest, ExhaustedFastPathReportsConversionWarningsAndErrorsOnce
                           SQL_VARCHAR, 8, 0, output.data(), output.size(), &length),
                       SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                   reinterpret_cast<SQLPOINTER>(2), 0), SQL_HANDLE_STMT, stmt_);
         const SQLRETURN expected = invalid_conversion ? SQL_ERROR : SQL_SUCCESS_WITH_INFO;
         int outcomes = 0;
         // Inspect diagnostics at the call that consumes the return tokens:
@@ -203,7 +235,7 @@ TEST_F(OutputParamsTest, ExhaustedFastPathReportsConversionWarningsAndErrorsOnce
             const auto state = StmtDiagState();
             if (!state.empty()) {
                 EXPECT_EQ(invalid_conversion ? "22018" : "01004", state);
-                EXPECT_TRUE(rc == expected || (!invalid_conversion && rc == SQL_NO_DATA));
+                EXPECT_EQ(expected, rc);
                 ++outcomes;
             } else {
                 EXPECT_TRUE(rc == SQL_SUCCESS || rc == SQL_NO_DATA);

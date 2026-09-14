@@ -2227,8 +2227,11 @@ unsafe fn deliver_bound(
         return RowOutcome::Error(RowIssue::IndicatorRequired);
     }
 
-    let slot =
-        unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) };
+    let slot = if binding.target_value_ptr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (binding.target_value_ptr as *mut u8).add(bind_offset + row_index * stride) }
+    };
 
     if is_null {
         unsafe { write_if_some(indicator, SQL_NULL_DATA) };
@@ -2289,14 +2292,14 @@ unsafe fn deliver_bound(
         let utf16: Vec<u16> = text.encode_utf16().collect();
         unsafe { write_if_some(octet_length, (utf16.len() * 2) as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot as *mut SqlWChar, buf_elements, &utf16) };
-        if truncated {
+        if truncated || (slot.is_null() && !utf16.is_empty()) {
             return RowOutcome::Info(RowIssue::StringTruncated);
         }
     } else {
         let bytes = text.as_bytes();
         unsafe { write_if_some(octet_length, bytes.len() as SqlLen) };
         let truncated = unsafe { copy_with_nul(slot, buf_elements, bytes) };
-        if truncated {
+        if truncated || (slot.is_null() && !bytes.is_empty()) {
             return RowOutcome::Info(RowIssue::StringTruncated);
         }
     }

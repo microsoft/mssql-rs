@@ -22,7 +22,8 @@ use super::ird::populate_ird;
 use super::sqlstate::*;
 use crate::api::odbc_types::{
     SQL_ATTR_PARAMS_PROCESSED_PTR, SQL_DATA_AT_EXEC, SQL_ERROR, SQL_LEN_DATA_AT_EXEC_OFFSET,
-    SQL_NEED_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn, SqlULen,
+    SQL_NEED_DATA, SQL_NO_DATA, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlLen, SqlReturn,
+    SqlULen,
 };
 use crate::conversion::error::ConvOk;
 use crate::conversion::param_convert::{
@@ -937,7 +938,7 @@ pub(super) fn finish_execute_with_param_warning(
     fractional_truncated: bool,
 ) -> SqlReturn {
     let rc = finish_execute(dbc, stmt, statement_handle, client, op);
-    if !fractional_truncated || !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
+    if !fractional_truncated || !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO | SQL_NO_DATA) {
         return rc;
     }
     let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -1012,13 +1013,27 @@ pub(super) fn rebuild_deferred_params(
     Ok((params, fractional_truncated))
 }
 
+fn no_row_execute_return(row_count: i64, has_server_info: bool) -> SqlReturn {
+    if has_server_info {
+        SQL_SUCCESS_WITH_INFO
+    } else if row_count == 0 {
+        // msodbcsql's sqlccmd.cpp returns SQL_NO_DATA for an ODBC 3.x
+        // execution positioned on an RS_COUNT with zero affected rows.
+        SQL_NO_DATA
+    } else {
+        SQL_SUCCESS
+    }
+}
+
 /// Captures result metadata after a successful execution and finalizes the
 /// statement/connection state.
 ///
 /// - **Result set** (non-empty `COLMETADATA`): the cursor is left open for
 ///   `SQLFetch`; the connection stays busy.
 /// - **DDL/DML** (no `COLMETADATA`): the wire is drained via `close_query` and
-///   the connection returns to idle so the statement can re-execute.
+///   the connection returns to idle. Collected DML counts remain navigable;
+///   output parameters wait until `SQLMoreResults` consumes the final count.
+///   A zero first count returns `SQL_NO_DATA` without consuming that result.
 ///
 /// `EXEC_STARTED` is always cleared. No lock is held across the drain I/O.
 pub(super) fn finish_execute(
@@ -1060,7 +1075,8 @@ pub(super) fn finish_execute(
         // Statement-wise: report this no-row (DML/PRINT/RAISERROR) statement's
         // own affected-row count for SQLRowCount. Later statements' counts are
         // surfaced as SQLMoreResults advances onto each in turn (not pre-queued).
-        stmt_state.row_count = client.last_rows_affected();
+        let row_count = client.last_rows_affected();
+        stmt_state.row_count = row_count;
         stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT | STMT_STATE_CURSOR_OPEN);
         stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
@@ -1078,11 +1094,7 @@ pub(super) fn finish_execute(
             }
             return SQL_ERROR;
         }
-        return if has_server_info {
-            SQL_SUCCESS_WITH_INFO
-        } else {
-            SQL_SUCCESS
-        };
+        return no_row_execute_return(row_count, has_server_info);
     }
 
     if !has_result_set {
@@ -1098,6 +1110,7 @@ pub(super) fn finish_execute(
         // statement. Report the first here; queue the rest for SQLMoreResults to
         // step through, matching msodbcsql's one result set per DML statement.
         let mut dml_counts: VecDeque<i64> = client.take_dml_result_counts().into();
+        let has_dml_counts = !dml_counts.is_empty();
         let first_count = dml_counts.pop_front().unwrap_or(-1);
         let bound_params = snapshot_bound_params(stmt);
         let Ok(mut stmt_state) = stmt.inner.lock() else {
@@ -1105,12 +1118,17 @@ pub(super) fn finish_execute(
             return_client_idle(dbc, statement_handle, client);
             return SQL_ERROR;
         };
-        // A procedure that returns no result set is already exhausted by the
-        // drain above, so this is where its output parameters and return status
-        // become available -- SQLMoreResults never runs for it.
+        stmt_state.clear_exhaustion_state();
+        // Draining the wire does not consume application-visible DML counts.
+        // Keep the return tokens until SQLMoreResults advances past the last
+        // count, even when the first count is the only one.
         let return_values = client.get_return_values();
         let return_status = client.get_return_status();
-        let output_rc = if let Ok(bound_params) = bound_params {
+        let output_rc = if has_dml_counts {
+            stmt_state.batch_exhausted = true;
+            stmt_state.pending_output_params = Some((return_values, return_status));
+            SQL_SUCCESS
+        } else if let Ok(bound_params) = bound_params {
             // Fresh descriptor snapshot; execute-time input pointers may have
             // been reset or rebound while the results were being consumed.
             unsafe {
@@ -1133,7 +1151,6 @@ pub(super) fn finish_execute(
         stmt_state.begin_batch(metadata); // empty
         stmt_state.row_count = first_count;
         stmt_state.pending_row_counts = dml_counts;
-        stmt_state.clear_exhaustion_state();
         stmt_state.set_state(STMT_STATE_EXEC_CONTEXT);
         stmt_state.clear_state(STMT_STATE_CURSOR_OPEN | STMT_STATE_EXEC_STARTED);
         let has_server_info = post_tds_info_messages(&mut stmt_state, &info_messages);
@@ -1152,10 +1169,8 @@ pub(super) fn finish_execute(
         }
         return if output_rc != SQL_SUCCESS {
             output_rc
-        } else if has_server_info {
-            SQL_SUCCESS_WITH_INFO
         } else {
-            SQL_SUCCESS
+            no_row_execute_return(first_count, has_server_info)
         };
     }
 
@@ -1429,6 +1444,99 @@ mod tests {
                 .any(|record| record.native_error == 8153),
             "the warning must be posted under the execute that drained it"
         );
+    }
+
+    #[test]
+    fn finish_execute_retains_outputs_until_drained_dml_counts_are_consumed() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::done_more_with_count;
+
+        for counts in [vec![], vec![0], vec![2, 1]] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut tokens: Vec<_> = counts.iter().copied().map(done_more_with_count).collect();
+            tokens.push(done_no_more());
+            let mut client = tds_client_from_tokens(tokens);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            // RPC execution can already have consumed the whole response before
+            // handing the drained client and its collected counts to ODBC.
+            dbc.runtime.block_on(client.close_query()).unwrap();
+            assert_eq!(
+                finish_execute(dbc, stmt, h.stmt, client, "SQLExecute"),
+                if counts.first() == Some(&0) {
+                    SQL_NO_DATA
+                } else {
+                    SQL_SUCCESS
+                }
+            );
+            if counts.is_empty() {
+                let state = stmt.inner.lock().unwrap();
+                assert!(state.pending_output_params.is_none());
+                assert!(!state.batch_exhausted);
+            }
+            for (index, count) in counts.iter().enumerate() {
+                if index != 0 {
+                    assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+                }
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, i64::try_from(*count).unwrap());
+                assert!(state.pending_output_params.is_some());
+                assert!(state.batch_exhausted);
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+            assert!(stmt.inner.lock().unwrap().pending_output_params.is_none());
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        }
+    }
+
+    #[test]
+    fn finish_execute_zero_count_preserves_pending_results_and_parameter_warnings() {
+        use crate::api::more_results::sql_more_results;
+        use mssql_tds::test_client_support::done_more_with_count;
+
+        for fractional_truncated in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let mut client = tds_client_from_tokens(vec![
+                done_more_with_count(0),
+                done_more_with_count(2),
+                done_no_more(),
+            ]);
+            dbc.runtime
+                .block_on(client.execute("UPDATE t SET v=1".to_owned(), ()))
+                .unwrap();
+            assert_eq!(
+                finish_execute_with_param_warning(
+                    dbc,
+                    stmt,
+                    h.stmt,
+                    client,
+                    "SQLExecute",
+                    fractional_truncated,
+                ),
+                if fractional_truncated {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_NO_DATA
+                }
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, 0);
+                assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+                assert_eq!(state.diag_records.len(), usize::from(fractional_truncated));
+                if fractional_truncated {
+                    assert_eq!(state.diag_records[0].sql_state, SQLSTATE_01S07);
+                }
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, 2);
+            assert!(stmt.inner.lock().unwrap().diag_records.is_empty());
+        }
     }
 
     #[test]

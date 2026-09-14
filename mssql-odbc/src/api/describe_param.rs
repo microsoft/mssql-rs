@@ -890,6 +890,7 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
@@ -948,6 +949,7 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
@@ -1010,6 +1012,7 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
             });
             state.query_timeout = STMT_TIMEOUT_SECS;

@@ -130,6 +130,7 @@ fn sql_prepare_w_safe(stmt: &StmtHandle, sql: String) -> SqlReturn {
             }
         };
     stmt_state.orphan_prepared_handle();
+    stmt_state.direct_marker_count = None;
     stmt_state.prepared = Some(PreparedPlan {
         stmt: PreparedStatement::new(rewritten_sql),
         marker_count,

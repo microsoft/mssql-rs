@@ -135,6 +135,8 @@ docker. `.pipeline/scripts/containerized-odbc-e2e.sh` installs a pinned
 
 Run new or changed parity tests against both drivers before pushing. For output-parameter tests, change pending bindings before fetching can consume the return tokens, and inspect diagnostics immediately after each result-draining API call. A later `SQLMoreResults` call need not preserve a diagnostic already reported by `SQLFetch`. Keep exact SQLSTATE and output-value assertions, including single-delivery checks, rather than skipping the reference leg.
 
+Exercise warning-bearing output tails with a nonempty final rowset (for example, one row with `SQL_ATTR_ROW_ARRAY_SIZE=2`). With the pinned Linux reference driver, unixODBC hides warnings returned alongside an empty `SQL_NO_DATA` fetch. The nonempty rowset keeps the warning observable and permits exact `SQL_SUCCESS_WITH_INFO`/SQLSTATE assertions on both drivers. `output_params_test` records `SQL_DRIVER_VER` in its test properties; verify Linux as well as Windows rather than extrapolating between Driver Managers.
+
 ### Failure modes that are never silently green
 
 Both runners abort — locally and in CI — when:

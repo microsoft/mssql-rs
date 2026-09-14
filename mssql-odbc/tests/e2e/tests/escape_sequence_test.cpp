@@ -117,6 +117,19 @@ TEST_F(EscapeSequenceLiveTest, CallTranslatesToExecText) {
     EXPECT_EQ(" EXEC ?=sp_who ?  ", NativeSql(dbc_, "{? = call sp_who(?)}", rc));
 }
 
+TEST_F(EscapeSequenceLiveTest, IntervalInsideCallIsPassedThrough) {
+    for (const char* interval : {
+             "{interval '1' DAY}",
+             "{INTERVAL '100' DAY}",
+             "{interval '30.1234' SECOND(2,3)}"}) {
+        SCOPED_TRACE(interval);
+        SQLRETURN rc = SQL_SUCCESS;
+        EXPECT_EQ(std::string(" EXEC p ") + interval + ",?  ",
+                  NativeSql(dbc_, std::string("{call p(") + interval + ",?)}", rc));
+        ASSERT_SQL_OK(rc, SQL_HANDLE_DBC, dbc_);
+    }
+}
+
 TEST_F(EscapeSequenceLiveTest, MalformedEscapeIsRejected) {
     SQLRETURN rc = SQL_SUCCESS;
     NativeSql(dbc_, "SELECT {bogus 1}", rc);

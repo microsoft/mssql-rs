@@ -120,11 +120,14 @@ pub(crate) struct CallSite {
 impl CallSite {
     /// True when every argument can be carried as an RPC parameter, i.e. the
     /// call needs no `EXEC` text at all.
-    /// DEFAULT stays textual so omission cannot shift later positional bindings.
+    /// Named arguments and DEFAULT stay textual so positional RPC bindings
+    /// cannot change their meaning.
+    /// This exceeds msodbcsql's AddRpcSprocParameters (sqlccmd.cpp), which
+    /// strips inline argument names before serializing canonical-call markers.
     pub(crate) fn is_rpc_eligible(&self) -> bool {
         self.args
             .iter()
-            .all(|a| matches!(a, CallArg::Marker { .. }))
+            .all(|a| matches!(a, CallArg::Marker { name: None, .. }))
     }
 }
 
@@ -474,7 +477,14 @@ fn translate_escapes_inner(
                 *marker += executable_marker_count(remainder);
             }
             EscapeKind::Interval => {
-                push_translated(&mut out, &translate_interval(body)?);
+                // SubstituteECodes (sqlcmisc.cpp) bypasses ProcessDTI when
+                // fNestedInCall is set, even for invalid interval values.
+                if inside_call {
+                    out.push_str(&sql[open..close]);
+                    *marker += executable_marker_count(body);
+                } else {
+                    push_translated(&mut out, &translate_interval(body)?);
+                }
             }
             EscapeKind::Encrypt => {
                 push_translated(&mut out, &translate_encrypt(remainder)?);
@@ -1603,6 +1613,7 @@ mod tests {
                 },
             ]
         );
+        assert!(!call.is_rpc_eligible());
         // msodbcsql writes the argument through verbatim, spaces and all.
         assert_eq!(tr("{call p(@a = ?)}"), " EXEC p @a = ?  ");
 
@@ -1611,6 +1622,31 @@ mod tests {
             .call
             .unwrap();
         assert_eq!(call.proc_name, "myproc;2");
+    }
+
+    #[test]
+    fn mixed_named_and_positional_markers_stay_textual() {
+        let call = translate_escapes("{call p(?, @b = ?)}")
+            .unwrap()
+            .call
+            .unwrap();
+        assert!(!call.is_rpc_eligible());
+        assert_eq!(
+            translate_for_execution("{call p(@b = ?, @a = ?)}", false, &[true, false])
+                .unwrap()
+                .0,
+            " EXEC p @b = @P1 OUTPUT,@a = @P2  "
+        );
+    }
+
+    #[test]
+    fn unicode_procedure_names_remain_rpc_eligible() {
+        let call = translate_escapes("{call [#路由](?)}")
+            .unwrap()
+            .call
+            .unwrap();
+        assert_eq!(call.proc_name, "[#路由]");
+        assert!(call.is_rpc_eligible());
     }
 
     #[test]
@@ -1854,10 +1890,24 @@ mod tests {
             tr("SELECT {fn CONCAT({fn CONCAT({encrypt N'?'},?)},'x')}"),
             "SELECT {fn CONCAT({fn CONCAT( 0x56A5 ,?)},'x')}"
         );
-        assert_eq!(
-            tr("{call p({interval '1' DAY},?)}"),
-            " EXEC p 'INTERVAL +''1'' DAY(2)',?  "
-        );
+    }
+
+    #[test]
+    fn interval_inside_call_is_preserved_without_conversion() {
+        for interval in [
+            "{interval '1' DAY}",
+            "{INTERVAL '100' DAY}",
+            "{interval '30.1234' SECOND(2,3)}",
+        ] {
+            assert_eq!(
+                tr(&format!("{{call p({interval},?)}}")),
+                format!(" EXEC p {interval},?  ")
+            );
+        }
+        let (sql, count, _) =
+            translate_for_execution("{call p({interval '1' DAY},?)}", false, &[true]).unwrap();
+        assert_eq!(sql, " EXEC p {interval '1' DAY},@P1 OUTPUT  ");
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -136,7 +136,11 @@ unsafe fn write_value(param: &BoundParam, value: &ColumnValues) -> RowOutcome {
         column_number: 1,
         target_type: param.c_type,
         target_value_ptr: param.parameter_value_ptr,
-        buffer_length: param.buffer_length,
+        buffer_length: if param.parameter_value_ptr.is_null() {
+            0
+        } else {
+            param.buffer_length
+        },
         strlen_or_ind_ptr: param.strlen_or_ind_ptr,
         octet_length_ptr: param.octet_length_ptr,
     };
@@ -189,6 +193,45 @@ mod tests {
             column_metadata: Box::new(int_columns(1).remove(0)),
             status: ReturnValueStatus::OutputParam,
         }
+    }
+
+    #[test]
+    fn indicator_only_output_never_writes_a_null_destination() {
+        let mut length = -2;
+        let integer = output_param(
+            SQL_C_SLONG,
+            SQL_INTEGER,
+            std::ptr::null_mut(),
+            128,
+            &raw mut length,
+        );
+        assert!(matches!(
+            unsafe { write_value(&integer, &ColumnValues::Int(73)) },
+            RowOutcome::Success
+        ));
+        assert_eq!(length, 4);
+        assert!(matches!(
+            unsafe { write_value(&integer, &ColumnValues::Null) },
+            RowOutcome::Success
+        ));
+        assert_eq!(length, crate::api::odbc_types::SQL_NULL_DATA);
+        let text = output_param(
+            SQL_C_CHAR,
+            SQL_VARCHAR,
+            std::ptr::null_mut(),
+            128,
+            &raw mut length,
+        );
+        assert!(matches!(
+            unsafe { write_value(&text, &ColumnValues::Int(73)) },
+            RowOutcome::Info(crate::api::fetch_scroll::RowIssue::StringTruncated)
+        ));
+        assert_eq!(length, 2);
+        assert!(matches!(
+            unsafe { write_value(&text, &ColumnValues::Null) },
+            RowOutcome::Success
+        ));
+        assert_eq!(length, crate::api::odbc_types::SQL_NULL_DATA);
     }
 
     fn bind(h: &TestHandles, param: BoundParam) {

@@ -283,16 +283,8 @@ fn sql_bind_parameter_safe(
             }
         }
 
-        // An output-only parameter has no value to send, so its indicator is
-        // not read at execute time; ODBC still requires a value buffer to write
-        // the result back into.
-        if matches!(input_output_type, SQL_PARAM_OUTPUT | SQL_RETURN_VALUE)
-            && parameter_value_ptr.is_null()
-        {
-            error!("SQLBindParameter: an output parameter needs a value buffer");
-            post_diag(&mut stmt_state, ERR_INVALID_NULL_POINTER);
-            return SQL_ERROR;
-        }
+        // SQLBindParameter/SetIPDRec in sqlcdesc.cpp retain indicator-only
+        // output bindings; GetReturnValue treats a null destination as size 0.
 
         (stmt_state.effective_apd(stmt), c_type)
     };
@@ -634,9 +626,8 @@ mod tests {
         assert_eq!(ret, SQL_ERROR);
     }
 
-    /// An output parameter has nowhere to put its result without a buffer.
     #[test]
-    fn output_parameter_without_a_buffer_is_refused() {
+    fn output_parameter_accepts_an_indicator_without_a_value_buffer() {
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -653,7 +644,7 @@ mod tests {
                 &mut ind,
             )
         };
-        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(ret, SQL_SUCCESS);
     }
 
     #[test]

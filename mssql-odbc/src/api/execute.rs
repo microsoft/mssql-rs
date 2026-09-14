@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
     ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, PreparedStatement, ResultSet,
-    StatementId, StatementResult, StreamedParamStatus,
+    StatementId, StreamedParamStatus,
 };
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -295,27 +295,14 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 stmt_state.pending_unprepare = orphaned;
             }
 
-            let stmt_result = match exec_result {
-                Ok(result) => result,
-                Err(e) => {
-                    error!(%e, "SQLExecute: prepared execution failed");
-                    return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-                }
-            };
-
-            // A prepared statement runs a single SQL statement. If it produced no result
-            // set (DML / no-row), drain its trailing tokens so the statement is left idle
-            // and immediately re-executable (msodbcsql parity) instead of leaving a
-            // 0-column cursor open. A row-returning statement keeps its cursor open for
-            // SQLFetch; its `@handle` RETURNVALUE (sp_prepexec) is captured later at
-            // drain time (SQLCloseCursor / the DDL finish path).
-            if !matches!(stmt_result, StatementResult::Rows)
-                && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
-            {
-                error!(%e, "SQLExecute: draining no-row prepared result failed");
+            if let Err(e) = exec_result {
+                error!(%e, "SQLExecute: prepared execution failed");
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
+            // TDS already settles a protocol-only RPC tail. Advancing to rows
+            // here would discard the counts/messages before a prepared batch's
+            // first rowset instead of leaving them for SQLMoreResults.
             finish_execute_with_param_warning(
                 dbc,
                 stmt,
@@ -1233,6 +1220,91 @@ mod tests {
                 .message
                 .contains("Internal error reading parameter bindings")
         );
+    }
+
+    #[test]
+    fn prepared_execution_keeps_dml_counts_before_the_first_rowset() {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::more_results::sql_more_results;
+        use crate::api::odbc_types::{
+            SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NEED_DATA, SQL_NO_DATA, SQL_PARAM_INPUT,
+            SQL_VARCHAR,
+        };
+        use crate::api::param_data::sql_param_data;
+        use crate::api::put_data::sql_put_data;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_more_with_count, done_no_more, int_columns, tds_client_from_tokens,
+        };
+
+        for dae_sql_type in [None, Some(SQL_VARCHAR), Some(SQL_INTEGER)] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            set_prepared(
+                h.stmt,
+                if dae_sql_type.is_some() {
+                    "UPDATE t SET v=?; UPDATE t SET v=2; SELECT v FROM t"
+                } else {
+                    "UPDATE t SET v=1; UPDATE t SET v=2; SELECT v FROM t"
+                },
+            );
+            let dbc = unsafe { handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
+                done_more_with_count(2),
+                done_more_with_count(1),
+                col_metadata(int_columns(1)),
+                done_no_more(),
+            ]));
+
+            let mut input = b'1';
+            let mut indicator = SQL_DATA_AT_EXEC;
+            if let Some(sql_type) = dae_sql_type {
+                assert_eq!(
+                    unsafe {
+                        sql_bind_parameter(
+                            h.stmt,
+                            1,
+                            SQL_PARAM_INPUT,
+                            SQL_C_CHAR,
+                            sql_type,
+                            10,
+                            0,
+                            (&raw mut input).cast(),
+                            1,
+                            &raw mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+                let mut token = std::ptr::null_mut();
+                assert_eq!(
+                    unsafe { sql_param_data(h.stmt, &raw mut token) },
+                    SQL_NEED_DATA
+                );
+                assert_eq!(token, (&raw mut input).cast());
+                assert_eq!(unsafe { sql_put_data(h.stmt, token, 1) }, SQL_SUCCESS);
+                assert_eq!(
+                    unsafe { sql_param_data(h.stmt, &raw mut token) },
+                    SQL_SUCCESS
+                );
+            } else {
+                assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_SUCCESS);
+            }
+            for (index, expected_count) in [2, 1].into_iter().enumerate() {
+                if index != 0 {
+                    assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+                }
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, expected_count);
+                assert!(state.column_metadata.is_empty());
+                assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().column_metadata.len(), 1);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, -1);
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        }
     }
 
     #[test]

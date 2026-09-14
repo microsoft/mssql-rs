@@ -31,6 +31,16 @@ protected:
                       SQL_HANDLE_STMT, stmt_);
     }
 
+    void SetParameterName(SQLSMALLINT ordinal, const std::string& name) {
+        SQLHDESC ipd = SQL_NULL_HDESC;
+        ASSERT_SQL_OK(SQLGetStmtAttrW(stmt_, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        std::basic_string<SQLWCHAR> wide_name(name.begin(), name.end());
+        ASSERT_SQL_OK(SQLSetDescFieldW(ipd, ordinal, SQL_DESC_NAME,
+                                      wide_name.data(), SQL_NTS),
+                      SQL_HANDLE_DESC, ipd);
+    }
+
     void Exhaust() {
         SQLRETURN rc;
         while (SQL_SUCCEEDED(rc = SQLMoreResults(stmt_))) {}
@@ -119,6 +129,107 @@ TEST_F(CallRoutingTest, DefaultArgumentsPreservePositions) {
         EXPECT_EQ(303, result);
         Exhaust();
         ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// msodbcsql strips inline names in AddRpcSprocParameters (sqlccmd.cpp), then
+// ProcessRPCData reads names from the IPD. Set both so the canonical call
+// exercises Rust's text fallback and the reference driver's named RPC route.
+// Benefits-from-mock-tds: verify the named EXEC text instead of positional RPC.
+TEST_F(CallRoutingTest, ReorderedNamedInputsPreserveParameterNames) {
+    ExecDirect("CREATE PROCEDURE #route @a int,@b int AS SELECT @a*10+@b");
+    SQLINTEGER first = 2, second = 1;
+    SQLLEN first_length = 0, second_length = 0;
+    for (bool prepared : {false, true}) {
+        SCOPED_TRACE(prepared);
+        const char* sql = "{call #route(@b = ?, @a = ?)}";
+        if (prepared) {
+            ASSERT_SQL_OK(Prepare(sql), SQL_HANDLE_STMT, stmt_);
+        }
+        BindInt(1, SQL_PARAM_INPUT, first, first_length);
+        BindInt(2, SQL_PARAM_INPUT, second, second_length);
+        SetParameterName(1, "@b");
+        SetParameterName(2, "@a");
+        if (prepared) {
+            ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        } else {
+            ASSERT_SQL_OK(Direct(sql), SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER result = 0;
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &result, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(12, result);
+        Exhaust();
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+    }
+}
+
+// Benefits-from-mock-tds: verify OUTPUT stays attached to the named argument.
+TEST_F(CallRoutingTest, ReorderedNamedOutputsPreserveParameterNames) {
+    ExecDirect("CREATE PROCEDURE #route @a int,@b int OUTPUT AS "
+               "SET @b=@a*10+COALESCE(@b,0)");
+    for (bool prepared : {false, true}) {
+        for (SQLSMALLINT direction : {SQL_PARAM_OUTPUT, SQL_PARAM_INPUT_OUTPUT}) {
+            SCOPED_TRACE(prepared);
+            SCOPED_TRACE(direction);
+            SQLINTEGER output = 3, input = 7;
+            SQLLEN output_length = 0, input_length = 0;
+            const char* sql = "{call #route(@b = ?, @a = ?)}";
+            if (prepared) {
+                ASSERT_SQL_OK(Prepare(sql), SQL_HANDLE_STMT, stmt_);
+            }
+            BindInt(1, direction, output, output_length);
+            BindInt(2, SQL_PARAM_INPUT, input, input_length);
+            SetParameterName(1, "@b");
+            SetParameterName(2, "@a");
+            if (prepared) {
+                ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+            } else {
+                ASSERT_SQL_OK(Direct(sql), SQL_HANDLE_STMT, stmt_);
+            }
+            Exhaust();
+            EXPECT_EQ(direction == SQL_PARAM_OUTPUT ? 70 : 73, output);
+            EXPECT_EQ(sizeof(SQLINTEGER), output_length);
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        }
+    }
+}
+
+// Benefits-from-mock-tds: assert the RPC name's UTF-16 length on the wire.
+TEST_F(CallRoutingTest, UnicodeProcedureNamesExecuteDirectAndPrepared) {
+    for (size_t count : {2, 90}) {
+        SCOPED_TRACE(count);
+        const std::u16string name = u"[#" + std::u16string(count, u'\u8def') + u"]";
+        const std::u16string create = u"CREATE PROCEDURE " + name +
+                                     u" @a int AS SELECT @a*2";
+        std::basic_string<SQLWCHAR> create_sql(create.begin(), create.end());
+        ASSERT_SQL_OK(SQLExecDirectW(stmt_, create_sql.data(), SQL_NTS),
+                      SQL_HANDLE_STMT, stmt_);
+        SQLINTEGER input = 21;
+        SQLLEN input_length = 0;
+        BindInt(1, SQL_PARAM_INPUT, input, input_length);
+        for (bool prepared : {false, true}) {
+            SCOPED_TRACE(prepared);
+            const std::u16string call = u"{call " + name + u"(?)}";
+            std::basic_string<SQLWCHAR> call_sql(call.begin(), call.end());
+            if (prepared) {
+                ASSERT_SQL_OK(SQLPrepareW(stmt_, call_sql.data(), SQL_NTS),
+                              SQL_HANDLE_STMT, stmt_);
+                ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+            } else {
+                ASSERT_SQL_OK(SQLExecDirectW(stmt_, call_sql.data(), SQL_NTS),
+                              SQL_HANDLE_STMT, stmt_);
+            }
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            SQLINTEGER result = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &result, 0, nullptr),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_EQ(42, result);
+            Exhaust();
+            ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_CLOSE), SQL_HANDLE_STMT, stmt_);
+        }
+        ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
     }
 }
 

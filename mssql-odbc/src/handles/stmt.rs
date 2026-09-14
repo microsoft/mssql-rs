@@ -444,6 +444,9 @@ pub(crate) struct StmtState {
     /// `SQLExecute`. `Some` marks the statement as prepared; the handle is filled
     /// after the first execute.
     pub(crate) prepared: Option<PreparedPlan>,
+    /// Marker count of the accepted direct SQL, independent of a prepared plan.
+    /// Retained across cursor close and parameter reset; replaced by new SQL.
+    pub(crate) direct_marker_count: Option<usize>,
     /// Metadata inferred by `SQLDescribeParam`, indexed by parameter ordinal.
     /// The first describe call fills every marker; `SQLPrepare` invalidates it.
     pub(crate) parameter_metadata: Vec<ParameterDescription>,
@@ -1511,6 +1514,7 @@ impl StmtHandle {
                 pending_fetch_info: Vec::new(),
                 pending_output_params: None,
                 prepared: None,
+                direct_marker_count: None,
                 parameter_metadata: Vec::new(),
                 bound_params: Vec::new(),
                 pending_unprepare: None,

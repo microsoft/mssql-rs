@@ -246,6 +246,7 @@ fn sql_exec_direct_w_safe(
         // (deferred) once we hold the client below.
         stmt_state.orphan_prepared_handle();
         stmt_state.prepared = None;
+        stmt_state.direct_marker_count = Some(marker_count);
         stmt_state.parameter_metadata.clear();
         stmt_state.clear_state(STMT_STATE_PREPARED);
         stmt_state.call_returns_status = call.as_ref().is_some_and(|c| c.returns_status);
