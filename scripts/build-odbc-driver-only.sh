@@ -16,6 +16,7 @@ set -eu
 
 LIBC="${1:-glibc}"
 DROP_DIR="${ODBC_DROP_DIR:-/workspace/odbc-drop}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
 MAX_GLIBC_VERSION="${MAX_GLIBC_VERSION:-2.34}"
 
 # Clean the shared drop as root inside the container; a prior pass may have left
@@ -29,7 +30,7 @@ if [ "$LIBC" = "musl" ]; then
   export RUSTFLAGS="-C target-feature=-crt-static"
 fi
 
-cd /workspace/mssql-odbc
+cd "$WORKSPACE_DIR/mssql-odbc"
 cargo build --release
 DRIVER="$(bash scripts/finalize-artifact.sh release)"
 

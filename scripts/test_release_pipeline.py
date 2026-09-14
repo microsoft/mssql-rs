@@ -571,11 +571,74 @@ def test_wheel_image_odbc_builds_use_isolated_cargo_target() -> None:
     }
     assert parameters["maxGlibcVersion"]["default"] == "2.34"
 
-    build_script = (_ROOT / "scripts" / "build-odbc-driver-only.sh").read_text(
-        encoding="utf-8"
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None,
+    reason="bash is required to run the ODBC build script",
+)
+@pytest.mark.parametrize(
+    ("ceiling", "required", "succeeds"),
+    [
+        ("2.28", "2.28", True),
+        ("2.28", "2.29", False),
+        (None, "2.34", True),
+        (None, "2.35", False),
+    ],
+)
+def test_odbc_build_script_enforces_glibc_ceiling(
+    tmp_path: Path,
+    ceiling: str | None,
+    required: str,
+    succeeds: bool,
+) -> None:
+    script = tmp_path / "build-odbc-driver-only.sh"
+    shutil.copy2(_ROOT / "scripts" / script.name, script)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "cargo").write_text("#!/usr/bin/env bash\nexit 0\n", newline="\n")
+    (bin_dir / "readelf").write_text(
+        "#!/usr/bin/env bash\n" 'echo "Version needs section: Name: GLIBC_${FAKE_GLIBC_VERSION}"\n',
+        newline="\n",
     )
-    assert 'MAX_GLIBC_VERSION="${MAX_GLIBC_VERSION:-2.34}"' in build_script
-    assert 'ceiling="GLIBC_$MAX_GLIBC_VERSION"' in build_script
+
+    odbc_dir = tmp_path / "workspace" / "mssql-odbc"
+    scripts_dir = odbc_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "finalize-artifact.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        'driver="$PWD/fake-driver.so"\n'
+        ': > "$driver"\n'
+        "printf '%s\n' \"$driver\"\n",
+        newline="\n",
+    )
+
+    ceiling_export = f"export MAX_GLIBC_VERSION={ceiling}; " if ceiling is not None else ""
+    command = (
+        'export PATH="$PWD/bin:$PATH"; '
+        'export WORKSPACE_DIR="$PWD/workspace"; '
+        'export ODBC_DROP_DIR="$PWD/odbc-drop"; '
+        f"export FAKE_GLIBC_VERSION={required}; "
+        f"{ceiling_export}"
+        "chmod +x ./bin/cargo ./bin/readelf; "
+        "exec sh ./build-odbc-driver-only.sh glibc"
+    )
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert (result.returncode == 0) is succeeds, result.stdout + result.stderr
+    if succeeds:
+        assert f"max required GLIBC: GLIBC_{required}" in result.stdout
+    else:
+        expected_ceiling = ceiling or "2.34"
+        assert (
+            f"ERROR: GLIBC_{required} exceeds the GLIBC_{expected_ceiling} floor" in result.stderr
+        )
 
 
 @pytest.mark.parametrize("values", list(itertools.product((False, True), repeat=5)))
