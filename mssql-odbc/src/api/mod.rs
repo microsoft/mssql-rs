@@ -11,7 +11,7 @@ mod close_cursor;
 mod col_attribute;
 mod connect;
 mod current_catalog;
-mod describe_col;
+pub(crate) mod describe_col;
 mod describe_param;
 mod disconnect;
 mod driver_connect;

@@ -12,6 +12,7 @@ use mssql_tds::error::{Error as TdsError, SqlInfoMessage};
 
 use super::desc::{DescHandle, DescKind, DescRecord, DescState};
 use super::{DbcHandle, HandleType, HasObjectType, free_handle, handle_to_raw};
+use crate::api::describe_col::odbc_sql_type;
 use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
@@ -343,6 +344,10 @@ pub(crate) struct StmtState {
     pub(crate) column_names_utf16: Vec<Vec<u16>>,
     /// Bound-fetch metadata for result sets containing PLP columns.
     pub(crate) plp_columns: Option<Arc<[Option<PlpColumnInfo>]>>,
+    /// ODBC SQL type per column, built once when result metadata changes so
+    /// resolving `SQL_C_DEFAULT` bindings does not need to re-lock the
+    /// statement after the fetch path has released it.
+    pub(crate) column_sql_types: Arc<[SqlSmallInt]>,
     /// Reused by bounded PLP read-ahead so each MAX value does not allocate a
     /// fresh carry buffer.
     pub(crate) plp_prefetch_scratch: Vec<u8>,
@@ -1061,6 +1066,7 @@ impl StmtState {
                 .iter()
                 .map(|column| column.column_name.encode_utf16().collect()),
         );
+        self.column_sql_types = self.column_metadata.iter().map(odbc_sql_type).collect();
         self.plp_columns = self
             .column_metadata
             .iter()
@@ -1090,6 +1096,7 @@ impl StmtState {
         self.column_metadata.clear();
         self.column_names_utf16.clear();
         self.plp_columns = None;
+        self.column_sql_types = Arc::from([]);
     }
 
     /// Makes `metadata` the first result set of a new execution.
@@ -1256,6 +1263,7 @@ impl StmtHandle {
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
                 plp_columns: None,
+                column_sql_types: Arc::from([]),
                 plp_prefetch_scratch: Vec::new(),
                 result_set_exhausted: false,
                 batch_exhausted: false,
@@ -1543,6 +1551,32 @@ mod tests {
             assert!(
                 s.plp_columns.is_none(),
                 "a non-PLP result set must not inherit the previous set's cache"
+            );
+        });
+    }
+
+    /// `SQLFetchScroll` resolves `SQL_C_DEFAULT` bindings from this cache after
+    /// it has released the statement lock, so a stale entry would map a
+    /// binding against the previous result set's types instead of failing.
+    /// Covers the rebuild, the explicit clear, and the shrinking result set
+    /// that follows a wider one — that transition is where a stale tail would
+    /// still be indexable.
+    #[test]
+    fn column_sql_type_cache_does_not_outlive_its_result_set() {
+        with_state(|s| {
+            s.begin_result_set(mixed_lob_columns(2));
+            assert_eq!(s.column_sql_types.len(), 3);
+            assert_eq!(s.column_sql_types[0], odbc_types::SQL_INTEGER);
+            assert_eq!(s.column_sql_types[2], odbc_types::SQL_WVARCHAR);
+
+            s.clear_result_metadata();
+            assert!(s.column_sql_types.is_empty());
+
+            s.begin_result_set(int_columns(1));
+            assert_eq!(
+                &*s.column_sql_types,
+                &[odbc_types::SQL_INTEGER],
+                "a narrower result set must not inherit the previous set's tail"
             );
         });
     }

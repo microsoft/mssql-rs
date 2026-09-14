@@ -38,7 +38,6 @@ use mssql_tds::query::metadata::PlpEncoding;
 use uuid::Uuid;
 
 use super::sqlstate::*;
-use crate::api::describe_col::odbc_sql_type;
 use crate::api::exec_common::release_busy_if_row_exhausted;
 use crate::api::get_data::{
     TextError, column_value_to_text, convert_typed_c, is_typed_c_target, utf16le_chunk_to_utf8,
@@ -813,6 +812,7 @@ fn fetch_scroll_safe(
         row_bind_offset_ptr,
         trailing_utf16_plp,
         plp_columns,
+        column_sql_types,
     ) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLFetchScroll: stmt mutex poisoned");
@@ -912,6 +912,7 @@ fn fetch_scroll_safe(
             stmt_state.row_bind_offset_ptr,
             trailing_utf16_plp,
             stmt_state.plp_columns.clone(),
+            Arc::clone(&stmt_state.column_sql_types),
         )
     };
 
@@ -963,8 +964,9 @@ fn fetch_scroll_safe(
         .iter()
         .any(|binding| binding.target_type == SQL_C_DEFAULT)
     {
-        // These locks are needed only for deferred default bindings and are
-        // acquired sequentially, after the ARD snapshot has been released.
+        // Only the ENV lock is needed here, and only for deferred default
+        // bindings: the SQL types come from the snapshot taken above, so this
+        // never re-acquires the statement lock it already released.
         let odbc_version = {
             let env = stmt.parent_dbc().parent_env();
             let Ok(env_state) = env.inner.lock() else {
@@ -981,17 +983,6 @@ fn fetch_scroll_safe(
                 return SQL_ERROR;
             };
             env_state.odbc_version
-        };
-        let column_sql_types: Vec<SqlSmallInt> = {
-            let Ok(stmt_state) = stmt.inner.lock() else {
-                error!("SQLFetchScroll: stmt mutex poisoned reading column metadata");
-                return SQL_ERROR;
-            };
-            stmt_state
-                .column_metadata
-                .iter()
-                .map(odbc_sql_type)
-                .collect()
         };
         resolve_default_bindings(&mut bindings, &column_sql_types, odbc_version);
     }
