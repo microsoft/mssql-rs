@@ -89,9 +89,6 @@ claim them as such.
 | `SQL_BOOKMARK_PERSISTENCE` | `0` | Bookmark fetch and persistence are not implemented. Planned Phase 10. |
 | `SQL_CURSOR_SENSITIVITY` | `SQL_UNSPECIFIED` | No sensitive cursor implementation. Planned Phase 10. |
 | `SQL_SCROLL_OPTIONS` | `SQL_SO_FORWARD_ONLY` | Only forward-only cursors are implemented. Planned Phase 10. |
-| `SQL_CONVERT_FUNCTIONS` | `0` | ODBC scalar escape translation is not implemented. Tracked by AB#46384. |
-| `SQL_TIMEDATE_ADD_INTERVALS` | `0` | `{fn TIMESTAMPADD(...)}` translation is not implemented. Tracked by AB#46384. |
-| `SQL_TIMEDATE_DIFF_INTERVALS` | `0` | `{fn TIMESTAMPDIFF(...)}` translation is not implemented. Tracked by AB#46384. |
 | `SQL_FETCH_DIRECTION` | `SQL_FD_FETCH_NEXT` | Deprecated identifier truthfully mirrors forward-only fetch support. Phase 10 owns additional directions. |
 | `SQL_POSITIONED_STATEMENTS` | `0` | Positioned update/delete is not implemented. Planned Phase 10. |
 | `SQL_SCROLL_CONCURRENCY` | `SQL_SCCO_READ_ONLY` | Deprecated identifier truthfully mirrors read-only cursor support. Phase 10 owns additional modes. |

@@ -217,28 +217,8 @@ const STATIC_INFO: &[InfoEntry] = &[
         value: InfoValue::U16(odbc::SQL_IC_MIXED),
     },
     InfoEntry {
-        info_type: odbc::SQL_LIKE_ESCAPE_CLAUSE,
-        value: InfoValue::String("Y"),
-    },
-    InfoEntry {
-        info_type: odbc::SQL_OJ_CAPABILITIES,
-        value: InfoValue::Bitmask(
-            odbc::SQL_OJ_LEFT
-                | odbc::SQL_OJ_RIGHT
-                | odbc::SQL_OJ_FULL
-                | odbc::SQL_OJ_NESTED
-                | odbc::SQL_OJ_NOT_ORDERED
-                | odbc::SQL_OJ_INNER
-                | odbc::SQL_OJ_ALL_COMPARISON_OPS,
-        ),
-    },
-    InfoEntry {
         info_type: odbc::SQL_ORDER_BY_COLUMNS_IN_SELECT,
         value: InfoValue::String("N"),
-    },
-    InfoEntry {
-        info_type: odbc::SQL_OUTER_JOINS,
-        value: InfoValue::String("F"),
     },
     InfoEntry {
         info_type: odbc::SQL_QUOTED_IDENTIFIER_CASE,
@@ -307,18 +287,6 @@ const STATIC_INFO: &[InfoEntry] = &[
     InfoEntry {
         info_type: odbc::SQL_MAX_USER_NAME_LEN,
         value: InfoValue::U16(MAX_IDENTIFIER_LEN),
-    },
-    InfoEntry {
-        info_type: odbc::SQL_CONVERT_FUNCTIONS,
-        value: InfoValue::Bitmask(NO_CAPABILITIES),
-    },
-    InfoEntry {
-        info_type: odbc::SQL_TIMEDATE_ADD_INTERVALS,
-        value: InfoValue::Bitmask(NO_CAPABILITIES),
-    },
-    InfoEntry {
-        info_type: odbc::SQL_TIMEDATE_DIFF_INTERVALS,
-        value: InfoValue::Bitmask(NO_CAPABILITIES),
     },
     InfoEntry {
         info_type: odbc::SQL_FETCH_DIRECTION,
@@ -933,7 +901,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let mut seen = HashSet::new();
 
-        assert_eq!(STATIC_INFO.len(), 56);
+        assert_eq!(STATIC_INFO.len(), 50);
         for entry in STATIC_INFO {
             assert!(
                 seen.insert(entry.info_type),
