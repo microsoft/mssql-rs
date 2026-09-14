@@ -300,6 +300,11 @@ TEST_F(GetInfoLiveTest, WorkItem48149U16ValuesMatchMsodbcsql) {
 }
 
 TEST_F(GetInfoLiveTest, WorkItem48149SqlCapabilitiesMatchMsodbcsql) {
+    SQLUINTEGER packetSize = 0;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_PACKET_SIZE, &packetSize,
+                                    SQL_IS_UINTEGER, nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+
     struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; const char* name; };
     const Case cases[] = {
         {SQL_BATCH_ROW_COUNT, SQL_BRC_EXPLICIT, "SQL_BATCH_ROW_COUNT"},
@@ -333,8 +338,8 @@ TEST_F(GetInfoLiveTest, WorkItem48149SqlCapabilitiesMatchMsodbcsql) {
              SQL_SQ_CORRELATED_SUBQUERIES,
          "SQL_SUBQUERIES"},
         {SQL_UNION, SQL_U_UNION | SQL_U_UNION_ALL, "SQL_UNION"},
-        {SQL_MAX_BINARY_LITERAL_LEN, 65536, "SQL_MAX_BINARY_LITERAL_LEN"},
-        {SQL_MAX_CHAR_LITERAL_LEN, 65536, "SQL_MAX_CHAR_LITERAL_LEN"},
+        {SQL_MAX_BINARY_LITERAL_LEN, 128u * packetSize, "SQL_MAX_BINARY_LITERAL_LEN"},
+        {SQL_MAX_CHAR_LITERAL_LEN, 128u * packetSize, "SQL_MAX_CHAR_LITERAL_LEN"},
         {SQL_MAX_ROW_SIZE, 8060, "SQL_MAX_ROW_SIZE"},
     };
 

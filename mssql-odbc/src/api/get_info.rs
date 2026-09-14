@@ -44,7 +44,6 @@ const MAX_SQL_BLOCKS: u32 = 128;
 const NO_CAPABILITIES: u32 = 0;
 const NO_STATED_U16_LIMIT: u16 = 0;
 const MSODBCSQL_ALTER_TABLE_CAPABILITIES: u32 = 0x0000_9869;
-const SQL_SERVER_MAX_LITERAL_LEN: u32 = 65_536;
 const SQL_SERVER_MAX_INDEX_COLUMNS: u16 = 16;
 const SQL_SERVER_MAX_SELECT_COLUMNS: u16 = 4096;
 const SQL_SERVER_MAX_TABLE_COLUMNS: u16 = 1024;
@@ -250,16 +249,8 @@ const STATIC_INFO: &[InfoEntry] = &[
         value: InfoValue::Bitmask(odbc::SQL_U_UNION | odbc::SQL_U_UNION_ALL),
     },
     InfoEntry {
-        info_type: odbc::SQL_MAX_BINARY_LITERAL_LEN,
-        value: InfoValue::U32(SQL_SERVER_MAX_LITERAL_LEN),
-    },
-    InfoEntry {
         info_type: odbc::SQL_MAX_CATALOG_NAME_LEN,
         value: InfoValue::U16(MAX_IDENTIFIER_LEN),
-    },
-    InfoEntry {
-        info_type: odbc::SQL_MAX_CHAR_LITERAL_LEN,
-        value: InfoValue::U32(SQL_SERVER_MAX_LITERAL_LEN),
     },
     InfoEntry {
         info_type: odbc::SQL_MAX_COLUMNS_IN_GROUP_BY,
@@ -639,7 +630,9 @@ fn sql_get_info_w_safe(
         SQL_MAX_COLUMN_NAME_LEN | SQL_MAX_SCHEMA_NAME_LEN | SQL_MAX_TABLE_NAME_LEN => {
             write_u16(info_value_ptr, MAX_IDENTIFIER_LEN, string_length_ptr)
         }
-        SQL_MAX_STATEMENT_LEN => write_u32(
+        odbc::SQL_MAX_BINARY_LITERAL_LEN
+        | odbc::SQL_MAX_CHAR_LITERAL_LEN
+        | SQL_MAX_STATEMENT_LEN => write_u32(
             info_value_ptr,
             max_statement_len(state.client.as_ref().map(|client| client.packet_size())),
             string_length_ptr,
@@ -821,7 +814,7 @@ mod tests {
         let h = TestHandles::with_env_dbc();
         let mut seen = HashSet::new();
 
-        assert_eq!(STATIC_INFO.len(), 58);
+        assert_eq!(STATIC_INFO.len(), 56);
         for entry in STATIC_INFO {
             assert!(
                 seen.insert(entry.info_type),
@@ -920,6 +913,8 @@ mod tests {
             (SQL_DEFAULT_TXN_ISOLATION, SQL_TXN_READ_COMMITTED),
             (SQL_TXN_ISOLATION_OPTION, SQL_TXN_ISOLATION_OPTION_SPT),
             (SQL_SQL_CONFORMANCE, SQL_SC_SQL92_ENTRY),
+            (odbc::SQL_MAX_BINARY_LITERAL_LEN, 512 * 1024),
+            (odbc::SQL_MAX_CHAR_LITERAL_LEN, 512 * 1024),
             (SQL_MAX_STATEMENT_LEN, 512 * 1024),
             (SQL_NUMERIC_FUNCTIONS, SQL_FN_NONE_SUPPORTED),
             (SQL_STRING_FUNCTIONS, SQL_FN_NONE_SUPPORTED),

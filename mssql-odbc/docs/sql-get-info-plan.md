@@ -33,10 +33,11 @@ Parity evidence has two sources:
   `SQL_DRIVER_VER=18.06.0002`, through the comparison leg of
   `tests/e2e/tests/get_info_test.cpp`.
 
-The source and retail build disagree on four values. Runtime behavior is the
+The source and retail build disagree on two values. Runtime behavior is the
 compatibility contract: `SQL_OUTER_JOINS="F"`,
-`SQL_CONCAT_NULL_BEHAVIOR=SQL_CB_NULL`, and
-`SQL_MAX_BINARY_LITERAL_LEN=SQL_MAX_CHAR_LITERAL_LEN=65536`.
+and `SQL_CONCAT_NULL_BEHAVIOR=SQL_CB_NULL`. The statement, character-literal,
+and binary-literal limits all track the negotiated packet size as
+`128 * packet_size`; retail reports 524288 for the default 4096-byte packet.
 
 ## Capability ledger
 
@@ -87,7 +88,7 @@ Driver Manager interaction difference is recorded in
 
 ## Test inventory
 
-Rust unit tests validate all 58 static table entries, their ODBC
+Rust unit tests validate all 56 static table entries, their ODBC
 representation, the two aliases, dynamic connection state, probes, truncation,
 diagnostic clearing, and `HY096`.
 
