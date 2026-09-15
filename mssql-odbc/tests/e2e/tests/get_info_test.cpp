@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // get_info_test.cpp  –  E2E tests for SQLGetInfoW.
 //
-// Values are pinned against retail msodbcsql18 18.6.2.1, so this file runs
-// unchanged on both legs of `run_e2e.sh --compare-with-msodbcsql`. Where
-// mssql-odbc deliberately diverges for its first release the assertion is
-// widened rather than skipped, and the divergence is named in a comment.
+// Values are pinned against retail msodbcsql18 18.6.2.1, so parity assertions
+// run unchanged on both legs of `run_e2e.sh --compare-with-msodbcsql`.
+// Capability assertions that describe only this driver are skipped on the
+// comparison leg and recorded in docs/sql-get-info-plan.md.
 //
 // This suite builds wide on Windows and narrow on Unix (see ODBC_E2E_FORCE_UNICODE
 // in CMakeLists.txt), so lengths are asserted in SQLTCHAR units rather than
@@ -47,6 +47,17 @@ SQLUINTEGER GetInfoU32(SQLHDBC dbc, SQLUSMALLINT infoType, SQLRETURN* rc,
     *rc = SQLGetInfo(dbc, infoType, &value, sizeof(value), &len);
     if (byteLen) *byteLen = len;
     return value;
+}
+
+// A connection string with `extra` appended. Reuses the shared builder so the
+// credential handling stays in one place. `BuildConnectionString()` returns
+// `ODBC_TEST_CONNSTR` verbatim when that env var is set, which is not
+// guaranteed to end in `;`, so normalize the separator here rather than
+// assuming one.
+SqlTString ConnStrWith(const std::string& extra) {
+    std::string base = ODBCTestUtils::ToNarrow(ODBCTestUtils::BuildConnectionString());
+    if (!base.empty() && base.back() != ';') base += ';';
+    return ODBCTestUtils::ToSqlTStr(base + extra);
 }
 
 }  // namespace
@@ -224,6 +235,62 @@ TEST_F(GetInfoLiveTest, MaxStatementLenAndConformance) {
     EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len);
 }
 
+// The other parity checks in this file re-derive their expectation from
+// SQLGetConnectAttr(SQL_ATTR_PACKET_SIZE), which reads the exact same stored
+// value SQLGetInfo does here — so on this driver `128*x == 128*x` passes
+// regardless of what x actually is, and the shared default connection string
+// never sets `PacketSize=`, so none of them exercise that keyword. Open a
+// second connection with an explicit, non-default `PacketSize=` and assert
+// the literal expected number, so a regression in either the connection's
+// resolved packet size or SQLGetInfo's derivation would be caught.
+//
+// mssql-odbc-specific: skipped on the msodbcsql comparison leg. Measured
+// against retail msodbcsql18 18.6.2.1 over an encrypted connection, it
+// reports a *smaller* value than requested here (16192, not 16384) —
+// contradicting the "never the negotiated value" claim in
+// docs/sql-get-info-plan.md, which was derived from static source reading
+// and evidently misses a TLS-driven reduction path. mssql-odbc's own design
+// (always the requested/configured size, proven independent of negotiation
+// by the `Encrypt=no` mock-server unit test in driver_connect.rs) has no
+// such reduction, so the literal expectation only holds for this driver.
+// See the divergence table entry for `SQL_MAX_STATEMENT_LEN` et al.
+TEST_F(GetInfoLiveTest, MaxLengthsUseTheConnectionStringPacketSize) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    constexpr SQLUINTEGER kRequestedPacketSize = 16384;
+
+    SQLHDBC dbc = SQL_NULL_HDBC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc), SQL_HANDLE_ENV, env_);
+    SqlTString connstr = ConnStrWith("PacketSize=" + std::to_string(kRequestedPacketSize));
+    SQLTCHAR outStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+    ASSERT_SQL_OK(SQLDriverConnect(dbc, nullptr, const_cast<SQLTCHAR*>(connstr.c_str()),
+                                   static_cast<SQLSMALLINT>(connstr.size()), outStr,
+                                   static_cast<SQLSMALLINT>(sizeof(outStr) / sizeof(SQLTCHAR)),
+                                   &outLen, SQL_DRIVER_NOPROMPT),
+                  SQL_HANDLE_DBC, dbc);
+
+    SQLUINTEGER packetSize = 0;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc, SQL_ATTR_PACKET_SIZE, &packetSize, SQL_IS_UINTEGER,
+                                    nullptr),
+                  SQL_HANDLE_DBC, dbc);
+    EXPECT_EQ(kRequestedPacketSize, packetSize)
+        << "SQLGetConnectAttr must report the connection string's PacketSize=, not a "
+           "negotiated or default value";
+
+    SQLRETURN rc = SQL_ERROR;
+    SQLSMALLINT len = -1;
+    for (SQLUSMALLINT infoType :
+         {SQL_MAX_STATEMENT_LEN, SQL_MAX_CHAR_LITERAL_LEN, SQL_MAX_BINARY_LITERAL_LEN}) {
+        EXPECT_EQ(128u * kRequestedPacketSize, GetInfoU32(dbc, infoType, &rc, &len))
+            << "info_type " << infoType;
+        EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "info_type " << infoType;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << "info_type " << infoType;
+    }
+
+    SQLDisconnect(dbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+}
+
 TEST_F(GetInfoLiveTest, KeywordsAndSpecialCharacters) {
     SQLRETURN rc = SQL_ERROR;
     SQLSMALLINT len = -1;
@@ -242,6 +309,182 @@ TEST_F(GetInfoLiveTest, KeywordsAndSpecialCharacters) {
     EXPECT_NE(std::string::npos, special.find('$'));
     // '@' is only legal as the first character of a variable name.
     EXPECT_EQ(std::string::npos, special.find('@'));
+}
+
+TEST_F(GetInfoLiveTest, WorkItem48149StringValuesMatchMsodbcsql) {
+    struct Case { SQLUSMALLINT infoType; const char* expected; const char* name; };
+    const Case cases[] = {
+        {SQL_SEARCH_PATTERN_ESCAPE, "\\", "SQL_SEARCH_PATTERN_ESCAPE"},
+        {SQL_DESCRIBE_PARAMETER, "Y", "SQL_DESCRIBE_PARAMETER"},
+        {SQL_MULT_RESULT_SETS, "Y", "SQL_MULT_RESULT_SETS"},
+        {SQL_PROCEDURE_TERM, "stored procedure", "SQL_PROCEDURE_TERM"},
+        {SQL_TABLE_TERM, "table", "SQL_TABLE_TERM"},
+        {SQL_CATALOG_NAME, "Y", "SQL_CATALOG_NAME"},
+        {SQL_COLUMN_ALIAS, "Y", "SQL_COLUMN_ALIAS"},
+        {SQL_LIKE_ESCAPE_CLAUSE, "Y", "SQL_LIKE_ESCAPE_CLAUSE"},
+        {SQL_ORDER_BY_COLUMNS_IN_SELECT, "N", "SQL_ORDER_BY_COLUMNS_IN_SELECT"},
+        {SQL_OUTER_JOINS, "F", "SQL_OUTER_JOINS"},
+        {SQL_XOPEN_CLI_YEAR, "1995", "SQL_XOPEN_CLI_YEAR"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoString(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(strlen(c.expected) * sizeof(SQLTCHAR)), len)
+            << c.name;
+    }
+}
+
+TEST_F(GetInfoLiveTest, WorkItem48149U16ValuesMatchMsodbcsql) {
+    struct Case { SQLUSMALLINT infoType; SQLUSMALLINT expected; const char* name; };
+    const Case cases[] = {
+        {SQL_CONCAT_NULL_BEHAVIOR, SQL_CB_NULL, "SQL_CONCAT_NULL_BEHAVIOR"},
+        {SQL_NULL_COLLATION, SQL_NC_LOW, "SQL_NULL_COLLATION"},
+        {SQL_CORRELATION_NAME, SQL_CN_ANY, "SQL_CORRELATION_NAME"},
+        {SQL_GROUP_BY, SQL_GB_GROUP_BY_CONTAINS_SELECT, "SQL_GROUP_BY"},
+        {SQL_IDENTIFIER_CASE, SQL_IC_MIXED, "SQL_IDENTIFIER_CASE"},
+        {SQL_QUOTED_IDENTIFIER_CASE, SQL_IC_MIXED, "SQL_QUOTED_IDENTIFIER_CASE"},
+        {SQL_MAX_CATALOG_NAME_LEN, 128, "SQL_MAX_CATALOG_NAME_LEN"},
+        {SQL_MAX_COLUMNS_IN_GROUP_BY, 0, "SQL_MAX_COLUMNS_IN_GROUP_BY"},
+        {SQL_MAX_COLUMNS_IN_INDEX, 16, "SQL_MAX_COLUMNS_IN_INDEX"},
+        {SQL_MAX_COLUMNS_IN_ORDER_BY, 0, "SQL_MAX_COLUMNS_IN_ORDER_BY"},
+        {SQL_MAX_COLUMNS_IN_SELECT, 4096, "SQL_MAX_COLUMNS_IN_SELECT"},
+        {SQL_MAX_COLUMNS_IN_TABLE, 1024, "SQL_MAX_COLUMNS_IN_TABLE"},
+        {SQL_MAX_IDENTIFIER_LEN, 128, "SQL_MAX_IDENTIFIER_LEN"},
+        {SQL_MAX_TABLES_IN_SELECT, 32, "SQL_MAX_TABLES_IN_SELECT"},
+        {SQL_MAX_USER_NAME_LEN, 128, "SQL_MAX_USER_NAME_LEN"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU16(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUSMALLINT)), len) << c.name;
+    }
+}
+
+TEST_F(GetInfoLiveTest, WorkItem48149SqlCapabilitiesMatchMsodbcsql) {
+    SQLUINTEGER packetSize = 0;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_PACKET_SIZE, &packetSize,
+                                    SQL_IS_UINTEGER, nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+
+    struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; const char* name; };
+    const Case cases[] = {
+        {SQL_BATCH_ROW_COUNT, SQL_BRC_EXPLICIT, "SQL_BATCH_ROW_COUNT"},
+        {SQL_BATCH_SUPPORT,
+         SQL_BS_SELECT_EXPLICIT | SQL_BS_ROW_COUNT_EXPLICIT | SQL_BS_SELECT_PROC |
+             SQL_BS_ROW_COUNT_PROC,
+         "SQL_BATCH_SUPPORT"},
+        {SQL_ALTER_TABLE, 0x00009869, "SQL_ALTER_TABLE"},
+        {SQL_CATALOG_USAGE,
+         SQL_CU_DML_STATEMENTS | SQL_CU_PROCEDURE_INVOCATION | SQL_CU_TABLE_DEFINITION,
+         "SQL_CATALOG_USAGE"},
+        {SQL_QUALIFIER_USAGE,
+         SQL_QU_DML_STATEMENTS | SQL_QU_PROCEDURE_INVOCATION | SQL_QU_TABLE_DEFINITION,
+         "SQL_QUALIFIER_USAGE"},
+        {SQL_CREATE_ASSERTION, 0, "SQL_CREATE_ASSERTION"},
+        {SQL_DDL_INDEX, SQL_DI_CREATE_INDEX | SQL_DI_DROP_INDEX, "SQL_DDL_INDEX"},
+        {SQL_OJ_CAPABILITIES,
+         SQL_OJ_LEFT | SQL_OJ_RIGHT | SQL_OJ_FULL | SQL_OJ_NESTED | SQL_OJ_NOT_ORDERED |
+             SQL_OJ_INNER | SQL_OJ_ALL_COMPARISON_OPS,
+         "SQL_OJ_CAPABILITIES"},
+        {SQL_SCHEMA_USAGE,
+         SQL_SU_DML_STATEMENTS | SQL_SU_PROCEDURE_INVOCATION | SQL_SU_TABLE_DEFINITION |
+             SQL_SU_INDEX_DEFINITION | SQL_SU_PRIVILEGE_DEFINITION,
+         "SQL_SCHEMA_USAGE"},
+        {SQL_OWNER_USAGE,
+         SQL_OU_DML_STATEMENTS | SQL_OU_PROCEDURE_INVOCATION | SQL_OU_TABLE_DEFINITION |
+             SQL_OU_INDEX_DEFINITION | SQL_OU_PRIVILEGE_DEFINITION,
+         "SQL_OWNER_USAGE"},
+        {SQL_SUBQUERIES,
+         SQL_SQ_COMPARISON | SQL_SQ_EXISTS | SQL_SQ_IN | SQL_SQ_QUANTIFIED |
+             SQL_SQ_CORRELATED_SUBQUERIES,
+         "SQL_SUBQUERIES"},
+        {SQL_UNION, SQL_U_UNION | SQL_U_UNION_ALL, "SQL_UNION"},
+        {SQL_MAX_BINARY_LITERAL_LEN, 128u * packetSize, "SQL_MAX_BINARY_LITERAL_LEN"},
+        {SQL_MAX_CHAR_LITERAL_LEN, 128u * packetSize, "SQL_MAX_CHAR_LITERAL_LEN"},
+        {SQL_MAX_ROW_SIZE, 8060, "SQL_MAX_ROW_SIZE"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU32(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << c.name;
+    }
+}
+
+TEST_F(GetInfoLiveTest, WorkItem48149CapabilitiesDescribeThisDriver) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+
+    struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; const char* name; };
+    const Case cases[] = {
+        {SQL_ASYNC_MODE, SQL_AM_NONE, "SQL_ASYNC_MODE"},
+        {SQL_DYNAMIC_CURSOR_ATTRIBUTES1, 0, "SQL_DYNAMIC_CURSOR_ATTRIBUTES1"},
+        {SQL_DYNAMIC_CURSOR_ATTRIBUTES2, 0, "SQL_DYNAMIC_CURSOR_ATTRIBUTES2"},
+        {SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1, SQL_CA1_NEXT,
+         "SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1"},
+        {SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2,
+         SQL_CA2_READ_ONLY_CONCURRENCY | SQL_CA2_MAX_ROWS_SELECT,
+         "SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2"},
+        {SQL_KEYSET_CURSOR_ATTRIBUTES1, 0, "SQL_KEYSET_CURSOR_ATTRIBUTES1"},
+        {SQL_KEYSET_CURSOR_ATTRIBUTES2, 0, "SQL_KEYSET_CURSOR_ATTRIBUTES2"},
+        {SQL_STATIC_CURSOR_ATTRIBUTES1, 0, "SQL_STATIC_CURSOR_ATTRIBUTES1"},
+        {SQL_STATIC_CURSOR_ATTRIBUTES2, 0, "SQL_STATIC_CURSOR_ATTRIBUTES2"},
+        {SQL_BOOKMARK_PERSISTENCE, 0, "SQL_BOOKMARK_PERSISTENCE"},
+        {SQL_CURSOR_SENSITIVITY, SQL_UNSPECIFIED, "SQL_CURSOR_SENSITIVITY"},
+        {SQL_SCROLL_OPTIONS, SQL_SO_FORWARD_ONLY, "SQL_SCROLL_OPTIONS"},
+        // AB#46384: {fn CONVERT}/{fn CAST} and {fn TIMESTAMPADD}/{fn
+        // TIMESTAMPDIFF} are translated and forwarded to the server.
+        {SQL_CONVERT_FUNCTIONS, 0x00000003u, "SQL_CONVERT_FUNCTIONS"},
+        {SQL_TIMEDATE_ADD_INTERVALS, 0x000001FFu, "SQL_TIMEDATE_ADD_INTERVALS"},
+        {SQL_TIMEDATE_DIFF_INTERVALS, 0x000001FFu, "SQL_TIMEDATE_DIFF_INTERVALS"},
+        {SQL_FETCH_DIRECTION, SQL_FD_FETCH_NEXT, "SQL_FETCH_DIRECTION"},
+        {SQL_POSITIONED_STATEMENTS, 0, "SQL_POSITIONED_STATEMENTS"},
+        {SQL_SCROLL_CONCURRENCY, SQL_SCCO_READ_ONLY, "SQL_SCROLL_CONCURRENCY"},
+        {SQL_STATIC_SENSITIVITY, 0, "SQL_STATIC_SENSITIVITY"},
+    };
+
+    for (const Case& c : cases) {
+        SQLRETURN rc = SQL_ERROR;
+        SQLSMALLINT len = -1;
+        EXPECT_EQ(c.expected, GetInfoU32(dbc_, c.infoType, &rc, &len)) << c.name;
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.name;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << c.name;
+    }
+}
+
+TEST_F(GetInfoLiveTest, DatabaseNameMatchesCurrentCatalog) {
+    SQLRETURN rc = SQL_ERROR;
+    std::string database = GetInfoString(dbc_, SQL_DATABASE_NAME, &rc, nullptr);
+    ASSERT_EQ(SQL_SUCCESS, rc);
+    EXPECT_FALSE(database.empty());
+
+    SQLTCHAR currentCatalog[256] = {};
+    SQLINTEGER len = -1;
+    ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_ATTR_CURRENT_CATALOG, currentCatalog,
+                                    sizeof(currentCatalog), &len),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(ODBCTestUtils::ToNarrow(SqlTString(currentCatalog)), database);
+}
+
+TEST_F(GetInfoLiveTest, DatabaseNameTracksCurrentCatalogChange) {
+    SQLRETURN rc = SQL_ERROR;
+    std::string original = GetInfoString(dbc_, SQL_DATABASE_NAME, &rc, nullptr);
+    ASSERT_EQ(SQL_SUCCESS, rc);
+    const std::string target = original == "master" ? "tempdb" : "master";
+    SqlTString catalog = ODBCTestUtils::ToSqlTStr(target);
+
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CURRENT_CATALOG,
+                                    const_cast<SQLTCHAR*>(catalog.c_str()), SQL_NTS),
+                  SQL_HANDLE_DBC, dbc_);
+    EXPECT_EQ(target, GetInfoString(dbc_, SQL_DATABASE_NAME, &rc, nullptr));
+    EXPECT_EQ(SQL_SUCCESS, rc);
 }
 
 // ===================================================================
@@ -285,6 +528,60 @@ TEST_F(GetInfoLiveTest, ShortBufferTruncatesWith01004) {
     EXPECT_EQ(0xFFFF, tiny.guard);
 }
 
+// ODBC defines BufferLength only for character information. The classic
+// driver's Raidpp TCSQLGetInfo::Variation_3 regressed by applying it to numeric
+// results, so exercise each numeric representation used by AB#48149.
+TEST_F(GetInfoLiveTest, NumericInfoIgnoresBufferLength) {
+    SQLUSMALLINT smallValue = 0xAAAA;
+    SQLSMALLINT len = -1;
+    SQLRETURN rc = SQLGetInfo(dbc_, SQL_CONCAT_NULL_BEHAVIOR, &smallValue, 0, &len);
+    EXPECT_EQ(SQL_SUCCESS, rc);
+    EXPECT_EQ(SQL_CB_NULL, smallValue);
+    EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUSMALLINT)), len);
+
+    struct Case { SQLUSMALLINT infoType; SQLUINTEGER expected; };
+    const Case cases[] = {
+        {SQL_MAX_ROW_SIZE, 8060},
+        {SQL_UNION, SQL_U_UNION | SQL_U_UNION_ALL},
+    };
+
+    for (const Case& c : cases) {
+        SQLUINTEGER value = 0xAAAAAAAA;
+        len = -1;
+        rc = SQLGetInfo(dbc_, c.infoType, &value, 0, &len);
+        EXPECT_EQ(SQL_SUCCESS, rc) << c.infoType;
+        EXPECT_EQ(c.expected, value) << c.infoType;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), len) << c.infoType;
+    }
+}
+
+// Classic Raidpp TCSQLGetInfo::Variation_1: a negative BufferLength for a
+// character result is an invalid buffer length, not a size probe.
+TEST_F(GetInfoLiveTest, NegativeStringBufferLengthReturnsHy090) {
+    SQLWCHAR value[16] = {};
+    SQLSMALLINT len = -1;
+    SQLRETURN rc = SQLGetInfoW(dbc_, SQL_DRIVER_ODBC_VER, value, -10, &len);
+    EXPECT_EQ(SQL_ERROR, rc);
+    EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY090");
+}
+
+TEST_F(GetInfoLiveTest, SuccessfulCallClearsPreviousDiagnostic) {
+    SQLWCHAR value[16] = {};
+    SQLSMALLINT len = -1;
+    ASSERT_EQ(SQL_ERROR, SQLGetInfoW(dbc_, SQL_DRIVER_ODBC_VER, value, -10, &len));
+    ASSERT_TRUE(ODBCTestUtils::HasDiagState(SQL_HANDLE_DBC, dbc_, "HY090"));
+
+    ASSERT_EQ(SQL_SUCCESS,
+              SQLGetInfoW(dbc_, SQL_DRIVER_ODBC_VER, value, sizeof(value), &len));
+
+    SQLWCHAR state[6] = {};
+    SQLINTEGER native = 0;
+    SQLWCHAR message[256] = {};
+    SQLSMALLINT messageLen = 0;
+    EXPECT_EQ(SQL_NO_DATA, SQLGetDiagRecW(SQL_HANDLE_DBC, dbc_, 1, state, &native,
+                                          message, 256, &messageLen));
+}
+
 // SQLGetInfo must work while a cursor is open on a non-MARS connection, and
 // must leave that cursor usable. mssql-odbc satisfies this by answering from
 // state captured at login; msodbcsql spawns a second connection for its own
@@ -303,17 +600,17 @@ TEST_F(GetInfoLiveTest, WorksWithAnOpenCursorAndLeavesItUsable) {
     SQLCloseCursor(stmt_);
 }
 
-// An identifier this driver does not implement stays an error rather than
-// silently returning a zeroed buffer.
-//
-// mssql-odbc-specific. Retail msodbcsql18 rejects 65000 with HY096 on Linux but
-// answers SQL_SUCCESS on Windows (observed in ADO build 173877), so the parity
-// leg cannot share an assertion that is about this driver's own contract.
-TEST_F(GetInfoLiveTest, UnknownInfoTypeIsRejected) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+// The Windows Driver Manager answers a reserved information type itself with
+// SQL_SUCCESS for both drivers. Unix forwards it, and both drivers return
+// HY096. The Rust unit test bypasses the manager and pins the driver response.
+TEST_F(GetInfoLiveTest, ReservedInfoTypeFollowsDriverManagerContract) {
     SQLUINTEGER value = 0;
     SQLSMALLINT len = -1;
     SQLRETURN rc = SQLGetInfo(dbc_, 65000, &value, sizeof(value), &len);
+#ifdef _WIN32
+    EXPECT_EQ(SQL_SUCCESS, rc);
+#else
     EXPECT_EQ(SQL_ERROR, rc);
     EXPECT_SQLSTATE(SQL_HANDLE_DBC, dbc_, "HY096");
+#endif
 }

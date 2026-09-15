@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use tracing::{debug, error};
 
+use crate::api::escape::describe_text;
+
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet};
 use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::datatypes::sql_string::SqlString;
@@ -36,6 +38,16 @@ const SUGGESTED_PRECISION: usize = 5;
 const SUGGESTED_SCALE: usize = 6;
 const SUGGESTED_TDS_TYPE_ID: usize = 22;
 const SUGGESTED_TDS_LENGTH: usize = 23;
+
+/// The description msodbcsql reports for the return-status parameter of
+/// `{? = call ...}`: a nullable `SQL_INTEGER` of precision 10, scale 0.
+/// Measured against msodbcsql 18.6.2.1.
+const RETURN_STATUS_DESCRIPTION: ParameterDescription = ParameterDescription {
+    data_type: SQL_INTEGER,
+    parameter_size: 10,
+    decimal_digits: 0,
+    nullable: SQL_NULLABLE,
+};
 
 /// Describes a prepared statement parameter.
 ///
@@ -130,7 +142,7 @@ fn sql_describe_param_safe(
         env_state.odbc_version != OdbcVersion::Odbc2
     };
 
-    let (sql, marker_count, query_timeout) = {
+    let (sql, marker_count, return_status, query_timeout) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLDescribeParam: stmt mutex poisoned");
             return SQL_ERROR;
@@ -184,9 +196,20 @@ fn sql_describe_param_safe(
             return SQL_ERROR;
         }
 
-        let sql = plan.stmt.sql().to_string();
+        // Described from the text the application supplied, re-translated
+        // here rather than reused from the prepared plan: the metadata RPC
+        // cannot parse `{call ...}`, so describe must translate even when
+        // SQL_ATTR_NOSCAN suppressed it at prepare time.
+        let (sql, return_status) = match describe_text(&plan.original_sql) {
+            Ok(parts) => parts,
+            Err(e) => {
+                error!(error = %e, "SQLDescribeParam: escape translation failed");
+                post_sql_error(&mut stmt_state, e.state(), 0, e.message());
+                return SQL_ERROR;
+            }
+        };
         stmt_state.set_state(STMT_STATE_EXEC_STARTED);
-        (sql, marker_count, stmt_state.query_timeout)
+        (sql, marker_count, return_status, stmt_state.query_timeout)
     };
 
     let mut client = match claim_connection(dbc, stmt, statement_handle, "SQLDescribeParam") {
@@ -263,7 +286,8 @@ fn sql_describe_param_safe(
         }
     }
 
-    let mut collector = DescriptionCollector::new(marker_count);
+    let described_count = marker_count - usize::from(return_status);
+    let mut collector = DescriptionCollector::new(described_count);
     // INVARIANT: a row that cannot be mapped must not leave this loop early.
     // The result set has to be drained and `close_query()` called below, or the
     // connection is left mid-result and every later operation on it fails. That
@@ -271,7 +295,7 @@ fn sql_describe_param_safe(
     // *after* the drain, rather than propagated with `?` or an early `return`.
     let parse_result = loop {
         match dbc.runtime.block_on(client.next_row()) {
-            Ok(Some(row)) => match parse_parameter_row(&row, marker_count, is_odbc3) {
+            Ok(Some(row)) => match parse_parameter_row(&row, described_count, is_odbc3) {
                 Ok((index, description)) => {
                     if let Err(e) = collector.accept(index, description) {
                         break Err(e);
@@ -288,12 +312,20 @@ fn sql_describe_param_safe(
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 
-    let descriptions = match parse_result.and_then(|()| collector.finish()) {
+    let mut descriptions = match parse_result.and_then(|()| collector.finish()) {
         Ok(descriptions) => descriptions,
         Err(e) => {
             return fail_metadata_response(dbc, stmt, statement_handle, client, &e);
         }
     };
+
+    // `{? = call ...}` puts the procedure's return status in parameter 1. The
+    // server never describes it — it is not an argument — so it is prepended
+    // here as the integer msodbcsql reports for it (measured: SQL_INTEGER,
+    // precision 10, scale 0, nullable).
+    if return_status {
+        descriptions.insert(0, RETURN_STATUS_DESCRIPTION);
+    }
 
     let info_messages = client.take_info_messages();
     return_client_idle(dbc, statement_handle, client);
@@ -858,6 +890,7 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
@@ -916,6 +949,7 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
@@ -978,6 +1012,7 @@ mod tests {
             let mut state = stmt.inner.lock().unwrap();
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
+                original_sql: "SELECT ?".to_string(),
                 marker_count: 1,
             });
             state.query_timeout = STMT_TIMEOUT_SECS;
@@ -1030,6 +1065,7 @@ mod tests {
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
+                original_sql: String::new(),
             });
         }
 
@@ -1059,6 +1095,7 @@ mod tests {
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
+                original_sql: String::new(),
             });
             state.parameter_metadata.push(ParameterDescription {
                 data_type: SQL_INTEGER,
@@ -1114,6 +1151,7 @@ mod tests {
             state.prepared = Some(crate::handles::stmt::PreparedPlan {
                 stmt: PreparedStatement::new("SELECT @P1".to_string()),
                 marker_count: 1,
+                original_sql: String::new(),
             });
         }
 

@@ -28,7 +28,7 @@
 
 use tracing::{debug, error};
 
-use mssql_tds::connection::tds_client::{ExecuteOptions, StatementResult, StreamedParamStatus};
+use mssql_tds::connection::tds_client::{ExecuteOptions, StreamedParamStatus};
 
 use super::exec_common::{
     abort_dae_with_diag, clear_exec_started, fail_with_tds, finish_execute_with_param_warning,
@@ -348,14 +348,14 @@ fn sql_param_data_safe(
             SQL_NEED_DATA
         }
 
-        Ok(StreamedParamStatus::Complete(result)) => {
+        Ok(StreamedParamStatus::Complete(_)) => {
             // All DAE parameters are done.  `take_dae` recovers the prepared
             // plan and orphan in the same critical section that ends the
             // sequence: a statement observed between the two would look idle
             // but unprepared, and a concurrent SQLExecute would report 07002
             // instead of re-running the plan. `SQLExecDirect` parks no plan, so
             // a `None` plan is legitimate there.
-            let (was_prepared, fractional_truncated) = {
+            let fractional_truncated = {
                 let Ok(mut stmt_state) = stmt.inner.lock() else {
                     error!("SQLParamData: stmt mutex poisoned on completion");
                     return_client_idle(dbc, statement_handle, client);
@@ -372,24 +372,8 @@ fn sql_param_data_safe(
                 let parked = stmt_state.take_dae();
                 debug_assert!(parked.is_none(), "the client is checked out by this call");
                 stmt_state.clear_state(STMT_STATE_EXEC_STARTED);
-                (stmt_state.prepared.is_some(), fractional_truncated)
+                fractional_truncated
             };
-
-            // Same contract as the non-streaming `SQLExecute` arm: a prepared
-            // statement runs one SQL statement, so a no-row result must have its
-            // trailing tokens drained (including `sp_prepexec`'s `@handle`
-            // RETURNVALUE, which is what materializes the handle for reuse)
-            // instead of leaving a 0-column cursor open. `SQLExecDirect` streams
-            // ad-hoc `sp_executesql` with no parked plan and no trailing handle,
-            // so it keeps the batch-navigation behaviour `finish_execute` gives
-            // it.
-            if was_prepared
-                && !matches!(result, StatementResult::Rows)
-                && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
-            {
-                error!(%e, "SQLParamData: draining no-row prepared result failed");
-                return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-            }
 
             finish_execute_with_param_warning(
                 dbc,
@@ -672,24 +656,22 @@ fn run_deferred_execute(
     };
 
     let options = ExecuteOptions::new().timeout_secs(timeout_secs);
-    let was_prepared = prepared.is_some();
-    let exec_result: Result<Option<StatementResult>, mssql_tds::error::Error> =
-        match (prepared.as_mut(), sql) {
-            (Some(plan), _) => dbc
-                .runtime
-                .block_on(client.execute_prepared(&mut plan.stmt, params, &mut orphaned, options))
-                .map(Some),
-            (None, Some(sql)) => dbc
-                .runtime
-                .block_on(client.execute_sp_executesql(sql, params, options))
-                .map(|_| None),
-            (None, None) => {
-                error!("SQLParamData: deferred sequence has neither a plan nor SQL text");
-                return_client_idle(dbc, statement_handle, client);
-                clear_exec_started(stmt);
-                return SQL_ERROR;
-            }
-        };
+    let exec_result = match (prepared.as_mut(), sql) {
+        (Some(plan), _) => dbc
+            .runtime
+            .block_on(client.execute_prepared(&mut plan.stmt, params, &mut orphaned, options))
+            .map(|_| ()),
+        (None, Some(sql)) => dbc
+            .runtime
+            .block_on(client.execute_sp_executesql(sql, params, options))
+            .map(|_| ()),
+        (None, None) => {
+            error!("SQLParamData: deferred sequence has neither a plan nor SQL text");
+            return_client_idle(dbc, statement_handle, client);
+            clear_exec_started(stmt);
+            return SQL_ERROR;
+        }
+    };
 
     // Give the plan back before reporting either outcome, exactly as the
     // immediate path does: a failure must still leave the statement prepared.
@@ -698,21 +680,8 @@ fn run_deferred_execute(
         stmt_state.pending_unprepare = orphaned;
     }
 
-    let stmt_result = match exec_result {
-        Ok(result) => result,
-        Err(e) => {
-            error!(%e, "SQLParamData: deferred execute failed");
-            return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-        }
-    };
-
-    // Same contract as the immediate prepared arm: a no-row prepared result has
-    // its trailing tokens drained rather than leaving a 0-column cursor open.
-    if was_prepared
-        && !matches!(stmt_result, Some(StatementResult::Rows))
-        && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
-    {
-        error!(%e, "SQLParamData: draining a no-row deferred result failed");
+    if let Err(e) = exec_result {
+        error!(%e, "SQLParamData: deferred execute failed");
         return fail_with_tds(dbc, stmt, statement_handle, client, &e);
     }
 

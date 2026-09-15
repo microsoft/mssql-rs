@@ -151,6 +151,7 @@ fn sql_disconnect_safe(dbc: &DbcHandle) -> SqlReturn {
     state.client = None;
     state.active_stmt = None;
     state.effective_vendor_settings = None;
+    state.effective_packet_size = None;
     state.identity = ConnectionIdentity::default();
     state.connection_state = ConnectionState::Disconnected;
 

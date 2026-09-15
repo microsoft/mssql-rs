@@ -910,7 +910,7 @@ work items. Not restated here.
 | 1 | a set that fails **client-side** conversion | sets already serialized still commit and the call is partial success; msodbcsql materializes first, sends nothing, and reports total failure | AB#47945 |
 | 2 | `SQLExecDirect` with `PARAMSET_SIZE > 1` | `HYC00`, with or without markers | AB#47939 |
 | 4 | data-at-execution combined with an array | `HYC00` at execute | AB#47958 |
-| 5 | output / `InputOutput` parameters | refused at `SQLBindParameter` | driver-wide gap, not array-specific |
+| 5 | output / `InputOutput` parameters in arrays only (`SQL_ATTR_PARAMSET_SIZE > 1`) | binding accepted; array execution returns `HYC00` | AB#48148 |
 | 6 | array stride for `SQL_C_SS_VECTOR` | binding refused | AB#47790 |
 | 7 | array size set through `SQLSetDescField(apd, SQL_DESC_ARRAY_SIZE, n)` | accepted, then one set executes | AB#47945 |
 | 8 | server reports fewer sets than `PARAMSET_SIZE` with no error | `SQL_SUCCESS_WITH_INFO` and `01000` naming the reported count; msodbcsql returns `SQL_SUCCESS` | AB#47945 |
@@ -961,7 +961,9 @@ rows would invite a retry that double-inserts. The rest are gaps.
 
 1-4 are pinned by `param_array_test.cpp` cases gated with
 `SKIP_IF_COMPARING_MSODBCSQL()`; 5 by
-`output_parameters_are_refused_before_the_array_path_sees_them`.
+the input-only array validation in `stage_execution`.
+
+Single-row output/input-output parameters and call return values are supported (AB#46384 / AB#48049). Direct RPC and `EXEC ... OUTPUT` text routes match returned parameters by name or ordinal. Delivery uses current bindings and bind offsets, survives fetch exhaustion and connection reuse, and respects rebind/`SQL_RESET_PARAMS`. Writeback reports string/fractional truncation (`01004`/`01S07`) and conversion/indicator errors (`22018`/`22002`).
 
 ## Remaining work
 
@@ -969,7 +971,7 @@ rows would invite a retry that double-inserts. The rest are gaps.
   already scans and rewrites once. A future allocation optimization could store
   the original SQL plus `Vec<usize>` marker offsets, then stream SQL chunks and
   `@P{n}` names directly to the TDS writer. Execute-time binding state would
-  also allow `OUTPUT` and `?=` handling. This is no longer a repeated-parsing
+  already supplies `OUTPUT` and `?=` handling. This is no longer a repeated-parsing
   correctness issue.
 - **Type matrix and TDS type selection:** tracked by the conversion milestone
   above. P3-P5 drive the wire type from `ParameterType` for the integer and
@@ -982,9 +984,7 @@ rows would invite a retry that double-inserts. The rest are gaps.
   the off-diagonal cross-product, together with the `HYC00` -> `07006` flip that
   depends on it - is P9 (AB#47790). `ColumnSize` still does not bound a
   data-at-execution value in either family (AB#47590).
-- **Deferred features:** output parameters (`SQL_PARAM_OUTPUT`, `SQL_PARAM_INPUT_OUTPUT`)
-  and TVPs. Parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented - see the
-  section above for the surface that is still missing.
+- **Deferred features (AB#48148):** output/input-output parameters in parameter arrays and TVPs. Single-row output parameters are supported; input parameter arrays (`SQL_ATTR_PARAMSET_SIZE`) are implemented with the limitations above.
 - **`mssql-tds` gap found by P8, closed by AB#47800:** a `sql_variant` could not
   carry a `varchar` payload - `get_variant_base_type` and
   `create_variant_inner_context` assumed every `ColumnValues::String` was

@@ -9,8 +9,8 @@ use tracing::{debug, error};
 use std::time::Instant;
 
 use mssql_tds::connection::tds_client::{
-    ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, ResultSet, StatementId,
-    StatementResult, StreamedParamStatus,
+    ExecuteOptions, PreparedBatchResult, PreparedBatchRowResult, PreparedStatement, ResultSet,
+    StatementId, StreamedParamStatus,
 };
 use mssql_tds::error::Error as TdsError;
 use mssql_tds::message::parameters::rpc_parameters::RpcParameter;
@@ -30,7 +30,7 @@ use crate::api::odbc_types::{
     SQL_PARAM_SUCCESS, SQL_PARAM_SUCCESS_WITH_INFO, SQL_PARAM_UNUSED, SQL_SUCCESS,
     SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn, SqlULen, SqlUSmallInt,
 };
-use crate::conversion::param_convert::is_data_at_exec_indicator;
+use crate::conversion::param_convert::{is_data_at_exec_indicator, is_output_direction};
 use crate::error::free_errors;
 use crate::error::post_sql_error;
 use crate::handles::stmt::{
@@ -295,27 +295,14 @@ fn sql_execute_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn
                 stmt_state.pending_unprepare = orphaned;
             }
 
-            let stmt_result = match exec_result {
-                Ok(result) => result,
-                Err(e) => {
-                    error!(%e, "SQLExecute: prepared execution failed");
-                    return fail_with_tds(dbc, stmt, statement_handle, client, &e);
-                }
-            };
-
-            // A prepared statement runs a single SQL statement. If it produced no result
-            // set (DML / no-row), drain its trailing tokens so the statement is left idle
-            // and immediately re-executable (msodbcsql parity) instead of leaving a
-            // 0-column cursor open. A row-returning statement keeps its cursor open for
-            // SQLFetch; its `@handle` RETURNVALUE (sp_prepexec) is captured later at
-            // drain time (SQLCloseCursor / the DDL finish path).
-            if !matches!(stmt_result, StatementResult::Rows)
-                && let Err(e) = dbc.runtime.block_on(client.advance_to_rows())
-            {
-                error!(%e, "SQLExecute: draining no-row prepared result failed");
+            if let Err(e) = exec_result {
+                error!(%e, "SQLExecute: prepared execution failed");
                 return fail_with_tds(dbc, stmt, statement_handle, client, &e);
             }
 
+            // TDS already settles a protocol-only RPC tail. Advancing to rows
+            // here would discard the counts/messages before a prepared batch's
+            // first rowset instead of leaving them for SQLMoreResults.
             finish_execute_with_param_warning(
                 dbc,
                 stmt,
@@ -911,16 +898,57 @@ fn stage_execution(stmt: &StmtHandle) -> Result<ExecutionStaging, SqlReturn> {
         return Err(SQL_ERROR);
     }
 
-    let marker_count = stmt_state
-        .prepared
-        .as_ref()
-        .expect("prepared checked non-None above")
-        .marker_count;
-
     // All state-sequencing checks passed: this is a real new execute, so the
     // fresh snapshot now becomes the one `build_named_params` and any DAE
     // sequence it opens will read for the rest of this execute.
     stmt_state.bound_params = bound_params;
+    stmt_state.call_returns_status = false;
+    let output_flags: Vec<bool> = stmt_state
+        .bound_params
+        .iter()
+        .map(|param| param.is_some_and(|param| is_output_direction(param.input_output_type)))
+        .collect();
+    let Some(plan) = stmt_state.prepared.as_ref() else {
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return Err(SQL_ERROR);
+    };
+    if !plan.original_sql.is_empty() {
+        let (sql, marker_count, call) = match super::escape::translate_for_execution(
+            &plan.original_sql,
+            stmt_state.inert_attrs.noscan(),
+            &output_flags,
+        ) {
+            Ok(parts) => parts,
+            Err(error) => {
+                post_sql_error(&mut stmt_state, error.state(), 0, error.message());
+                return Err(SQL_ERROR);
+            }
+        };
+        if call.as_ref().is_some_and(|call| call.returns_status) {
+            match stmt_state.bound_params.first().and_then(Option::as_ref) {
+                None => {
+                    post_diag(&mut stmt_state, ERR_UNBOUND_PARAMETER);
+                    return Err(SQL_ERROR);
+                }
+                Some(param) if !is_output_direction(param.input_output_type) => {
+                    post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                    return Err(SQL_ERROR);
+                }
+                Some(_) => {}
+            }
+        }
+        if sql != plan.stmt.sql() {
+            stmt_state.orphan_prepared_handle();
+            if let Some(plan) = stmt_state.prepared.as_mut() {
+                plan.stmt = PreparedStatement::new(sql);
+                plan.marker_count = marker_count;
+            }
+        }
+    }
+    let Some(marker_count) = stmt_state.prepared.as_ref().map(|plan| plan.marker_count) else {
+        post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);
+        return Err(SQL_ERROR);
+    };
 
     if stmt_state.paramset_size > 1 {
         let paramset_size = stmt_state.paramset_size;
@@ -1131,6 +1159,7 @@ mod tests {
         state.prepared = Some(PreparedPlan {
             stmt: PreparedStatement::new(rewritten),
             marker_count,
+            original_sql: String::new(),
         });
     }
 
@@ -1164,6 +1193,70 @@ mod tests {
         assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
     }
 
+    fn assert_return_status_binding_error(bind_return: bool, expected_state: [u8; 5]) {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::odbc_types::{SQL_C_SLONG, SQL_INTEGER, SQL_NTS, SQL_PARAM_INPUT};
+        use crate::api::prepare::sql_prepare_w;
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let sql: Vec<u16> = "{?=call #return_binding(?)}"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(
+            unsafe { sql_prepare_w(h.stmt, sql.as_ptr(), SQL_NTS) },
+            SQL_SUCCESS
+        );
+        let mut input = 7_i32;
+        let mut input_ind = 0;
+        let mut status = -1_i32;
+        let mut status_ind = 0;
+        for (ordinal, value, indicator) in [
+            (2, &raw mut input, &raw mut input_ind),
+            (1, &raw mut status, &raw mut status_ind),
+        ] {
+            if ordinal == 1 && !bind_return {
+                continue;
+            }
+            assert_eq!(
+                unsafe {
+                    sql_bind_parameter(
+                        h.stmt,
+                        ordinal,
+                        SQL_PARAM_INPUT,
+                        SQL_C_SLONG,
+                        SQL_INTEGER,
+                        0,
+                        0,
+                        value.cast(),
+                        0,
+                        indicator,
+                    )
+                },
+                SQL_SUCCESS
+            );
+        }
+        assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 1);
+        assert_eq!(state.diag_records[0].sql_state, expected_state);
+        assert!(!state.has_state(STMT_STATE_EXEC_STARTED));
+        assert_eq!(status, -1);
+        assert_eq!(status_ind, 0);
+    }
+
+    #[test]
+    fn return_status_bound_as_input_returns_hy105() {
+        assert_return_status_binding_error(true, SQLSTATE_HY105);
+    }
+
+    #[test]
+    fn unbound_return_status_returns_07002() {
+        assert_return_status_binding_error(false, SQLSTATE_07002);
+    }
+
     /// A `snapshot_bound_params` failure (here, a poisoned APD) must still
     /// post an HY000 diagnostic, and post it as record 1 — not leave
     /// `SQLGetDiagRec` reporting `SQL_NO_DATA`, and not append after a stale
@@ -1191,6 +1284,91 @@ mod tests {
                 .message
                 .contains("Internal error reading parameter bindings")
         );
+    }
+
+    #[test]
+    fn prepared_execution_keeps_dml_counts_before_the_first_rowset() {
+        use crate::api::bind_param::sql_bind_parameter;
+        use crate::api::more_results::sql_more_results;
+        use crate::api::odbc_types::{
+            SQL_C_CHAR, SQL_DATA_AT_EXEC, SQL_INTEGER, SQL_NEED_DATA, SQL_NO_DATA, SQL_PARAM_INPUT,
+            SQL_VARCHAR,
+        };
+        use crate::api::param_data::sql_param_data;
+        use crate::api::put_data::sql_put_data;
+        use mssql_tds::test_client_support::{
+            col_metadata, done_more_with_count, done_no_more, int_columns, tds_client_from_tokens,
+        };
+
+        for dae_sql_type in [None, Some(SQL_VARCHAR), Some(SQL_INTEGER)] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            set_prepared(
+                h.stmt,
+                if dae_sql_type.is_some() {
+                    "UPDATE t SET v=?; UPDATE t SET v=2; SELECT v FROM t"
+                } else {
+                    "UPDATE t SET v=1; UPDATE t SET v=2; SELECT v FROM t"
+                },
+            );
+            let dbc = unsafe { handle_from_raw::<crate::handles::DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            dbc.inner.lock().unwrap().client = Some(tds_client_from_tokens(vec![
+                done_more_with_count(2),
+                done_more_with_count(1),
+                col_metadata(int_columns(1)),
+                done_no_more(),
+            ]));
+
+            let mut input = b'1';
+            let mut indicator = SQL_DATA_AT_EXEC;
+            if let Some(sql_type) = dae_sql_type {
+                assert_eq!(
+                    unsafe {
+                        sql_bind_parameter(
+                            h.stmt,
+                            1,
+                            SQL_PARAM_INPUT,
+                            SQL_C_CHAR,
+                            sql_type,
+                            10,
+                            0,
+                            (&raw mut input).cast(),
+                            1,
+                            &raw mut indicator,
+                        )
+                    },
+                    SQL_SUCCESS
+                );
+                assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_NEED_DATA);
+                let mut token = std::ptr::null_mut();
+                assert_eq!(
+                    unsafe { sql_param_data(h.stmt, &raw mut token) },
+                    SQL_NEED_DATA
+                );
+                assert_eq!(token, (&raw mut input).cast());
+                assert_eq!(unsafe { sql_put_data(h.stmt, token, 1) }, SQL_SUCCESS);
+                assert_eq!(
+                    unsafe { sql_param_data(h.stmt, &raw mut token) },
+                    SQL_SUCCESS
+                );
+            } else {
+                assert_eq!(unsafe { sql_execute(h.stmt) }, SQL_SUCCESS);
+            }
+            for (index, expected_count) in [2, 1].into_iter().enumerate() {
+                if index != 0 {
+                    assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+                }
+                let state = stmt.inner.lock().unwrap();
+                assert_eq!(state.row_count, expected_count);
+                assert!(state.column_metadata.is_empty());
+                assert!(state.has_state(STMT_STATE_CURSOR_OPEN));
+            }
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_SUCCESS);
+            assert_eq!(stmt.inner.lock().unwrap().column_metadata.len(), 1);
+            assert_eq!(stmt.inner.lock().unwrap().row_count, -1);
+            assert_eq!(unsafe { sql_more_results(h.stmt) }, SQL_NO_DATA);
+        }
     }
 
     #[test]
@@ -1676,10 +1854,10 @@ mod tests {
         );
     }
 
-    /// Output parameters are refused by `SQLBindParameter` itself, so nothing
-    /// non-input ever reaches `bound_params` and the array path's own
-    /// input-only guard is unreachable. Pins that, so the guard is not mistaken
-    /// for an array-specific deviation (AB#47945).
+    /// Output parameters bind fine now that `{call ...}` needs them, so the
+    /// array path's input-only guard is genuinely reachable: one output buffer
+    /// cannot receive a value per parameter set. Pins that it refuses with
+    /// HYC00 rather than silently writing one set's value (AB#47945).
     #[test]
     fn output_parameters_are_refused_before_the_array_path_sees_them() {
         let h = TestHandles::with_env_dbc_stmt();
@@ -1701,19 +1879,13 @@ mod tests {
             )
         };
 
-        assert_eq!(rc, SQL_ERROR, "binding an output parameter must fail");
+        assert_eq!(rc, SQL_SUCCESS, "binding an output parameter must succeed");
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        assert_eq!(
-            stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            SQLSTATE_HYC00
-        );
         stmt.inner.lock().unwrap().paramset_size = 2;
-        // The marker is still unbound, so staging stops at 07002 - it never
-        // reaches the input-only check.
         assert!(stage_execution(stmt).is_err());
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            SQLSTATE_07002
+            SQLSTATE_HYC00
         );
     }
 

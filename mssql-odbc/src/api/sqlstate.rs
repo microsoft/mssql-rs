@@ -366,6 +366,15 @@ pub(crate) const WARN_OPTION_VALUE_CHANGED: DiagMsg = DiagMsg {
     text: "Option value changed",
 };
 
+/// Posted when a requested `SQL_ATTR_PACKET_SIZE` falls outside the range
+/// `mssql-tds` accepts and is clamped. Matches msodbcsql's `IDS_01_S02_02`
+/// (`dll/res/local.rc:42`), which it posts from the same clamp
+/// (`sqlcmisc.cpp:1909-1917`).
+pub(crate) const WARN_PACKET_SIZE_CHANGED: DiagMsg = DiagMsg {
+    state: SQLSTATE_01S02,
+    text: "Packet size changed",
+};
+
 /// Post a server-originated error under a caller-chosen SQLSTATE, keeping the
 /// native error number and the engine's message text.
 ///

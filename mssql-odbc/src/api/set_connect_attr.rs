@@ -13,6 +13,7 @@
 use tracing::{debug, error};
 
 use super::current_catalog::set_current_catalog;
+use super::driver_connect::{MAX_PACKET_SIZE, MIN_PACKET_SIZE};
 use super::set_stmt_attr::clamp_query_timeout;
 use super::sqlstate::*;
 use super::txn::{reset_connection, set_autocommit, set_txn_isolation};
@@ -350,8 +351,24 @@ unsafe fn sql_set_connect_attr_w_impl(
                 );
                 return SQL_ERROR;
             }
-            state.packet_size = value_ptr as usize as u32;
-            SQL_SUCCESS
+            let requested = value_ptr as usize as u32;
+            if requested == 0 {
+                // msodbcsql's clamp explicitly exempts zero (`sqlcmisc.cpp:1909-1917`):
+                // it is the sentinel for "let the connection pick its own
+                // default", not a size to force into range. Store it as-is,
+                // with no `01S02` — `seed_and_apply_connection_params` resolves
+                // it to the TDS context default at connect time.
+                state.packet_size = 0;
+                return SQL_SUCCESS;
+            }
+            let clamped = requested.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE);
+            state.packet_size = clamped;
+            if clamped != requested {
+                post_diag(&mut state, WARN_PACKET_SIZE_CHANGED);
+                SQL_SUCCESS_WITH_INFO
+            } else {
+                SQL_SUCCESS
+            }
         }
         // Set by the Driver Manager only, and not retrievable, so nothing to
         // store.
@@ -976,6 +993,93 @@ mod tests {
             state.packet_size, DEFAULT_PACKET_SIZE,
             "a rejected set must not change the stored value"
         );
+    }
+
+    #[test]
+    fn packet_size_above_maximum_is_clamped() {
+        // Matches msodbcsql's own clamp for an out-of-range packet size
+        // (`sqlcmisc.cpp:1909-1917`, `IDS_01_S02_02` "Packet size changed").
+        // Also guards `get_info::max_statement_len`'s `128 * packet_size`:
+        // an unclamped caller-supplied value here could overflow that
+        // multiplication before the driver ever connects.
+        let h = TestHandles::with_env_dbc();
+        let ret = unsafe {
+            sql_set_connect_attr_w(
+                h.dbc,
+                SQL_ATTR_PACKET_SIZE,
+                u32::MAX as usize as SqlPointer,
+                0,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, MAX_PACKET_SIZE);
+        let record = &state.diag_records()[0];
+        assert_eq!(record.sql_state, SQLSTATE_01S02);
+        assert!(
+            record.message.ends_with(WARN_PACKET_SIZE_CHANGED.text),
+            "got: {}",
+            record.message
+        );
+    }
+
+    #[test]
+    fn packet_size_below_minimum_is_clamped() {
+        let h = TestHandles::with_env_dbc();
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 1usize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS_WITH_INFO);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, MIN_PACKET_SIZE);
+    }
+
+    #[test]
+    fn packet_size_zero_on_a_fresh_handle_is_stored_without_a_warning() {
+        // msodbcsql exempts zero from its packet-size clamp
+        // (`sqlcmisc.cpp:1909-1917`): it is the "let the connection pick its
+        // own default" sentinel, not a size to force into range, so this must
+        // succeed cleanly rather than clamp up to MIN_PACKET_SIZE with 01S02.
+        let h = TestHandles::with_env_dbc();
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, 0);
+        assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn packet_size_nonzero_to_zero_is_stored_without_a_warning() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 16384usize as SqlPointer, 0) };
+        assert_eq!(dbc.inner.lock().unwrap().packet_size, 16384);
+        free_errors(&mut dbc.inner.lock().unwrap());
+
+        let ret =
+            unsafe { sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        let state = dbc.inner.lock().unwrap();
+        assert_eq!(state.packet_size, 0);
+        assert!(state.diag_records().is_empty());
+    }
+
+    #[test]
+    fn packet_size_repeated_zero_never_warns() {
+        let h = TestHandles::with_env_dbc();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        for _ in 0..3 {
+            let ret = unsafe {
+                sql_set_connect_attr_w(h.dbc, SQL_ATTR_PACKET_SIZE, 0usize as SqlPointer, 0)
+            };
+            assert_eq!(ret, SQL_SUCCESS);
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.packet_size, 0);
+            assert!(state.diag_records().is_empty());
+        }
     }
 
     #[test]

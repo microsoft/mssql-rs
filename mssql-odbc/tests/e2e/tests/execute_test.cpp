@@ -2114,18 +2114,38 @@ TEST_F(PrepareExecuteLiveTest, BindParameterNumberZeroReturns07009) {
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "07009");
 }
 
-// Output parameters are not implemented in Phase 1: mssql-odbc rejects the bind
-// with HYC00. The reference msodbcsql driver supports output params, so this is
-// mssql-odbc-specific behavior — skip it on the msodbcsql comparison leg.
-TEST_F(PrepareExecuteLiveTest, OutputParameterReturnsHyc00) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+// Output parameters bind successfully since AB#48049; the value is delivered
+// once the procedure's result sets are consumed (see escape_sequence_test).
+// Streamed output stays unimplemented, and that refusal is mssql-odbc-specific.
+TEST_F(PrepareExecuteLiveTest, OutputParameterBinds) {
     std::vector<SQLCHAR> value = {'x', '\0'};
     SQLLEN ind = SQL_NTS;
-    SQLRETURN rc = SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
-                                    SQL_VARCHAR, 1, 0, value.data(),
-                                    static_cast<SQLLEN>(value.size()), &ind);
-    EXPECT_EQ(SQL_ERROR, rc);
-    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+    EXPECT_EQ(SQL_SUCCESS,
+              SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
+                               SQL_VARCHAR, 1, 0, value.data(),
+                               static_cast<SQLLEN>(value.size()), &ind));
+}
+
+TEST_F(PrepareExecuteLiveTest, StreamedOutputParametersAreRejected) {
+    SKIP_IF_COMPARING_MSODBCSQL();
+    for (SQLSMALLINT direction :
+         {SQL_PARAM_OUTPUT_STREAM, SQL_PARAM_INPUT_OUTPUT_STREAM}) {
+        SCOPED_TRACE(direction);
+        std::vector<SQLCHAR> value = {'x', '\0'};
+        SQLLEN ind = SQL_NTS;
+        SQLRETURN rc = SQLBindParameter(stmt_, 1, direction, SQL_C_CHAR,
+                                       SQL_VARCHAR, 1, 0, value.data(),
+                                       static_cast<SQLLEN>(value.size()), &ind);
+        EXPECT_EQ(SQL_ERROR, rc);
+#ifdef _WIN32
+        // The Windows DM rejects these directions before calling this driver
+        // (traced on x64; also observed on ARM in build 174287). The direct
+        // driver's HYC00 is pinned by streamed_output_directions_are_refused.
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY105");
+#else
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HYC00");
+#endif
+    }
 }
 
 // A re-prepare whose new plan fails at sp_prepexec (syntax error) must leave the
