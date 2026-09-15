@@ -381,6 +381,7 @@ impl DescHandle {
         parent: Arc<DbcHandle>,
         activity: Arc<HandleActivity>,
     ) -> Self {
+        let binding_use = BindingUse::new(Arc::clone(&parent.activity));
         Self {
             object_type: HandleType::Desc,
             activity,
@@ -388,7 +389,7 @@ impl DescHandle {
             kind,
             alloc_type,
             parent_dbc,
-            binding_use: BindingUse::default(),
+            binding_use,
             inner: Mutex::new(DescState {
                 diag_records: Vec::new(),
                 header: DescHeader {
@@ -414,6 +415,11 @@ impl DescHandle {
 
 impl Handle for DescHandle {
     const TYPE: HandleType = HandleType::Desc;
+    type State = DescState;
+
+    fn state(&self) -> &Mutex<Self::State> {
+        &self.inner
+    }
 
     fn activity(&self) -> &Arc<HandleActivity> {
         &self.activity

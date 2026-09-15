@@ -7,7 +7,7 @@
 //! `SQLGetDiagRec` reads them back by index.
 
 use std::ops::{Deref, DerefMut};
-use std::sync::MutexGuard;
+use std::sync::{Mutex, MutexGuard};
 
 /// SQLSTATE stored as 5 ASCII bytes (no NUL).
 pub(crate) type SqlState = [u8; 5];
@@ -23,6 +23,29 @@ pub(crate) const DRIVER_DIAG_PREFIX: &str = "[Microsoft][ODBC Driver 18 for SQL 
 pub(crate) trait HasDiagnostics {
     fn diag_records(&self) -> &[DiagRecord];
     fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord>;
+}
+
+impl HasDiagnostics for Vec<DiagRecord> {
+    fn diag_records(&self) -> &[DiagRecord] {
+        self
+    }
+
+    fn diag_records_mut(&mut self) -> &mut Vec<DiagRecord> {
+        self
+    }
+}
+
+/// A poisoned business-state mutex still protects an initialized diagnostic
+/// Vec. Expose only that list; do not clear poison or resume business operations.
+pub(crate) fn with_diagnostics<S: HasDiagnostics, R>(
+    state: &Mutex<S>,
+    f: impl FnOnce(&mut Vec<DiagRecord>) -> R,
+) -> R {
+    let mut state = state.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("accessing diagnostics on poisoned handle state");
+        poisoned.into_inner()
+    });
+    f(state.diag_records_mut())
 }
 
 // If T implements HasDiagnostics, then MutexGuard<T> does too by delegation.

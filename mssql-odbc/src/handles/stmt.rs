@@ -1494,6 +1494,8 @@ impl StmtHandle {
             (ird, ird_ref),
             (ipd, ipd_ref),
         ] = descriptors;
+        let row_binding_use = BindingUse::new(Arc::clone(&parent.activity));
+        let param_binding_use = BindingUse::new(Arc::clone(&parent.activity));
         Self {
             object_type: HandleType::Stmt,
             activity,
@@ -1504,8 +1506,8 @@ impl StmtHandle {
             ird,
             ipd,
             _implicit_descriptors: [ard_ref, apd_ref, ird_ref, ipd_ref],
-            row_binding_use: BindingUse::default(),
-            param_binding_use: BindingUse::default(),
+            row_binding_use,
+            param_binding_use,
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
                 column_metadata: Vec::new(),
@@ -1568,6 +1570,11 @@ impl StmtHandle {
 
 impl Handle for StmtHandle {
     const TYPE: HandleType = HandleType::Stmt;
+    type State = StmtState;
+
+    fn state(&self) -> &Mutex<Self::State> {
+        &self.inner
+    }
 
     fn activity(&self) -> &Arc<HandleActivity> {
         &self.activity

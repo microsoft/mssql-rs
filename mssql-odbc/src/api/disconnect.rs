@@ -138,7 +138,9 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
 
     // The close claim excludes new calls and was refused if an older call
     // still owned the client. Cleanup cannot race a late client hand-back.
-    for (stmt_ptr, stmt) in &statements {
+    // Retire from the tail so removing each successful entry is O(1). If a
+    // retirement fails, the remaining IDs stay tracked and can be retried.
+    for (stmt_ptr, stmt) in statements.iter().rev() {
         if stmt.inner.lock().is_err() {
             error!(
                 ?stmt_ptr,
@@ -150,7 +152,8 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
             error.post(&mut state);
             return SQL_ERROR;
         }
-        state.statements.retain(|raw| raw != stmt_ptr);
+        debug_assert_eq!(state.statements.last(), Some(stmt_ptr));
+        state.statements.pop();
     }
 
     // Drop all explicitly-allocated DESC handles, after the statements: an
@@ -164,7 +167,7 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
     // Same poison-tolerant shape as the statement loop above, for the same
     // reason: synchronization only, and treating poison as fatal here would
     // equally orphan the descriptor rather than actually resolve anything.
-    for (desc_ptr, desc) in &descriptors {
+    for (desc_ptr, desc) in descriptors.iter().rev() {
         if desc.inner.lock().is_err() {
             error!(
                 ?desc_ptr,
@@ -176,7 +179,8 @@ fn sql_disconnect_safe(dbc: &HandleRef<DbcHandle>) -> SqlReturn {
             error.post(&mut state);
             return SQL_ERROR;
         }
-        state.descriptors.retain(|raw| raw != desc_ptr);
+        debug_assert_eq!(state.descriptors.last(), Some(desc_ptr));
+        state.descriptors.pop();
     }
 
     // Drop the TDS client (closes the connection) and clear connection-level cursor claim.

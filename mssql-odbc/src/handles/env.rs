@@ -269,6 +269,11 @@ impl EnvHandle {
 
 impl Handle for EnvHandle {
     const TYPE: HandleType = HandleType::Env;
+    type State = EnvState;
+
+    fn state(&self) -> &Mutex<Self::State> {
+        &self.inner
+    }
 
     fn activity(&self) -> &Arc<HandleActivity> {
         &self.activity

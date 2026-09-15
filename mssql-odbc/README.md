@@ -183,6 +183,10 @@ may use a module-scoped allocator, but its memory services must outlive all
 allocations and reference-count control blocks, not merely the last public
 handle ID.
 
+Rejected calls on live, closing handles post retrievable diagnostics. Diagnostic
+access can read a closing handle or the diagnostic list of poisoned handle
+state without admitting new operations or recovering its business state.
+
 ## Conventions
 
 Before writing or modifying code in this crate, read

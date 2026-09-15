@@ -18,7 +18,8 @@ use crate::error::{free_errors, post_sql_error};
 use crate::handles::stmt::STMT_STATE_CURSOR_OPEN;
 use crate::handles::{
     DbcHandle, DescHandle, EnvHandle, HandleType, RegistryError, StmtHandle, begin_close,
-    get_handle, handle_from_raw, process_is_shutting_down, retire_handle,
+    get_handle, handle_from_raw, post_handle_error, process_is_shutting_down, report_handle_error,
+    retire_handle,
 };
 use mssql_tds::connection::tds_client::StatementId;
 
@@ -28,10 +29,7 @@ macro_rules! claim_close {
             Ok(claim) => claim,
             Err(error) => {
                 error!(?error, "SQLFreeHandle: close admission failed");
-                if let Ok(mut state) = $handle.inner.lock() {
-                    free_errors(&mut state);
-                    error.post(&mut state);
-                }
+                post_handle_error($handle, error);
                 return SQL_ERROR;
             }
         }
@@ -205,7 +203,7 @@ unsafe fn free_stmt(handle: SqlHandle) -> SqlReturn {
         Ok(stmt) => stmt,
         Err(error) => {
             error!(?handle, ?error, "SQLFreeHandle(STMT): acquisition failed");
-            return error.sql_return();
+            return report_handle_error::<StmtHandle>(handle, error);
         }
     };
     let _closing = claim_close!(&stmt);
@@ -295,7 +293,7 @@ unsafe fn free_desc(handle: SqlHandle) -> SqlReturn {
         Ok(desc) => desc,
         Err(error) => {
             error!(?handle, ?error, "SQLFreeHandle(DESC): acquisition failed");
-            return error.sql_return();
+            return report_handle_error::<DescHandle>(handle, error);
         }
     };
     debug_assert_eq!(

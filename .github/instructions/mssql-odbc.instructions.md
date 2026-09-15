@@ -385,7 +385,12 @@ does not grow every time a new msodbcsql build is measured.
   there are caught by the test harness.
 - Use `.unwrap_or()`, `.unwrap_or_else()`, `.unwrap_or_default()`, or
   pattern matching instead.
-- For `Mutex::lock()`, return `SQL_ERROR` on poison — use `let Ok(state) = handle.inner.lock() else { return SQL_ERROR; }`. Do **not** recover via `e.into_inner()`.
+- For business-state `Mutex::lock()`, return `SQL_ERROR` on poison; do not
+  resume business operations via `e.into_inner()`. Two narrow exceptions are
+  audited: the registry recovers metadata-only critical sections with no
+  unwinding callbacks/destructors, and `error::diag::with_diagnostics` exposes
+  only the diagnostic Vec of poisoned handle state. Diagnostic access never
+  clears the business-state poison flag.
 - Every FFI entry point must be wrapped in the `crate::ffi_entry!` macro
   (see [FFI boundary conventions](#ffi-boundary-conventions)). The macro is
   a last-resort safety net — write code that cannot panic in the first place.
@@ -402,6 +407,11 @@ does not grow every time a new msodbcsql build is measured.
   error types at the call site.
 - At FFI boundaries, convert every `Result::Err` into the appropriate
   `SqlReturn` code (`SQL_ERROR`, `SQL_INVALID_HANDLE`, etc.).
+- `get_handle!` posts fresh `HY010`/`HY001` diagnostics for rejected live-handle
+  admission. Its diagnostic-only lookup bypasses closing/activity limits, not
+  identity/type validation, and exposes no business-state reference.
+  `SQL_INVALID_HANDLE` deliberately posts nothing. Diagnostic getters use the
+  same restricted lookup so callers can retrieve errors while a parent closes.
 - Store diagnostic info on the handle so `SQLGetDiagRec` / `SQLGetDiagField`
   can report it — don't discard error details. Three posters, choose by source:
   - `post_diag(state, DiagMsg)` — **preferred for driver-raised diagnostics
@@ -587,6 +597,9 @@ Driver Manager (DM) provides serialization guarantees that the driver relies on
   application-buffer access. All binding setters, unbind/reset operations,
   descriptor reassociation, and descriptor free use the same DBC gate and
   reject conflicting use with `ERR_FUNCTION_SEQUENCE` before mutation.
+  Binding-use counters validate that the supplied DBC gate has their owning
+  connection's identity; a guard from another connection must fail before
+  reading or modifying the use count.
   Check the descriptor's use state, not just the calling statement: an
   explicit descriptor can be another statement's active ARD or APD.
   Procedure outputs take a fresh `ParameterSnapshot` at delivery, not at

@@ -3,32 +3,50 @@
 
 //! Buffer-use lifetimes, separate from registry API-call admission. Admission
 //! and binding mutation share the owning DBC lock; dropping a lease never locks.
+//! The DBC activity identity rejects a different connection's gate.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::dbc::DbcState;
 use super::desc::{DescHandle, DescState};
-use super::{RegistryError, handle_from_raw};
+use super::{HandleActivity, RegistryError, handle_from_raw};
 use crate::api::odbc_types::{SQL_ERROR, SqlHandle, SqlReturn};
 use crate::api::sqlstate::{
     ERR_FUNCTION_SEQUENCE, ERR_MEMORY_ALLOCATION, SQLSTATE_HY000, post_diag,
 };
 use crate::error::{HasDiagnostics, post_sql_error};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BindingUse {
+    owner: Arc<HandleActivity>,
     active: Arc<AtomicUsize>,
 }
 
 impl BindingUse {
+    pub(crate) fn new(owner: Arc<HandleActivity>) -> Self {
+        Self {
+            owner,
+            active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire) != 0
     }
 
+    fn ensure_owner(&self, gate: &DbcState) -> Result<(), BindingError> {
+        if !Arc::ptr_eq(&self.owner, gate.gate_identity()) {
+            tracing::error!("binding access attempted with a non-owning DBC gate");
+            return Err(BindingError::WrongOwner);
+        }
+        Ok(())
+    }
+
     /// The caller holds the owning DBC gate through snapshot admission or
     /// mutation. A separate check without that gate cannot authorize mutation.
-    pub(crate) fn ensure_idle(&self, _gate: &DbcState) -> Result<(), BindingError> {
+    pub(crate) fn ensure_idle(&self, gate: &DbcState) -> Result<(), BindingError> {
+        self.ensure_owner(gate)?;
         if self.is_active() {
             Err(BindingError::InUse)
         } else {
@@ -36,7 +54,8 @@ impl BindingUse {
         }
     }
 
-    pub(crate) fn acquire(&self, _gate: &DbcState) -> Result<BindingUseGuard, BindingError> {
+    pub(crate) fn acquire(&self, gate: &DbcState) -> Result<BindingUseGuard, BindingError> {
+        self.ensure_owner(gate)?;
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1)
@@ -84,6 +103,7 @@ impl BindingLease {
 #[derive(Debug)]
 pub(crate) enum BindingError {
     InUse,
+    WrongOwner,
     Capacity,
     Registry(RegistryError),
     Poisoned,
@@ -100,16 +120,28 @@ impl BindingError {
                 state,
                 SQLSTATE_HY000,
                 0,
-                format!("Cannot acquire binding descriptor: {error:?}"),
+                format!("Cannot acquire binding descriptor: {error}"),
             ),
-            Self::Poisoned | Self::InvalidRecord => {
+            Self::WrongOwner => {
                 post_sql_error(
                     state,
                     SQLSTATE_HY000,
                     0,
-                    format!("Binding access failed: {self:?}"),
+                    "Internal error resolving binding ownership",
                 );
             }
+            Self::Poisoned => post_sql_error(
+                state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error accessing parameter or column bindings: poisoned mutex",
+            ),
+            Self::InvalidRecord => post_sql_error(
+                state,
+                SQLSTATE_HY000,
+                0,
+                "Internal error accessing a binding record",
+            ),
         }
         SQL_ERROR
     }
@@ -856,11 +888,113 @@ mod tests {
     }
 
     #[test]
+    fn binding_uses_reject_other_connection_gates_without_changing_counts() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit = owned_descriptor(h.alloc_explicit_desc()).unwrap();
+        let other_connection = h.alloc_other_connection();
+        let other = owned_descriptor(other_connection.desc).unwrap();
+        let stmt = handle_from_raw::<StmtHandle>(h.stmt).unwrap().into_arc();
+        let implicit =
+            [h.ard(), h.apd(), h.ird(), h.ipd()].map(|raw| owned_descriptor(raw).unwrap());
+        let gate = stmt.parent_dbc().inner.lock().unwrap();
+        let other_gate = other.parent_dbc().inner.lock().unwrap();
+        let binding_uses = [
+            &stmt.row_binding_use,
+            &stmt.param_binding_use,
+            &explicit.binding_use,
+        ]
+        .into_iter()
+        .chain(implicit.iter().map(|desc| &desc.binding_use));
+
+        for binding_use in binding_uses {
+            for active_count in [0, 1] {
+                let guards: Vec<_> = (0..active_count)
+                    .map(|_| binding_use.acquire(&gate).unwrap())
+                    .collect();
+                let other_guards: Vec<_> = (0..active_count * 2)
+                    .map(|_| other.binding_use.acquire(&other_gate).unwrap())
+                    .collect();
+                assert!(matches!(
+                    binding_use.ensure_idle(&other_gate),
+                    Err(BindingError::WrongOwner)
+                ));
+                assert!(matches!(
+                    binding_use.acquire(&other_gate),
+                    Err(BindingError::WrongOwner)
+                ));
+                assert_eq!(binding_use.active.load(Ordering::Acquire), active_count);
+                assert_eq!(
+                    other.binding_use.active.load(Ordering::Acquire),
+                    active_count * 2
+                );
+                if active_count == 0 {
+                    binding_use.ensure_idle(&gate).unwrap();
+                } else {
+                    assert!(matches!(
+                        binding_use.ensure_idle(&gate),
+                        Err(BindingError::InUse)
+                    ));
+                }
+                drop(guards);
+                drop(other_guards);
+                assert_eq!(binding_use.active.load(Ordering::Acquire), 0);
+                assert_eq!(other.binding_use.active.load(Ordering::Acquire), 0);
+                binding_use.ensure_idle(&gate).unwrap();
+                other.binding_use.ensure_idle(&other_gate).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_leases_validate_owner_and_release_cloned_descriptor_uses() {
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let explicit = h.alloc_explicit_desc();
+        let other_connection = h.alloc_other_connection();
+        let other = owned_descriptor(other_connection.desc).unwrap();
+        for raw in [h.ard(), h.apd(), h.ird(), h.ipd(), explicit] {
+            let desc = owned_descriptor(raw).unwrap();
+            let cloned_desc = Arc::clone(&desc);
+            let gate = desc.parent_dbc().inner.lock().unwrap();
+            let other_gate = other.parent_dbc().inner.lock().unwrap();
+            let mut state = desc.inner.lock().unwrap();
+            let error = BindingLease::acquire(&desc, &other_gate, &state).unwrap_err();
+            assert!(matches!(error, BindingError::WrongOwner));
+            assert_eq!(error.post(&mut *state), SQL_ERROR);
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, *b"HY000");
+            assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 0);
+            assert_eq!(other.binding_use.active.load(Ordering::Acquire), 0);
+
+            let first = BindingLease::acquire(&desc, &gate, &state).unwrap();
+            let second = BindingLease::acquire(&cloned_desc, &gate, &state).unwrap();
+            assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 2);
+            assert!(matches!(
+                BindingLease::acquire(&desc, &other_gate, &state),
+                Err(BindingError::WrongOwner)
+            ));
+            assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 2);
+            assert_eq!(other.binding_use.active.load(Ordering::Acquire), 0);
+            drop(state);
+            drop(other_gate);
+            drop(gate);
+
+            drop(first);
+            assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 1);
+            assert!(desc.binding_use.is_active());
+            drop(second);
+            assert_eq!(desc.binding_use.active.load(Ordering::Acquire), 0);
+            assert!(!desc.binding_use.is_active());
+            let gate = desc.parent_dbc().inner.lock().unwrap();
+            desc.binding_use.ensure_idle(&gate).unwrap();
+        }
+    }
+
+    #[test]
     fn lease_counter_is_checked_and_shared_uses_release_independently() {
         let h = TestHandles::with_env_dbc_stmt();
         let dbc = handle_from_raw::<DbcHandle>(h.dbc).unwrap().into_arc();
         let gate = dbc.inner.lock().unwrap();
-        let binding_use = BindingUse::default();
+        let binding_use = BindingUse::new(Arc::clone(&dbc.activity));
         let first = binding_use.acquire(&gate).unwrap();
         let second = binding_use.acquire(&gate).unwrap();
         drop(first);

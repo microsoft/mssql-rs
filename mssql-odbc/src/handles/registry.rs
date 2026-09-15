@@ -34,7 +34,6 @@ pub(crate) enum RegistryError {
     NotFound,
     WrongType,
     Busy,
-    Poisoned,
     IdExhausted,
     Capacity,
     ActivityOverflow,
@@ -50,7 +49,6 @@ impl fmt::Display for RegistryError {
             Self::NotFound => "handle is missing or retired",
             Self::WrongType => "handle type does not match",
             Self::Busy => "handle or ancestor is in use or closing",
-            Self::Poisoned => "handle registry mutex is poisoned",
             Self::IdExhausted => "handle identities are exhausted",
             Self::Capacity => "handle registry capacity could not be reserved",
             Self::ActivityOverflow => "handle activity count would overflow",
@@ -111,6 +109,28 @@ impl HandleActivity {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn exhaust_for_test(self: &Arc<Self>) -> ActivityOverflowGuard {
+        let previous = self.active.swap(usize::MAX, Ordering::AcqRel);
+        ActivityOverflowGuard {
+            activity: Arc::clone(self),
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) struct ActivityOverflowGuard {
+    activity: Arc<HandleActivity>,
+    previous: usize,
+}
+
+#[cfg(test)]
+impl Drop for ActivityOverflowGuard {
+    fn drop(&mut self) {
+        self.activity.active.store(self.previous, Ordering::Release);
     }
 }
 
@@ -188,9 +208,26 @@ struct RegistryState {
     next_id: Option<NonZeroUsize>,
     #[cfg(test)]
     reserve_additional: usize,
+    #[cfg(test)]
+    fail_retirement_after: Option<usize>,
 }
 
 impl RegistryState {
+    #[cfg(test)]
+    fn check_retirement(&mut self) -> Result<(), RegistryError> {
+        match self.fail_retirement_after {
+            Some(0) => {
+                self.fail_retirement_after = None;
+                Err(RegistryError::Capacity)
+            }
+            Some(count) => {
+                self.fail_retirement_after = Some(count - 1);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
     fn reserve_entry(&mut self) -> Result<(), RegistryError> {
         #[cfg(test)]
         let additional = self.reserve_additional;
@@ -221,13 +258,35 @@ impl HandleRegistry {
                 next_id: Some(NonZeroUsize::MIN),
                 #[cfg(test)]
                 reserve_additional: 1,
+                #[cfg(test)]
+                fail_retirement_after: None,
             }),
             identity: Arc::new(()),
         }
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, RegistryState>, RegistryError> {
-        self.state.lock().map_err(|_| RegistryError::Poisoned)
+    fn lock(&self) -> MutexGuard<'_, RegistryState> {
+        // Critical sections contain only map operations on primitive keys,
+        // reserved-capacity insertions, Arc clones and atomics. No user code or
+        // payload destructor can unwind here and leave a partial update.
+        self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("recovering poisoned handle registry");
+            self.state.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(|| {
+            let _state = self.state.lock().unwrap();
+            panic!("poison the registry without changing its invariants");
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_retirement_after(&self, successes: usize) {
+        self.lock().fail_retirement_after = Some(successes);
     }
 
     /// An activity may be registered once. Its ancestors need not have entries:
@@ -238,7 +297,7 @@ impl HandleRegistry {
         value: Arc<T>,
         activity: Arc<HandleActivity>,
     ) -> Result<HandleId, RegistryError> {
-        let mut state = self.lock()?;
+        let mut state = self.lock();
         if kind == HandleType::Invalid {
             return Err(RegistryError::WrongType);
         }
@@ -280,7 +339,7 @@ impl HandleRegistry {
         id: HandleId,
         expected: HandleType,
     ) -> Result<HandleRef<T>, RegistryError> {
-        let state = self.lock()?;
+        let state = self.lock();
         let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
         if entry.kind != expected {
             return Err(RegistryError::WrongType);
@@ -316,7 +375,32 @@ impl HandleRegistry {
 
     #[cfg(test)]
     pub(crate) fn kind(&self, id: HandleId) -> Result<Option<HandleType>, RegistryError> {
-        Ok(self.lock()?.entries.get(&id).map(|entry| entry.kind))
+        Ok(self.lock().entries.get(&id).map(|entry| entry.kind))
+    }
+
+    /// Diagnostic access ignores closing admission and activity limits, but
+    /// never revives a retired handle or an entry with a retired ancestor.
+    pub(super) fn diagnostics<T: Any + Send + Sync>(
+        &self,
+        id: HandleId,
+        expected: HandleType,
+    ) -> Result<Arc<T>, RegistryError> {
+        let value = {
+            let state = self.lock();
+            let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
+            if entry.kind != expected {
+                return Err(RegistryError::WrongType);
+            }
+            if entry
+                .activity
+                .ancestors()
+                .any(|ancestor| ancestor.admission.load(Ordering::Acquire) == RETIRED)
+            {
+                return Err(RegistryError::NotFound);
+            }
+            Arc::clone(&entry.value)
+        };
+        value.downcast().map_err(|_| RegistryError::WrongType)
     }
 
     /// Only for fixture cleanup after deliberately violating parent-free order.
@@ -327,7 +411,7 @@ impl HandleRegistry {
         expected: HandleType,
     ) -> Result<Arc<T>, RegistryError> {
         let value = {
-            let state = self.lock()?;
+            let state = self.lock();
             let entry = state.entries.get(&id).ok_or(RegistryError::NotFound)?;
             if entry.kind != expected {
                 return Err(RegistryError::WrongType);
@@ -341,7 +425,7 @@ impl HandleRegistry {
         &self,
         handle: &HandleRef<T>,
     ) -> Result<CloseGuard, RegistryError> {
-        let state = self.lock()?;
+        let state = self.lock();
         let entry = state
             .entries
             .get(&handle.id())
@@ -371,7 +455,9 @@ impl HandleRegistry {
     /// existing HandleRefs and structural Arcs continue to own their payloads.
     pub(crate) fn retire(&self, id: HandleId, expected: HandleType) -> Result<(), RegistryError> {
         let removed = {
-            let mut state = self.lock()?;
+            let mut state = self.lock();
+            #[cfg(test)]
+            state.check_retirement()?;
             match state.entries.entry(id) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     if entry.get().kind != expected {
@@ -403,7 +489,9 @@ impl HandleRegistry {
         removed
             .try_reserve(handles.len())
             .map_err(|_| RegistryError::Capacity)?;
-        let mut state = self.lock()?;
+        let mut state = self.lock();
+        #[cfg(test)]
+        state.check_retirement()?;
         for (index, (id, expected)) in handles.iter().enumerate() {
             if handles
                 .iter()
@@ -1288,38 +1376,76 @@ mod tests {
     }
 
     #[test]
-    fn every_registry_operation_reports_poison_and_guard_drops_do_not_lock() {
+    fn registry_recovers_poison_without_reopening_closed_handles() {
         let registry = Arc::new(HandleRegistry::new());
         let (id, activity) = register(&registry, HandleType::Env, None);
         let handle = registry.acquire::<u32>(id, HandleType::Env).unwrap();
         let closing = registry.begin_close(&handle).unwrap();
         poison(&registry);
-        assert_eq!(registry.kind(id), Err(RegistryError::Poisoned));
+        assert_eq!(registry.kind(id), Ok(Some(HandleType::Env)));
+        assert!(!registry.state.is_poisoned());
         assert_eq!(
             registry.acquire::<u32>(id, HandleType::Env).err(),
-            Some(RegistryError::Poisoned)
+            Some(RegistryError::Busy)
+        );
+        assert_eq!(
+            *registry.diagnostics::<u32>(id, HandleType::Env).unwrap(),
+            *handle
         );
         assert_eq!(
             registry.begin_close(&handle).err(),
-            Some(RegistryError::Poisoned)
+            Some(RegistryError::Busy)
         );
-        assert_eq!(
-            registry.register(HandleType::Env, Arc::new(0_u32), HandleActivity::new(None)),
-            Err(RegistryError::Poisoned)
-        );
-        assert_eq!(
-            registry.retire(id, HandleType::Env),
-            Err(RegistryError::Poisoned)
-        );
-        assert_eq!(
-            registry.retire_batch(&[(id, HandleType::Env)]),
-            Err(RegistryError::Poisoned)
-        );
-        assert_eq!(registry.retire_batch(&[]), Err(RegistryError::Poisoned));
+        let other = registry
+            .register(HandleType::Env, Arc::new(0_u32), HandleActivity::new(None))
+            .unwrap();
+        registry.retire(other, HandleType::Env).unwrap();
         drop(closing);
         assert_eq!(activity.admission.load(Ordering::Acquire), OPEN);
+        drop(registry.acquire::<u32>(id, HandleType::Env).unwrap());
         drop(handle);
         assert_eq!(count(&activity), 0);
+        poison(&registry);
+        registry.retire_batch(&[(id, HandleType::Env)]).unwrap();
+        registry.retire_batch(&[]).unwrap();
+        assert_eq!(registry.kind(id), Ok(None));
+    }
+
+    #[test]
+    fn diagnostics_validate_identity_without_changing_activity() {
+        let tree = Tree::new();
+        let parent = tree.acquire(tree.dbc, HandleType::Dbc);
+        let _closing = tree.registry.begin_close(&parent).unwrap();
+        let diagnostic = tree
+            .registry
+            .diagnostics::<u32>(tree.stmt, HandleType::Stmt)
+            .unwrap();
+        assert_eq!(
+            tree.registry
+                .diagnostics::<u32>(tree.stmt, HandleType::Desc)
+                .err(),
+            Some(RegistryError::WrongType)
+        );
+        assert_eq!(
+            tree.registry
+                .diagnostics::<u64>(tree.stmt, HandleType::Stmt)
+                .err(),
+            Some(RegistryError::WrongType)
+        );
+        assert_eq!(
+            tree.registry
+                .acquire::<u32>(tree.stmt, HandleType::Stmt)
+                .err(),
+            Some(RegistryError::Busy)
+        );
+        tree.registry.retire(tree.dbc, HandleType::Dbc).unwrap();
+        assert_eq!(
+            tree.registry
+                .diagnostics::<u32>(tree.stmt, HandleType::Stmt)
+                .err(),
+            Some(RegistryError::NotFound)
+        );
+        drop(diagnostic);
     }
 
     struct Reenter {
@@ -1480,7 +1606,6 @@ mod tests {
             RegistryError::NotFound,
             RegistryError::IdExhausted,
             RegistryError::Capacity,
-            RegistryError::Poisoned,
         ] {
             let registry = Arc::new(HandleRegistry::new());
             let (probe, parent_activity) = register(&registry, HandleType::Env, None);
@@ -1499,7 +1624,6 @@ mod tests {
                 RegistryError::Capacity => {
                     registry.state.lock().unwrap().reserve_additional = usize::MAX;
                 }
-                RegistryError::Poisoned => poison(&registry),
                 _ => unreachable!("not a registration error"),
             }
             let (dropped_tx, dropped_rx) = mpsc::channel();
@@ -1512,7 +1636,6 @@ mod tests {
                     .unwrap();
             });
             let probe_result = match expected {
-                RegistryError::Poisoned => Err(RegistryError::Poisoned),
                 RegistryError::NotFound => Ok(None),
                 _ => Ok(Some(HandleType::Env)),
             };

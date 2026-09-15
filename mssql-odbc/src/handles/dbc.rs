@@ -78,6 +78,7 @@ pub(crate) struct VendorConnOverrides {
 
 /// Mutable state within a connection handle, protected by `inner`.
 pub(crate) struct DbcState {
+    gate_identity: Arc<HandleActivity>,
     pub(crate) diag_records: Vec<DiagRecord>,
     pub(crate) connection_state: ConnectionState,
     /// Active child STMT handles
@@ -215,6 +216,12 @@ pub(crate) struct ConnectionIdentity {
     pub(crate) user_name: String,
 }
 
+impl DbcState {
+    pub(super) fn gate_identity(&self) -> &Arc<HandleActivity> {
+        &self.gate_identity
+    }
+}
+
 // Manual `Debug` so the bearer access token is never rendered in logs or panic
 // messages; presence is shown, the value is redacted (mirrors `ConnectionParams`).
 impl std::fmt::Debug for DbcState {
@@ -252,12 +259,14 @@ impl HasDiagnostics for DbcState {
 
 impl DbcHandle {
     pub(crate) fn new(parent: Arc<EnvHandle>) -> Self {
+        let activity = HandleActivity::new(Some(Arc::clone(&parent.activity)));
         Self {
             object_type: HandleType::Dbc,
-            activity: HandleActivity::new(Some(Arc::clone(&parent.activity))),
+            activity: Arc::clone(&activity),
             runtime: Arc::clone(&parent.runtime),
             parent,
             inner: Mutex::new(DbcState {
+                gate_identity: activity,
                 diag_records: Vec::new(),
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
@@ -297,6 +306,11 @@ impl DbcHandle {
 
 impl Handle for DbcHandle {
     const TYPE: HandleType = HandleType::Dbc;
+    type State = DbcState;
+
+    fn state(&self) -> &Mutex<Self::State> {
+        &self.inner
+    }
 
     fn activity(&self) -> &Arc<HandleActivity> {
         &self.activity

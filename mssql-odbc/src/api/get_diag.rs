@@ -24,23 +24,25 @@ use crate::api::odbc_types::{
     SqlWChar,
 };
 use crate::api::util::{copy_with_nul, write_if_some};
-use crate::error::{DiagRecord, HasDiagnostics};
-use crate::handles::{DbcHandle, DescHandle, EnvHandle, HandleRef, StmtHandle, handle_from_raw};
+use crate::error::DiagRecord;
+use crate::handles::{
+    DbcHandle, DescHandle, EnvHandle, HandleDiagnostics, StmtHandle, diagnostics_from_raw,
+};
 
 enum DiagHandle {
-    Env(HandleRef<EnvHandle>),
-    Dbc(HandleRef<DbcHandle>),
-    Stmt(HandleRef<StmtHandle>),
-    Desc(HandleRef<DescHandle>),
+    Env(HandleDiagnostics<EnvHandle>),
+    Dbc(HandleDiagnostics<DbcHandle>),
+    Stmt(HandleDiagnostics<StmtHandle>),
+    Desc(HandleDiagnostics<DescHandle>),
 }
 
 impl DiagHandle {
     fn from_raw(handle_type: SqlSmallInt, handle: SqlHandle) -> Result<Self, SqlReturn> {
         let result = match handle_type {
-            SQL_HANDLE_ENV => handle_from_raw::<EnvHandle>(handle).map(Self::Env),
-            SQL_HANDLE_DBC => handle_from_raw::<DbcHandle>(handle).map(Self::Dbc),
-            SQL_HANDLE_STMT => handle_from_raw::<StmtHandle>(handle).map(Self::Stmt),
-            SQL_HANDLE_DESC => handle_from_raw::<DescHandle>(handle).map(Self::Desc),
+            SQL_HANDLE_ENV => diagnostics_from_raw::<EnvHandle>(handle).map(Self::Env),
+            SQL_HANDLE_DBC => diagnostics_from_raw::<DbcHandle>(handle).map(Self::Dbc),
+            SQL_HANDLE_STMT => diagnostics_from_raw::<StmtHandle>(handle).map(Self::Stmt),
+            SQL_HANDLE_DESC => diagnostics_from_raw::<DescHandle>(handle).map(Self::Desc),
             _ => {
                 error!(handle_type, "diagnostic lookup: unsupported handle type");
                 return Err(SQL_INVALID_HANDLE);
@@ -101,10 +103,7 @@ pub(crate) unsafe fn sql_get_diag_rec_w(
         unsafe { write_if_some(text_length_ptr, 0) };
 
         // TODO: Do we need to snapshot here? Copy to user buffer directly?
-        let snapshot = match snapshot_record(&handle, rec_number) {
-            Ok(s) => s,
-            Err(rc) => return rc,
-        };
+        let snapshot = snapshot_record(&handle, rec_number);
         let Some(rec) = snapshot else {
             return SQL_NO_DATA;
         };
@@ -209,10 +208,7 @@ unsafe fn handle_header_field(
     match diag_identifier {
         SQL_DIAG_NUMBER => {
             if !diag_info_ptr.is_null() {
-                let count = match diag_record_count(handle) {
-                    Ok(c) => c,
-                    Err(rc) => return rc,
-                };
+                let count = diag_record_count(handle);
                 unsafe { (diag_info_ptr as *mut SqlInteger).write(count) };
             }
             SQL_SUCCESS
@@ -279,10 +275,7 @@ unsafe fn handle_record_field(
         return SQL_ERROR;
     }
 
-    let snapshot = match snapshot_record(handle, rec_number) {
-        Ok(s) => s,
-        Err(rc) => return rc,
-    };
+    let snapshot = snapshot_record(handle, rec_number);
     let Some(rec) = snapshot else {
         return SQL_NO_DATA;
     };
@@ -377,13 +370,13 @@ unsafe fn write_utf16_field_bytes(
 }
 
 /// Returns the number of diagnostic records stored on a handle.
-fn diag_record_count(handle: &DiagHandle) -> Result<SqlInteger, SqlReturn> {
+fn diag_record_count(handle: &DiagHandle) -> SqlInteger {
     with_locked_diag_records(handle, |records| records.len() as SqlInteger)
 }
 
 /// Clones the requested record out from under the handle's diag mutex.
-/// Returns `Ok(None)` if the index is past the end of the list.
-/// Returns `Err(SQL_ERROR)` on a poisoned diagnostic mutex.
+/// Returns `None` if the index is past the end of the list. A poisoned handle
+/// permits diagnostic access only, not access to its business state.
 ///
 /// TODO: For ODBC 3.x parity with msodbcsql, diagnostic records should be
 /// sorted by priority before indexing (as msodbcsql does). We currently
@@ -391,49 +384,18 @@ fn diag_record_count(handle: &DiagHandle) -> Result<SqlInteger, SqlReturn> {
 /// TODO: Add an OOM-resilient fallback diagnostic path for out-of-memory:
 /// store a non-allocating OOM flag on the handle and return
 /// static HY001 text for record 1 without heap allocation.
-fn snapshot_record(
-    handle: &DiagHandle,
-    rec_number: SqlSmallInt,
-) -> Result<Option<DiagRecord>, SqlReturn> {
+fn snapshot_record(handle: &DiagHandle, rec_number: SqlSmallInt) -> Option<DiagRecord> {
     let idx = (rec_number - 1) as usize;
     with_locked_diag_records(handle, |records| records.get(idx).cloned())
 }
 
-/// Dispatches to the correct handle type, locks its state, and passes the
-/// diagnostic records to `f`. Returns `Err(SQL_ERROR)` on a poisoned mutex.
-fn with_locked_diag_records<T>(
-    handle: &DiagHandle,
-    f: impl Fn(&[DiagRecord]) -> T,
-) -> Result<T, SqlReturn> {
+/// Only the diagnostic list is accessible, even when business state is poisoned.
+fn with_locked_diag_records<T>(handle: &DiagHandle, f: impl Fn(&[DiagRecord]) -> T) -> T {
     match handle {
-        DiagHandle::Env(h) => {
-            let guard = h.inner.lock().map_err(|_| {
-                error!("with_locked_diag_records: ENV mutex poisoned");
-                SQL_ERROR
-            })?;
-            Ok(f(guard.diag_records()))
-        }
-        DiagHandle::Dbc(h) => {
-            let guard = h.inner.lock().map_err(|_| {
-                error!("with_locked_diag_records: DBC mutex poisoned");
-                SQL_ERROR
-            })?;
-            Ok(f(guard.diag_records()))
-        }
-        DiagHandle::Stmt(h) => {
-            let guard = h.inner.lock().map_err(|_| {
-                error!("with_locked_diag_records: STMT mutex poisoned");
-                SQL_ERROR
-            })?;
-            Ok(f(guard.diag_records()))
-        }
-        DiagHandle::Desc(h) => {
-            let guard = h.inner.lock().map_err(|_| {
-                error!("with_locked_diag_records: DESC mutex poisoned");
-                SQL_ERROR
-            })?;
-            Ok(f(guard.diag_records()))
-        }
+        DiagHandle::Env(h) => h.with_records(f),
+        DiagHandle::Dbc(h) => h.with_records(f),
+        DiagHandle::Stmt(h) => h.with_records(f),
+        DiagHandle::Desc(h) => h.with_records(f),
     }
 }
 

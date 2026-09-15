@@ -247,6 +247,13 @@ unsafe fn alloc_stmt(input_handle: SqlHandle, output_handle: *mut SqlHandle) -> 
     }
     let [Some(ard), Some(apd), Some(ird), Some(ipd)] = descriptors else {
         error!("SQLAllocHandle(STMT): implicit descriptors incomplete");
+        crate::error::post_sql_error(
+            &mut dbc_state,
+            crate::api::sqlstate::SQLSTATE_HY000,
+            0,
+            "Internal error allocating statement descriptors",
+        );
+        debug_assert!(false, "implicit descriptors incomplete");
         return SQL_ERROR;
     };
     let stmt = StmtHandle::new(

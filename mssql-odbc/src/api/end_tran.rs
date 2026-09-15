@@ -103,20 +103,20 @@ fn sql_end_tran_dbc_safe(dbc: &DbcHandle, completion_type: SqlSmallInt) -> SqlRe
 
 /// Fans the request out over every connection on `env`.
 fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -> SqlReturn {
-    let Ok(mut env_state) = env.inner.lock() else {
-        error!("SQLEndTran: env mutex poisoned");
-        return SQL_ERROR;
+    let connections = {
+        let Ok(mut env_state) = env.inner.lock() else {
+            error!("SQLEndTran: env mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut env_state);
+
+        if commit_flag(completion_type).is_none() {
+            error!(completion_type, "SQLEndTran: invalid completion type");
+            post_diag(&mut env_state, ERR_INVALID_TRANSACTION_OPERATION_CODE);
+            return SQL_ERROR;
+        }
+        env_state.connections.clone()
     };
-    free_errors(&mut env_state);
-
-    if commit_flag(completion_type).is_none() {
-        error!(completion_type, "SQLEndTran: invalid completion type");
-        post_diag(&mut env_state, ERR_INVALID_TRANSACTION_OPERATION_CODE);
-        return SQL_ERROR;
-    }
-
-    let connections = env_state.connections.clone();
-    drop(env_state);
 
     let mut worst = SQL_SUCCESS;
     let mut failed = 0usize;
@@ -130,7 +130,7 @@ fn sql_end_tran_env_safe(env: &EnvHandle, completion_type: SqlSmallInt) -> SqlRe
                         &mut env_state,
                         SQLSTATE_HY000,
                         0,
-                        format!("A connection on this environment could not be accessed: {err:?}"),
+                        format!("A connection on this environment could not be accessed: {err}"),
                     );
                 }
                 worst = SQL_ERROR;
