@@ -61,6 +61,12 @@ temporal inputs, ignored storage, and length sentinels. Column-wise arrays and
 packed row-wise parameter bindings exercise production address calculations
 with nonzero offsets and distinct first/last values.
 
+PR validation runs this profile under Miri on **Windows x64 and Linux x64**
+only, using `nightly-2026-09-06` and seed 0. The Linux job uses the existing
+Ubuntu build container. Test failures and empty selections fail the job, and
+each platform publishes a separate ODBC Miri JUnit report. The ordinary native
+test run still includes these tests; ARM64, macOS, and Alpine do not run Miri.
+
 From the repository root, with `cargo-nextest` installed:
 
 ```powershell

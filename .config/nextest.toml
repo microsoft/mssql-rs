@@ -14,6 +14,9 @@ default-filter = 'package(mssqlodbc) & (test(::memory_safety::) | test(conversio
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 3 }
 
+[profile.miri-odbc.junit]
+path = "junit.xml"
+
 # Test groups for tests that need to run sequentially
 # TLS tests have race conditions with macOS Security.framework when creating
 # PKCS12 identities in parallel, so they must run one at a time.
