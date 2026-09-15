@@ -83,6 +83,18 @@ def test_alpine_gssapi_compilation_still_runs_on_prs():
     assert "--features gssapi" in script
 
 
+def test_mssql_python_odbc_failures_fail_the_job():
+    steps = load_template("test-mssql-python-odbc-template.yml")["steps"]
+    test_step = next(
+        step
+        for step in steps
+        if step.get("displayName") == "Run mssql-python tests against mssql-odbc"
+    )
+    assert "continueOnError" not in test_step
+    assert 'exit "$rc"' in test_step["script"]
+    assert "task.complete result=SucceededWithIssues" not in test_step["script"]
+
+
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])
 def test_linux_compilation_and_pr_tests_remain_enabled(architecture):
     steps = load_template("build-template-container.yml")["steps"]

@@ -726,9 +726,9 @@ stages:
       - template: test-mssql-python-macos-template.yml
 
   # Same upstream suite, but with mssql-python's bundled msodbcsql18 binary
-  # replaced by the Rust mssql-odbc driver. Failures and crashes are expected
-  # while the driver is in development, so the job is informational: only a
-  # broken harness fails it, and each test file runs in its own bounded process.
+  # replaced by the Rust mssql-odbc driver. Test failures, crashes, and harness
+  # failures fail the job; each test file runs in its own bounded process so the
+  # remaining results can still be published for diagnosis.
   #
   # Deliberately always-on rather than behind an opt-in parameter like RunFuzz /
   # RunLongHaul: the point is a continuous compatibility signal for a driver

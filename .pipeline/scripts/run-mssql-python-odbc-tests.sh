@@ -234,12 +234,10 @@ echo "==============================================================="
 echo "files: ${#TEST_FILES[@]} | passed: $passed | failed: $failed | crashed: $crashed | timed out: $timedout | no tests: $empty | skipped: $skipped | harness errors: $harness_error"
 echo "==============================================================="
 
-# The two failure modes need distinct exit codes: a broken environment must be a
-# loud, actionable red, while driver test failures are the expected baseline
-# while mssql-odbc is under development. Collapsing both into exit 1 under the
-# step's error handling makes them indistinguishable.
+# The two failure modes need distinct exit codes so the pipeline can distinguish
+# a broken environment from a driver test failure.
 #   2 -> harness could not run the tests (environment defect)
-#   1 -> tests ran and did not fully pass (driver defect, advisory)
+#   1 -> tests ran and did not fully pass (driver defect)
 #   0 -> everything passed
 # Files skipped because the aggregate budget ran out count as "not clean" too:
 # the result set is incomplete, which must not read as a clean pass.
@@ -258,6 +256,6 @@ if [ "$((passed + failed + crashed + timedout))" -eq 0 ]; then
 fi
 
 if [ "$failed" -gt 0 ] || [ "$crashed" -gt 0 ] || [ "$timedout" -gt 0 ] || [ "$skipped" -gt 0 ]; then
-    echo "##[warning]mssql-python suite did not complete cleanly against the mssql-odbc driver (expected while the driver is in development)"
+    echo "##[error]mssql-python suite did not complete cleanly against the mssql-odbc driver"
     exit 1
 fi

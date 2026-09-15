@@ -229,30 +229,10 @@ steps:
         bash /mssql-rs-scripts/run-mssql-python-odbc-tests.sh
       ' || rc=$?
 
-    # Exit 2 means the harness could not run the tests at all, and docker's own
-    # 125/126/127 mean `docker exec` never launched it - both are broken
-    # environments, which say nothing about the driver and must be a real red.
-    # Anything else is the expected in-development baseline and stays advisory,
-    # so a genuine infrastructure break is never mistaken for it.
-    case "$rc" in
-      2|125|126|127)
-        echo "##vso[task.logissue type=error]mssql-python test harness could not run (exit $rc) - broken test environment, not a driver defect"
-        exit 1
-        ;;
-    esac
-
     if [ "$rc" -ne 0 ]; then
-      echo "##vso[task.logissue type=warning]mssql-python tests did not fully pass against mssql-odbc (exit $rc) - expected while the driver is in development"
-      # `logissue` only annotates the log - on its own the step still reports a
-      # green check, so an entirely red suite looks indistinguishable from a
-      # clean run. Set the result explicitly to surface the warning glyph.
-      #
-      # This marks the build "partially succeeded", which Azure Pipelines reports
-      # to GitHub as `success` (verified against build 166244 on PR #210), so the
-      # signal is visible without the job ever blocking a pull request.
-      echo "##vso[task.complete result=SucceededWithIssues;]"
+      echo "##vso[task.logissue type=error]mssql-python tests did not fully pass against mssql-odbc (exit $rc)"
     fi
-    exit 0
+    exit "$rc"
   displayName: Run mssql-python tests against mssql-odbc
   # The runner enforces its own budget; this only backstops a wedged `docker
   # exec`. It must stay below the job timeout so the publish and cleanup steps
