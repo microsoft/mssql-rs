@@ -230,6 +230,12 @@ steps:
 
     if [ "$rc" -ne 0 ]; then
       case "$rc" in
+        2)
+          # The runner itself already printed its own ##[error] for this -
+          # broken venv, missing interpreter, or no test ever ran. Distinct
+          # from a driver test failure.
+          echo "##vso[task.logissue type=error]mssql-python test harness could not run (exit 2) - broken test environment, not a driver defect"
+          ;;
         125|126|127)
           # These come from `docker exec` itself, not from the script it never
           # reached - the harness never ran, so this is not a driver result.

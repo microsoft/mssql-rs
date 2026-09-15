@@ -98,9 +98,11 @@ def test_mssql_python_odbc_failures_fail_the_job():
     assert "task.complete result=SucceededWithIssues" not in test_step["script"]
     assert "SucceededWithIssues" not in template
 
-    # A docker-exec launch failure (125/126/127) means the harness never ran,
-    # so it must still fail the job (exit "$rc"), but through a distinct
-    # branch that says so rather than reporting it as a driver test failure.
+    # A docker-exec launch failure (125/126/127), or the runner's own exit 2
+    # for a broken harness, both mean the tests said nothing about the driver,
+    # so each must still fail the job (exit "$rc") through a branch that says
+    # so rather than reporting it as a driver test failure.
+    assert re.search(r"\b2\)", test_step["script"])
     assert re.search(r"125\|126\|127\)", test_step["script"])
     assert "exit \"$rc\"" in test_step["script"].rsplit("esac", 1)[-1]
 
@@ -122,8 +124,9 @@ def test_mssql_python_odbc_failures_fail_the_job():
     runner = (_ROOT / ".pipeline" / "scripts" / "run-mssql-python-odbc-tests.sh").read_text(
         encoding="utf-8"
     )
-    dirty_run_check = runner.split('if [ "$failed" -gt 0 ]', 1)[1]
-    assert re.search(r"\bexit 1\b", dirty_run_check)
+    dirty_run_parts = runner.split('if [ "$failed" -gt 0 ]', 1)
+    assert len(dirty_run_parts) == 2, "dirty-run guard line not found in runner script"
+    assert re.search(r"\bexit 1\b", dirty_run_parts[1])
 
 
 @pytest.mark.parametrize("architecture", ["x64", "ARM64"])

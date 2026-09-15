@@ -6,10 +6,11 @@
 # bundled Microsoft ODBC Driver 18 binary has been replaced by the Rust
 # mssql-odbc driver (see swap-mssql-python-odbc-driver.sh).
 #
-# The Rust driver is still under construction, so this suite is expected to fail
-# and to hard-crash the interpreter (segfault / abort) on some files. Each test
-# file therefore gets its own pytest process wrapped in `timeout`, so a crash or
-# a hang costs one file instead of the whole run:
+# A test file can hard-crash the interpreter (segfault / abort) against a
+# driver still under active development, so each test file gets its own pytest
+# process wrapped in `timeout`: a crash or a hang costs one file, not the whole
+# run, and the suite is now a blocking compatibility signal rather than an
+# advisory one.
 #
 #   - A crash kills only that file's process; the loop moves to the next file.
 #   - `timeout` bounds every file, so a wedged driver call can never stall the job.
